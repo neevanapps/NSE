@@ -1,15 +1,6 @@
-namespace NiftySignal.Rules;
+using NiftySignal.Domain.Enums;
 
-public enum ExitReason
-{
-    None,
-    SquareOff,
-    StopLoss,
-    PartialBook,
-    ScoreFlip,
-    ScoreDecay,
-    TimeStop,
-}
+namespace NiftySignal.Rules;
 
 public sealed record OpenPositionState(
     DateTimeOffset EntryTime,

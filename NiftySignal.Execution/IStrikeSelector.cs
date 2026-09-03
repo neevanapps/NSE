@@ -1,3 +1,4 @@
+using NiftySignal.Domain.Enums;
 using NiftySignal.Rules;
 
 namespace NiftySignal.Execution;

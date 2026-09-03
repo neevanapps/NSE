@@ -1,11 +1,6 @@
-namespace NiftySignal.Rules;
+using NiftySignal.Domain.Enums;
 
-public enum EntryDirection
-{
-    None,
-    Bullish,
-    Bearish,
-}
+namespace NiftySignal.Rules;
 
 /// <summary>
 /// Everything EntryRuleEvaluator needs, precomputed by the caller -- deliberately a plain
