@@ -11,21 +11,23 @@ using NiftySignal.Domain.Enums;
 namespace NiftySignal.Ingestion.FlatTrade;
 
 /// <summary>
-/// Live <see cref="ITickSource"/> over FlatTrade's WebSocket feed. A session token and the
+/// Live <see cref="ITickSource"/> over FlatTrade's WebSocket feed. An access token and the
 /// day's subscription list are supplied at construction -- obtaining/refreshing the token
 /// (plan section 4.3, daily) and building the subscription list (section 3.1, the 08:45
 /// job) are separate concerns, not yet wired up; this class only owns "given those, stream
 /// ticks reliably and reconnect when the connection drops."
 ///
-/// The message shapes here (connect handshake, tk/tf/dk/df feed types, field names) are
-/// corroborated against FlatTrade's own reference client and independent documentation,
-/// not guessed -- this is the well-verified half of the FlatTrade integration. The
-/// unverified half is the auth token exchange in <see cref="FlatTradeAuthClient"/>.
+/// Message shapes confirmed 2026-09-03 against the live docs at pi.flattrade.in/docs.
+/// That site's own changelog documents a breaking change from an older API generation
+/// (connect task "c" -> "a", auth field "susertoken" -> "accesstoken", connect
+/// acknowledgement "ck" -> "ak") -- this targets the current shape, not the older one
+/// still found in some reference clients circulating online. Still not exercised against
+/// a real account, since that needs an approved API key.
 /// </summary>
 public sealed class FlatTradeTickSource(
     FlatTradeOptions options,
     string userId,
-    string sessionToken,
+    string accessToken,
     IReadOnlyList<(Exchange Exchange, string Token)> subscriptions,
     IDataGapRecorder dataGapRecorder,
     ILogger<FlatTradeTickSource> logger) : ITickSource
@@ -104,7 +106,7 @@ public sealed class FlatTradeTickSource(
 
         try
         {
-            await SendAsync(ws, $$"""{"t":"c","uid":"{{userId}}","actid":"{{userId}}","susertoken":"{{sessionToken}}"}""", ct);
+            await SendAsync(ws, $$"""{"t":"a","uid":"{{userId}}","actid":"{{userId}}","source":"API","accesstoken":"{{accessToken}}"}""", ct);
 
             var state = new Dictionary<string, FlatTradeFeedState>();
             var buffer = new byte[64 * 1024];
@@ -125,7 +127,7 @@ public sealed class FlatTradeTickSource(
                     continue;
                 }
 
-                if (msg.Type == "ck")
+                if (msg.Type == "ak")
                 {
                     policy.RecordSuccess();
                     if (!subscribed)
@@ -175,7 +177,9 @@ public sealed class FlatTradeTickSource(
         {
             while (!ct.IsCancellationRequested)
             {
-                await Task.Delay(TimeSpan.FromSeconds(45), ct);
+                // Docs require a heartbeat every 30s to keep the connection alive; 25s
+                // leaves a small margin.
+                await Task.Delay(TimeSpan.FromSeconds(25), ct);
                 if (ws.State == WebSocketState.Open)
                 {
                     await SendAsync(ws, """{"t":"h"}""", ct);

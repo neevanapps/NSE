@@ -12,12 +12,10 @@ public sealed record ScripMatch(Exchange Exchange, string TradingSymbol, string 
 /// <summary>
 /// The browser-based authorize -> request_code -> signed token exchange (plan section
 /// 4.3), plus scrip search (used to resolve an instrument by name without the full
-/// instrument master). Endpoints and the token-exchange hash formula are corroborated
-/// against FlatTrade's own auth service independently of the reference code this was
-/// adapted from, but that exact call was never exercised end-to-end before this was
-/// written -- if <see cref="ExchangeRequestCodeForTokenAsync"/> comes back non-OK on the
-/// first real run, the likely fix is switching the request body from JSON to real
-/// application/x-www-form-urlencoded fields; see the comment inline.
+/// instrument master). Confirmed 2026-09-03 against the live docs at
+/// pi.flattrade.in/docs (request/response shapes, including that the token-exchange
+/// response uses "status", not the "stat" field every other FlatTrade endpoint uses) --
+/// still not exercised against a real account, since that needs an approved API key.
 /// </summary>
 public sealed class FlatTradeAuthClient(HttpClient http, IOptions<FlatTradeOptions> options)
 {
@@ -29,10 +27,7 @@ public sealed class FlatTradeAuthClient(HttpClient http, IOptions<FlatTradeOptio
     {
         var hash = Sha256Hex(_options.ApiKey + requestCode + _options.ApiSecret);
 
-        // Sent as real JSON here. The one reference implementation this was checked
-        // against sent this same JSON string under a form-urlencoded content type
-        // (likely a bug in an unexercised code path) -- if this fails, try
-        // FormUrlEncodedContent with the same three fields instead.
+        // Confirmed as real JSON (application/json), per the docs' own example.
         var payload = JsonSerializer.Serialize(new TokenExchangeRequest(_options.ApiKey, requestCode, hash));
         using var content = new StringContent(payload, Encoding.UTF8, "application/json");
 
@@ -42,7 +37,7 @@ public sealed class FlatTradeAuthClient(HttpClient http, IOptions<FlatTradeOptio
         var parsed = JsonSerializer.Deserialize<TokenExchangeResponse>(body, JsonOpts)
             ?? throw new InvalidOperationException("Empty response from FlatTrade token exchange.");
 
-        if (!string.Equals(parsed.Stat, "Ok", StringComparison.OrdinalIgnoreCase) || parsed.Token is null)
+        if (!string.Equals(parsed.Status, "Ok", StringComparison.OrdinalIgnoreCase) || parsed.Token is null)
         {
             throw new InvalidOperationException($"FlatTrade token exchange failed: {parsed.Emsg ?? body}");
         }
@@ -100,7 +95,7 @@ public sealed class FlatTradeAuthClient(HttpClient http, IOptions<FlatTradeOptio
         [property: JsonPropertyName("request_code")] string RequestCode,
         [property: JsonPropertyName("api_secret")] string ApiSecret);
 
-    record TokenExchangeResponse(string? Stat, string? Emsg, string? Token);
+    record TokenExchangeResponse(string? Status, string? Emsg, string? Token, string? Client);
 
     record SearchScripRequest(string Uid, string Exch, string Stext);
 

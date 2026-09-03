@@ -12,16 +12,15 @@ public sealed record ScripMatch(string Exch, string Tsym, string Token);
 /// authorize-code token exchange, and a scrip search to find one live Nifty option
 /// without needing the full instrument master (that's real Phase 1 work, not this spike).
 ///
-/// Endpoints and the token-exchange hash formula are confirmed against FlatTrade's own
-/// auth service (authapi.flattrade.in) independently of the reference iBuzz code, but the
-/// token-exchange call was never exercised end-to-end in that reference app -- if it 404s
-/// or rejects the content type, the likely fix is switching PostTokenExchange from a raw
-/// JSON body to real application/x-www-form-urlencoded fields (see the comment there).
+/// Endpoints, the hash formula, and the response shape (including that the token-exchange
+/// response uses "status", not the "stat" field every other FlatTrade endpoint uses) are
+/// confirmed 2026-09-03 against the live docs at pi.flattrade.in/docs. Still not exercised
+/// against a real account.
 /// </summary>
 public sealed class FlatTradeRestClient(HttpClient http, string apiKey, string apiSecret)
 {
     const string TokenExchangeUrl = "https://authapi.flattrade.in/trade/apitoken";
-    const string RestBaseUrl = "https://piconnect.flattrade.in/PiConnectTP/";
+    const string RestBaseUrl = "https://piconnect.flattrade.in/PiConnectAPI/";
 
     public string AuthorizeUrl => $"https://auth.flattrade.in/?app_key={apiKey}";
 
@@ -29,10 +28,6 @@ public sealed class FlatTradeRestClient(HttpClient http, string apiKey, string a
     {
         var hash = Sha256Hex(apiKey + requestCode + apiSecret);
 
-        // Reference implementation sent this as a JSON string body under a
-        // form-urlencoded content type (likely a bug in that unused code path, tolerated
-        // by a lenient server). Sending it as real JSON here since that's what the bytes
-        // actually were; switch to FormUrlEncodedContent below if this comes back non-OK.
         var payload = JsonSerializer.Serialize(new TokenExchangeRequest(apiKey, requestCode, hash));
         using var content = new StringContent(payload, Encoding.UTF8, "application/json");
 
@@ -43,7 +38,7 @@ public sealed class FlatTradeRestClient(HttpClient http, string apiKey, string a
         var parsed = JsonSerializer.Deserialize<TokenExchangeResponse>(body, JsonOpts)
             ?? throw new InvalidOperationException("Empty response from token exchange.");
 
-        if (!string.Equals(parsed.Stat, "Ok", StringComparison.OrdinalIgnoreCase) || parsed.Token is null)
+        if (!string.Equals(parsed.Status, "Ok", StringComparison.OrdinalIgnoreCase) || parsed.Token is null)
         {
             throw new InvalidOperationException($"Token exchange failed: {parsed.Emsg ?? body}");
         }
@@ -52,10 +47,10 @@ public sealed class FlatTradeRestClient(HttpClient http, string apiKey, string a
     }
 
     public async Task<IReadOnlyList<ScripMatch>> SearchScripAsync(
-        string uid, string susertoken, string exch, string searchText, CancellationToken ct)
+        string uid, string accessToken, string exch, string searchText, CancellationToken ct)
     {
         var jData = JsonSerializer.Serialize(new SearchScripRequest(uid, exch, Uri.EscapeDataString(searchText)));
-        using var content = new StringContent($"jData={jData}&jKey={susertoken}", Encoding.UTF8, "text/plain");
+        using var content = new StringContent($"jData={jData}&jKey={accessToken}", Encoding.UTF8, "text/plain");
 
         using var response = await http.PostAsync(RestBaseUrl + "SearchScrip", content, ct);
         var body = await response.Content.ReadAsStringAsync(ct);
@@ -83,7 +78,7 @@ public sealed class FlatTradeRestClient(HttpClient http, string apiKey, string a
         [property: JsonPropertyName("request_code")] string RequestCode,
         [property: JsonPropertyName("api_secret")] string ApiSecret);
 
-    record TokenExchangeResponse(string? Stat, string? Emsg, string? Token);
+    record TokenExchangeResponse(string? Status, string? Emsg, string? Token, string? Client);
 
     record SearchScripRequest(string Uid, string Exch, string Stext);
 

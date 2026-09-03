@@ -4,12 +4,11 @@ namespace NiftySignal.Domain.Abstractions;
 
 /// <summary>
 /// Resolves the day's tradeable instrument universe (plan section 3.1: the 08:45 job).
-/// Contract only for now -- FlatTrade's actual instrument-master file format/URL hasn't
-/// been confirmed yet (Noren-family brokers typically publish a downloadable
-/// exchange-segment file, e.g. Shoonya's NFO_symbols.txt.zip, but FlatTrade's exact
-/// equivalent needs confirming against a live account, not guessed). The implementation
-/// in NiftySignal.Ingestion is the next thing to build once the FlatTrade API key is
-/// approved; everything else in the system can be built against this interface today.
+/// Implemented by <c>FlatTradeInstrumentMasterProvider</c> in NiftySignal.Ingestion, which
+/// downloads FlatTrade's public (no-auth) scrip master CSV -- confirmed 2026-09-03, see
+/// plan section 4.3. That implementation resolves the full option/future chain for an
+/// underlying; narrowing to ATM +/- 10 strikes (needs a spot/previous-close price) is a
+/// separate concern for whatever orchestrates the 08:45 job, not yet built.
 /// </summary>
 public interface IInstrumentMasterProvider
 {

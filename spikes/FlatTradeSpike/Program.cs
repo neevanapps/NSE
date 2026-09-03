@@ -1,6 +1,6 @@
 using FlatTradeSpike;
 
-const string WsUrl = "wss://piconnect.flattrade.in/PiConnectWSTp/";
+const string WsUrl = "wss://piconnect.flattrade.in/PiConnectWSAPI/";
 var duration = args.Length > 0 && int.TryParse(args[0], out var seconds)
     ? TimeSpan.FromSeconds(seconds)
     : TimeSpan.FromMinutes(5);

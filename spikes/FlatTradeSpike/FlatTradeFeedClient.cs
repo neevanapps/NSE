@@ -11,7 +11,7 @@ namespace FlatTradeSpike;
 /// sync-over-async style (blocking .Wait() calls) -- this is async/await throughout,
 /// which is what the real NiftySignal.Ingestion worker will need anyway.
 /// </summary>
-public sealed class FlatTradeFeedClient(string wsUrl, string uid, string susertoken) : IAsyncDisposable
+public sealed class FlatTradeFeedClient(string wsUrl, string uid, string accessToken) : IAsyncDisposable
 {
     readonly ClientWebSocket _ws = new();
     readonly TaskCompletionSource _sessionEstablished = new();
@@ -32,13 +32,13 @@ public sealed class FlatTradeFeedClient(string wsUrl, string uid, string suserto
         _receiveLoop = ReceiveLoopAsync(ct);
         _heartbeatLoop = HeartbeatLoopAsync(ct);
 
-        await SendAsync($$"""{"t":"c","uid":"{{uid}}","actid":"{{uid}}","susertoken":"{{susertoken}}"}""", ct);
+        await SendAsync($$"""{"t":"a","uid":"{{uid}}","actid":"{{uid}}","source":"API","accesstoken":"{{accessToken}}"}""", ct);
 
-        // "ck" (session established) must arrive before subscribing to anything.
+        // "ak" (connect acknowledgement) must arrive before subscribing to anything.
         using var timeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
         await _sessionEstablished.Task.WaitAsync(linked.Token);
-        Console.WriteLine("[ws] session established (ck)");
+        Console.WriteLine("[ws] session established (ak)");
     }
 
     public Task SubscribeTouchlineAsync(string exch, string token, CancellationToken ct) =>
@@ -56,13 +56,12 @@ public sealed class FlatTradeFeedClient(string wsUrl, string uid, string suserto
 
     async Task HeartbeatLoopAsync(CancellationToken ct)
     {
-        // FlatTrade's own reference client pings roughly every 60s to hold the
-        // connection open; 45s leaves margin without spamming the socket.
+        // Docs require a heartbeat every 30s to keep the connection alive; 25s leaves margin.
         try
         {
             while (!ct.IsCancellationRequested)
             {
-                await Task.Delay(TimeSpan.FromSeconds(45), ct);
+                await Task.Delay(TimeSpan.FromSeconds(25), ct);
                 await SendAsync("""{"t":"h"}""", ct);
             }
         }
@@ -121,7 +120,7 @@ public sealed class FlatTradeFeedClient(string wsUrl, string uid, string suserto
 
         _messageCountsByType[type] = _messageCountsByType.GetValueOrDefault(type) + 1;
 
-        if (type == "ck")
+        if (type == "ak")
         {
             _sessionEstablished.TrySetResult();
         }

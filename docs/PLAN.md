@@ -233,6 +233,8 @@ FlatTrade (Pi API) sessions expire and require a login flow, same operational sh
 - FlatTrade's WebSocket multiplexes market data and order updates on the **same connection**, with touchline (`t`) and depth (`d`) tick types, each with an acknowledgement stage and an update-only stage — the ingestion worker needs to demux by message type
 - Keep all FlatTrade-specific field/message mapping isolated inside `NiftySignal.Ingestion`; the rest of the system should only ever see the broker-agnostic `Tick`/`Instrument` entities
 
+**Confirmed 2026-09-03** against the live docs at `pi.flattrade.in/docs` (JS-rendered — needs a real browser, not a plain fetch, to read): REST base is `https://piconnect.flattrade.in/PiConnectAPI/`, WebSocket is `wss://piconnect.flattrade.in/PiConnectWSAPI/`. The docs' own changelog notes a breaking change from an older API generation still circulating in reference code online — connect task `"c"` → `"a"`, auth field `"susertoken"` → `"accesstoken"`, connect acknowledgement `"ck"` → `"ak"` — so anything built against an older third-party FlatTrade client should be checked against the current docs, not trusted as-is. Also confirmed: heartbeat interval is 30s, and FlatTrade publishes the scrip master as public, no-auth-required per-segment CSVs at `https://flattrade.s3.ap-south-1.amazonaws.com/scripmaster/<Segment>.csv` (e.g. `Nfo_Index_Derivatives.csv` for Nifty/BankNifty options+futures) — this resolves the "instrument-master format not yet confirmed" gap from section 1.9. Current Nifty lot size (used in the 7.2 example) is **65**, confirmed from that file.
+
 ---
 
 ## 5. Feature Engine
@@ -330,7 +332,7 @@ score  = 100 × tanh(raw / k)          // k tuned so typical range spans usefull
 ```json
 {
   "RulesetVersion": "2026-09-01.1",
-  "Capital": { "Total": 50000, "LotSize": 75, "MaxConcurrentPositions": 3 },
+  "Capital": { "Total": 50000, "LotSize": 65, "MaxConcurrentPositions": 3 },
   "Session": {
     "NoEntryBeforeMinutes": 15,
     "NoEntryAfterTime": "15:00",
