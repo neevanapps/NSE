@@ -1,4 +1,7 @@
 <Solution>
+  <Folder Name="/spikes/">
+    <Project Path="spikes/FlatTradeSpike/FlatTradeSpike.csproj" />
+  </Folder>
   <Project Path="NiftySignal.Backtest/NiftySignal.Backtest.csproj" />
   <Project Path="NiftySignal.Dashboard/NiftySignal.Dashboard.csproj" />
   <Project Path="NiftySignal.Domain/NiftySignal.Domain.csproj" />

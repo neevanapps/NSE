@@ -31,3 +31,6 @@ Thumbs.db
 project.lock.json
 project.fragment.lock.json
 artifacts/
+
+# Spike output (raw tick captures, not source)
+spikes/*/output/
