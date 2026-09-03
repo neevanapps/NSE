@@ -15,9 +15,19 @@
     <PackageVersion Include="Serilog.Sinks.File" Version="7.0.0" />
     <PackageVersion Include="Serilog.Settings.Configuration" Version="10.0.1" />
 
-    <!-- Data access -->
+    <!-- Data access. Pin Microsoft.EntityFrameworkCore itself alongside Npgsql's
+         provider and the Design package so every project in the graph resolves the
+         same EF Core assembly version. Npgsql accepts [10.0.4, 11.0.0), Design ships
+         10.0.11, so pin everything to 10.0.11 rather than let them disagree. -->
+    <PackageVersion Include="Microsoft.EntityFrameworkCore" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.11" />
     <PackageVersion Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="10.0.3" />
     <PackageVersion Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.11" />
+
+    <!-- Configuration (design-time DbContext factory) -->
+    <PackageVersion Include="Microsoft.Extensions.Configuration" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.Extensions.Configuration.Json" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.Extensions.Configuration.EnvironmentVariables" Version="10.0.11" />
 
     <!-- Tests -->
     <PackageVersion Include="coverlet.collector" Version="6.0.4" />
