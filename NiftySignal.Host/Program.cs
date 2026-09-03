@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using NiftySignal.Domain.Configuration;
 using NiftySignal.Host;
+using NiftySignal.Notifications;
 using NiftySignal.Persistence;
 using Serilog;
 
@@ -29,6 +30,12 @@ try
 
     builder.Services.AddDbContext<NiftySignalDbContext>(options =>
         options.UseNpgsql(builder.Configuration.GetConnectionString("NiftySignalDb")));
+
+    builder.Services.Configure<TelegramOptions>(builder.Configuration.GetSection(TelegramOptions.SectionName));
+    builder.Services.AddHttpClient<TelegramNotifier>();
+    builder.Services.AddSingleton(TimeProvider.System);
+    builder.Services.AddSingleton<ITelegramNotifier>(sp =>
+        new RateLimitedTelegramNotifier(sp.GetRequiredService<TelegramNotifier>(), sp.GetRequiredService<TimeProvider>()));
 
     builder.Services.AddHostedService<Worker>();
 
