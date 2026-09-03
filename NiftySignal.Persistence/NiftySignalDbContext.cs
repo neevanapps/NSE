@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using NiftySignal.Domain.Entities;
 
 namespace NiftySignal.Persistence;
 
@@ -10,4 +11,14 @@ namespace NiftySignal.Persistence;
 public sealed class NiftySignalDbContext(DbContextOptions<NiftySignalDbContext> options)
     : DbContext(options)
 {
+    public DbSet<Instrument> Instruments => Set<Instrument>();
+
+    public DbSet<Tick> Ticks => Set<Tick>();
+
+    public DbSet<DataGap> DataGaps => Set<DataGap>();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.ApplyConfigurationsFromAssembly(typeof(NiftySignalDbContext).Assembly);
+    }
 }
