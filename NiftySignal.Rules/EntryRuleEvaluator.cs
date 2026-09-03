@@ -1,0 +1,124 @@
+namespace NiftySignal.Rules;
+
+public enum EntryDirection
+{
+    None,
+    Bullish,
+    Bearish,
+}
+
+/// <summary>
+/// Everything EntryRuleEvaluator needs, precomputed by the caller -- deliberately a plain
+/// snapshot so the evaluator itself stays pure and every boundary condition in plan section
+/// 7.3 is testable by constructing a context, no live wiring required.
+/// </summary>
+public sealed record EntryContext(
+    DateTimeOffset Now,
+    double Score,
+    TimeSpan ScoreSustainedDuration,
+    bool KillSwitchEntriesEnabled,
+    bool DailyLossLimitBreached,
+    bool AllFeaturesWarmedUp,
+    bool HasOpenDataGap,
+    int TradesSoFarToday,
+    int OpenConcurrentPositions,
+    DateTimeOffset? LastEntryTimeSameDirection,
+    bool IsExpiryDay);
+
+/// <summary>Every failed check is included, not just the first -- plan section 7.3: "the rejection data matters as much as the acceptance data."</summary>
+public sealed record EntryDecision(bool ShouldEnter, EntryDirection Direction, IReadOnlyList<string> FailedConditions);
+
+/// <summary>
+/// The ordered filter-then-threshold checks from plan section 7.3. "Capital available" from
+/// that list isn't a separate check here -- plan section 1.2 ties capital directly to
+/// MaxConcurrentPositions (fixed lot size near a fixed premium band), so the concurrent-
+/// positions check below already covers it. "Strike selection returns a valid candidate"
+/// (step 5) is also not here -- that's IStrikeSelector's job, run only after this method
+/// says entry conditions are otherwise met, since it needs live quotes this evaluator has
+/// no business depending on.
+/// </summary>
+public static class EntryRuleEvaluator
+{
+    public static readonly TimeOnly MarketOpen = new(9, 15);
+
+    public static EntryDecision Evaluate(EntryContext context, RulesetConfig config)
+    {
+        var failures = new List<string>();
+        var nowTime = TimeOnly.FromDateTime(context.Now.DateTime);
+
+        var noEntryBefore = MarketOpen.AddMinutes(config.Session.NoEntryBeforeMinutes);
+        if (nowTime < noEntryBefore)
+        {
+            failures.Add($"Before session open window (NoEntryBeforeMinutes: entries start {noEntryBefore})");
+        }
+
+        var noEntryAfter = config.Session.ExpiryDayEnabled && context.IsExpiryDay
+            ? config.Session.ExpiryDayNoEntryAfterTime
+            : config.Session.NoEntryAfterTime;
+        if (nowTime >= noEntryAfter)
+        {
+            failures.Add($"After session close window (entries stop at {noEntryAfter})");
+        }
+
+        if (!context.KillSwitchEntriesEnabled)
+        {
+            failures.Add("KillSwitch.EntriesEnabled is false");
+        }
+
+        if (context.DailyLossLimitBreached)
+        {
+            failures.Add("Daily loss circuit breaker has tripped");
+        }
+
+        if (!context.AllFeaturesWarmedUp)
+        {
+            failures.Add("Not all contributing features are warmed up yet");
+        }
+
+        if (context.HasOpenDataGap)
+        {
+            failures.Add("An open data gap is in progress");
+        }
+
+        if (context.TradesSoFarToday >= config.Entry.MaxTradesPerDay)
+        {
+            failures.Add($"MaxTradesPerDay ({config.Entry.MaxTradesPerDay}) already reached");
+        }
+
+        if (context.OpenConcurrentPositions >= config.Capital.MaxConcurrentPositions)
+        {
+            failures.Add($"MaxConcurrentPositions ({config.Capital.MaxConcurrentPositions}) already reached");
+        }
+
+        var direction = Math.Sign(context.Score) switch
+        {
+            > 0 => EntryDirection.Bullish,
+            < 0 => EntryDirection.Bearish,
+            _ => EntryDirection.None,
+        };
+
+        if (Math.Abs(context.Score) < config.Entry.MinAbsScore)
+        {
+            failures.Add($"|score| ({Math.Abs(context.Score):F1}) below MinAbsScore ({config.Entry.MinAbsScore})");
+        }
+
+        var requiredSustain = TimeSpan.FromSeconds(config.Entry.MinScoreSustainedSeconds);
+        if (context.ScoreSustainedDuration < requiredSustain)
+        {
+            failures.Add($"Score not sustained for MinScoreSustainedSeconds ({requiredSustain.TotalSeconds}s, held for {context.ScoreSustainedDuration.TotalSeconds}s)");
+        }
+
+        if (context.LastEntryTimeSameDirection is { } lastEntry)
+        {
+            var gap = context.Now - lastEntry;
+            var requiredGap = TimeSpan.FromMinutes(config.Entry.ReEntryGapSameDirectionMinutes);
+            if (gap < requiredGap)
+            {
+                failures.Add($"Within ReEntryGapSameDirectionMinutes ({requiredGap.TotalMinutes}min) of the last same-direction entry");
+            }
+        }
+
+        var shouldEnter = failures.Count == 0 && direction != EntryDirection.None;
+        return new EntryDecision(shouldEnter, shouldEnter ? direction : EntryDirection.None, failures);
+    }
+}
