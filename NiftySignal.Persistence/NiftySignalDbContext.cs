@@ -19,6 +19,8 @@ public sealed class NiftySignalDbContext(DbContextOptions<NiftySignalDbContext> 
 
     public DbSet<KillSwitchState> KillSwitchStates => Set<KillSwitchState>();
 
+    public DbSet<PaperTrade> PaperTrades => Set<PaperTrade>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         modelBuilder.ApplyConfigurationsFromAssembly(typeof(NiftySignalDbContext).Assembly);
