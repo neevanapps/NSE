@@ -1,0 +1,41 @@
+@implements IDisposable
+@using NiftySignal.Dashboard.Services
+@inject DemoDataService Demo
+
+<div class="panel health-panel">
+    <div class="panel-title">Data Health</div>
+
+    <div class="health-list">
+        @foreach (var m in Demo.WarmUpStatuses)
+        {
+            <div class="health-row">
+                <span class="health-dot @(m.IsWarmedUp ? "ok" : "pending")"></span>
+                <span class="health-name">@m.Name</span>
+                <span class="text-faint mono health-window">@FormatWindow(m.Window)</span>
+                @if (m.IsWarmedUp)
+                {
+                    <span class="badge badge-bull">Warmed up</span>
+                }
+                else
+                {
+                    <span class="badge badge-warn">~@FormatWindow(m.Remaining) left</span>
+                }
+            </div>
+        }
+    </div>
+
+    <div class="panel-title" style="margin-top:16px;">Data Gaps (last 24h)</div>
+    <div class="text-faint" style="font-size:13px;">No gaps recorded.</div>
+</div>
+
+@code {
+    static string FormatWindow(TimeSpan t) => t.TotalMinutes >= 60
+        ? $"{t.TotalHours:0.#}h"
+        : $"{t.TotalMinutes:0}m";
+
+    protected override void OnInitialized() => Demo.Updated += OnDemoUpdated;
+
+    void OnDemoUpdated() => InvokeAsync(StateHasChanged);
+
+    public void Dispose() => Demo.Updated -= OnDemoUpdated;
+}

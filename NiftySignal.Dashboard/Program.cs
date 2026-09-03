@@ -1,10 +1,20 @@
+using Microsoft.EntityFrameworkCore;
 using NiftySignal.Dashboard.Components;
+using NiftySignal.Dashboard.Services;
+using NiftySignal.Persistence;
 
 var builder = WebApplication.CreateBuilder(args);
+
+builder.Configuration.AddJsonFile("appsettings.Local.json", optional: true, reloadOnChange: true);
 
 // Add services to the container.
 builder.Services.AddRazorComponents()
     .AddInteractiveServerComponents();
+
+builder.Services.AddDbContext<NiftySignalDbContext>(options =>
+    options.UseNpgsql(builder.Configuration.GetConnectionString("NiftySignalDb")));
+
+builder.Services.AddSingleton<DemoDataService>();
 
 var app = builder.Build();
 

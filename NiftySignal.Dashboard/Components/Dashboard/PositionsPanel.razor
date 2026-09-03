@@ -1,0 +1,64 @@
+@implements IDisposable
+@using NiftySignal.Dashboard.Services
+@using NiftySignal.Rules
+@inject DemoDataService Demo
+
+<div class="panel positions-panel">
+    <div class="panel-title">
+        Open Paper Positions
+        <span class="mono text-dim">@Demo.Positions.Count / 3 max</span>
+    </div>
+
+    @if (Demo.Positions.Count == 0)
+    {
+        <div class="text-faint" style="font-size:13px;">No open positions.</div>
+    }
+    else
+    {
+        <div class="scroll-x">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Symbol</th>
+                        <th>Dir</th>
+                        <th>Entry</th>
+                        <th>LTP</th>
+                        <th>Qty</th>
+                        <th>P&amp;L</th>
+                        <th>P&amp;L %</th>
+                        <th>Held</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var p in Demo.Positions)
+                    {
+                        <tr>
+                            <td>@p.TradingSymbol @if (p.HasPartiallyBooked) { <span class="badge badge-neutral" style="margin-left:6px;">partial</span> }</td>
+                            <td><span class="badge @(p.Direction == EntryDirection.Bullish ? "badge-bull" : "badge-bear")">@(p.Direction == EntryDirection.Bullish ? "CE" : "PE")</span></td>
+                            <td>@p.EntryPremium.ToString("0.00")</td>
+                            <td>@p.CurrentPremium.ToString("0.00")</td>
+                            <td>@p.Quantity</td>
+                            <td class="@(p.UnrealizedPnl >= 0 ? "text-bull" : "text-bear")">@p.UnrealizedPnl.ToString("+0.00;-0.00")</td>
+                            <td class="@(p.UnrealizedPnlPct >= 0 ? "text-bull" : "text-bear")">@p.UnrealizedPnlPct.ToString("+0.0;-0.0")%</td>
+                            <td class="text-faint">@FormatHeld(p.EntryTime)</td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        </div>
+    }
+</div>
+
+@code {
+    static string FormatHeld(DateTimeOffset entryTime)
+    {
+        var held = DateTimeOffset.Now - entryTime;
+        return held.TotalMinutes >= 60 ? $"{held.TotalHours:0.0}h" : $"{held.TotalMinutes:0}m";
+    }
+
+    protected override void OnInitialized() => Demo.Updated += OnDemoUpdated;
+
+    void OnDemoUpdated() => InvokeAsync(StateHasChanged);
+
+    public void Dispose() => Demo.Updated -= OnDemoUpdated;
+}

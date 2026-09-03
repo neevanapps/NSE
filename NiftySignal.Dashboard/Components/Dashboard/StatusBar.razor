@@ -1,0 +1,95 @@
+@implements IDisposable
+@using Microsoft.EntityFrameworkCore
+@using NiftySignal.Domain.Entities
+@using NiftySignal.Persistence
+@using NiftySignal.Dashboard.Services
+@inject NiftySignalDbContext Db
+@inject DemoDataService Demo
+
+<div class="status-bar">
+    <div class="brand">
+        <span class="brand-dot"></span>
+        NiftySignal
+    </div>
+
+    <div class="status-item">
+        <span class="text-faint">Connection</span>
+        <span class="badge @ConnectionBadgeClass">@Demo.Connection</span>
+    </div>
+
+    <div class="status-item">
+        <span class="text-faint">Last update</span>
+        <span class="mono text-dim">@_secondsSinceTick s ago</span>
+    </div>
+
+    <div class="status-item">
+        <span class="badge badge-warn">Demo data &mdash; not yet connected to a live feed</span>
+    </div>
+
+    <div class="spacer"></div>
+
+    <div class="killswitch">
+        <span class="text-faint">New entries</span>
+        <button class="toggle @(_entriesEnabled ? "on" : "")" @onclick="ToggleKillSwitch" disabled="@_saving" title="Disables new trade entries only; ingestion keeps running">
+            <span class="knob"></span>
+        </button>
+        <span class="@(_entriesEnabled ? "text-bull" : "text-bear")" style="font-weight:600;">
+            @(_entriesEnabled ? "Enabled" : "DISABLED")
+        </span>
+    </div>
+</div>
+
+@code {
+    bool _entriesEnabled = true;
+    bool _saving;
+    Timer? _clockTimer;
+    int _secondsSinceTick;
+
+    string ConnectionBadgeClass => Demo.Connection switch
+    {
+        ConnectionStatus.Connected => "badge-bull",
+        ConnectionStatus.Reconnecting => "badge-warn",
+        _ => "badge-bear",
+    };
+
+    protected override async Task OnInitializedAsync()
+    {
+        var state = await Db.KillSwitchStates.FindAsync(KillSwitchState.SingletonId);
+        _entriesEnabled = state?.EntriesEnabled ?? true;
+
+        Demo.Updated += OnDemoUpdated;
+        _clockTimer = new Timer(_ => InvokeAsync(RecomputeClock), null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
+    }
+
+    void RecomputeClock()
+    {
+        _secondsSinceTick = (int)(DateTimeOffset.Now - Demo.LastTickAt).TotalSeconds;
+        StateHasChanged();
+    }
+
+    async Task ToggleKillSwitch()
+    {
+        _saving = true;
+        StateHasChanged();
+
+        var state = await Db.KillSwitchStates.FindAsync(KillSwitchState.SingletonId);
+        if (state is not null)
+        {
+            state.EntriesEnabled = !_entriesEnabled;
+            state.UpdatedAt = DateTimeOffset.UtcNow; // Npgsql only accepts UTC (Offset=0) for timestamptz
+            state.UpdatedBy = "Dashboard";
+            await Db.SaveChangesAsync();
+            _entriesEnabled = state.EntriesEnabled;
+        }
+
+        _saving = false;
+    }
+
+    void OnDemoUpdated() => InvokeAsync(StateHasChanged);
+
+    public void Dispose()
+    {
+        Demo.Updated -= OnDemoUpdated;
+        _clockTimer?.Dispose();
+    }
+}

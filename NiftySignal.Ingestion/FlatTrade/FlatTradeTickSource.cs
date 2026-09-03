@@ -145,7 +145,9 @@ public sealed class FlatTradeTickSource(
                     }
 
                     feedState.ApplyDelta(msg);
-                    if (feedState.ToTick(DateTimeOffset.Now) is { } tick)
+                    // UtcNow, not Now: Npgsql only accepts Offset=0 for timestamptz columns,
+                    // and this flows straight into a persisted Tick.ReceivedAt.
+                    if (feedState.ToTick(DateTimeOffset.UtcNow) is { } tick)
                     {
                         await writer.WriteAsync(tick, ct);
                     }

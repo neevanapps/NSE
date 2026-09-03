@@ -1,0 +1,35 @@
+.performance-panel {
+    grid-column: span 12;
+}
+
+.stat-row {
+    display: flex;
+    gap: 28px;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+}
+
+.stat {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.stat-value {
+    font-family: var(--font-mono);
+    font-size: 22px;
+    font-weight: 700;
+}
+
+.stat-label {
+    font-size: 11px;
+    color: var(--text-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.equity-chart {
+    height: 120px;
+    position: relative;
+    margin-bottom: 16px;
+}

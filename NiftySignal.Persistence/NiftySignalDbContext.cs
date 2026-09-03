@@ -17,6 +17,8 @@ public sealed class NiftySignalDbContext(DbContextOptions<NiftySignalDbContext> 
 
     public DbSet<DataGap> DataGaps => Set<DataGap>();
 
+    public DbSet<KillSwitchState> KillSwitchStates => Set<KillSwitchState>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         modelBuilder.ApplyConfigurationsFromAssembly(typeof(NiftySignalDbContext).Assembly);

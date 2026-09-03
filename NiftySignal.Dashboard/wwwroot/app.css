@@ -1,5 +1,175 @@
+:root {
+    --bg: #0a0e14;
+    --bg-elevated: #10151d;
+    --surface: #141b26;
+    --surface-hover: #1a2330;
+    --border: #232d3d;
+    --text: #e6eaf0;
+    --text-dim: #8a96a8;
+    --text-faint: #5b6576;
+    --accent: #38bdf8;
+    --bull: #22c55e;
+    --bull-dim: #14532d;
+    --bear: #f87171;
+    --bear-dim: #5b1a1a;
+    --warn: #f59e0b;
+    --neutral: #64748b;
+    --font-ui: "Inter", system-ui, -apple-system, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-ui);
+    font-size: 14px;
+}
+
 h1:focus {
     outline: none;
+}
+
+.panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.panel-title {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin: 0 0 12px 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.mono {
+    font-family: var(--font-mono);
+}
+
+.text-bull { color: var(--bull); }
+.text-bear { color: var(--bear); }
+.text-warn { color: var(--warn); }
+.text-dim { color: var(--text-dim); }
+.text-faint { color: var(--text-faint); }
+
+table.data-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+    table.data-table th {
+        text-align: right;
+        font-size: 11px;
+        font-weight: 600;
+        color: var(--text-faint);
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        padding: 6px 10px;
+        border-bottom: 1px solid var(--border);
+        white-space: nowrap;
+    }
+
+        table.data-table th:first-child {
+            text-align: left;
+        }
+
+    table.data-table td {
+        text-align: right;
+        padding: 7px 10px;
+        border-bottom: 1px solid rgba(255,255,255,0.03);
+        font-family: var(--font-mono);
+        white-space: nowrap;
+    }
+
+        table.data-table td:first-child {
+            text-align: left;
+            font-family: var(--font-ui);
+        }
+
+    table.data-table tbody tr:hover {
+        background: var(--surface-hover);
+    }
+
+.badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.badge-bull { background: var(--bull-dim); color: var(--bull); }
+.badge-bear { background: var(--bear-dim); color: var(--bear); }
+.badge-neutral { background: rgba(100,116,139,0.2); color: var(--neutral); }
+.badge-warn { background: rgba(245,158,11,0.15); color: var(--warn); }
+
+.toggle {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    width: 44px;
+    height: 24px;
+    border-radius: 999px;
+    background: var(--bear-dim);
+    border: 1px solid var(--border);
+    cursor: pointer;
+    transition: background 0.15s ease;
+    padding: 0;
+}
+
+    .toggle.on {
+        background: var(--bull-dim);
+    }
+
+    .toggle .knob {
+        position: absolute;
+        top: 2px;
+        left: 2px;
+        width: 18px;
+        height: 18px;
+        border-radius: 50%;
+        background: var(--bear);
+        transition: transform 0.15s ease, background 0.15s ease;
+    }
+
+    .toggle.on .knob {
+        transform: translateX(20px);
+        background: var(--bull);
+    }
+
+.scroll-x {
+    overflow-x: auto;
+}
+
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 4px;
 }
 
 .valid.modified:not([type=checkbox]) {
@@ -23,16 +193,3 @@ h1:focus {
     .blazor-error-boundary::after {
         content: "An error has occurred."
     }
-
-.darker-border-checkbox.form-check-input {
-    border-color: #929292;
-}
-
-.form-floating > .form-control-plaintext::placeholder, .form-floating > .form-control::placeholder {
-    color: var(--bs-secondary-color);
-    text-align: end;
-}
-
-.form-floating > .form-control-plaintext:focus::placeholder, .form-floating > .form-control:focus::placeholder {
-    text-align: start;
-}

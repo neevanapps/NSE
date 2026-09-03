@@ -1,0 +1,30 @@
+.chain-panel {
+    grid-column: span 12;
+}
+
+.oi-chart {
+    height: 200px;
+    position: relative;
+    margin-bottom: 16px;
+}
+
+.chain-table :deep(.atm-row) {
+    background: rgba(56,189,248,0.08);
+}
+
+    .chain-table :deep(.atm-row td:first-child) {
+        color: var(--accent);
+        font-weight: 700;
+    }
+
+.chain-panel .scroll-x {
+    max-height: 360px;
+    overflow-y: auto;
+}
+
+.chain-table :deep(thead th) {
+    position: sticky;
+    top: 0;
+    background: var(--surface);
+    z-index: 1;
+}

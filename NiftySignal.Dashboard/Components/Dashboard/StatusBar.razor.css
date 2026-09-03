@@ -1,0 +1,43 @@
+.status-bar {
+    display: flex;
+    align-items: center;
+    gap: 28px;
+    padding: 12px 20px;
+    background: var(--bg-elevated);
+    border-bottom: 1px solid var(--border);
+}
+
+.brand {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 800;
+    font-size: 16px;
+    letter-spacing: -0.02em;
+}
+
+.brand-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 8px var(--accent);
+}
+
+.status-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+}
+
+.spacer {
+    flex: 1;
+}
+
+.killswitch {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 13px;
+}
