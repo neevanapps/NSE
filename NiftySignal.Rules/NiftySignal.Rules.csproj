@@ -1,0 +1,9 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\NiftySignal.Domain\NiftySignal.Domain.csproj" />
+    <ProjectReference Include="..\NiftySignal.Features\NiftySignal.Features.csproj" />
+    <ProjectReference Include="..\NiftySignal.Scoring\NiftySignal.Scoring.csproj" />
+  </ItemGroup>
+
+</Project>

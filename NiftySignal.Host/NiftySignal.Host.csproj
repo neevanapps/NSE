@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+  <PropertyGroup>
+    <UserSecretsId>dotnet-NiftySignal.Host-38778e57-1840-41c0-9fd0-6c1b893ef386</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" />
+    <PackageReference Include="Serilog.Extensions.Hosting" />
+    <PackageReference Include="Serilog.Sinks.Console" />
+    <PackageReference Include="Serilog.Sinks.File" />
+    <PackageReference Include="Serilog.Settings.Configuration" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NiftySignal.Domain\NiftySignal.Domain.csproj" />
+    <ProjectReference Include="..\NiftySignal.Ingestion\NiftySignal.Ingestion.csproj" />
+    <ProjectReference Include="..\NiftySignal.Persistence\NiftySignal.Persistence.csproj" />
+    <ProjectReference Include="..\NiftySignal.Notifications\NiftySignal.Notifications.csproj" />
+    <ProjectReference Include="..\NiftySignal.Pricing\NiftySignal.Pricing.csproj" />
+    <ProjectReference Include="..\NiftySignal.Features\NiftySignal.Features.csproj" />
+    <ProjectReference Include="..\NiftySignal.Scoring\NiftySignal.Scoring.csproj" />
+    <ProjectReference Include="..\NiftySignal.Rules\NiftySignal.Rules.csproj" />
+    <ProjectReference Include="..\NiftySignal.Execution\NiftySignal.Execution.csproj" />
+  </ItemGroup>
+</Project>

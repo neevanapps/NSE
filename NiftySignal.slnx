@@ -1,0 +1,15 @@
+<Solution>
+  <Project Path="NiftySignal.Backtest/NiftySignal.Backtest.csproj" />
+  <Project Path="NiftySignal.Dashboard/NiftySignal.Dashboard.csproj" />
+  <Project Path="NiftySignal.Domain/NiftySignal.Domain.csproj" />
+  <Project Path="NiftySignal.Execution/NiftySignal.Execution.csproj" />
+  <Project Path="NiftySignal.Features/NiftySignal.Features.csproj" />
+  <Project Path="NiftySignal.Host/NiftySignal.Host.csproj" />
+  <Project Path="NiftySignal.Ingestion/NiftySignal.Ingestion.csproj" />
+  <Project Path="NiftySignal.Notifications/NiftySignal.Notifications.csproj" />
+  <Project Path="NiftySignal.Persistence/NiftySignal.Persistence.csproj" />
+  <Project Path="NiftySignal.Pricing/NiftySignal.Pricing.csproj" />
+  <Project Path="NiftySignal.Rules/NiftySignal.Rules.csproj" />
+  <Project Path="NiftySignal.Scoring/NiftySignal.Scoring.csproj" />
+  <Project Path="NiftySignal.Tests/NiftySignal.Tests.csproj" />
+</Solution>
