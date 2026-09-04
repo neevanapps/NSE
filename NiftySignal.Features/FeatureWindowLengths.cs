@@ -24,4 +24,7 @@ public static class FeatureWindowLengths
 
     /// <summary>Moderate.</summary>
     public static readonly TimeSpan FuturesBasis = TimeSpan.FromMinutes(30);
+
+    /// <summary>VIX ticks slowly (observed ~20-25s between updates, often with no price change) -- a short window would mostly read zero.</summary>
+    public static readonly TimeSpan VixChange = TimeSpan.FromMinutes(30);
 }

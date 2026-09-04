@@ -118,18 +118,52 @@ public class CompositeScoreCalculatorTests
     }
 
     [Fact]
-    public void Calculate_ComponentBreakdown_ContainsAllSixNamedComponents()
+    public void Calculate_ComponentBreakdown_ContainsAllSevenNamedComponents()
     {
         var result = CompositeScoreCalculator.Calculate(FullyWarmInputs, ScoreWeights.Default, ComputedAt);
 
         var names = result.Components.Select(c => c.Name).ToHashSet();
-        Assert.Equal(6, result.Components.Count);
+        Assert.Equal(7, result.Components.Count);
         Assert.Contains("OiBuildupNet", names);
         Assert.Contains("Pcr", names);
         Assert.Contains("FuturesBasis", names);
         Assert.Contains("IvSkew", names);
         Assert.Contains("PriceMomentum", names);
         Assert.Contains("DepthImbalance", names);
+        Assert.Contains("VixChange", names);
+    }
+
+    [Fact]
+    public void Calculate_StaysWarmedUp_WhenOnlyVixChangeZIsMissing()
+    {
+        // VixChangeZ is deliberately optional (2026-09-04) -- unlike the six required
+        // components, its absence must not block the composite score.
+        var inputs = FullyWarmInputs with { VixChangeZ = null };
+
+        var result = CompositeScoreCalculator.Calculate(inputs, ScoreWeights.Default, ComputedAt);
+
+        Assert.True(result.IsWarmedUp);
+        Assert.NotNull(result.Score);
+    }
+
+    [Fact]
+    public void Calculate_IncludesVixChangesWeightedContribution_WhenPresent()
+    {
+        var weights = ScoreWeights.Default;
+        var inputs = FullyWarmInputs with { VixChangeZ = 1.5 };
+
+        var result = CompositeScoreCalculator.Calculate(inputs, weights, ComputedAt, k: 1.0);
+
+        var expectedRaw = (weights.OiBuildupNet * FullyWarmInputs.OiBuildupNetZ!.Value)
+            + (weights.Pcr * FullyWarmInputs.PcrZ!.Value)
+            + (weights.FuturesBasis * FullyWarmInputs.FuturesBasisZ!.Value)
+            + (weights.IvSkew * FullyWarmInputs.IvSkewZ!.Value)
+            + (weights.PriceMomentum * FullyWarmInputs.PriceMomentumZ!.Value)
+            + (weights.DepthImbalance * FullyWarmInputs.DepthImbalanceZ!.Value)
+            + (weights.VixChange * 1.5);
+        var expectedScore = 100.0 * Math.Tanh(expectedRaw / 1.0);
+
+        Assert.Equal(expectedScore, result.Score!.Value, 1e-9);
     }
 
     [Theory]
@@ -142,16 +176,38 @@ public class CompositeScoreCalculatorTests
     }
 
     [Fact]
-    public void DefaultWeights_MatchThePlansSection6Table_AndSumToOne()
+    public void ComputeRaw_MatchesTheWeightedSumInsideCalculate()
     {
+        var raw = CompositeScoreCalculator.ComputeRaw(FullyWarmInputs, ScoreWeights.Default);
+        var viaCalculate = CompositeScoreCalculator.Calculate(FullyWarmInputs, ScoreWeights.Default, ComputedAt, k: 1.0);
+
+        Assert.NotNull(raw);
+        // 100*tanh(raw/1) == score at k=1, so raw is recoverable from the score for this check.
+        Assert.Equal(100.0 * Math.Tanh(raw!.Value), viaCalculate.Score!.Value, 1e-9);
+    }
+
+    [Fact]
+    public void ComputeRaw_ReturnsNull_WhenAnyComponentIsNotWarmedUp()
+    {
+        var raw = CompositeScoreCalculator.ComputeRaw(FullyWarmInputs with { PcrZ = null }, ScoreWeights.Default);
+
+        Assert.Null(raw);
+    }
+
+    [Fact]
+    public void DefaultWeights_AreThePlansSection6TableRescaledForVix_AndSumToOne()
+    {
+        // Plan section 6's 25/20/15/15/15/10, each x0.95, plus a conservative 0.05 for the
+        // new VixChange component (2026-09-04) -- see ScoreWeights.Default's own doc comment.
         var weights = ScoreWeights.Default;
 
-        Assert.Equal(0.25, weights.OiBuildupNet);
-        Assert.Equal(0.20, weights.Pcr);
-        Assert.Equal(0.15, weights.FuturesBasis);
-        Assert.Equal(0.15, weights.IvSkew);
-        Assert.Equal(0.15, weights.PriceMomentum);
-        Assert.Equal(0.10, weights.DepthImbalance);
+        Assert.Equal(0.2375, weights.OiBuildupNet, 1e-9);
+        Assert.Equal(0.19, weights.Pcr, 1e-9);
+        Assert.Equal(0.1425, weights.FuturesBasis, 1e-9);
+        Assert.Equal(0.1425, weights.IvSkew, 1e-9);
+        Assert.Equal(0.1425, weights.PriceMomentum, 1e-9);
+        Assert.Equal(0.095, weights.DepthImbalance, 1e-9);
+        Assert.Equal(0.05, weights.VixChange, 1e-9);
         Assert.Equal(1.0, weights.Total, 1e-9);
     }
 }

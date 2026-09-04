@@ -6,7 +6,20 @@ namespace NiftySignal.Dashboard.Services;
 
 public sealed record ScoreHistoryPoint(DateTimeOffset Timestamp, double Score);
 
-public sealed record ScoreComponentRow(string Name, double Weight, double ZScore, double WeightedContribution);
+/// <summary>
+/// One score component's weight/z-score/contribution plus its own warm-up status
+/// (2026-09-04, folded in from the former standalone Data Health panel -- see
+/// LiveDataService.BuildComponentRows) so ScorePanel doesn't need to correlate two
+/// separately-keyed lists by name.
+/// </summary>
+public sealed record ScoreComponentRow(
+    string Name,
+    double Weight,
+    double ZScore,
+    double WeightedContribution,
+    bool IsWarmedUp,
+    TimeSpan Window,
+    TimeSpan Remaining);
 
 public sealed record OptionChainRow(
     string TradingSymbol,
@@ -44,8 +57,6 @@ public sealed record ClosedTradeRow(
     DateTimeOffset ExitTime,
     decimal NetPnl,
     ExitReason ExitReason);
-
-public sealed record MetricWarmUpStatus(string Name, bool IsWarmedUp, TimeSpan Window, TimeSpan Remaining);
 
 /// <summary>
 /// The Live Quote panel's fast (1s) refresh -- deliberately a small subset of

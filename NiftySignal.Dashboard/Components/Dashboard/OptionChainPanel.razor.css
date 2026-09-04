@@ -2,12 +2,6 @@
     grid-column: span 12;
 }
 
-.oi-chart {
-    height: 200px;
-    position: relative;
-    margin-bottom: 16px;
-}
-
 /* Blazor CSS isolation's deep-descendant combinator is "::deep" (double colon, plain
    combinator) -- NOT ":deep(...)" (single colon, function syntax). The latter isn't a real
    CSS isolation feature; the compiler passes it through untouched into the compiled scoped

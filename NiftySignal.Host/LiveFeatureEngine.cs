@@ -25,11 +25,43 @@ readonly record struct InstrumentState(decimal LastPrice, long? OpenInterest, Ma
 ///   buildup/short-covering = bearish for the underlying) is the standard NSE option-chain
 ///   reading, not something the plan spells out numerically.
 /// - IvSkew uses the strike nearest +/-200 points from spot as "OTM put/call at a fixed
-///   strike offset" (plan 5.3's own wording, offset left unspecified).
-/// - DepthImbalance's "NTM strikes" (plan 5.3) = the 2 strikes nearest spot, nearest expiry.
+///   strike offset" (plan 5.3's own wording, offset left unspecified). Priced against spot,
+///   not the tracked future -- see <see cref="ComputeIvSkew"/>'s doc comment (2026-09-04 fix).
+/// - DepthImbalance's "NTM strikes" (plan 5.3) = the 2 strikes nearest spot, nearest
+///   expiry, combined into (bid-ask)/(bid+ask) -- normalized to [-1,+1] and centered at 0
+///   (not a raw bid/ask ratio, which can never be negative; fixed 2026-09-04).
 ///
-/// Not thread-safe on its own -- <see cref="OnTick"/> and <see cref="ComputeCadence"/> are
-/// called from different loops in the same worker and must be externally synchronized.
+/// Two more additions from real live data, 2026-09-04:
+/// - Within-cadence smoothing: <see cref="Sample"/> takes a point-in-time read of the five
+///   "noisy instantaneous" metrics (FuturesBasis, PriceMomentum, Pcr, DepthImbalance,
+///   IvSkew) every few seconds; ComputeCadence averages whatever samples landed since the
+///   last cadence tick instead of trusting a single instant right at the 15s boundary.
+///   OiBuildupNet is deliberately excluded -- it's a genuine interval delta (change since
+///   the last cadence), not a point read, so averaging sub-deltas would change what it
+///   measures rather than just denoise it; exchange-reported OI also updates far less often
+///   than LTP, so sub-sampling it would mostly average in a lot of true zeros.
+/// - Dynamic k: composite scoring used a hardcoded k, calibrated by eyeballing one trending
+///   session's data -- directionally unbiased (tanh is odd, so no k value favors bulls or
+///   bears) but not generalizable across volatility regimes. k is now the rolling stddev of
+///   the raw (pre-tanh) composite itself, via the same WelfordRollingWindow machinery
+///   already used to z-score the six inputs -- it shrinks on quiet days and grows on
+///   volatile ones instead of needing a human to re-tune it from a snapshot of one session.
+///
+/// A 7th, optional component, 2026-09-04: VixChange is India VIX's change over a 30-minute
+/// lookback (<see cref="ComputeVixChange"/>), negated -- VIX-vs-Nifty is the standard "fear
+/// gauge" inverse relationship (rising VIX = bearish, falling VIX = mildly bullish), so
+/// negating keeps the sign convention consistent with the other six (positive raw =
+/// bullish). Computed once per cadence tick only, not through <see cref="Sample"/>'s
+/// smoothing -- VIX itself ticks far slower than the other metrics' inputs (observed
+/// ~20-25s between updates, often with no price change at all), so 3s sub-sampling would
+/// mostly average in repeats of the same stale value. Unlike the other six, a missing or
+/// not-yet-warm VixChangeZ never blocks the composite score -- see
+/// CompositeScoreCalculator's VixComponentName handling and ScoreComponentInputs'
+/// VixChangeZ doc comment.
+///
+/// Not thread-safe on its own -- <see cref="OnTick"/>, <see cref="Sample"/>, and
+/// <see cref="ComputeCadence"/> are called from different loops in the same worker and must
+/// be externally synchronized.
 /// </summary>
 public sealed class LiveFeatureEngine
 {
@@ -38,9 +70,18 @@ public sealed class LiveFeatureEngine
     const double RiskFreeRate = 0.065;
     const decimal IvSkewStrikeOffset = 200m;
 
+    // Matches the longest of the six per-metric windows (Pcr/OiBuildupNet/FuturesBasis) so
+    // the dynamic-k window doesn't push composite warm-up out any further than the existing
+    // six already require.
+    static readonly TimeSpan CompositeRawWindowLength = TimeSpan.FromMinutes(30);
+
     readonly IReadOnlyList<Instrument> _instruments;
     readonly Instrument _spot;
     readonly Instrument _future;
+
+    /// <summary>Null when the day's instrument universe doesn't track VIX -- optional by design, see class doc comment.</summary>
+    readonly Instrument? _vix;
+
     readonly List<Instrument> _nearestExpiryOptions;
     readonly DateOnly _nearestExpiry;
 
@@ -53,14 +94,24 @@ public sealed class LiveFeatureEngine
     readonly WelfordRollingWindow _ivSkewWindow = new(FeatureWindowLengths.IvSkew);
     readonly WelfordRollingWindow _momentumWindow = new(FeatureWindowLengths.PriceMomentum);
     readonly WelfordRollingWindow _depthImbalanceWindow = new(FeatureWindowLengths.DepthImbalance);
+    readonly WelfordRollingWindow _compositeRawWindow = new(CompositeRawWindowLength);
+    readonly WelfordRollingWindow _vixWindow = new(FeatureWindowLengths.VixChange);
+
+    readonly RunningAverage _basisSamples = new();
+    readonly RunningAverage _momentumSamples = new();
+    readonly RunningAverage _pcrSamples = new();
+    readonly RunningAverage _depthImbalanceSamples = new();
+    readonly RunningAverage _ivSkewSamples = new();
 
     readonly Queue<(DateTimeOffset At, decimal FuturesPrice)> _momentumLookback = new();
+    readonly Queue<(DateTimeOffset At, decimal Vix)> _vixLookback = new();
 
     public LiveFeatureEngine(IReadOnlyList<Instrument> instruments)
     {
         _instruments = instruments;
         _spot = instruments.First(i => i.InstrumentType == InstrumentType.Index);
         _future = instruments.First(i => i.InstrumentType == InstrumentType.Future);
+        _vix = instruments.FirstOrDefault(i => i.InstrumentType == InstrumentType.Vix);
         _nearestExpiry = instruments
             .Where(i => i.InstrumentType == InstrumentType.Option && i.ExpiryDate is not null)
             .Select(i => i.ExpiryDate!.Value)
@@ -84,10 +135,10 @@ public sealed class LiveFeatureEngine
     /// several redeploys mid-session each cost ~30 minutes of re-warming).
     ///
     /// What this can't restore: <c>_previousCadence</c> (per-instrument OI/price from the
-    /// prior tick, needed for OiBuildupNet's own delta calc) and the momentum lookback
-    /// queue's raw futures-price history -- those reset to "no prior observation" on
-    /// restart regardless. That costs one cadence tick's OiBuildupNet reading (reported as
-    /// 0 instead of the true delta) and one tick where momentum falls back to 0 -- a single
+    /// prior tick, needed for OiBuildupNet's own delta calc) and the momentum/VIX lookback
+    /// queues' raw price history -- those reset to "no prior observation" on restart
+    /// regardless. That costs one cadence tick's OiBuildupNet reading (reported as 0 instead
+    /// of the true delta) and one tick where momentum/VixChange fall back to 0 -- a single
     /// slightly-wrong point inside a multi-minute window, not a warm-up reset.
     /// </summary>
     public void SeedHistory(IEnumerable<ScoreSnapshot> history)
@@ -123,6 +174,16 @@ public sealed class LiveFeatureEngine
             {
                 _depthImbalanceWindow.Add(snapshot.ComputedAt, depthImbalance);
             }
+
+            if (snapshot.CompositeScoreRaw is { } compositeRaw)
+            {
+                _compositeRawWindow.Add(snapshot.ComputedAt, compositeRaw);
+            }
+
+            if (snapshot.VixChangeRaw is { } vixChange)
+            {
+                _vixWindow.Add(snapshot.ComputedAt, vixChange);
+            }
         }
     }
 
@@ -156,13 +217,14 @@ public sealed class LiveFeatureEngine
     /// Live option-chain snapshot for strike selection, nearest-expiry + one side only (the
     /// side the entry direction calls for). Mid/bid/ask come from the top-of-book depth
     /// snapshot (null bid/ask if none arrived yet -- StrikeSelector already treats that as
-    /// a filter failure, not a crash). Delta/IV reuse the same futures-as-underlying
-    /// Black-Scholes convention as <see cref="ComputeIvSkew"/>.
+    /// a filter failure, not a crash). Delta/IV use spot as the underlying, not the tracked
+    /// future -- see <see cref="ComputeIvSkew"/>'s doc comment for why (2026-09-04 fix: NSE
+    /// only lists monthly futures, which don't match a weekly option's own expiry).
     /// </summary>
     public List<Execution.StrikeCandidate> BuildStrikeCandidates(OptionType side, DateTimeOffset now)
     {
         var candidates = new List<Execution.StrikeCandidate>();
-        if (!_latest.TryGetValue(_future.Token, out var future) || future.LastPrice <= 0)
+        if (!_latest.TryGetValue(_spot.Token, out var spot) || spot.LastPrice <= 0)
         {
             return candidates;
         }
@@ -184,10 +246,10 @@ public sealed class LiveFeatureEngine
             double? iv = null, delta = null;
             if (state.LastPrice > 0)
             {
-                iv = ImpliedVolatilitySolver.Solve(side, (double)mid, (double)future.LastPrice, (double)instrument.StrikePrice!.Value, t, RiskFreeRate);
+                iv = ImpliedVolatilitySolver.Solve(side, (double)mid, (double)spot.LastPrice, (double)instrument.StrikePrice!.Value, t, RiskFreeRate);
                 if (iv is { } ivValue)
                 {
-                    delta = BlackScholes.Calculate(side, (double)future.LastPrice, (double)instrument.StrikePrice.Value, t, RiskFreeRate, ivValue).Greeks.Delta;
+                    delta = BlackScholes.Calculate(side, (double)spot.LastPrice, (double)instrument.StrikePrice.Value, t, RiskFreeRate, ivValue).Greeks.Delta;
                 }
             }
 
@@ -207,6 +269,27 @@ public sealed class LiveFeatureEngine
         return candidates;
     }
 
+    /// <summary>
+    /// Point-in-time read of the five "noisy instantaneous" metrics, folded into a running
+    /// average that <see cref="ComputeCadence"/> consumes and resets. Meant to be called
+    /// every few seconds between cadence ticks (see class doc comment) -- a no-op if spot or
+    /// future haven't ticked yet, same guard as ComputeCadence itself.
+    /// </summary>
+    public void Sample(DateTimeOffset now)
+    {
+        if (!_latest.TryGetValue(_spot.Token, out var spot) || !_latest.TryGetValue(_future.Token, out var future)
+            || spot.LastPrice <= 0 || future.LastPrice <= 0)
+        {
+            return;
+        }
+
+        _basisSamples.Add((double)(future.LastPrice - spot.LastPrice));
+        _momentumSamples.Add(ComputeMomentum(now, future.LastPrice));
+        _pcrSamples.Add(ComputePcr());
+        _depthImbalanceSamples.Add(ComputeDepthImbalance(spot.LastPrice));
+        _ivSkewSamples.Add(ComputeIvSkew(spot.LastPrice, now));
+    }
+
     /// <summary>Null until the spot and future have at least one tick each.</summary>
     public ScoreSnapshot? ComputeCadence(DateTimeOffset now)
     {
@@ -216,31 +299,50 @@ public sealed class LiveFeatureEngine
             return null;
         }
 
-        var basisRaw = (double)(future.LastPrice - spot.LastPrice);
+        // One final sample right up to the cadence boundary, then consume the average of
+        // everything collected since the last cadence tick. Basis/momentum are guaranteed
+        // at least this one sample (spot/future are already confirmed present above, and
+        // Sample() uses the same _latest data synchronously) -- Average is never null for
+        // those two. Pcr/DepthImbalance/IvSkew can still legitimately be null (e.g. no depth
+        // snapshot has arrived yet), same as before this change.
+        Sample(now);
+
+        var basisRaw = _basisSamples.Average!.Value;
         _basisWindow.Add(now, basisRaw);
 
-        var momentumRaw = ComputeMomentum(now, future.LastPrice);
+        var momentumRaw = _momentumSamples.Average!.Value;
         _momentumWindow.Add(now, momentumRaw);
 
-        var pcrRaw = ComputePcr();
+        var pcrRaw = _pcrSamples.Average;
         if (pcrRaw is { } pcr)
         {
             _pcrWindow.Add(now, pcr);
         }
 
+        // Not smoothed like the other five -- see class doc comment. Compares state at this
+        // cadence tick to state at the last one (unchanged from before this change).
         var oiBuildupRaw = ComputeOiBuildupNet();
         _oiBuildupWindow.Add(now, oiBuildupRaw);
 
-        var depthImbalanceRaw = ComputeDepthImbalance(spot.LastPrice);
+        var depthImbalanceRaw = _depthImbalanceSamples.Average;
         if (depthImbalanceRaw is { } di)
         {
             _depthImbalanceWindow.Add(now, di);
         }
 
-        var ivSkewRaw = ComputeIvSkew(spot.LastPrice, future.LastPrice, now);
+        var ivSkewRaw = _ivSkewSamples.Average;
         if (ivSkewRaw is { } skew)
         {
             _ivSkewWindow.Add(now, skew);
+        }
+
+        ResetSamples();
+
+        // Not smoothed like the other five -- see class doc comment.
+        var vixChangeRaw = ComputeVixChange(now);
+        if (vixChangeRaw is { } vc)
+        {
+            _vixWindow.Add(now, vc);
         }
 
         var inputs = new ScoreComponentInputs(
@@ -249,9 +351,24 @@ public sealed class LiveFeatureEngine
             FuturesBasisZ: _basisWindow.ComputeZScore(basisRaw),
             IvSkewZ: ivSkewRaw is { } iv ? _ivSkewWindow.ComputeZScore(iv) : null,
             PriceMomentumZ: _momentumWindow.ComputeZScore(momentumRaw),
-            DepthImbalanceZ: depthImbalanceRaw is { } d ? _depthImbalanceWindow.ComputeZScore(d) : null);
+            DepthImbalanceZ: depthImbalanceRaw is { } d ? _depthImbalanceWindow.ComputeZScore(d) : null,
+            VixChangeZ: vixChangeRaw is { } vcr ? _vixWindow.ComputeZScore(vcr) : null);
 
-        var composite = CompositeScoreCalculator.Calculate(inputs, ScoreWeights.Default, now);
+        // Dynamic k -- see class doc comment. Falls back to CompositeScoreCalculator.DefaultK
+        // until the composite-raw window itself has 30 real minutes of history, same
+        // "unreliable until warmed up" rule WelfordRollingWindow already applies to StdDev.
+        var compositeRaw = CompositeScoreCalculator.ComputeRaw(inputs, ScoreWeights.Default);
+        var k = CompositeScoreCalculator.DefaultK;
+        if (compositeRaw is { } raw)
+        {
+            _compositeRawWindow.Add(now, raw);
+            if (_compositeRawWindow.IsWarmedUp && _compositeRawWindow.StdDev >= 1e-12)
+            {
+                k = _compositeRawWindow.StdDev;
+            }
+        }
+
+        var composite = CompositeScoreCalculator.Calculate(inputs, ScoreWeights.Default, now, k);
 
         _previousCadence = new Dictionary<string, InstrumentState>(_latest);
 
@@ -264,16 +381,28 @@ public sealed class LiveFeatureEngine
             IvSkewRaw = ivSkewRaw,
             PriceMomentumRaw = momentumRaw,
             DepthImbalanceRaw = depthImbalanceRaw,
+            VixChangeRaw = vixChangeRaw,
             OiBuildupNetZ = inputs.OiBuildupNetZ,
             PcrZ = inputs.PcrZ,
             FuturesBasisZ = inputs.FuturesBasisZ,
             IvSkewZ = inputs.IvSkewZ,
             PriceMomentumZ = inputs.PriceMomentumZ,
             DepthImbalanceZ = inputs.DepthImbalanceZ,
+            VixChangeZ = inputs.VixChangeZ,
+            CompositeScoreRaw = compositeRaw,
             CompositeScore = composite.Score,
             IsWarmedUp = composite.IsWarmedUp,
             WeightSetVersion = composite.WeightSetVersion,
         };
+    }
+
+    void ResetSamples()
+    {
+        _basisSamples.Reset();
+        _momentumSamples.Reset();
+        _pcrSamples.Reset();
+        _depthImbalanceSamples.Reset();
+        _ivSkewSamples.Reset();
     }
 
     double ComputeMomentum(DateTimeOffset now, decimal futuresPrice)
@@ -285,6 +414,29 @@ public sealed class LiveFeatureEngine
         }
 
         return (double)(futuresPrice - _momentumLookback.Peek().FuturesPrice);
+    }
+
+    /// <summary>
+    /// Null when the day's universe doesn't track VIX, or it hasn't ticked yet -- same
+    /// optional-by-design tolerance as Pcr/DepthImbalance/IvSkew's own null cases.
+    /// </summary>
+    double? ComputeVixChange(DateTimeOffset now)
+    {
+        if (_vix is null || !_latest.TryGetValue(_vix.Token, out var vix) || vix.LastPrice <= 0)
+        {
+            return null;
+        }
+
+        _vixLookback.Enqueue((now, vix.LastPrice));
+        while (_vixLookback.Count > 1 && now - _vixLookback.Peek().At > FeatureWindowLengths.VixChange)
+        {
+            _vixLookback.Dequeue();
+        }
+
+        // Negated -- see class doc comment: VIX-vs-Nifty is the standard inverse "fear
+        // gauge" relationship, so a rising VIX must contribute negatively (bearish) to stay
+        // consistent with the other six components' "positive raw = bullish" convention.
+        return -(double)(vix.LastPrice - _vixLookback.Peek().Vix);
     }
 
     double? ComputePcr()
@@ -367,10 +519,28 @@ public sealed class LiveFeatureEngine
             }
         }
 
-        return totalAsk > 0 ? (double)totalBid / totalAsk : null;
+        var totalDepth = totalBid + totalAsk;
+        // Normalized imbalance, not a raw bid/ask ratio: (bid-ask)/(bid+ask) ranges [-1,+1]
+        // and is centered at 0 (balanced). A plain ratio is a real bug fixed here
+        // (2026-09-04, live-caught) -- it can never be negative by construction (two
+        // non-negative quantities divided), yet both this feature's z-score and the
+        // option-chain grid display it as a signed bull/bear value. The window's z-score
+        // was still statistically valid against the old formula, just not measuring
+        // "which side has more pressure" the way "imbalance" implies.
+        return totalDepth > 0 ? (double)(totalBid - totalAsk) / totalDepth : null;
     }
 
-    double? ComputeIvSkew(decimal spotPrice, decimal futuresPrice, DateTimeOffset now)
+    /// <summary>
+    /// Underlying for the IV solve is spot, not the tracked future (2026-09-04 fix,
+    /// live-caught: "all put IVs read >10, call IVs around 5"). NSE only lists monthly
+    /// futures; the tracked future is the current-month contract, which doesn't match a
+    /// weekly option's own (much nearer) expiry. Using it overstated the underlying by its
+    /// full month-vs-week cost-of-carry gap (~127 points, observed 2026-09-04) -- enough to
+    /// price 23400 CE below its own intrinsic value (an impossible/arbitrage price), which
+    /// is what was driving the solver to a degenerate call IV and, symmetrically, an
+    /// inflated put IV. Same fix applied to BuildStrikeCandidates' Delta/IV.
+    /// </summary>
+    double? ComputeIvSkew(decimal spotPrice, DateTimeOffset now)
     {
         var targetCallStrike = spotPrice + IvSkewStrikeOffset;
         var targetPutStrike = spotPrice - IvSkewStrikeOffset;
@@ -396,8 +566,8 @@ public sealed class LiveFeatureEngine
         }
 
         var t = TimeToExpiry.YearsUntilExpiry(_nearestExpiry, now);
-        var callIv = ImpliedVolatilitySolver.Solve(OptionType.Call, (double)cm, (double)futuresPrice, (double)callOpt.StrikePrice!.Value, t, RiskFreeRate);
-        var putIv = ImpliedVolatilitySolver.Solve(OptionType.Put, (double)pm, (double)futuresPrice, (double)putOpt.StrikePrice!.Value, t, RiskFreeRate);
+        var callIv = ImpliedVolatilitySolver.Solve(OptionType.Call, (double)cm, (double)spotPrice, (double)callOpt.StrikePrice!.Value, t, RiskFreeRate);
+        var putIv = ImpliedVolatilitySolver.Solve(OptionType.Put, (double)pm, (double)spotPrice, (double)putOpt.StrikePrice!.Value, t, RiskFreeRate);
 
         return callIv is null || putIv is null ? null : putIv - callIv;
     }
@@ -411,5 +581,29 @@ public sealed class LiveFeatureEngine
         }
 
         return state.LastPrice > 0 ? state.LastPrice : null;
+    }
+
+    /// <summary>Accumulates a mean across null-tolerant samples (2026-09-04), reset each cadence tick -- <see cref="Add"/> silently skips null values instead of counting them.</summary>
+    sealed class RunningAverage
+    {
+        double _sum;
+        int _count;
+
+        public void Add(double? value)
+        {
+            if (value is { } v)
+            {
+                _sum += v;
+                _count++;
+            }
+        }
+
+        public double? Average => _count > 0 ? _sum / _count : null;
+
+        public void Reset()
+        {
+            _sum = 0;
+            _count = 0;
+        }
     }
 }

@@ -1,0 +1,8 @@
+.oi-profile-panel {
+    grid-column: span 5;
+}
+
+.oi-chart {
+    height: 340px;
+    position: relative;
+}

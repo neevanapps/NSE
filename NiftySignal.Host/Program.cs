@@ -54,6 +54,9 @@ try
     builder.Services.AddScoped<InstrumentUniverseResolver>();
     builder.Services.AddSingleton<LiveTradingEngine>();
 
+    builder.Services.Configure<DashboardPushOptions>(builder.Configuration.GetSection(DashboardPushOptions.SectionName));
+    builder.Services.AddSingleton<DashboardPushClient>();
+
     builder.Services.AddHostedService<MarketDataIngestionWorker>();
 
     var host = builder.Build();

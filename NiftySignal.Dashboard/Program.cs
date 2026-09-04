@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using NiftySignal.Dashboard.Components;
+using NiftySignal.Dashboard.Hubs;
 using NiftySignal.Dashboard.Services;
 using NiftySignal.Ingestion.FlatTrade;
 using NiftySignal.Persistence;
@@ -19,6 +20,10 @@ builder.Services.AddWindowsService(options => options.ServiceName = "NiftySignal
 // Add services to the container.
 builder.Services.AddRazorComponents()
     .AddInteractiveServerComponents();
+
+// Host -> Dashboard live push (see Hubs/MarketDataHub.cs). Browsers never connect to this
+// hub directly -- only Host does, as a SignalR client.
+builder.Services.AddSignalR();
 
 // Factory, not AddDbContext: Blazor Server runs sibling components' OnInitializedAsync
 // concurrently within one circuit, and they'd otherwise share one scoped DbContext
@@ -49,5 +54,6 @@ app.UseAntiforgery();
 app.MapStaticAssets();
 app.MapRazorComponents<App>()
     .AddInteractiveServerRenderMode();
+app.MapHub<MarketDataHub>("/hubs/market-data");
 
 app.Run();

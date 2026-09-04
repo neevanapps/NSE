@@ -7,8 +7,8 @@ namespace NiftySignal.Ingestion.FlatTrade;
 
 /// <summary>
 /// The daily 08:45 job (plan section 3.1): ATM +/- 10 strikes for the nearest and next
-/// weekly expiry, plus the underlying spot index and current-month future -- ~84 option
-/// instruments + 2 underlying. Built around a live-verified discovery (2026-09-04) that
+/// weekly expiry, plus the underlying spot index, current-month future, and India VIX --
+/// ~84 option instruments + 3 underlying. Built around a live-verified discovery (2026-09-04) that
 /// simplifies the plan's original design: FlatTrade's GetOptionChain endpoint resolves
 /// strikes around a reference price server-side, so this class doesn't need to compute
 /// ATM from the raw instrument master itself -- it only uses the master
@@ -22,6 +22,9 @@ public sealed class InstrumentUniverseResolver(
 {
     /// <summary>NSE:26000, "Nifty 50" -- confirmed live 2026-09-04 via FlatTrade's NSE_Equity.csv scrip master segment.</summary>
     public const string NiftySpotToken = "26000";
+
+    /// <summary>NSE:26017, "INDIAVIX" -- same scrip master segment as <see cref="NiftySpotToken"/>, confirmed live 2026-09-04.</summary>
+    public const string IndiaVixToken = "26017";
 
     const string Underlying = "NIFTY";
     const int StrikeCountEachSide = 10;
@@ -80,6 +83,20 @@ public sealed class InstrumentUniverseResolver(
                 Underlying = Underlying,
                 LotSize = nearestFuture.LotSize,
                 TickSize = nearestFuture.TickSize,
+                AsOfDate = asOfDate,
+            },
+            new()
+            {
+                Token = IndiaVixToken,
+                Exchange = Exchange.Nse,
+                TradingSymbol = "India VIX",
+                InstrumentType = InstrumentType.Vix,
+                Underlying = Underlying,
+                LotSize = 1,
+                // Not in the scrip master CSV; India VIX quotes to 2 decimals on NSE's
+                // display, same "starting point, re-confirm if it looks mis-rounded"
+                // status as the F&O DefaultTickSize in FlatTradeInstrumentMasterProvider.
+                TickSize = 0.01m,
                 AsOfDate = asOfDate,
             },
         };

@@ -1,3 +1,4 @@
+using System.Text;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using NiftySignal.Domain.Abstractions;
@@ -21,6 +22,7 @@ public sealed class MarketDataIngestionWorker(
     IOptions<FlatTradeOptions> flatTradeOptions,
     ITelegramNotifier telegram,
     LiveTradingEngine tradingEngine,
+    DashboardPushClient dashboardPush,
     ILogger<MarketDataIngestionWorker> logger) : BackgroundService
 {
     static readonly TimeSpan IstOffset = TimeSpan.FromHours(5.5);
@@ -29,6 +31,15 @@ public sealed class MarketDataIngestionWorker(
 
     // Plan section 6: "Cadence: every 15 seconds."
     static readonly TimeSpan ScoreCadence = TimeSpan.FromSeconds(15);
+
+    // Within-cadence smoothing (2026-09-04, see LiveFeatureEngine's class doc comment): 5
+    // samples per 15s cadence window, folded into a running average instead of trusting a
+    // single instantaneous read right at the cadence boundary.
+    static readonly TimeSpan SampleInterval = TimeSpan.FromSeconds(3);
+
+    // Not in plan section 12's original send-on list (2026-09-04, user-requested) -- not
+    // clock-aligned to :00/:30, same as every other periodic loop in this worker.
+    static readonly TimeSpan PaperTradeSummaryInterval = TimeSpan.FromMinutes(30);
 
     // SemaphoreSlim, not a plain lock: the cadence loop needs to await DB calls (score
     // persistence, then the trading engine's own DB-backed entry/exit evaluation) while
@@ -61,6 +72,7 @@ public sealed class MarketDataIngestionWorker(
 
         _engine = new LiveFeatureEngine(instruments);
         await SeedEngineHistoryAsync(_engine, asOfDate, stoppingToken);
+        await dashboardPush.StartAsync(stoppingToken);
 
         logger.LogInformation("Starting FlatTrade feed with {Count} subscriptions for {AsOfDate}", subscriptions.Count, asOfDate);
         await telegram.SendAsync(
@@ -75,10 +87,14 @@ public sealed class MarketDataIngestionWorker(
             flatTradeOptions.Value, session.ClientId, session.Token, subscriptions, gapRecorder, tickSourceLogger);
 
         var cadenceLoop = RunScoreCadenceLoopAsync(stoppingToken);
+        var sampleLoop = RunSampleLoopAsync(stoppingToken);
         var pendingSubscriptionLoop = RunPendingSubscriptionLoopAsync(tickSource, asOfDate, stoppingToken);
+        var paperTradeSummaryLoop = RunPaperTradeSummaryLoopAsync(asOfDate, stoppingToken);
         await RunTickLoopAsync(tickSource, stoppingToken);
         await cadenceLoop;
+        await sampleLoop;
         await pendingSubscriptionLoop;
+        await paperTradeSummaryLoop;
     }
 
     async Task RunTickLoopAsync(FlatTradeTickSource tickSource, CancellationToken stoppingToken)
@@ -97,6 +113,8 @@ public sealed class MarketDataIngestionWorker(
             {
                 _engineSync.Release();
             }
+
+            await dashboardPush.PushTickAsync(tick, stoppingToken);
 
             buffer.Add(tick);
             if (buffer.Count >= FlushBatchSize || DateTimeOffset.UtcNow - lastFlush >= FlushInterval)
@@ -129,6 +147,30 @@ public sealed class MarketDataIngestionWorker(
                         await PersistSnapshotAsync(snapshot, stoppingToken);
                         await tradingEngine.EvaluateCadenceAsync(snapshot, _engine, stoppingToken);
                     }
+                }
+                finally
+                {
+                    _engineSync.Release();
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    /// <summary>Feeds LiveFeatureEngine.Sample every few seconds so ComputeCadence has more than one instant to average over -- see LiveFeatureEngine's class doc comment.</summary>
+    async Task RunSampleLoopAsync(CancellationToken stoppingToken)
+    {
+        using var timer = new PeriodicTimer(SampleInterval);
+        try
+        {
+            while (await timer.WaitForNextTickAsync(stoppingToken))
+            {
+                await _engineSync.WaitAsync(stoppingToken);
+                try
+                {
+                    _engine!.Sample(DateTimeOffset.UtcNow);
                 }
                 finally
                 {
@@ -174,6 +216,74 @@ public sealed class MarketDataIngestionWorker(
         catch (OperationCanceledException)
         {
         }
+    }
+
+    /// <summary>Not in plan section 12's original list (2026-09-04, user-requested) -- open positions + today's closed-trade stats, sent every 30 minutes regardless of whether anything changed (a quiet "0 trades so far" is itself useful confirmation the pipeline is alive).</summary>
+    async Task RunPaperTradeSummaryLoopAsync(DateOnly asOfDate, CancellationToken stoppingToken)
+    {
+        using var timer = new PeriodicTimer(PaperTradeSummaryInterval);
+        try
+        {
+            while (await timer.WaitForNextTickAsync(stoppingToken))
+            {
+                await SendPaperTradeSummaryAsync(asOfDate, stoppingToken);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+
+    async Task SendPaperTradeSummaryAsync(DateOnly asOfDate, CancellationToken ct)
+    {
+        // Same UTC-conversion rule as SeedEngineHistoryAsync's todayIstMidnightUtc -- Npgsql
+        // only accepts Offset=0 DateTimeOffset values for timestamptz parameters.
+        var todayIstMidnightUtc = new DateTimeOffset(asOfDate.ToDateTime(TimeOnly.MinValue), IstOffset).ToUniversalTime();
+
+        await using var scope = scopeFactory.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
+
+        var open = await db.PaperTrades.Where(t => t.ExitTime == null).ToListAsync(ct);
+        var closedToday = await db.PaperTrades
+            .Where(t => t.ExitTime != null && t.ExitTime >= todayIstMidnightUtc)
+            .OrderByDescending(t => t.ExitTime)
+            .ToListAsync(ct);
+
+        var message = BuildPaperTradeSummaryMessage(open, closedToday);
+        await telegram.SendAsync(NotificationCategory.PaperTradeSummary, message, ct);
+    }
+
+    static string BuildPaperTradeSummaryMessage(List<PaperTrade> open, List<PaperTrade> closedToday)
+    {
+        var wins = closedToday.Count(t => t.NetPnl > 0);
+        var netPnl = closedToday.Sum(t => t.NetPnl ?? 0);
+        var grossWin = closedToday.Where(t => t.NetPnl > 0).Sum(t => t.NetPnl ?? 0);
+        var grossLoss = Math.Abs(closedToday.Where(t => t.NetPnl < 0).Sum(t => t.NetPnl ?? 0));
+        var winRate = closedToday.Count == 0 ? 0 : 100.0 * wins / closedToday.Count;
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"NiftySignal paper trade summary ({DateTimeOffset.UtcNow.ToOffset(IstOffset):HH:mm} IST)");
+        sb.AppendLine($"Open positions: {open.Count}");
+        sb.AppendLine(closedToday.Count == 0
+            ? "Closed today: 0"
+            : $"Closed today: {closedToday.Count} ({wins}W/{closedToday.Count - wins}L, {winRate:0}% win rate)");
+        sb.AppendLine($"Net P&L: {netPnl:+0.00;-0.00}");
+        if (grossLoss > 0)
+        {
+            sb.AppendLine($"Profit factor: {(double)(grossWin / grossLoss):0.00}");
+        }
+
+        if (closedToday.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine("Recent closes:");
+            foreach (var t in closedToday.Take(5))
+            {
+                sb.AppendLine($"- {t.TradingSymbol} ({t.Direction}): {t.NetPnl:+0.00;-0.00} ({t.ExitReason})");
+            }
+        }
+
+        return sb.ToString().TrimEnd();
     }
 
     async Task PersistSnapshotAsync(ScoreSnapshot snapshot, CancellationToken ct)

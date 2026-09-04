@@ -39,11 +39,28 @@
 
 .component-row {
     display: grid;
-    grid-template-columns: 120px 1fr 60px 70px;
+    grid-template-columns: 10px 110px 1fr 60px 70px;
     align-items: center;
     gap: 10px;
     font-size: 12px;
 }
+
+.health-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+    .health-dot.ok {
+        background: var(--bull);
+        box-shadow: 0 0 6px var(--bull);
+    }
+
+    .health-dot.pending {
+        background: var(--warn);
+        box-shadow: 0 0 6px var(--warn);
+    }
 
 .component-name {
     white-space: nowrap;

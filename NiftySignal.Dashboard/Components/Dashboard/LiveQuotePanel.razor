@@ -22,6 +22,10 @@
                     <span class="text-faint">Future</span>
                     <span class="mono quote-value">@FormatPriceWithChange(Live.FutureLtp, Live.FutureChange)</span>
                 </div>
+                <div class="quote-stat">
+                    <span class="text-faint">VIX</span>
+                    <span class="mono quote-value">@FormatPriceWithChange(Live.VixLtp, Live.VixChange)</span>
+                </div>
             </div>
 
             <div class="quote-spacer"></div>
@@ -180,7 +184,8 @@
         });
     }
 
-    // Fast path (1s, via Live.QuoteUpdated): the actual quote values this panel exists to show.
+    // Fast path (push, via Live.QuoteUpdated -- fires the instant Host forwards a tick):
+    // the actual quote values this panel exists to show.
     void OnQuoteUpdated() => InvokeAsync(StateHasChanged);
 
     public void Dispose()

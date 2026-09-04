@@ -20,12 +20,24 @@ public sealed class ScoreSnapshot
     public double? PriceMomentumRaw { get; set; }
     public double? DepthImbalanceRaw { get; set; }
 
+    /// <summary>VIX change over its lookback window, negated (rising VIX = bearish) -- see LiveFeatureEngine.ComputeVixChange. Optional: never blocks the composite (see CompositeScoreCalculator).</summary>
+    public double? VixChangeRaw { get; set; }
+
     public double? OiBuildupNetZ { get; set; }
     public double? PcrZ { get; set; }
     public double? FuturesBasisZ { get; set; }
     public double? IvSkewZ { get; set; }
     public double? PriceMomentumZ { get; set; }
     public double? DepthImbalanceZ { get; set; }
+    public double? VixChangeZ { get; set; }
+
+    /// <summary>
+    /// The pre-tanh weighted z-sum (2026-09-04) -- persisted so the dynamic-k rolling window
+    /// (see LiveFeatureEngine) can be replayed on restart via SeedHistory, same as the six
+    /// per-metric raw values already are. Without this, k would silently reset to
+    /// CompositeScoreCalculator.DefaultK for 30 minutes after every service restart.
+    /// </summary>
+    public double? CompositeScoreRaw { get; set; }
 
     public double? CompositeScore { get; set; }
 
