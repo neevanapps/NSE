@@ -2,11 +2,11 @@
 @using NiftySignal.Dashboard.Services
 @using NiftySignal.Domain.Enums
 @using NiftySignal.Rules
-@inject DemoDataService Demo
+@inject LiveDataService Live
 @inject IJSRuntime JS
 
 <div class="panel performance-panel">
-    <div class="panel-title">Performance (paper trades, last 24h demo)</div>
+    <div class="panel-title">Performance (paper trades, last 24h)</div>
 
     <div class="stat-row">
         <div class="stat">
@@ -30,7 +30,7 @@
             <span class="stat-label">Avg loss</span>
         </div>
         <div class="stat">
-            <span class="stat-value text-dim">@Demo.ClosedTrades.Count</span>
+            <span class="stat-value text-dim">@Live.ClosedTrades.Count</span>
             <span class="stat-label">Trades</span>
         </div>
     </div>
@@ -52,7 +52,7 @@
                 </tr>
             </thead>
             <tbody>
-                @foreach (var t in Demo.ClosedTrades.OrderByDescending(t => t.ExitTime).Take(10))
+                @foreach (var t in Live.ClosedTrades.OrderByDescending(t => t.ExitTime).Take(10))
                 {
                     <tr>
                         <td>@t.TradingSymbol</td>
@@ -71,8 +71,8 @@
 @code {
     IJSObjectReference? _module;
 
-    double WinRate => Demo.ClosedTrades.Count == 0 ? 0 : 100.0 * Demo.ClosedTrades.Count(t => t.NetPnl > 0) / Demo.ClosedTrades.Count;
-    decimal TotalPnl => Demo.ClosedTrades.Sum(t => t.NetPnl);
+    double WinRate => Live.ClosedTrades.Count == 0 ? 0 : 100.0 * Live.ClosedTrades.Count(t => t.NetPnl > 0) / Live.ClosedTrades.Count;
+    decimal TotalPnl => Live.ClosedTrades.Sum(t => t.NetPnl);
     decimal AvgWin => AvgOf(t => t.NetPnl > 0);
     decimal AvgLoss => AvgOf(t => t.NetPnl < 0);
 
@@ -80,27 +80,27 @@
     {
         get
         {
-            var grossWin = Demo.ClosedTrades.Where(t => t.NetPnl > 0).Sum(t => t.NetPnl);
-            var grossLoss = Math.Abs(Demo.ClosedTrades.Where(t => t.NetPnl < 0).Sum(t => t.NetPnl));
+            var grossWin = Live.ClosedTrades.Where(t => t.NetPnl > 0).Sum(t => t.NetPnl);
+            var grossLoss = Math.Abs(Live.ClosedTrades.Where(t => t.NetPnl < 0).Sum(t => t.NetPnl));
             return grossLoss == 0 ? 0 : (double)(grossWin / grossLoss);
         }
     }
 
     decimal AvgOf(Func<ClosedTradeRow, bool> predicate)
     {
-        var trades = Demo.ClosedTrades.Where(predicate).ToList();
+        var trades = Live.ClosedTrades.Where(predicate).ToList();
         return trades.Count == 0 ? 0 : trades.Average(t => t.NetPnl);
     }
 
-    // Trade history doesn't change on the DemoDataService timer, so the chart is rendered
-    // once on first render and never updated -- no subscription to Demo.Updated needed here.
+    // Trade history doesn't change on the LiveDataService timer, so the chart is rendered
+    // once on first render and never updated -- no subscription to Live.Updated needed here.
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
         if (firstRender)
         {
             _module = await JS.InvokeAsync<IJSObjectReference>("import", "./js/charts.js");
 
-            var ordered = Demo.ClosedTrades.OrderBy(t => t.ExitTime).ToList();
+            var ordered = Live.ClosedTrades.OrderBy(t => t.ExitTime).ToList();
             var labels = ordered.Select(t => t.ExitTime.ToString("HH:mm")).ToArray();
             decimal running = 0;
             var equity = ordered.Select(t => (double)(running += t.NetPnl)).ToArray();

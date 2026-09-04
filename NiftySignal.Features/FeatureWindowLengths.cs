@@ -1,9 +1,9 @@
 namespace NiftySignal.Features;
 
 /// <summary>
-/// Per-metric rolling-window lengths, exactly as specified in plan section 5.4 -- named
-/// here so the scoring engine (Phase 4) references these constants instead of scattering
-/// magic durations across the codebase.
+/// Per-metric rolling-window lengths -- originally plan section 5.4's starting values,
+/// tuned from there as live behavior warrants (2026-09-04: IvSkew shortened from 60 to 15
+/// minutes so it warms up in the same session it's tested in, not the next day).
 /// </summary>
 public static class FeatureWindowLengths
 {
@@ -20,7 +20,7 @@ public static class FeatureWindowLengths
     public static readonly TimeSpan OiBuildupNet = TimeSpan.FromMinutes(30);
 
     /// <summary>Slow structural signal.</summary>
-    public static readonly TimeSpan IvSkew = TimeSpan.FromMinutes(60);
+    public static readonly TimeSpan IvSkew = TimeSpan.FromMinutes(15);
 
     /// <summary>Moderate.</summary>
     public static readonly TimeSpan FuturesBasis = TimeSpan.FromMinutes(30);

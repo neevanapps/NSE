@@ -2,15 +2,15 @@
 @using NiftySignal.Dashboard.Services
 @using NiftySignal.Domain.Enums
 @using NiftySignal.Rules
-@inject DemoDataService Demo
+@inject LiveDataService Live
 
 <div class="panel positions-panel">
     <div class="panel-title">
         Open Paper Positions
-        <span class="mono text-dim">@Demo.Positions.Count / 3 max</span>
+        <span class="mono text-dim">@Live.Positions.Count / 3 max</span>
     </div>
 
-    @if (Demo.Positions.Count == 0)
+    @if (Live.Positions.Count == 0)
     {
         <div class="text-faint" style="font-size:13px;">No open positions.</div>
     }
@@ -31,7 +31,7 @@
                     </tr>
                 </thead>
                 <tbody>
-                    @foreach (var p in Demo.Positions)
+                    @foreach (var p in Live.Positions)
                     {
                         <tr>
                             <td>@p.TradingSymbol @if (p.HasPartiallyBooked) { <span class="badge badge-neutral" style="margin-left:6px;">partial</span> }</td>
@@ -57,9 +57,9 @@
         return held.TotalMinutes >= 60 ? $"{held.TotalHours:0.0}h" : $"{held.TotalMinutes:0}m";
     }
 
-    protected override void OnInitialized() => Demo.Updated += OnDemoUpdated;
+    protected override void OnInitialized() => Live.Updated += OnDemoUpdated;
 
     void OnDemoUpdated() => InvokeAsync(StateHasChanged);
 
-    public void Dispose() => Demo.Updated -= OnDemoUpdated;
+    public void Dispose() => Live.Updated -= OnDemoUpdated;
 }

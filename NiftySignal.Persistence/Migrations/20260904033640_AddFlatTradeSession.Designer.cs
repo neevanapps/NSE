@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using NiftySignal.Persistence;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace NiftySignal.Persistence.Migrations
 {
     [DbContext(typeof(NiftySignalDbContext))]
-    partial class NiftySignalDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260904033640_AddFlatTradeSession")]
+    partial class AddFlatTradeSession
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -107,9 +110,6 @@ namespace NiftySignal.Persistence.Migrations
                     b.Property<decimal?>("StrikePrice")
                         .HasPrecision(18, 4)
                         .HasColumnType("numeric(18,4)");
-
-                    b.Property<bool>("Subscribed")
-                        .HasColumnType("boolean");
 
                     b.Property<decimal>("TickSize")
                         .HasPrecision(18, 4)
@@ -250,71 +250,6 @@ namespace NiftySignal.Persistence.Migrations
                     b.HasIndex("ExitTime");
 
                     b.ToTable("paper_trades", (string)null);
-                });
-
-            modelBuilder.Entity("NiftySignal.Domain.Entities.ScoreSnapshot", b =>
-                {
-                    b.Property<long>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("bigint");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
-
-                    b.Property<double?>("CompositeScore")
-                        .HasColumnType("double precision");
-
-                    b.Property<DateTimeOffset>("ComputedAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<double?>("DepthImbalanceRaw")
-                        .HasColumnType("double precision");
-
-                    b.Property<double?>("DepthImbalanceZ")
-                        .HasColumnType("double precision");
-
-                    b.Property<double?>("FuturesBasisRaw")
-                        .HasColumnType("double precision");
-
-                    b.Property<double?>("FuturesBasisZ")
-                        .HasColumnType("double precision");
-
-                    b.Property<bool>("IsWarmedUp")
-                        .HasColumnType("boolean");
-
-                    b.Property<double?>("IvSkewRaw")
-                        .HasColumnType("double precision");
-
-                    b.Property<double?>("IvSkewZ")
-                        .HasColumnType("double precision");
-
-                    b.Property<double?>("OiBuildupNetRaw")
-                        .HasColumnType("double precision");
-
-                    b.Property<double?>("OiBuildupNetZ")
-                        .HasColumnType("double precision");
-
-                    b.Property<double?>("PcrRaw")
-                        .HasColumnType("double precision");
-
-                    b.Property<double?>("PcrZ")
-                        .HasColumnType("double precision");
-
-                    b.Property<double?>("PriceMomentumRaw")
-                        .HasColumnType("double precision");
-
-                    b.Property<double?>("PriceMomentumZ")
-                        .HasColumnType("double precision");
-
-                    b.Property<string>("WeightSetVersion")
-                        .IsRequired()
-                        .HasMaxLength(100)
-                        .HasColumnType("character varying(100)");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("ComputedAt");
-
-                    b.ToTable("score_snapshots", (string)null);
                 });
 
             modelBuilder.Entity("NiftySignal.Domain.Entities.Tick", b =>

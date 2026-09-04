@@ -21,6 +21,10 @@ public sealed class NiftySignalDbContext(DbContextOptions<NiftySignalDbContext> 
 
     public DbSet<PaperTrade> PaperTrades => Set<PaperTrade>();
 
+    public DbSet<FlatTradeSession> FlatTradeSessions => Set<FlatTradeSession>();
+
+    public DbSet<ScoreSnapshot> ScoreSnapshots => Set<ScoreSnapshot>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         modelBuilder.ApplyConfigurationsFromAssembly(typeof(NiftySignalDbContext).Assembly);

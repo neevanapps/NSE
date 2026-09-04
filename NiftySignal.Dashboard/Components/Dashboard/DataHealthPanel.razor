@@ -1,12 +1,12 @@
 @implements IDisposable
 @using NiftySignal.Dashboard.Services
-@inject DemoDataService Demo
+@inject LiveDataService Live
 
 <div class="panel health-panel">
     <div class="panel-title">Data Health</div>
 
     <div class="health-list">
-        @foreach (var m in Demo.WarmUpStatuses)
+        @foreach (var m in Live.WarmUpStatuses)
         {
             <div class="health-row">
                 <span class="health-dot @(m.IsWarmedUp ? "ok" : "pending")"></span>
@@ -33,9 +33,9 @@
         ? $"{t.TotalHours:0.#}h"
         : $"{t.TotalMinutes:0}m";
 
-    protected override void OnInitialized() => Demo.Updated += OnDemoUpdated;
+    protected override void OnInitialized() => Live.Updated += OnDemoUpdated;
 
     void OnDemoUpdated() => InvokeAsync(StateHasChanged);
 
-    public void Dispose() => Demo.Updated -= OnDemoUpdated;
+    public void Dispose() => Live.Updated -= OnDemoUpdated;
 }

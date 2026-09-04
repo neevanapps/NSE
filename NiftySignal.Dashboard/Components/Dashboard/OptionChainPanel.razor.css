@@ -8,11 +8,18 @@
     margin-bottom: 16px;
 }
 
-.chain-table :deep(.atm-row) {
+/* Blazor CSS isolation's deep-descendant combinator is "::deep" (double colon, plain
+   combinator) -- NOT ":deep(...)" (single colon, function syntax). The latter isn't a real
+   CSS isolation feature; the compiler passes it through untouched into the compiled scoped
+   stylesheet, where the browser can't parse it as a selector at all and silently drops the
+   whole rule. Both rules below were dead because of this until 2026-09-04 (verified live:
+   getComputedStyle on a header cell read position:"static", and ATM-row highlighting never
+   applied either). */
+.chain-table ::deep .atm-row {
     background: rgba(56,189,248,0.08);
 }
 
-    .chain-table :deep(.atm-row td:first-child) {
+    .chain-table ::deep .atm-row td:first-child {
         color: var(--accent);
         font-weight: 700;
     }
@@ -22,7 +29,7 @@
     overflow-y: auto;
 }
 
-.chain-table :deep(thead th) {
+.chain-table ::deep thead th {
     position: sticky;
     top: 0;
     background: var(--surface);

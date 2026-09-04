@@ -1,9 +1,18 @@
 using Microsoft.EntityFrameworkCore;
+using NiftySignal.Domain.Abstractions;
 using NiftySignal.Domain.Configuration;
 using NiftySignal.Host;
+using NiftySignal.Ingestion.FlatTrade;
 using NiftySignal.Notifications;
 using NiftySignal.Persistence;
 using Serilog;
+
+// Windows Services start with their working directory at C:\Windows\System32, not the
+// exe's own folder -- without this, the relative "logs/niftysignal-.log" path in
+// appsettings.json (and appsettings.Local.json's relative connection-string-adjacent
+// paths, if any are ever added) silently lands in System32 instead. Live-caught 2026-09-04
+// after installing this as a real Windows Service for the first time.
+Directory.SetCurrentDirectory(AppContext.BaseDirectory);
 
 Log.Logger = new LoggerConfiguration()
     .MinimumLevel.Information()
@@ -37,7 +46,15 @@ try
     builder.Services.AddSingleton<ITelegramNotifier>(sp =>
         new RateLimitedTelegramNotifier(sp.GetRequiredService<TelegramNotifier>(), sp.GetRequiredService<TimeProvider>()));
 
-    builder.Services.AddHostedService<Worker>();
+    builder.Services.Configure<FlatTradeOptions>(builder.Configuration.GetSection(FlatTradeOptions.SectionName));
+    builder.Services.AddHttpClient<FlatTradeAuthClient>();
+    builder.Services.AddHttpClient<FlatTradeInstrumentMasterProvider>();
+    builder.Services.AddScoped<IInstrumentMasterProvider>(sp => sp.GetRequiredService<FlatTradeInstrumentMasterProvider>());
+    builder.Services.AddScoped<IDataGapRecorder, EfDataGapRecorder>();
+    builder.Services.AddScoped<InstrumentUniverseResolver>();
+    builder.Services.AddSingleton<LiveTradingEngine>();
+
+    builder.Services.AddHostedService<MarketDataIngestionWorker>();
 
     var host = builder.Build();
 

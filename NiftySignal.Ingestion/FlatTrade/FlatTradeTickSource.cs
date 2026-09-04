@@ -32,6 +32,18 @@ public sealed class FlatTradeTickSource(
     IDataGapRecorder dataGapRecorder,
     ILogger<FlatTradeTickSource> logger) : ITickSource
 {
+    // Additions requested live, after the session's already connected (e.g. a dashboard
+    // user watching a strike outside the originally-resolved ATM band). Kept separately
+    // from the fixed `subscriptions` list (rather than mutating it) because it also has to
+    // survive a reconnect -- SubscribeAllAsync replays both lists on every (re)connect.
+    readonly List<(Exchange Exchange, string Token)> _dynamicSubscriptions = [];
+    readonly Lock _dynamicSubscriptionsSync = new();
+    readonly Channel<(Exchange Exchange, string Token)> _subscriptionRequests = Channel.CreateUnbounded<(Exchange, string)>();
+
+    /// <summary>Thread-safe, callable at any time regardless of connection state -- queued if the session is mid-reconnect.</summary>
+    public void RequestSubscribe(Exchange exchange, string token) =>
+        _subscriptionRequests.Writer.TryWrite((exchange, token));
+
     public async IAsyncEnumerable<Tick> ReadTicksAsync([EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var channel = Channel.CreateUnbounded<Tick>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
@@ -103,6 +115,7 @@ public sealed class FlatTradeTickSource(
 
         using var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var heartbeat = HeartbeatLoopAsync(ws, sessionCts.Token);
+        var subscriptionDrain = DrainSubscriptionRequestsAsync(ws, sessionCts.Token);
 
         try
         {
@@ -158,19 +171,53 @@ public sealed class FlatTradeTickSource(
         finally
         {
             sessionCts.Cancel();
-            await Task.WhenAny(heartbeat, Task.Delay(TimeSpan.FromSeconds(2), CancellationToken.None));
+            await Task.WhenAny(Task.WhenAll(heartbeat, subscriptionDrain), Task.Delay(TimeSpan.FromSeconds(2), CancellationToken.None));
         }
     }
 
     async Task SubscribeAllAsync(ClientWebSocket ws, CancellationToken ct)
     {
-        foreach (var (exchange, token) in subscriptions)
+        List<(Exchange Exchange, string Token)> dynamic;
+        lock (_dynamicSubscriptionsSync)
+        {
+            dynamic = [.. _dynamicSubscriptions];
+        }
+
+        foreach (var (exchange, token) in subscriptions.Concat(dynamic))
         {
             var code = FlatTradeAuthClient.ExchangeCode(exchange);
             await SendAsync(ws, $$"""{"t":"t","k":"{{code}}|{{token}}"}""", ct);
             await SendAsync(ws, $$"""{"t":"d","k":"{{code}}|{{token}}"}""", ct);
         }
-        logger.LogInformation("Subscribed to {Count} instrument(s) (touchline + depth)", subscriptions.Count);
+        logger.LogInformation("Subscribed to {Count} instrument(s) (touchline + depth)", subscriptions.Count + dynamic.Count);
+    }
+
+    /// <summary>Sends a live subscribe message for anything queued via <see cref="RequestSubscribe"/>, and remembers it so a reconnect's SubscribeAllAsync replays it too.</summary>
+    async Task DrainSubscriptionRequestsAsync(ClientWebSocket ws, CancellationToken ct)
+    {
+        try
+        {
+            await foreach (var (exchange, token) in _subscriptionRequests.Reader.ReadAllAsync(ct))
+            {
+                lock (_dynamicSubscriptionsSync)
+                {
+                    if (_dynamicSubscriptions.Contains((exchange, token)))
+                    {
+                        continue; // already subscribed earlier this session (or a prior one)
+                    }
+
+                    _dynamicSubscriptions.Add((exchange, token));
+                }
+
+                var code = FlatTradeAuthClient.ExchangeCode(exchange);
+                await SendAsync(ws, $$"""{"t":"t","k":"{{code}}|{{token}}"}""", ct);
+                await SendAsync(ws, $$"""{"t":"d","k":"{{code}}|{{token}}"}""", ct);
+                logger.LogInformation("Dynamically subscribed to {Exchange}|{Token} (touchline + depth)", code, token);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
     }
 
     async Task HeartbeatLoopAsync(ClientWebSocket ws, CancellationToken ct)

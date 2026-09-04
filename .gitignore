@@ -34,3 +34,6 @@ artifacts/
 
 # Spike output (raw tick captures, not source)
 spikes/*/output/
+
+# Publish output for the Windows Service deployment (contains appsettings.Local.json)
+deploy/

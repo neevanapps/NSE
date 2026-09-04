@@ -34,4 +34,13 @@ public sealed class Instrument
 
     /// <summary>The trading day this snapshot of the instrument master applies to.</summary>
     public required DateOnly AsOfDate { get; set; }
+
+    /// <summary>
+    /// True once the ingestion worker has added this instrument to the live WebSocket feed.
+    /// The daily 08:45-equivalent job's own resolved instruments are subscribed immediately
+    /// (default true); a row inserted on-demand (Dashboard: "watch this strike even though
+    /// it's outside the tracked ATM band") starts false, and the worker's poll loop flips
+    /// it once the live subscribe call actually goes out.
+    /// </summary>
+    public bool Subscribed { get; set; } = true;
 }

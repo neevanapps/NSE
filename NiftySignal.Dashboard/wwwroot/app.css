@@ -158,6 +158,50 @@ table.data-table {
     overflow-x: auto;
 }
 
+.login-link {
+    color: var(--accent);
+    font-size: 13px;
+    text-decoration: none;
+}
+
+    .login-link:hover {
+        text-decoration: underline;
+    }
+
+.login-input {
+    flex: 1;
+    min-width: 0;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    padding: 6px 10px;
+    font-size: 13px;
+    font-family: var(--font-mono);
+}
+
+    .login-input:focus {
+        outline: none;
+        border-color: var(--accent);
+    }
+
+.login-btn {
+    background: var(--accent);
+    color: var(--bg);
+    border: none;
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+    .login-btn:disabled {
+        opacity: 0.5;
+        cursor: default;
+    }
+
 ::-webkit-scrollbar {
     width: 8px;
     height: 8px;

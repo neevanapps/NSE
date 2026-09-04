@@ -12,10 +12,11 @@ public sealed record ScripMatch(string Exch, string Tsym, string Token);
 /// authorize-code token exchange, and a scrip search to find one live Nifty option
 /// without needing the full instrument master (that's real Phase 1 work, not this spike).
 ///
-/// Endpoints, the hash formula, and the response shape (including that the token-exchange
-/// response uses "status", not the "stat" field every other FlatTrade endpoint uses) are
-/// confirmed 2026-09-03 against the live docs at pi.flattrade.in/docs. Still not exercised
-/// against a real account.
+/// Endpoints and the hash formula confirmed 2026-09-03 against the live docs at
+/// pi.flattrade.in/docs, and the token exchange verified live against a real account the
+/// same day -- the docs claimed the response uses a "status" field, but the real response
+/// uses "stat" like every other FlatTrade endpoint. Docs were wrong on that one detail;
+/// trust the live response shape here over the doc text.
 /// </summary>
 public sealed class FlatTradeRestClient(HttpClient http, string apiKey, string apiSecret)
 {
@@ -38,7 +39,7 @@ public sealed class FlatTradeRestClient(HttpClient http, string apiKey, string a
         var parsed = JsonSerializer.Deserialize<TokenExchangeResponse>(body, JsonOpts)
             ?? throw new InvalidOperationException("Empty response from token exchange.");
 
-        if (!string.Equals(parsed.Status, "Ok", StringComparison.OrdinalIgnoreCase) || parsed.Token is null)
+        if (!string.Equals(parsed.Stat, "Ok", StringComparison.OrdinalIgnoreCase) || parsed.Token is null)
         {
             throw new InvalidOperationException($"Token exchange failed: {parsed.Emsg ?? body}");
         }
@@ -49,7 +50,13 @@ public sealed class FlatTradeRestClient(HttpClient http, string apiKey, string a
     public async Task<IReadOnlyList<ScripMatch>> SearchScripAsync(
         string uid, string accessToken, string exch, string searchText, CancellationToken ct)
     {
-        var jData = JsonSerializer.Serialize(new SearchScripRequest(uid, exch, Uri.EscapeDataString(searchText)));
+        // jData goes in as literal JSON text in the body (matches FlatTrade's own curl
+        // examples), NOT URL-encoded -- the endpoint does a raw string split on "jData="/
+        // "&jKey=" rather than form-decoding, so percent-encoding it produces "jData is not
+        // valid json object". The real live bug (2026-09-04) was upstream of that: Serialize
+        // was called without JsonOpts, so field names came out PascalCase ("Uid") instead of
+        // the "uid" the server expects, which is what actually caused "uid is Missing".
+        var jData = JsonSerializer.Serialize(new SearchScripRequest(uid, exch, searchText), JsonOpts);
         using var content = new StringContent($"jData={jData}&jKey={accessToken}", Encoding.UTF8, "text/plain");
 
         using var response = await http.PostAsync(RestBaseUrl + "SearchScrip", content, ct);
@@ -78,7 +85,7 @@ public sealed class FlatTradeRestClient(HttpClient http, string apiKey, string a
         [property: JsonPropertyName("request_code")] string RequestCode,
         [property: JsonPropertyName("api_secret")] string ApiSecret);
 
-    record TokenExchangeResponse(string? Status, string? Emsg, string? Token, string? Client);
+    record TokenExchangeResponse(string? Stat, string? Emsg, string? Token, string? Client);
 
     record SearchScripRequest(string Uid, string Exch, string Stext);
 

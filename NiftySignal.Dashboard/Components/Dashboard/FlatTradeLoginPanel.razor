@@ -1,0 +1,106 @@
+@using Microsoft.EntityFrameworkCore
+@using NiftySignal.Domain.Entities
+@using NiftySignal.Ingestion.FlatTrade
+@using NiftySignal.Persistence
+@inject IDbContextFactory<NiftySignalDbContext> DbFactory
+@inject FlatTradeAuthClient AuthClient
+
+@if (!IsValidToday)
+{
+    <div class="panel login-panel">
+        <div class="panel-title">
+            FlatTrade Session
+            @if (_session?.IssuedAt is not null)
+            {
+                <span class="badge badge-warn">Stale — login again</span>
+            }
+            else
+            {
+                <span class="badge badge-warn">Not logged in</span>
+            }
+        </div>
+
+        <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap;">
+            <a href="@AuthClient.AuthorizeUrl" target="_blank" rel="noopener" class="login-link">Open FlatTrade login &rarr;</a>
+
+            @if (_session?.IssuedAt is not null)
+            {
+                <span class="text-faint" style="font-size:13px;">
+                    Token <span class="mono">@MaskToken(_session.Token)</span> issued @FormatIst(_session.IssuedAt.Value) IST
+                </span>
+            }
+
+            <div style="display:flex; gap:8px; flex:1; min-width:280px;">
+                <input class="login-input" placeholder="Paste redirect URL or request_code" @bind="_pastedCode" @bind:event="oninput" disabled="@_saving" />
+                <button class="login-btn" @onclick="ExchangeAndSave" disabled="@(_saving || string.IsNullOrWhiteSpace(_pastedCode))">
+                    @(_saving ? "Saving…" : "Exchange & Save")
+                </button>
+            </div>
+
+            @if (_errorMessage is not null)
+            {
+                <span class="text-bear" style="font-size:13px;">@_errorMessage</span>
+            }
+        </div>
+    </div>
+}
+
+@code {
+    static readonly TimeSpan IstOffset = TimeSpan.FromHours(5.5);
+
+    FlatTradeSession? _session;
+    string _pastedCode = "";
+    string? _errorMessage;
+    bool _saving;
+
+    bool IsValidToday => _session?.IsValidAt(DateTimeOffset.UtcNow) ?? false;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await using var db = await DbFactory.CreateDbContextAsync();
+        _session = await db.FlatTradeSessions.FindAsync(FlatTradeSession.SingletonId);
+    }
+
+    async Task ExchangeAndSave()
+    {
+        _saving = true;
+        _errorMessage = null;
+        StateHasChanged();
+
+        try
+        {
+            var code = FlatTradeAuthClient.ExtractRequestCode(_pastedCode);
+            var result = await AuthClient.ExchangeRequestCodeForTokenAsync(code, CancellationToken.None);
+
+            await using var db = await DbFactory.CreateDbContextAsync();
+            var session = await db.FlatTradeSessions.FindAsync(FlatTradeSession.SingletonId);
+            if (session is not null)
+            {
+                session.Token = result.Token;
+                session.ClientId = result.ClientId;
+                session.IssuedAt = DateTimeOffset.UtcNow;
+                await db.SaveChangesAsync();
+                _session = session;
+            }
+
+            _pastedCode = "";
+        }
+        catch (Exception ex)
+        {
+            // A bad/expired/reused request_code is an expected, recoverable user error here
+            // -- surface it inline rather than letting it crash the Blazor circuit.
+            _errorMessage = ex.Message;
+        }
+        finally
+        {
+            _saving = false;
+        }
+    }
+
+    static string MaskToken(string? token) =>
+        string.IsNullOrEmpty(token) || token.Length < 10
+            ? "••••"
+            : $"{token[..6]}…{token[^4..]}";
+
+    static string FormatIst(DateTimeOffset utc) => utc.ToOffset(IstOffset).ToString("dd-MMM HH:mm");
+}

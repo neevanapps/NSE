@@ -1,0 +1,57 @@
+.quote-panel {
+    grid-column: span 12;
+    position: sticky;
+    top: 8px;
+    z-index: 5;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.35);
+}
+
+.quote-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+.quote-group {
+    display: flex;
+    align-items: center;
+    gap: 28px;
+    flex-wrap: wrap;
+}
+
+.quote-group-right {
+    /* CE and PE grouped together on the right, with their own gap between them -- the
+       spacer (flex:1) between the two .quote-group elements pushes this one to the edge. */
+    gap: 40px;
+}
+
+.quote-spacer {
+    flex: 1;
+    min-width: 20px;
+}
+
+.quote-stat {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.quote-value {
+    font-size: 15px;
+    font-weight: 600;
+}
+
+.quote-select {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    padding: 4px 8px;
+    font-size: 13px;
+    font-family: var(--font-mono);
+}
+
+    .quote-select:focus {
+        outline: none;
+        border-color: var(--accent);
+    }

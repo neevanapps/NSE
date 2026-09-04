@@ -1,6 +1,6 @@
 @implements IAsyncDisposable
 @using NiftySignal.Dashboard.Services
-@inject DemoDataService Demo
+@inject LiveDataService Live
 @inject IJSRuntime JS
 
 <div class="panel score-panel">
@@ -11,7 +11,7 @@
 
     <div class="score-top">
         <div class="score-readout">
-            <div class="score-number @ScoreColorClass">@Demo.CurrentScore.ToString("+0;-0;0")</div>
+            <div class="score-number @ScoreColorClass">@Live.CurrentScore.ToString("+0;-0;0")</div>
             <div class="score-label badge @ScoreBadgeClass">@ScoreLabel</div>
         </div>
         <div class="score-chart">
@@ -20,7 +20,7 @@
     </div>
 
     <div class="components">
-        @foreach (var c in Demo.ScoreComponents)
+        @foreach (var c in Live.ScoreComponents)
         {
             <div class="component-row">
                 <span class="component-name text-dim">@FormatName(c.Name)</span>
@@ -38,21 +38,21 @@
     IJSObjectReference? _module;
     bool _rendered;
 
-    string ScoreColorClass => Demo.CurrentScore switch
+    string ScoreColorClass => Live.CurrentScore switch
     {
         > 10 => "text-bull",
         < -10 => "text-bear",
         _ => "text-dim",
     };
 
-    string ScoreBadgeClass => Demo.CurrentScore switch
+    string ScoreBadgeClass => Live.CurrentScore switch
     {
         > 10 => "badge-bull",
         < -10 => "badge-bear",
         _ => "badge-neutral",
     };
 
-    string ScoreLabel => Demo.CurrentScore switch
+    string ScoreLabel => Live.CurrentScore switch
     {
         > 55 => "Strongly Bullish",
         > 10 => "Bullish",
@@ -79,7 +79,7 @@
         return $"width:{pct.ToString("0")}%; {side}: 50%;";
     }
 
-    protected override void OnInitialized() => Demo.Updated += OnDemoUpdated;
+    protected override void OnInitialized() => Live.Updated += OnDemoUpdated;
 
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
@@ -94,7 +94,7 @@
     async Task RenderChart()
     {
         if (_module is null) return;
-        var history = Demo.ScoreHistory;
+        var history = Live.ScoreHistory;
         var labels = history.Select(h => h.Timestamp.ToString("HH:mm:ss")).ToArray();
         var data = history.Select(h => Math.Round(h.Score, 1)).ToArray();
         await _module.InvokeVoidAsync("renderLineChart", "score-history-chart", labels, data, "#38bdf8");
@@ -107,7 +107,7 @@
             StateHasChanged();
             if (_rendered && _module is not null)
             {
-                var history = Demo.ScoreHistory;
+                var history = Live.ScoreHistory;
                 var labels = history.Select(h => h.Timestamp.ToString("HH:mm:ss")).ToArray();
                 var data = history.Select(h => Math.Round(h.Score, 1)).ToArray();
                 await _module.InvokeVoidAsync("updateLineChart", "score-history-chart", labels, data);
@@ -117,7 +117,7 @@
 
     public async ValueTask DisposeAsync()
     {
-        Demo.Updated -= OnDemoUpdated;
+        Live.Updated -= OnDemoUpdated;
         if (_module is not null)
         {
             try
