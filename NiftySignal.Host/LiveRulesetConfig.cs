@@ -43,6 +43,10 @@ public static class LiveRulesetConfig
             ExitOnScoreBelowAbs: 30,
             MaxHoldMinutes: 120),
         Costs: new CostsConfig(BrokeragePerOrder: 20, SlippageTicks: 2),
-        RiskLimits: new RiskLimitsConfig(MaxDailyLossPct: 3.0, MaxConsecutiveLosses: 4),
+        // Profit target deliberately wider than the loss limit (6% vs 3%): the loss breaker
+        // exists to stop a bad day compounding, the profit target only to stop giving back an
+        // unusually good one, so it should trip far less often. Starting point -- revisit once
+        // there's a real distribution of daily P&L to look at.
+        RiskLimits: new RiskLimitsConfig(MaxDailyLossPct: 3.0, MaxDailyProfitPct: 6.0, MaxConsecutiveLosses: 4),
         KillSwitch: new KillSwitchOptions { EntriesEnabled = true });
 }

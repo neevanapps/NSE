@@ -1,0 +1,34 @@
+@page "/login"
+@using Microsoft.AspNetCore.Components.Forms
+
+@* Deliberately no @rendermode: this must render as static SSR so the form is a real HTTP POST.
+   An interactive circuit can't sign a cookie in -- the response headers are long gone by the
+   time component code runs. The POST is handled by the /auth/login endpoint in Program.cs. *@
+
+<PageTitle>Sign in &mdash; NiftySignal</PageTitle>
+
+<div class="login-shell">
+    <form class="login-card" method="post" action="/auth/login">
+        <AntiforgeryToken />
+
+        <div class="login-brand">NiftySignal</div>
+
+        @if (Failed)
+        {
+            <div class="login-error">Incorrect username or password.</div>
+        }
+
+        <label class="login-label" for="username">Username</label>
+        <input class="login-input" id="username" name="username" autocomplete="username" autofocus />
+
+        <label class="login-label" for="password">Password</label>
+        <input class="login-input" id="password" name="password" type="password" autocomplete="current-password" />
+
+        <button class="login-button" type="submit">Sign in</button>
+    </form>
+</div>
+
+@code {
+    [SupplyParameterFromQuery(Name = "failed")]
+    public bool Failed { get; set; }
+}

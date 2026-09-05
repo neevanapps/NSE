@@ -173,4 +173,31 @@ public class WelfordRollingWindowTests
 
         Assert.Null(window.ComputeZScore(60));
     }
+
+    [Fact]
+    public void StdDev_NeverGoesNaN_AcrossManyAddAndEvictCycles()
+    {
+        // Live-caught 2026-09-04: floating-point cancellation in Remove's incremental M2
+        // update can drift it slightly negative after enough add/evict churn, and
+        // Math.Sqrt(negative) is NaN -- which then silently passed the old `StdDev < 1e-12`
+        // guard (any comparison against NaN is false in .NET), reached CompositeScore, and
+        // crashed the dashboard's JSON serialization. A tight cluster of near-identical
+        // values keeps the true variance close to the precision floor, which is exactly
+        // where cancellation error is most likely to tip it negative.
+        var window = new WelfordRollingWindow(TimeSpan.FromSeconds(30));
+        var random = new Random(2026_09_04);
+
+        for (var i = 0; i < 5000; i++)
+        {
+            // Every point outlives the 30s window within a few Adds, so this churns
+            // through continuous evict-then-add cycles for the whole run.
+            var value = 100.0 + (random.NextDouble() - 0.5) * 1e-6;
+            window.Add(Start.AddSeconds(i), value);
+
+            Assert.False(double.IsNaN(window.StdDev), $"StdDev went NaN at iteration {i}");
+        }
+
+        // The guard itself: a NaN StdDev must not silently slip past ComputeZScore either.
+        Assert.False(double.IsNaN(window.ComputeZScore(100.0) ?? 0.0));
+    }
 }

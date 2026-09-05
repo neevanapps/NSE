@@ -48,6 +48,7 @@ public sealed class LiveDataService : IDisposable
     readonly ILogger<LiveDataService> _logger;
     readonly Timer _timer;
     readonly Lock _lock = new();
+    int _pollInProgress;
 
     double _currentScore;
     List<ScoreHistoryPoint> _scoreHistory = [];
@@ -110,7 +111,22 @@ public sealed class LiveDataService : IDisposable
         _timer = new Timer(_ => Poll(), null, TimeSpan.Zero, PollInterval);
     }
 
-    void Poll() => _ = PollAsync();
+    /// <summary>
+    /// Guards against overlapping PollAsync runs -- the fire-and-forget timer used to start a
+    /// new poll every 5s regardless of whether the previous one had finished, which would have
+    /// let concurrent DB-heavy polls pile up on a slow cycle. Now a poll that's still running
+    /// when the next tick fires is skipped rather than stacked.
+    /// </summary>
+    void Poll()
+    {
+        if (Interlocked.CompareExchange(ref _pollInProgress, 1, 0) != 0)
+        {
+            _logger.LogWarning("Skipping poll tick -- previous poll is still running");
+            return;
+        }
+
+        _ = PollAsync();
+    }
 
     /// <summary>
     /// Called by MarketDataHub the instant Host forwards a tick. No DB access here on
@@ -259,7 +275,7 @@ public sealed class LiveDataService : IDisposable
                 lock (_lock)
                 {
                     _currentScore = latest.CompositeScore ?? _currentScore;
-                    _scoreHistory = [.. snapshots.Select(s => new ScoreHistoryPoint(s.ComputedAt, s.CompositeScore ?? 0))];
+                    _scoreHistory = [.. snapshots.Select(s => new ScoreHistoryPoint(s.ComputedAt, s.CompositeScore ?? 0, s.SpotPrice))];
                 }
 
                 ScoreComponents = BuildComponentRows(latest, _firstSnapshotAt ?? latest.ComputedAt, _firstVixSnapshotAt);
@@ -289,6 +305,10 @@ public sealed class LiveDataService : IDisposable
             // that would take down every connected viewer's next poll silently. Log and
             // retry next tick instead (a transient DB hiccup shouldn't kill the dashboard).
             _logger.LogWarning(ex, "LiveDataService poll failed");
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _pollInProgress, 0);
         }
     }
 
@@ -336,16 +356,9 @@ public sealed class LiveDataService : IDisposable
             };
         }
 
-        var allTokens = instruments.Select(i => i.Token).ToList();
-        var dayOpenByToken = new Dictionary<string, decimal>();
-        if (allTokens.Count > 0)
-        {
-            dayOpenByToken = await db.Ticks
-                .Where(t => allTokens.Contains(t.Token))
-                .GroupBy(t => t.Token)
-                .Select(g => g.OrderBy(t => t.ExchangeTimestamp).First())
-                .ToDictionaryAsync(t => t.Token, t => t.LastPrice);
-        }
+        var allTokens = instruments.Select(i => i.Token).ToArray();
+        var dayOpenTicks = await EarliestTicksAsync(db, allTokens);
+        var dayOpenByToken = dayOpenTicks.ToDictionary(t => t.Token, t => t.LastPrice);
 
         _tokenRoles = roles;
         _dayOpenByToken = dayOpenByToken;
@@ -414,37 +427,33 @@ public sealed class LiveDataService : IDisposable
             return [];
         }
 
-        var nearestExpiry = instruments.Min(i => i.ExpiryDate);
-        var nearest = instruments.Where(i => i.ExpiryDate == nearestExpiry).ToList();
-        var tokens = nearest.Select(i => i.Token).ToList();
+        // Both tracked weeklies come back together (2026-09-05); OptionChainPanel filters to
+        // the one the viewer selected. Deliberately not filtered here: LiveDataService is a
+        // singleton shared by every circuit, so an expiry choice stored on it would change the
+        // view for everyone at once. Note this does NOT touch RefreshTokenRolesAsync, which
+        // stays nearest-expiry-only -- _quickQuotes is keyed (Strike, OptionType) with no
+        // expiry component, and relaxing that filter would reintroduce the CE/PE flip bug
+        // caught live on 2026-09-04.
+        var tokens = instruments.Select(i => i.Token).ToArray();
 
         var spotToken = await db.Instruments
             .Where(i => i.AsOfDate == today && i.InstrumentType == InstrumentType.Index)
             .Select(i => i.Token)
             .FirstOrDefaultAsync();
 
-        var latestByToken = await db.Ticks
-            .Where(t => tokens.Contains(t.Token))
-            .GroupBy(t => t.Token)
-            .Select(g => g.OrderByDescending(t => t.ExchangeTimestamp).First())
-            .ToDictionaryAsync(t => t.Token);
+        var latestTicks = await LatestTicksAsync(db, tokens);
+        var latestByToken = latestTicks.ToDictionary(t => t.Token);
 
         // OI itself only updates on the exchange side every ~3 minutes -- comparing
         // against the immediately-prior poll (5s ago) was structurally almost always a
         // no-op, which is why this always read 0.0%. Compare against ~30 minutes ago
         // instead, a window long enough to always span at least one real OI update.
         var oiLookbackCutoff = DateTimeOffset.UtcNow.AddMinutes(-30);
-        var oi30MinAgoByToken = await db.Ticks
-            .Where(t => tokens.Contains(t.Token) && t.ExchangeTimestamp <= oiLookbackCutoff)
-            .GroupBy(t => t.Token)
-            .Select(g => g.OrderByDescending(t => t.ExchangeTimestamp).First())
-            .ToDictionaryAsync(t => t.Token, t => t.OpenInterest);
+        var oi30MinAgoTicks = await LatestTicksAtOrBeforeAsync(db, tokens, oiLookbackCutoff);
+        var oi30MinAgoByToken = oi30MinAgoTicks.ToDictionary(t => t.Token, t => t.OpenInterest);
 
-        var dayOpenByToken = await db.Ticks
-            .Where(t => tokens.Contains(t.Token))
-            .GroupBy(t => t.Token)
-            .Select(g => g.OrderBy(t => t.ExchangeTimestamp).First())
-            .ToDictionaryAsync(t => t.Token, t => t.LastPrice);
+        var dayOpenTicks = await EarliestTicksAsync(db, tokens);
+        var dayOpenByToken = dayOpenTicks.ToDictionary(t => t.Token, t => t.LastPrice);
 
         // Spot/Future LTP+change are ApplyPushedTick's job now (push, not poll) -- still
         // fetched here since the ATM calc and IV solve below need spotLtp, just no longer
@@ -470,23 +479,46 @@ public sealed class LiveDataService : IDisposable
         // ATM = the strike whose call+put pair together straddle the underlying most
         // tightly -- approximate with "nearest strike to spot" if we have one.
         var atmStrike = spotLtp is { } sl
-            ? nearest.Select(i => i.StrikePrice!.Value).Distinct().OrderBy(s => Math.Abs(s - sl)).FirstOrDefault()
-            : nearest.Select(i => i.StrikePrice!.Value).Distinct().OrderBy(s => s).Skip(nearest.Count / 4).FirstOrDefault();
+            ? instruments.Select(i => i.StrikePrice!.Value).Distinct().OrderBy(s => Math.Abs(s - sl)).FirstOrDefault()
+            : instruments.Select(i => i.StrikePrice!.Value).Distinct().OrderBy(s => s).Skip(instruments.Count / 4).FirstOrDefault();
 
-        var t = TimeToExpiry.YearsUntilExpiry(nearestExpiry!.Value, DateTimeOffset.UtcNow);
+        // Time to expiry is per-expiry now that both weeklies are in play -- a single `t` from
+        // the nearest expiry would misprice every next-week row.
+        var yearsToExpiry = instruments
+            .Select(i => i.ExpiryDate!.Value)
+            .Distinct()
+            .ToDictionary(e => e, e => TimeToExpiry.YearsUntilExpiry(e, DateTimeOffset.UtcNow));
+
+        // Reference vol for theoretical pricing (2026-09-05), solved per expiry at the ATM
+        // strike. Pricing each strike with its *own* implied vol would just reproduce that
+        // strike's market price exactly -- true by construction, and useless. Pricing every
+        // strike at the ATM strike's vol instead makes the gap meaningful: it's the skew
+        // premium in rupee terms, i.e. how much more (or less) the market is paying for this
+        // strike than the at-the-money baseline implies. Above theoretical reads as demand
+        // bidding premium up; below reads as supply/writing pressure.
+        var atmVolByExpiry = BuildAtmReferenceVol(instruments, latestByToken, spotLtp, atmStrike, yearsToExpiry);
 
         var rows = new List<OptionChainRow>();
-        foreach (var instrument in nearest.OrderBy(i => i.StrikePrice))
+        foreach (var instrument in instruments.OrderBy(i => i.ExpiryDate).ThenBy(i => i.StrikePrice))
         {
             if (!latestByToken.TryGetValue(instrument.Token, out var tick))
             {
                 continue;
             }
 
-            double? iv = null;
+            var expiry = instrument.ExpiryDate!.Value;
+            var t = yearsToExpiry[expiry];
+
+            double? iv = null, theoretical = null;
             if (spotLtp is { } underlying && tick.LastPrice > 0)
             {
                 iv = ImpliedVolatilitySolver.Solve(instrument.OptionType, (double)tick.LastPrice, (double)underlying, (double)instrument.StrikePrice!.Value, t, RiskFreeRate);
+
+                if (atmVolByExpiry.TryGetValue(expiry, out var atmVol))
+                {
+                    theoretical = BlackScholes.Calculate(
+                        instrument.OptionType, (double)underlying, (double)instrument.StrikePrice!.Value, t, RiskFreeRate, atmVol).Price;
+                }
             }
 
             var depth = tick.Depth;
@@ -498,10 +530,15 @@ public sealed class LiveDataService : IDisposable
                 ? (double)(d.TotalBidQty - d.TotalAskQty) / (d.TotalBidQty + d.TotalAskQty)
                 : 0.0;
 
+            long? oiChange = null;
             double oiChangePct = 0;
-            if (oi30MinAgoByToken.TryGetValue(instrument.Token, out var oi30MinAgo) && oi30MinAgo is > 0 && tick.OpenInterest is { } currentOi)
+            if (oi30MinAgoByToken.TryGetValue(instrument.Token, out var oi30MinAgo) && oi30MinAgo is { } prevOi && tick.OpenInterest is { } currentOi)
             {
-                oiChangePct = (double)(currentOi - oi30MinAgo.Value) / oi30MinAgo.Value * 100.0;
+                oiChange = currentOi - prevOi;
+                if (prevOi > 0)
+                {
+                    oiChangePct = (double)oiChange.Value / prevOi * 100.0;
+                }
             }
 
             var change = dayOpenByToken.TryGetValue(instrument.Token, out var open) ? tick.LastPrice - open : (decimal?)null;
@@ -510,10 +547,14 @@ public sealed class LiveDataService : IDisposable
                 TradingSymbol: instrument.TradingSymbol,
                 OptionType: instrument.OptionType,
                 Strike: instrument.StrikePrice!.Value,
+                ExpiryDate: expiry,
                 Ltp: tick.LastPrice,
                 OpenInterest: tick.OpenInterest ?? 0,
+                LotSize: instrument.LotSize,
                 OiChangePct: oiChangePct,
+                OiChange: oiChange,
                 ImpliedVolatility: iv,
+                TheoreticalPrice: theoretical,
                 DepthImbalance: depthImbalance,
                 Buildup: OiBuildupClassification.Neutral, // per-row buildup not tracked yet -- see LiveFeatureEngine for the aggregate version
                 IsAtm: instrument.StrikePrice == atmStrike,
@@ -523,6 +564,52 @@ public sealed class LiveDataService : IDisposable
         }
 
         return rows;
+    }
+
+    /// <summary>
+    /// One reference volatility per expiry, solved from the ATM strike -- the most liquid and
+    /// therefore most trustworthy point on the chain. Prefers the call, falls back to the put
+    /// if the call's solve fails. Expiries with no usable ATM quote are simply absent from the
+    /// result, and their rows get no theoretical price rather than one built on a guess.
+    /// </summary>
+    static Dictionary<DateOnly, double> BuildAtmReferenceVol(
+        List<Instrument> instruments,
+        Dictionary<string, Tick> latestByToken,
+        decimal? spotLtp,
+        decimal atmStrike,
+        Dictionary<DateOnly, double> yearsToExpiry)
+    {
+        var result = new Dictionary<DateOnly, double>();
+        if (spotLtp is not { } underlying)
+        {
+            return result;
+        }
+
+        foreach (var expiry in yearsToExpiry.Keys)
+        {
+            var atmLegs = instruments
+                .Where(i => i.ExpiryDate == expiry && i.StrikePrice == atmStrike)
+                .OrderBy(i => i.OptionType == OptionType.Call ? 0 : 1);
+
+            foreach (var leg in atmLegs)
+            {
+                if (!latestByToken.TryGetValue(leg.Token, out var tick) || tick.LastPrice <= 0)
+                {
+                    continue;
+                }
+
+                var solved = ImpliedVolatilitySolver.Solve(
+                    leg.OptionType, (double)tick.LastPrice, (double)underlying, (double)atmStrike, yearsToExpiry[expiry], RiskFreeRate);
+
+                if (solved is { } vol)
+                {
+                    result[expiry] = vol;
+                    break;
+                }
+            }
+        }
+
+        return result;
     }
 
     /// <summary>
@@ -541,17 +628,14 @@ public sealed class LiveDataService : IDisposable
         }
 
         var today = DateOnly.FromDateTime(DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromHours(5.5)).Date);
-        var tokens = open.Select(t => t.InstrumentToken).Distinct().ToList();
+        var tokens = open.Select(t => t.InstrumentToken).Distinct().ToArray();
 
         var lotSizeByToken = await db.Instruments
             .Where(i => i.AsOfDate == today && tokens.Contains(i.Token))
             .ToDictionaryAsync(i => i.Token, i => i.LotSize);
 
-        var latestPriceByToken = await db.Ticks
-            .Where(t => tokens.Contains(t.Token))
-            .GroupBy(t => t.Token)
-            .Select(g => g.OrderByDescending(t => t.ExchangeTimestamp).First())
-            .ToDictionaryAsync(t => t.Token, t => t.LastPrice);
+        var latestTicks = await LatestTicksAsync(db, tokens);
+        var latestPriceByToken = latestTicks.ToDictionary(t => t.Token, t => t.LastPrice);
 
         return open.Select(t => new PositionRow(
             TradingSymbol: t.TradingSymbol,
@@ -585,6 +669,55 @@ public sealed class LiveDataService : IDisposable
             ExitReason: t.ExitReason))
             .ToList();
     }
+
+    /// <summary>
+    /// "Latest/earliest tick per token" the LINQ way -- <c>GroupBy(t => t.Token).Select(g =>
+    /// g.OrderBy(...).First())</c> -- translates to a ROW_NUMBER() window function scanning and
+    /// sorting every matching row for every token, not an index seek per token. Measured against
+    /// the live DB (3.86M rows): ~11s wall time with a 200MB+ disk sort. Raw SQL was needed too --
+    /// Npgsql's EF Core provider flattens even a correlated `Select(x => relatedQuery.
+    /// FirstOrDefault())` into the same window-function shape rather than a LATERAL join
+    /// (confirmed via ToQueryString), so plain LINQ can't reach the fast plan either way.
+    ///
+    /// `unnest(tokens) CROSS JOIN LATERAL (... LIMIT 1)` lets Postgres seek the existing
+    /// (Token, ExchangeTimestamp) index once per token instead: measured at 1-16ms for the same
+    /// 80-token lookup, a ~1000x improvement, because cost now scales with the (small, fixed)
+    /// number of distinct tokens rather than with total table size.
+    /// </summary>
+    static Task<List<Tick>> LatestTicksAsync(NiftySignalDbContext db, string[] tokens) =>
+        tokens.Length == 0
+            ? Task.FromResult(new List<Tick>())
+            : db.Ticks.FromSqlInterpolated($@"
+                SELECT lt.* FROM unnest({tokens}) AS tok(token)
+                CROSS JOIN LATERAL (
+                    SELECT * FROM ticks t WHERE t.""Token"" = tok.token ORDER BY t.""ExchangeTimestamp"" DESC LIMIT 1
+                ) lt")
+                .AsNoTracking()
+                .ToListAsync();
+
+    /// <summary>Same as <see cref="LatestTicksAsync"/> but the earliest tick per token (today's open).</summary>
+    static Task<List<Tick>> EarliestTicksAsync(NiftySignalDbContext db, string[] tokens) =>
+        tokens.Length == 0
+            ? Task.FromResult(new List<Tick>())
+            : db.Ticks.FromSqlInterpolated($@"
+                SELECT lt.* FROM unnest({tokens}) AS tok(token)
+                CROSS JOIN LATERAL (
+                    SELECT * FROM ticks t WHERE t.""Token"" = tok.token ORDER BY t.""ExchangeTimestamp"" ASC LIMIT 1
+                ) lt")
+                .AsNoTracking()
+                .ToListAsync();
+
+    /// <summary>Same as <see cref="LatestTicksAsync"/> but the latest tick at or before <paramref name="cutoff"/> per token.</summary>
+    static Task<List<Tick>> LatestTicksAtOrBeforeAsync(NiftySignalDbContext db, string[] tokens, DateTimeOffset cutoff) =>
+        tokens.Length == 0
+            ? Task.FromResult(new List<Tick>())
+            : db.Ticks.FromSqlInterpolated($@"
+                SELECT lt.* FROM unnest({tokens}) AS tok(token)
+                CROSS JOIN LATERAL (
+                    SELECT * FROM ticks t WHERE t.""Token"" = tok.token AND t.""ExchangeTimestamp"" <= {cutoff} ORDER BY t.""ExchangeTimestamp"" DESC LIMIT 1
+                ) lt")
+                .AsNoTracking()
+                .ToListAsync();
 
     // 91-day T-bill proxy -- same starting value as LiveFeatureEngine (plan 4.1).
     const double RiskFreeRate = 0.065;

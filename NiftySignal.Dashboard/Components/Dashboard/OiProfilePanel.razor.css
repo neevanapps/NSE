@@ -2,7 +2,50 @@
     grid-column: span 5;
 }
 
+.oi-totals {
+    display: flex;
+    gap: 20px;
+    font-size: 12px;
+    color: var(--text-dim);
+    margin: 2px 0 10px;
+}
+
+.oi-total-item span {
+    font-weight: 700;
+    margin-left: 6px;
+}
+
 .oi-chart {
     height: 340px;
     position: relative;
 }
+
+.oi-mode-tabs {
+    display: inline-flex;
+    gap: 4px;
+    margin-left: auto;
+}
+
+.oi-mode-tab {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid transparent;
+    border-radius: 4px;
+    color: var(--text-dim);
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: normal;
+    padding: 3px 10px;
+    text-transform: none;
+    cursor: pointer;
+}
+
+    .oi-mode-tab:hover {
+        color: var(--text);
+    }
+
+    .oi-mode-tab.active {
+        background: rgba(56,189,248,0.12);
+        border-color: var(--accent);
+        color: var(--accent);
+    }

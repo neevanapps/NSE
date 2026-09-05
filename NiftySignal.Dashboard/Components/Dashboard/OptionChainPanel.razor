@@ -6,8 +6,18 @@
 
 <div class="panel chain-panel">
     <div class="panel-title">
-        Option Chain &mdash; NIFTY (nearest weekly)
-        <span class="text-faint" style="font-weight:400; text-transform:none;">ATM highlighted</span>
+        Option Chain &mdash; NIFTY
+        <span class="chain-expiry-tabs">
+            @foreach (var expiry in Expiries)
+            {
+                <button type="button"
+                        class="expiry-tab @(expiry == SelectedExpiry ? "active" : "")"
+                        @onclick="() => SelectExpiry(expiry)">
+                    @FormatExpiry(expiry)
+                </button>
+            }
+        </span>
+        <span class="text-faint" style="font-weight:400; text-transform:none;">ATM highlighted &middot; theoretical priced at ATM vol</span>
     </div>
 
     <div class="scroll-x">
@@ -17,6 +27,8 @@
                     <th>Strike</th>
                     <th>Type</th>
                     <th>LTP</th>
+                    <th>Theo.</th>
+                    <th>Diff</th>
                     <th>OI</th>
                     <th>OI %</th>
                     <th>IV</th>
@@ -25,12 +37,16 @@
                 </tr>
             </thead>
             <tbody>
-                @foreach (var row in Live.OptionChain.OrderBy(r => r.Strike).ThenBy(r => r.OptionType))
+                @foreach (var row in VisibleRows)
                 {
                     <tr class="@(row.IsAtm ? "atm-row" : "")">
                         <td class="mono">@row.Strike.ToString("0")@(row.IsAtm ? " •" : "")</td>
                         <td><span class="badge @(row.OptionType == OptionType.Call ? "badge-bull" : "badge-bear")">@(row.OptionType == OptionType.Call ? "CE" : "PE")</span></td>
                         <td>@row.Ltp.ToString("0.00")</td>
+                        <td class="text-dim">@(row.TheoreticalPrice is { } theo ? theo.ToString("0.00") : "—")</td>
+                        <td class="@DiffClass(row.PriceVsTheoretical)">
+                            @(row.PriceVsTheoretical is { } diff ? FormatDiff(diff) : "—")
+                        </td>
                         <td>@row.OpenInterest.ToString("N0")</td>
                         <td class="@(row.OiChangePct >= 0 ? "text-bull" : "text-bear")">@row.OiChangePct.ToString("+0.0;-0.0")%</td>
                         <td>@(row.ImpliedVolatility is { } iv ? $"{iv * 100:0.0}%" : "—")</td>
@@ -44,6 +60,55 @@
 </div>
 
 @code {
+    // Component-local, not on LiveDataService: that's a singleton shared by every circuit, so
+    // storing the selection there would switch expiry for every viewer at once.
+    DateOnly? _selectedExpiry;
+
+    IReadOnlyList<DateOnly> Expiries =>
+        [.. Live.OptionChain.Select(r => r.ExpiryDate).Distinct().OrderBy(e => e)];
+
+    DateOnly? SelectedExpiry
+    {
+        get
+        {
+            var expiries = Expiries;
+            if (expiries.Count == 0)
+            {
+                return null;
+            }
+
+            // Nearest expiry by default. Also falls back to it if a previously-selected expiry
+            // disappears from the chain -- which it will the day after that expiry passes.
+            return _selectedExpiry is { } chosen && expiries.Contains(chosen) ? chosen : expiries[0];
+        }
+    }
+
+    IEnumerable<OptionChainRow> VisibleRows => SelectedExpiry is { } expiry
+        ? Live.OptionChain.Where(r => r.ExpiryDate == expiry).OrderBy(r => r.Strike).ThenBy(r => r.OptionType)
+        : [];
+
+    void SelectExpiry(DateOnly expiry) => _selectedExpiry = expiry;
+
+    // "08 Sep" is enough to tell the two tracked weeklies apart at a glance.
+    static string FormatExpiry(DateOnly expiry) => expiry.ToString("dd MMM");
+
+    // Round before formatting, and give zero its own branch. Two reasons: a difference that
+    // *displays* as zero shouldn't carry a sign, and IEEE-754 negative zero (which
+    // actual-minus-theoretical produces whenever they're equal, e.g. at the ATM strike whose
+    // own vol is the reference) otherwise renders as the nonsense "-+0.00" -- .NET Core 3.0+
+    // preserves -0.0's sign but picks the positive section for it, then prepends the minus.
+    static string FormatDiff(double diff)
+    {
+        var rounded = Math.Round(diff, 2);
+        return rounded == 0 ? "0.00" : rounded.ToString("+0.00;-0.00");
+    }
+
+    // Coloured off the same rounded value the cell displays, so a "0.00" is never tinted
+    // bearish by a residue too small to see.
+    static string DiffClass(double? diff) => diff is { } d && Math.Round(d, 2) is var r && r != 0
+        ? (r > 0 ? "text-bull" : "text-bear")
+        : "text-dim";
+
     static string BuildupClass(OiBuildupClassification b) => b switch
     {
         OiBuildupClassification.LongBuildup => "badge-bull",

@@ -283,4 +283,85 @@ public class LiveTradingEngineTests
             Assert.Equal(723.5m, closed.NetPnl);
         });
     }
+
+    [Fact]
+    public async Task EvaluateCadenceAsync_TracksExcursions_AtTheirExtremes_NotTheLatestMark()
+    {
+        await using var fixture = new Fixture();
+        var entryTime = new DateTimeOffset(2026, 9, 4, 10, 0, 0, Ist);
+
+        await fixture.WithDbAsync(async db =>
+        {
+            db.PaperTrades.Add(new PaperTrade
+            {
+                InstrumentToken = AtmCallToken, TradingSymbol = "NIFTY08SEP26C24000", Direction = EntryDirection.Bullish,
+                EntryTime = entryTime, EntryPrice = 100m, EntryScore = 70,
+                RulesetVersion = "live-v1-2026-09-04", ScoreWeightsVersion = "test-weights-1",
+            });
+            await db.SaveChangesAsync();
+        });
+
+        // Marks are the bid (that's what an exit would actually fill at): 110 -> 92 -> 104.
+        // Against a 100 entry that's +10%, -8%, +4%. None of the three is both extremes, so a
+        // "last value wins" bug would fail this: MFE must hold +10 and MAE must hold -8 even
+        // though the final observation is +4.
+        foreach (var (offsetSeconds, bid, ask) in new[] { (15, 110m, 110.5m), (30, 92m, 92.5m), (45, 104m, 104.5m) })
+        {
+            var at = entryTime.AddSeconds(offsetSeconds);
+            var engine = new LiveFeatureEngine(BaseUniverse());
+            engine.OnTick(MakeTick(SpotToken, 24000m, at));
+            engine.OnTick(MakeTick(FutureToken, 24000m, at));
+            engine.OnTick(MakeTick(AtmCallToken, bid, at, depth: Depth(bid: bid, ask: ask)));
+
+            // Score held low enough to avoid tripping an exit -- but above ExitOnScoreBelowAbs
+            // (30), or ScoreDecay would close the position before the third mark lands.
+            await fixture.Engine.EvaluateCadenceAsync(WarmedSnapshot(35, at), engine, CancellationToken.None);
+        }
+
+        await fixture.WithDbAsync(async db =>
+        {
+            var trade = Assert.Single(await db.PaperTrades.ToListAsync());
+            Assert.Null(trade.ExitTime); // still open -- this test is about excursions, not exits
+            Assert.Equal(10.0, trade.MaxFavourableExcursionPct!.Value, precision: 4);
+            Assert.Equal(-8.0, trade.MaxAdverseExcursionPct!.Value, precision: 4);
+        });
+    }
+
+    [Fact]
+    public async Task EvaluateCadenceAsync_NoEntry_WhenDailyProfitTargetAlreadyReached()
+    {
+        await using var fixture = new Fixture();
+        var t0 = new DateTimeOffset(2026, 9, 4, 10, 0, 0, Ist);
+
+        // Target is 6% of 50,000 capital = 3,000. One closed trade at 3,100 clears it, so the
+        // day is done taking new risk even though every other entry condition is satisfied.
+        await fixture.WithDbAsync(async db =>
+        {
+            db.PaperTrades.Add(new PaperTrade
+            {
+                InstrumentToken = AtmCallToken, TradingSymbol = "NIFTY08SEP26C24000", Direction = EntryDirection.Bullish,
+                EntryTime = t0.AddHours(-1), EntryPrice = 100m, EntryScore = 70,
+                ExitTime = t0.AddMinutes(-30), ExitPrice = 150m, ExitReason = ExitReason.PartialBook,
+                GrossPnl = 3_250m, NetPnl = 3_100m,
+                RulesetVersion = "live-v1-2026-09-04", ScoreWeightsVersion = "test-weights-1",
+            });
+            await db.SaveChangesAsync();
+        });
+
+        var featureEngine = WarmedFeatureEngineWithAtmCall(t0);
+
+        // Two ticks 50s apart so the 45s sustain requirement is genuinely met -- otherwise
+        // sustain alone would explain the absence of a new trade.
+        await fixture.Engine.EvaluateCadenceAsync(WarmedSnapshot(70, t0), featureEngine, CancellationToken.None);
+        await fixture.Engine.EvaluateCadenceAsync(WarmedSnapshot(70, t0.AddSeconds(50)), featureEngine, CancellationToken.None);
+
+        await fixture.WithDbAsync(async db =>
+        {
+            // Still just the pre-existing closed trade -- no new entry was opened.
+            var trades = await db.PaperTrades.ToListAsync();
+            Assert.Single(trades);
+            Assert.NotNull(trades[0].ExitTime);
+        });
+        Assert.DoesNotContain(fixture.Telegram.Sent, s => s.Category == NotificationCategory.TradeEntry);
+    }
 }

@@ -67,13 +67,14 @@ public class LiveFeatureEngineTests
         Option(PutToken, OptionType.Put, 23950m),
     ];
 
-    static Tick MakeTick(string token, decimal lastPrice, DateTimeOffset at, long? oi = null, MarketDepth? depth = null) => new()
+    static Tick MakeTick(string token, decimal lastPrice, DateTimeOffset at, long? oi = null, MarketDepth? depth = null, long volume = 0) => new()
     {
         Token = token,
         Exchange = Exchange.Nfo,
         ExchangeTimestamp = at,
         ReceivedAt = at,
         LastPrice = lastPrice,
+        Volume = volume,
         OpenInterest = oi,
         Depth = depth,
     };
@@ -153,6 +154,89 @@ public class LiveFeatureEngineTests
         // sign) if it weren't excluded.
         Assert.NotNull(snapshot);
         Assert.Equal(-200.0 / 2200.0, snapshot!.DepthImbalanceRaw!.Value, precision: 3);
+    }
+
+    [Fact]
+    public void BuildStrikeSnapshots_ReportsVolumeTradedThisCadence_NotTheCumulativeDayTotal()
+    {
+        // The feed reports cumulative day volume, so a naive persist would record an
+        // ever-growing number instead of "how much traded in these 15 seconds".
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, volume: 5_000));
+
+        // First pass has no prior observation to diff against -- null, not a fabricated zero.
+        var first = engine.BuildStrikeSnapshots(Start);
+        Assert.Null(Assert.Single(first, s => s.Token == CallToken).VolumeDelta);
+
+        engine.OnTick(MakeTick(CallToken, 101m, Start.AddSeconds(15), volume: 5_350));
+
+        var second = engine.BuildStrikeSnapshots(Start.AddSeconds(15));
+
+        // 5,350 cumulative minus 5,000 at the previous cadence = 350 traded in between.
+        Assert.Equal(350, Assert.Single(second, s => s.Token == CallToken).VolumeDelta);
+    }
+
+    [Fact]
+    public void BuildStrikeSnapshots_ClampsVolumeDeltaToZero_WhenTheCumulativeCounterGoesBackwards()
+    {
+        // A feed reset mid-session would otherwise yield a negative "traded volume", which is
+        // meaningless -- better to record no activity than a nonsense negative.
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, volume: 9_000));
+        engine.BuildStrikeSnapshots(Start);
+
+        engine.OnTick(MakeTick(CallToken, 100m, Start.AddSeconds(15), volume: 120));
+        var afterReset = engine.BuildStrikeSnapshots(Start.AddSeconds(15));
+
+        Assert.Equal(0, Assert.Single(afterReset, s => s.Token == CallToken).VolumeDelta);
+    }
+
+    [Fact]
+    public void BuildStrikeSnapshots_RecordsSpreadAndGreeks_ForTheNearAtmBand()
+    {
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, oi: 1_000_000, depth: Depth(500, 400, bid: 99.5m, ask: 100.5m)));
+
+        var call = Assert.Single(engine.BuildStrikeSnapshots(Start), s => s.Token == CallToken);
+
+        Assert.Equal(99.5m, call.BidPrice);
+        Assert.Equal(100.5m, call.AskPrice);
+        Assert.Equal(1.0m, call.SpreadAbs);
+        Assert.Equal(1_000_000, call.OpenInterest);
+        Assert.Equal(NearestExpiry, call.ExpiryDate);
+
+        // Greeks only exist when the IV solve succeeded -- they must travel together, never a
+        // partially-populated row.
+        Assert.NotNull(call.ImpliedVolatility);
+        Assert.NotNull(call.Delta);
+        Assert.NotNull(call.Gamma);
+        Assert.NotNull(call.Vega);
+    }
+
+    [Fact]
+    public void BuildStrikeSnapshots_ReturnsEmpty_BeforeSpotHasTicked()
+    {
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(CallToken, 100m, Start));
+
+        Assert.Empty(engine.BuildStrikeSnapshots(Start));
+    }
+
+    [Fact]
+    public void ComputeCadence_RecordsSpotPrice_ForChartingAndReversalAnalysis()
+    {
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23942.35m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24068.90m, Start));
+
+        var snapshot = engine.ComputeCadence(Start);
+
+        Assert.NotNull(snapshot);
+        Assert.Equal(23942.35, snapshot!.SpotPrice!.Value, precision: 2);
     }
 
     [Fact]

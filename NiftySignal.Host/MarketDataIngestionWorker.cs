@@ -141,10 +141,11 @@ public sealed class MarketDataIngestionWorker(
                 await _engineSync.WaitAsync(stoppingToken);
                 try
                 {
-                    var snapshot = _engine!.ComputeCadence(DateTimeOffset.UtcNow);
+                    var now = DateTimeOffset.UtcNow;
+                    var snapshot = _engine!.ComputeCadence(now);
                     if (snapshot is not null)
                     {
-                        await PersistSnapshotAsync(snapshot, stoppingToken);
+                        await PersistSnapshotAsync(snapshot, _engine.BuildStrikeSnapshots(now), stoppingToken);
                         await tradingEngine.EvaluateCadenceAsync(snapshot, _engine, stoppingToken);
                     }
                 }
@@ -286,15 +287,23 @@ public sealed class MarketDataIngestionWorker(
         return sb.ToString().TrimEnd();
     }
 
-    async Task PersistSnapshotAsync(ScoreSnapshot snapshot, CancellationToken ct)
+    async Task PersistSnapshotAsync(ScoreSnapshot snapshot, List<StrikeSnapshot> strikeSnapshots, CancellationToken ct)
     {
         await using var scope = scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
         db.ScoreSnapshots.Add(snapshot);
+
+        // Same transaction as the score row -- they describe the same cadence instant, so a
+        // partial write would leave analysis joining against a cadence that only half exists.
+        if (strikeSnapshots.Count > 0)
+        {
+            db.StrikeSnapshots.AddRange(strikeSnapshots);
+        }
+
         await db.SaveChangesAsync(ct);
         logger.LogInformation(
-            "Score cadence: composite={Score} warmedUp={WarmedUp}",
-            snapshot.CompositeScore, snapshot.IsWarmedUp);
+            "Score cadence: composite={Score} warmedUp={WarmedUp} strikeRows={StrikeRows}",
+            snapshot.CompositeScore, snapshot.IsWarmedUp, strikeSnapshots.Count);
     }
 
     async Task<FlatTradeSession?> LoadSessionAsync(CancellationToken ct)

@@ -40,6 +40,13 @@
             @(_entriesEnabled ? "Enabled" : "DISABLED")
         </span>
     </div>
+
+    @* A real form POST, not an interactive click handler -- clearing the auth cookie needs an
+       HTTP response, which a circuit callback can't produce. *@
+    <form method="post" action="/auth/logout" class="logout-form">
+        <AntiforgeryToken />
+        <button type="submit" class="logout-button" title="Sign out">Sign out</button>
+    </form>
 </div>
 
 @code {

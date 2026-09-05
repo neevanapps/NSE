@@ -41,3 +41,24 @@
     gap: 10px;
     font-size: 13px;
 }
+
+.logout-form {
+    display: flex;
+    margin-left: 16px;
+}
+
+.logout-button {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    color: var(--text-dim);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 12px;
+    padding: 4px 10px;
+}
+
+    .logout-button:hover {
+        border-color: var(--bear);
+        color: var(--bear);
+    }

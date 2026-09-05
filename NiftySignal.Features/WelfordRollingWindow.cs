@@ -25,8 +25,16 @@ public sealed class WelfordRollingWindow(TimeSpan windowDuration)
 
     public double Mean => _mean;
 
-    /// <summary>Sample standard deviation (n-1 denominator). 0 when Count &lt; 2.</summary>
-    public double StdDev => _count < 2 ? 0.0 : Math.Sqrt(_m2 / (_count - 1));
+    /// <summary>
+    /// Sample standard deviation (n-1 denominator). 0 when Count &lt; 2. Clamps <see cref="_m2"/>
+    /// to non-negative here as a second line of defense on top of the clamp in <see
+    /// cref="Remove"/> -- if it were ever negative, Math.Sqrt would return NaN, and the
+    /// ComputeZScore guard below (`StdDev &lt; 1e-12`) silently fails to catch that: any
+    /// comparison with NaN evaluates false in .NET, so a NaN StdDev would pass the guard and
+    /// propagate into the composite score (live-caught 2026-09-04, corrupted one score_snapshots
+    /// row and crashed the dashboard's JSON serialization).
+    /// </summary>
+    public double StdDev => _count < 2 ? 0.0 : Math.Sqrt(Math.Max(_m2, 0.0) / (_count - 1));
 
     /// <summary>
     /// True once real elapsed time since the first observation reaches the full window
@@ -91,7 +99,10 @@ public sealed class WelfordRollingWindow(TimeSpan windowDuration)
         }
 
         var newMean = _mean - ((value - _mean) / (_count - 1));
-        _m2 -= (value - _mean) * (value - newMean);
+        // Floating-point cancellation in this subtraction can push _m2 slightly below zero
+        // (true variance is never negative) -- clamp rather than let it compound across
+        // further Remove calls and eventually hand StdDev a negative radicand.
+        _m2 = Math.Max(_m2 - (value - _mean) * (value - newMean), 0.0);
         _mean = newMean;
         _count--;
     }

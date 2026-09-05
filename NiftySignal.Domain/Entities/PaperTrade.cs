@@ -48,6 +48,21 @@ public sealed class PaperTrade
     /// <summary>India VIX at entry, for regime-bucketed reporting (plan section 9). Null until a VIX data source is wired up.</summary>
     public double? VixAtEntry { get; set; }
 
+    /// <summary>
+    /// Best unrealised profit the trade ever reached, as a percentage of entry premium
+    /// (2026-09-05). Same percent-of-entry basis as StopLossPct/PartialBookAtProfitPct so the
+    /// three are directly comparable -- "it ran to +40% before we exited at +30%" is the
+    /// question this exists to answer. Null until the first cadence with a live quote.
+    /// </summary>
+    public double? MaxFavourableExcursionPct { get; set; }
+
+    /// <summary>
+    /// Worst unrealised drawdown the trade ever reached, same basis as
+    /// <see cref="MaxFavourableExcursionPct"/>. Negative by convention (a trade that never went
+    /// underwater records a value at or above zero).
+    /// </summary>
+    public double? MaxAdverseExcursionPct { get; set; }
+
     public required string RulesetVersion { get; set; }
 
     public required string ScoreWeightsVersion { get; set; }

@@ -100,13 +100,24 @@
         }
     }
 
+    // Spot rides on the same time axis as the score so the two can be read against each other
+    // -- "did the score turn before price did?" is the whole question this panel exists to
+    // answer. Nulls (snapshots predating the SpotPrice column) pass through as gaps rather
+    // than being coerced to zero, which would drag the price axis to the floor.
+    (string[] Labels, double[] Scores, double?[] Prices) BuildSeries()
+    {
+        var history = Live.ScoreHistory;
+        return (
+            history.Select(h => h.Timestamp.ToString("HH:mm:ss")).ToArray(),
+            history.Select(h => Math.Round(h.Score, 1)).ToArray(),
+            history.Select(h => h.SpotPrice).ToArray());
+    }
+
     async Task RenderChart()
     {
         if (_module is null) return;
-        var history = Live.ScoreHistory;
-        var labels = history.Select(h => h.Timestamp.ToString("HH:mm:ss")).ToArray();
-        var data = history.Select(h => Math.Round(h.Score, 1)).ToArray();
-        await _module.InvokeVoidAsync("renderLineChart", "score-history-chart", labels, data, "#38bdf8");
+        var (labels, scores, prices) = BuildSeries();
+        await _module.InvokeVoidAsync("renderScoreWithPriceChart", "score-history-chart", labels, scores, prices, "#38bdf8", "#fbbf24");
     }
 
     async void OnDemoUpdated()
@@ -116,10 +127,8 @@
             StateHasChanged();
             if (_rendered && _module is not null)
             {
-                var history = Live.ScoreHistory;
-                var labels = history.Select(h => h.Timestamp.ToString("HH:mm:ss")).ToArray();
-                var data = history.Select(h => Math.Round(h.Score, 1)).ToArray();
-                await _module.InvokeVoidAsync("updateLineChart", "score-history-chart", labels, data);
+                var (labels, scores, prices) = BuildSeries();
+                await _module.InvokeVoidAsync("updateScoreWithPriceChart", "score-history-chart", labels, scores, prices);
             }
         });
     }

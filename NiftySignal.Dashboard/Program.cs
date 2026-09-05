@@ -1,4 +1,9 @@
+using System.Security.Claims;
+using Microsoft.AspNetCore.Antiforgery;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 using NiftySignal.Dashboard.Components;
 using NiftySignal.Dashboard.Hubs;
 using NiftySignal.Dashboard.Services;
@@ -37,6 +42,22 @@ builder.Services.AddHttpClient<FlatTradeAuthClient>();
 
 builder.Services.AddSingleton<LiveDataService>();
 
+// Single-user cookie auth (2026-09-05) -- see DashboardAuthOptions for why this is deliberately
+// minimal. Sliding expiration so a phone left on the dashboard doesn't get logged out mid-session.
+builder.Services.Configure<DashboardAuthOptions>(builder.Configuration.GetSection(DashboardAuthOptions.SectionName));
+builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
+    .AddCookie(options =>
+    {
+        options.LoginPath = "/login";
+        options.LogoutPath = "/auth/logout";
+        options.ExpireTimeSpan = TimeSpan.FromDays(7);
+        options.SlidingExpiration = true;
+        options.Cookie.HttpOnly = true;
+        options.Cookie.SameSite = SameSiteMode.Lax;
+    });
+builder.Services.AddAuthorization();
+builder.Services.AddCascadingAuthenticationState();
+
 var app = builder.Build();
 
 // Configure the HTTP request pipeline.
@@ -49,11 +70,48 @@ if (!app.Environment.IsDevelopment())
 app.UseStatusCodePagesWithReExecute("/not-found", createScopeForStatusCodePages: true);
 app.UseHttpsRedirection();
 
+app.UseAuthentication();
+app.UseAuthorization();
+
 app.UseAntiforgery();
 
 app.MapStaticAssets();
 app.MapRazorComponents<App>()
     .AddInteractiveServerRenderMode();
+
+// Deliberately NOT behind RequireAuthorization: Host connects to this hub as an
+// unauthenticated SignalR client to push ticks, so gating it would silently kill live
+// ingestion into the dashboard. The hub is only reachable on the VM's own network anyway --
+// no public firewall rule exposes this port.
 app.MapHub<MarketDataHub>("/hubs/market-data");
+
+// Static form POST rather than an interactive component: a Blazor circuit can't write an auth
+// cookie (response headers are already flushed by the time component code runs).
+app.MapPost("/auth/login", async (HttpContext context, IAntiforgery antiforgery, IOptions<DashboardAuthOptions> auth) =>
+{
+    // Validated explicitly -- the antiforgery middleware only auto-validates endpoints that
+    // opt in via [FromForm] binding metadata, which reading the form directly doesn't do.
+    await antiforgery.ValidateRequestAsync(context);
+
+    var form = await context.Request.ReadFormAsync();
+    if (!auth.Value.Matches(form["username"], form["password"]))
+    {
+        return Results.Redirect("/login?failed=true");
+    }
+
+    var identity = new ClaimsIdentity(
+        [new Claim(ClaimTypes.Name, auth.Value.Username)],
+        CookieAuthenticationDefaults.AuthenticationScheme);
+
+    await context.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme, new ClaimsPrincipal(identity));
+    return Results.Redirect("/");
+});
+
+app.MapPost("/auth/logout", async (HttpContext context, IAntiforgery antiforgery) =>
+{
+    await antiforgery.ValidateRequestAsync(context);
+    await context.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+    return Results.Redirect("/login");
+});
 
 app.Run();

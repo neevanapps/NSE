@@ -87,6 +87,11 @@ public sealed class LiveTradingEngine(
         var dailyLossLimit = _config.Capital.Total * (decimal)_config.RiskLimits.MaxDailyLossPct / 100m;
         var dailyLossLimitBreached = closedTodayNetPnl <= -dailyLossLimit;
 
+        // Same already-fetched figure, opposite side -- no extra round trip. Realised only:
+        // an open position sitting in profit does not trip this, since it isn't banked yet.
+        var dailyProfitTarget = _config.Capital.Total * (decimal)_config.RiskLimits.MaxDailyProfitPct / 100m;
+        var dailyProfitTargetReached = closedTodayNetPnl >= dailyProfitTarget;
+
         var isExpiryDay = featureEngine.NearestExpiry == DateOnly.FromDateTime(todayIstMidnight.Date);
 
         var context = new EntryContext(
@@ -100,7 +105,8 @@ public sealed class LiveTradingEngine(
             TradesSoFarToday: tradesToday,
             OpenConcurrentPositions: openConcurrentPositions,
             LastEntryTimeSameDirection: lastEntrySameDirection,
-            IsExpiryDay: isExpiryDay);
+            IsExpiryDay: isExpiryDay,
+            DailyProfitTargetReached: dailyProfitTargetReached);
 
         var decision = EntryRuleEvaluator.Evaluate(context, _config);
         if (!decision.ShouldEnter)
@@ -155,6 +161,13 @@ public sealed class LiveTradingEngine(
         }
 
         var markPrice = bid ?? ltp;
+
+        // Before the exit evaluation, not after: the tick that trips a stop or a partial book
+        // is by definition an extreme, so it belongs in the excursion record. Cadences with no
+        // live quote returned above, so those gaps are missing from MFE/MAE the same way they're
+        // missing from the exit rules themselves.
+        var excursionMoved = UpdateExcursions(position, markPrice);
+
         var state = new OpenPositionState(
             EntryTime: position.EntryTime,
             EntryPremium: position.EntryPrice,
@@ -165,6 +178,13 @@ public sealed class LiveTradingEngine(
         var decision = ExitRuleEvaluator.Evaluate(state, score, now, _config);
         if (!decision.ShouldExit)
         {
+            // Only write when a watermark actually moved -- otherwise this turns every cadence
+            // into a DB write per open position for no new information.
+            if (excursionMoved)
+            {
+                await db.SaveChangesAsync(ct);
+            }
+
             return false;
         }
 
@@ -218,5 +238,39 @@ public sealed class LiveTradingEngine(
             $"NiftySignal EXIT: {position.TradingSymbol} {decision.Reason} @ {finalFill.FillPrice} P&L {netPnl:+0.00;-0.00}",
             ct);
         return true;
+    }
+
+    /// <summary>
+    /// Rolls the trade's best/worst unrealised excursion forward with the latest mark, returning
+    /// whether either watermark actually moved (so the caller can skip a pointless write).
+    ///
+    /// Percent of entry premium, matching ExitRuleEvaluator's own profit calculation, so MFE/MAE
+    /// read on the same scale as StopLossPct and PartialBookAtProfitPct -- "ran to +40% before
+    /// exiting at +30%" is directly answerable. Both are seeded on the first quoted cadence
+    /// rather than at entry, since entry has no mark price of its own yet.
+    /// </summary>
+    static bool UpdateExcursions(PaperTrade position, decimal markPrice)
+    {
+        if (position.EntryPrice <= 0)
+        {
+            return false;
+        }
+
+        var excursionPct = (double)((markPrice - position.EntryPrice) / position.EntryPrice * 100m);
+        var moved = false;
+
+        if (position.MaxFavourableExcursionPct is not { } mfe || excursionPct > mfe)
+        {
+            position.MaxFavourableExcursionPct = excursionPct;
+            moved = true;
+        }
+
+        if (position.MaxAdverseExcursionPct is not { } mae || excursionPct < mae)
+        {
+            position.MaxAdverseExcursionPct = excursionPct;
+            moved = true;
+        }
+
+        return moved;
     }
 }

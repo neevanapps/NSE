@@ -61,4 +61,9 @@ public sealed record ExitConfig(
 
 public sealed record CostsConfig(decimal BrokeragePerOrder, int SlippageTicks);
 
-public sealed record RiskLimitsConfig(double MaxDailyLossPct, int MaxConsecutiveLosses);
+/// <summary>
+/// <paramref name="MaxDailyProfitPct"/> (2026-09-05) is the upside counterpart to
+/// <paramref name="MaxDailyLossPct"/>: once realised profit for the day clears it, new entries
+/// stop. Both are percentages of <see cref="CapitalConfig.Total"/>.
+/// </summary>
+public sealed record RiskLimitsConfig(double MaxDailyLossPct, double MaxDailyProfitPct, int MaxConsecutiveLosses);

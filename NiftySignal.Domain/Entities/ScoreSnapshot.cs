@@ -41,6 +41,14 @@ public sealed class ScoreSnapshot
 
     public double? CompositeScore { get; set; }
 
+    /// <summary>
+    /// Spot at the moment this cadence was computed (2026-09-05). Captured here rather than
+    /// re-derived from the tick stream so score and price are aligned by construction -- the
+    /// dashboard's score chart overlays them, and the reversal analysis in
+    /// docs/REVERSAL_ANALYSIS.md needs exactly this pairing without a time-window join.
+    /// </summary>
+    public double? SpotPrice { get; set; }
+
     public bool IsWarmedUp { get; set; }
 
     public required string WeightSetVersion { get; set; }

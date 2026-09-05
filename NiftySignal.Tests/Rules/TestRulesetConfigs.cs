@@ -35,6 +35,6 @@ public static class TestRulesetConfigs
             ExitOnScoreBelowAbs: 30,
             MaxHoldMinutes: 120),
         Costs: new CostsConfig(BrokeragePerOrder: 20, SlippageTicks: 2),
-        RiskLimits: new RiskLimitsConfig(MaxDailyLossPct: 3.0, MaxConsecutiveLosses: 4),
+        RiskLimits: new RiskLimitsConfig(MaxDailyLossPct: 3.0, MaxDailyProfitPct: 6.0, MaxConsecutiveLosses: 4),
         KillSwitch: new KillSwitchOptions { EntriesEnabled = true });
 }

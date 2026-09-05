@@ -7,7 +7,7 @@ using NiftySignal.Scoring;
 
 namespace NiftySignal.Host;
 
-readonly record struct InstrumentState(decimal LastPrice, long? OpenInterest, MarketDepth? Depth);
+readonly record struct InstrumentState(decimal LastPrice, long Volume, long? OpenInterest, MarketDepth? Depth);
 
 /// <summary>
 /// Turns the live tick stream into the six weighted z-scores + composite score (plan
@@ -70,6 +70,15 @@ public sealed class LiveFeatureEngine
     const double RiskFreeRate = 0.065;
     const decimal IvSkewStrikeOffset = 200m;
 
+    /// <summary>
+    /// Strikes each side of ATM whose per-cadence analytics get persisted (2026-09-05) --
+    /// so ATM +/- 2, i.e. 5 strikes x 2 sides = ~10 rows a cadence. The full tracked chain is
+    /// ATM +/- 10; persisting Greeks for all of it every 15s would be ~600k values a day,
+    /// mostly for far strikes that barely trade. Display is unaffected -- the option chain and
+    /// OI profile still show the full range.
+    /// </summary>
+    const int PersistedStrikeBand = 2;
+
     // Matches the longest of the six per-metric windows (Pcr/OiBuildupNet/FuturesBasis) so
     // the dynamic-k window doesn't push composite warm-up out any further than the existing
     // six already require.
@@ -106,6 +115,14 @@ public sealed class LiveFeatureEngine
     readonly Queue<(DateTimeOffset At, decimal FuturesPrice)> _momentumLookback = new();
     readonly Queue<(DateTimeOffset At, decimal Vix)> _vixLookback = new();
 
+    /// <summary>
+    /// Cumulative day volume per token as of the last <see cref="BuildStrikeSnapshots"/> pass.
+    /// Kept separate from <see cref="_previousCadence"/> so strike-snapshot building has no
+    /// ordering dependency on ComputeCadence -- either can run first, and neither resets the
+    /// other's baseline. Only holds the persisted band's tokens, so it stays tiny.
+    /// </summary>
+    readonly Dictionary<string, long> _previousVolumeByToken = [];
+
     public LiveFeatureEngine(IReadOnlyList<Instrument> instruments)
     {
         _instruments = instruments;
@@ -121,7 +138,7 @@ public sealed class LiveFeatureEngine
 
     public void OnTick(Tick tick)
     {
-        _latest[tick.Token] = new InstrumentState(tick.LastPrice, tick.OpenInterest, tick.Depth);
+        _latest[tick.Token] = new InstrumentState(tick.LastPrice, tick.Volume, tick.OpenInterest, tick.Depth);
     }
 
     /// <summary>
@@ -391,9 +408,120 @@ public sealed class LiveFeatureEngine
             VixChangeZ = inputs.VixChangeZ,
             CompositeScoreRaw = compositeRaw,
             CompositeScore = composite.Score,
+            SpotPrice = (double)spot.LastPrice,
             IsWarmedUp = composite.IsWarmedUp,
             WeightSetVersion = composite.WeightSetVersion,
         };
+    }
+
+    /// <summary>
+    /// Per-strike analytics for the persisted band (2026-09-05) -- volume traded this cadence,
+    /// top-of-book spread, IV and the full Greeks set. Pure accumulation for later analysis;
+    /// nothing downstream consumes these yet.
+    ///
+    /// Independent of <see cref="ComputeCadence"/> in both directions: it keeps its own volume
+    /// baseline (<see cref="_previousVolumeByToken"/>) rather than sharing
+    /// <c>_previousCadence</c>, so the worker can call the two in either order without one
+    /// silently zeroing the other's deltas.
+    ///
+    /// Empty (not null) whenever spot hasn't ticked yet -- same "no data, no output" tolerance
+    /// as everything else here.
+    /// </summary>
+    public List<StrikeSnapshot> BuildStrikeSnapshots(DateTimeOffset now)
+    {
+        var snapshots = new List<StrikeSnapshot>();
+        if (!_latest.TryGetValue(_spot.Token, out var spot) || spot.LastPrice <= 0)
+        {
+            return snapshots;
+        }
+
+        // Nearest (2*band + 1) distinct strikes to spot. Taking by absolute distance rather
+        // than computing an ATM strike and stepping outward means an off-centre spot (sitting
+        // between two strikes) still yields the genuinely closest set, which is what "near the
+        // money" should mean.
+        var bandStrikes = _nearestExpiryOptions
+            .Select(o => o.StrikePrice!.Value)
+            .Distinct()
+            .OrderBy(s => Math.Abs(s - spot.LastPrice))
+            .Take((PersistedStrikeBand * 2) + 1)
+            .ToHashSet();
+
+        var t = TimeToExpiry.YearsUntilExpiry(_nearestExpiry, now);
+
+        foreach (var option in _nearestExpiryOptions.Where(o => bandStrikes.Contains(o.StrikePrice!.Value)))
+        {
+            if (!_latest.TryGetValue(option.Token, out var state))
+            {
+                continue;
+            }
+
+            long? volumeDelta = null;
+            if (_previousVolumeByToken.TryGetValue(option.Token, out var previousVolume))
+            {
+                // Guard against a feed reset (cumulative counter going backwards) producing a
+                // negative "traded volume", which would be nonsense rather than merely wrong.
+                volumeDelta = Math.Max(0, state.Volume - previousVolume);
+            }
+
+            _previousVolumeByToken[option.Token] = state.Volume;
+
+            var depth = state.Depth;
+            var bid = depth?.Bid1Price is > 0 ? depth.Bid1Price : (decimal?)null;
+            var ask = depth?.Ask1Price is > 0 ? depth.Ask1Price : (decimal?)null;
+
+            decimal? spreadAbs = null, spreadPctOfMid = null;
+            if (bid is { } b && ask is { } a)
+            {
+                spreadAbs = a - b;
+                var mid = (a + b) / 2;
+                spreadPctOfMid = mid > 0 ? spreadAbs / mid * 100m : null;
+            }
+
+            // Priced against spot, not the tracked (monthly) future -- see ComputeIvSkew's doc
+            // comment for why. Greeks are only meaningful if the IV solve succeeded; a failed
+            // solve leaves all six null rather than seeding an arbitrary volatility.
+            var mark = MidPrice(state);
+            double? iv = null, delta = null, gamma = null, thetaPerDay = null, vega = null, rho = null;
+            if (mark is { } markPrice && markPrice > 0)
+            {
+                iv = ImpliedVolatilitySolver.Solve(
+                    option.OptionType, (double)markPrice, (double)spot.LastPrice, (double)option.StrikePrice!.Value, t, RiskFreeRate);
+
+                if (iv is { } ivValue)
+                {
+                    var greeks = BlackScholes.Calculate(
+                        option.OptionType, (double)spot.LastPrice, (double)option.StrikePrice!.Value, t, RiskFreeRate, ivValue).Greeks;
+                    delta = greeks.Delta;
+                    gamma = greeks.Gamma;
+                    thetaPerDay = greeks.ThetaPerDay;
+                    vega = greeks.Vega;
+                    rho = greeks.Rho;
+                }
+            }
+
+            snapshots.Add(new StrikeSnapshot
+            {
+                ComputedAt = now,
+                Token = option.Token,
+                StrikePrice = option.StrikePrice!.Value,
+                OptionType = option.OptionType,
+                ExpiryDate = _nearestExpiry,
+                VolumeDelta = volumeDelta,
+                OpenInterest = state.OpenInterest,
+                BidPrice = bid,
+                AskPrice = ask,
+                SpreadAbs = spreadAbs,
+                SpreadPctOfMid = spreadPctOfMid,
+                ImpliedVolatility = iv,
+                Delta = delta,
+                Gamma = gamma,
+                ThetaPerDay = thetaPerDay,
+                Vega = vega,
+                Rho = rho,
+            });
+        }
+
+        return snapshots;
     }
 
     void ResetSamples()

@@ -18,7 +18,8 @@ public class EntryRuleEvaluatorTests
         TradesSoFarToday: 0,
         OpenConcurrentPositions: 0,
         LastEntryTimeSameDirection: null,
-        IsExpiryDay: false);
+        IsExpiryDay: false,
+        DailyProfitTargetReached: false);
 
     [Fact]
     public void Evaluate_AllowsEntry_WhenEveryConditionIsMet()
@@ -114,6 +115,31 @@ public class EntryRuleEvaluatorTests
 
         Assert.False(result.ShouldEnter);
         Assert.Contains(result.FailedConditions, f => f.Contains("circuit breaker"));
+    }
+
+    [Fact]
+    public void Evaluate_Blocks_WhenDailyProfitTargetHasBeenReached()
+    {
+        // The upside mirror of the loss breaker -- a good day should stop opening new risk,
+        // not keep trading until it's given back.
+        var context = HappyPath() with { DailyProfitTargetReached = true };
+
+        var result = EntryRuleEvaluator.Evaluate(context, TestRulesetConfigs.Default());
+
+        Assert.False(result.ShouldEnter);
+        Assert.Contains(result.FailedConditions, f => f.Contains("profit target"));
+    }
+
+    [Fact]
+    public void Evaluate_AllowsEntry_WhenDailyProfitTargetHasNotBeenReached()
+    {
+        // Boundary companion to the test above: the flag being false must not block on its own.
+        var context = HappyPath() with { DailyProfitTargetReached = false };
+
+        var result = EntryRuleEvaluator.Evaluate(context, TestRulesetConfigs.Default());
+
+        Assert.True(result.ShouldEnter);
+        Assert.DoesNotContain(result.FailedConditions, f => f.Contains("profit target"));
     }
 
     [Fact]

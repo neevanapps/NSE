@@ -19,6 +19,11 @@ public sealed class TickConfiguration : IEntityTypeConfiguration<Tick>
         // the query shape both live feature computation and backtest replay depend on.
         builder.HasIndex(t => new { t.Token, t.ExchangeTimestamp });
 
+        // LiveDataService.PollAsync's connection-status check orders the whole table by
+        // ReceivedAt with no token filter -- without this, it's a full parallel seq scan
+        // (335ms measured against 3.86M rows).
+        builder.HasIndex(t => t.ReceivedAt);
+
         builder.OwnsOne(t => t.Depth, depth =>
         {
             depth.Property(d => d.Bid1Price).HasColumnName("bid1_price").HasPrecision(18, 4);

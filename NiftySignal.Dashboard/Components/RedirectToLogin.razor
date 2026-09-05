@@ -1,0 +1,9 @@
+@inject NavigationManager Navigation
+
+@code {
+    // Rendered by Routes.razor's NotAuthorized fragment. forceLoad is required, not optional:
+    // signing in has to be a real HTTP round trip so the auth cookie is actually written --
+    // an in-circuit navigation would land on /login without ever leaving the current
+    // unauthenticated circuit.
+    protected override void OnInitialized() => Navigation.NavigateTo("/login", forceLoad: true);
+}

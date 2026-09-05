@@ -6,8 +6,16 @@
 
 <div class="panel oi-profile-panel">
     <div class="panel-title">
-        OI Profile &mdash; NIFTY (nearest weekly)
-        <span class="text-faint" style="font-weight:400; text-transform:none;">call vs put OI by strike</span>
+        OI Change &mdash; NIFTY (nearest weekly, last 30 min)
+        <span class="oi-mode-tabs">
+            <button type="button" class="oi-mode-tab @(_mode == OiMode.Contracts ? "active" : "")" @onclick="() => SetMode(OiMode.Contracts)">Contracts</button>
+            <button type="button" class="oi-mode-tab @(_mode == OiMode.Notional ? "active" : "")" @onclick="() => SetMode(OiMode.Notional)">Notional</button>
+        </span>
+    </div>
+
+    <div class="oi-totals">
+        <span class="oi-total-item">Total CE <span class="text-bull">@FormatNotional(_totalCallNotional)</span></span>
+        <span class="oi-total-item">Total PE <span class="text-bear">@FormatNotional(_totalPutNotional)</span></span>
     </div>
 
     <div class="oi-chart">
@@ -31,21 +39,106 @@
         }
     }
 
+    // Contracts answers "how many contracts changed hands here"; notional answers "how much
+    // money moved here". A 5-rupee option and a 500-rupee option count the same in the first
+    // view and differ 100x in the second, so both are worth having rather than one replacing
+    // the other.
+    enum OiMode { Contracts, Notional }
+
+    OiMode _mode = OiMode.Contracts;
+    decimal _totalCallNotional;
+    decimal _totalPutNotional;
+
+    async Task SetMode(OiMode mode)
+    {
+        _mode = mode;
+        if (_rendered && _module is not null)
+        {
+            var (labels, calls, puts) = BuildOiSeries();
+            await _module.InvokeVoidAsync("updateDivergingBarChart", "oi-profile-chart", labels, calls, puts);
+        }
+    }
+
+    // Nearest expiry only: the chain now carries both weeklies, but overlaying two expiries'
+    // OI on one axis would blur exactly the support/resistance read this chart exists for.
+    IEnumerable<OptionChainRow> NearestExpiryRows
+    {
+        get
+        {
+            var chain = Live.OptionChain;
+            if (chain.Count == 0)
+            {
+                return [];
+            }
+
+            var nearest = chain.Min(r => r.ExpiryDate);
+            return chain.Where(r => r.ExpiryDate == nearest);
+        }
+    }
+
+    /// <summary>
+    /// 30-min OI *change* per strike (2026-09-05), not the absolute level -- the level was
+    /// structurally almost static within any one viewing session (OI only moves meaningfully
+    /// over minutes, not the 5s poll cadence) and told you where positions already sit, not
+    /// where money is moving right now. A null change (no 30-min-ago tick yet) reads as 0 here,
+    /// same as everywhere else that tolerates "nothing live yet".
+    /// </summary>
     (string[] Labels, double[] CallOi, double[] PutOi) BuildOiSeries()
     {
-        var strikes = Live.OptionChain.Select(r => r.Strike).Distinct().OrderBy(s => s).ToArray();
-        var calls = strikes.Select(s => (double)(Live.OptionChain.FirstOrDefault(r => r.Strike == s && r.OptionType == OptionType.Call)?.OpenInterest ?? 0)).ToArray();
-        var puts = strikes.Select(s => -(double)(Live.OptionChain.FirstOrDefault(r => r.Strike == s && r.OptionType == OptionType.Put)?.OpenInterest ?? 0)).ToArray();
+        var rows = NearestExpiryRows.ToList();
+        var strikes = rows.Select(r => r.Strike).Distinct().OrderBy(s => s).ToArray();
+
+        double Value(decimal strike, OptionType side)
+        {
+            var row = rows.FirstOrDefault(r => r.Strike == strike && r.OptionType == side);
+            if (row is null)
+            {
+                return 0;
+            }
+
+            return _mode == OiMode.Notional ? (double)(row.NotionalOiChange ?? 0) : (row.OiChange ?? 0);
+        }
+
+        var calls = strikes.Select(s => Value(s, OptionType.Call)).ToArray();
+        var puts = strikes.Select(s => -Value(s, OptionType.Put)).ToArray();
         return (strikes.Select(s => s.ToString("0")).ToArray(), calls, puts);
+    }
+
+    /// <summary>
+    /// Total CE / PE open interest right now, always in notional rupees regardless of the
+    /// chart's Contracts/Notional toggle -- the classic PCR-style "how much money sits on each
+    /// side overall", independent of the 30-min change the bars above show.
+    /// </summary>
+    void RefreshTotals()
+    {
+        var rows = NearestExpiryRows;
+        _totalCallNotional = rows.Where(r => r.OptionType == OptionType.Call).Sum(r => r.NotionalValue);
+        _totalPutNotional = rows.Where(r => r.OptionType == OptionType.Put).Sum(r => r.NotionalValue);
+    }
+
+    // Indian-market convention (Lakh/Crore) rather than raw digits -- these totals run into the
+    // hundreds of crores and are unreadable as a plain number.
+    static string FormatNotional(decimal value)
+    {
+        var abs = Math.Abs(value);
+        return abs switch
+        {
+            >= 1_00_00_000m => $"₹{value / 1_00_00_000m:0.00} Cr",
+            >= 1_00_000m => $"₹{value / 1_00_000m:0.0} L",
+            _ => $"₹{value:N0}",
+        };
     }
 
     async Task RenderChart()
     {
         if (_module is null) return;
 
-        // Two real series -- call OI (positive, green) and put OI (negative, red) -- sharing
-        // one strike axis, mirrored around zero: the standard "OI profile" read for where
-        // resistance/support sits. A single series can't show both sides at once.
+        RefreshTotals();
+
+        // Two real series -- call OI change (positive, green) and put OI change (negative,
+        // red) -- sharing one strike axis, mirrored around zero. A bar extending outward from
+        // zero on its own side is buildup; one crossing back over zero is unwinding on that
+        // side. A single series can't show both sides at once.
         var (labels, calls, puts) = BuildOiSeries();
         await _module.InvokeVoidAsync("renderDivergingBarChart", "oi-profile-chart", labels, calls, puts, "#22c55e", "#f87171");
     }
@@ -54,6 +147,7 @@
     {
         await InvokeAsync(async () =>
         {
+            RefreshTotals();
             StateHasChanged();
             if (_rendered && _module is not null)
             {

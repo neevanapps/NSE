@@ -18,7 +18,8 @@ public sealed record EntryContext(
     int TradesSoFarToday,
     int OpenConcurrentPositions,
     DateTimeOffset? LastEntryTimeSameDirection,
-    bool IsExpiryDay);
+    bool IsExpiryDay,
+    bool DailyProfitTargetReached = false);
 
 /// <summary>Every failed check is included, not just the first -- plan section 7.3: "the rejection data matters as much as the acceptance data."</summary>
 public sealed record EntryDecision(bool ShouldEnter, EntryDirection Direction, IReadOnlyList<string> FailedConditions);
@@ -63,6 +64,15 @@ public static class EntryRuleEvaluator
         if (context.DailyLossLimitBreached)
         {
             failures.Add("Daily loss circuit breaker has tripped");
+        }
+
+        // The upside mirror of the loss breaker (2026-09-05): once the day's realised profit
+        // clears the target, stop opening new risk rather than giving it back. Deliberately
+        // blocks entries only -- open positions still run their normal exit rules, and
+        // ingestion is untouched, same separation the kill switch already draws.
+        if (context.DailyProfitTargetReached)
+        {
+            failures.Add("Daily profit target has been reached");
         }
 
         if (!context.AllFeaturesWarmedUp)
