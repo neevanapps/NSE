@@ -112,6 +112,18 @@ public sealed class LiveFeatureEngine
     readonly RunningAverage _depthImbalanceSamples = new();
     readonly RunningAverage _ivSkewSamples = new();
 
+    /// <summary>
+    /// Per-strike spread samples, fed by <see cref="Sample"/> every ~3s like the five score
+    /// metrics above -- but consumed and reset by <see cref="BuildStrikeSnapshots"/> instead of
+    /// <see cref="ResetSamples"/>, so the two stay independent of each other's call order (same
+    /// reason <see cref="_previousVolumeByToken"/> keeps its own baseline rather than sharing
+    /// <c>_previousCadence</c>). Keyed by every tracked option token, not just the currently
+    /// persisted band, so a strike that enters the band mid-window still has real history
+    /// rather than nothing to average.
+    /// </summary>
+    readonly Dictionary<string, RunningAverage> _spreadAbsSamplesByToken = [];
+    readonly Dictionary<string, RunningAverage> _spreadPctOfMidSamplesByToken = [];
+
     readonly Queue<(DateTimeOffset At, decimal FuturesPrice)> _momentumLookback = new();
     readonly Queue<(DateTimeOffset At, decimal Vix)> _vixLookback = new();
 
@@ -305,6 +317,52 @@ public sealed class LiveFeatureEngine
         _pcrSamples.Add(ComputePcr());
         _depthImbalanceSamples.Add(ComputeDepthImbalance(spot.LastPrice));
         _ivSkewSamples.Add(ComputeIvSkew(spot.LastPrice, now));
+        SampleSpreads();
+    }
+
+    /// <summary>
+    /// One spread reading per tracked option token, folded into that token's running average --
+    /// a single wide print right at the cadence boundary would otherwise look identical to a
+    /// persistently wide, illiquid market. Every option in the nearest expiry is sampled, not
+    /// just the currently persisted ATM band, since the band itself is only decided later in
+    /// <see cref="BuildStrikeSnapshots"/> once the exact cadence-time spot price is known.
+    /// </summary>
+    void SampleSpreads()
+    {
+        foreach (var option in _nearestExpiryOptions)
+        {
+            if (!_latest.TryGetValue(option.Token, out var state))
+            {
+                continue;
+            }
+
+            var depth = state.Depth;
+            var bid = depth?.Bid1Price is > 0 ? depth.Bid1Price : (decimal?)null;
+            var ask = depth?.Ask1Price is > 0 ? depth.Ask1Price : (decimal?)null;
+            if (bid is not { } b || ask is not { } a)
+            {
+                continue;
+            }
+
+            var spreadAbs = a - b;
+            if (!_spreadAbsSamplesByToken.TryGetValue(option.Token, out var absSamples))
+            {
+                absSamples = new RunningAverage();
+                _spreadAbsSamplesByToken[option.Token] = absSamples;
+            }
+            absSamples.Add((double)spreadAbs);
+
+            var mid = (a + b) / 2;
+            if (mid > 0)
+            {
+                if (!_spreadPctOfMidSamplesByToken.TryGetValue(option.Token, out var pctSamples))
+                {
+                    pctSamples = new RunningAverage();
+                    _spreadPctOfMidSamplesByToken[option.Token] = pctSamples;
+                }
+                pctSamples.Add((double)(spreadAbs / mid * 100m));
+            }
+        }
     }
 
     /// <summary>Null until the spot and future have at least one tick each.</summary>
@@ -439,14 +497,23 @@ public sealed class LiveFeatureEngine
         // than computing an ATM strike and stepping outward means an off-centre spot (sitting
         // between two strikes) still yields the genuinely closest set, which is what "near the
         // money" should mean.
-        var bandStrikes = _nearestExpiryOptions
+        var strikesByDistance = _nearestExpiryOptions
             .Select(o => o.StrikePrice!.Value)
             .Distinct()
             .OrderBy(s => Math.Abs(s - spot.LastPrice))
-            .Take((PersistedStrikeBand * 2) + 1)
-            .ToHashSet();
+            .ToList();
+        var atmStrike = strikesByDistance[0];
+        var bandStrikes = strikesByDistance.Take((PersistedStrikeBand * 2) + 1).ToHashSet();
 
         var t = TimeToExpiry.YearsUntilExpiry(_nearestExpiry, now);
+
+        // One reference vol per cadence, solved at the ATM strike -- the most liquid, most
+        // trustworthy point on the chain. Pricing every strike at the ATM strike's vol (rather
+        // than each strike's own solved IV, which would just reproduce its own price and be
+        // circular) makes the gap meaningful: the skew premium in rupees. Same methodology as
+        // the dashboard's live theoretical-price display (LiveDataService.BuildAtmReferenceVol),
+        // ported here so it gets persisted for analysis rather than only existing on screen.
+        var atmReferenceVol = SolveAtmReferenceVol(atmStrike, spot.LastPrice, t);
 
         foreach (var option in _nearestExpiryOptions.Where(o => bandStrikes.Contains(o.StrikePrice!.Value)))
         {
@@ -465,17 +532,22 @@ public sealed class LiveFeatureEngine
 
             _previousVolumeByToken[option.Token] = state.Volume;
 
+            // Bid/Ask themselves stay instantaneous -- "what could I trade at right now" is
+            // inherently a point-in-time fact. Spread is different: it's averaged over the
+            // cadence (fed by SampleSpreads every ~3s, same treatment as the five score
+            // metrics), because it's used to judge how *consistently* liquid a strike is, and a
+            // single wide print at the cadence boundary shouldn't read the same as a
+            // persistently wide market.
             var depth = state.Depth;
             var bid = depth?.Bid1Price is > 0 ? depth.Bid1Price : (decimal?)null;
             var ask = depth?.Ask1Price is > 0 ? depth.Ask1Price : (decimal?)null;
 
-            decimal? spreadAbs = null, spreadPctOfMid = null;
-            if (bid is { } b && ask is { } a)
-            {
-                spreadAbs = a - b;
-                var mid = (a + b) / 2;
-                spreadPctOfMid = mid > 0 ? spreadAbs / mid * 100m : null;
-            }
+            decimal? spreadAbs = _spreadAbsSamplesByToken.TryGetValue(option.Token, out var spreadAbsSamples) && spreadAbsSamples.Average is { } avgSpreadAbs
+                ? (decimal)avgSpreadAbs
+                : null;
+            decimal? spreadPctOfMid = _spreadPctOfMidSamplesByToken.TryGetValue(option.Token, out var spreadPctSamples) && spreadPctSamples.Average is { } avgSpreadPct
+                ? (decimal)avgSpreadPct
+                : null;
 
             // Priced against spot, not the tracked (monthly) future -- see ComputeIvSkew's doc
             // comment for why. Greeks are only meaningful if the IV solve succeeded; a failed
@@ -499,6 +571,17 @@ public sealed class LiveFeatureEngine
                 }
             }
 
+            // Independent of this strike's own mark: an illiquid wing with no live quote right
+            // now should still show what it *should* cost against the reference vol, not just
+            // strikes that happen to have a two-sided quote this cadence.
+            double? theoreticalPrice = atmReferenceVol is { } refVol
+                ? BlackScholes.Calculate(option.OptionType, (double)spot.LastPrice, (double)option.StrikePrice!.Value, t, RiskFreeRate, refVol).Price
+                : null;
+
+            double? priceVsTheoretical = mark is { } markForDiff && theoreticalPrice is { } theo
+                ? (double)markForDiff - theo
+                : null;
+
             snapshots.Add(new StrikeSnapshot
             {
                 ComputedAt = now,
@@ -518,8 +601,17 @@ public sealed class LiveFeatureEngine
                 ThetaPerDay = thetaPerDay,
                 Vega = vega,
                 Rho = rho,
+                MarkPrice = mark,
+                TheoreticalPrice = theoreticalPrice,
+                PriceVsTheoretical = priceVsTheoretical,
             });
         }
+
+        // Independent of ResetSamples() -- resets every tracked token's spread accumulator
+        // (not just this cadence's persisted band), so a strike that enters the band later
+        // starts averaging fresh rather than inheriting stale samples from before it mattered.
+        _spreadAbsSamplesByToken.Clear();
+        _spreadPctOfMidSamplesByToken.Clear();
 
         return snapshots;
     }
@@ -698,6 +790,41 @@ public sealed class LiveFeatureEngine
         var putIv = ImpliedVolatilitySolver.Solve(OptionType.Put, (double)pm, (double)spotPrice, (double)putOpt.StrikePrice!.Value, t, RiskFreeRate);
 
         return callIv is null || putIv is null ? null : putIv - callIv;
+    }
+
+    /// <summary>
+    /// Solves IV at the ATM strike to use as every other strike's theoretical-pricing input in
+    /// <see cref="BuildStrikeSnapshots"/>. Prefers the call leg, falls back to the put if the
+    /// call has no usable quote or its solve fails -- same preference as the dashboard's own
+    /// BuildAtmReferenceVol. Null (not a guess) when neither leg can be solved this cadence.
+    /// </summary>
+    double? SolveAtmReferenceVol(decimal atmStrike, decimal spotPrice, double t)
+    {
+        var atmLegs = _nearestExpiryOptions
+            .Where(o => o.StrikePrice == atmStrike)
+            .OrderBy(o => o.OptionType == OptionType.Call ? 0 : 1);
+
+        foreach (var leg in atmLegs)
+        {
+            if (!_latest.TryGetValue(leg.Token, out var state))
+            {
+                continue;
+            }
+
+            var mark = MidPrice(state);
+            if (mark is not { } markPrice || markPrice <= 0)
+            {
+                continue;
+            }
+
+            var solved = ImpliedVolatilitySolver.Solve(leg.OptionType, (double)markPrice, (double)spotPrice, (double)atmStrike, t, RiskFreeRate);
+            if (solved is { } vol)
+            {
+                return vol;
+            }
+        }
+
+        return null;
     }
 
     // Plan 4.2: mid of bid/ask when the depth snapshot is available, LTP fallback otherwise.

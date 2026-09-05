@@ -42,14 +42,23 @@ public sealed class StrikeSnapshot
 
     public long? OpenInterest { get; set; }
 
+    /// <summary>Instantaneous top-of-book bid as of this cadence tick -- not averaged, unlike <see cref="SpreadAbs"/> below.</summary>
     public decimal? BidPrice { get; set; }
 
+    /// <summary>Instantaneous top-of-book ask as of this cadence tick -- not averaged, unlike <see cref="SpreadAbs"/> below.</summary>
     public decimal? AskPrice { get; set; }
 
-    /// <summary>Ask minus bid. Stored rather than derived at query time so spread history is directly queryable.</summary>
+    /// <summary>
+    /// Ask minus bid, averaged over the ~15s cadence window (sampled every ~3s by
+    /// LiveFeatureEngine.SampleSpreads) rather than read once at the cadence boundary -- a
+    /// single wide print right at that instant would otherwise look identical to a
+    /// persistently illiquid strike. Same smoothing the composite score's five noisy metrics
+    /// already get, applied per-strike here (2026-09-05). Stored rather than derived at query
+    /// time so spread history is directly queryable.
+    /// </summary>
     public decimal? SpreadAbs { get; set; }
 
-    /// <summary>Spread as a percentage of mid -- the same normalisation StrikeSelectionConfig.MaxSpreadPctOfMid filters on.</summary>
+    /// <summary>Spread as a percentage of mid, averaged the same way as <see cref="SpreadAbs"/> -- the same normalisation StrikeSelectionConfig.MaxSpreadPctOfMid filters on.</summary>
     public decimal? SpreadPctOfMid { get; set; }
 
     /// <summary>Null when the solver genuinely fails (deep ITM/OTM near expiry, no depth yet) -- never a fabricated value.</summary>
@@ -64,4 +73,26 @@ public sealed class StrikeSnapshot
     public double? Vega { get; set; }
 
     public double? Rho { get; set; }
+
+    /// <summary>
+    /// (Bid+Ask)/2, LTP fallback when there's no two-sided quote (see LiveFeatureEngine.MidPrice)
+    /// -- the same price this row's <see cref="ImpliedVolatility"/> was solved from, so the two
+    /// stay self-consistent. Not the tick's own LastPrice: mixing an LTP-based price against a
+    /// mid-based IV/theoretical would make an ordinary quote move look like a false anomaly.
+    /// </summary>
+    public decimal? MarkPrice { get; set; }
+
+    /// <summary>
+    /// Black-Scholes price at the shared ATM-strike reference vol for this expiry+cadence, not
+    /// this strike's own IV (which would just reproduce <see cref="MarkPrice"/> and be circular).
+    /// Null when no ATM leg had a usable quote to solve a reference vol from that cadence.
+    /// </summary>
+    public double? TheoreticalPrice { get; set; }
+
+    /// <summary>
+    /// <see cref="MarkPrice"/> minus <see cref="TheoreticalPrice"/> -- the skew premium in
+    /// rupees. Stored rather than derived at query time (same call as <see cref="SpreadAbs"/>)
+    /// so future analysis can filter/sort on it directly. Null unless both inputs are present.
+    /// </summary>
+    public double? PriceVsTheoretical { get; set; }
 }

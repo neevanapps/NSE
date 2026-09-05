@@ -19,6 +19,7 @@ public sealed class StrikeSnapshotConfiguration : IEntityTypeConfiguration<Strik
         builder.Property(s => s.AskPrice).HasPrecision(18, 4);
         builder.Property(s => s.SpreadAbs).HasPrecision(18, 4);
         builder.Property(s => s.SpreadPctOfMid).HasPrecision(18, 4);
+        builder.Property(s => s.MarkPrice).HasPrecision(18, 4);
 
         // Analysis queries are "this strike over time" (how did its Greeks/spread evolve) and
         // "this cadence across strikes" (what did the band look like at one instant) -- the

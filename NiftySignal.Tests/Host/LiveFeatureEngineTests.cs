@@ -200,6 +200,10 @@ public class LiveFeatureEngineTests
         engine.OnTick(MakeTick(SpotToken, 23950m, Start));
         engine.OnTick(MakeTick(FutureToken, 24000m, Start));
         engine.OnTick(MakeTick(CallToken, 100m, Start, oi: 1_000_000, depth: Depth(500, 400, bid: 99.5m, ask: 100.5m)));
+        // Spread is sampled by Sample() (called every ~3s in production, and once more right at
+        // the cadence boundary by ComputeCadence) rather than read instantaneously -- one sample
+        // in means the average is trivially that one value.
+        engine.Sample(Start);
 
         var call = Assert.Single(engine.BuildStrikeSnapshots(Start), s => s.Token == CallToken);
 
@@ -215,6 +219,119 @@ public class LiveFeatureEngineTests
         Assert.NotNull(call.Delta);
         Assert.NotNull(call.Gamma);
         Assert.NotNull(call.Vega);
+    }
+
+    [Fact]
+    public void BuildStrikeSnapshots_AveragesSpreadAcrossSamples_RatherThanReadingTheLatestOnly()
+    {
+        // Two samples straddling a brief wide print: (1.0 + 3.0) / 2 = 2.0. A point-in-time
+        // read at the cadence boundary would have reported 3.0 (or 1.0, depending on which
+        // arrived last) and hidden that the strike was tight for most of the window.
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, depth: Depth(500, 400, bid: 99.5m, ask: 100.5m)));
+        engine.Sample(Start);
+
+        engine.OnTick(MakeTick(CallToken, 100m, Start.AddSeconds(3), depth: Depth(500, 400, bid: 98.5m, ask: 101.5m)));
+        engine.Sample(Start.AddSeconds(3));
+
+        var call = Assert.Single(engine.BuildStrikeSnapshots(Start.AddSeconds(15)), s => s.Token == CallToken);
+
+        Assert.Equal(2.0m, call.SpreadAbs);
+        // The bid/ask fields themselves stay instantaneous -- they reflect whichever tick
+        // arrived last, not an average of unrelated price levels.
+        Assert.Equal(98.5m, call.BidPrice);
+        Assert.Equal(101.5m, call.AskPrice);
+    }
+
+    [Fact]
+    public void BuildStrikeSnapshots_ResetsSpreadSamples_SoTheyDoNotBleedIntoTheNextCadence()
+    {
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, depth: Depth(500, 400, bid: 90m, ask: 110m))); // spread 20
+        engine.Sample(Start);
+        engine.BuildStrikeSnapshots(Start);
+
+        // A single new sample in the next window -- if the previous window's spread=20 sample
+        // survived, this would average to (20 + 1) / 2 = 10.5 instead of 1.
+        engine.OnTick(MakeTick(CallToken, 100m, Start.AddSeconds(15), depth: Depth(500, 400, bid: 99.5m, ask: 100.5m)));
+        engine.Sample(Start.AddSeconds(15));
+
+        var call = Assert.Single(engine.BuildStrikeSnapshots(Start.AddSeconds(15)), s => s.Token == CallToken);
+
+        Assert.Equal(1.0m, call.SpreadAbs);
+    }
+
+    [Fact]
+    public void BuildStrikeSnapshots_TheoreticalPriceAtTheAtmStrike_ReproducesItsOwnMarkPrice()
+    {
+        // BaseUniverse's one strike (23950) sits exactly at spot, so it IS the ATM strike --
+        // the reference vol is solved from its own quote, so pricing it back at that same vol
+        // must reproduce the price it was solved from. Same sanity check already verified live
+        // for the dashboard's identical methodology (2026-09-05).
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        engine.OnTick(MakeTick(CallToken, 150m, Start, depth: Depth(500, 400, bid: 149.5m, ask: 150.5m)));
+
+        var call = Assert.Single(engine.BuildStrikeSnapshots(Start), s => s.Token == CallToken);
+
+        Assert.Equal(150m, call.MarkPrice);
+        Assert.NotNull(call.TheoreticalPrice);
+        Assert.Equal((double)call.MarkPrice!.Value, call.TheoreticalPrice!.Value, precision: 6);
+        Assert.NotNull(call.PriceVsTheoretical);
+        Assert.Equal(0.0, call.PriceVsTheoretical!.Value, precision: 6);
+    }
+
+    [Fact]
+    public void BuildStrikeSnapshots_PricesEveryStrikeAtTheSharedAtmReferenceVol_NotItsOwnImpliedVol()
+    {
+        // A second, farther strike must be priced at the ATM leg's vol, not its own -- proving
+        // the vol is genuinely shared rather than each row solving (and so trivially
+        // reproducing) its own price.
+        const string FarCallToken = "99001";
+        var universe = BaseUniverse();
+        universe.Add(Option(FarCallToken, OptionType.Call, 24450m));
+
+        var engine = new LiveFeatureEngine(universe);
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        engine.OnTick(MakeTick(CallToken, 150m, Start, depth: Depth(500, 400, bid: 149.5m, ask: 150.5m)));
+        engine.OnTick(MakeTick(FarCallToken, 40m, Start, depth: Depth(200, 200, bid: 39.5m, ask: 40.5m)));
+
+        var snapshots = engine.BuildStrikeSnapshots(Start);
+        var far = Assert.Single(snapshots, s => s.Token == FarCallToken);
+
+        var t = TimeToExpiry.YearsUntilExpiry(NearestExpiry, Start);
+        var atmVol = ImpliedVolatilitySolver.Solve(OptionType.Call, 150.0, 23950.0, 23950.0, t, 0.065)!.Value;
+        var expectedTheoretical = BlackScholes.Calculate(OptionType.Call, 23950.0, 24450.0, t, 0.065, atmVol).Price;
+
+        Assert.NotNull(far.TheoreticalPrice);
+        Assert.Equal(expectedTheoretical, far.TheoreticalPrice!.Value, precision: 6);
+        // Its own market price (40) is nowhere near the shared-vol theoretical for a strike
+        // this far out of the money -- if this failed, it'd mean the row silently fell back to
+        // solving its own IV instead of using the shared one.
+        Assert.NotEqual(40.0, far.TheoreticalPrice!.Value, precision: 1);
+    }
+
+    [Fact]
+    public void BuildStrikeSnapshots_LeavesTheoreticalPriceNull_WhenNeitherAtmLegHasAUsableQuote()
+    {
+        // Both ATM legs present but with no depth and no LTP (price 0) -- there's nothing to
+        // solve a reference vol from, so every row's theoretical price must stay null rather
+        // than falling back to a fabricated vol.
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(CallToken, 0m, Start));
+        engine.OnTick(MakeTick(PutToken, 0m, Start));
+
+        var snapshots = engine.BuildStrikeSnapshots(Start);
+
+        Assert.All(snapshots, s => Assert.Null(s.TheoreticalPrice));
+        Assert.All(snapshots, s => Assert.Null(s.PriceVsTheoretical));
     }
 
     [Fact]
