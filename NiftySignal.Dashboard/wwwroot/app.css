@@ -202,6 +202,23 @@ table.data-table {
         cursor: default;
     }
 
+@media (max-width: 900px) {
+    /* Global on purpose: each dashboard panel is a separate child component, and Blazor's
+       CSS isolation never lets a scoped rule in the parent (Home.razor.css) reach a child
+       component's root element -- only an unscoped, global rule like this one can force
+       every panel to full width regardless of which component rendered it. */
+    .dashboard-grid > * {
+        grid-column: 1 / -1 !important;
+    }
+
+    /* This badge normally holds a short status word (Connected, Reconnecting) but doubles as
+       the long "no recent ticks" warning message -- nowrap is right for the former and
+       overflows the screen for the latter. */
+    .badge-warn {
+        white-space: normal;
+    }
+}
+
 ::-webkit-scrollbar {
     width: 8px;
     height: 8px;

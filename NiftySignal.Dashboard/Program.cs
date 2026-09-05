@@ -114,4 +114,14 @@ app.MapPost("/auth/logout", async (HttpContext context, IAntiforgery antiforgery
     return Results.Redirect("/login");
 });
 
-app.Run();
+try
+{
+    app.Run();
+}
+catch (OperationCanceledException)
+{
+    // WindowsServiceLifetime.StopAsync throws this when the Windows Service stop request
+    // arrives while the host is still mid-shutdown -- benign (the service does stop cleanly
+    // immediately after), but otherwise escapes as an unhandled exception and gets logged as
+    // an Application Error / WER crash in Event Viewer on every single stop.
+}

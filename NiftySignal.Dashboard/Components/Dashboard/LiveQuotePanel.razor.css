@@ -55,3 +55,26 @@
         outline: none;
         border-color: var(--accent);
     }
+
+@media (max-width: 900px) {
+    .quote-panel {
+        /* Sticky is a desktop convenience (plenty of vertical room to spare); on a phone it
+           permanently pins a tall card at the top and eats into the little scroll height
+           there is for everything else below it. */
+        position: static;
+        box-shadow: none;
+    }
+
+    /* Left and right groups already wrap onto their own lines at this width (CE and PE end
+       up one per line) -- the desktop-sized 28px/40px gaps were meant to separate stats
+       sharing a single row, and just add dead vertical space between rows here instead. */
+    .quote-group, .quote-group-right {
+        gap: 10px 20px;
+    }
+
+    .quote-spacer {
+        flex-basis: 100%;
+        height: 0;
+        min-width: 0;
+    }
+}

@@ -47,6 +47,23 @@
     margin-left: 16px;
 }
 
+@media (max-width: 900px) {
+    .status-bar {
+        flex-wrap: wrap;
+        row-gap: 10px;
+    }
+
+    /* A flex:1 spacer only makes sense pinning things to one line's far edge -- once the bar
+       wraps onto several lines it just leaves an empty line of its own. */
+    .spacer {
+        display: none;
+    }
+
+    .logout-form {
+        margin-left: 0;
+    }
+}
+
 .logout-button {
     background: transparent;
     border: 1px solid var(--border);

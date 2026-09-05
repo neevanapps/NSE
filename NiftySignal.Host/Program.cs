@@ -70,6 +70,14 @@ try
 
     host.Run();
 }
+catch (OperationCanceledException)
+{
+    // WindowsServiceLifetime.StopAsync throws this when the Windows Service stop request
+    // arrives while the host is still mid-shutdown -- benign (the service does stop cleanly
+    // immediately after). Without this, it falls into the catch below and gets logged as a
+    // fatal/unexpected termination on every single stop. See NiftySignal.Dashboard/Program.cs
+    // for the same fix, needed there because it has no top-level catch at all.
+}
 catch (Exception ex)
 {
     Log.Fatal(ex, "NiftySignal Host terminated unexpectedly");

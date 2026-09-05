@@ -16,7 +16,9 @@
         grid-template-columns: 1fr;
     }
 
-    .dashboard-grid > * {
-        grid-column: span 1 !important;
-    }
+    /* The single-column override for each panel lives in app.css, not here: every panel is
+       its own child component (ScorePanel, OiProfilePanel, ...), and Blazor's CSS isolation
+       only stamps a component's scope attribute onto elements *that component* renders --
+       never onto a child component's root element. A scoped ".dashboard-grid > *" rule here
+       can never match those panels, so the override would silently do nothing. */
 }
