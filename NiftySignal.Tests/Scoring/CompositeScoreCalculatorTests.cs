@@ -30,6 +30,39 @@ public class CompositeScoreCalculatorTests
         Assert.Equal(expectedScore, result.Score.Value, 1e-9);
     }
 
+    [Fact]
+    public void Calculate_UsesRawOverride_InsteadOfRecomputingFromInputs_WhenSupplied()
+    {
+        // 2026-09-07: LiveFeatureEngine's multi-cadence smoothing feeds a caller-supplied raw
+        // (the smoothed value) rather than letting Calculate derive it from inputs itself.
+        var weights = ScoreWeights.Default;
+        var withoutOverride = CompositeScoreCalculator.Calculate(FullyWarmInputs, weights, ComputedAt, k: 1.0);
+        var withOverride = CompositeScoreCalculator.Calculate(FullyWarmInputs, weights, ComputedAt, k: 1.0, rawOverride: 0.0);
+
+        Assert.NotEqual(withoutOverride.Score, withOverride.Score);
+        // raw=0 with any positive k must tanh to exactly 0.
+        Assert.Equal(0.0, withOverride.Score!.Value, 1e-9);
+        // Warm-up and the per-component breakdown still come from inputs, not the override --
+        // an override doesn't manufacture a score out of components that aren't ready.
+        Assert.True(withOverride.IsWarmedUp);
+        Assert.Equal(withoutOverride.Components, withOverride.Components);
+    }
+
+    [Fact]
+    public void Calculate_RawOverrideDoesNotForceAScore_WhenInputsAreNotWarmedUp()
+    {
+        // An override must not bypass the "all six required components present" gate --
+        // that gate is about whether the inputs are trustworthy, which a substituted raw
+        // number can't fix.
+        var weights = ScoreWeights.Default;
+        var notWarm = FullyWarmInputs with { PcrZ = null };
+
+        var result = CompositeScoreCalculator.Calculate(notWarm, weights, ComputedAt, k: 1.0, rawOverride: 5.0);
+
+        Assert.False(result.IsWarmedUp);
+        Assert.Null(result.Score);
+    }
+
     [Theory]
     [InlineData(true, false, false, false, false, false)]
     [InlineData(false, true, false, false, false, false)]

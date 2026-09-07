@@ -25,6 +25,26 @@ public static class FeatureWindowLengths
     /// <summary>Moderate.</summary>
     public static readonly TimeSpan FuturesBasis = TimeSpan.FromMinutes(30);
 
-    /// <summary>VIX ticks slowly (observed ~20-25s between updates, often with no price change) -- a short window would mostly read zero.</summary>
+    /// <summary>
+    /// The lookback used to compute the *raw* VIX change ("VIX now minus VIX this-long-ago").
+    /// VIX ticks slowly (observed ~20-25s between updates, often with no price change) -- a
+    /// short lookback would mostly read zero. Distinct from <see cref="VixChangeZScoreWindow"/>
+    /// below, which governs how that raw value gets z-scored, not how it's computed.
+    /// </summary>
     public static readonly TimeSpan VixChange = TimeSpan.FromMinutes(30);
+
+    /// <summary>
+    /// Rolling window the raw VixChange value (above) is z-scored against. Deliberately much
+    /// longer than the 30-minute raw lookback (2026-09-07 live-caught): since each new 15s
+    /// sample's 30-minute lookback overlaps the previous one by all but 15 seconds, z-scoring
+    /// against a window the *same* length as the raw lookback compares an almost-fully-
+    /// autocorrelated series against itself -- during any stretch where VIX drifts smoothly,
+    /// that series has almost no internal variance, so the window's StdDev collapses toward
+    /// zero and an ordinary subsequent move slams into the +/-3 clip. A window several times
+    /// longer spans enough distinct regimes (calm stretches and active ones) that a single
+    /// flat patch can't dominate the variance estimate. Safe to warm up on a normal timescale
+    /// despite the length -- LiveFeatureEngine.SeedHistory replays persisted VixChangeRaw
+    /// history into this window on restart rather than waiting on real time.
+    /// </summary>
+    public static readonly TimeSpan VixChangeZScoreWindow = TimeSpan.FromHours(2);
 }

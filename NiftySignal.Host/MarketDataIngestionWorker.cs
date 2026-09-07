@@ -86,6 +86,15 @@ public sealed class MarketDataIngestionWorker(
         var tickSource = new FlatTradeTickSource(
             flatTradeOptions.Value, session.ClientId, session.Token, subscriptions, gapRecorder, tickSourceLogger);
 
+        // The only consumer of ConnectionUnstable -- turns a FATAL log line no one was
+        // watching (live-caught 2026-09-07: the feed dropped six times in one morning with
+        // zero notification) into an actual Telegram message. ConnectionFailure already has a
+        // 5-minute cooldown in RateLimitedTelegramNotifier, so a flapping reconnect can't spam.
+        tickSource.ConnectionUnstable += failures => telegram.SendAsync(
+            NotificationCategory.ConnectionFailure,
+            $"NiftySignal: FlatTrade feed has failed {failures} times consecutively and may be down.",
+            stoppingToken);
+
         var cadenceLoop = RunScoreCadenceLoopAsync(stoppingToken);
         var sampleLoop = RunSampleLoopAsync(stoppingToken);
         var pendingSubscriptionLoop = RunPendingSubscriptionLoopAsync(tickSource, asOfDate, stoppingToken);

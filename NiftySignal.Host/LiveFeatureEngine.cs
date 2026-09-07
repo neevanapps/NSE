@@ -84,6 +84,11 @@ public sealed class LiveFeatureEngine
     // six already require.
     static readonly TimeSpan CompositeRawWindowLength = TimeSpan.FromMinutes(30);
 
+    // 5 minutes at the 15s cadence (live-caught 2026-09-07: chosen for a deliberately
+    // low-frequency, 1-5-trades-a-day strategy -- longer smoothing trades entry speed for
+    // fewer, more deliberate signals, which is the explicit goal here, not a side effect).
+    const int CompositeSmoothingCadences = 20;
+
     readonly IReadOnlyList<Instrument> _instruments;
     readonly Instrument _spot;
     readonly Instrument _future;
@@ -96,6 +101,11 @@ public sealed class LiveFeatureEngine
 
     readonly Dictionary<string, InstrumentState> _latest = [];
     Dictionary<string, InstrumentState>? _previousCadence;
+    DateTimeOffset? _lastCadenceAt;
+
+    // Normal cadence spacing is 15s; a gap bigger than this means a feed outage happened
+    // between cadences, not ordinary scheduling jitter.
+    static readonly TimeSpan MaxCadenceGapForOiBuildup = TimeSpan.FromSeconds(20);
 
     readonly WelfordRollingWindow _oiBuildupWindow = new(FeatureWindowLengths.OiBuildupNet);
     readonly WelfordRollingWindow _pcrWindow = new(FeatureWindowLengths.Pcr);
@@ -104,7 +114,10 @@ public sealed class LiveFeatureEngine
     readonly WelfordRollingWindow _momentumWindow = new(FeatureWindowLengths.PriceMomentum);
     readonly WelfordRollingWindow _depthImbalanceWindow = new(FeatureWindowLengths.DepthImbalance);
     readonly WelfordRollingWindow _compositeRawWindow = new(CompositeRawWindowLength);
-    readonly WelfordRollingWindow _vixWindow = new(FeatureWindowLengths.VixChange);
+    readonly WelfordRollingWindow _vixWindow = new(FeatureWindowLengths.VixChangeZScoreWindow);
+
+    /// <summary>Last <see cref="CompositeSmoothingCadences"/> single-cadence composite raw values, oldest first -- see ComputeCadence's smoothing comment.</summary>
+    readonly Queue<double> _compositeRawHistory = new();
 
     readonly RunningAverage _basisSamples = new();
     readonly RunningAverage _momentumSamples = new();
@@ -207,6 +220,19 @@ public sealed class LiveFeatureEngine
             if (snapshot.CompositeScoreRaw is { } compositeRaw)
             {
                 _compositeRawWindow.Add(snapshot.ComputedAt, compositeRaw);
+            }
+
+            // Rebuilds the smoothing FIFO from persisted history so a restart doesn't need a
+            // fresh 5-minute warm-up before smoothing kicks back in. Null for any row persisted
+            // before this field existed -- those are simply skipped, same as every other
+            // nullable field's replay above.
+            if (snapshot.CompositeScoreRawInstant is { } compositeRawInstant)
+            {
+                _compositeRawHistory.Enqueue(compositeRawInstant);
+                while (_compositeRawHistory.Count > CompositeSmoothingCadences)
+                {
+                    _compositeRawHistory.Dequeue();
+                }
             }
 
             if (snapshot.VixChangeRaw is { } vixChange)
@@ -312,8 +338,14 @@ public sealed class LiveFeatureEngine
             return;
         }
 
-        _basisSamples.Add((double)(future.LastPrice - spot.LastPrice));
-        _momentumSamples.Add(ComputeMomentum(now, future.LastPrice));
+        // Mid (bid+ask)/2 rather than raw LTP -- the future's last-traded print was observed
+        // alternating between two levels ~3-4 points apart within seconds (live-caught
+        // 2026-09-07), which read as a real move to both Basis and Momentum even though
+        // nothing was actually trending. Same MidPrice fallback-to-LTP helper options already
+        // use, so this degrades to the old behavior if depth isn't available.
+        var futureMark = MidPrice(future) ?? future.LastPrice;
+        _basisSamples.Add((double)(futureMark - spot.LastPrice));
+        _momentumSamples.Add(ComputeMomentum(now, futureMark));
         _pcrSamples.Add(ComputePcr());
         _depthImbalanceSamples.Add(ComputeDepthImbalance(spot.LastPrice));
         _ivSkewSamples.Add(ComputeIvSkew(spot.LastPrice, now));
@@ -395,9 +427,13 @@ public sealed class LiveFeatureEngine
         }
 
         // Not smoothed like the other five -- see class doc comment. Compares state at this
-        // cadence tick to state at the last one (unchanged from before this change).
-        var oiBuildupRaw = ComputeOiBuildupNet();
-        _oiBuildupWindow.Add(now, oiBuildupRaw);
+        // cadence tick to state at the last one. Null (not a fabricated delta) when the "last
+        // cadence" is stale by more than one normal interval -- see ComputeOiBuildupNet.
+        var oiBuildupRaw = ComputeOiBuildupNet(now);
+        if (oiBuildupRaw is { } oiBuildup)
+        {
+            _oiBuildupWindow.Add(now, oiBuildup);
+        }
 
         var depthImbalanceRaw = _depthImbalanceSamples.Average;
         if (depthImbalanceRaw is { } di)
@@ -421,7 +457,7 @@ public sealed class LiveFeatureEngine
         }
 
         var inputs = new ScoreComponentInputs(
-            OiBuildupNetZ: _oiBuildupWindow.ComputeZScore(oiBuildupRaw),
+            OiBuildupNetZ: oiBuildupRaw is { } oi ? _oiBuildupWindow.ComputeZScore(oi) : null,
             PcrZ: pcrRaw is { } p ? _pcrWindow.ComputeZScore(p) : null,
             FuturesBasisZ: _basisWindow.ComputeZScore(basisRaw),
             IvSkewZ: ivSkewRaw is { } iv ? _ivSkewWindow.ComputeZScore(iv) : null,
@@ -429,23 +465,51 @@ public sealed class LiveFeatureEngine
             DepthImbalanceZ: depthImbalanceRaw is { } d ? _depthImbalanceWindow.ComputeZScore(d) : null,
             VixChangeZ: vixChangeRaw is { } vcr ? _vixWindow.ComputeZScore(vcr) : null);
 
+        // Multi-cadence smoothing (2026-09-07): a composite recomputed from scratch every 15s
+        // with no memory of its own recent behavior was too noisy to sustain past the entry
+        // rules' hold-above-threshold window, even when the underlying direction was genuinely
+        // right (live-caught: a real, sustained ~120-point down move never produced a trade
+        // because single-cadence spikes kept resetting the sustain timer). Average the last
+        // few cadences' raw values -- a plain FIFO count, not a strict time window, so a
+        // cadence delayed by a reconnect just means "average of the last few genuine readings"
+        // rather than a gap in the window. Skipped (not backfilled with a fabricated value)
+        // whenever this cadence's own raw is null -- e.g. the one cadence right after a
+        // reconnect where OiBuildupNet has no reliable baseline (see ComputeOiBuildupNet) --
+        // Calculate's own warm-up check (from `inputs`, not this) already suppresses the score
+        // for that cadence regardless, so there is nothing meaningful to add.
+        var compositeRawInstant = CompositeScoreCalculator.ComputeRaw(inputs, ScoreWeights.Default);
+        double? compositeRawSmoothed = null;
+        if (compositeRawInstant is { } instantRaw)
+        {
+            _compositeRawHistory.Enqueue(instantRaw);
+            while (_compositeRawHistory.Count > CompositeSmoothingCadences)
+            {
+                _compositeRawHistory.Dequeue();
+            }
+
+            compositeRawSmoothed = _compositeRawHistory.Average();
+        }
+
         // Dynamic k -- see class doc comment. Falls back to CompositeScoreCalculator.DefaultK
         // until the composite-raw window itself has 30 real minutes of history, same
         // "unreliable until warmed up" rule WelfordRollingWindow already applies to StdDev.
-        var compositeRaw = CompositeScoreCalculator.ComputeRaw(inputs, ScoreWeights.Default);
+        // Fed the smoothed value, not the instantaneous one -- k is meant to normalize against
+        // how volatile the score actually driving trade decisions has recently been, which
+        // (now that trading is off the smoothed series) is the smoothed series' own spread.
         var k = CompositeScoreCalculator.DefaultK;
-        if (compositeRaw is { } raw)
+        if (compositeRawSmoothed is { } smoothedForK)
         {
-            _compositeRawWindow.Add(now, raw);
+            _compositeRawWindow.Add(now, smoothedForK);
             if (_compositeRawWindow.IsWarmedUp && _compositeRawWindow.StdDev >= 1e-12)
             {
                 k = _compositeRawWindow.StdDev;
             }
         }
 
-        var composite = CompositeScoreCalculator.Calculate(inputs, ScoreWeights.Default, now, k);
+        var composite = CompositeScoreCalculator.Calculate(inputs, ScoreWeights.Default, now, k, compositeRawSmoothed);
 
         _previousCadence = new Dictionary<string, InstrumentState>(_latest);
+        _lastCadenceAt = now;
 
         return new ScoreSnapshot
         {
@@ -464,7 +528,8 @@ public sealed class LiveFeatureEngine
             PriceMomentumZ = inputs.PriceMomentumZ,
             DepthImbalanceZ = inputs.DepthImbalanceZ,
             VixChangeZ = inputs.VixChangeZ,
-            CompositeScoreRaw = compositeRaw,
+            CompositeScoreRaw = compositeRawSmoothed,
+            CompositeScoreRawInstant = compositeRawInstant,
             CompositeScore = composite.Score,
             SpotPrice = (double)spot.LastPrice,
             IsWarmedUp = composite.IsWarmedUp,
@@ -682,11 +747,26 @@ public sealed class LiveFeatureEngine
         return callOi > 0 ? (double)putOi / callOi : null;
     }
 
-    double ComputeOiBuildupNet()
+    /// <summary>
+    /// Null (not a fabricated delta) when "the last cadence" is stale by more than one normal
+    /// interval -- e.g. right after a feed reconnect (live-caught 2026-09-07). This compares
+    /// OI now against OI at whatever <see cref="_previousCadence"/> happens to hold, which is
+    /// normally ~15s old; after an outage it could be 60-90+ seconds old, so the delta would
+    /// really be "several cadences' worth of change," not one -- and z-scoring that against a
+    /// window calibrated for normal 15s deltas reads as a spurious extreme move. Skipping the
+    /// one cadence right after a gap is cheaper and more honest than trying to guess a
+    /// time-normalized correction.
+    /// </summary>
+    double? ComputeOiBuildupNet(DateTimeOffset now)
     {
         if (_previousCadence is null)
         {
             return 0;
+        }
+
+        if (_lastCadenceAt is { } lastAt && now - lastAt > MaxCadenceGapForOiBuildup)
+        {
+            return null;
         }
 
         double net = 0;

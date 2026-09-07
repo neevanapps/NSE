@@ -44,6 +44,18 @@ public sealed class FlatTradeTickSource(
     public void RequestSubscribe(Exchange exchange, string token) =>
         _subscriptionRequests.Writer.TryWrite((exchange, token));
 
+    /// <summary>
+    /// Fires whenever <see cref="ReconnectionPolicy.ShouldAlert"/> does (2026-09-07,
+    /// live-caught: the feed dropped six times in one morning with a FATAL log line each time
+    /// and nothing else -- no one watching logs would have known). Deliberately not wired
+    /// straight to Telegram here -- this project stays a plain tick source with no notification
+    /// dependency; the caller (which already has ITelegramNotifier) decides what to do with it.
+    /// Async and awaited by the raiser rather than a plain event, so a subscriber's own
+    /// exception (or a slow HTTP call) can't get silently dropped or crash the process the way
+    /// an async-void handler would.
+    /// </summary>
+    public event Func<int, Task>? ConnectionUnstable;
+
     public async IAsyncEnumerable<Tick> ReadTicksAsync([EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var channel = Channel.CreateUnbounded<Tick>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
@@ -86,6 +98,11 @@ public sealed class FlatTradeTickSource(
                         logger.LogCritical(
                             "FlatTrade feed has failed {Count} times consecutively -- exceeds the {Threshold} alert threshold",
                             policy.ConsecutiveFailures, ReconnectionPolicy.AlertThreshold);
+
+                        if (ConnectionUnstable is { } handler)
+                        {
+                            await handler(policy.ConsecutiveFailures);
+                        }
                     }
 
                     var delay = policy.NextDelay();

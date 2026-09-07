@@ -380,8 +380,8 @@ public sealed class LiveDataService : IDisposable
         // would under-count its remaining warm-up time. Null (never seen yet) reads as
         // "the full window remains", not "already warmed up".
         var vixRemaining = firstVixSnapshotAt is { } vixStart
-            ? (FeatureWindowLengths.VixChange - (s.ComputedAt - vixStart) is var vixLeft && vixLeft > TimeSpan.Zero ? vixLeft : TimeSpan.Zero)
-            : FeatureWindowLengths.VixChange;
+            ? (FeatureWindowLengths.VixChangeZScoreWindow - (s.ComputedAt - vixStart) is var vixLeft && vixLeft > TimeSpan.Zero ? vixLeft : TimeSpan.Zero)
+            : FeatureWindowLengths.VixChangeZScoreWindow;
 
         return
         [
@@ -400,7 +400,7 @@ public sealed class LiveDataService : IDisposable
             // Optional (see CompositeScoreCalculator) -- can legitimately stay "not warmed
             // up" indefinitely on a day VIX isn't tracked, unlike the other six.
             new("VixChange", ScoreWeights.Default.VixChange, s.VixChangeZ ?? 0, (s.VixChangeZ ?? 0) * ScoreWeights.Default.VixChange,
-                s.VixChangeZ is not null, FeatureWindowLengths.VixChange, vixRemaining),
+                s.VixChangeZ is not null, FeatureWindowLengths.VixChangeZScoreWindow, vixRemaining),
         ];
     }
 
@@ -412,7 +412,7 @@ public sealed class LiveDataService : IDisposable
         new("IvSkew", ScoreWeights.Default.IvSkew, 0, 0, false, FeatureWindowLengths.IvSkew, FeatureWindowLengths.IvSkew),
         new("PriceMomentum", ScoreWeights.Default.PriceMomentum, 0, 0, false, FeatureWindowLengths.PriceMomentum, FeatureWindowLengths.PriceMomentum),
         new("DepthImbalance", ScoreWeights.Default.DepthImbalance, 0, 0, false, FeatureWindowLengths.DepthImbalance, FeatureWindowLengths.DepthImbalance),
-        new("VixChange", ScoreWeights.Default.VixChange, 0, 0, false, FeatureWindowLengths.VixChange, FeatureWindowLengths.VixChange),
+        new("VixChange", ScoreWeights.Default.VixChange, 0, 0, false, FeatureWindowLengths.VixChangeZScoreWindow, FeatureWindowLengths.VixChangeZScoreWindow),
     ];
 
     async Task<List<OptionChainRow>> BuildOptionChainAsync(NiftySignalDbContext db)

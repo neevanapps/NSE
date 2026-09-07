@@ -36,10 +36,26 @@ public sealed class ScoreSnapshot
     /// (see LiveFeatureEngine) can be replayed on restart via SeedHistory, same as the six
     /// per-metric raw values already are. Without this, k would silently reset to
     /// CompositeScoreCalculator.DefaultK for 30 minutes after every service restart.
+    ///
+    /// Smoothed since 2026-09-07 -- a simple moving average over the last several cadences
+    /// (see LiveFeatureEngine's CompositeSmoothingCadences), not the single-cadence value. A
+    /// fresh composite recomputed from scratch every 15s with no memory of its own recent
+    /// behavior was too noisy to sustain past the entry rules' hold-above-threshold window
+    /// even when the underlying direction was genuinely right (live-caught 2026-09-07: a real,
+    /// sustained ~120-point down move never produced a trade because single-cadence spikes
+    /// kept resetting the sustain timer). This is now the tradable value -- see
+    /// <see cref="CompositeScoreRawInstant"/> for the un-smoothed one.
     /// </summary>
     public double? CompositeScoreRaw { get; set; }
 
     public double? CompositeScore { get; set; }
+
+    /// <summary>
+    /// The single-cadence composite raw before smoothing (2026-09-07) -- kept purely for
+    /// transparency/future analysis (comparing smoothed vs instantaneous), not read by any
+    /// live decision. See <see cref="CompositeScoreRaw"/> for the smoothed, tradable value.
+    /// </summary>
+    public double? CompositeScoreRawInstant { get; set; }
 
     /// <summary>
     /// Spot at the moment this cadence was computed (2026-09-05). Captured here rather than

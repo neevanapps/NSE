@@ -34,8 +34,16 @@ public static class CompositeScoreCalculator
     public static double? ComputeRaw(ScoreComponentInputs inputs, ScoreWeights weights) =>
         TryComputeRaw(BuildComponents(inputs, weights), out var raw) ? raw : null;
 
+    /// <param name="rawOverride">
+    /// Substitutes a caller-supplied raw value (2026-09-07, e.g. LiveFeatureEngine's
+    /// multi-cadence smoothed raw) for the tanh input, instead of the single-cadence raw this
+    /// method would otherwise compute from <paramref name="inputs"/>. Warm-up still comes from
+    /// <paramref name="inputs"/> itself -- an override doesn't manufacture a score out of
+    /// components that genuinely aren't ready this cadence. Null (the default) reproduces the
+    /// original single-cadence behavior exactly.
+    /// </param>
     public static CompositeScore Calculate(
-        ScoreComponentInputs inputs, ScoreWeights weights, DateTimeOffset computedAt, double k = DefaultK)
+        ScoreComponentInputs inputs, ScoreWeights weights, DateTimeOffset computedAt, double k = DefaultK, double? rawOverride = null)
     {
         if (k <= 0)
         {
@@ -44,7 +52,8 @@ public static class CompositeScoreCalculator
 
         var components = BuildComponents(inputs, weights);
         var isWarmedUp = TryComputeRaw(components, out var raw);
-        var score = isWarmedUp ? 100.0 * Math.Tanh(raw / k) : (double?)null;
+        var effectiveRaw = rawOverride ?? raw;
+        var score = isWarmedUp ? 100.0 * Math.Tanh(effectiveRaw / k) : (double?)null;
 
         return new CompositeScore(score, isWarmedUp, components, weights.Version, computedAt);
     }

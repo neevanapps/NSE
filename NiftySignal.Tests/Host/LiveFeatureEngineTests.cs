@@ -114,6 +114,24 @@ public class LiveFeatureEngineTests
     }
 
     [Fact]
+    public void ComputeCadence_UsesFutureMidPrice_NotBouncingLastPrice_ForBasisAndMomentum()
+    {
+        // Regression for a live-caught bug (2026-09-07): the future's last-traded price was
+        // observed alternating between two levels several points apart within seconds -- not
+        // genuine price discovery. Mid (bid+ask)/2 is stable against that kind of bounce.
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23900m, Start));
+        engine.OnTick(MakeTick(FutureToken, 23905m, Start, depth: Depth(bidQty: 10, askQty: 10, bid: 24000m, ask: 24002m)));
+
+        var snapshot = engine.ComputeCadence(Start);
+
+        Assert.NotNull(snapshot);
+        // Mid = (24000+24002)/2 = 24001, basis = 24001-23900 = 101 -- not 23905-23900 = 5,
+        // which is what using the bouncing LastPrice directly would have produced.
+        Assert.Equal(101.0, snapshot!.FuturesBasisRaw!.Value, precision: 2);
+    }
+
+    [Fact]
     public void ComputeCadence_ComputesPcr_AsPutOiOverCallOi()
     {
         var engine = new LiveFeatureEngine(BaseUniverse());
@@ -154,6 +172,107 @@ public class LiveFeatureEngineTests
         // sign) if it weren't excluded.
         Assert.NotNull(snapshot);
         Assert.Equal(-200.0 / 2200.0, snapshot!.DepthImbalanceRaw!.Value, precision: 3);
+    }
+
+    [Fact]
+    public void ComputeCadence_SkipsOiBuildupNet_WhenTheGapSinceTheLastCadenceExceedsNormalSpacing()
+    {
+        // Regression for a live-caught bug (2026-09-07): after a feed reconnect, "the last
+        // cadence" could be 60-90+ seconds old instead of the normal ~15s, so the OI delta
+        // would really represent several cadences' worth of change bunched into one -- which
+        // read as a spurious extreme z-score against a window calibrated for normal 15s
+        // deltas. The cadence right after a gap like that must report no OiBuildupNet reading
+        // at all rather than a misleading one.
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23900m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, oi: 1_000_000));
+        engine.OnTick(MakeTick(PutToken, 80m, Start, oi: 900_000));
+        var first = engine.ComputeCadence(Start);
+        Assert.NotNull(first);
+
+        // A big, real OI change -- but arriving 90 seconds later, well past the normal ~15s
+        // cadence spacing (simulating a reconnect gap).
+        var afterGap = Start.AddSeconds(90);
+        engine.OnTick(MakeTick(SpotToken, 23900m, afterGap));
+        engine.OnTick(MakeTick(FutureToken, 24000m, afterGap));
+        engine.OnTick(MakeTick(CallToken, 100m, afterGap, oi: 1_500_000));
+        engine.OnTick(MakeTick(PutToken, 80m, afterGap, oi: 1_200_000));
+        var afterReconnect = engine.ComputeCadence(afterGap);
+
+        Assert.NotNull(afterReconnect);
+        Assert.Null(afterReconnect!.OiBuildupNetRaw);
+
+        // The next cadence, back to normal ~15s spacing, must compute normally again.
+        var normalNext = afterGap.AddSeconds(15);
+        engine.OnTick(MakeTick(SpotToken, 23900m, normalNext));
+        engine.OnTick(MakeTick(FutureToken, 24000m, normalNext));
+        engine.OnTick(MakeTick(CallToken, 100m, normalNext, oi: 1_500_000));
+        engine.OnTick(MakeTick(PutToken, 80m, normalNext, oi: 1_200_000));
+        var resumed = engine.ComputeCadence(normalNext);
+
+        Assert.NotNull(resumed);
+        Assert.NotNull(resumed!.OiBuildupNetRaw);
+    }
+
+    [Fact]
+    public void ComputeCadence_SmoothsCompositeRaw_AcrossTheLastSeveralCadences()
+    {
+        // Regression for the live-caught "score isn't tradable" problem (2026-09-07): a
+        // composite recomputed from scratch every cadence, with no memory of its own recent
+        // behavior, let a single noisy cadence swing the tradable score just as much as a
+        // genuinely sustained move -- which kept resetting the entry rules' sustain timer even
+        // on days with a real, persistent directional move. Warm up a baseline with small,
+        // realistic jitter (StdDev must be non-zero or every z-score stays null -- see
+        // WelfordRollingWindow.ComputeZScore), then inject one drastic single-cadence OI
+        // change and confirm the smoothed CompositeScoreRaw moves far less than the
+        // instantaneous one did.
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        var at = Start;
+        ScoreSnapshot? snapshot = null;
+        var random = new Random(42);
+
+        // ~31 minutes at 15s cadence -- long enough to warm up the 30-minute windows
+        // (Pcr, OiBuildupNet, FuturesBasis), the longest of the six required. Every jittered
+        // quantity is independently randomized -- spot and future must NOT share the same
+        // offset (that cancels out in the basis calc), and depth quantities need their own
+        // variance too (imbalance is otherwise perfectly balanced, hence zero, every cadence).
+        for (var elapsed = TimeSpan.Zero; elapsed <= TimeSpan.FromMinutes(31); elapsed += TimeSpan.FromSeconds(15))
+        {
+            at = Start + elapsed;
+            engine.OnTick(MakeTick(SpotToken, 23900m + random.Next(-2, 3), at));
+            engine.OnTick(MakeTick(FutureToken, 24000m + random.Next(-2, 3), at));
+            // OiBuildupNet's classifier needs the option's OWN price to move too (it classifies
+            // off price-change x OI-change together) -- a constant price here is why oiRaw
+            // stayed exactly 0 every cadence before this fix.
+            engine.OnTick(MakeTick(CallToken, 100m + random.Next(-1, 2), at,
+                oi: 1_000_000 + random.Next(-3_000, 3_001),
+                depth: Depth(400 + random.Next(0, 200), 400 + random.Next(0, 200), bid: 99.5m, ask: 100.5m)));
+            engine.OnTick(MakeTick(PutToken, 80m + random.Next(-1, 2), at,
+                oi: 900_000 + random.Next(-3_000, 3_001),
+                depth: Depth(400 + random.Next(0, 200), 400 + random.Next(0, 200), bid: 79.5m, ask: 80.5m)));
+            snapshot = engine.ComputeCadence(at);
+        }
+
+        Assert.NotNull(snapshot);
+        Assert.True(snapshot!.IsWarmedUp);
+
+        // One drastic, single-cadence OI spike -- call OI roughly 4-5x its baseline, versus
+        // the +/-2,000 jitter the baseline warmed up on.
+        var spikeAt = at + TimeSpan.FromSeconds(15);
+        engine.OnTick(MakeTick(SpotToken, 23900m, spikeAt));
+        engine.OnTick(MakeTick(FutureToken, 24000m, spikeAt));
+        engine.OnTick(MakeTick(CallToken, 100m, spikeAt, oi: 5_000_000, depth: Depth(500, 500, bid: 99.5m, ask: 100.5m)));
+        engine.OnTick(MakeTick(PutToken, 80m, spikeAt, oi: 900_000, depth: Depth(500, 500, bid: 79.5m, ask: 80.5m)));
+        var spiked = engine.ComputeCadence(spikeAt);
+
+        Assert.NotNull(spiked);
+        Assert.NotNull(spiked!.CompositeScoreRawInstant);
+        Assert.NotNull(spiked.CompositeScoreRaw);
+
+        // The smoothed value must move far less than the instantaneous one -- averaged
+        // against ~20 calm prior readings, not replaced by the spike outright.
+        Assert.True(Math.Abs(spiked.CompositeScoreRaw!.Value) < Math.Abs(spiked.CompositeScoreRawInstant!.Value) / 2);
     }
 
     [Fact]
@@ -392,6 +511,61 @@ public class LiveFeatureEngineTests
         Assert.NotNull(second);
         // Negated: VIX rose (12.00 -> 13.50), so raw must be negative (bearish contribution).
         Assert.Equal(-1.50, second!.VixChangeRaw!.Value, precision: 6);
+    }
+
+    [Fact]
+    public void ComputeCadence_VixChangeZStaysNull_UntilTheZScoreWindowElapses_NotJustTheRawLookbackWindow()
+    {
+        // Regression for a live-caught bug (2026-09-07): the raw VIX change is a 30-minute
+        // lookback delta, and z-scoring it against a window of that SAME 30-minute length
+        // means each new 15s sample's lookback overlaps the last one almost entirely -- during
+        // any stretch where VIX drifts smoothly, that series has almost no internal variance,
+        // so the window's StdDev collapses and an ordinary later move slams into the +/-3 clip.
+        // The z-score window is now several times longer than the raw lookback, confirmed here
+        // by checking VixChangeZ is still null just past the OLD window's length -- a genuine
+        // fix must make the window longer, not just rename the same duration.
+        const string VixToken = "26017";
+        var universe = BaseUniverse();
+        universe.Add(new Instrument
+        {
+            Token = VixToken,
+            Exchange = Exchange.Nse,
+            TradingSymbol = "India VIX",
+            InstrumentType = InstrumentType.Vix,
+            Underlying = "NIFTY",
+            LotSize = 1,
+            TickSize = 0.01m,
+            AsOfDate = AsOfDate,
+        });
+
+        // Sample every 5 minutes (well inside the 30-minute raw lookback, so each reading is a
+        // genuine non-zero comparison rather than degenerating to "compares to itself") with
+        // VIX drifting up a little each time -- exactly the "smoothly drifting" shape that
+        // triggered the live bug. Runs past both the old 30-minute window and the new one so
+        // the warm-up transition is directly observable.
+        var engine = new LiveFeatureEngine(universe);
+        ScoreSnapshot? last = null;
+        var vix = 12.00m;
+        for (var elapsed = TimeSpan.Zero; elapsed <= FeatureWindowLengths.VixChangeZScoreWindow + TimeSpan.FromMinutes(10); elapsed += TimeSpan.FromMinutes(5))
+        {
+            var at = Start + elapsed;
+            vix += 0.01m;
+            engine.OnTick(MakeTick(SpotToken, 23900m, at));
+            engine.OnTick(MakeTick(FutureToken, 24000m, at));
+            engine.OnTick(MakeTick(VixToken, vix, at));
+            last = engine.ComputeCadence(at);
+
+            // Just past the OLD 30-minute window -- under the pre-fix window length this would
+            // already be warmed up (and prone to clipping); it must not be now.
+            if (elapsed == FeatureWindowLengths.VixChange + TimeSpan.FromMinutes(5))
+            {
+                Assert.Null(last!.VixChangeZ);
+            }
+        }
+
+        // Past the new (longer) window, it should finally be able to warm up.
+        Assert.NotNull(last);
+        Assert.NotNull(last!.VixChangeZ);
     }
 
     [Fact]

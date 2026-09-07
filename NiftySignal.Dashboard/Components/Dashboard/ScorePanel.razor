@@ -120,17 +120,32 @@
         await _module.InvokeVoidAsync("renderScoreWithPriceChart", "score-history-chart", labels, scores, prices, "#38bdf8", "#fbbf24");
     }
 
+    // async void is required here -- Live.Updated is a plain event Action?, and it fires for
+    // every connected circuit (every open tab, desktop or mobile) on every 5s poll. If any one
+    // of those circuits is mid-disconnect right at that instant (a tab closed, a phone locking,
+    // a network blip), the JS interop call below throws -- and because this is async void, an
+    // uncaught exception here has no Task to land on and crashes the whole Dashboard process
+    // for every user, not just the disconnecting circuit (live-caught 2026-09-07, twice in one
+    // morning). The three exception types below are Blazor Server's well-known signals for
+    // exactly that "circuit is going away" case -- expected and harmless, not a real failure.
     async void OnDemoUpdated()
     {
-        await InvokeAsync(async () =>
+        try
         {
-            StateHasChanged();
-            if (_rendered && _module is not null)
+            await InvokeAsync(async () =>
             {
-                var (labels, scores, prices) = BuildSeries();
-                await _module.InvokeVoidAsync("updateScoreWithPriceChart", "score-history-chart", labels, scores, prices);
-            }
-        });
+                StateHasChanged();
+                if (_rendered && _module is not null)
+                {
+                    var (labels, scores, prices) = BuildSeries();
+                    await _module.InvokeVoidAsync("updateScoreWithPriceChart", "score-history-chart", labels, scores, prices);
+                }
+            });
+        }
+        catch (Exception ex) when (ex is JSDisconnectedException or TaskCanceledException or ObjectDisposedException)
+        {
+            // This circuit is going away -- nothing to update client-side.
+        }
     }
 
     public async ValueTask DisposeAsync()
