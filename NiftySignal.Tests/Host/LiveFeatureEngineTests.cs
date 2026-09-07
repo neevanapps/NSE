@@ -257,6 +257,34 @@ public class LiveFeatureEngineTests
     }
 
     [Fact]
+    public void ComputeCadence_ComputesSpreadRatio_AsPutOverCall_AcrossTheFullChain()
+    {
+        // Same "far strike must still count" shape as the GammaExposure/VolumePcr full-chain
+        // tests above. Near strikes (23950) alone would give ratio 2.5/2.0 = 1.25 -- the far
+        // strike (25000, wide and illiquid, spread% dominated by a tiny mid) must pull that
+        // number away from 1.25, or this is secretly band-limited after all.
+        const string FarCallToken = "99003";
+        const string FarPutToken = "99004";
+        var universe = BaseUniverse();
+        universe.Add(Option(FarCallToken, OptionType.Call, 25000m));
+        universe.Add(Option(FarPutToken, OptionType.Put, 25000m));
+
+        var engine = new LiveFeatureEngine(universe);
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, depth: Depth(bidQty: 1, askQty: 1, bid: 99m, ask: 101m)));   // spread 2, mid 100 -> 2.0%
+        engine.OnTick(MakeTick(PutToken, 80m, Start, depth: Depth(bidQty: 1, askQty: 1, bid: 79m, ask: 81m)));      // spread 2, mid 80 -> 2.5%
+        engine.OnTick(MakeTick(FarCallToken, 5m, Start, depth: Depth(bidQty: 1, askQty: 1, bid: 4m, ask: 6m)));     // spread 2, mid 5 -> 40%
+        engine.OnTick(MakeTick(FarPutToken, 5m, Start, depth: Depth(bidQty: 1, askQty: 1, bid: 4.5m, ask: 5.5m)));  // spread 1, mid 5 -> 20%
+
+        var snapshot = engine.ComputeCadence(Start);
+
+        // callMean = (2.0 + 40) / 2 = 21.0; putMean = (2.5 + 20) / 2 = 11.25; ratio = 11.25/21.0.
+        Assert.NotNull(snapshot!.SpreadRatioRaw);
+        Assert.Equal(11.25 / 21.0, snapshot.SpreadRatioRaw!.Value, precision: 6);
+    }
+
+    [Fact]
     public void ComputeCadence_SkipsOiBuildupNet_WhenTheGapSinceTheLastCadenceExceedsNormalSpacing()
     {
         // Regression for a live-caught bug (2026-09-07): after a feed reconnect, "the last
@@ -309,7 +337,30 @@ public class LiveFeatureEngineTests
         // WelfordRollingWindow.ComputeZScore), then inject one drastic single-cadence OI
         // change and confirm the smoothed CompositeScoreRaw moves far less than the
         // instantaneous one did.
-        var engine = new LiveFeatureEngine(BaseUniverse());
+        // A second strike (2026-09-07), independently jittered -- ComputeUnderlyingPrice
+        // averages the synthetic forward across every strike with both legs quoted, and
+        // IvSkew solves at whichever strike is nearest spot +/-200. With only one strike in
+        // the universe, both resolve to the exact same (strike, call price, put price) triple.
+        // Put-call parity makes C-P independent of volatility entirely (see
+        // NiftySignal.Pricing.SyntheticForward's derivation), so an underlying solved via that
+        // exact identity from IvSkew's own two prices makes the sigma that solves the call
+        // side an *exact* algebraic solution of the put side too -- putIv-callIv is
+        // mathematically forced to (near enough) zero every cadence, not just usually small.
+        // Its window's StdDev then drops below WelfordRollingWindow's 1e-12 floor,
+        // ComputeZScore nulls IvSkewZ out, and warm-up never completes (it's one of the six
+        // required components). A second, independent strike breaks the self-reference by
+        // pulling the *averaged* underlying away from that one exact value -- constructed via
+        // real BlackScholes pricing (not arbitrary numbers) so it stays parity-consistent and
+        // doesn't itself break either solve. Production never hits this at all: it always has
+        // dozens of strikes, never just the one IvSkew itself targets.
+        const string SecondCallToken = "99005";
+        const string SecondPutToken = "99006";
+        const decimal SecondStrike = 24000m;
+        var universe = BaseUniverse();
+        universe.Add(Option(SecondCallToken, OptionType.Call, SecondStrike));
+        universe.Add(Option(SecondPutToken, OptionType.Put, SecondStrike));
+
+        var engine = new LiveFeatureEngine(universe);
         var at = Start;
         ScoreSnapshot? snapshot = null;
         var random = new Random(42);
@@ -319,6 +370,9 @@ public class LiveFeatureEngineTests
         // quantity is independently randomized -- spot and future must NOT share the same
         // offset (that cancels out in the basis calc), and depth quantities need their own
         // variance too (imbalance is otherwise perfectly balanced, hence zero, every cadence).
+        // Depth bid/ask must jitter too, not just LTP: MidPrice prefers depth mid over LTP, and
+        // a fixed depth mid would make the option price constant every cadence regardless of
+        // LLP's own jitter.
         for (var elapsed = TimeSpan.Zero; elapsed <= TimeSpan.FromMinutes(31); elapsed += TimeSpan.FromSeconds(15))
         {
             at = Start + elapsed;
@@ -327,12 +381,23 @@ public class LiveFeatureEngineTests
             // OiBuildupNet's classifier needs the option's OWN price to move too (it classifies
             // off price-change x OI-change together) -- a constant price here is why oiRaw
             // stayed exactly 0 every cadence before this fix.
-            engine.OnTick(MakeTick(CallToken, 100m + random.Next(-1, 2), at,
+            var callJitter = random.Next(-1, 2);
+            var putJitter = random.Next(-1, 2);
+            engine.OnTick(MakeTick(CallToken, 100m + callJitter, at,
                 oi: 1_000_000 + random.Next(-3_000, 3_001),
-                depth: Depth(400 + random.Next(0, 200), 400 + random.Next(0, 200), bid: 99.5m, ask: 100.5m)));
-            engine.OnTick(MakeTick(PutToken, 80m + random.Next(-1, 2), at,
+                depth: Depth(400 + random.Next(0, 200), 400 + random.Next(0, 200), bid: 99.5m + callJitter, ask: 100.5m + callJitter)));
+            engine.OnTick(MakeTick(PutToken, 80m + putJitter, at,
                 oi: 900_000 + random.Next(-3_000, 3_001),
-                depth: Depth(400 + random.Next(0, 200), 400 + random.Next(0, 200), bid: 79.5m, ask: 80.5m)));
+                depth: Depth(400 + random.Next(0, 200), 400 + random.Next(0, 200), bid: 79.5m + putJitter, ask: 80.5m + putJitter)));
+            // Real BlackScholes construction, not arbitrary numbers -- see the comment above
+            // on why an inconsistent second strike would just break both IV solves instead of
+            // gently perturbing the averaged underlying.
+            var secondUnderlying = 23900.0 + random.Next(-3, 4);
+            var secondT = TimeToExpiry.YearsUntilExpiry(NearestExpiry, at);
+            var secondCallPrice = (decimal)BlackScholes.Calculate(OptionType.Call, secondUnderlying, (double)SecondStrike, secondT, 0.065, 0.15).Price;
+            var secondPutPrice = (decimal)BlackScholes.Calculate(OptionType.Put, secondUnderlying, (double)SecondStrike, secondT, 0.065, 0.15).Price;
+            engine.OnTick(MakeTick(SecondCallToken, secondCallPrice, at, depth: Depth(200, 200, bid: secondCallPrice - 0.05m, ask: secondCallPrice + 0.05m)));
+            engine.OnTick(MakeTick(SecondPutToken, secondPutPrice, at, depth: Depth(200, 200, bid: secondPutPrice - 0.05m, ask: secondPutPrice + 0.05m)));
             snapshot = engine.ComputeCadence(at);
         }
 
@@ -778,27 +843,32 @@ public class LiveFeatureEngineTests
     }
 
     [Fact]
-    public void ComputeCadence_ComputesIvSkew_AgainstSpot_NotTheMismatchedTrackedFuture()
+    public void ComputeCadence_ComputesIvSkew_AgainstTheSyntheticForward_NotRawSpot()
     {
-        // Same fix, different call site: IvSkew is one of the six required score components,
-        // so this bug wasn't just a display issue -- it was feeding a biased raw value into
-        // the composite score itself.
+        // 2026-09-07: the original fix here (spot instead of the mismatched monthly future)
+        // was directionally right but incomplete -- spot itself carries no cost-of-carry
+        // adjustment, and a same-day live check found call/put IV at the same strike
+        // systematically ~7-8 vol points apart, all day, every strike: the signature of an
+        // understated underlying (it biases a call solve up and a put solve down), not real
+        // skew (which shows up across strikes, not as a same-strike call/put split).
+        //
+        // Here: call and put are both priced off the SAME true vol (0.15, i.e. genuinely zero
+        // skew) but off the FORWARD (24080, a realistic ~130pt premium to spot), not spot
+        // itself (23950). If IvSkew still used raw spot as the underlying, solving these
+        // prices against the wrong (too-low) underlying would recover a large artificial
+        // skew -- exactly the live-caught symptom. Recovering ~zero proves the forward is
+        // what's actually feeding the solve now.
         var engine = new LiveFeatureEngine(BaseUniverse());
         const decimal spot = 23950m;
-        const decimal future = 24100m;
-        const double callTrueIv = 0.12;
-        const double putTrueIv = 0.18;
+        const decimal forward = 24080m;
+        const double trueVol = 0.15;
 
         var years = TimeToExpiry.YearsUntilExpiry(NearestExpiry, Start);
-        // CallToken/PutToken are both strike 23950 in BaseUniverse() -- the +/-200 offset's
-        // nearest match trivially lands on this same strike for both sides, which is fine:
-        // this test only cares whether the solved IVs recover the true values, proving spot
-        // (not future) was used as the underlying.
-        var callPrice = (decimal)BlackScholes.Calculate(OptionType.Call, (double)spot, 23950, years, 0.065, callTrueIv).Price;
-        var putPrice = (decimal)BlackScholes.Calculate(OptionType.Put, (double)spot, 23950, years, 0.065, putTrueIv).Price;
+        var callPrice = (decimal)BlackScholes.Calculate(OptionType.Call, (double)forward, 23950, years, 0.065, trueVol).Price;
+        var putPrice = (decimal)BlackScholes.Calculate(OptionType.Put, (double)forward, 23950, years, 0.065, trueVol).Price;
 
         engine.OnTick(MakeTick(SpotToken, spot, Start));
-        engine.OnTick(MakeTick(FutureToken, future, Start));
+        engine.OnTick(MakeTick(FutureToken, 24200m, Start)); // the mismatched monthly future -- must not be used either
         engine.OnTick(MakeTick(CallToken, callPrice, Start, depth: Depth(bidQty: 100, askQty: 100, bid: callPrice - 0.05m, ask: callPrice + 0.05m)));
         engine.OnTick(MakeTick(PutToken, putPrice, Start, depth: Depth(bidQty: 100, askQty: 100, bid: putPrice - 0.05m, ask: putPrice + 0.05m)));
 
@@ -806,7 +876,7 @@ public class LiveFeatureEngineTests
 
         Assert.NotNull(snapshot);
         Assert.NotNull(snapshot!.IvSkewRaw);
-        Assert.Equal(putTrueIv - callTrueIv, snapshot.IvSkewRaw!.Value, 1e-3);
+        Assert.Equal(0.0, snapshot.IvSkewRaw!.Value, 1e-3);
     }
 
     [Fact]

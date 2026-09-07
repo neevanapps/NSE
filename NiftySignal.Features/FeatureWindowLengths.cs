@@ -63,4 +63,13 @@ public static class FeatureWindowLengths
     /// window as the existing (contract-count) Pcr, its closest sibling.
     /// </summary>
     public static readonly TimeSpan VolumePcr = TimeSpan.FromMinutes(30);
+
+    /// <summary>
+    /// Put-spread/call-spread ratio (2026-09-07, diagnostic-only -- see ScoreWeights.Default's
+    /// SpreadRatio weight). A point-in-time read like IvSkew (its closest structural sibling --
+    /// both compare something across the put vs call side), not an interval delta, so it's
+    /// smoothed the same within-cadence way via Sample()/SampleSpreads(), not left instantaneous
+    /// like OiBuildupNet/GammaExposure/VolumePcr.
+    /// </summary>
+    public static readonly TimeSpan SpreadRatio = TimeSpan.FromMinutes(15);
 }

@@ -118,6 +118,7 @@ public sealed class LiveFeatureEngine
     readonly WelfordRollingWindow _vixWindow = new(FeatureWindowLengths.VixChangeZScoreWindow);
     readonly WelfordRollingWindow _gammaExposureWindow = new(FeatureWindowLengths.GammaExposure);
     readonly WelfordRollingWindow _volumePcrWindow = new(FeatureWindowLengths.VolumePcr);
+    readonly WelfordRollingWindow _spreadRatioWindow = new(FeatureWindowLengths.SpreadRatio);
 
     /// <summary>Last <see cref="CompositeSmoothingCadences"/> single-cadence composite raw values, oldest first -- see ComputeCadence's smoothing comment.</summary>
     readonly Queue<double> _compositeRawHistory = new();
@@ -260,6 +261,11 @@ public sealed class LiveFeatureEngine
             {
                 _volumePcrWindow.Add(snapshot.ComputedAt, volumePcr);
             }
+
+            if (snapshot.SpreadRatioRaw is { } spreadRatio)
+            {
+                _spreadRatioWindow.Add(snapshot.ComputedAt, spreadRatio);
+            }
         }
     }
 
@@ -289,13 +295,43 @@ public sealed class LiveFeatureEngine
         return false;
     }
 
+    const int SyntheticForwardStrikeCount = 5;
+
+    /// <summary>
+    /// The Black-Scholes underlying for every IV/Greeks calculation in this class -- see
+    /// <see cref="NiftySignal.Pricing.SyntheticForward"/>'s doc comment for why this replaced
+    /// raw spot (2026-09-07). Averages the put-call-parity estimate from the
+    /// <see cref="SyntheticForwardStrikeCount"/> strikes nearest spot, each with both a call
+    /// and put quote -- falls back to spot itself when no strike has both legs quoted yet
+    /// (e.g. very early in the session), rather than blocking every downstream calculation.
+    /// </summary>
+    decimal ComputeUnderlyingPrice(decimal spotPrice, double t)
+    {
+        var pairs = new List<(double Strike, double CallMid, double PutMid)>();
+
+        foreach (var strike in _nearestExpiryOptions.Select(o => o.StrikePrice!.Value).Distinct().OrderBy(s => Math.Abs(s - spotPrice)).Take(SyntheticForwardStrikeCount))
+        {
+            var call = _nearestExpiryOptions.FirstOrDefault(o => o.OptionType == OptionType.Call && o.StrikePrice == strike);
+            var put = _nearestExpiryOptions.FirstOrDefault(o => o.OptionType == OptionType.Put && o.StrikePrice == strike);
+            if (call is null || put is null
+                || !_latest.TryGetValue(call.Token, out var callState) || !_latest.TryGetValue(put.Token, out var putState)
+                || MidPrice(callState) is not { } callMid || MidPrice(putState) is not { } putMid)
+            {
+                continue;
+            }
+
+            pairs.Add(((double)strike, (double)callMid, (double)putMid));
+        }
+
+        return NiftySignal.Pricing.SyntheticForward.Compute(pairs, t, RiskFreeRate) is { } forward ? (decimal)forward : spotPrice;
+    }
+
     /// <summary>
     /// Live option-chain snapshot for strike selection, nearest-expiry + one side only (the
     /// side the entry direction calls for). Mid/bid/ask come from the top-of-book depth
     /// snapshot (null bid/ask if none arrived yet -- StrikeSelector already treats that as
-    /// a filter failure, not a crash). Delta/IV use spot as the underlying, not the tracked
-    /// future -- see <see cref="ComputeIvSkew"/>'s doc comment for why (2026-09-04 fix: NSE
-    /// only lists monthly futures, which don't match a weekly option's own expiry).
+    /// a filter failure, not a crash). Delta/IV are priced against the synthetic forward, not
+    /// raw spot or the tracked future -- see <see cref="ComputeUnderlyingPrice"/>.
     /// </summary>
     public List<Execution.StrikeCandidate> BuildStrikeCandidates(OptionType side, DateTimeOffset now)
     {
@@ -306,6 +342,7 @@ public sealed class LiveFeatureEngine
         }
 
         var t = TimeToExpiry.YearsUntilExpiry(_nearestExpiry, now);
+        var underlying = ComputeUnderlyingPrice(spot.LastPrice, t);
 
         foreach (var instrument in _nearestExpiryOptions.Where(o => o.OptionType == side))
         {
@@ -322,10 +359,10 @@ public sealed class LiveFeatureEngine
             double? iv = null, delta = null;
             if (state.LastPrice > 0)
             {
-                iv = ImpliedVolatilitySolver.Solve(side, (double)mid, (double)spot.LastPrice, (double)instrument.StrikePrice!.Value, t, RiskFreeRate);
+                iv = ImpliedVolatilitySolver.Solve(side, (double)mid, (double)underlying, (double)instrument.StrikePrice!.Value, t, RiskFreeRate);
                 if (iv is { } ivValue)
                 {
-                    delta = BlackScholes.Calculate(side, (double)spot.LastPrice, (double)instrument.StrikePrice.Value, t, RiskFreeRate, ivValue).Greeks.Delta;
+                    delta = BlackScholes.Calculate(side, (double)underlying, (double)instrument.StrikePrice.Value, t, RiskFreeRate, ivValue).Greeks.Delta;
                 }
             }
 
@@ -418,6 +455,52 @@ public sealed class LiveFeatureEngine
         }
     }
 
+    /// <summary>
+    /// Put-spread/call-spread ratio (2026-09-07, diagnostic-only -- see ScoreWeights.Default's
+    /// SpreadRatio weight), across the *entire* nearest-expiry chain -- reuses
+    /// <see cref="_spreadPctOfMidSamplesByToken"/>, which <see cref="SampleSpreads"/> already
+    /// fills for every tracked option token every ~3s, not just the persisted band. Averages
+    /// each side's per-token spread-percent-of-mid, then divides -- ratio, not difference: a
+    /// same-day check found the ratio construction correlated more strongly and more
+    /// consistently across horizons (+0.10/+0.15/+0.32 at 1/5/15min) than a plain put-minus-call
+    /// difference. Must run before <see cref="BuildStrikeSnapshots"/> clears these dictionaries
+    /// for the next cadence -- true today because MarketDataIngestionWorker always calls
+    /// ComputeCadence first, but this method has no way to enforce that itself.
+    /// </summary>
+    double? ComputeSpreadRatio()
+    {
+        double callTotal = 0, putTotal = 0;
+        int callCount = 0, putCount = 0;
+
+        foreach (var option in _nearestExpiryOptions)
+        {
+            if (!_spreadPctOfMidSamplesByToken.TryGetValue(option.Token, out var samples) || samples.Average is not { } avg)
+            {
+                continue;
+            }
+
+            if (option.OptionType == OptionType.Call)
+            {
+                callTotal += avg;
+                callCount++;
+            }
+            else if (option.OptionType == OptionType.Put)
+            {
+                putTotal += avg;
+                putCount++;
+            }
+        }
+
+        if (callCount == 0 || putCount == 0)
+        {
+            return null;
+        }
+
+        var callMean = callTotal / callCount;
+        var putMean = putTotal / putCount;
+        return callMean > 0 ? putMean / callMean : null;
+    }
+
     /// <summary>Null until the spot and future have at least one tick each.</summary>
     public ScoreSnapshot? ComputeCadence(DateTimeOffset now)
     {
@@ -468,6 +551,15 @@ public sealed class LiveFeatureEngine
             _ivSkewWindow.Add(now, skew);
         }
 
+        // Reads _spreadPctOfMidSamplesByToken, which BuildStrikeSnapshots clears later this
+        // same cadence -- must run before that, which ResetSamples() below doesn't touch
+        // anyway (see SampleSpreads' own doc comment on why it's independent of ResetSamples).
+        var spreadRatioRaw = ComputeSpreadRatio();
+        if (spreadRatioRaw is { } sr)
+        {
+            _spreadRatioWindow.Add(now, sr);
+        }
+
         ResetSamples();
 
         // Not smoothed like the other five -- see class doc comment.
@@ -485,8 +577,9 @@ public sealed class LiveFeatureEngine
             var gexStrikesByDistance = _nearestExpiryOptions.Select(o => o.StrikePrice!.Value).Distinct().OrderBy(s => Math.Abs(s - spot.LastPrice)).ToList();
             var gexAtmStrike = gexStrikesByDistance[0];
             var gexT = TimeToExpiry.YearsUntilExpiry(_nearestExpiry, now);
-            var gexAtmVol = SolveAtmReferenceVol(gexAtmStrike, spot.LastPrice, gexT);
-            gammaExposureRaw = ComputeGammaExposure(spot.LastPrice, gexAtmVol, gexT);
+            var gexUnderlying = ComputeUnderlyingPrice(spot.LastPrice, gexT);
+            var gexAtmVol = SolveAtmReferenceVol(gexAtmStrike, gexUnderlying, gexT);
+            gammaExposureRaw = ComputeGammaExposure(gexUnderlying, gexAtmVol, gexT);
         }
 
         if (gammaExposureRaw is { } gex)
@@ -510,7 +603,8 @@ public sealed class LiveFeatureEngine
             DepthImbalanceZ: depthImbalanceRaw is { } d ? _depthImbalanceWindow.ComputeZScore(d) : null,
             VixChangeZ: vixChangeRaw is { } vcr ? _vixWindow.ComputeZScore(vcr) : null,
             GammaExposureZ: gammaExposureRaw is { } gexr ? _gammaExposureWindow.ComputeZScore(gexr) : null,
-            VolumePcrZ: volumePcrRaw is { } vpcrr ? _volumePcrWindow.ComputeZScore(vpcrr) : null);
+            VolumePcrZ: volumePcrRaw is { } vpcrr ? _volumePcrWindow.ComputeZScore(vpcrr) : null,
+            SpreadRatioZ: spreadRatioRaw is { } srr ? _spreadRatioWindow.ComputeZScore(srr) : null);
 
         // Multi-cadence smoothing (2026-09-07): a composite recomputed from scratch every 15s
         // with no memory of its own recent behavior was too noisy to sustain past the entry
@@ -570,6 +664,7 @@ public sealed class LiveFeatureEngine
             VixChangeRaw = vixChangeRaw,
             GammaExposureRaw = gammaExposureRaw,
             VolumePcrRaw = volumePcrRaw,
+            SpreadRatioRaw = spreadRatioRaw,
             OiBuildupNetZ = inputs.OiBuildupNetZ,
             PcrZ = inputs.PcrZ,
             FuturesBasisZ = inputs.FuturesBasisZ,
@@ -579,6 +674,7 @@ public sealed class LiveFeatureEngine
             VixChangeZ = inputs.VixChangeZ,
             GammaExposureZ = inputs.GammaExposureZ,
             VolumePcrZ = inputs.VolumePcrZ,
+            SpreadRatioZ = inputs.SpreadRatioZ,
             CompositeScoreRaw = compositeRawSmoothed,
             CompositeScoreRawInstant = compositeRawInstant,
             CompositeScore = composite.Score,
@@ -622,6 +718,7 @@ public sealed class LiveFeatureEngine
         var bandStrikes = strikesByDistance.Take((PersistedStrikeBand * 2) + 1).ToHashSet();
 
         var t = TimeToExpiry.YearsUntilExpiry(_nearestExpiry, now);
+        var underlying = ComputeUnderlyingPrice(spot.LastPrice, t);
 
         // One reference vol per cadence, solved at the ATM strike -- the most liquid, most
         // trustworthy point on the chain. Pricing every strike at the ATM strike's vol (rather
@@ -629,7 +726,7 @@ public sealed class LiveFeatureEngine
         // circular) makes the gap meaningful: the skew premium in rupees. Same methodology as
         // the dashboard's live theoretical-price display (LiveDataService.BuildAtmReferenceVol),
         // ported here so it gets persisted for analysis rather than only existing on screen.
-        var atmReferenceVol = SolveAtmReferenceVol(atmStrike, spot.LastPrice, t);
+        var atmReferenceVol = SolveAtmReferenceVol(atmStrike, underlying, t);
 
         foreach (var option in _nearestExpiryOptions.Where(o => bandStrikes.Contains(o.StrikePrice!.Value)))
         {
@@ -665,20 +762,21 @@ public sealed class LiveFeatureEngine
                 ? (decimal)avgSpreadPct
                 : null;
 
-            // Priced against spot, not the tracked (monthly) future -- see ComputeIvSkew's doc
-            // comment for why. Greeks are only meaningful if the IV solve succeeded; a failed
-            // solve leaves all six null rather than seeding an arbitrary volatility.
+            // Priced against the synthetic forward, not raw spot or the tracked (monthly)
+            // future -- see ComputeUnderlyingPrice's doc comment for why. Greeks are only
+            // meaningful if the IV solve succeeded; a failed solve leaves all six null rather
+            // than seeding an arbitrary volatility.
             var mark = MidPrice(state);
             double? iv = null, delta = null, gamma = null, thetaPerDay = null, vega = null, rho = null;
             if (mark is { } markPrice && markPrice > 0)
             {
                 iv = ImpliedVolatilitySolver.Solve(
-                    option.OptionType, (double)markPrice, (double)spot.LastPrice, (double)option.StrikePrice!.Value, t, RiskFreeRate);
+                    option.OptionType, (double)markPrice, (double)underlying, (double)option.StrikePrice!.Value, t, RiskFreeRate);
 
                 if (iv is { } ivValue)
                 {
                     var greeks = BlackScholes.Calculate(
-                        option.OptionType, (double)spot.LastPrice, (double)option.StrikePrice!.Value, t, RiskFreeRate, ivValue).Greeks;
+                        option.OptionType, (double)underlying, (double)option.StrikePrice!.Value, t, RiskFreeRate, ivValue).Greeks;
                     delta = greeks.Delta;
                     gamma = greeks.Gamma;
                     thetaPerDay = greeks.ThetaPerDay;
@@ -691,7 +789,7 @@ public sealed class LiveFeatureEngine
             // now should still show what it *should* cost against the reference vol, not just
             // strikes that happen to have a two-sided quote this cadence.
             double? theoreticalPrice = atmReferenceVol is { } refVol
-                ? BlackScholes.Calculate(option.OptionType, (double)spot.LastPrice, (double)option.StrikePrice!.Value, t, RiskFreeRate, refVol).Price
+                ? BlackScholes.Calculate(option.OptionType, (double)underlying, (double)option.StrikePrice!.Value, t, RiskFreeRate, refVol).Price
                 : null;
 
             double? priceVsTheoretical = mark is { } markForDiff && theoreticalPrice is { } theo
@@ -917,8 +1015,9 @@ public sealed class LiveFeatureEngine
         }
 
         var t = TimeToExpiry.YearsUntilExpiry(_nearestExpiry, now);
-        var callIv = ImpliedVolatilitySolver.Solve(OptionType.Call, (double)cm, (double)spotPrice, (double)callOpt.StrikePrice!.Value, t, RiskFreeRate);
-        var putIv = ImpliedVolatilitySolver.Solve(OptionType.Put, (double)pm, (double)spotPrice, (double)putOpt.StrikePrice!.Value, t, RiskFreeRate);
+        var underlying = ComputeUnderlyingPrice(spotPrice, t);
+        var callIv = ImpliedVolatilitySolver.Solve(OptionType.Call, (double)cm, (double)underlying, (double)callOpt.StrikePrice!.Value, t, RiskFreeRate);
+        var putIv = ImpliedVolatilitySolver.Solve(OptionType.Put, (double)pm, (double)underlying, (double)putOpt.StrikePrice!.Value, t, RiskFreeRate);
 
         return callIv is null || putIv is null ? null : putIv - callIv;
     }
@@ -928,8 +1027,10 @@ public sealed class LiveFeatureEngine
     /// <see cref="BuildStrikeSnapshots"/>. Prefers the call leg, falls back to the put if the
     /// call has no usable quote or its solve fails -- same preference as the dashboard's own
     /// BuildAtmReferenceVol. Null (not a guess) when neither leg can be solved this cadence.
+    /// <paramref name="underlyingPrice"/> should be <see cref="ComputeUnderlyingPrice"/>'s
+    /// result, not raw spot -- see that method's doc comment.
     /// </summary>
-    double? SolveAtmReferenceVol(decimal atmStrike, decimal spotPrice, double t)
+    double? SolveAtmReferenceVol(decimal atmStrike, decimal underlyingPrice, double t)
     {
         var atmLegs = _nearestExpiryOptions
             .Where(o => o.StrikePrice == atmStrike)
@@ -948,7 +1049,7 @@ public sealed class LiveFeatureEngine
                 continue;
             }
 
-            var solved = ImpliedVolatilitySolver.Solve(leg.OptionType, (double)markPrice, (double)spotPrice, (double)atmStrike, t, RiskFreeRate);
+            var solved = ImpliedVolatilitySolver.Solve(leg.OptionType, (double)markPrice, (double)underlyingPrice, (double)atmStrike, t, RiskFreeRate);
             if (solved is { } vol)
             {
                 return vol;

@@ -24,7 +24,8 @@ public static class CompositeScoreCalculator
     const string VixComponentName = "VixChange";
     const string GammaExposureComponentName = "GammaExposure";
     const string VolumePcrComponentName = "VolumePcr";
-    static readonly string[] OptionalComponentNames = [VixComponentName, GammaExposureComponentName, VolumePcrComponentName];
+    const string SpreadRatioComponentName = "SpreadRatio";
+    static readonly string[] OptionalComponentNames = [VixComponentName, GammaExposureComponentName, VolumePcrComponentName, SpreadRatioComponentName];
 
     /// <summary>
     /// The pre-tanh weighted z-sum on its own (2026-09-04), for callers that need to build a
@@ -95,6 +96,7 @@ public static class CompositeScoreCalculator
         BuildComponent(VixComponentName, weights.VixChange, inputs.VixChangeZ),
         BuildComponent(GammaExposureComponentName, weights.GammaExposure, inputs.GammaExposureZ),
         BuildComponent(VolumePcrComponentName, weights.VolumePcr, inputs.VolumePcrZ),
+        BuildComponent(SpreadRatioComponentName, weights.SpreadRatio, inputs.SpreadRatioZ),
     ];
 
     static ScoreComponentBreakdown BuildComponent(string name, double weight, double? z)

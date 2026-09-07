@@ -16,7 +16,8 @@ public sealed record ScoreWeights(
     double DepthImbalance,
     double VixChange = 0.0,
     double GammaExposure = 0.0,
-    double VolumePcr = 0.0)
+    double VolumePcr = 0.0,
+    double SpreadRatio = 0.0)
 {
     /// <summary>
     /// The plan's own starting weights (section 6: 25/20/15/15/15/10), rescaled by 0.95 to
@@ -57,8 +58,19 @@ public sealed record ScoreWeights(
     /// count-vs-notional disagreement is exactly the kind of thing worth watching once there's
     /// real multi-day VolumePcrZ history to look at.
     /// </summary>
+    /// <summary>
+    /// SpreadRatio (2026-09-07) starts at weight 0.0 for the same reason GammaExposure and
+    /// VolumePcr do -- zero days of validated evidence. Unlike VolumePcr's mixed methodology
+    /// signal, this one came back clean on a same-day check: put-spread/call-spread ratio
+    /// correlated +0.315 with the 15-minute forward price move, consistently signed across
+    /// 1/5/15-minute horizons (unlike VolumePcr's count-vs-notional sign disagreement), and on
+    /// a much less autocorrelated series than the raw-level metrics whose apparent correlation
+    /// turned out to be a single trending day's spurious signal -- the cleanest same-day result
+    /// of the three new diagnostic components. Still launches at 0.0 regardless: one day is one
+    /// day, not multi-day validated evidence.
+    /// </summary>
     public static ScoreWeights Default { get; } = new(
-        Version: "plan-section-6-default+vix-2026-09-04+momentum-cut-2026-09-07+gex-and-volumepcr-diagnostic-2026-09-07",
+        Version: "plan-section-6-default+vix-2026-09-04+momentum-cut-2026-09-07+diagnostics-2026-09-07",
         OiBuildupNet: 0.2775,
         Pcr: 0.19,
         FuturesBasis: 0.1425,
@@ -67,7 +79,8 @@ public sealed record ScoreWeights(
         DepthImbalance: 0.1275,
         VixChange: 0.05,
         GammaExposure: 0.0,
-        VolumePcr: 0.0);
+        VolumePcr: 0.0,
+        SpreadRatio: 0.0);
 
-    public double Total => OiBuildupNet + Pcr + FuturesBasis + IvSkew + PriceMomentum + DepthImbalance + VixChange + GammaExposure + VolumePcr;
+    public double Total => OiBuildupNet + Pcr + FuturesBasis + IvSkew + PriceMomentum + DepthImbalance + VixChange + GammaExposure + VolumePcr + SpreadRatio;
 }

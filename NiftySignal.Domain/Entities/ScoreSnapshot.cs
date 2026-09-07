@@ -42,6 +42,14 @@ public sealed class ScoreSnapshot
     /// </summary>
     public double? VolumePcrRaw { get; set; }
 
+    /// <summary>
+    /// Put-spread/call-spread ratio (2026-09-07, diagnostic-only -- see ScoreWeights.Default's
+    /// SpreadRatio weight), across the full nearest-expiry chain -- see
+    /// LiveFeatureEngine.ComputeSpreadRatio. Optional: never blocks the composite, same as
+    /// VixChangeRaw/GammaExposureRaw/VolumePcrRaw.
+    /// </summary>
+    public double? SpreadRatioRaw { get; set; }
+
     public double? OiBuildupNetZ { get; set; }
     public double? PcrZ { get; set; }
     public double? FuturesBasisZ { get; set; }
@@ -51,6 +59,7 @@ public sealed class ScoreSnapshot
     public double? VixChangeZ { get; set; }
     public double? GammaExposureZ { get; set; }
     public double? VolumePcrZ { get; set; }
+    public double? SpreadRatioZ { get; set; }
 
     /// <summary>
     /// The pre-tanh weighted z-sum (2026-09-04) -- persisted so the dynamic-k rolling window

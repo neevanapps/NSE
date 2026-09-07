@@ -429,6 +429,9 @@ public sealed class LiveDataService : IDisposable
             // Diagnostic-only (weight 0.0, see ScoreWeights.Default) -- same treatment as GammaExposure.
             new("VolumePcr", ScoreWeights.Default.VolumePcr, s.VolumePcrZ ?? 0, (s.VolumePcrZ ?? 0) * ScoreWeights.Default.VolumePcr,
                 s.VolumePcrZ is not null, FeatureWindowLengths.VolumePcr, Remaining(FeatureWindowLengths.VolumePcr)),
+            // Diagnostic-only (weight 0.0, see ScoreWeights.Default) -- same treatment as GammaExposure/VolumePcr.
+            new("SpreadRatio", ScoreWeights.Default.SpreadRatio, s.SpreadRatioZ ?? 0, (s.SpreadRatioZ ?? 0) * ScoreWeights.Default.SpreadRatio,
+                s.SpreadRatioZ is not null, FeatureWindowLengths.SpreadRatio, Remaining(FeatureWindowLengths.SpreadRatio)),
         ];
     }
 
@@ -443,6 +446,7 @@ public sealed class LiveDataService : IDisposable
         new("VixChange", ScoreWeights.Default.VixChange, 0, 0, false, FeatureWindowLengths.VixChangeZScoreWindow, FeatureWindowLengths.VixChangeZScoreWindow),
         new("GammaExposure", ScoreWeights.Default.GammaExposure, 0, 0, false, FeatureWindowLengths.GammaExposure, FeatureWindowLengths.GammaExposure),
         new("VolumePcr", ScoreWeights.Default.VolumePcr, 0, 0, false, FeatureWindowLengths.VolumePcr, FeatureWindowLengths.VolumePcr),
+        new("SpreadRatio", ScoreWeights.Default.SpreadRatio, 0, 0, false, FeatureWindowLengths.SpreadRatio, FeatureWindowLengths.SpreadRatio),
     ];
 
     async Task<List<OptionChainRow>> BuildOptionChainAsync(NiftySignalDbContext db)
@@ -496,7 +500,10 @@ public sealed class LiveDataService : IDisposable
         // cost-of-carry gap (~127 points, observed 2026-09-04) -- enough to price deep-ITM
         // calls below their own intrinsic value (an impossible/arbitrage price), which is
         // what was driving the solver to a degenerate call IV and, symmetrically, an
-        // inflated put IV. Same root cause and fix as LiveFeatureEngine's IV/Delta calcs.
+        // inflated put IV. Kept only as the anchor for BuildSyntheticForwardByExpiry below
+        // (2026-09-07) -- spot itself is no longer fed directly into any IV/Greeks calculation;
+        // that first fix was directionally right but incomplete, since spot alone still carries
+        // no cost-of-carry adjustment. See BuildSyntheticForwardByExpiry's own doc comment.
         var spotLtp = spotToken is null
             ? (decimal?)null
             : await db.Ticks.Where(t => t.Token == spotToken).OrderByDescending(t => t.ExchangeTimestamp).Select(t => (decimal?)t.LastPrice).FirstOrDefaultAsync();
@@ -519,6 +526,19 @@ public sealed class LiveDataService : IDisposable
             .Distinct()
             .ToDictionary(e => e, e => TimeToExpiry.YearsUntilExpiry(e, DateTimeOffset.UtcNow));
 
+        // Synthetic forward per expiry via put-call parity (2026-09-07) -- replaces spotLtp as
+        // the Black-Scholes underlying below. Neither spot nor a tracked future is the right
+        // underlying for a weekly option (spot has no cost-of-carry adjustment; the earlier
+        // 2026-09-04 fix already ruled out the mismatched monthly future) -- a same-day live
+        // check found systematically inconsistent call/put IV at the same strike (put running
+        // ~7-8 vol points below call, everywhere, all day) that traced to exactly this: an
+        // understated underlying biases a call solve up and a put solve down. See
+        // NiftySignal.Pricing.SyntheticForward's doc comment and
+        // LiveFeatureEngine.ComputeUnderlyingPrice (same fix, same day, same root cause).
+        var forwardByExpiry = spotLtp is { } spotForForward
+            ? BuildSyntheticForwardByExpiry(instruments, latestByToken, spotForForward, yearsToExpiry)
+            : [];
+
         // Reference vol for theoretical pricing (2026-09-05), solved per expiry at the ATM
         // strike. Pricing each strike with its *own* implied vol would just reproduce that
         // strike's market price exactly -- true by construction, and useless. Pricing every
@@ -526,7 +546,7 @@ public sealed class LiveDataService : IDisposable
         // premium in rupee terms, i.e. how much more (or less) the market is paying for this
         // strike than the at-the-money baseline implies. Above theoretical reads as demand
         // bidding premium up; below reads as supply/writing pressure.
-        var atmVolByExpiry = BuildAtmReferenceVol(instruments, latestByToken, spotLtp, atmStrike, yearsToExpiry);
+        var atmVolByExpiry = BuildAtmReferenceVol(instruments, latestByToken, forwardByExpiry, atmStrike, yearsToExpiry);
 
         var rows = new List<OptionChainRow>();
         foreach (var instrument in instruments.OrderBy(i => i.ExpiryDate).ThenBy(i => i.StrikePrice))
@@ -540,7 +560,7 @@ public sealed class LiveDataService : IDisposable
             var t = yearsToExpiry[expiry];
 
             double? iv = null, theoretical = null;
-            if (spotLtp is { } underlying && tick.LastPrice > 0)
+            if (forwardByExpiry.TryGetValue(expiry, out var underlying) && tick.LastPrice > 0)
             {
                 iv = ImpliedVolatilitySolver.Solve(instrument.OptionType, (double)tick.LastPrice, (double)underlying, (double)instrument.StrikePrice!.Value, t, RiskFreeRate);
 
@@ -605,18 +625,19 @@ public sealed class LiveDataService : IDisposable
     static Dictionary<DateOnly, double> BuildAtmReferenceVol(
         List<Instrument> instruments,
         Dictionary<string, Tick> latestByToken,
-        decimal? spotLtp,
+        Dictionary<DateOnly, decimal> forwardByExpiry,
         decimal atmStrike,
         Dictionary<DateOnly, double> yearsToExpiry)
     {
         var result = new Dictionary<DateOnly, double>();
-        if (spotLtp is not { } underlying)
-        {
-            return result;
-        }
 
         foreach (var expiry in yearsToExpiry.Keys)
         {
+            if (!forwardByExpiry.TryGetValue(expiry, out var underlying))
+            {
+                continue;
+            }
+
             var atmLegs = instruments
                 .Where(i => i.ExpiryDate == expiry && i.StrikePrice == atmStrike)
                 .OrderBy(i => i.OptionType == OptionType.Call ? 0 : 1);
@@ -640,6 +661,59 @@ public sealed class LiveDataService : IDisposable
         }
 
         return result;
+    }
+
+    const int SyntheticForwardStrikeCount = 5;
+
+    /// <summary>
+    /// Synthetic forward via put-call parity, one per expiry (2026-09-07) -- see the call
+    /// site's doc comment for why this replaced spotLtp as the Black-Scholes underlying.
+    /// Averages (median, via SyntheticForward.Compute) the parity estimate from the
+    /// <see cref="SyntheticForwardStrikeCount"/> strikes nearest spot within that expiry, each
+    /// with both a call and put quote. Falls back to spotLtp itself for an expiry where no
+    /// strike has both legs quoted yet.
+    /// </summary>
+    static Dictionary<DateOnly, decimal> BuildSyntheticForwardByExpiry(
+        List<Instrument> instruments,
+        Dictionary<string, Tick> latestByToken,
+        decimal spotLtp,
+        Dictionary<DateOnly, double> yearsToExpiry)
+    {
+        var result = new Dictionary<DateOnly, decimal>();
+
+        foreach (var (expiry, t) in yearsToExpiry)
+        {
+            var expiryInstruments = instruments.Where(i => i.ExpiryDate == expiry).ToList();
+            var pairs = new List<(double Strike, double CallMid, double PutMid)>();
+
+            foreach (var strike in expiryInstruments.Select(i => i.StrikePrice!.Value).Distinct().OrderBy(s => Math.Abs(s - spotLtp)).Take(SyntheticForwardStrikeCount))
+            {
+                var call = expiryInstruments.FirstOrDefault(i => i.OptionType == OptionType.Call && i.StrikePrice == strike);
+                var put = expiryInstruments.FirstOrDefault(i => i.OptionType == OptionType.Put && i.StrikePrice == strike);
+                if (call is null || put is null
+                    || !latestByToken.TryGetValue(call.Token, out var callTick) || !latestByToken.TryGetValue(put.Token, out var putTick)
+                    || MidPrice(callTick) is not { } callMid || MidPrice(putTick) is not { } putMid)
+                {
+                    continue;
+                }
+
+                pairs.Add(((double)strike, (double)callMid, (double)putMid));
+            }
+
+            result[expiry] = SyntheticForward.Compute(pairs, t, RiskFreeRate) is { } forward ? (decimal)forward : spotLtp;
+        }
+
+        return result;
+    }
+
+    static decimal? MidPrice(Tick tick)
+    {
+        if (tick.Depth is { } depth && depth.Bid1Price > 0 && depth.Ask1Price > 0)
+        {
+            return (depth.Bid1Price + depth.Ask1Price) / 2;
+        }
+
+        return tick.LastPrice > 0 ? tick.LastPrice : null;
     }
 
     /// <summary>

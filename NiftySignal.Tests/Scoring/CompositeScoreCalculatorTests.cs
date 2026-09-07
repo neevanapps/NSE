@@ -151,12 +151,12 @@ public class CompositeScoreCalculatorTests
     }
 
     [Fact]
-    public void Calculate_ComponentBreakdown_ContainsAllNineNamedComponents()
+    public void Calculate_ComponentBreakdown_ContainsAllTenNamedComponents()
     {
         var result = CompositeScoreCalculator.Calculate(FullyWarmInputs, ScoreWeights.Default, ComputedAt);
 
         var names = result.Components.Select(c => c.Name).ToHashSet();
-        Assert.Equal(9, result.Components.Count);
+        Assert.Equal(10, result.Components.Count);
         Assert.Contains("OiBuildupNet", names);
         Assert.Contains("Pcr", names);
         Assert.Contains("FuturesBasis", names);
@@ -166,6 +166,7 @@ public class CompositeScoreCalculatorTests
         Assert.Contains("VixChange", names);
         Assert.Contains("GammaExposure", names);
         Assert.Contains("VolumePcr", names);
+        Assert.Contains("SpreadRatio", names);
     }
 
     [Fact]
@@ -271,6 +272,41 @@ public class CompositeScoreCalculatorTests
         Assert.Equal(expectedScore, result.Score!.Value, 1e-9);
     }
 
+    [Fact]
+    public void Calculate_StaysWarmedUp_WhenOnlySpreadRatioZIsMissing()
+    {
+        // SpreadRatioZ is deliberately optional too (2026-09-07, diagnostic-only -- see
+        // ScoreWeights.Default's own weight of 0.0) -- its absence must not block the composite.
+        var inputs = FullyWarmInputs with { SpreadRatioZ = null };
+
+        var result = CompositeScoreCalculator.Calculate(inputs, ScoreWeights.Default, ComputedAt);
+
+        Assert.True(result.IsWarmedUp);
+        Assert.NotNull(result.Score);
+    }
+
+    [Fact]
+    public void Calculate_IncludesSpreadRatiosWeightedContribution_WhenPresentAndWeighted()
+    {
+        // Default's SpreadRatio weight is 0.0 (diagnostic-only), so this uses a nonzero weight
+        // to verify the wiring itself, independent of the current live weight.
+        var weights = ScoreWeights.Default with { SpreadRatio = 0.05 };
+        var inputs = FullyWarmInputs with { SpreadRatioZ = -1.4 };
+
+        var result = CompositeScoreCalculator.Calculate(inputs, weights, ComputedAt, k: 1.0);
+
+        var expectedRaw = (weights.OiBuildupNet * FullyWarmInputs.OiBuildupNetZ!.Value)
+            + (weights.Pcr * FullyWarmInputs.PcrZ!.Value)
+            + (weights.FuturesBasis * FullyWarmInputs.FuturesBasisZ!.Value)
+            + (weights.IvSkew * FullyWarmInputs.IvSkewZ!.Value)
+            + (weights.PriceMomentum * FullyWarmInputs.PriceMomentumZ!.Value)
+            + (weights.DepthImbalance * FullyWarmInputs.DepthImbalanceZ!.Value)
+            + (weights.SpreadRatio * -1.4);
+        var expectedScore = 100.0 * Math.Tanh(expectedRaw / 1.0);
+
+        Assert.Equal(expectedScore, result.Score!.Value, 1e-9);
+    }
+
     [Theory]
     [InlineData(0)]
     [InlineData(-1)]
@@ -317,6 +353,7 @@ public class CompositeScoreCalculatorTests
         Assert.Equal(0.05, weights.VixChange, 1e-9);
         Assert.Equal(0.0, weights.GammaExposure, 1e-9);
         Assert.Equal(0.0, weights.VolumePcr, 1e-9);
+        Assert.Equal(0.0, weights.SpreadRatio, 1e-9);
         Assert.Equal(1.0, weights.Total, 1e-9);
     }
 }
