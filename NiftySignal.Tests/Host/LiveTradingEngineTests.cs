@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using NiftySignal.Domain.Entities;
 using NiftySignal.Domain.Enums;
 using NiftySignal.Domain.ValueObjects;
@@ -18,7 +19,7 @@ public class LiveTradingEngineTests
 
     const string SpotToken = "26000";
     const string FutureToken = "68407";
-    const string AtmCallToken = "42000"; // strike 24000, priced ~163.74 at 15% vol -- see class remarks
+    const string AtmCallToken = "42000"; // strike 24000, priced ~124.74 -- see WarmedFeatureEngineWithAtmCall
 
     /// <summary>
     /// A recording fake, not a mock library -- this project has no mocking dependency and
@@ -39,6 +40,7 @@ public class LiveTradingEngineTests
     sealed class Fixture : IAsyncDisposable
     {
         readonly ServiceProvider _provider;
+        readonly DashboardPushClient _dashboardPush;
         public LiveTradingEngine Engine { get; }
         public FakeTelegramNotifier Telegram { get; } = new();
 
@@ -56,9 +58,15 @@ public class LiveTradingEngineTests
             services.AddDbContext<NiftySignalDbContext>(o => o.UseInMemoryDatabase(dbName));
             _provider = services.BuildServiceProvider();
 
+            // Never started (StartAsync is never called), so it never actually attempts a
+            // connection -- PushTradesChangedAsync's own state check makes every call from
+            // the engine under test a harmless no-op, same as a real Dashboard being down.
+            _dashboardPush = new DashboardPushClient(Options.Create(new DashboardPushOptions()), NullLogger<DashboardPushClient>.Instance);
+
             Engine = new LiveTradingEngine(
                 _provider.GetRequiredService<IServiceScopeFactory>(),
                 Telegram,
+                _dashboardPush,
                 NullLogger<LiveTradingEngine>.Instance);
         }
 
@@ -74,10 +82,10 @@ public class LiveTradingEngineTests
             await action(scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>());
         }
 
-        public ValueTask DisposeAsync()
+        public async ValueTask DisposeAsync()
         {
             _provider.Dispose();
-            return ValueTask.CompletedTask;
+            await _dashboardPush.DisposeAsync();
         }
     }
 
@@ -116,10 +124,10 @@ public class LiveTradingEngineTests
         var engine = new LiveFeatureEngine(BaseUniverse());
         engine.OnTick(MakeTick(SpotToken, 24000m, now));
         engine.OnTick(MakeTick(FutureToken, 24000m, now));
-        // Theoretical price at strike=24000, futures=24000, 15% vol, ~4 days to expiry is
-        // ~163.74 (verified against BlackScholes directly) -- lands inside the live
-        // ruleset's [150,200] premium band with room either side.
-        engine.OnTick(MakeTick(AtmCallToken, 163.74m, now, oi: 150_000, depth: Depth(bid: 163.24m, ask: 164.24m)));
+        // A premium that lands inside the live ruleset's [100,150] band (2026-09-07, narrowed
+        // from [150,200]) with room either side -- not tied to a specific BlackScholes solve,
+        // just a plausible near-ATM premium for these cadence-evaluation tests.
+        engine.OnTick(MakeTick(AtmCallToken, 124.74m, now, oi: 150_000, depth: Depth(bid: 124.24m, ask: 125.24m)));
         return engine;
     }
 
@@ -187,8 +195,8 @@ public class LiveTradingEngineTests
             Assert.Equal(AtmCallToken, trade.InstrumentToken);
             Assert.Equal(EntryDirection.Bullish, trade.Direction);
             Assert.Equal(70, trade.EntryScore);
-            // FillEntry: ask (164.24) + tickSize(0.05) * SlippageTicks(2) = 164.34.
-            Assert.Equal(164.34m, trade.EntryPrice);
+            // FillEntry: ask (125.24) + tickSize(0.05) * SlippageTicks(2) = 125.34.
+            Assert.Equal(125.34m, trade.EntryPrice);
         });
         Assert.Contains(fixture.Telegram.Sent, s => s.Category == NotificationCategory.TradeEntry);
     }
@@ -205,7 +213,7 @@ public class LiveTradingEngineTests
             db.PaperTrades.Add(new PaperTrade
             {
                 InstrumentToken = AtmCallToken, TradingSymbol = "NIFTY08SEP26C24000", Direction = EntryDirection.Bullish,
-                EntryTime = entryTime, EntryPrice = 164.34m, EntryScore = 70,
+                EntryTime = entryTime, EntryPrice = 164.34m, Quantity = 130, EntryScore = 70,
                 RulesetVersion = "live-v1-2026-09-04", ScoreWeightsVersion = "test-weights-1",
             });
             await db.SaveChangesAsync();
@@ -234,13 +242,13 @@ public class LiveTradingEngineTests
             db.PaperTrades.Add(new PaperTrade
             {
                 InstrumentToken = AtmCallToken, TradingSymbol = "NIFTY08SEP26C24000", Direction = EntryDirection.Bullish,
-                EntryTime = entryTime, EntryPrice = 100m, EntryScore = 70,
+                EntryTime = entryTime, EntryPrice = 100m, Quantity = 65, EntryScore = 70,
                 RulesetVersion = "live-v1-2026-09-04", ScoreWeightsVersion = "test-weights-1",
             });
             await db.SaveChangesAsync();
         });
 
-        // Partial book: +35% profit (>= the 30% PartialBookAtProfitPct threshold).
+        // Partial book: +35% profit (>= the 15% PartialBookAtProfitPct threshold).
         var partialNow = entryTime.AddMinutes(10);
         var partialEngine = new LiveFeatureEngine(BaseUniverse());
         partialEngine.OnTick(MakeTick(FutureToken, 24000m, partialNow));
@@ -295,7 +303,7 @@ public class LiveTradingEngineTests
             db.PaperTrades.Add(new PaperTrade
             {
                 InstrumentToken = AtmCallToken, TradingSymbol = "NIFTY08SEP26C24000", Direction = EntryDirection.Bullish,
-                EntryTime = entryTime, EntryPrice = 100m, EntryScore = 70,
+                EntryTime = entryTime, EntryPrice = 100m, Quantity = 130, EntryScore = 70,
                 RulesetVersion = "live-v1-2026-09-04", ScoreWeightsVersion = "test-weights-1",
             });
             await db.SaveChangesAsync();
@@ -333,16 +341,16 @@ public class LiveTradingEngineTests
         await using var fixture = new Fixture();
         var t0 = new DateTimeOffset(2026, 9, 4, 10, 0, 0, Ist);
 
-        // Target is 6% of 50,000 capital = 3,000. One closed trade at 3,100 clears it, so the
-        // day is done taking new risk even though every other entry condition is satisfied.
+        // Target is 30% of 50,000 capital = 15,000. One closed trade at 15,100 clears it, so
+        // the day is done taking new risk even though every other entry condition is satisfied.
         await fixture.WithDbAsync(async db =>
         {
             db.PaperTrades.Add(new PaperTrade
             {
                 InstrumentToken = AtmCallToken, TradingSymbol = "NIFTY08SEP26C24000", Direction = EntryDirection.Bullish,
-                EntryTime = t0.AddHours(-1), EntryPrice = 100m, EntryScore = 70,
+                EntryTime = t0.AddHours(-1), EntryPrice = 100m, Quantity = 130, EntryScore = 70,
                 ExitTime = t0.AddMinutes(-30), ExitPrice = 150m, ExitReason = ExitReason.PartialBook,
-                GrossPnl = 3_250m, NetPnl = 3_100m,
+                GrossPnl = 15_250m, NetPnl = 15_100m,
                 RulesetVersion = "live-v1-2026-09-04", ScoreWeightsVersion = "test-weights-1",
             });
             await db.SaveChangesAsync();

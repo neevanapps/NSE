@@ -1,3 +1,4 @@
+using Microsoft.EntityFrameworkCore;
 using NiftySignal.Domain.Abstractions;
 using NiftySignal.Domain.Entities;
 
@@ -20,6 +21,19 @@ public sealed class EfDataGapRecorder(NiftySignalDbContext db) : IDataGapRecorde
         if (gap is not null)
         {
             gap.EndedAt = endedAt;
+            await db.SaveChangesAsync(cancellationToken);
+        }
+    }
+
+    public async Task CloseAllOpenGapsAsync(DateTimeOffset endedAt, CancellationToken cancellationToken)
+    {
+        var openGaps = await db.DataGaps.Where(g => g.EndedAt == null).ToListAsync(cancellationToken);
+        foreach (var gap in openGaps)
+        {
+            gap.EndedAt = endedAt;
+        }
+        if (openGaps.Count > 0)
+        {
             await db.SaveChangesAsync(cancellationToken);
         }
     }

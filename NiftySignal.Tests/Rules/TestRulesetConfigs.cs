@@ -8,7 +8,7 @@ public static class TestRulesetConfigs
 {
     public static RulesetConfig Default() => new(
         RulesetVersion: "test-ruleset-1",
-        Capital: new CapitalConfig(Total: 50000, LotSize: 65, MaxConcurrentPositions: 3),
+        Capital: new CapitalConfig(Total: 50000, LotSize: 65, MaxConcurrentPositions: 3, LotsPerTrade: 2),
         Session: new SessionConfig(
             NoEntryBeforeMinutes: 15,
             NoEntryAfterTime: new TimeOnly(15, 0),
@@ -22,19 +22,19 @@ public static class TestRulesetConfigs
             MaxTradesPerDay: 7,
             MaxIvRankForEntry: 70),
         StrikeSelection: new StrikeSelectionConfig(
-            MinPremium: 150,
-            MaxPremium: 200,
+            MinPremium: 100,
+            MaxPremium: 150,
             MaxSpreadPctOfMid: 2.0,
             MinOpenInterest: 100_000),
         Exit: new ExitConfig(
-            PartialBookAtProfitPct: 30,
+            PartialBookAtProfitPct: 15,
             PartialBookFraction: 0.5,
-            StopLossPct: 25,
+            StopLossPct: 10,
             TrailAfterPartialBook: true,
             ExitOnScoreFlip: true,
             ExitOnScoreBelowAbs: 30,
             MaxHoldMinutes: 120),
         Costs: new CostsConfig(BrokeragePerOrder: 20, SlippageTicks: 2),
-        RiskLimits: new RiskLimitsConfig(MaxDailyLossPct: 3.0, MaxDailyProfitPct: 6.0, MaxConsecutiveLosses: 4),
+        RiskLimits: new RiskLimitsConfig(MaxDailyLossPct: 20.0, MaxDailyProfitPct: 30.0, MaxConsecutiveLosses: 4),
         KillSwitch: new KillSwitchOptions { EntriesEnabled = true });
 }

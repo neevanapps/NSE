@@ -1,5 +1,6 @@
 @implements IAsyncDisposable
 @using NiftySignal.Dashboard.Services
+@using NiftySignal.Domain
 @using NiftySignal.Domain.Enums
 @using NiftySignal.Rules
 @inject LiveDataService Live
@@ -57,8 +58,8 @@
                     <tr>
                         <td>@t.TradingSymbol</td>
                         <td><span class="badge @(t.Direction == EntryDirection.Bullish ? "badge-bull" : "badge-bear")">@(t.Direction == EntryDirection.Bullish ? "CE" : "PE")</span></td>
-                        <td class="text-faint">@t.EntryTime.ToString("HH:mm")</td>
-                        <td class="text-faint">@t.ExitTime.ToString("HH:mm")</td>
+                        <td class="text-faint">@t.EntryTime.ToIst().ToString("HH:mm")</td>
+                        <td class="text-faint">@t.ExitTime.ToIst().ToString("HH:mm")</td>
                         <td class="text-dim">@t.ExitReason</td>
                         <td class="@(t.NetPnl >= 0 ? "text-bull" : "text-bear")">@t.NetPnl.ToString("+0.00;-0.00")</td>
                     </tr>
@@ -101,7 +102,7 @@
             _module = await JS.InvokeAsync<IJSObjectReference>("import", "./js/charts.js");
 
             var ordered = Live.ClosedTrades.OrderBy(t => t.ExitTime).ToList();
-            var labels = ordered.Select(t => t.ExitTime.ToString("HH:mm")).ToArray();
+            var labels = ordered.Select(t => t.ExitTime.ToIst().ToString("HH:mm")).ToArray();
             decimal running = 0;
             var equity = ordered.Select(t => (double)(running += t.NetPnl)).ToArray();
 

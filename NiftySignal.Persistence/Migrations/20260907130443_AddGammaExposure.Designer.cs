@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using NiftySignal.Persistence;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace NiftySignal.Persistence.Migrations
 {
     [DbContext(typeof(NiftySignalDbContext))]
-    partial class NiftySignalDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260907130443_AddGammaExposure")]
+    partial class AddGammaExposure
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -333,12 +336,6 @@ namespace NiftySignal.Persistence.Migrations
                         .HasColumnType("double precision");
 
                     b.Property<double?>("VixChangeZ")
-                        .HasColumnType("double precision");
-
-                    b.Property<double?>("VolumePcrRaw")
-                        .HasColumnType("double precision");
-
-                    b.Property<double?>("VolumePcrZ")
                         .HasColumnType("double precision");
 
                     b.Property<string>("WeightSetVersion")

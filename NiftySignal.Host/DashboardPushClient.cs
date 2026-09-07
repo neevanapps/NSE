@@ -107,5 +107,28 @@ public sealed class DashboardPushClient : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Signal-only (2026-09-07) -- tells Dashboard a paper trade changed (entry/partial-book/
+    /// exit) so it re-reads positions/closed trades immediately instead of waiting up to 5s
+    /// for its next poll. Best-effort, same as PushTickAsync: if Dashboard is unreachable this
+    /// silently no-ops and the next poll picks the change up anyway.
+    /// </summary>
+    public async Task PushTradesChangedAsync(CancellationToken ct)
+    {
+        if (_connection.State != HubConnectionState.Connected)
+        {
+            return;
+        }
+
+        try
+        {
+            await _connection.SendAsync("PushTradesChanged", ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Dashboard trade-changed push failed -- the next poll will still pick it up");
+        }
+    }
+
     public async ValueTask DisposeAsync() => await _connection.DisposeAsync();
 }

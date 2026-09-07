@@ -25,7 +25,7 @@ public class StrikeSelectorTests
     [Fact]
     public void SelectBestCandidate_PicksACall_ForABullishDirection()
     {
-        var candidates = new[] { Call("NIFTY_C_25000", 175), Put("NIFTY_P_25000", 175) };
+        var candidates = new[] { Call("NIFTY_C_25000", 125), Put("NIFTY_P_25000", 125) };
 
         var result = Selector.SelectBestCandidate(candidates, EntryDirection.Bullish, Config);
 
@@ -36,7 +36,7 @@ public class StrikeSelectorTests
     [Fact]
     public void SelectBestCandidate_PicksAPut_ForABearishDirection()
     {
-        var candidates = new[] { Call("NIFTY_C_25000", 175), Put("NIFTY_P_25000", 175) };
+        var candidates = new[] { Call("NIFTY_C_25000", 125), Put("NIFTY_P_25000", 125) };
 
         var result = Selector.SelectBestCandidate(candidates, EntryDirection.Bearish, Config);
 
@@ -47,9 +47,9 @@ public class StrikeSelectorTests
     [Fact]
     public void SelectBestCandidate_ExcludesPremiumOutsideTheConfiguredBand()
     {
-        var tooCheap = Call("cheap", 100);
-        var tooExpensive = Call("expensive", 300);
-        var justRight = Call("right", 175);
+        var tooCheap = Call("cheap", 70);
+        var tooExpensive = Call("expensive", 200);
+        var justRight = Call("right", 125);
 
         var result = Selector.SelectBestCandidate([tooCheap, tooExpensive, justRight], EntryDirection.Bullish, Config);
 
@@ -62,9 +62,9 @@ public class StrikeSelectorTests
     public void SelectBestCandidate_ExcludesACandidateWithNoValidQuote()
     {
         var noQuote = new StrikeCandidate(
-            Token: "no_quote", TradingSymbol: "no_quote", OptionType.Call, Mid: 175,
+            Token: "no_quote", TradingSymbol: "no_quote", OptionType.Call, Mid: 125,
             BidPrice: null, AskPrice: null, OpenInterest: 200_000, Volume: 5000, Delta: 0.45, ImpliedVolatility: 0.18);
-        var valid = Call("valid", 175);
+        var valid = Call("valid", 125);
 
         var result = Selector.SelectBestCandidate([noQuote, valid], EntryDirection.Bullish, Config);
 
@@ -75,9 +75,9 @@ public class StrikeSelectorTests
     [Fact]
     public void SelectBestCandidate_ExcludesASpreadWiderThanTheConfiguredMax()
     {
-        // Config max spread is 2% of mid. Mid=175 -> 2% = 3.5.
-        var wideSpread = Call("wide", 175, bid: 170, ask: 180); // spread=10, 5.7% of mid
-        var tightSpread = Call("tight", 175, bid: 174, ask: 176); // spread=2, 1.14% of mid
+        // Config max spread is 2% of mid. Mid=125 -> 2% = 2.5.
+        var wideSpread = Call("wide", 125, bid: 120, ask: 130); // spread=10, 8% of mid
+        var tightSpread = Call("tight", 125, bid: 124, ask: 126); // spread=2, 1.6% of mid
 
         var result = Selector.SelectBestCandidate([wideSpread, tightSpread], EntryDirection.Bullish, Config);
 
@@ -88,8 +88,8 @@ public class StrikeSelectorTests
     [Fact]
     public void SelectBestCandidate_ExcludesOpenInterestBelowTheFloor()
     {
-        var thin = Call("thin", 175, oi: 50_000); // floor is 100_000
-        var liquid = Call("liquid", 175, oi: 500_000);
+        var thin = Call("thin", 125, oi: 50_000); // floor is 100_000
+        var liquid = Call("liquid", 125, oi: 500_000);
 
         var result = Selector.SelectBestCandidate([thin, liquid], EntryDirection.Bullish, Config);
 
@@ -100,8 +100,8 @@ public class StrikeSelectorTests
     [Fact]
     public void SelectBestCandidate_ExcludesACandidateWithNoImpliedVolatility()
     {
-        var noIv = Call("no_iv", 175, iv: null);
-        var valid = Call("valid", 175);
+        var noIv = Call("no_iv", 125, iv: null);
+        var valid = Call("valid", 125);
 
         var result = Selector.SelectBestCandidate([noIv, valid], EntryDirection.Bullish, Config);
 
@@ -124,8 +124,8 @@ public class StrikeSelectorTests
     public void SelectBestCandidate_PrefersTheDeltaBand_OverHigherLiquidityOutsideIt()
     {
         // Higher OI but delta outside [0.30, 0.60]; lower OI but delta inside the band.
-        var highLiquidityLowDelta = Call("far_otm", 175, oi: 900_000, delta: 0.15);
-        var inBandDelta = Call("preferred", 175, oi: 150_000, delta: 0.50);
+        var highLiquidityLowDelta = Call("far_otm", 125, oi: 900_000, delta: 0.15);
+        var inBandDelta = Call("preferred", 125, oi: 150_000, delta: 0.50);
 
         var result = Selector.SelectBestCandidate([highLiquidityLowDelta, inBandDelta], EntryDirection.Bullish, Config);
 
@@ -135,8 +135,8 @@ public class StrikeSelectorTests
     [Fact]
     public void SelectBestCandidate_RanksByOpenInterest_AsTheTiebreakWithinTheDeltaBand()
     {
-        var lowerOi = Call("lower_oi", 175, oi: 150_000, delta: 0.45);
-        var higherOi = Call("higher_oi", 175, oi: 400_000, delta: 0.50);
+        var lowerOi = Call("lower_oi", 125, oi: 150_000, delta: 0.45);
+        var higherOi = Call("higher_oi", 125, oi: 400_000, delta: 0.50);
 
         var result = Selector.SelectBestCandidate([lowerOi, higherOi], EntryDirection.Bullish, Config);
 
@@ -146,8 +146,8 @@ public class StrikeSelectorTests
     [Fact]
     public void SelectBestCandidate_IgnoresCandidatesOnTheWrongSide()
     {
-        var wrongSide = Put("wrong_side", 175, oi: 900_000);
-        var rightSide = Call("right_side", 175, oi: 50); // low OI, would fail on its own
+        var wrongSide = Put("wrong_side", 125, oi: 900_000);
+        var rightSide = Call("right_side", 125, oi: 50); // low OI, would fail on its own
 
         // rightSide alone would fail the OI floor, but the point here is that wrongSide
         // (a Put, when Bullish wants a Call) is never even considered as an alternative.
@@ -160,6 +160,6 @@ public class StrikeSelectorTests
     public void SelectBestCandidate_ThrowsForANonDirectionalEntryDirection()
     {
         Assert.Throws<ArgumentOutOfRangeException>(() =>
-            Selector.SelectBestCandidate([Call("c", 175)], EntryDirection.None, Config));
+            Selector.SelectBestCandidate([Call("c", 125)], EntryDirection.None, Config));
     }
 }

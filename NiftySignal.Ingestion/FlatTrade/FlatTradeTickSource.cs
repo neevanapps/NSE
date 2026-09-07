@@ -126,9 +126,9 @@ public sealed class FlatTradeTickSource(
                 // throwing. The far more common "reconnected and resumed streaming" case is
                 // handled inside RunSessionAsync itself, at the point auth actually succeeds --
                 // this is just a fallback for the graceful-close path.
-                if (_openGapId is { } gapId)
+                if (_openGapId is not null)
                 {
-                    await dataGapRecorder.RecordGapEndedAsync(gapId, DateTimeOffset.UtcNow, ct);
+                    await dataGapRecorder.CloseAllOpenGapsAsync(DateTimeOffset.UtcNow, ct);
                     _openGapId = null;
                 }
             }
@@ -179,11 +179,13 @@ public sealed class FlatTradeTickSource(
                     // The actual "the outage is over" moment -- authenticated and about to
                     // resume streaming, not "the session object eventually returned" (see
                     // _openGapId's doc comment for why that distinction is the whole bug).
-                    if (_openGapId is { } gapId)
-                    {
-                        await dataGapRecorder.RecordGapEndedAsync(gapId, DateTimeOffset.UtcNow, ct);
-                        _openGapId = null;
-                    }
+                    // Closes *all* open gaps unconditionally (not just _openGapId), because a
+                    // service restart while disconnected starts this process with _openGapId
+                    // null even though the DB still has a real open gap from the previous
+                    // process -- confirmed live 2026-09-07 (gap #14, orphaned by a restart,
+                    // never closed by this instance because it never opened it).
+                    await dataGapRecorder.CloseAllOpenGapsAsync(DateTimeOffset.UtcNow, ct);
+                    _openGapId = null;
 
                     if (!subscribed)
                     {

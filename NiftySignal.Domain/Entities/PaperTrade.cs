@@ -23,6 +23,14 @@ public sealed class PaperTrade
 
     public required decimal EntryPrice { get; set; }
 
+    /// <summary>
+    /// Units traded, captured at entry (2026-09-07) -- LotSize * LotsPerTrade at the moment
+    /// this trade opened. Read back at exit instead of recomputing from current config, so a
+    /// config change (e.g. LotsPerTrade) can never retroactively change the economics of a
+    /// position that's already open when it happens.
+    /// </summary>
+    public required int Quantity { get; set; }
+
     /// <summary>The composite score (plan section 6) that triggered this entry.</summary>
     public required double EntryScore { get; set; }
 

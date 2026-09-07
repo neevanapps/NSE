@@ -37,9 +37,24 @@ public class ExitRuleEvaluatorTests
     }
 
     [Fact]
+    public void Evaluate_SquareOff_ConvertsNowToIst_RegardlessOfWhatOffsetItArrivesWith()
+    {
+        // 15:15 IST == 09:45 UTC, the same instant as the test above but carrying UTC's
+        // Offset=0 (how it actually arrives from the DB/engine in production). A naive
+        // now.DateTime read (no IST conversion) would read this as "09:45", nowhere near
+        // SquareOffTime, and square-off would silently never fire during market hours.
+        var squareOffInstantAsUtc = new DateTimeOffset(2026, 9, 3, 9, 45, 0, TimeSpan.Zero);
+
+        var result = ExitRuleEvaluator.Evaluate(HealthyLongPosition(), currentScore: 60, squareOffInstantAsUtc, TestRulesetConfigs.Default());
+
+        Assert.True(result.ShouldExit);
+        Assert.Equal(ExitReason.SquareOff, result.Reason);
+    }
+
+    [Fact]
     public void Evaluate_StopLoss_TriggersAtTheConfiguredLossPercent()
     {
-        var position = HealthyLongPosition() with { CurrentPremium = 175 * 0.74m }; // -26%, past the 25% stop
+        var position = HealthyLongPosition() with { CurrentPremium = 175 * 0.74m }; // -26%, past the 10% stop
         var result = ExitRuleEvaluator.Evaluate(position, currentScore: 60, EntryTime.AddMinutes(5), TestRulesetConfigs.Default());
 
         Assert.True(result.ShouldExit);
@@ -50,7 +65,7 @@ public class ExitRuleEvaluatorTests
     [Fact]
     public void Evaluate_PartialBook_TriggersAtTheConfiguredProfitPercent()
     {
-        var position = HealthyLongPosition() with { CurrentPremium = 175 * 1.31m }; // +31%, past the 30% partial-book level
+        var position = HealthyLongPosition() with { CurrentPremium = 175 * 1.31m }; // +31%, past the 15% partial-book level
         var result = ExitRuleEvaluator.Evaluate(position, currentScore: 60, EntryTime.AddMinutes(5), TestRulesetConfigs.Default());
 
         Assert.True(result.ShouldExit);
@@ -70,7 +85,7 @@ public class ExitRuleEvaluatorTests
     [Fact]
     public void Evaluate_TrailsStopToBreakeven_AfterAPartialBook()
     {
-        // Small loss (-5%) that would NOT trigger the original 25% stop, but DOES breach
+        // Small loss (-5%) that would NOT trigger the 10% stop, but DOES breach
         // the breakeven trail that TrailAfterPartialBook activates post-partial-book.
         var position = HealthyLongPosition() with { CurrentPremium = 175 * 0.95m, HasPartiallyBooked = true };
 
@@ -89,7 +104,7 @@ public class ExitRuleEvaluatorTests
 
         var result = ExitRuleEvaluator.Evaluate(position, currentScore: 60, EntryTime.AddMinutes(5), config);
 
-        // -5% is well inside the original 25% stop, and score (60) doesn't trigger flip/decay either.
+        // -5% is well inside the 10% stop, and score (60) doesn't trigger flip/decay either.
         Assert.False(result.ShouldExit);
     }
 

@@ -16,12 +16,15 @@ public static class CompositeScoreCalculator
     public const double DefaultK = 1.0;
 
     /// <summary>
-    /// The one component that doesn't gate warm-up (2026-09-04) -- see ScoreComponentInputs'
-    /// VixChangeZ doc comment for why. Excluded by name rather than restructuring the six
-    /// into their own type, since this is a single, deliberate, one-off exception, not a
-    /// general "optional components" mechanism.
+    /// The components that don't gate warm-up -- see ScoreComponentInputs' VixChangeZ and
+    /// GammaExposureZ doc comments for why. Excluded by name rather than restructuring the
+    /// six required ones into their own type, since these are deliberate, individually-named
+    /// exceptions, not a general "optional components" mechanism.
     /// </summary>
     const string VixComponentName = "VixChange";
+    const string GammaExposureComponentName = "GammaExposure";
+    const string VolumePcrComponentName = "VolumePcr";
+    static readonly string[] OptionalComponentNames = [VixComponentName, GammaExposureComponentName, VolumePcrComponentName];
 
     /// <summary>
     /// The pre-tanh weighted z-sum on its own (2026-09-04), for callers that need to build a
@@ -60,21 +63,24 @@ public static class CompositeScoreCalculator
 
     /// <summary>
     /// True (with the weighted-z-sum in <paramref name="raw"/>) once every *required*
-    /// component (everything except <see cref="VixComponentName"/>) has a z-score. VIX's own
-    /// contribution is added when available and silently treated as 0 when not -- it never
-    /// blocks the composite, and never prevents the other six from producing one.
+    /// component (everything except <see cref="OptionalComponentNames"/>) has a z-score. An
+    /// optional component's own contribution is added when available and silently treated as
+    /// 0 when not -- neither one blocks the composite, or prevents the required six from
+    /// producing one.
     /// </summary>
     static bool TryComputeRaw(List<ScoreComponentBreakdown> components, out double raw)
     {
-        var required = components.Where(c => c.Name != VixComponentName).ToList();
+        var required = components.Where(c => !OptionalComponentNames.Contains(c.Name)).ToList();
         if (!required.All(c => c.ZScore is not null))
         {
             raw = 0;
             return false;
         }
 
-        var vixContribution = components.FirstOrDefault(c => c.Name == VixComponentName)?.WeightedContribution ?? 0.0;
-        raw = required.Sum(c => c.WeightedContribution!.Value) + vixContribution;
+        var optionalContribution = components
+            .Where(c => OptionalComponentNames.Contains(c.Name))
+            .Sum(c => c.WeightedContribution ?? 0.0);
+        raw = required.Sum(c => c.WeightedContribution!.Value) + optionalContribution;
         return true;
     }
 
@@ -87,6 +93,8 @@ public static class CompositeScoreCalculator
         BuildComponent("PriceMomentum", weights.PriceMomentum, inputs.PriceMomentumZ),
         BuildComponent("DepthImbalance", weights.DepthImbalance, inputs.DepthImbalanceZ),
         BuildComponent(VixComponentName, weights.VixChange, inputs.VixChangeZ),
+        BuildComponent(GammaExposureComponentName, weights.GammaExposure, inputs.GammaExposureZ),
+        BuildComponent(VolumePcrComponentName, weights.VolumePcr, inputs.VolumePcrZ),
     ];
 
     static ScoreComponentBreakdown BuildComponent(string name, double weight, double? z)

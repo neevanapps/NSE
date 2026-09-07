@@ -24,7 +24,14 @@ public sealed record RulesetConfig(
     RiskLimitsConfig RiskLimits,
     KillSwitchOptions KillSwitch);
 
-public sealed record CapitalConfig(decimal Total, int LotSize, int MaxConcurrentPositions);
+/// <summary>
+/// LotSize is the exchange-defined unit (65 for NIFTY) -- fixed, not a tuning knob.
+/// LotsPerTrade (2026-09-07) is how many of those lots one position actually trades; it
+/// exists separately because PartialBookFraction needs the traded quantity to be a multiple
+/// large enough that "book 50%" lands on a whole number of lots. At 1 lot, 50% of 65 is 32.5
+/// -- not a size the exchange would even accept, let alone a realistic paper-trade fill.
+/// </summary>
+public sealed record CapitalConfig(decimal Total, int LotSize, int MaxConcurrentPositions, int LotsPerTrade);
 
 /// <summary>
 /// Times are wall-clock IST. NoEntryBeforeMinutes counts from market open (09:15 IST,

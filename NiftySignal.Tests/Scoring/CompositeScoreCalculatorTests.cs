@@ -151,12 +151,12 @@ public class CompositeScoreCalculatorTests
     }
 
     [Fact]
-    public void Calculate_ComponentBreakdown_ContainsAllSevenNamedComponents()
+    public void Calculate_ComponentBreakdown_ContainsAllNineNamedComponents()
     {
         var result = CompositeScoreCalculator.Calculate(FullyWarmInputs, ScoreWeights.Default, ComputedAt);
 
         var names = result.Components.Select(c => c.Name).ToHashSet();
-        Assert.Equal(7, result.Components.Count);
+        Assert.Equal(9, result.Components.Count);
         Assert.Contains("OiBuildupNet", names);
         Assert.Contains("Pcr", names);
         Assert.Contains("FuturesBasis", names);
@@ -164,6 +164,8 @@ public class CompositeScoreCalculatorTests
         Assert.Contains("PriceMomentum", names);
         Assert.Contains("DepthImbalance", names);
         Assert.Contains("VixChange", names);
+        Assert.Contains("GammaExposure", names);
+        Assert.Contains("VolumePcr", names);
     }
 
     [Fact]
@@ -194,6 +196,76 @@ public class CompositeScoreCalculatorTests
             + (weights.PriceMomentum * FullyWarmInputs.PriceMomentumZ!.Value)
             + (weights.DepthImbalance * FullyWarmInputs.DepthImbalanceZ!.Value)
             + (weights.VixChange * 1.5);
+        var expectedScore = 100.0 * Math.Tanh(expectedRaw / 1.0);
+
+        Assert.Equal(expectedScore, result.Score!.Value, 1e-9);
+    }
+
+    [Fact]
+    public void Calculate_StaysWarmedUp_WhenOnlyGammaExposureZIsMissing()
+    {
+        // GammaExposureZ is deliberately optional too (2026-09-07, diagnostic-only -- see
+        // ScoreWeights.Default's own weight of 0.0) -- its absence must not block the composite.
+        var inputs = FullyWarmInputs with { GammaExposureZ = null };
+
+        var result = CompositeScoreCalculator.Calculate(inputs, ScoreWeights.Default, ComputedAt);
+
+        Assert.True(result.IsWarmedUp);
+        Assert.NotNull(result.Score);
+    }
+
+    [Fact]
+    public void Calculate_IncludesGammaExposuresWeightedContribution_WhenPresentAndWeighted()
+    {
+        // Default's GammaExposure weight is 0.0 (diagnostic-only), so this uses a nonzero
+        // weight to verify the wiring itself, independent of the current live weight.
+        var weights = ScoreWeights.Default with { GammaExposure = 0.08 };
+        var inputs = FullyWarmInputs with { GammaExposureZ = -2.0 };
+
+        var result = CompositeScoreCalculator.Calculate(inputs, weights, ComputedAt, k: 1.0);
+
+        var expectedRaw = (weights.OiBuildupNet * FullyWarmInputs.OiBuildupNetZ!.Value)
+            + (weights.Pcr * FullyWarmInputs.PcrZ!.Value)
+            + (weights.FuturesBasis * FullyWarmInputs.FuturesBasisZ!.Value)
+            + (weights.IvSkew * FullyWarmInputs.IvSkewZ!.Value)
+            + (weights.PriceMomentum * FullyWarmInputs.PriceMomentumZ!.Value)
+            + (weights.DepthImbalance * FullyWarmInputs.DepthImbalanceZ!.Value)
+            + (weights.GammaExposure * -2.0);
+        var expectedScore = 100.0 * Math.Tanh(expectedRaw / 1.0);
+
+        Assert.Equal(expectedScore, result.Score!.Value, 1e-9);
+    }
+
+    [Fact]
+    public void Calculate_StaysWarmedUp_WhenOnlyVolumePcrZIsMissing()
+    {
+        // VolumePcrZ is deliberately optional too (2026-09-07, diagnostic-only -- see
+        // ScoreWeights.Default's own weight of 0.0) -- its absence must not block the composite.
+        var inputs = FullyWarmInputs with { VolumePcrZ = null };
+
+        var result = CompositeScoreCalculator.Calculate(inputs, ScoreWeights.Default, ComputedAt);
+
+        Assert.True(result.IsWarmedUp);
+        Assert.NotNull(result.Score);
+    }
+
+    [Fact]
+    public void Calculate_IncludesVolumePcrsWeightedContribution_WhenPresentAndWeighted()
+    {
+        // Default's VolumePcr weight is 0.0 (diagnostic-only), so this uses a nonzero weight
+        // to verify the wiring itself, independent of the current live weight.
+        var weights = ScoreWeights.Default with { VolumePcr = 0.06 };
+        var inputs = FullyWarmInputs with { VolumePcrZ = 1.8 };
+
+        var result = CompositeScoreCalculator.Calculate(inputs, weights, ComputedAt, k: 1.0);
+
+        var expectedRaw = (weights.OiBuildupNet * FullyWarmInputs.OiBuildupNetZ!.Value)
+            + (weights.Pcr * FullyWarmInputs.PcrZ!.Value)
+            + (weights.FuturesBasis * FullyWarmInputs.FuturesBasisZ!.Value)
+            + (weights.IvSkew * FullyWarmInputs.IvSkewZ!.Value)
+            + (weights.PriceMomentum * FullyWarmInputs.PriceMomentumZ!.Value)
+            + (weights.DepthImbalance * FullyWarmInputs.DepthImbalanceZ!.Value)
+            + (weights.VolumePcr * 1.8);
         var expectedScore = 100.0 * Math.Tanh(expectedRaw / 1.0);
 
         Assert.Equal(expectedScore, result.Score!.Value, 1e-9);
@@ -231,16 +303,20 @@ public class CompositeScoreCalculatorTests
     public void DefaultWeights_AreThePlansSection6TableRescaledForVix_AndSumToOne()
     {
         // Plan section 6's 25/20/15/15/15/10, each x0.95, plus a conservative 0.05 for the
-        // new VixChange component (2026-09-04) -- see ScoreWeights.Default's own doc comment.
+        // VixChange component (2026-09-04), then PriceMomentum cut 0.1425 -> 0.07 with the
+        // freed 0.0725 moved to OiBuildupNet/DepthImbalance (2026-09-07) -- see
+        // ScoreWeights.Default's own doc comment.
         var weights = ScoreWeights.Default;
 
-        Assert.Equal(0.2375, weights.OiBuildupNet, 1e-9);
+        Assert.Equal(0.2775, weights.OiBuildupNet, 1e-9);
         Assert.Equal(0.19, weights.Pcr, 1e-9);
         Assert.Equal(0.1425, weights.FuturesBasis, 1e-9);
         Assert.Equal(0.1425, weights.IvSkew, 1e-9);
-        Assert.Equal(0.1425, weights.PriceMomentum, 1e-9);
-        Assert.Equal(0.095, weights.DepthImbalance, 1e-9);
+        Assert.Equal(0.07, weights.PriceMomentum, 1e-9);
+        Assert.Equal(0.1275, weights.DepthImbalance, 1e-9);
         Assert.Equal(0.05, weights.VixChange, 1e-9);
+        Assert.Equal(0.0, weights.GammaExposure, 1e-9);
+        Assert.Equal(0.0, weights.VolumePcr, 1e-9);
         Assert.Equal(1.0, weights.Total, 1e-9);
     }
 }

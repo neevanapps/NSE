@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using NiftySignal.Persistence;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace NiftySignal.Persistence.Migrations
 {
     [DbContext(typeof(NiftySignalDbContext))]
-    partial class NiftySignalDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260907075513_AddPaperTradeQuantity")]
+    partial class AddPaperTradeQuantity
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -293,12 +296,6 @@ namespace NiftySignal.Persistence.Migrations
                     b.Property<double?>("FuturesBasisZ")
                         .HasColumnType("double precision");
 
-                    b.Property<double?>("GammaExposureRaw")
-                        .HasColumnType("double precision");
-
-                    b.Property<double?>("GammaExposureZ")
-                        .HasColumnType("double precision");
-
                     b.Property<bool>("IsWarmedUp")
                         .HasColumnType("boolean");
 
@@ -333,12 +330,6 @@ namespace NiftySignal.Persistence.Migrations
                         .HasColumnType("double precision");
 
                     b.Property<double?>("VixChangeZ")
-                        .HasColumnType("double precision");
-
-                    b.Property<double?>("VolumePcrRaw")
-                        .HasColumnType("double precision");
-
-                    b.Property<double?>("VolumePcrZ")
                         .HasColumnType("double precision");
 
                     b.Property<string>("WeightSetVersion")

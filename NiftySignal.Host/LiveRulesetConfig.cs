@@ -15,8 +15,11 @@ namespace NiftySignal.Host;
 public static class LiveRulesetConfig
 {
     public static RulesetConfig Default() => new(
-        RulesetVersion: "live-v1-2026-09-04",
-        Capital: new CapitalConfig(Total: 50000, LotSize: 65, MaxConcurrentPositions: 3),
+        RulesetVersion: "live-v2-2026-09-07",
+        // LotsPerTrade: 2 (2026-09-07) -- 1 lot made PartialBookFraction's 50% land on 32.5
+        // units, not a valid multiple of LotSize. 2 lots means the partial book is exactly 1
+        // clean lot and the remainder is exactly 1 clean lot too.
+        Capital: new CapitalConfig(Total: 50000, LotSize: 65, MaxConcurrentPositions: 3, LotsPerTrade: 2),
         Session: new SessionConfig(
             NoEntryBeforeMinutes: 15,
             NoEntryAfterTime: new TimeOnly(15, 0),
@@ -29,24 +32,33 @@ public static class LiveRulesetConfig
             ReEntryGapSameDirectionMinutes: 2,
             MaxTradesPerDay: 7,
             MaxIvRankForEntry: 70),
+        // Narrowed 2026-09-07 (from 150-200) after the first live session -- cheaper premium
+        // means a smaller capital commitment per lot and generally higher gamma/more strikes
+        // to choose from near the money.
         StrikeSelection: new StrikeSelectionConfig(
-            MinPremium: 150,
-            MaxPremium: 200,
+            MinPremium: 100,
+            MaxPremium: 150,
             MaxSpreadPctOfMid: 2.0,
             MinOpenInterest: 100_000),
         Exit: new ExitConfig(
-            PartialBookAtProfitPct: 30,
+            // Tightened 2026-09-07 after the first day of live paper trading: 25%/30% let a
+            // position round-trip a lot of premium before anything protected it -- today's
+            // score reversed from +99 to ~0 in about a minute, and a position sitting at only
+            // +15% would still have had nothing booked under the old 30% partial-book level.
+            PartialBookAtProfitPct: 15,
             PartialBookFraction: 0.5,
-            StopLossPct: 25,
+            StopLossPct: 10,
             TrailAfterPartialBook: true,
             ExitOnScoreFlip: true,
             ExitOnScoreBelowAbs: 30,
             MaxHoldMinutes: 120),
         Costs: new CostsConfig(BrokeragePerOrder: 20, SlippageTicks: 2),
-        // Profit target deliberately wider than the loss limit (6% vs 3%): the loss breaker
-        // exists to stop a bad day compounding, the profit target only to stop giving back an
-        // unusually good one, so it should trip far less often. Starting point -- revisit once
-        // there's a real distribution of daily P&L to look at.
-        RiskLimits: new RiskLimitsConfig(MaxDailyLossPct: 3.0, MaxDailyProfitPct: 6.0, MaxConsecutiveLosses: 4),
+        // Widened 2026-09-07, deliberately -- this is paper trading, no real capital is at
+        // risk, and the 3%/6% starting point cut the very first live session short (tripped
+        // after -6.1%, before a later -99 score move could even be considered). At this early,
+        // exploratory stage, seeing a fuller day's range of outcomes is more valuable than a
+        // tight breaker -- revisit both numbers downward once there's a real distribution of
+        // daily P&L to calibrate against, before any real capital is involved.
+        RiskLimits: new RiskLimitsConfig(MaxDailyLossPct: 20.0, MaxDailyProfitPct: 30.0, MaxConsecutiveLosses: 4),
         KillSwitch: new KillSwitchOptions { EntriesEnabled = true });
 }

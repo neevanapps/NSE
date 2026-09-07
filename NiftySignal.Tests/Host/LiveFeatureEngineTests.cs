@@ -175,6 +175,88 @@ public class LiveFeatureEngineTests
     }
 
     [Fact]
+    public void ComputeCadence_ComputesGammaExposure_AcrossTheFullChain_NotJustAPersistedBand()
+    {
+        // Same three-strike layout as the DepthImbalance "excludes farther ones" test above,
+        // but GammaExposure must do the OPPOSITE: BuildStrikeSnapshots' PersistedStrikeBand (2,
+        // i.e. nearest 5 strikes) is a *persistence* concern, unrelated to what this component
+        // aggregates over. A strike 1050 points from spot -- nowhere near any plausible band --
+        // must still move the aggregate, or GammaExposure would be exactly as band-limited as
+        // the day-one attempt that made the metric impossible to evaluate in the first place.
+        const string MediumCallToken = "99000";
+        const string FarCallToken = "99001";
+        var universeWithFarOi = BaseUniverse();
+        universeWithFarOi.Add(Option(MediumCallToken, OptionType.Call, 24450m));
+        universeWithFarOi.Add(Option(FarCallToken, OptionType.Call, 25000m));
+
+        var withFarOi = new LiveFeatureEngine(universeWithFarOi);
+        withFarOi.OnTick(MakeTick(SpotToken, 23950m, Start));
+        withFarOi.OnTick(MakeTick(FutureToken, 24000m, Start));
+        withFarOi.OnTick(MakeTick(CallToken, 100m, Start, oi: 100_000, depth: Depth(bidQty: 500, askQty: 400, bid: 99.5m, ask: 100.5m)));
+        withFarOi.OnTick(MakeTick(PutToken, 80m, Start, oi: 100_000, depth: Depth(bidQty: 300, askQty: 600, bid: 79.5m, ask: 80.5m)));
+        withFarOi.OnTick(MakeTick(MediumCallToken, 40m, Start, oi: 50_000, depth: Depth(bidQty: 200, askQty: 200, bid: 39.5m, ask: 40.5m)));
+        // Far strike: touchline OI only, deliberately no depth -- proves GEX doesn't need a
+        // live two-sided quote for a strike to count, only its OpenInterest.
+        withFarOi.OnTick(MakeTick(FarCallToken, 5m, Start, oi: 900_000));
+
+        var universeNoFarOi = BaseUniverse();
+        universeNoFarOi.Add(Option(MediumCallToken, OptionType.Call, 24450m));
+        universeNoFarOi.Add(Option(FarCallToken, OptionType.Call, 25000m));
+
+        var withoutFarOi = new LiveFeatureEngine(universeNoFarOi);
+        withoutFarOi.OnTick(MakeTick(SpotToken, 23950m, Start));
+        withoutFarOi.OnTick(MakeTick(FutureToken, 24000m, Start));
+        withoutFarOi.OnTick(MakeTick(CallToken, 100m, Start, oi: 100_000, depth: Depth(bidQty: 500, askQty: 400, bid: 99.5m, ask: 100.5m)));
+        withoutFarOi.OnTick(MakeTick(PutToken, 80m, Start, oi: 100_000, depth: Depth(bidQty: 300, askQty: 600, bid: 79.5m, ask: 80.5m)));
+        withoutFarOi.OnTick(MakeTick(MediumCallToken, 40m, Start, oi: 50_000, depth: Depth(bidQty: 200, askQty: 200, bid: 39.5m, ask: 40.5m)));
+        withoutFarOi.OnTick(MakeTick(FarCallToken, 5m, Start, oi: 0));
+
+        var withFar = withFarOi.ComputeCadence(Start);
+        var withoutFar = withoutFarOi.ComputeCadence(Start);
+
+        Assert.NotNull(withFar!.GammaExposureRaw);
+        Assert.NotNull(withoutFar!.GammaExposureRaw);
+        Assert.NotEqual(withoutFar.GammaExposureRaw!.Value, withFar.GammaExposureRaw!.Value);
+    }
+
+    [Fact]
+    public void ComputeCadence_ComputesVolumePcr_AsNotionalNotContractCount_AcrossTheFullChain()
+    {
+        // A strike far outside any plausible persisted band, same reasoning as the GammaExposure
+        // full-chain test above -- VolumePcr must include it too, not just the near strikes.
+        const string FarPutToken = "99002";
+        var universe = BaseUniverse();
+        universe.Add(Option(FarPutToken, OptionType.Put, 25000m));
+
+        var engine = new LiveFeatureEngine(universe);
+        var t0 = Start;
+        engine.OnTick(MakeTick(SpotToken, 23950m, t0));
+        engine.OnTick(MakeTick(FutureToken, 24000m, t0));
+        engine.OnTick(MakeTick(CallToken, 100m, t0, volume: 1000, depth: Depth(bidQty: 1, askQty: 1, bid: 99.5m, ask: 100.5m)));
+        engine.OnTick(MakeTick(PutToken, 80m, t0, volume: 1000, depth: Depth(bidQty: 1, askQty: 1, bid: 79.5m, ask: 80.5m)));
+        engine.OnTick(MakeTick(FarPutToken, 5m, t0, volume: 500));
+
+        // First cadence: no prior volume baseline yet -- must be null, not a fabricated delta.
+        var first = engine.ComputeCadence(t0);
+        Assert.Null(first!.VolumePcrRaw);
+
+        var t1 = t0.AddSeconds(15);
+        engine.OnTick(MakeTick(SpotToken, 23950m, t1));
+        engine.OnTick(MakeTick(FutureToken, 24000m, t1));
+        engine.OnTick(MakeTick(CallToken, 100m, t1, volume: 1200, depth: Depth(bidQty: 1, askQty: 1, bid: 99.5m, ask: 100.5m))); // +200 @ mid 100
+        engine.OnTick(MakeTick(PutToken, 80m, t1, volume: 1100, depth: Depth(bidQty: 1, askQty: 1, bid: 79.5m, ask: 80.5m)));   // +100 @ mid 80
+        engine.OnTick(MakeTick(FarPutToken, 5m, t1, volume: 800));                                                              // +300 @ 5 (no depth -- LTP fallback)
+
+        var second = engine.ComputeCadence(t1);
+
+        // Call notional = 200 * 100 = 20,000. Put notional = (100*80) + (300*5) = 9,500.
+        // A count-weighted or band-limited ratio would both give a different number (0.5 count,
+        // 0.4 notional-but-band-limited) -- 0.475 only comes out if it's notional AND full-chain.
+        Assert.NotNull(second!.VolumePcrRaw);
+        Assert.Equal(9_500.0 / 20_000.0, second.VolumePcrRaw!.Value, precision: 6);
+    }
+
+    [Fact]
     public void ComputeCadence_SkipsOiBuildupNet_WhenTheGapSinceTheLastCadenceExceedsNormalSpacing()
     {
         // Regression for a live-caught bug (2026-09-07): after a feed reconnect, "the last

@@ -47,4 +47,20 @@ public static class FeatureWindowLengths
     /// history into this window on restart rather than waiting on real time.
     /// </summary>
     public static readonly TimeSpan VixChangeZScoreWindow = TimeSpan.FromHours(2);
+
+    /// <summary>
+    /// Net gamma exposure across the full nearest-expiry chain (2026-09-07, diagnostic-only --
+    /// see ScoreWeights.Default's GammaExposure weight). Changes mostly as OI shifts (OI
+    /// updates are not tick-frequency, same reasoning as OiBuildupNet) rather than as gamma
+    /// itself, since gamma moves smoothly with spot.
+    /// </summary>
+    public static readonly TimeSpan GammaExposure = TimeSpan.FromMinutes(30);
+
+    /// <summary>
+    /// Notional (rupee-value, not contract-count) put/call traded-volume ratio (2026-09-07,
+    /// diagnostic-only -- see ScoreWeights.Default's VolumePcr weight). A genuine interval
+    /// delta like OiBuildupNet and GammaExposure, not a point-in-time read -- same 30-minute
+    /// window as the existing (contract-count) Pcr, its closest sibling.
+    /// </summary>
+    public static readonly TimeSpan VolumePcr = TimeSpan.FromMinutes(30);
 }

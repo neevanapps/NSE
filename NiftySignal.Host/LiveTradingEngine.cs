@@ -19,6 +19,7 @@ namespace NiftySignal.Host;
 public sealed class LiveTradingEngine(
     IServiceScopeFactory scopeFactory,
     ITelegramNotifier telegram,
+    DashboardPushClient dashboardPush,
     ILogger<LiveTradingEngine> logger)
 {
     static readonly TimeSpan IstOffset = TimeSpan.FromHours(5.5);
@@ -140,7 +141,8 @@ public sealed class LiveTradingEngine(
 
         var instrument = featureEngine.FindInstrument(chosen.Token);
         var tickSize = instrument?.TickSize ?? 0.05m;
-        var fill = PaperTradeSimulator.FillEntry(ask, tickSize, _config.Capital.LotSize, _config.Costs);
+        var quantity = _config.Capital.LotSize * _config.Capital.LotsPerTrade;
+        var fill = PaperTradeSimulator.FillEntry(ask, tickSize, quantity, _config.Costs);
 
         var trade = new PaperTrade
         {
@@ -149,12 +151,14 @@ public sealed class LiveTradingEngine(
             Direction = decision.Direction,
             EntryTime = now,
             EntryPrice = fill.FillPrice,
+            Quantity = quantity,
             EntryScore = score,
             RulesetVersion = _config.RulesetVersion,
             ScoreWeightsVersion = snapshot.WeightSetVersion,
         };
         db.PaperTrades.Add(trade);
         await db.SaveChangesAsync(ct);
+        await dashboardPush.PushTradesChangedAsync(ct);
 
         logger.LogInformation("Paper trade ENTRY: {Symbol} {Direction} @ {Price} (score {Score:F1})", trade.TradingSymbol, trade.Direction, trade.EntryPrice, score);
         await telegram.SendAsync(
@@ -202,7 +206,10 @@ public sealed class LiveTradingEngine(
 
         var instrument = featureEngine.FindInstrument(position.InstrumentToken);
         var tickSize = instrument?.TickSize ?? 0.05m;
-        var totalQty = _config.Capital.LotSize;
+        // The quantity actually traded at entry, not a fresh recompute from current config --
+        // a config change (LotsPerTrade, LotSize) must never retroactively change what an
+        // already-open position's exit is worth.
+        var totalQty = position.Quantity;
 
         if (decision.IsPartialExit)
         {
@@ -213,6 +220,7 @@ public sealed class LiveTradingEngine(
             position.PartialExitTime = now;
             position.PartialExitPrice = fill.FillPrice;
             await db.SaveChangesAsync(ct);
+            await dashboardPush.PushTradesChangedAsync(ct);
 
             logger.LogInformation("Paper trade PARTIAL BOOK: {Symbol} @ {Price}", position.TradingSymbol, fill.FillPrice);
             await telegram.SendAsync(NotificationCategory.PartialBook, $"NiftySignal PARTIAL BOOK: {position.TradingSymbol} @ {fill.FillPrice}", ct);
@@ -241,6 +249,7 @@ public sealed class LiveTradingEngine(
         position.GrossPnl = grossPnl;
         position.NetPnl = netPnl;
         await db.SaveChangesAsync(ct);
+        await dashboardPush.PushTradesChangedAsync(ct);
 
         logger.LogInformation(
             "Paper trade EXIT: {Symbol} {Reason} @ {Price} netPnl={NetPnl:F2}",

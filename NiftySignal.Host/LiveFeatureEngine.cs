@@ -84,10 +84,11 @@ public sealed class LiveFeatureEngine
     // six already require.
     static readonly TimeSpan CompositeRawWindowLength = TimeSpan.FromMinutes(30);
 
-    // 5 minutes at the 15s cadence (live-caught 2026-09-07: chosen for a deliberately
-    // low-frequency, 1-5-trades-a-day strategy -- longer smoothing trades entry speed for
-    // fewer, more deliberate signals, which is the explicit goal here, not a side effect).
-    const int CompositeSmoothingCadences = 20;
+    // 3 minutes at the 15s cadence (started at 5 min on 2026-09-07, chosen for a deliberately
+    // low-frequency, 1-5-trades-a-day strategy; shortened the same day after watching the
+    // first live session -- still meaningfully smoothed versus no averaging at all, just less
+    // lag between a real move and the score reflecting it).
+    const int CompositeSmoothingCadences = 12;
 
     readonly IReadOnlyList<Instrument> _instruments;
     readonly Instrument _spot;
@@ -115,6 +116,8 @@ public sealed class LiveFeatureEngine
     readonly WelfordRollingWindow _depthImbalanceWindow = new(FeatureWindowLengths.DepthImbalance);
     readonly WelfordRollingWindow _compositeRawWindow = new(CompositeRawWindowLength);
     readonly WelfordRollingWindow _vixWindow = new(FeatureWindowLengths.VixChangeZScoreWindow);
+    readonly WelfordRollingWindow _gammaExposureWindow = new(FeatureWindowLengths.GammaExposure);
+    readonly WelfordRollingWindow _volumePcrWindow = new(FeatureWindowLengths.VolumePcr);
 
     /// <summary>Last <see cref="CompositeSmoothingCadences"/> single-cadence composite raw values, oldest first -- see ComputeCadence's smoothing comment.</summary>
     readonly Queue<double> _compositeRawHistory = new();
@@ -147,6 +150,14 @@ public sealed class LiveFeatureEngine
     /// other's baseline. Only holds the persisted band's tokens, so it stays tiny.
     /// </summary>
     readonly Dictionary<string, long> _previousVolumeByToken = [];
+
+    /// <summary>
+    /// Cumulative day volume per token, same idea as <see cref="_previousVolumeByToken"/> but
+    /// covering the *entire* nearest-expiry chain rather than just the persisted band -- kept
+    /// as its own dictionary (2026-09-07) so ComputeVolumePcr has no ordering dependency on
+    /// BuildStrikeSnapshots, matching why the two never shared one to begin with.
+    /// </summary>
+    readonly Dictionary<string, long> _previousVolumeByTokenFullChain = [];
 
     public LiveFeatureEngine(IReadOnlyList<Instrument> instruments)
     {
@@ -238,6 +249,16 @@ public sealed class LiveFeatureEngine
             if (snapshot.VixChangeRaw is { } vixChange)
             {
                 _vixWindow.Add(snapshot.ComputedAt, vixChange);
+            }
+
+            if (snapshot.GammaExposureRaw is { } gammaExposure)
+            {
+                _gammaExposureWindow.Add(snapshot.ComputedAt, gammaExposure);
+            }
+
+            if (snapshot.VolumePcrRaw is { } volumePcr)
+            {
+                _volumePcrWindow.Add(snapshot.ComputedAt, volumePcr);
             }
         }
     }
@@ -456,6 +477,30 @@ public sealed class LiveFeatureEngine
             _vixWindow.Add(now, vc);
         }
 
+        // Not smoothed either -- same reasoning as VixChange (a full-chain aggregate, not a
+        // point-in-time price/quote read that benefits from within-cadence averaging).
+        double? gammaExposureRaw = null;
+        if (_nearestExpiryOptions.Count > 0)
+        {
+            var gexStrikesByDistance = _nearestExpiryOptions.Select(o => o.StrikePrice!.Value).Distinct().OrderBy(s => Math.Abs(s - spot.LastPrice)).ToList();
+            var gexAtmStrike = gexStrikesByDistance[0];
+            var gexT = TimeToExpiry.YearsUntilExpiry(_nearestExpiry, now);
+            var gexAtmVol = SolveAtmReferenceVol(gexAtmStrike, spot.LastPrice, gexT);
+            gammaExposureRaw = ComputeGammaExposure(spot.LastPrice, gexAtmVol, gexT);
+        }
+
+        if (gammaExposureRaw is { } gex)
+        {
+            _gammaExposureWindow.Add(now, gex);
+        }
+
+        // Not smoothed either -- see ComputeVolumePcr's own doc comment.
+        var volumePcrRaw = ComputeVolumePcr();
+        if (volumePcrRaw is { } vpcr)
+        {
+            _volumePcrWindow.Add(now, vpcr);
+        }
+
         var inputs = new ScoreComponentInputs(
             OiBuildupNetZ: oiBuildupRaw is { } oi ? _oiBuildupWindow.ComputeZScore(oi) : null,
             PcrZ: pcrRaw is { } p ? _pcrWindow.ComputeZScore(p) : null,
@@ -463,7 +508,9 @@ public sealed class LiveFeatureEngine
             IvSkewZ: ivSkewRaw is { } iv ? _ivSkewWindow.ComputeZScore(iv) : null,
             PriceMomentumZ: _momentumWindow.ComputeZScore(momentumRaw),
             DepthImbalanceZ: depthImbalanceRaw is { } d ? _depthImbalanceWindow.ComputeZScore(d) : null,
-            VixChangeZ: vixChangeRaw is { } vcr ? _vixWindow.ComputeZScore(vcr) : null);
+            VixChangeZ: vixChangeRaw is { } vcr ? _vixWindow.ComputeZScore(vcr) : null,
+            GammaExposureZ: gammaExposureRaw is { } gexr ? _gammaExposureWindow.ComputeZScore(gexr) : null,
+            VolumePcrZ: volumePcrRaw is { } vpcrr ? _volumePcrWindow.ComputeZScore(vpcrr) : null);
 
         // Multi-cadence smoothing (2026-09-07): a composite recomputed from scratch every 15s
         // with no memory of its own recent behavior was too noisy to sustain past the entry
@@ -521,6 +568,8 @@ public sealed class LiveFeatureEngine
             PriceMomentumRaw = momentumRaw,
             DepthImbalanceRaw = depthImbalanceRaw,
             VixChangeRaw = vixChangeRaw,
+            GammaExposureRaw = gammaExposureRaw,
+            VolumePcrRaw = volumePcrRaw,
             OiBuildupNetZ = inputs.OiBuildupNetZ,
             PcrZ = inputs.PcrZ,
             FuturesBasisZ = inputs.FuturesBasisZ,
@@ -528,6 +577,8 @@ public sealed class LiveFeatureEngine
             PriceMomentumZ = inputs.PriceMomentumZ,
             DepthImbalanceZ = inputs.DepthImbalanceZ,
             VixChangeZ = inputs.VixChangeZ,
+            GammaExposureZ = inputs.GammaExposureZ,
+            VolumePcrZ = inputs.VolumePcrZ,
             CompositeScoreRaw = compositeRawSmoothed,
             CompositeScoreRawInstant = compositeRawInstant,
             CompositeScore = composite.Score,
@@ -905,6 +956,103 @@ public sealed class LiveFeatureEngine
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Net gamma exposure across the *entire* nearest-expiry chain (2026-09-07, diagnostic-only
+    /// -- see ScoreWeights.Default's GammaExposure weight), not just the ATM+/-2 strikes
+    /// strike_snapshots persists (see BuildStrikeSnapshots' PersistedStrikeBand) -- that band is
+    /// far too narrow to mean anything as an aggregate positioning read, and evaluating it
+    /// against one day's data (2026-09-07) came back inconclusive for exactly that reason.
+    ///
+    /// Deliberately reuses the single ATM-solved reference vol (same one BuildStrikeSnapshots
+    /// uses for TheoreticalPrice) for every strike's Gamma, rather than solving each strike's
+    /// own IV -- two reasons: (1) it's cheap, a closed-form BlackScholes.Calculate call per
+    /// strike with zero additional Newton-Raphson solves; (2) it doesn't depend on every strike
+    /// having a live two-sided quote this cadence (illiquid wings often don't), only on knowing
+    /// its OpenInterest, which arrives on touchline updates alone. A strike's own IV would be
+    /// more accurate per-strike, but GEX is inherently an aggregate approximation, not a pricing
+    /// exercise, and this keeps every OI-bearing strike counted rather than only the ones with a
+    /// fresh two-sided market.
+    ///
+    /// Sign convention matches OiBuildupNet's call-vs-put reasoning: net call gamma-OI counted
+    /// positive, net put gamma-OI counted negative -- an exploratory choice, not a claim about
+    /// which side of a given position dealers are actually on (this system has no visibility
+    /// into dealer positioning, only aggregate OI). Null when the ATM vol can't be solved this
+    /// cadence (same "don't fabricate a value" rule as everywhere else) or no strike has both a
+    /// strike price and OI yet.
+    /// </summary>
+    double? ComputeGammaExposure(decimal spotPrice, double? atmReferenceVol, double t)
+    {
+        if (atmReferenceVol is not { } vol)
+        {
+            return null;
+        }
+
+        double net = 0;
+        var any = false;
+        foreach (var option in _nearestExpiryOptions)
+        {
+            if (!_latest.TryGetValue(option.Token, out var state) || state.OpenInterest is not { } oi || oi <= 0)
+            {
+                continue;
+            }
+
+            var gamma = BlackScholes.Calculate(
+                option.OptionType, (double)spotPrice, (double)option.StrikePrice!.Value, t, RiskFreeRate, vol).Greeks.Gamma;
+            net += option.OptionType == OptionType.Call ? gamma * oi : -(gamma * oi);
+            any = true;
+        }
+
+        return any ? net : null;
+    }
+
+    /// <summary>
+    /// Notional (traded-volume x mark price) put/call ratio across the *entire* nearest-expiry
+    /// chain (2026-09-07, diagnostic-only -- see ScoreWeights.Default's VolumePcr weight).
+    /// Notional rather than raw contract count -- a same-day check found a notional-weighted
+    /// version of the existing OI-based Pcr correlated far more strongly with forward price
+    /// moves than the count-weighted one; see ScoreWeights.Default's own doc comment for the
+    /// full reasoning, including where count and notional weighting disagreed for volume
+    /// specifically.
+    ///
+    /// A genuine interval delta like OiBuildupNet/GammaExposure (volume traded *this cadence*,
+    /// via <see cref="_previousVolumeByTokenFullChain"/>), not a point-in-time read -- so this
+    /// is computed once per cadence, not smoothed through <see cref="Sample"/>.
+    /// </summary>
+    double? ComputeVolumePcr()
+    {
+        double callNotional = 0, putNotional = 0;
+
+        foreach (var option in _nearestExpiryOptions)
+        {
+            if (!_latest.TryGetValue(option.Token, out var state))
+            {
+                continue;
+            }
+
+            var volumeDelta = _previousVolumeByTokenFullChain.TryGetValue(option.Token, out var previousVolume)
+                ? Math.Max(0, state.Volume - previousVolume)
+                : 0;
+            _previousVolumeByTokenFullChain[option.Token] = state.Volume;
+
+            if (volumeDelta <= 0 || MidPrice(state) is not { } mark || mark <= 0)
+            {
+                continue;
+            }
+
+            var notional = (double)volumeDelta * (double)mark;
+            if (option.OptionType == OptionType.Call)
+            {
+                callNotional += notional;
+            }
+            else if (option.OptionType == OptionType.Put)
+            {
+                putNotional += notional;
+            }
+        }
+
+        return callNotional > 0 ? putNotional / callNotional : null;
     }
 
     // Plan 4.2: mid of bid/ask when the depth snapshot is available, LTP fallback otherwise.

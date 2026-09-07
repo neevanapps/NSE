@@ -1,3 +1,4 @@
+using NiftySignal.Domain;
 using NiftySignal.Domain.Enums;
 
 namespace NiftySignal.Rules;
@@ -24,7 +25,11 @@ public static class ExitRuleEvaluator
 {
     public static ExitDecision Evaluate(OpenPositionState position, double currentScore, DateTimeOffset now, RulesetConfig config)
     {
-        var nowTime = TimeOnly.FromDateTime(now.DateTime);
+        // now is UTC-backed (Npgsql/timestamptz convention) but SquareOffTime is IST wall-clock
+        // -- must convert before extracting TimeOnly, or this only fires 5:30 late (the same
+        // bug class fixed in EntryRuleEvaluator earlier today; this evaluator had no local
+        // IstOffset constant, which is very likely why it was missed then). See IstTime.
+        var nowTime = TimeOnly.FromDateTime(now.ToIst().DateTime);
         if (nowTime >= config.Session.SquareOffTime)
         {
             return new ExitDecision(true, false, ExitReason.SquareOff);

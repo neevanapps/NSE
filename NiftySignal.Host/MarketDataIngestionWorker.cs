@@ -1,6 +1,7 @@
 using System.Text;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
+using NiftySignal.Domain;
 using NiftySignal.Domain.Abstractions;
 using NiftySignal.Domain.Entities;
 using NiftySignal.Ingestion.FlatTrade;
@@ -29,6 +30,16 @@ public sealed class MarketDataIngestionWorker(
     const int FlushBatchSize = 200;
     static readonly TimeSpan FlushInterval = TimeSpan.FromSeconds(1);
 
+    // Live feed/cadence activity is only meaningful inside this window (2026-09-07, live-caught:
+    // with no gating at all, the cadence loop kept computing on frozen post-close prices until
+    // scores went to NULL around 16:10). MarketPreOpen matches the "08:45-equivalent job"
+    // ResolveInstrumentsAsync's own comment already assumes; MarketHardClose is SquareOffTime
+    // (15:15) plus a buffer past NSE's 15:30 close, not the square-off time itself -- square-off
+    // still needs the cadence loop running to actually fire the exit.
+    static readonly TimeOnly MarketPreOpen = new(8, 45);
+    static readonly TimeOnly MarketHardClose = new(15, 35);
+    static readonly TimeSpan MarketHoursPollInterval = TimeSpan.FromMinutes(1);
+
     // Plan section 6: "Cadence: every 15 seconds."
     static readonly TimeSpan ScoreCadence = TimeSpan.FromSeconds(15);
 
@@ -50,6 +61,12 @@ public sealed class MarketDataIngestionWorker(
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        await WaitForMarketHoursAsync(stoppingToken);
+        if (stoppingToken.IsCancellationRequested)
+        {
+            return;
+        }
+
         var session = await LoadSessionAsync(stoppingToken);
         if (session?.Token is null || session.ClientId is null || !session.IsValidAt(DateTimeOffset.UtcNow))
         {
@@ -95,15 +112,73 @@ public sealed class MarketDataIngestionWorker(
             $"NiftySignal: FlatTrade feed has failed {failures} times consecutively and may be down.",
             stoppingToken);
 
-        var cadenceLoop = RunScoreCadenceLoopAsync(stoppingToken);
-        var sampleLoop = RunSampleLoopAsync(stoppingToken);
-        var pendingSubscriptionLoop = RunPendingSubscriptionLoopAsync(tickSource, asOfDate, stoppingToken);
-        var paperTradeSummaryLoop = RunPaperTradeSummaryLoopAsync(asOfDate, stoppingToken);
-        await RunTickLoopAsync(tickSource, stoppingToken);
+        // A separate, linked token for the feed/cadence/sample/subscription loops only --
+        // StopAtMarketCloseAsync cancels *this* once MarketHardClose is reached, so those loops
+        // wind down (they already handle OperationCanceledException) without needing the whole
+        // service stopped. The paper-trade summary loop deliberately stays on the full-lifetime
+        // stoppingToken -- it's cheap (once/30min) and still useful to send after close.
+        using var feedCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+        var closeWatchdog = StopAtMarketCloseAsync(feedCts, stoppingToken);
+
+        var cadenceLoop = RunScoreCadenceLoopAsync(feedCts.Token);
+        var sampleLoop = RunSampleLoopAsync(feedCts.Token);
+        var pendingSubscriptionLoop = RunPendingSubscriptionLoopAsync(tickSource, asOfDate, feedCts.Token);
+        var paperTradeSummaryLoop = RunPaperTradeSummaryLoopAsync(stoppingToken);
+        await RunTickLoopAsync(tickSource, feedCts.Token);
         await cadenceLoop;
         await sampleLoop;
         await pendingSubscriptionLoop;
+        await closeWatchdog;
         await paperTradeSummaryLoop;
+    }
+
+    /// <summary>Waits (checking once a minute) until the current IST time is within [MarketPreOpen, MarketHardClose) on a weekday -- keeps the worker from attempting a live feed connection at all outside that window.</summary>
+    async Task WaitForMarketHoursAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            var nowIst = DateTimeOffset.UtcNow.ToIst();
+            var nowTime = TimeOnly.FromDateTime(nowIst.DateTime);
+            var isWeekday = nowIst.DayOfWeek is not (DayOfWeek.Saturday or DayOfWeek.Sunday);
+
+            if (isWeekday && nowTime >= MarketPreOpen && nowTime < MarketHardClose)
+            {
+                return;
+            }
+
+            logger.LogInformation("Outside market hours ({NowIst:HH:mm} IST, {DayOfWeek}) -- waiting for {MarketPreOpen}", nowIst, nowIst.DayOfWeek, MarketPreOpen);
+            try
+            {
+                await Task.Delay(MarketHoursPollInterval, ct);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+        }
+    }
+
+    /// <summary>Cancels <paramref name="feedCts"/> once IST time reaches MarketHardClose, so the live feed/cadence/sample/subscription loops stop rather than running on frozen post-close data until the service is manually stopped.</summary>
+    async Task StopAtMarketCloseAsync(CancellationTokenSource feedCts, CancellationToken lifetimeToken)
+    {
+        try
+        {
+            while (!lifetimeToken.IsCancellationRequested)
+            {
+                var nowIst = DateTimeOffset.UtcNow.ToIst();
+                if (TimeOnly.FromDateTime(nowIst.DateTime) >= MarketHardClose)
+                {
+                    logger.LogInformation("Market hard-close reached ({NowIst:HH:mm} IST) -- stopping the live feed and cadence loops", nowIst);
+                    feedCts.Cancel();
+                    return;
+                }
+
+                await Task.Delay(MarketHoursPollInterval, lifetimeToken);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
     }
 
     async Task RunTickLoopAsync(FlatTradeTickSource tickSource, CancellationToken stoppingToken)
@@ -228,15 +303,15 @@ public sealed class MarketDataIngestionWorker(
         }
     }
 
-    /// <summary>Not in plan section 12's original list (2026-09-04, user-requested) -- open positions + today's closed-trade stats, sent every 30 minutes regardless of whether anything changed (a quiet "0 trades so far" is itself useful confirmation the pipeline is alive).</summary>
-    async Task RunPaperTradeSummaryLoopAsync(DateOnly asOfDate, CancellationToken stoppingToken)
+    /// <summary>Open positions + today's closed-trade stats, sent every 30 minutes -- but only when there's something to report (2026-09-07: previously sent unconditionally, including a bare "0 trades" every 30 minutes all day).</summary>
+    async Task RunPaperTradeSummaryLoopAsync(CancellationToken stoppingToken)
     {
         using var timer = new PeriodicTimer(PaperTradeSummaryInterval);
         try
         {
             while (await timer.WaitForNextTickAsync(stoppingToken))
             {
-                await SendPaperTradeSummaryAsync(asOfDate, stoppingToken);
+                await SendPaperTradeSummaryAsync(stoppingToken);
             }
         }
         catch (OperationCanceledException)
@@ -244,11 +319,14 @@ public sealed class MarketDataIngestionWorker(
         }
     }
 
-    async Task SendPaperTradeSummaryAsync(DateOnly asOfDate, CancellationToken ct)
+    async Task SendPaperTradeSummaryAsync(CancellationToken ct)
     {
-        // Same UTC-conversion rule as SeedEngineHistoryAsync's todayIstMidnightUtc -- Npgsql
-        // only accepts Offset=0 DateTimeOffset values for timestamptz parameters.
-        var todayIstMidnightUtc = new DateTimeOffset(asOfDate.ToDateTime(TimeOnly.MinValue), IstOffset).ToUniversalTime();
+        // Computed fresh from UtcNow on every call (2026-09-07), not from the asOfDate
+        // captured once at ExecuteAsync startup -- a worker still running past IST midnight
+        // (the exact "no market-hours gating" issue fixed alongside this) would otherwise
+        // keep comparing against the day it started, silently including a prior day's trades
+        // under "today" once the calendar actually rolled over.
+        var todayIstMidnightUtc = new DateTimeOffset(DateTimeOffset.UtcNow.ToIst().Date, IstOffset).ToUniversalTime();
 
         await using var scope = scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
@@ -258,6 +336,11 @@ public sealed class MarketDataIngestionWorker(
             .Where(t => t.ExitTime != null && t.ExitTime >= todayIstMidnightUtc)
             .OrderByDescending(t => t.ExitTime)
             .ToListAsync(ct);
+
+        if (open.Count == 0 && closedToday.Count == 0)
+        {
+            return;
+        }
 
         var message = BuildPaperTradeSummaryMessage(open, closedToday);
         await telegram.SendAsync(NotificationCategory.PaperTradeSummary, message, ct);

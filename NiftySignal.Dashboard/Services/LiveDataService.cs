@@ -177,6 +177,27 @@ public sealed class LiveDataService : IDisposable
     }
 
     /// <summary>
+    /// Called by MarketDataHub the instant Host pushes a trade-changed signal (2026-09-07) --
+    /// re-reads just positions + closed trades (not the whole 5s poll, which also solves IV
+    /// across the option chain) so the Positions/Performance panels update immediately on
+    /// entry/partial-book/exit instead of waiting up to 5s for the next timer tick.
+    /// </summary>
+    public async Task RefreshTradesAsync()
+    {
+        await using var db = await _dbFactory.CreateDbContextAsync();
+        var positions = await BuildPositionsAsync(db);
+        var closedTrades = await BuildClosedTradesAsync(db);
+
+        lock (_lock)
+        {
+            _positions = positions;
+            _closedTrades = closedTrades;
+        }
+
+        Updated?.Invoke();
+    }
+
+    /// <summary>
     /// Resolves an arbitrary (strike, side) into a real instrument via a live FlatTrade
     /// call and inserts it (Subscribed=false) for the Host's poll loop to pick up -- the
     /// dashboard's "watch this strike even though it's outside the tracked ATM band" path.
@@ -401,6 +422,13 @@ public sealed class LiveDataService : IDisposable
             // up" indefinitely on a day VIX isn't tracked, unlike the other six.
             new("VixChange", ScoreWeights.Default.VixChange, s.VixChangeZ ?? 0, (s.VixChangeZ ?? 0) * ScoreWeights.Default.VixChange,
                 s.VixChangeZ is not null, FeatureWindowLengths.VixChangeZScoreWindow, vixRemaining),
+            // Diagnostic-only (weight 0.0, see ScoreWeights.Default) -- shown so the metric can
+            // be watched across real sessions before it's ever given a nonzero weight.
+            new("GammaExposure", ScoreWeights.Default.GammaExposure, s.GammaExposureZ ?? 0, (s.GammaExposureZ ?? 0) * ScoreWeights.Default.GammaExposure,
+                s.GammaExposureZ is not null, FeatureWindowLengths.GammaExposure, Remaining(FeatureWindowLengths.GammaExposure)),
+            // Diagnostic-only (weight 0.0, see ScoreWeights.Default) -- same treatment as GammaExposure.
+            new("VolumePcr", ScoreWeights.Default.VolumePcr, s.VolumePcrZ ?? 0, (s.VolumePcrZ ?? 0) * ScoreWeights.Default.VolumePcr,
+                s.VolumePcrZ is not null, FeatureWindowLengths.VolumePcr, Remaining(FeatureWindowLengths.VolumePcr)),
         ];
     }
 
@@ -413,6 +441,8 @@ public sealed class LiveDataService : IDisposable
         new("PriceMomentum", ScoreWeights.Default.PriceMomentum, 0, 0, false, FeatureWindowLengths.PriceMomentum, FeatureWindowLengths.PriceMomentum),
         new("DepthImbalance", ScoreWeights.Default.DepthImbalance, 0, 0, false, FeatureWindowLengths.DepthImbalance, FeatureWindowLengths.DepthImbalance),
         new("VixChange", ScoreWeights.Default.VixChange, 0, 0, false, FeatureWindowLengths.VixChangeZScoreWindow, FeatureWindowLengths.VixChangeZScoreWindow),
+        new("GammaExposure", ScoreWeights.Default.GammaExposure, 0, 0, false, FeatureWindowLengths.GammaExposure, FeatureWindowLengths.GammaExposure),
+        new("VolumePcr", ScoreWeights.Default.VolumePcr, 0, 0, false, FeatureWindowLengths.VolumePcr, FeatureWindowLengths.VolumePcr),
     ];
 
     async Task<List<OptionChainRow>> BuildOptionChainAsync(NiftySignalDbContext db)
@@ -613,11 +643,11 @@ public sealed class LiveDataService : IDisposable
     }
 
     /// <summary>
-    /// Open paper_trades rows plus what the UI needs but the row itself doesn't store --
-    /// PaperTrade has no Quantity column (LiveTradingEngine always trades the same
-    /// Instrument-defined lot size, so it doesn't need to persist a per-trade copy) and no
-    /// live mark price, so both come from the same today's-instruments/latest-tick lookups
-    /// BuildOptionChainAsync already uses for the same purpose.
+    /// Open paper_trades rows plus what the UI needs but the row itself doesn't store -- the
+    /// live mark price, from the same latest-tick lookup BuildOptionChainAsync already uses
+    /// for the same purpose. Quantity comes straight from the row itself (2026-09-07: what was
+    /// actually traded at entry, not re-derived from the instrument's exchange lot size --
+    /// LotsPerTrade means those two numbers are no longer the same thing).
     /// </summary>
     async Task<List<PositionRow>> BuildPositionsAsync(NiftySignalDbContext db)
     {
@@ -627,12 +657,7 @@ public sealed class LiveDataService : IDisposable
             return [];
         }
 
-        var today = DateOnly.FromDateTime(DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromHours(5.5)).Date);
         var tokens = open.Select(t => t.InstrumentToken).Distinct().ToArray();
-
-        var lotSizeByToken = await db.Instruments
-            .Where(i => i.AsOfDate == today && tokens.Contains(i.Token))
-            .ToDictionaryAsync(i => i.Token, i => i.LotSize);
 
         var latestTicks = await LatestTicksAsync(db, tokens);
         var latestPriceByToken = latestTicks.ToDictionary(t => t.Token, t => t.LastPrice);
@@ -645,7 +670,7 @@ public sealed class LiveDataService : IDisposable
             // token this session -- same "nothing live yet" tolerance as everywhere else,
             // not a crash or a fabricated number.
             CurrentPremium: latestPriceByToken.TryGetValue(t.InstrumentToken, out var ltp) ? ltp : t.EntryPrice,
-            Quantity: lotSizeByToken.TryGetValue(t.InstrumentToken, out var lotSize) ? lotSize : 0,
+            Quantity: t.Quantity,
             EntryTime: t.EntryTime,
             HasPartiallyBooked: t.HasPartiallyBooked))
             .ToList();

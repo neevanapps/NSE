@@ -1,5 +1,6 @@
 @implements IAsyncDisposable
 @using NiftySignal.Dashboard.Services
+@using NiftySignal.Domain
 @inject LiveDataService Live
 @inject IJSRuntime JS
 
@@ -74,6 +75,8 @@
         "PriceMomentum" => "Price Momentum",
         "DepthImbalance" => "Depth Imbalance",
         "VixChange" => "VIX Change",
+        "GammaExposure" => "Gamma Exposure",
+        "VolumePcr" => "Volume PCR (notional)",
         _ => name,
     };
 
@@ -108,7 +111,7 @@
     {
         var history = Live.ScoreHistory;
         return (
-            history.Select(h => h.Timestamp.ToString("HH:mm:ss")).ToArray(),
+            history.Select(h => h.Timestamp.ToIst().ToString("HH:mm:ss")).ToArray(),
             history.Select(h => Math.Round(h.Score, 1)).ToArray(),
             history.Select(h => h.SpotPrice).ToArray());
     }
