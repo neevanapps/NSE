@@ -37,10 +37,22 @@ public static class EntryRuleEvaluator
 {
     public static readonly TimeOnly MarketOpen = new(9, 15);
 
+    // NSE trading hours are always IST regardless of where this process runs or what offset
+    // context.Now happens to carry (UtcNow throughout this codebase, per Npgsql's timestamptz
+    // convention). Same value LiveTradingEngine already uses for its own IST-midnight calc.
+    static readonly TimeSpan IstOffset = TimeSpan.FromHours(5.5);
+
     public static EntryDecision Evaluate(EntryContext context, RulesetConfig config)
     {
         var failures = new List<string>();
-        var nowTime = TimeOnly.FromDateTime(context.Now.DateTime);
+
+        // Live-caught 2026-09-07: context.Now is UTC, and .DateTime returns that UTC instant's
+        // own wall-clock time, not a timezone conversion. Comparing that raw UTC clock reading
+        // against IST-intended cutoffs (MarketOpen 9:15, NoEntryAfterTime 15:00) meant "entries
+        // start at 9:30" was actually only satisfied once the clock read 9:30 UTC = 15:00 IST --
+        // at or past NSE's close. This single bug meant no entry had ever been possible during
+        // the actual trading session, for the entire life of this project.
+        var nowTime = TimeOnly.FromDateTime(context.Now.ToOffset(IstOffset).DateTime);
 
         var noEntryBefore = MarketOpen.AddMinutes(config.Session.NoEntryBeforeMinutes);
         if (nowTime < noEntryBefore)

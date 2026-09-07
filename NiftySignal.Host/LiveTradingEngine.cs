@@ -111,6 +111,18 @@ public sealed class LiveTradingEngine(
         var decision = EntryRuleEvaluator.Evaluate(context, _config);
         if (!decision.ShouldEnter)
         {
+            // Only when the score itself would otherwise qualify -- every other rejection
+            // (score too weak, not sustained yet) is the normal, expected majority of
+            // cadences and would drown out the interesting case: score is strong but
+            // something ELSE is silently blocking (live-caught 2026-09-07: this exact gap
+            // was invisible for days because EntryRuleEvaluator's failures were never logged).
+            if (Math.Abs(score) >= _config.Entry.MinAbsScore)
+            {
+                logger.LogInformation(
+                    "Entry NOT taken despite qualifying score {Score:F1}: {Reasons}",
+                    score, string.Join("; ", decision.FailedConditions));
+            }
+
             return;
         }
 

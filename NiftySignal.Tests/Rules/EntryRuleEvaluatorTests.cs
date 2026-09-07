@@ -32,6 +32,29 @@ public class EntryRuleEvaluatorTests
     }
 
     [Fact]
+    public void Evaluate_ConvertsNowToIst_RegardlessOfWhatOffsetItArrivesWith()
+    {
+        // Regression for a live-caught bug (2026-09-07): production always passes Now as UTC
+        // (DateTimeOffset.UtcNow, per this codebase's Npgsql timestamptz convention throughout)
+        // -- but every existing test in this file constructs Now directly at the +5:30 IST
+        // offset, which happens to sidestep the bug entirely and never exercises the real
+        // conversion. 04:30 UTC and 10:00 IST are the exact same instant as WithinWindow above;
+        // this must allow entry exactly like the IST-offset happy path does. Before the fix,
+        // TimeOnly.FromDateTime(context.Now.DateTime) read the UTC wall-clock time (04:30)
+        // directly against the IST-intended 09:30 cutoff and wrongly rejected it -- which in
+        // production meant "entries start at 9:30" was only ever satisfied once the clock hit
+        // 9:30 UTC = 15:00 IST, at or past NSE's close. No entry had ever been possible during
+        // the actual trading session as a result.
+        var sameInstantAsUtc = new DateTimeOffset(2026, 9, 3, 4, 30, 0, TimeSpan.Zero);
+        var context = HappyPath() with { Now = sameInstantAsUtc };
+
+        var result = EntryRuleEvaluator.Evaluate(context, TestRulesetConfigs.Default());
+
+        Assert.True(result.ShouldEnter);
+        Assert.Empty(result.FailedConditions);
+    }
+
+    [Fact]
     public void Evaluate_PicksBearish_ForANegativeScore()
     {
         var context = HappyPath() with { Score = -60 };

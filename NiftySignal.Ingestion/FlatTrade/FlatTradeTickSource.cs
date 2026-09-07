@@ -40,6 +40,17 @@ public sealed class FlatTradeTickSource(
     readonly Lock _dynamicSubscriptionsSync = new();
     readonly Channel<(Exchange Exchange, string Token)> _subscriptionRequests = Channel.CreateUnbounded<(Exchange, string)>();
 
+    /// <summary>
+    /// The currently-open data gap, if any -- promoted from a PumpAsync-local variable
+    /// (2026-09-07, live-caught) so RunSessionAsync can close it too. Previously the only
+    /// close point was PumpAsync's post-await check, reached only if RunSessionAsync *returns*
+    /// -- which in normal operation it doesn't; a successful reconnect just keeps the session
+    /// running (streaming ticks) for the next hour, not returning. Every gap this feed had ever
+    /// recorded stayed open forever as a result (confirmed live: 11 gaps back to 2026-09-04,
+    /// all still open), which silently blocked every entry via EntryContext.HasOpenDataGap.
+    /// </summary>
+    long? _openGapId;
+
     /// <summary>Thread-safe, callable at any time regardless of connection state -- queued if the session is mid-reconnect.</summary>
     public void RequestSubscribe(Exchange exchange, string token) =>
         _subscriptionRequests.Writer.TryWrite((exchange, token));
@@ -72,7 +83,6 @@ public sealed class FlatTradeTickSource(
     async Task PumpAsync(ChannelWriter<Tick> writer, CancellationToken ct)
     {
         var policy = new ReconnectionPolicy();
-        long? openGapId = null;
 
         try
         {
@@ -91,7 +101,7 @@ public sealed class FlatTradeTickSource(
                     policy.RecordFailure();
                     logger.LogError(ex, "FlatTrade feed session failed (consecutive failures: {Count})", policy.ConsecutiveFailures);
 
-                    openGapId ??= await dataGapRecorder.RecordGapStartedAsync(DateTimeOffset.UtcNow, ex.Message, ct);
+                    _openGapId ??= await dataGapRecorder.RecordGapStartedAsync(DateTimeOffset.UtcNow, ex.Message, ct);
 
                     if (policy.ShouldAlert)
                     {
@@ -111,10 +121,15 @@ public sealed class FlatTradeTickSource(
                     continue;
                 }
 
-                if (openGapId is { } gapId)
+                // Reached only if RunSessionAsync returns normally (e.g. the server closed
+                // the socket gracefully -- see the `json is null` branch below) rather than
+                // throwing. The far more common "reconnected and resumed streaming" case is
+                // handled inside RunSessionAsync itself, at the point auth actually succeeds --
+                // this is just a fallback for the graceful-close path.
+                if (_openGapId is { } gapId)
                 {
                     await dataGapRecorder.RecordGapEndedAsync(gapId, DateTimeOffset.UtcNow, ct);
-                    openGapId = null;
+                    _openGapId = null;
                 }
             }
         }
@@ -160,6 +175,16 @@ public sealed class FlatTradeTickSource(
                 if (msg.Type == "ak")
                 {
                     policy.RecordSuccess();
+
+                    // The actual "the outage is over" moment -- authenticated and about to
+                    // resume streaming, not "the session object eventually returned" (see
+                    // _openGapId's doc comment for why that distinction is the whole bug).
+                    if (_openGapId is { } gapId)
+                    {
+                        await dataGapRecorder.RecordGapEndedAsync(gapId, DateTimeOffset.UtcNow, ct);
+                        _openGapId = null;
+                    }
+
                     if (!subscribed)
                     {
                         await SubscribeAllAsync(ws, ct);
