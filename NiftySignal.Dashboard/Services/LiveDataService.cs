@@ -785,9 +785,13 @@ public sealed class LiveDataService : IDisposable
     /// <summary>
     /// Open paper_trades rows plus what the UI needs but the row itself doesn't store -- the
     /// live mark price, from the same latest-tick lookup BuildOptionChainAsync already uses
-    /// for the same purpose. Quantity comes straight from the row itself (2026-09-07: what was
-    /// actually traded at entry, not re-derived from the instrument's exchange lot size --
-    /// LotsPerTrade means those two numbers are no longer the same thing).
+    /// for the same purpose. Quantity is the *remaining* open quantity (2026-09-08 dashboard
+    /// fix): PaperTrade.Quantity itself is always the original traded-at-entry total (2026-09-07
+    /// -- what was actually traded, not re-derived from the instrument's exchange lot size,
+    /// since LotsPerTrade means those two numbers are no longer the same thing), but once a
+    /// position has partially booked, only Quantity minus PartialExitQuantity is genuinely
+    /// still open -- showing the original total there read as if the booked half were still
+    /// at risk, both in the Qty column and in UnrealizedPnl (PositionRow multiplies by this).
     /// </summary>
     async Task<List<PositionRow>> BuildPositionsAsync(NiftySignalDbContext db)
     {
@@ -811,7 +815,7 @@ public sealed class LiveDataService : IDisposable
             // token this session -- same "nothing live yet" tolerance as everywhere else,
             // not a crash or a fabricated number.
             CurrentPremium: latestPriceByToken.TryGetValue(t.InstrumentToken, out var ltp) ? ltp : t.EntryPrice,
-            Quantity: t.Quantity,
+            Quantity: t.HasPartiallyBooked ? t.Quantity - (t.PartialExitQuantity ?? 0) : t.Quantity,
             EntryTime: t.EntryTime,
             HasPartiallyBooked: t.HasPartiallyBooked))
             .ToList();

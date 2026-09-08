@@ -75,6 +75,12 @@ public sealed record PositionRow(
     EntryDirection Direction,
     decimal EntryPremium,
     decimal CurrentPremium,
+    // The remaining open quantity, not the original traded-at-entry quantity (2026-09-08
+    // dashboard fix) -- PaperTrade.Quantity itself stays the original total (needed for the
+    // final-exit blended P&L calc, see LiveTradingEngine.EvaluateExitAsync), but a position
+    // that's already partially booked genuinely only has the remainder still open, and both
+    // this display and UnrealizedPnl below were overstating it by counting the booked half
+    // as if it were still at risk.
     int Quantity,
     DateTimeOffset EntryTime,
     bool HasPartiallyBooked)

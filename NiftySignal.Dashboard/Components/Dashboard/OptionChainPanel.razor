@@ -83,9 +83,40 @@
         }
     }
 
-    IEnumerable<OptionChainRow> VisibleRows => SelectedExpiry is { } expiry
-        ? Live.OptionChain.Where(r => r.ExpiryDate == expiry).OrderBy(r => r.Strike).ThenBy(r => r.OptionType)
-        : [];
+    // ATM +/- StrikesEachSide (7 strikes total, both CE and PE -- 14 rows) rather than the
+    // full tracked chain (2026-09-08, dashboard request): the wide chain was mostly deep
+    // OTM strikes nobody reads at a glance. Centered on whichever row IsAtm marks, not a
+    // separately-tracked ATM value -- BuildOptionChainAsync already computes that once.
+    const int StrikesEachSide = 3;
+
+    IEnumerable<OptionChainRow> VisibleRows
+    {
+        get
+        {
+            if (SelectedExpiry is not { } expiry)
+            {
+                return [];
+            }
+
+            var expiryRows = Live.OptionChain.Where(r => r.ExpiryDate == expiry).ToList();
+            var strikes = expiryRows.Select(r => r.Strike).Distinct().OrderBy(s => s).ToList();
+            var atmIndex = strikes.IndexOf(expiryRows.FirstOrDefault(r => r.IsAtm)?.Strike ?? decimal.MinValue);
+
+            // No ATM resolved yet (e.g. no live spot tick this session) -- fall back to the
+            // full chain rather than showing nothing.
+            if (atmIndex < 0)
+            {
+                return expiryRows.OrderBy(r => r.Strike).ThenBy(r => r.OptionType);
+            }
+
+            var visibleStrikes = strikes
+                .Skip(Math.Max(0, Math.Min(atmIndex - StrikesEachSide, strikes.Count - (2 * StrikesEachSide + 1))))
+                .Take(2 * StrikesEachSide + 1)
+                .ToHashSet();
+
+            return expiryRows.Where(r => visibleStrikes.Contains(r.Strike)).OrderBy(r => r.Strike).ThenBy(r => r.OptionType);
+        }
+    }
 
     void SelectExpiry(DateOnly expiry) => _selectedExpiry = expiry;
 

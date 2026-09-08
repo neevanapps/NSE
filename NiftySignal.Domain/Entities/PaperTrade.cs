@@ -40,6 +40,16 @@ public sealed class PaperTrade
 
     public decimal? PartialExitPrice { get; set; }
 
+    /// <summary>
+    /// Units actually filled at the partial book (2026-09-08 dashboard fix), captured at that
+    /// moment rather than recomputed later from <see cref="Quantity"/> and the current
+    /// PartialBookFraction config -- same "read back what actually happened, don't re-derive
+    /// from config that might have changed since" rule <see cref="Quantity"/>'s own doc comment
+    /// already follows. Null until a partial book happens. The dashboard's remaining open
+    /// quantity is <see cref="Quantity"/> minus this once <see cref="HasPartiallyBooked"/> is true.
+    /// </summary>
+    public int? PartialExitQuantity { get; set; }
+
     /// <summary>Null while the trade is still open.</summary>
     public DateTimeOffset? ExitTime { get; set; }
 

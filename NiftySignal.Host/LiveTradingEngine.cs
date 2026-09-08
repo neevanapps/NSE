@@ -240,6 +240,7 @@ public sealed class LiveTradingEngine(
             position.HasPartiallyBooked = true;
             position.PartialExitTime = now;
             position.PartialExitPrice = fill.FillPrice;
+            position.PartialExitQuantity = partialQty;
             await db.SaveChangesAsync(ct);
             await dashboardPush.PushTradesChangedAsync(ct);
 
@@ -251,8 +252,12 @@ public sealed class LiveTradingEngine(
         // Final exit -- blend the partial leg (if one happened) with the remaining
         // quantity's leg. Entry/partial-exit net values are derived directly from the
         // prices already on the row (they were already filled -- re-running FillEntry on
-        // them would apply slippage a second time), not re-simulated.
-        var partialQtyFinal = position.HasPartiallyBooked ? (int)(totalQty * _config.Exit.PartialBookFraction) : 0;
+        // them would apply slippage a second time), not re-simulated. partialQtyFinal reads
+        // back the quantity actually filled at partial-book time (position.PartialExitQuantity)
+        // rather than recomputing totalQty * PartialBookFraction against -- possibly by
+        // now -- a different config, same "never let a config change retroactively alter an
+        // already-open position's economics" rule totalQty itself already follows.
+        var partialQtyFinal = position.HasPartiallyBooked ? position.PartialExitQuantity ?? 0 : 0;
         var remainingQty = totalQty - partialQtyFinal;
 
         var finalFill = PaperTradeSimulator.FillExit(markPrice, tickSize, remainingQty, _config.Costs);

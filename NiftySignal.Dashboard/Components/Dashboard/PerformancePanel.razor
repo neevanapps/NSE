@@ -71,6 +71,8 @@
 
 @code {
     IJSObjectReference? _module;
+    bool _rendered;
+    int _renderedTradeCount = -1;
 
     double WinRate => Live.ClosedTrades.Count == 0 ? 0 : 100.0 * Live.ClosedTrades.Count(t => t.NetPnl > 0) / Live.ClosedTrades.Count;
     decimal TotalPnl => Live.ClosedTrades.Sum(t => t.NetPnl);
@@ -93,25 +95,61 @@
         return trades.Count == 0 ? 0 : trades.Average(t => t.NetPnl);
     }
 
-    // Trade history doesn't change on the LiveDataService timer, so the chart is rendered
-    // once on first render and never updated -- no subscription to Live.Updated needed here.
+    (string[] Labels, double[] Equity) BuildEquitySeries()
+    {
+        var ordered = Live.ClosedTrades.OrderBy(t => t.ExitTime).ToList();
+        var labels = ordered.Select(t => t.ExitTime.ToIst().ToString("HH:mm")).ToArray();
+        decimal running = 0;
+        var equity = ordered.Select(t => (double)(running += t.NetPnl)).ToArray();
+        return (labels, equity);
+    }
+
+    protected override void OnInitialized() => Live.Updated += OnDemoUpdated;
+
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
         if (firstRender)
         {
             _module = await JS.InvokeAsync<IJSObjectReference>("import", "./js/charts.js");
-
-            var ordered = Live.ClosedTrades.OrderBy(t => t.ExitTime).ToList();
-            var labels = ordered.Select(t => t.ExitTime.ToIst().ToString("HH:mm")).ToArray();
-            decimal running = 0;
-            var equity = ordered.Select(t => (double)(running += t.NetPnl)).ToArray();
-
+            var (labels, equity) = BuildEquitySeries();
             await _module.InvokeVoidAsync("renderLineChart", "equity-curve-chart", labels, equity, "#a78bfa");
+            _renderedTradeCount = Live.ClosedTrades.Count;
+            _rendered = true;
+        }
+    }
+
+    // Audit finding (2026-09-08 dashboard fix): this panel never subscribed to Live.Updated at
+    // all, so neither the win-rate/P&L stats nor the trades table ever refreshed after a trade
+    // closed -- only a full page reload picked up new data. Wired the same way ScorePanel
+    // already handles its own live-updating chart: StateHasChanged for the stat/table markup,
+    // plus an in-place chart update (not a full renderLineChart -- see charts.js's own "avoids
+    // flicker" comment) whenever the closed-trade count actually changed. async void + the
+    // three-exception catch matches ScorePanel's own reasoning: Live.Updated fires for every
+    // connected circuit, and a circuit mid-disconnect at that instant must not crash the others.
+    async void OnDemoUpdated()
+    {
+        try
+        {
+            await InvokeAsync(async () =>
+            {
+                StateHasChanged();
+                if (_rendered && _module is not null && Live.ClosedTrades.Count != _renderedTradeCount)
+                {
+                    _renderedTradeCount = Live.ClosedTrades.Count;
+                    var (labels, equity) = BuildEquitySeries();
+                    await _module.InvokeVoidAsync("updateLineChart", "equity-curve-chart", labels, equity);
+                }
+            });
+        }
+        catch (Exception ex) when (ex is JSDisconnectedException or TaskCanceledException or ObjectDisposedException)
+        {
+            // This circuit is going away -- nothing to update client-side.
         }
     }
 
     public async ValueTask DisposeAsync()
     {
+        Live.Updated -= OnDemoUpdated;
         if (_module is not null)
         {
             try
