@@ -640,11 +640,12 @@ public class LiveFeatureEngineTests
         engine.OnTick(MakeTick(PutToken, 80m, Start, oi: 100_000));
         engine.ComputeCadence(Start);
 
-        // Call: price up, OI up by a small 1,000 -- LongBuildup, bullish, +1 sign, small size.
-        // Put: price up, OI up by a large 50,000 -- LongBuildup, bearish for a put, -1 sign,
+        // Spot up (classification is spot-driven since F17, not each leg's own price -- see
+        // ComputeOiBuildupNet). Call: OI up by a small 1,000 -- LongBuildup, bullish, +1 sign,
+        // small size. Put: OI up by a large 50,000 -- LongBuildup, bearish for a put, -1 sign,
         // large size. Old formula: (+1) + (-1) = 0. New formula: (+1,000) + (-50,000) = -49,000.
         var next = Start.AddSeconds(15);
-        engine.OnTick(MakeTick(SpotToken, 23950m, next));
+        engine.OnTick(MakeTick(SpotToken, 23960m, next));
         engine.OnTick(MakeTick(FutureToken, 24000m, next));
         engine.OnTick(MakeTick(CallToken, 105m, next, oi: 101_000));
         engine.OnTick(MakeTick(PutToken, 85m, next, oi: 150_000));
@@ -693,6 +694,8 @@ public class LiveFeatureEngineTests
         var at = Start;
         ScoreSnapshot? snapshot = null;
         var random = new Random(42);
+        var lastSpotPrice = 23900m;
+        var i = 0;
 
         // A little over 2 hours at 15s cadence -- long enough to warm up PriceMomentumZScoreWindow
         // (2h, the longest of the six required since F4/2026-09-08; previously the 30-minute
@@ -705,11 +708,22 @@ public class LiveFeatureEngineTests
         for (var elapsed = TimeSpan.Zero; elapsed <= TimeSpan.FromHours(2) + TimeSpan.FromSeconds(15); elapsed += TimeSpan.FromSeconds(15))
         {
             at = Start + elapsed;
-            engine.OnTick(MakeTick(SpotToken, 23900m + random.Next(-2, 3), at));
+            // Spot oscillates deterministically (Wave, same helper BuildSeedHistory uses),
+            // not i.i.d. random noise, during warm-up here (audit finding F17, 2026-09-08):
+            // OiBuildupNet's classification now reads spot's own cadence-to-cadence delta, and
+            // spot already anchors FuturesBasis/IvSkew's theoretical pricing too -- a random
+            // walk's occasional same-direction runs correlated all three components' z-scores
+            // during the warm-up loop often enough to inflate the smoothed baseline this test
+            // warms up on, defeating the point of testing against a genuinely calm one. A regular
+            // oscillation still gives every window real (non-zero) variance without the
+            // multi-cadence same-direction runs a random walk produces by chance.
+            lastSpotPrice = 23900m + (decimal)Math.Round(Wave(1.5, i));
+            engine.OnTick(MakeTick(SpotToken, lastSpotPrice, at));
             engine.OnTick(MakeTick(FutureToken, 24000m + random.Next(-2, 3), at));
-            // OiBuildupNet's classifier needs the option's OWN price to move too (it classifies
-            // off price-change x OI-change together) -- a constant price here is why oiRaw
-            // stayed exactly 0 every cadence before this fix.
+            i++;
+            // OiBuildupNet's classifier reads spot's own price change (audit finding F17,
+            // 2026-09-08 -- previously the option's own price, but spot already jitters above,
+            // which is what drives classification now).
             var callJitter = random.Next(-1, 2);
             var putJitter = random.Next(-1, 2);
             engine.OnTick(MakeTick(CallToken, 100m + callJitter, at,
@@ -734,9 +748,20 @@ public class LiveFeatureEngineTests
         Assert.True(snapshot!.IsWarmedUp);
 
         // One drastic, single-cadence OI spike -- call OI roughly 4-5x its baseline, versus
-        // the +/-2,000 jitter the baseline warmed up on.
+        // the +/-2,000 jitter the baseline warmed up on. Spot moves by exactly +/-1 from its own
+        // last real value (audit finding F17: classification is spot-driven now, not the
+        // option's own price) -- deterministic and unambiguous (never accidentally 0) without a
+        // disturbance large enough to also swing FuturesBasis/IvSkew's own spot-anchored
+        // calculations. Direction matches the already-warmed-up baseline's own sign (not fixed
+        // up) so the spike's classification reinforces the existing trend rather than risking a
+        // coincidental cancellation -- F17 means OiBuildupNet's classification now shares spot as
+        // a jitter source with FuturesBasis/IvSkew, so a fixed spike direction could land opposite
+        // an already-nonzero smoothed baseline under some RNG seeds, shrinking |instant| instead
+        // of growing it.
+        var preSpikeSmoothed = snapshot!.CompositeScoreRaw!.Value;
+        var pushUp = preSpikeSmoothed is not < 0;
         var spikeAt = at + TimeSpan.FromSeconds(15);
-        engine.OnTick(MakeTick(SpotToken, 23900m, spikeAt));
+        engine.OnTick(MakeTick(SpotToken, lastSpotPrice + (pushUp ? 1 : -1), spikeAt));
         engine.OnTick(MakeTick(FutureToken, 24000m, spikeAt));
         engine.OnTick(MakeTick(CallToken, 100m, spikeAt, oi: 5_000_000, depth: Depth(500, 500, bid: 99.5m, ask: 100.5m)));
         engine.OnTick(MakeTick(PutToken, 80m, spikeAt, oi: 900_000, depth: Depth(500, 500, bid: 79.5m, ask: 80.5m)));
@@ -746,9 +771,15 @@ public class LiveFeatureEngineTests
         Assert.NotNull(spiked!.CompositeScoreRawInstant);
         Assert.NotNull(spiked.CompositeScoreRaw);
 
-        // The smoothed value must move far less than the instantaneous one -- averaged
-        // against ~20 calm prior readings, not replaced by the spike outright.
-        Assert.True(Math.Abs(spiked.CompositeScoreRaw!.Value) < Math.Abs(spiked.CompositeScoreRawInstant!.Value) / 2);
+        // The smoothed value must *move* far less than the instantaneous one, both measured as a
+        // delta off the established pre-spike baseline (not their raw magnitudes) -- comparing
+        // absolute values implicitly assumed the pre-spike baseline was near zero, which doesn't
+        // reliably hold once OiBuildupNet's classification shares spot as a jitter source with
+        // several other components (audit finding F17); comparing movement off the actual
+        // pre-spike baseline is robust to whatever ambient value that baseline happens to be.
+        var smoothedMove = Math.Abs(spiked.CompositeScoreRaw!.Value - preSpikeSmoothed);
+        var instantMove = Math.Abs(spiked.CompositeScoreRawInstant!.Value - preSpikeSmoothed);
+        Assert.True(smoothedMove < instantMove / 2);
     }
 
     [Fact]
@@ -1425,7 +1456,15 @@ public class LiveFeatureEngineTests
         var engine = new LiveFeatureEngine(BaseUniverse());
         engine.SeedHistory(history);
 
-        var now = Start.AddMinutes(SeedMinutes).AddSeconds(1);
+        // A priming cadence first (audit finding F16, 2026-09-08): OiBuildupNet correctly
+        // returns null, not a fabricated 0, on the very first cadence after SeedHistory (there's
+        // no real _previousCadence yet to diff against) -- same as a real restart genuinely loses
+        // one cadence's worth of OiBuildupNet. The second call below has a real previous cadence.
+        var primingAt = Start.AddMinutes(SeedMinutes).AddSeconds(1);
+        FeedFinalTick(engine, primingAt);
+        engine.ComputeCadence(primingAt);
+
+        var now = primingAt.AddSeconds(15);
         FeedFinalTick(engine, now);
         var snapshot = engine.ComputeCadence(now);
 

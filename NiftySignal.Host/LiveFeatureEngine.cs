@@ -620,7 +620,7 @@ public sealed class LiveFeatureEngine
         // Not smoothed like the other five -- see class doc comment. Compares state at this
         // cadence tick to state at the last one. Null (not a fabricated delta) when the "last
         // cadence" is stale by more than one normal interval -- see ComputeOiBuildupNet.
-        var oiBuildupRaw = ComputeOiBuildupNet(now);
+        var oiBuildupRaw = ComputeOiBuildupNet(now, spot.LastPrice);
         if (oiBuildupRaw is { } oiBuildup)
         {
             _oiBuildupWindow.Add(now, oiBuildup);
@@ -1102,24 +1102,25 @@ public sealed class LiveFeatureEngine
     /// one cadence right after a gap is cheaper and more honest than trying to guess a
     /// time-normalized correction.
     /// </summary>
-    // PENDING (audit findings F16/F17/F18, 2026-09-08 lead review -- see fix plan Batch 6):
-    // three still-open issues in this method, on the single largest-weighted component (0.2775):
-    //   F16 -- the `_previousCadence is null` branch below returns 0, not null, so every Host
-    //   restart (frequent, per this session's own deploy cadence) feeds a fake zero into the
-    //   downstream Welford window instead of correctly skipping the cadence, same as the gap
-    //   branch just below it already does.
-    //   F17 -- priceChange reads the *option's own* LastPrice, not spot/synthetic-forward, so
-    //   OiBuildupClassifier.Classify is driven by the option's own delta/gamma/theta/vega rather
-    //   than the underlying's actual direction (a flat-spot IV pop can move both a call's and a
-    //   put's LastPrice up with no real spot move behind it).
-    //   F18 -- this loops the full nearest-expiry chain, not an ATM band; F5 restricted Pcr to
-    //   PersistedStrikeBand, this was never given the same treatment, so a deep-OTM strike's OI
-    //   change votes as loud as an ATM one.
-    double? ComputeOiBuildupNet(DateTimeOffset now)
+    // Three fixes together (audit findings F16/F17/F18, 2026-09-08 lead review), on the single
+    // largest-weighted component (0.2775):
+    //   F16 -- returns null (not a fabricated 0) when there's no trustworthy previous cadence,
+    //   including right after a Host restart (frequent, per this project's own deploy cadence) --
+    //   the old `return 0` fed a fake reading into the downstream Welford window indistinguishable
+    //   from a real "no buildup" cadence. Matches the gap branch just below, which already
+    //   correctly returns null for the same underlying reason.
+    //   F17 -- classifies from spot's own price change, not the option's -- the option leg's
+    //   LastPrice is driven by its own delta/gamma/theta/vega, not necessarily monotonic with the
+    //   underlying's actual direction (a flat-spot IV pop can move both a call's and a put's price
+    //   up simultaneously with no real spot move behind either).
+    //   F18 -- restricted to the ATM +/- PersistedStrikeBand strikes, not the full chain, same
+    //   band ComputePcr already uses (F5) -- a deep-OTM strike's OI change previously voted as
+    //   loud as an ATM one.
+    double? ComputeOiBuildupNet(DateTimeOffset now, decimal spotPrice)
     {
-        if (_previousCadence is null)
+        if (_previousCadence is null || !_previousCadence.TryGetValue(_spot.Token, out var prevSpot))
         {
-            return 0;
+            return null;
         }
 
         if (_lastCadenceAt is { } lastAt && now - lastAt > MaxCadenceGapForOiBuildup)
@@ -1127,17 +1128,25 @@ public sealed class LiveFeatureEngine
             return null;
         }
 
+        var spotPriceChange = spotPrice - prevSpot.LastPrice;
+
+        var bandStrikes = _nearestExpiryOptions
+            .Select(o => o.StrikePrice!.Value)
+            .Distinct()
+            .OrderBy(s => Math.Abs(s - spotPrice))
+            .Take((PersistedStrikeBand * 2) + 1)
+            .ToHashSet();
+
         double net = 0;
-        foreach (var opt in _nearestExpiryOptions)
+        foreach (var opt in _nearestExpiryOptions.Where(o => bandStrikes.Contains(o.StrikePrice!.Value)))
         {
             if (!_latest.TryGetValue(opt.Token, out var curr) || !_previousCadence.TryGetValue(opt.Token, out var prev))
             {
                 continue;
             }
 
-            var priceChange = curr.LastPrice - prev.LastPrice;
             var oiChange = (curr.OpenInterest ?? 0) - (prev.OpenInterest ?? 0);
-            var classification = OiBuildupClassifier.Classify(priceChange, oiChange);
+            var classification = OiBuildupClassifier.Classify(spotPriceChange, oiChange);
 
             // Standard NSE option-chain reading: call buildup/short-covering is bullish for
             // the underlying, put buildup/short-covering is bearish -- see class doc comment.
