@@ -1414,15 +1414,14 @@ public class LiveFeatureEngineTests
     }
 
     [Fact]
-    public void ComputeCadence_FallsBackToDefaultK_WhenCompositeRawWindowIsNotYetWarm()
+    public void ComputeCadence_CompositeScore_AlwaysUsesFixedDefaultK_RegardlessOfPastRawVolatility()
     {
-        // All six per-metric windows warmed (longest is PriceMomentumZScoreWindow, 2h, since
-        // F4/2026-09-08), but CompositeScoreRaw never seeded -- simulates a composite-raw
-        // window that hasn't accumulated 30 real minutes yet (e.g. right after this feature was
-        // deployed). k must fall back to DefaultK, not to some degenerate/near-zero value from
-        // an unwarmed window.
+        // Audit finding F1 (2026-09-08): k used to self-normalize as the rolling stddev of the
+        // composite's own recent raw values -- this proves that mechanism is gone. Confirms the
+        // resulting score matches CompositeScoreCalculator.Calculate's own DefaultK regardless
+        // of how much the underlying components moved during warm-up.
         const int SeedMinutes = 120;
-        var history = BuildSeedHistory(SeedMinutes, includeCompositeRaw: false);
+        var history = BuildSeedHistory(SeedMinutes);
         var engine = new LiveFeatureEngine(BaseUniverse());
         engine.SeedHistory(history);
 
@@ -1442,53 +1441,9 @@ public class LiveFeatureEngineTests
         Assert.Equal(expectedScore!.Value, snapshot.CompositeScore!.Value, precision: 9);
     }
 
-    [Fact]
-    public void ComputeCadence_UsesCompositeRawWindowsStdDev_AsK_OnceWarmedUp()
-    {
-        // 120 minutes seeded so all six per-metric windows (PriceMomentumZScoreWindow, 2h, is
-        // now the longest -- see F4) warm up; CompositeRawWindowLength itself is still only 30
-        // minutes, so the oracle below (also a 30-min rolling window fed the same full history)
-        // ends up retaining the same trailing slice production's own window would.
-        const int SeedMinutes = 120;
-        var history = BuildSeedHistory(SeedMinutes, includeCompositeRaw: true);
-        var engine = new LiveFeatureEngine(BaseUniverse());
-        engine.SeedHistory(history);
-
-        var now = Start.AddMinutes(SeedMinutes).AddSeconds(1);
-        FeedFinalTick(engine, now);
-        var snapshot = engine.ComputeCadence(now);
-
-        Assert.NotNull(snapshot);
-        Assert.True(snapshot!.IsWarmedUp);
-        Assert.NotNull(snapshot.CompositeScore);
-        Assert.NotNull(snapshot.CompositeScoreRaw);
-
-        // Oracle: feed the same CompositeScoreRaw sequence (seed history + this final point)
-        // into a fresh window and read its own StdDev independently. WelfordRollingWindow's
-        // arithmetic has its own dedicated tests -- reusing it here only verifies that
-        // ComputeCadence wires the result through as k, not that the math itself is right.
-        var oracle = new WelfordRollingWindow(TimeSpan.FromMinutes(30));
-        foreach (var s in history)
-        {
-            oracle.Add(s.ComputedAt, s.CompositeScoreRaw!.Value);
-        }
-        oracle.Add(now, snapshot.CompositeScoreRaw!.Value);
-
-        Assert.True(oracle.IsWarmedUp);
-        var expectedK = oracle.StdDev;
-        Assert.NotEqual(CompositeScoreCalculator.DefaultK, expectedK); // sanity: the seeded spread isn't coincidentally 1.0
-
-        var inputs = new ScoreComponentInputs(
-            OiBuildupNetZ: snapshot.OiBuildupNetZ, PcrZ: snapshot.PcrZ, FuturesBasisZ: snapshot.FuturesBasisZ,
-            IvSkewZ: snapshot.IvSkewZ, PriceMomentumZ: snapshot.PriceMomentumZ, DepthImbalanceZ: snapshot.DepthImbalanceZ);
-        var expectedScore = CompositeScoreCalculator.Calculate(inputs, ScoreWeights.Default, now, expectedK).Score;
-
-        Assert.Equal(expectedScore!.Value, snapshot.CompositeScore!.Value, precision: 6);
-    }
-
     static double Wave(double amplitude, int i) => amplitude * Math.Sin(i * 0.7);
 
-    static List<ScoreSnapshot> BuildSeedHistory(int minutes, bool includeCompositeRaw)
+    static List<ScoreSnapshot> BuildSeedHistory(int minutes)
     {
         var history = new List<ScoreSnapshot>();
         for (var i = 0; i < minutes; i++)
@@ -1502,7 +1457,6 @@ public class LiveFeatureEngineTests
                 IvSkewRaw = Wave(0.05, i),
                 PriceMomentumRaw = Wave(10, i),
                 DepthImbalanceRaw = Wave(0.3, i),
-                CompositeScoreRaw = includeCompositeRaw ? Wave(0.6, i) : null,
                 WeightSetVersion = "v1",
             });
         }

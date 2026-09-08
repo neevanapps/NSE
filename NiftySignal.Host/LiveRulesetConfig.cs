@@ -27,6 +27,14 @@ public static class LiveRulesetConfig
             ExpiryDayEnabled: true,
             ExpiryDayNoEntryAfterTime: new TimeOnly(14, 0)),
         Entry: new EntryConfig(
+            // MinAbsScore and MinScoreSustainedSeconds (audit finding F13, 2026-09-08): both
+            // tuned watching a score that sat at +/-99 roughly a third of the day under the old
+            // dynamic-k mechanism (see F1 / CompositeScoreCalculator.DefaultK's doc comment) --
+            // left unchanged here rather than guessed at, since a new number picked before k's
+            // corrected scale exists would just be tuning against a distribution about to shift
+            // again. Revisit both from a live session's qualification-rate data on the fixed-k,
+            // Batch-3-corrected score (target "top 5-10% of cadences" per the audit) once that
+            // data exists.
             MinAbsScore: 55,
             MinScoreSustainedSeconds: 45,
             ReEntryGapSameDirectionMinutes: 2,

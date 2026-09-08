@@ -40,12 +40,16 @@ readonly record struct InstrumentState(decimal LastPrice, long Volume, long? Ope
 ///   the last cadence), not a point read, so averaging sub-deltas would change what it
 ///   measures rather than just denoise it; exchange-reported OI also updates far less often
 ///   than LTP, so sub-sampling it would mostly average in a lot of true zeros.
-/// - Dynamic k: composite scoring used a hardcoded k, calibrated by eyeballing one trending
-///   session's data -- directionally unbiased (tanh is odd, so no k value favors bulls or
-///   bears) but not generalizable across volatility regimes. k is now the rolling stddev of
-///   the raw (pre-tanh) composite itself, via the same WelfordRollingWindow machinery
-///   already used to z-score the six inputs -- it shrinks on quiet days and grows on
-///   volatile ones instead of needing a human to re-tune it from a snapshot of one session.
+/// - k (2026-09-08, audit finding F1): briefly self-normalized as the rolling stddev of the
+///   raw (pre-tanh) composite itself (2026-09-04), on the reasoning that a fixed k wasn't
+///   generalizable across volatility regimes. In practice this fed k's own denominator off
+///   the same series it was trying to normalize, which shrank k on quiet stretches and
+///   pushed the score toward saturation right when it should have looked calmest -- over
+///   60% of a session routinely sat near +/-100 regardless of true conviction. Reverted to
+///   <see cref="CompositeScoreCalculator.DefaultK"/>, a single fixed constant -- currently
+///   still the audit's own back-of-envelope k~=1.0 starting point, explicitly provisional
+///   until a live session's worth of data on Batch 3's corrected raw distributions
+///   (F2/F4/F5/F7/F8) exists to size it from properly (see the fix plan's Batch 4 section).
 ///
 /// A 7th, optional component, 2026-09-04: VixChange is India VIX's change over a 30-minute
 /// lookback (<see cref="ComputeVixChange"/>), negated -- VIX-vs-Nifty is the standard "fear
@@ -77,11 +81,6 @@ public sealed class LiveFeatureEngine
     /// OI profile still show the full range.
     /// </summary>
     const int PersistedStrikeBand = 2;
-
-    // Matches the longest of the six per-metric windows (Pcr/OiBuildupNet/FuturesBasis) so
-    // the dynamic-k window doesn't push composite warm-up out any further than the existing
-    // six already require.
-    static readonly TimeSpan CompositeRawWindowLength = TimeSpan.FromMinutes(30);
 
     // 3 minutes at the 15s cadence (started at 5 min on 2026-09-07, chosen for a deliberately
     // low-frequency, 1-5-trades-a-day strategy; shortened the same day after watching the
@@ -116,7 +115,6 @@ public sealed class LiveFeatureEngine
     // window as the raw lookback collapses variance.
     readonly WelfordRollingWindow _momentumWindow = new(FeatureWindowLengths.PriceMomentumZScoreWindow);
     readonly WelfordRollingWindow _depthImbalanceWindow = new(FeatureWindowLengths.DepthImbalance);
-    readonly WelfordRollingWindow _compositeRawWindow = new(CompositeRawWindowLength);
     readonly WelfordRollingWindow _vixWindow = new(FeatureWindowLengths.VixChangeZScoreWindow);
     readonly WelfordRollingWindow _gammaExposureWindow = new(FeatureWindowLengths.GammaExposure);
     readonly WelfordRollingWindow _volumePcrWindow = new(FeatureWindowLengths.VolumePcr);
@@ -263,11 +261,6 @@ public sealed class LiveFeatureEngine
             if (snapshot.DepthImbalanceRaw is { } depthImbalance)
             {
                 _depthImbalanceWindow.Add(snapshot.ComputedAt, depthImbalance);
-            }
-
-            if (snapshot.CompositeScoreRaw is { } compositeRaw)
-            {
-                _compositeRawWindow.Add(snapshot.ComputedAt, compositeRaw);
             }
 
             // Rebuilds the smoothing FIFO from persisted history so a restart doesn't need a
@@ -735,23 +728,11 @@ public sealed class LiveFeatureEngine
             compositeRawSmoothed = _compositeRawHistory.Average();
         }
 
-        // Dynamic k -- see class doc comment. Falls back to CompositeScoreCalculator.DefaultK
-        // until the composite-raw window itself has 30 real minutes of history, same
-        // "unreliable until warmed up" rule WelfordRollingWindow already applies to StdDev.
-        // Fed the smoothed value, not the instantaneous one -- k is meant to normalize against
-        // how volatile the score actually driving trade decisions has recently been, which
-        // (now that trading is off the smoothed series) is the smoothed series' own spread.
-        var k = CompositeScoreCalculator.DefaultK;
-        if (compositeRawSmoothed is { } smoothedForK)
-        {
-            _compositeRawWindow.Add(now, smoothedForK);
-            if (_compositeRawWindow.IsWarmedUp && _compositeRawWindow.StdDev >= 1e-12)
-            {
-                k = _compositeRawWindow.StdDev;
-            }
-        }
-
-        var composite = CompositeScoreCalculator.Calculate(inputs, ScoreWeights.Default, now, k, compositeRawSmoothed);
+        // Fixed k (audit finding F1, 2026-09-08) -- see class doc comment for why the dynamic,
+        // self-normalizing version this replaced was actually driving the saturation it was
+        // meant to prevent.
+        var composite = CompositeScoreCalculator.Calculate(
+            inputs, ScoreWeights.Default, now, CompositeScoreCalculator.DefaultK, compositeRawSmoothed);
 
         _previousCadence = new Dictionary<string, InstrumentState>(_latest);
         _lastCadenceAt = now;
