@@ -68,7 +68,6 @@ public sealed class LiveFeatureEngine
     // 91-day T-bill proxy (plan 4.1: "static config value, reviewed weekly") -- hardcoded
     // starting point since no config surface exists yet for it.
     const double RiskFreeRate = 0.065;
-    const decimal IvSkewStrikeOffset = 200m;
 
     /// <summary>
     /// Strikes each side of ATM whose per-cadence analytics get persisted (2026-09-05) --
@@ -112,7 +111,10 @@ public sealed class LiveFeatureEngine
     readonly WelfordRollingWindow _pcrWindow = new(FeatureWindowLengths.Pcr);
     readonly WelfordRollingWindow _basisWindow = new(FeatureWindowLengths.FuturesBasis);
     readonly WelfordRollingWindow _ivSkewWindow = new(FeatureWindowLengths.IvSkew);
-    readonly WelfordRollingWindow _momentumWindow = new(FeatureWindowLengths.PriceMomentum);
+    // FeatureWindowLengths.PriceMomentumZScoreWindow, not .PriceMomentum (audit finding F4,
+    // 2026-09-08) -- see that constant's own doc comment for why z-scoring against the same
+    // window as the raw lookback collapses variance.
+    readonly WelfordRollingWindow _momentumWindow = new(FeatureWindowLengths.PriceMomentumZScoreWindow);
     readonly WelfordRollingWindow _depthImbalanceWindow = new(FeatureWindowLengths.DepthImbalance);
     readonly WelfordRollingWindow _compositeRawWindow = new(CompositeRawWindowLength);
     readonly WelfordRollingWindow _vixWindow = new(FeatureWindowLengths.VixChangeZScoreWindow);
@@ -474,7 +476,7 @@ public sealed class LiveFeatureEngine
         // time-decay drift washes out over a few minutes; F11 is specifically about Basis's
         // absolute-level bias, not Momentum.
         _momentumSamples.Add(ComputeMomentum(now, futureMark));
-        _pcrSamples.Add(ComputePcr());
+        _pcrSamples.Add(ComputePcr(spot.LastPrice));
         _depthImbalanceSamples.Add(ComputeDepthImbalance(spot.LastPrice));
         _ivSkewSamples.Add(ComputeIvSkew(spot.LastPrice, now));
         SampleSpreads();
@@ -1032,10 +1034,24 @@ public sealed class LiveFeatureEngine
         return -(double)(vix.LastPrice - _vixLookback.Peek().Vix);
     }
 
-    double? ComputePcr()
+    /// <summary>
+    /// Restricted to the ATM +/- PersistedStrikeBand strikes, not the full chain (2026-09-08,
+    /// audit finding F5) -- the full chain was dominated by enormous open interest sitting on
+    /// far strikes that has nothing to do with today's positioning, and refreshes at OI-update
+    /// frequency (not the 15s cadence clock), so summing dozens of strikes together mostly just
+    /// added stale noise rather than signal. Same band selection as BuildStrikeSnapshots.
+    /// </summary>
+    double? ComputePcr(decimal spotPrice)
     {
+        var bandStrikes = _nearestExpiryOptions
+            .Select(o => o.StrikePrice!.Value)
+            .Distinct()
+            .OrderBy(s => Math.Abs(s - spotPrice))
+            .Take((PersistedStrikeBand * 2) + 1)
+            .ToHashSet();
+
         long callOi = 0, putOi = 0;
-        foreach (var opt in _nearestExpiryOptions)
+        foreach (var opt in _nearestExpiryOptions.Where(o => bandStrikes.Contains(o.StrikePrice!.Value)))
         {
             if (!_latest.TryGetValue(opt.Token, out var state) || state.OpenInterest is not { } oi)
             {
@@ -1091,7 +1107,14 @@ public sealed class LiveFeatureEngine
 
             // Standard NSE option-chain reading: call buildup/short-covering is bullish for
             // the underlying, put buildup/short-covering is bearish -- see class doc comment.
-            net += (opt.OptionType, classification) switch
+            // The sign switch below is multiplied by |oiChange| (audit finding F7, 2026-09-08),
+            // not just summed as a flat +/-1 -- a 200-contract strike voted exactly as loud as
+            // a 500,000-contract one under the old formula, on a component that carries the
+            // largest weight in the whole composite. Raw OI-change magnitude, not further
+            // normalized: this only ever feeds a z-score downstream, same as every other raw
+            // value here, so the absolute scale (now much larger than the old +/-1..6 range)
+            // is immaterial -- only its variation against its own rolling window is used.
+            var sign = (opt.OptionType, classification) switch
             {
                 (OptionType.Call, OiBuildupClassification.LongBuildup) => 1,
                 (OptionType.Call, OiBuildupClassification.ShortCovering) => 1,
@@ -1103,6 +1126,7 @@ public sealed class LiveFeatureEngine
                 (OptionType.Put, OiBuildupClassification.ShortCovering) => -1,
                 _ => 0,
             };
+            net += sign * Math.Abs(oiChange);
         }
 
         return net;
@@ -1117,25 +1141,44 @@ public sealed class LiveFeatureEngine
             .Take(2)
             .ToHashSet();
 
-        long totalBid = 0, totalAsk = 0;
+        long callBid = 0, callAsk = 0, putBid = 0, putAsk = 0;
         foreach (var opt in _nearestExpiryOptions.Where(o => ntmStrikes.Contains(o.StrikePrice!.Value)))
         {
-            if (_latest.TryGetValue(opt.Token, out var state) && state.Depth is { } depth)
+            if (!_latest.TryGetValue(opt.Token, out var state) || state.Depth is not { } depth)
             {
-                totalBid += depth.TotalBidQty;
-                totalAsk += depth.TotalAskQty;
+                continue;
+            }
+
+            if (opt.OptionType == OptionType.Call)
+            {
+                callBid += depth.TotalBidQty;
+                callAsk += depth.TotalAskQty;
+            }
+            else if (opt.OptionType == OptionType.Put)
+            {
+                putBid += depth.TotalBidQty;
+                putAsk += depth.TotalAskQty;
             }
         }
 
-        var totalDepth = totalBid + totalAsk;
-        // Normalized imbalance, not a raw bid/ask ratio: (bid-ask)/(bid+ask) ranges [-1,+1]
-        // and is centered at 0 (balanced). A plain ratio is a real bug fixed here
-        // (2026-09-04, live-caught) -- it can never be negative by construction (two
-        // non-negative quantities divided), yet both this feature's z-score and the
-        // option-chain grid display it as a signed bull/bear value. The window's z-score
-        // was still statistically valid against the old formula, just not measuring
-        // "which side has more pressure" the way "imbalance" implies.
-        return totalDepth > 0 ? (double)(totalBid - totalAsk) / totalDepth : null;
+        var callDepth = callBid + callAsk;
+        var putDepth = putBid + putAsk;
+        if (callDepth == 0 && putDepth == 0)
+        {
+            return null;
+        }
+
+        // Each side normalized independently, then differenced -- not summed together before
+        // normalizing (audit finding F2, 2026-09-08). A call book bid-heavy is bullish (buying
+        // calls); a put book bid-heavy is bearish (buying puts). Summing both sides' raw
+        // quantities together treated them as the same signal, so a book that was simply busy
+        // on both sides -- no real directional pressure at all -- read as strongly bullish. A
+        // side with no depth this cadence contributes 0 (no evidence either way) rather than
+        // making the whole cadence null just because one side happened to be quiet. Range is
+        // now [-2,+2], not [-1,+1] -- immaterial, since this only ever feeds a z-score.
+        var callImbalance = callDepth > 0 ? (double)(callBid - callAsk) / callDepth : 0.0;
+        var putImbalance = putDepth > 0 ? (double)(putBid - putAsk) / putDepth : 0.0;
+        return callImbalance - putImbalance;
     }
 
     /// <summary>
@@ -1150,8 +1193,25 @@ public sealed class LiveFeatureEngine
     /// </summary>
     double? ComputeIvSkew(decimal spotPrice, DateTimeOffset now)
     {
-        var targetCallStrike = spotPrice + IvSkewStrikeOffset;
-        var targetPutStrike = spotPrice - IvSkewStrikeOffset;
+        var t = TimeToExpiry.YearsUntilExpiry(_nearestExpiry, now);
+        var underlying = ComputeUnderlyingPrice(spotPrice, t);
+
+        // Risk-normalized offset, not a fixed point count (audit finding F8, 2026-09-08): a
+        // constant 200-point offset means something completely different on a calm day (deep
+        // OTM, near-worthless wings) than a volatile one (close to ATM, real premium) -- the
+        // metric quietly changed what it was measuring depending on conditions. Anchored to the
+        // expiry's own expected move (spot x sigma x sqrt(t)) via the same ATM-solved reference
+        // vol GEX/Vanna/Charm/IvRank already use, so the same *relative* strikes (roughly one
+        // expected move away) get compared regardless of regime.
+        var atmStrike = _nearestExpiryOptions.Select(o => o.StrikePrice!.Value).Distinct().OrderBy(s => Math.Abs(s - spotPrice)).FirstOrDefault();
+        if (atmStrike == 0 || SolveAtmReferenceVol(atmStrike, underlying, t) is not { } atmVol)
+        {
+            return null;
+        }
+
+        var expectedMove = (decimal)((double)spotPrice * atmVol * Math.Sqrt(t));
+        var targetCallStrike = spotPrice + expectedMove;
+        var targetPutStrike = spotPrice - expectedMove;
 
         var callOpt = _nearestExpiryOptions
             .Where(o => o.OptionType == OptionType.Call)
@@ -1173,8 +1233,6 @@ public sealed class LiveFeatureEngine
             return null;
         }
 
-        var t = TimeToExpiry.YearsUntilExpiry(_nearestExpiry, now);
-        var underlying = ComputeUnderlyingPrice(spotPrice, t);
         var callIv = ImpliedVolatilitySolver.Solve(OptionType.Call, (double)cm, (double)underlying, (double)callOpt.StrikePrice!.Value, t, RiskFreeRate);
         var putIv = ImpliedVolatilitySolver.Solve(OptionType.Put, (double)pm, (double)underlying, (double)putOpt.StrikePrice!.Value, t, RiskFreeRate);
 

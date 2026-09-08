@@ -10,8 +10,22 @@ public static class FeatureWindowLengths
     /// <summary>Fast-moving, noisy.</summary>
     public static readonly TimeSpan DepthImbalance = TimeSpan.FromMinutes(5);
 
-    /// <summary>Intraday responsiveness.</summary>
+    /// <summary>Intraday responsiveness. The lookback used to compute the *raw* momentum ("futures price now minus this-long-ago") -- distinct from <see cref="PriceMomentumZScoreWindow"/> below, which governs how that raw value gets z-scored, not how it's computed.</summary>
     public static readonly TimeSpan PriceMomentum = TimeSpan.FromMinutes(15);
+
+    /// <summary>
+    /// Rolling window the raw PriceMomentum value (above) is z-scored against (2026-09-08,
+    /// audit finding F4) -- the exact same bug already fixed for VixChange on 04 Sep, never
+    /// carried across here. Z-scoring against a window the *same* length as the raw lookback
+    /// compares an almost-fully-autocorrelated series against itself: each new 15s reading's
+    /// 15-minute lookback overlaps the previous one by all but 15 seconds, so that series has
+    /// almost no internal variance during any smooth stretch, collapsing the window's StdDev
+    /// toward zero and slamming ordinary moves into the +/-3 clip (PriceMomentumRaw's measured
+    /// lag-1 autocorrelation: 0.964). A window several times longer spans enough distinct
+    /// regimes that one flat patch can't dominate the variance estimate -- same reasoning as
+    /// VixChangeZScoreWindow, see its own doc comment.
+    /// </summary>
+    public static readonly TimeSpan PriceMomentumZScoreWindow = TimeSpan.FromHours(2);
 
     /// <summary>Slower-moving structural signal.</summary>
     public static readonly TimeSpan Pcr = TimeSpan.FromMinutes(30);

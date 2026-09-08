@@ -169,6 +169,47 @@ public class LiveFeatureEngineTests
     }
 
     [Fact]
+    public void ComputeCadence_Pcr_ExcludesStrikesOutsideThePersistedBand()
+    {
+        // Audit finding F5 (2026-09-08): Pcr must do the OPPOSITE of GammaExposure/VolumePcr --
+        // those two are deliberately full-chain (see their own "not just a persisted band"
+        // tests); Pcr is deliberately restricted, since a full-chain sum was dominated by
+        // enormous OI sitting on far strikes that has nothing to do with today's positioning.
+        const string FarPutToken = "99010";
+        // PersistedStrikeBand=2 means "5 nearest distinct strikes" -- need at least 6 distinct
+        // strikes total for that selection to genuinely exclude one, so four untraded filler
+        // strikes sit between spot and the deliberately far one (their presence as instruments
+        // is what matters here, not any tick data on them).
+        var universe = BaseUniverse();
+        universe.Add(Option("99006", OptionType.Call, 24000m));
+        universe.Add(Option("99007", OptionType.Call, 24050m));
+        universe.Add(Option("99008", OptionType.Call, 24100m));
+        universe.Add(Option("99009", OptionType.Call, 24150m));
+        universe.Add(Option(FarPutToken, OptionType.Put, 25000m)); // 1050 points from spot -- the 6th, farthest strike
+
+        var withFarOi = new LiveFeatureEngine(universe);
+        withFarOi.OnTick(MakeTick(SpotToken, 23950m, Start));
+        withFarOi.OnTick(MakeTick(FutureToken, 24000m, Start));
+        withFarOi.OnTick(MakeTick(CallToken, 100m, Start, oi: 1_000_000));
+        withFarOi.OnTick(MakeTick(PutToken, 80m, Start, oi: 870_000));
+        withFarOi.OnTick(MakeTick(FarPutToken, 5m, Start, oi: 50_000_000)); // enormous, if it counted would swamp the ratio
+
+        var withoutFarOi = new LiveFeatureEngine(universe);
+        withoutFarOi.OnTick(MakeTick(SpotToken, 23950m, Start));
+        withoutFarOi.OnTick(MakeTick(FutureToken, 24000m, Start));
+        withoutFarOi.OnTick(MakeTick(CallToken, 100m, Start, oi: 1_000_000));
+        withoutFarOi.OnTick(MakeTick(PutToken, 80m, Start, oi: 870_000));
+        withoutFarOi.OnTick(MakeTick(FarPutToken, 5m, Start, oi: 0));
+
+        var withFar = withFarOi.ComputeCadence(Start);
+        var withoutFar = withoutFarOi.ComputeCadence(Start);
+
+        Assert.NotNull(withFar);
+        Assert.NotNull(withoutFar);
+        Assert.Equal(withoutFar!.PcrRaw!.Value, withFar!.PcrRaw!.Value, precision: 9);
+    }
+
+    [Fact]
     public void ComputeCadence_ComputesDepthImbalance_FromNearestTwoStrikesOnly_ExcludingFartherOnes()
     {
         const string MediumCallToken = "99000";
@@ -189,11 +230,33 @@ public class LiveFeatureEngineTests
 
         var snapshot = engine.ComputeCadence(Start);
 
-        // bid=500+300+200=1000, ask=400+600+200=1200 -- normalized (bid-ask)/(bid+ask) =
-        // -200/2200 = -0.0909. The far strike's 9000/1 depth would swamp this (and flip its
-        // sign) if it weren't excluded.
+        // Calls at the 2 nearest strikes (23950, 24450): bid=500+200=700, ask=400+200=600 --
+        // callImbalance = 100/1300. Puts at those same 2 strikes (only 23950 has one):
+        // bid=300, ask=600 -- putImbalance = -300/900. Result = callImbalance - putImbalance.
+        // The far strike's 9000/1 call depth would dominate the call side (and the result) if
+        // it weren't excluded by "nearest 2".
         Assert.NotNull(snapshot);
-        Assert.Equal(-200.0 / 2200.0, snapshot!.DepthImbalanceRaw!.Value, precision: 3);
+        Assert.Equal((100.0 / 1300.0) - (-300.0 / 900.0), snapshot!.DepthImbalanceRaw!.Value, precision: 9);
+    }
+
+    [Fact]
+    public void ComputeCadence_DepthImbalance_ReadsNeutral_WhenBothCallAndPutBooksAreEquallyBidHeavy()
+    {
+        // Audit finding F2 (2026-09-08): a call book bid-heavy is bullish (buying calls); a put
+        // book bid-heavy is bearish (buying puts). Summing both sides together before
+        // normalizing (the pre-fix formula) would have read this as +0.2, strongly bullish, when
+        // nothing directional is actually happening -- differencing each side's own imbalance
+        // correctly cancels it to zero.
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, depth: Depth(bidQty: 600, askQty: 400)));
+        engine.OnTick(MakeTick(PutToken, 80m, Start, depth: Depth(bidQty: 600, askQty: 400)));
+
+        var snapshot = engine.ComputeCadence(Start);
+
+        Assert.NotNull(snapshot);
+        Assert.Equal(0.0, snapshot!.DepthImbalanceRaw!.Value, precision: 9);
     }
 
     [Fact]
@@ -563,6 +626,35 @@ public class LiveFeatureEngineTests
     }
 
     [Fact]
+    public void ComputeCadence_OiBuildupNet_WeighsEachStrikeByOiChangeMagnitude_NotAFlatVote()
+    {
+        // Audit finding F7 (2026-09-08): under the old flat +/-1 vote, a small bullish call
+        // buildup and a much larger bearish put buildup would have exactly canceled (net 0) --
+        // a 200-contract strike counted as loud as a 500,000-contract one, on the component
+        // carrying the single largest weight in the composite. Weighted by |OI change|, the
+        // far larger put buildup correctly dominates instead.
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, oi: 100_000));
+        engine.OnTick(MakeTick(PutToken, 80m, Start, oi: 100_000));
+        engine.ComputeCadence(Start);
+
+        // Call: price up, OI up by a small 1,000 -- LongBuildup, bullish, +1 sign, small size.
+        // Put: price up, OI up by a large 50,000 -- LongBuildup, bearish for a put, -1 sign,
+        // large size. Old formula: (+1) + (-1) = 0. New formula: (+1,000) + (-50,000) = -49,000.
+        var next = Start.AddSeconds(15);
+        engine.OnTick(MakeTick(SpotToken, 23950m, next));
+        engine.OnTick(MakeTick(FutureToken, 24000m, next));
+        engine.OnTick(MakeTick(CallToken, 105m, next, oi: 101_000));
+        engine.OnTick(MakeTick(PutToken, 85m, next, oi: 150_000));
+        var snapshot = engine.ComputeCadence(next);
+
+        Assert.NotNull(snapshot);
+        Assert.Equal(-49_000.0, snapshot!.OiBuildupNetRaw!.Value, precision: 6);
+    }
+
+    [Fact]
     public void ComputeCadence_SmoothsCompositeRaw_AcrossTheLastSeveralCadences()
     {
         // Regression for the live-caught "score isn't tradable" problem (2026-09-07): a
@@ -602,15 +694,15 @@ public class LiveFeatureEngineTests
         ScoreSnapshot? snapshot = null;
         var random = new Random(42);
 
-        // ~31 minutes at 15s cadence -- long enough to warm up the 30-minute windows
-        // (Pcr, OiBuildupNet, FuturesBasis), the longest of the six required. Every jittered
-        // quantity is independently randomized -- spot and future must NOT share the same
-        // offset (that cancels out in the basis calc), and depth quantities need their own
-        // variance too (imbalance is otherwise perfectly balanced, hence zero, every cadence).
-        // Depth bid/ask must jitter too, not just LTP: MidPrice prefers depth mid over LTP, and
-        // a fixed depth mid would make the option price constant every cadence regardless of
-        // LLP's own jitter.
-        for (var elapsed = TimeSpan.Zero; elapsed <= TimeSpan.FromMinutes(31); elapsed += TimeSpan.FromSeconds(15))
+        // A little over 2 hours at 15s cadence -- long enough to warm up PriceMomentumZScoreWindow
+        // (2h, the longest of the six required since F4/2026-09-08; previously the 30-minute
+        // windows -- Pcr/OiBuildupNet/FuturesBasis -- were longest). Every jittered quantity is
+        // independently randomized -- spot and future must NOT share the same offset (that
+        // cancels out in the basis calc), and depth quantities need their own variance too
+        // (imbalance is otherwise perfectly balanced, hence zero, every cadence). Depth bid/ask
+        // must jitter too, not just LTP: MidPrice prefers depth mid over LTP, and a fixed depth
+        // mid would make the option price constant every cadence regardless of LLP's own jitter.
+        for (var elapsed = TimeSpan.Zero; elapsed <= TimeSpan.FromHours(2) + TimeSpan.FromSeconds(15); elapsed += TimeSpan.FromSeconds(15))
         {
             at = Start + elapsed;
             engine.OnTick(MakeTick(SpotToken, 23900m + random.Next(-2, 3), at));
@@ -1196,6 +1288,72 @@ public class LiveFeatureEngineTests
     }
 
     [Fact]
+    public void ComputeCadence_IvSkew_TargetStrikeOffset_ScalesWithVolatility_NotAFixedPointCount()
+    {
+        // Audit finding F8 (2026-09-08): a fixed +/-200 point offset means something different
+        // on a calm day (deep OTM wings) than a volatile one (near ATM, real premium). Proven
+        // here with a near strike (zero skew) and a far strike (a large, deliberate skew): low
+        // ATM vol should target the near strike (small expected move), high ATM vol should
+        // target the far one (large expected move) -- extreme enough vol values that this holds
+        // regardless of the exact day-count between Start and NearestExpiry.
+        const decimal spot = 24000m;
+        const decimal atmStrike = 24000m;
+        const decimal nearCallStrike = 24050m;
+        const decimal nearPutStrike = 23950m;
+        const decimal farCallStrike = 24800m;
+        const decimal farPutStrike = 23200m;
+
+        var universe = new List<Instrument> { Spot(), Future(),
+            Option(CallToken, OptionType.Call, atmStrike), Option(PutToken, OptionType.Put, atmStrike),
+            Option("88101", OptionType.Call, nearCallStrike), Option("88102", OptionType.Put, nearPutStrike),
+            Option("88103", OptionType.Call, farCallStrike), Option("88104", OptionType.Put, farPutStrike) };
+
+        double SkewAtAtmVol(double atmVol)
+        {
+            var engine = new LiveFeatureEngine(universe);
+            var t = TimeToExpiry.YearsUntilExpiry(NearestExpiry, Start);
+            engine.OnTick(MakeTick(SpotToken, spot, Start));
+            engine.OnTick(MakeTick(FutureToken, spot + 50m, Start));
+
+            var atmCallPrice = (decimal)BlackScholes.Calculate(OptionType.Call, (double)spot, (double)atmStrike, t, 0.065, atmVol).Price;
+            var atmPutPrice = (decimal)BlackScholes.Calculate(OptionType.Put, (double)spot, (double)atmStrike, t, 0.065, atmVol).Price;
+            engine.OnTick(MakeTick(CallToken, atmCallPrice, Start, depth: Depth(100, 100, bid: atmCallPrice - 0.05m, ask: atmCallPrice + 0.05m)));
+            engine.OnTick(MakeTick(PutToken, atmPutPrice, Start, depth: Depth(100, 100, bid: atmPutPrice - 0.05m, ask: atmPutPrice + 0.05m)));
+
+            // Near strikes: identical call/put vol -- zero skew if these are the ones selected.
+            // Symmetric distances either side of spot (call target lands above spot, put target
+            // below it), since nearest-strike search only helps if a strike actually exists on
+            // the target's own side -- one strike reused for both legs left every put target
+            // resolving to the ATM strike instead, since nothing below spot was ever closer.
+            var nearCallPrice = (decimal)BlackScholes.Calculate(OptionType.Call, (double)spot, (double)nearCallStrike, t, 0.065, 0.15).Price;
+            var nearPutPrice = (decimal)BlackScholes.Calculate(OptionType.Put, (double)spot, (double)nearPutStrike, t, 0.065, 0.15).Price;
+            engine.OnTick(MakeTick("88101", nearCallPrice, Start, depth: Depth(100, 100, bid: nearCallPrice - 0.05m, ask: nearCallPrice + 0.05m)));
+            engine.OnTick(MakeTick("88102", nearPutPrice, Start, depth: Depth(100, 100, bid: nearPutPrice - 0.05m, ask: nearPutPrice + 0.05m)));
+
+            // Far strikes: a large, deliberate put-vs-call vol gap -- a recognizable +0.40 skew
+            // if these are the ones selected instead. Vols kept high enough on both legs that
+            // neither price underflows to near-zero given the short T (a strike this far OTM,
+            // at 0.15 vol, priced at only ~2 trading days to expiry, was observed to underflow
+            // to ~1e-10 -- an unusable, effectively-zero price with a negative synthetic bid).
+            var farCallPrice = (decimal)BlackScholes.Calculate(OptionType.Call, (double)spot, (double)farCallStrike, t, 0.065, 0.20).Price;
+            var farPutPrice = (decimal)BlackScholes.Calculate(OptionType.Put, (double)spot, (double)farPutStrike, t, 0.065, 0.60).Price;
+            engine.OnTick(MakeTick("88103", farCallPrice, Start, depth: Depth(100, 100, bid: farCallPrice - 0.05m, ask: farCallPrice + 0.05m)));
+            engine.OnTick(MakeTick("88104", farPutPrice, Start, depth: Depth(100, 100, bid: farPutPrice - 0.05m, ask: farPutPrice + 0.05m)));
+
+            var snapshot = engine.ComputeCadence(Start);
+            Assert.NotNull(snapshot);
+            Assert.NotNull(snapshot!.IvSkewRaw);
+            return snapshot.IvSkewRaw!.Value;
+        }
+
+        var lowVolSkew = SkewAtAtmVol(0.12);
+        var highVolSkew = SkewAtAtmVol(1.50);
+
+        Assert.Equal(0.0, lowVolSkew, 1e-2);
+        Assert.Equal(0.40, highVolSkew, 1e-1);
+    }
+
+    [Fact]
     public void TryGetLatestQuote_PrefersBidOverLtp()
     {
         var engine = new LiveFeatureEngine(BaseUniverse());
@@ -1258,11 +1416,12 @@ public class LiveFeatureEngineTests
     [Fact]
     public void ComputeCadence_FallsBackToDefaultK_WhenCompositeRawWindowIsNotYetWarm()
     {
-        // All six per-metric windows warmed (longest is 30 minutes), but CompositeScoreRaw
-        // never seeded -- simulates a composite-raw window that hasn't accumulated 30 real
-        // minutes yet (e.g. right after this feature was deployed). k must fall back to
-        // DefaultK, not to some degenerate/near-zero value from an unwarmed window.
-        const int SeedMinutes = 30;
+        // All six per-metric windows warmed (longest is PriceMomentumZScoreWindow, 2h, since
+        // F4/2026-09-08), but CompositeScoreRaw never seeded -- simulates a composite-raw
+        // window that hasn't accumulated 30 real minutes yet (e.g. right after this feature was
+        // deployed). k must fall back to DefaultK, not to some degenerate/near-zero value from
+        // an unwarmed window.
+        const int SeedMinutes = 120;
         var history = BuildSeedHistory(SeedMinutes, includeCompositeRaw: false);
         var engine = new LiveFeatureEngine(BaseUniverse());
         engine.SeedHistory(history);
@@ -1286,7 +1445,11 @@ public class LiveFeatureEngineTests
     [Fact]
     public void ComputeCadence_UsesCompositeRawWindowsStdDev_AsK_OnceWarmedUp()
     {
-        const int SeedMinutes = 30;
+        // 120 minutes seeded so all six per-metric windows (PriceMomentumZScoreWindow, 2h, is
+        // now the longest -- see F4) warm up; CompositeRawWindowLength itself is still only 30
+        // minutes, so the oracle below (also a 30-min rolling window fed the same full history)
+        // ends up retaining the same trailing slice production's own window would.
+        const int SeedMinutes = 120;
         var history = BuildSeedHistory(SeedMinutes, includeCompositeRaw: true);
         var engine = new LiveFeatureEngine(BaseUniverse());
         engine.SeedHistory(history);
