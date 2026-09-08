@@ -153,7 +153,12 @@
 
     string FormatGammaFlip()
     {
-        if (Live.GammaFlipLevel is not { } flip)
+        // double.IsFinite, not just null-check (2026-09-08 live-caught): a NaN/Infinity flip
+        // level -- e.g. from a near-zero time-to-expiry gamma blowing up late on expiry day --
+        // would otherwise reach the (decimal)flip cast below and throw OverflowException
+        // (decimal has no NaN/Infinity representation), crashing the whole Blazor circuit for
+        // a single stat nobody could even read at that point anyway.
+        if (Live.GammaFlipLevel is not { } flip || !double.IsFinite(flip))
         {
             return "—";
         }

@@ -83,7 +83,15 @@ public sealed class LiveDataService : IDisposable
 
     public IReadOnlyDictionary<(decimal Strike, OptionType Type), QuickQuote> QuickQuotes { get { lock (_lock) return _quickQuotes; } }
 
-    public IReadOnlyList<PositionRow> Positions { get { lock (_lock) return _positions; } }
+    // Snapshot copy, not the live list (2026-09-08 live-caught): ApplyPushedTick mutates
+    // _positions in place via index-set (list[i] = value), which bumps List<T>'s internal
+    // version counter same as Add/Remove does. A caller enumerating the live reference --
+    // PositionsPanel's @foreach captures this getter's return value once, then iterates it
+    // across an entire render-tree build, well outside this lock -- would throw
+    // InvalidOperationException the moment a tick landed on an open position's instrument
+    // mid-render. A snapshot is immune: mutating the *live* field afterward can never affect
+    // an already-returned, independent copy.
+    public IReadOnlyList<PositionRow> Positions { get { lock (_lock) return [.. _positions]; } }
 
     public IReadOnlyList<ClosedTradeRow> ClosedTrades { get { lock (_lock) return _closedTrades; } }
 
