@@ -1366,7 +1366,12 @@ public sealed class LiveFeatureEngine
     /// impact today since weight is already 0 (diagnostic-only). Would need a migration (rename
     /// or new columns: CallPutGammaTilt/TiltCrossLevel here, new DealerGexRaw/DealerGexFlip
     /// alongside) plus a genuinely new calculation -- not urgent, but worth doing before this
-    /// component is ever given a nonzero weight.
+    /// component is ever given a nonzero weight. Also folded in here (2026-09-08 third-party
+    /// review, same low-priority/diagnostic-only status): this, Vanna, and Charm all sum raw
+    /// per-contract Greek x OI with no notional scaling (the conventional Gamma x OI x Spot^2 x
+    /// 0.01-style scaling most public GEX write-ups use) -- internally consistent for z-scoring
+    /// against their own history (all that's used today) but not comparable to any external
+    /// reference level. Scale to a proper notional unit whenever any of the three is validated.
     /// </summary>
     double? ComputeGammaExposure(decimal spotPrice, double? atmReferenceVol, double t)
     {

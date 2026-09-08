@@ -17,6 +17,16 @@ namespace NiftySignal.Backtest;
 /// by exchange timestamp, since Features/Scoring need index-level aggregation across
 /// strikes simultaneously -- narrowing to one instrument would misrepresent how the live
 /// feed actually interleaves.
+///
+/// PENDING (audit finding F32, 2026-09-08 third-party review -- see fix plan): this class and
+/// PerformanceReportBuilder are both real and tested, but nothing wires them together yet --
+/// no BacktestRunner drives this source's replayed ticks through LiveFeatureEngine.OnTick/
+/// Sample/ComputeCadence on a clock keyed off tick timestamps (not DateTimeOffset.UtcNow, which
+/// MarketDataIngestionWorker/LiveTradingEngine currently hardcode), then through the
+/// entry/exit evaluation LiveTradingEngine performs live, into PaperTradeSimulator, into
+/// PerformanceReportBuilder. Right now there is genuinely no way to backtest anything -- this is
+/// the single biggest gap relative to the project's own "validate before trusting" plan, and the
+/// prerequisite for validating every sign/weight question already tracked elsewhere (F23-F28).
 /// </summary>
 public sealed class BacktestTickSource(
     NiftySignalDbContext db,

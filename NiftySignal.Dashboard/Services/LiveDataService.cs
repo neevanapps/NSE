@@ -687,6 +687,14 @@ public sealed class LiveDataService : IDisposable
     /// therefore most trustworthy point on the chain. Prefers the call, falls back to the put
     /// if the call's solve fails. Expiries with no usable ATM quote are simply absent from the
     /// result, and their rows get no theoretical price rather than one built on a guess.
+    ///
+    /// DEFERRED (audit finding F33, 2026-09-08 third-party review -- see fix plan): structurally
+    /// parallel to, but not shared with, LiveFeatureEngine.SolveAtmReferenceVol -- a
+    /// maintainability risk, not a correctness bug today (the two currently agree), but the next
+    /// fix to one has to be remembered and manually re-applied to the other or the dashboard will
+    /// quietly start showing different numbers than what's actually driving trades. Extract the
+    /// shared logic into NiftySignal.Pricing/NiftySignal.Features (which Dashboard could
+    /// reference) so there's exactly one implementation.
     /// </summary>
     static Dictionary<DateOnly, double> BuildAtmReferenceVol(
         List<Instrument> instruments,
