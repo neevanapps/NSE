@@ -20,7 +20,8 @@ public static class TestRulesetConfigs
             MinScoreSustainedSeconds: 45,
             ReEntryGapSameDirectionMinutes: 2,
             MaxTradesPerDay: 7,
-            MaxIvRankForEntry: 70),
+            MaxIvRankForEntry: 70,
+            MinScoreSustainedCadences: 3),
         StrikeSelection: new StrikeSelectionConfig(
             MinPremium: 100,
             MaxPremium: 150,

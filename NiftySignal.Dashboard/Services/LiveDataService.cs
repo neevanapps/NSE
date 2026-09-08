@@ -81,7 +81,15 @@ public sealed class LiveDataService : IDisposable
 
     public IReadOnlyList<OptionChainRow> OptionChain { get { lock (_lock) return _optionChain; } }
 
-    public IReadOnlyDictionary<(decimal Strike, OptionType Type), QuickQuote> QuickQuotes { get { lock (_lock) return _quickQuotes; } }
+    // Snapshot copy, not the live dictionary (2026-09-08, same bug class as Positions' own fix
+    // above): updating an *existing* key doesn't invalidate a Dictionary<TKey,TValue>
+    // enumerator, but ApplyPushedTick inserting a genuinely new key (a strike just subscribed
+    // to for the first time) while a consumer enumerates the live reference would. A snapshot
+    // is immune either way.
+    public IReadOnlyDictionary<(decimal Strike, OptionType Type), QuickQuote> QuickQuotes
+    {
+        get { lock (_lock) return new Dictionary<(decimal, OptionType), QuickQuote>(_quickQuotes); }
+    }
 
     // Snapshot copy, not the live list (2026-09-08 live-caught): ApplyPushedTick mutates
     // _positions in place via index-set (list[i] = value), which bumps List<T>'s internal

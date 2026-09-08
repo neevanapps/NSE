@@ -182,12 +182,20 @@ public class LiveTradingEngineTests
         var t0 = new DateTimeOffset(2026, 9, 4, 10, 0, 0, Ist);
         var featureEngine = WarmedFeatureEngineWithAtmCall(t0);
 
-        // First tick: score qualifies but hasn't sustained 45s yet -- must not enter.
+        // Realistic 15s-spaced cadences (audit finding F12: sustain now also requires a
+        // minimum cadence count, not just elapsed time -- two widely-spaced ticks, as this
+        // test used before, is exactly the feed-stall scenario that gate exists to reject).
         await fixture.Engine.EvaluateCadenceAsync(WarmedSnapshot(70, t0), featureEngine, CancellationToken.None);
+        await fixture.Engine.EvaluateCadenceAsync(WarmedSnapshot(70, t0.AddSeconds(15)), featureEngine, CancellationToken.None);
+        await fixture.Engine.EvaluateCadenceAsync(WarmedSnapshot(70, t0.AddSeconds(30)), featureEngine, CancellationToken.None);
+
+        // Three cadences in, 30s sustained: cadence count already cleared but duration hasn't
+        // reached MinScoreSustainedSeconds (45) yet -- must not enter.
         await fixture.WithDbAsync(async db => Assert.Empty(await db.PaperTrades.ToListAsync()));
 
-        // Second tick, 50s later: sustained >= MinScoreSustainedSeconds (45) -- should enter.
-        await fixture.Engine.EvaluateCadenceAsync(WarmedSnapshot(70, t0.AddSeconds(50)), featureEngine, CancellationToken.None);
+        // Fourth tick, 45s in: both MinScoreSustainedSeconds (45) and MinScoreSustainedCadences
+        // (3) are satisfied -- should enter.
+        await fixture.Engine.EvaluateCadenceAsync(WarmedSnapshot(70, t0.AddSeconds(45)), featureEngine, CancellationToken.None);
 
         await fixture.WithDbAsync(async db =>
         {

@@ -57,7 +57,7 @@ public sealed class LiveTradingEngine(
     }
 
     async Task EvaluateEntryAsync(
-        NiftySignalDbContext db, double score, TimeSpan sustained, int openConcurrentPositions,
+        NiftySignalDbContext db, double score, SustainStatus sustained, int openConcurrentPositions,
         DateTimeOffset now, LiveFeatureEngine featureEngine, ScoreSnapshot snapshot, CancellationToken ct)
     {
         // UTC, not IST -- Npgsql only accepts Offset=0 DateTimeOffset values for
@@ -82,11 +82,29 @@ public sealed class LiveTradingEngine(
                 .Select(p => (DateTimeOffset?)p.EntryTime)
                 .FirstOrDefaultAsync(ct);
 
-        var closedTodayNetPnl = await db.PaperTrades
+        // Newest first: both closedTodayNetPnl (sum) and the F3 consecutive-losses streak
+        // (2026-09-08) come from this one fetch -- no separate round trip for either.
+        var closedTodayPnls = await db.PaperTrades
             .Where(p => p.ExitTime != null && p.ExitTime >= todayIstMidnight && p.NetPnl != null)
-            .SumAsync(p => p.NetPnl!.Value, ct);
+            .OrderByDescending(p => p.ExitTime)
+            .Select(p => p.NetPnl!.Value)
+            .ToListAsync(ct);
+        var closedTodayNetPnl = closedTodayPnls.Sum();
         var dailyLossLimit = _config.Capital.Total * (decimal)_config.RiskLimits.MaxDailyLossPct / 100m;
         var dailyLossLimitBreached = closedTodayNetPnl <= -dailyLossLimit;
+
+        // The other half of F3: count losses backward from the most recent close, stopping at
+        // the first non-loss (or the day's start) -- "how many in a row, right now."
+        var consecutiveLossesToday = 0;
+        foreach (var pnl in closedTodayPnls)
+        {
+            if (pnl >= 0)
+            {
+                break;
+            }
+
+            consecutiveLossesToday++;
+        }
 
         // Same already-fetched figure, opposite side -- no extra round trip. Realised only:
         // an open position sitting in profit does not trip this, since it isn't banked yet.
@@ -98,7 +116,8 @@ public sealed class LiveTradingEngine(
         var context = new EntryContext(
             Now: now,
             Score: score,
-            ScoreSustainedDuration: sustained,
+            ScoreSustainedDuration: sustained.Duration,
+            ScoreSustainedCadenceCount: sustained.CadenceCount,
             KillSwitchEntriesEnabled: killSwitch?.EntriesEnabled ?? true,
             DailyLossLimitBreached: dailyLossLimitBreached,
             AllFeaturesWarmedUp: snapshot.IsWarmedUp,
@@ -107,7 +126,9 @@ public sealed class LiveTradingEngine(
             OpenConcurrentPositions: openConcurrentPositions,
             LastEntryTimeSameDirection: lastEntrySameDirection,
             IsExpiryDay: isExpiryDay,
-            DailyProfitTargetReached: dailyProfitTargetReached);
+            DailyProfitTargetReached: dailyProfitTargetReached,
+            CurrentIvRank: snapshot.IvRankRaw,
+            ConsecutiveLossesToday: consecutiveLossesToday);
 
         var decision = EntryRuleEvaluator.Evaluate(context, _config);
         if (!decision.ShouldEnter)

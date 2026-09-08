@@ -44,12 +44,20 @@ public sealed record SessionConfig(
     bool ExpiryDayEnabled,
     TimeOnly ExpiryDayNoEntryAfterTime);
 
+/// <summary>
+/// MinScoreSustainedCadences (2026-09-08, audit finding F12) is checked in addition to
+/// MinScoreSustainedSeconds, not instead of it -- see ScoreSustainTracker.Observe's own doc
+/// comment for why elapsed time alone isn't sufficient. At the 15s cadence, 3 matches a 45s
+/// MinScoreSustainedSeconds under normal (no-gap) conditions; it's a separate config value
+/// rather than derived from MinScoreSustainedSeconds/15 so the two can be tuned independently.
+/// </summary>
 public sealed record EntryConfig(
     double MinAbsScore,
     int MinScoreSustainedSeconds,
     int ReEntryGapSameDirectionMinutes,
     int MaxTradesPerDay,
-    double MaxIvRankForEntry);
+    double MaxIvRankForEntry,
+    int MinScoreSustainedCadences = 3);
 
 public sealed record StrikeSelectionConfig(
     decimal MinPremium,

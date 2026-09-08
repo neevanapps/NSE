@@ -101,34 +101,56 @@ public class LiveFeatureEngineTests
     }
 
     [Fact]
-    public void ComputeCadence_ComputesFuturesBasis_AsFutureMinusSpot()
+    public void ComputeCadence_ComputesFuturesBasis_AsSyntheticForwardMinusSpot_IndependentOfTheTrackedFuture()
     {
-        var engine = new LiveFeatureEngine(BaseUniverse());
-        engine.OnTick(MakeTick(SpotToken, 23900m, Start));
-        engine.OnTick(MakeTick(FutureToken, 24028.35m, Start));
+        // Audit finding F11 (2026-09-08): basis must be measured against the option-derived
+        // synthetic forward (this weekly expiry), not the tracked monthly future -- a monthly
+        // future's own time-decay drift isn't sentiment, and it isn't even the contract these
+        // options expire with. Proven here the opposite way from before the fix: the tracked
+        // future's price now has ZERO effect on basis once a real synthetic forward can be
+        // solved from the option chain, because the future is no longer read at all.
+        var engineA = new LiveFeatureEngine(BaseUniverse());
+        engineA.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engineA.OnTick(MakeTick(FutureToken, 24028.35m, Start)); // deliberately far from spot
+        engineA.OnTick(MakeTick(CallToken, 100m, Start, depth: Depth(bidQty: 10, askQty: 10, bid: 99.5m, ask: 100.5m)));
+        engineA.OnTick(MakeTick(PutToken, 80m, Start, depth: Depth(bidQty: 10, askQty: 10, bid: 79.5m, ask: 80.5m)));
 
-        var snapshot = engine.ComputeCadence(Start);
+        var engineB = new LiveFeatureEngine(BaseUniverse());
+        engineB.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engineB.OnTick(MakeTick(FutureToken, 23200m, Start)); // wildly different future price
+        engineB.OnTick(MakeTick(CallToken, 100m, Start, depth: Depth(bidQty: 10, askQty: 10, bid: 99.5m, ask: 100.5m)));
+        engineB.OnTick(MakeTick(PutToken, 80m, Start, depth: Depth(bidQty: 10, askQty: 10, bid: 79.5m, ask: 80.5m)));
 
-        Assert.NotNull(snapshot);
-        Assert.Equal(128.35, snapshot!.FuturesBasisRaw!.Value, precision: 2);
+        var snapshotA = engineA.ComputeCadence(Start);
+        var snapshotB = engineB.ComputeCadence(Start);
+
+        Assert.NotNull(snapshotA);
+        Assert.NotNull(snapshotB);
+        Assert.NotEqual(0, snapshotA!.FuturesBasisRaw!.Value, 6);
+        Assert.Equal(snapshotA.FuturesBasisRaw!.Value, snapshotB!.FuturesBasisRaw!.Value, precision: 6);
     }
 
     [Fact]
-    public void ComputeCadence_UsesFutureMidPrice_NotBouncingLastPrice_ForBasisAndMomentum()
+    public void ComputeCadence_UsesFutureMidPrice_NotBouncingLastPrice_ForMomentum()
     {
         // Regression for a live-caught bug (2026-09-07): the future's last-traded price was
         // observed alternating between two levels several points apart within seconds -- not
         // genuine price discovery. Mid (bid+ask)/2 is stable against that kind of bounce.
+        // (FuturesBasis no longer reads the future's price at all -- see F11 above -- so this
+        // now covers PriceMomentum, the one remaining consumer of the future's mid price.)
         var engine = new LiveFeatureEngine(BaseUniverse());
         engine.OnTick(MakeTick(SpotToken, 23900m, Start));
         engine.OnTick(MakeTick(FutureToken, 23905m, Start, depth: Depth(bidQty: 10, askQty: 10, bid: 24000m, ask: 24002m)));
+        engine.ComputeCadence(Start);
 
-        var snapshot = engine.ComputeCadence(Start);
+        // Second cadence 15s later: LTP bounces (the live-caught symptom), mid barely moves.
+        engine.OnTick(MakeTick(FutureToken, 23906m, Start.AddSeconds(15), depth: Depth(bidQty: 10, askQty: 10, bid: 24001m, ask: 24003m)));
+        var snapshot = engine.ComputeCadence(Start.AddSeconds(15));
 
+        // Mid moved from 24001 to 24002 -- momentum should read +1 against that, not whatever
+        // the bouncing LastPrice implies.
         Assert.NotNull(snapshot);
-        // Mid = (24000+24002)/2 = 24001, basis = 24001-23900 = 101 -- not 23905-23900 = 5,
-        // which is what using the bouncing LastPrice directly would have produced.
-        Assert.Equal(101.0, snapshot!.FuturesBasisRaw!.Value, precision: 2);
+        Assert.Equal(1.0, snapshot!.PriceMomentumRaw!.Value, precision: 2);
     }
 
     [Fact]
@@ -238,6 +260,44 @@ public class LiveFeatureEngineTests
         Assert.NotNull(snapshot.CharmExposureRaw);
         Assert.True(double.IsFinite(snapshot.VannaExposureRaw!.Value));
         Assert.True(double.IsFinite(snapshot.CharmExposureRaw!.Value));
+    }
+
+    [Fact]
+    public void ComputeCadence_IvRank_IsNull_OnTheFirstCadence_NotEnoughHistoryToRankAgainst()
+    {
+        // Audit finding F3: a single observation (or a perfectly flat window) can't produce a
+        // meaningful rank -- null, not a fabricated "neutral 50".
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, oi: 100_000, depth: Depth(bidQty: 500, askQty: 400, bid: 99.5m, ask: 100.5m)));
+        engine.OnTick(MakeTick(PutToken, 80m, Start, oi: 100_000, depth: Depth(bidQty: 300, askQty: 600, bid: 79.5m, ask: 80.5m)));
+
+        var snapshot = engine.ComputeCadence(Start);
+
+        Assert.Null(snapshot!.IvRankRaw);
+    }
+
+    [Fact]
+    public void ComputeCadence_IvRank_SitsAtAnExtreme_WithOnlyTwoObservationsInTheWindow()
+    {
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, oi: 100_000, depth: Depth(bidQty: 500, askQty: 400, bid: 99.5m, ask: 100.5m)));
+        engine.OnTick(MakeTick(PutToken, 80m, Start, oi: 100_000, depth: Depth(bidQty: 300, askQty: 600, bid: 79.5m, ask: 80.5m)));
+        engine.ComputeCadence(Start);
+
+        // Richer option prices this cadence imply a different (higher) solved IV -- a second,
+        // distinct observation to rank against.
+        engine.OnTick(MakeTick(CallToken, 150m, Start.AddSeconds(15), oi: 100_000, depth: Depth(bidQty: 500, askQty: 400, bid: 149.5m, ask: 150.5m)));
+        engine.OnTick(MakeTick(PutToken, 130m, Start.AddSeconds(15), oi: 100_000, depth: Depth(bidQty: 300, askQty: 600, bid: 129.5m, ask: 130.5m)));
+        var snapshot = engine.ComputeCadence(Start.AddSeconds(15));
+
+        // With only two points in the window, the latest one is necessarily either the new min
+        // or the new max -- rank must land exactly at 0 or 100, not somewhere in between.
+        Assert.NotNull(snapshot!.IvRankRaw);
+        Assert.True(snapshot.IvRankRaw is 0.0 or 100.0);
     }
 
     [Fact]
@@ -1001,38 +1061,46 @@ public class LiveFeatureEngineTests
     [Fact]
     public void ComputeCadence_AveragesSamplesSinceLastCadence_ForTheFiveSmoothedMetrics()
     {
+        // DepthImbalance stands in for FuturesBasis here (originally used) -- basis no longer
+        // varies with a simple per-sample delta once measured against the synthetic forward
+        // (see F11), and falls back to spot (delta 0) without a real option chain configured.
+        // The mechanism under test is the averaging itself, not which metric supplies the
+        // numbers, so any of the five smoothed metrics proves the same thing.
         var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
         engine.OnTick(MakeTick(FutureToken, 24000m, Start));
 
-        // Two mid-cadence samples (basis = future - spot) before any explicit ComputeCadence
-        // call: 100 then 200. A third, implicit sample happens inside ComputeCadence itself
-        // using whatever spot is current at that point (50) -- average of 100/200/50 = 350/3.
-        engine.OnTick(MakeTick(SpotToken, 23900m, Start.AddSeconds(3))); // basis = 100
-        engine.Sample(Start.AddSeconds(3));
-        engine.OnTick(MakeTick(SpotToken, 23800m, Start.AddSeconds(6))); // basis = 200
-        engine.Sample(Start.AddSeconds(6));
-        engine.OnTick(MakeTick(SpotToken, 23950m, Start.AddSeconds(9))); // basis = 50
+        // Two mid-cadence samples before any explicit ComputeCadence call: imbalance 1.0, then
+        // 0.2. A third, implicit sample happens inside ComputeCadence itself (-1.0) -- average
+        // of 1.0/0.2/-1.0 = 0.2/3.
+        engine.OnTick(MakeTick(CallToken, 100m, Start.AddSeconds(3), depth: Depth(bidQty: 100, askQty: 0)));
+        engine.Sample(Start.AddSeconds(3)); // (100-0)/100 = 1.0
+        engine.OnTick(MakeTick(CallToken, 100m, Start.AddSeconds(6), depth: Depth(bidQty: 60, askQty: 40)));
+        engine.Sample(Start.AddSeconds(6)); // (60-40)/100 = 0.2
+        engine.OnTick(MakeTick(CallToken, 100m, Start.AddSeconds(9), depth: Depth(bidQty: 0, askQty: 100))); // (0-100)/100 = -1.0
 
         var snapshot = engine.ComputeCadence(Start.AddSeconds(9));
 
         Assert.NotNull(snapshot);
-        Assert.Equal((100.0 + 200.0 + 50.0) / 3.0, snapshot!.FuturesBasisRaw!.Value, precision: 6);
+        Assert.Equal((1.0 + 0.2 - 1.0) / 3.0, snapshot!.DepthImbalanceRaw!.Value, precision: 6);
     }
 
     [Fact]
     public void ComputeCadence_SingleSample_MatchesTheUnsampledValue_WhenNoMidCadenceSamplesWereTaken()
     {
-        // Guards against a regression where averaging changes behavior even for callers (all
+        // Guards against a regression where averaging changes behavior even for callers (most
         // existing tests) that never call Sample() themselves -- a single implicit sample
         // inside ComputeCadence should equal the old "just read the instant" behavior.
+        // DepthImbalance stands in for FuturesBasis here -- see the averaging test above.
         var engine = new LiveFeatureEngine(BaseUniverse());
         engine.OnTick(MakeTick(SpotToken, 23900m, Start));
         engine.OnTick(MakeTick(FutureToken, 24028.35m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, depth: Depth(bidQty: 60, askQty: 40)));
 
         var snapshot = engine.ComputeCadence(Start);
 
         Assert.NotNull(snapshot);
-        Assert.Equal(128.35, snapshot!.FuturesBasisRaw!.Value, precision: 2);
+        Assert.Equal(0.2, snapshot!.DepthImbalanceRaw!.Value, precision: 6);
     }
 
     [Fact]

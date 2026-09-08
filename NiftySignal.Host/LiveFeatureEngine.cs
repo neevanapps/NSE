@@ -162,6 +162,7 @@ public sealed class LiveFeatureEngine
 
     readonly Queue<(DateTimeOffset At, decimal FuturesPrice)> _momentumLookback = new();
     readonly Queue<(DateTimeOffset At, decimal Vix)> _vixLookback = new();
+    readonly Queue<(DateTimeOffset At, double Iv)> _ivRankLookback = new();
 
     /// <summary>
     /// Cumulative day volume per token as of the last <see cref="BuildStrikeSnapshots"/> pass.
@@ -455,7 +456,23 @@ public sealed class LiveFeatureEngine
         // nothing was actually trending. Same MidPrice fallback-to-LTP helper options already
         // use, so this degrades to the old behavior if depth isn't available.
         var futureMark = MidPrice(future) ?? future.LastPrice;
-        _basisSamples.Add((double)(futureMark - spot.LastPrice));
+
+        // Basis measured against the synthetic forward, not the tracked future (2026-09-08,
+        // audit finding F11): the tracked future is a *monthly* contract, while the options
+        // being traded expire this week -- a monthly future's premium shrinks toward zero as
+        // its own (later) expiry approaches, purely from time passing, which has nothing to do
+        // with sentiment but landed in the score anyway (today's raw basis implied ~9.2%
+        // annualised carry, far above anything cost-of-carry explains). ComputeUnderlyingPrice
+        // already builds this via put-call parity for GEX/Vanna/Charm/theoretical pricing --
+        // reused here, not recomputed, so basis is measured against the option's own expiry.
+        var basisT = TimeToExpiry.YearsUntilExpiry(_nearestExpiry, now);
+        var syntheticForward = ComputeUnderlyingPrice(spot.LastPrice, basisT);
+        _basisSamples.Add((double)(syntheticForward - spot.LastPrice));
+
+        // Momentum deliberately keeps using the raw tracked future, not the synthetic forward --
+        // it measures a *relative* short-window change, where the monthly contract's own slow
+        // time-decay drift washes out over a few minutes; F11 is specifically about Basis's
+        // absolute-level bias, not Momentum.
         _momentumSamples.Add(ComputeMomentum(now, futureMark));
         _pcrSamples.Add(ComputePcr());
         _depthImbalanceSamples.Add(ComputeDepthImbalance(spot.LastPrice));
@@ -624,7 +641,7 @@ public sealed class LiveFeatureEngine
 
         // Not smoothed either -- same reasoning as VixChange (a full-chain aggregate, not a
         // point-in-time price/quote read that benefits from within-cadence averaging).
-        double? gammaExposureRaw = null, vannaExposureRaw = null, charmExposureRaw = null, gammaFlipLevel = null, straddleRichnessRaw = null;
+        double? gammaExposureRaw = null, vannaExposureRaw = null, charmExposureRaw = null, gammaFlipLevel = null, straddleRichnessRaw = null, ivRankRaw = null;
         if (_nearestExpiryOptions.Count > 0)
         {
             var gexStrikesByDistance = _nearestExpiryOptions.Select(o => o.StrikePrice!.Value).Distinct().OrderBy(s => Math.Abs(s - spot.LastPrice)).ToList();
@@ -640,6 +657,7 @@ public sealed class LiveFeatureEngine
             charmExposureRaw = ComputeCharmExposure(gexUnderlying, gexAtmVol, gexT);
             gammaFlipLevel = ComputeGammaFlipLevel(gexAtmVol, gexT);
             straddleRichnessRaw = ComputeStraddleRichness(gexUnderlying, gexAtmVol, gexT, now);
+            ivRankRaw = ComputeIvRank(gexAtmVol, now);
         }
 
         if (gammaExposureRaw is { } gex)
@@ -754,6 +772,7 @@ public sealed class LiveFeatureEngine
             CvdProxyRaw = cvdProxyRaw,
             StraddleRichnessRaw = straddleRichnessRaw,
             GammaFlipLevel = gammaFlipLevel,
+            IvRankRaw = ivRankRaw,
             OiBuildupNetZ = inputs.OiBuildupNetZ,
             PcrZ = inputs.PcrZ,
             FuturesBasisZ = inputs.FuturesBasisZ,
@@ -1436,6 +1455,43 @@ public sealed class LiveFeatureEngine
         _previousStraddleUnderlying = underlyingAsDouble;
 
         return richness;
+    }
+
+    /// <summary>
+    /// Where the current ATM IV sits within its own rolling-window range, 0-100 (2026-09-08,
+    /// audit finding F3). No multi-day IV history exists yet, so this is a rolling-window rank
+    /// against itself, not a true 52-week percentile -- see FeatureWindowLengths.IvRank. Null
+    /// until the window holds at least two observations with a real (non-degenerate) spread --
+    /// a single point, or a perfectly flat window, can't produce a meaningful rank, and
+    /// fabricating a "neutral 50" would be exactly the kind of made-up value this codebase
+    /// avoids everywhere else.
+    /// </summary>
+    double? ComputeIvRank(double? currentVol, DateTimeOffset now)
+    {
+        if (currentVol is not { } vol)
+        {
+            return null;
+        }
+
+        _ivRankLookback.Enqueue((now, vol));
+        while (_ivRankLookback.Count > 1 && now - _ivRankLookback.Peek().At > FeatureWindowLengths.IvRank)
+        {
+            _ivRankLookback.Dequeue();
+        }
+
+        if (_ivRankLookback.Count < 2)
+        {
+            return null;
+        }
+
+        var min = _ivRankLookback.Min(e => e.Iv);
+        var max = _ivRankLookback.Max(e => e.Iv);
+        if (max - min < 1e-9)
+        {
+            return null;
+        }
+
+        return (vol - min) / (max - min) * 100.0;
     }
 
     /// <summary>

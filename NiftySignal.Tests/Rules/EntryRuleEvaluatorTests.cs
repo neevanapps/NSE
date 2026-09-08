@@ -19,7 +19,8 @@ public class EntryRuleEvaluatorTests
         OpenConcurrentPositions: 0,
         LastEntryTimeSameDirection: null,
         IsExpiryDay: false,
-        DailyProfitTargetReached: false);
+        DailyProfitTargetReached: false,
+        ScoreSustainedCadenceCount: 3);
 
     [Fact]
     public void Evaluate_AllowsEntry_WhenEveryConditionIsMet()
@@ -281,5 +282,59 @@ public class EntryRuleEvaluatorTests
 
         Assert.False(result.ShouldEnter);
         Assert.Equal(2, result.FailedConditions.Count);
+    }
+
+    [Fact]
+    public void Evaluate_Blocks_WhenIvRankAboveMaxIvRankForEntry()
+    {
+        // Audit finding F3: buying premium when IV is already rich is how a directionally
+        // correct trade still loses to a vol crush.
+        var context = HappyPath() with { CurrentIvRank = 70.01 }; // MaxIvRankForEntry is 70
+
+        var result = EntryRuleEvaluator.Evaluate(context, TestRulesetConfigs.Default());
+
+        Assert.False(result.ShouldEnter);
+        Assert.Contains(result.FailedConditions, f => f.Contains("IV rank"));
+    }
+
+    [Fact]
+    public void Evaluate_AllowsEntry_WhenIvRankIsExactlyAtMaxIvRankForEntry()
+    {
+        var context = HappyPath() with { CurrentIvRank = 70 };
+
+        var result = EntryRuleEvaluator.Evaluate(context, TestRulesetConfigs.Default());
+
+        Assert.True(result.ShouldEnter);
+    }
+
+    [Fact]
+    public void Evaluate_AllowsEntry_WhenCurrentIvRankIsNull_NotEnoughHistoryYetToRankAgainst()
+    {
+        var context = HappyPath() with { CurrentIvRank = null };
+
+        var result = EntryRuleEvaluator.Evaluate(context, TestRulesetConfigs.Default());
+
+        Assert.True(result.ShouldEnter);
+    }
+
+    [Fact]
+    public void Evaluate_Blocks_WhenConsecutiveLossesReachesMaxConsecutiveLosses()
+    {
+        var context = HappyPath() with { ConsecutiveLossesToday = 4 }; // MaxConsecutiveLosses is 4
+
+        var result = EntryRuleEvaluator.Evaluate(context, TestRulesetConfigs.Default());
+
+        Assert.False(result.ShouldEnter);
+        Assert.Contains(result.FailedConditions, f => f.Contains("MaxConsecutiveLosses"));
+    }
+
+    [Fact]
+    public void Evaluate_AllowsEntry_WhenConsecutiveLossesIsOneBelowMaxConsecutiveLosses()
+    {
+        var context = HappyPath() with { ConsecutiveLossesToday = 3 };
+
+        var result = EntryRuleEvaluator.Evaluate(context, TestRulesetConfigs.Default());
+
+        Assert.True(result.ShouldEnter);
     }
 }

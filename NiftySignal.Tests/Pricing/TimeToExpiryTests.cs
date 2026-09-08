@@ -5,14 +5,34 @@ namespace NiftySignal.Tests.Pricing;
 public class TimeToExpiryTests
 {
     [Fact]
-    public void YearsUntilExpiry_ForOneYearOut_IsApproximatelyOne()
+    public void YearsUntilExpiry_ForOneYearOut_ExcludesWeekends()
     {
+        // 02 Jan 2026 (Friday) to 02 Jan 2027 (Saturday) inclusive contains 105 weekend days --
+        // trading time is calendar time minus those, not a plain calendar year (audit F6: the
+        // old calendar-days/365 formula would have asserted this at ~1.0).
         var asOf = new DateTimeOffset(2026, 1, 2, 9, 15, 0, TimeSpan.FromHours(5.5));
         var expiry = new DateOnly(2027, 1, 2);
 
         var years = TimeToExpiry.YearsUntilExpiry(expiry, asOf);
 
-        Assert.Equal(1.0, years, 0.01);
+        var calendarDays = (new DateTimeOffset(2027, 1, 2, 15, 30, 0, TimeSpan.FromHours(5.5)) - asOf).TotalDays;
+        var expected = (calendarDays - 105) / 365.0;
+        Assert.Equal(expected, years, 1e-9);
+        Assert.True(years < 0.75, "365 calendar days should be well under 0.75 trading years once ~105 weekend days are excluded.");
+    }
+
+    [Fact]
+    public void YearsUntilExpiry_ExcludesExactlyTheWeekendDays_ForASpanCrossingOneWeekend()
+    {
+        // Friday close to Monday close, in the exact market-close instant both endpoints use
+        // -- 3 calendar days, 2 of them weekend, so trading time is deterministically exactly
+        // 1 trading day, not the noisier fractional cases the other tests use.
+        var fridayClose = new DateTimeOffset(2026, 1, 2, 15, 30, 0, TimeSpan.FromHours(5.5));
+        var mondayExpiry = new DateOnly(2026, 1, 5);
+
+        var years = TimeToExpiry.YearsUntilExpiry(mondayExpiry, fridayClose);
+
+        Assert.Equal(1.0 / 365.0, years, 1e-9);
     }
 
     [Fact]

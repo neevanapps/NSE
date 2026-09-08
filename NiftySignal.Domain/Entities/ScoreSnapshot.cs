@@ -98,6 +98,16 @@ public sealed class ScoreSnapshot
     /// </summary>
     public double? GammaFlipLevel { get; set; }
 
+    /// <summary>
+    /// Where the current ATM IV sits within its own recent range, 0-100 (2026-09-08, audit
+    /// finding F3) -- see LiveFeatureEngine.ComputeIvRank. Already a normalized percentage by
+    /// construction, so unlike every other raw value here it has no Z counterpart and never
+    /// feeds the composite sum; it's read directly by EntryRuleEvaluator's MaxIvRankForEntry
+    /// gate. Null until the rolling window has at least two distinct observations to rank
+    /// against -- a single point (or a perfectly flat window) can't produce a meaningful rank.
+    /// </summary>
+    public double? IvRankRaw { get; set; }
+
     public double? OiBuildupNetZ { get; set; }
     public double? PcrZ { get; set; }
     public double? FuturesBasisZ { get; set; }

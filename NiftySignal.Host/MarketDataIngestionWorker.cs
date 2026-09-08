@@ -229,6 +229,22 @@ public sealed class MarketDataIngestionWorker(
                     var snapshot = _engine!.ComputeCadence(now);
                     if (snapshot is not null)
                     {
+                        if (!snapshot.IsWarmedUp)
+                        {
+                            // Audit finding F10 (2026-09-08): previously, one dead required
+                            // component silently withheld the composite score with no way to
+                            // tell which one -- diagnosed once today only by adding a temporary
+                            // throw. Named directly against ScoreSnapshot's own properties
+                            // (compiler-checked: a renamed/removed property breaks the build)
+                            // rather than a second, independently-maintained list of the six
+                            // required names.
+                            var blocking = DescribeWarmUpBlockers(snapshot);
+                            if (blocking.Count > 0)
+                            {
+                                logger.LogWarning("Composite score not warmed up -- blocked by: {Blocking}", string.Join(", ", blocking));
+                            }
+                        }
+
                         await PersistSnapshotAsync(snapshot, _engine.BuildStrikeSnapshots(now), stoppingToken);
                         await tradingEngine.EvaluateCadenceAsync(snapshot, _engine, stoppingToken);
                     }
@@ -251,6 +267,25 @@ public sealed class MarketDataIngestionWorker(
         catch (OperationCanceledException)
         {
         }
+    }
+
+    /// <summary>
+    /// The six components CompositeScoreCalculator treats as required (everything except
+    /// VixChange and the diagnostic-only Gamma/Vanna/Charm/VolumePcr/SpreadRatio/CvdProxy/
+    /// StraddleRichness set) -- named here explicitly rather than reflected, since this list
+    /// changes only when the plan's original six change, which is rare enough that an explicit
+    /// list reads better than reflection magic.
+    /// </summary>
+    static List<string> DescribeWarmUpBlockers(ScoreSnapshot snapshot)
+    {
+        var blocking = new List<string>();
+        if (snapshot.OiBuildupNetZ is null) blocking.Add(nameof(ScoreSnapshot.OiBuildupNetZ));
+        if (snapshot.PcrZ is null) blocking.Add(nameof(ScoreSnapshot.PcrZ));
+        if (snapshot.FuturesBasisZ is null) blocking.Add(nameof(ScoreSnapshot.FuturesBasisZ));
+        if (snapshot.IvSkewZ is null) blocking.Add(nameof(ScoreSnapshot.IvSkewZ));
+        if (snapshot.PriceMomentumZ is null) blocking.Add(nameof(ScoreSnapshot.PriceMomentumZ));
+        if (snapshot.DepthImbalanceZ is null) blocking.Add(nameof(ScoreSnapshot.DepthImbalanceZ));
+        return blocking;
     }
 
     /// <summary>Feeds LiveFeatureEngine.Sample every few seconds so ComputeCadence has more than one instant to average over -- see LiveFeatureEngine's class doc comment.</summary>

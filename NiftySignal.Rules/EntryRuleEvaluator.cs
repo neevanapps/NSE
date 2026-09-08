@@ -19,7 +19,19 @@ public sealed record EntryContext(
     int OpenConcurrentPositions,
     DateTimeOffset? LastEntryTimeSameDirection,
     bool IsExpiryDay,
-    bool DailyProfitTargetReached = false);
+    bool DailyProfitTargetReached = false,
+    // Audit finding F12 (2026-09-08): a feed stall that goes unrecorded before a data gap is
+    // formally opened would otherwise let ScoreSustainedDuration alone satisfy the hold
+    // requirement on elapsed silence, not a genuinely sustained score -- see
+    // ScoreSustainTracker.Observe's own doc comment. Checked in addition to duration, not
+    // instead of it.
+    int ScoreSustainedCadenceCount = 0,
+    // Audit finding F3 (2026-09-08): both wire up config fields that already existed
+    // (MaxIvRankForEntry, MaxConsecutiveLosses) but were read by nothing. CurrentIvRank is
+    // nullable and simply skips its gate when null (not enough IV history yet to rank against
+    // -- see LiveFeatureEngine.ComputeIvRank) rather than blocking on an unknown.
+    double? CurrentIvRank = null,
+    int ConsecutiveLossesToday = 0);
 
 /// <summary>Every failed check is included, not just the first -- plan section 7.3: "the rejection data matters as much as the acceptance data."</summary>
 public sealed record EntryDecision(bool ShouldEnter, EntryDirection Direction, IReadOnlyList<string> FailedConditions);
@@ -87,6 +99,22 @@ public static class EntryRuleEvaluator
             failures.Add("Daily profit target has been reached");
         }
 
+        // Audit finding F3 (2026-09-08): buying premium when IV is already rich relative to its
+        // own recent range is how a directionally-correct trade still loses to a vol crush.
+        // Skipped, not blocked, while there isn't yet enough IV history to rank against.
+        if (context.CurrentIvRank is { } ivRank && ivRank > config.Entry.MaxIvRankForEntry)
+        {
+            failures.Add($"IV rank ({ivRank:F1}) above MaxIvRankForEntry ({config.Entry.MaxIvRankForEntry})");
+        }
+
+        // The other half of F3: was dead config (RiskLimitsConfig.MaxConsecutiveLosses existed,
+        // nothing read it). A cooldown after a losing streak, same "blocks new entries only"
+        // separation as the daily loss/profit breakers above.
+        if (context.ConsecutiveLossesToday >= config.RiskLimits.MaxConsecutiveLosses)
+        {
+            failures.Add($"MaxConsecutiveLosses ({config.RiskLimits.MaxConsecutiveLosses}) already reached ({context.ConsecutiveLossesToday} in a row)");
+        }
+
         if (!context.AllFeaturesWarmedUp)
         {
             failures.Add("Not all contributing features are warmed up yet");
@@ -123,6 +151,11 @@ public static class EntryRuleEvaluator
         if (context.ScoreSustainedDuration < requiredSustain)
         {
             failures.Add($"Score not sustained for MinScoreSustainedSeconds ({requiredSustain.TotalSeconds}s, held for {context.ScoreSustainedDuration.TotalSeconds}s)");
+        }
+
+        if (context.ScoreSustainedCadenceCount < config.Entry.MinScoreSustainedCadences)
+        {
+            failures.Add($"Score not sustained for MinScoreSustainedCadences ({config.Entry.MinScoreSustainedCadences}, held for {context.ScoreSustainedCadenceCount} cadence(s))");
         }
 
         if (context.LastEntryTimeSameDirection is { } lastEntry)

@@ -36,7 +36,8 @@ public static class LiveRulesetConfig
             // wrong. 30 is deliberately loose for now to observe unconstrained behaviour for a
             // session or two before picking a real steady-state number.
             MaxTradesPerDay: 30,
-            MaxIvRankForEntry: 70),
+            MaxIvRankForEntry: 70,
+            MinScoreSustainedCadences: 3),
         // Narrowed 2026-09-07 (from 150-200) after the first live session -- cheaper premium
         // means a smaller capital commitment per lot and generally higher gamma/more strikes
         // to choose from near the money.
