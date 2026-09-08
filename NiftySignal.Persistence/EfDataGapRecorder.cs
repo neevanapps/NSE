@@ -9,10 +9,30 @@ public sealed class EfDataGapRecorder(NiftySignalDbContext db) : IDataGapRecorde
 {
     public async Task<long> RecordGapStartedAsync(DateTimeOffset startedAt, string reason, CancellationToken cancellationToken)
     {
-        var gap = new DataGap { StartedAt = startedAt, Reason = reason };
+        // Opens at 1, not 0 -- the failure that started the gap is itself a failed attempt.
+        var gap = new DataGap { StartedAt = startedAt, Reason = reason, ReconnectAttempts = 1 };
         db.DataGaps.Add(gap);
         await db.SaveChangesAsync(cancellationToken);
         return gap.Id;
+    }
+
+    public async Task RecordGapAttemptAsync(long gapId, string reason, CancellationToken cancellationToken)
+    {
+        var gap = await db.DataGaps.FindAsync([gapId], cancellationToken);
+        if (gap is null)
+        {
+            return;
+        }
+
+        gap.ReconnectAttempts++;
+        // Only worth storing when it differs -- a gap full of identical messages tells us
+        // nothing the opening Reason didn't already say.
+        if (!string.Equals(gap.Reason, reason, StringComparison.Ordinal))
+        {
+            gap.LastReason = reason;
+        }
+
+        await db.SaveChangesAsync(cancellationToken);
     }
 
     public async Task RecordGapEndedAsync(long gapId, DateTimeOffset endedAt, CancellationToken cancellationToken)

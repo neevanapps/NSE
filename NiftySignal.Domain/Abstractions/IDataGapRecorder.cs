@@ -10,6 +10,13 @@ public interface IDataGapRecorder
     /// <summary>Returns an id to pass back to <see cref="RecordGapEndedAsync"/> once reconnected.</summary>
     Task<long> RecordGapStartedAsync(DateTimeOffset startedAt, string reason, CancellationToken cancellationToken);
 
+    /// <summary>
+    /// Records one further failed connection attempt inside an already-open gap -- see
+    /// <see cref="NiftySignal.Domain.Entities.DataGap.ReconnectAttempts"/> for why a gap's
+    /// duration means nothing without this.
+    /// </summary>
+    Task RecordGapAttemptAsync(long gapId, string reason, CancellationToken cancellationToken);
+
     Task RecordGapEndedAsync(long gapId, DateTimeOffset endedAt, CancellationToken cancellationToken);
 
     /// <summary>

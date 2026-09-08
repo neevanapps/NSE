@@ -37,3 +37,7 @@ spikes/*/output/
 
 # Publish output for the Windows Service deployment (contains appsettings.Local.json)
 deploy/
+
+# Stale manual VM publish output (was committed by accident -- 132 binaries).
+# Deploys go through deploy.ps1 now, which stages under artifacts/ (already ignored).
+deploy-vm/

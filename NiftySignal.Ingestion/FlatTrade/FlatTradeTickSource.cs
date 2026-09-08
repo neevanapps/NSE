@@ -101,7 +101,18 @@ public sealed class FlatTradeTickSource(
                     policy.RecordFailure();
                     logger.LogError(ex, "FlatTrade feed session failed (consecutive failures: {Count})", policy.ConsecutiveFailures);
 
-                    _openGapId ??= await dataGapRecorder.RecordGapStartedAsync(DateTimeOffset.UtcNow, ex.Message, ct);
+                    // Every failure inside one outage is recorded, not just the first
+                    // (2026-09-07). A gap that lasted 59 seconds against a backoff starting
+                    // at 1 second is either one slow reconnect or a run of escalating
+                    // retries, and only the attempt count can tell those apart.
+                    if (_openGapId is { } openGapId)
+                    {
+                        await dataGapRecorder.RecordGapAttemptAsync(openGapId, ex.Message, ct);
+                    }
+                    else
+                    {
+                        _openGapId = await dataGapRecorder.RecordGapStartedAsync(DateTimeOffset.UtcNow, ex.Message, ct);
+                    }
 
                     if (policy.ShouldAlert)
                     {
