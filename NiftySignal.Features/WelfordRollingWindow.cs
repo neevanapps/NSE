@@ -42,6 +42,19 @@ public sealed class WelfordRollingWindow(TimeSpan windowDuration)
     /// partially-filled window, since its mean/stddev estimate is unreliable -- on a fresh
     /// install this correctly means no trades for the first several days while history
     /// accumulates.
+    ///
+    /// PENDING (audit finding F22, 2026-09-08 -- found while verifying the lead's separate A3
+    /// claim, not itself in either audit -- see fix plan Batch 6): _firstSeenAt is set once
+    /// (below) and never updated when points age out via Remove. MarketDataIngestionWorker
+    /// constructs one LiveFeatureEngine per process lifetime and the Host process idles rather
+    /// than exiting outside market hours (confirmed live: "Outside market hours ... waiting for
+    /// 08:45"), so if Host isn't restarted between sessions, the first tick of a new day evicts
+    /// all of yesterday's points correctly, but this check still spans the ~24h overnight gap
+    /// against firstSeenAt and reports true on 1-2 real points -- a false warm-up. Every one of
+    /// the 14 weighted/diagnostic components depends on this one class, so the blast radius is
+    /// the whole score. Fix: base the span on the oldest point still actually in _points
+    /// (_points.Count > 0 ? _points.Peek().Timestamp : null), not a permanent first-ever-seen
+    /// marker that eviction never touches.
     /// </summary>
     public bool IsWarmedUp => _firstSeenAt is { } firstSeenAt
         && _latestTimestamp is { } latestTimestamp

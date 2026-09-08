@@ -20,6 +20,11 @@ public static class CompositeScoreCalculator
     /// GammaExposureZ doc comments for why. Excluded by name rather than restructuring the
     /// six required ones into their own type, since these are deliberate, individually-named
     /// exceptions, not a general "optional components" mechanism.
+    ///
+    /// PENDING (audit finding F14, 2026-09-08 lead review -- see fix plan Batch 6): DepthImbalance
+    /// stays one of the required six below, so a missing depth book blocks OiBuildupNet/Pcr/
+    /// FuturesBasis/IvSkew/PriceMomentum even when those are otherwise ready. Should join this
+    /// list (contributing 0 when null, same as the other eight) once implemented.
     /// </summary>
     const string VixComponentName = "VixChange";
     const string GammaExposureComponentName = "GammaExposure";

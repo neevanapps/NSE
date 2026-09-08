@@ -15,6 +15,12 @@ public static class TimeToExpiry
     static readonly TimeOnly MarketClose = new(15, 30);
     static readonly TimeSpan IstOffset = TimeSpan.FromHours(5.5);
 
+    // PENDING (audit finding F20, 2026-09-08 lead review -- see fix plan Batch 6): 1 hour is too
+    // generous -- every Greek/IV/theoretical price in the system pretends T = 1h for the entire
+    // final hour of an expiry-day session (14:30-15:30 IST), exactly the highest-gamma, most
+    // volatile stretch. Tighten to 1-2 minutes -- still enough to keep the IV solver's Newton-
+    // Raphson step stable (vega doesn't collapse to zero) without discarding real accuracy for
+    // 58 of those 60 minutes.
     public static readonly TimeSpan Minimum = TimeSpan.FromHours(1);
 
     public static double YearsUntilExpiry(DateOnly expiryDate, DateTimeOffset asOf)

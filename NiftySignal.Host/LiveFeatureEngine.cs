@@ -66,11 +66,24 @@ readonly record struct InstrumentState(decimal LastPrice, long Volume, long? Ope
 /// Not thread-safe on its own -- <see cref="OnTick"/>, <see cref="Sample"/>, and
 /// <see cref="ComputeCadence"/> are called from different loops in the same worker and must
 /// be externally synchronized.
+///
+/// PENDING (audit finding F28, 2026-09-08 lead review -- see fix plan Batch 7, the largest item
+/// in it): PCR/IvSkew/VixChange (and VolumePcr) are all "level" metrics currently z-scored
+/// against a short rolling window (15-30 min, or 2h post-fix) -- a level that stays genuinely
+/// extreme all session (e.g. PCR at 1.4 the whole afternoon) reads as "unusual vs the last half
+/// hour" and z-scores back toward 0 the moment it stops *changing*, even though it never stopped
+/// being extreme. Proposed fix: persist Raw/VsOpen/Vs5DayMedian separately per component, feed
+/// the composite from a session-open or multi-day-anchored value instead of the rolling z, and
+/// keep the short z as a journal-only diagnostic. Deserves its own design pass once F23/F24/F27's
+/// individual sign questions are settled -- see the plan for why order matters here.
 /// </summary>
 public sealed class LiveFeatureEngine
 {
     // 91-day T-bill proxy (plan 4.1: "static config value, reviewed weekly") -- hardcoded
     // starting point since no config surface exists yet for it.
+    // PENDING (audit finding F21, 2026-09-08 lead review -- see fix plan Batch 6): duplicated
+    // identically in NiftySignal.Dashboard/Services/LiveDataService.cs. Move both to config
+    // (Pricing: { RiskFreeRate: 0.065 }) so a rate change can't land in one copy and not the other.
     const double RiskFreeRate = 0.065;
 
     /// <summary>
@@ -423,6 +436,10 @@ public sealed class LiveFeatureEngine
                 BidPrice: bid,
                 AskPrice: ask,
                 OpenInterest: state.OpenInterest ?? 0,
+                // PENDING (audit finding F19, 2026-09-08 lead review -- see fix plan Batch 6):
+                // StrikeSelector.SelectBestCandidate's .ThenByDescending(c => c.Volume) tie-break
+                // therefore always compares 0 to 0 -- a no-op presented as a real rank step. Wire
+                // real per-instrument volume delta here, or delete that dead ThenByDescending.
                 Volume: 0, // not tracked per-instrument yet -- see class doc comment's other scoped-down v1s
                 Delta: delta,
                 ImpliedVolatility: iv));
@@ -462,6 +479,11 @@ public sealed class LiveFeatureEngine
         // reused here, not recomputed, so basis is measured against the option's own expiry.
         var basisT = TimeToExpiry.YearsUntilExpiry(_nearestExpiry, now);
         var syntheticForward = ComputeUnderlyingPrice(spot.LastPrice, basisT);
+        // PENDING (audit finding F25, 2026-09-08 lead review -- see fix plan Batch 7): F11 (above)
+        // fixed *what* this is measured against; separately, this component may simply have near-
+        // zero forward correlation intraday for weeklies (current weight 0.1425, tied for second-
+        // largest) even when correctly computed -- validate via forward correlation before
+        // touching the weight, don't assume it should drop to 0.
         _basisSamples.Add((double)(syntheticForward - spot.LastPrice));
 
         // Momentum deliberately keeps using the raw tracked future, not the synthetic forward --
@@ -989,12 +1011,23 @@ public sealed class LiveFeatureEngine
             _momentumLookback.Dequeue();
         }
 
+        // PENDING (audit finding F26, 2026-09-08 lead review -- see fix plan Batch 7):
+        // ScoreWeights.Default's own doc comment already documents this raw value's backward
+        // r=+0.48 / forward r=-0.08 (why PriceMomentum was already cut 0.1425 -> 0.07 on
+        // 2026-09-07) -- a forward r of -0.08 reads mildly anti-predictive, not just uninformative,
+        // which argues for going the rest of the way to weight 0 rather than a partial cut.
+        // Revisit with more sessions of data before deciding; one session's r is still a small sample.
         return (double)(futuresPrice - _momentumLookback.Peek().FuturesPrice);
     }
 
     /// <summary>
     /// Null when the day's universe doesn't track VIX, or it hasn't ticked yet -- same
     /// optional-by-design tolerance as Pcr/DepthImbalance/IvSkew's own null cases.
+    ///
+    /// PENDING (audit finding F27, 2026-09-08 lead review -- see fix plan Batch 7): this reads a
+    /// 30-minute lookback (then z-scored against a 2h window); the lead proposes a session-open
+    /// baseline instead (-(VIX - VIX_open)), same class of fix as F23's PCR baseline. Weight is
+    /// small (0.05) so lower risk than F23/F24, but same validation method applies before changing it.
     /// </summary>
     double? ComputeVixChange(DateTimeOffset now)
     {
@@ -1021,6 +1054,13 @@ public sealed class LiveFeatureEngine
     /// far strikes that has nothing to do with today's positioning, and refreshes at OI-update
     /// frequency (not the 15s cadence clock), so summing dozens of strikes together mostly just
     /// added stale noise rather than signal. Same band selection as BuildStrikeSnapshots.
+    ///
+    /// PENDING (audit finding F23, 2026-09-08 lead review -- see fix plan Batch 7): the raw value
+    /// here feeds a 30-minute rolling z-score with a *positive* composite weight (0.19) -- i.e.
+    /// "PCR above its own recent mean" currently reads bullish, the opposite of the classic
+    /// contrarian reading (high PCR = bearish). Needs a scatter/correlation check against forward
+    /// returns before changing sign or switching to a session-open baseline -- see the plan for
+    /// the exact validation method. Do not flip this on intuition alone.
     /// </summary>
     double? ComputePcr(decimal spotPrice)
     {
@@ -1062,6 +1102,19 @@ public sealed class LiveFeatureEngine
     /// one cadence right after a gap is cheaper and more honest than trying to guess a
     /// time-normalized correction.
     /// </summary>
+    // PENDING (audit findings F16/F17/F18, 2026-09-08 lead review -- see fix plan Batch 6):
+    // three still-open issues in this method, on the single largest-weighted component (0.2775):
+    //   F16 -- the `_previousCadence is null` branch below returns 0, not null, so every Host
+    //   restart (frequent, per this session's own deploy cadence) feeds a fake zero into the
+    //   downstream Welford window instead of correctly skipping the cadence, same as the gap
+    //   branch just below it already does.
+    //   F17 -- priceChange reads the *option's own* LastPrice, not spot/synthetic-forward, so
+    //   OiBuildupClassifier.Classify is driven by the option's own delta/gamma/theta/vega rather
+    //   than the underlying's actual direction (a flat-spot IV pop can move both a call's and a
+    //   put's LastPrice up with no real spot move behind it).
+    //   F18 -- this loops the full nearest-expiry chain, not an ATM band; F5 restricted Pcr to
+    //   PersistedStrikeBand, this was never given the same treatment, so a deep-OTM strike's OI
+    //   change votes as loud as an ATM one.
     double? ComputeOiBuildupNet(DateTimeOffset now)
     {
         if (_previousCadence is null)
@@ -1113,6 +1166,13 @@ public sealed class LiveFeatureEngine
         return net;
     }
 
+    // DEFERRED (audit finding F30, 2026-09-08 lead review -- see fix plan Batch 6/7, "Deferred"
+    // section): this reads two option strikes' own depth, which is market-maker inventory, not
+    // Nifty order flow. Feasible alternative checked: the future instrument already flows through
+    // the same _latest dictionary and InstrumentState.Depth structure options use (_latest[_future.Token].Depth),
+    // so computing (bid-ask)/(bid+ask) on the future's own book instead needs no new ingestion
+    // work. Real behavior change to a currently-required, 0.1275-weighted component though --
+    // belongs in its own batch with before/after validation, not bundled into a mechanical fix.
     double? ComputeDepthImbalance(decimal spotPrice)
     {
         var ntmStrikes = _nearestExpiryOptions
@@ -1217,6 +1277,14 @@ public sealed class LiveFeatureEngine
         var callIv = ImpliedVolatilitySolver.Solve(OptionType.Call, (double)cm, (double)underlying, (double)callOpt.StrikePrice!.Value, t, RiskFreeRate);
         var putIv = ImpliedVolatilitySolver.Solve(OptionType.Put, (double)pm, (double)underlying, (double)putOpt.StrikePrice!.Value, t, RiskFreeRate);
 
+        // PENDING (audit finding F24, 2026-09-08 lead review -- see fix plan Batch 7): two open
+        // questions on this component (weight 0.1425). First, F8's expected-move-based target
+        // strikes (above) are a real improvement over the old fixed +/-200pt offset, but still an
+        // approximation of the industry-standard 25-delta risk reversal (strikes where |delta| is
+        // actually ~0.25, not a price-distance heuristic). Second, and independently: putIv -
+        // callIv carries a positive composite weight, meaning rising put skew (more fear premium)
+        // currently reads bullish -- the opposite of the standard reading. Needs the same
+        // scatter/correlation validation as F23 before changing either.
         return callIv is null || putIv is null ? null : putIv - callIv;
     }
 
@@ -1280,6 +1348,16 @@ public sealed class LiveFeatureEngine
     /// into dealer positioning, only aggregate OI). Null when the ATM vol can't be solved this
     /// cadence (same "don't fabricate a value" rule as everywhere else) or no strike has both a
     /// strike price and OI yet.
+    ///
+    /// DEFERRED (audit finding F29, 2026-09-08 lead review -- see fix plan Batch 6/7, "Deferred"
+    /// section): this (and GammaFlipLevel) is a call-put gamma *tilt*, not dealer GEX -- true
+    /// dealer GEX needs the same short-dealer sign convention on both legs, not the OiBuildupNet-
+    /// style call-positive/put-negative split above. Naming is misleading (GammaFlipLevel reads
+    /// as "the pin," but it's this tilt's own zero-cross, not dealer positioning) but zero live
+    /// impact today since weight is already 0 (diagnostic-only). Would need a migration (rename
+    /// or new columns: CallPutGammaTilt/TiltCrossLevel here, new DealerGexRaw/DealerGexFlip
+    /// alongside) plus a genuinely new calculation -- not urgent, but worth doing before this
+    /// component is ever given a nonzero weight.
     /// </summary>
     double? ComputeGammaExposure(decimal spotPrice, double? atmReferenceVol, double t)
     {
@@ -1444,6 +1522,13 @@ public sealed class LiveFeatureEngine
     /// straddles aren't the same instrument and comparing their prices would be meaningless, so
     /// this returns null on a roll cadence rather than fabricate a comparison (same "null, not
     /// wrong" discipline as <see cref="ComputeOiBuildupNet"/>'s stale-gap case).
+    ///
+    /// DEFERRED (audit finding F31, 2026-09-08 lead review -- see fix plan Batch 6/7, "Deferred"
+    /// section): already correctly excluded from the directional sum (weight 0) -- it's a vol-
+    /// demand residual, not a direction. Lead's new idea: use a sharply falling richness (a vol
+    /// dump) as a block on new long-premium entries, not add it to the score. A genuinely new
+    /// feature, not a fix; worth a dedicated look once there's enough live history to know what
+    /// "sharply falling" should mean numerically.
     /// </summary>
     double? ComputeStraddleRichness(decimal underlying, double? atmReferenceVol, double t, DateTimeOffset now)
     {

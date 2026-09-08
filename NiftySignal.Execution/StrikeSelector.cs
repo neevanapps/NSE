@@ -79,6 +79,10 @@ public sealed class StrikeSelector : IStrikeSelector
         var best = survivors
             .OrderByDescending(IsPreferredDelta)
             .ThenByDescending(c => c.OpenInterest)
+            // PENDING (audit finding F19, 2026-09-08 lead review -- see fix plan Batch 6):
+            // LiveFeatureEngine.BuildStrikeCandidates hardcodes Volume: 0 (not tracked per-
+            // instrument yet), so this tie-break always compares 0 to 0 -- a no-op presented as a
+            // real rank step. Wire real per-instrument volume delta through, or delete this.
             .ThenByDescending(c => c.Volume)
             .First();
 

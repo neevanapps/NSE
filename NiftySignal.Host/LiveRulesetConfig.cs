@@ -35,6 +35,15 @@ public static class LiveRulesetConfig
             // again. Revisit both from a live session's qualification-rate data on the fixed-k,
             // Batch-3-corrected score (target "top 5-10% of cadences" per the audit) once that
             // data exists.
+            //
+            // PENDING (audit finding F15, 2026-09-08 lead review -- see fix plan Batch 6):
+            // LiveFeatureEngine.CompositeSmoothingCadences already averages the raw composite
+            // over ~3 minutes (12 cadences) before MinScoreSustainedSeconds/MinScoreSustainedCadences
+            // demand additional time above threshold on top of that -- a double lag on an already-
+            // smoothed series. Factor this into the same recalibration pass as F13 above rather
+            // than picking MinScoreSustainedSeconds independently: either cut it to ~1-2 cadences
+            // given the 12-cadence MA already provides lag, or drop the MA and rely on the sustain
+            // timer alone.
             MinAbsScore: 55,
             MinScoreSustainedSeconds: 45,
             ReEntryGapSameDirectionMinutes: 2,

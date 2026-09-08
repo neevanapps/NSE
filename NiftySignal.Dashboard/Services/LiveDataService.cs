@@ -890,6 +890,9 @@ public sealed class LiveDataService : IDisposable
                 .ToListAsync();
 
     // 91-day T-bill proxy -- same starting value as LiveFeatureEngine (plan 4.1).
+    // PENDING (audit finding F21, 2026-09-08 lead review -- see fix plan Batch 6): duplicated
+    // identically in NiftySignal.Host/LiveFeatureEngine.cs. Move both to config so a rate change
+    // can't land in one copy and not the other.
     const double RiskFreeRate = 0.065;
 
     public void Dispose() => _timer.Dispose();

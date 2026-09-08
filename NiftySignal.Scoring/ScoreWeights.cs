@@ -97,12 +97,12 @@ public sealed record ScoreWeights(
         // grew past ScoreWeightsVersion's column length and silently killed the trading loop).
         Version: "live-2026-09-08",
         OiBuildupNet: 0.2775,
-        Pcr: 0.19,
-        FuturesBasis: 0.1425,
-        IvSkew: 0.1425,
-        PriceMomentum: 0.07,
+        Pcr: 0.19, // PENDING (audit finding F23) -- sign vs. bullish/bearish reading, see LiveFeatureEngine.ComputePcr
+        FuturesBasis: 0.1425, // PENDING (audit finding F25) -- may warrant weight 0, see LiveFeatureEngine.Sample's basis comment
+        IvSkew: 0.1425, // PENDING (audit finding F24) -- sign, and 25-delta rigor, see LiveFeatureEngine.ComputeIvSkew
+        PriceMomentum: 0.07, // PENDING (audit finding F26) -- may warrant weight 0, see LiveFeatureEngine's momentum raw comment
         DepthImbalance: 0.1275,
-        VixChange: 0.05,
+        VixChange: 0.05, // PENDING (audit finding F27) -- open-baseline vs. rolling lookback, see LiveFeatureEngine.ComputeVixChange
         GammaExposure: 0.0,
         VolumePcr: 0.0,
         SpreadRatio: 0.0,
