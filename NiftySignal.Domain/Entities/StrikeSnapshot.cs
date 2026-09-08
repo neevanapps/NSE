@@ -42,6 +42,32 @@ public sealed class StrikeSnapshot
 
     public long? OpenInterest { get; set; }
 
+    /// <summary>
+    /// OI change during this cadence, not the running level -- same "diff against the previous
+    /// cadence" treatment <see cref="VolumeDelta"/> gets. Unlike volume, OI is not a cumulative
+    /// day counter (it can legitimately fall as well as rise), so this is never clamped to zero:
+    /// a negative value is a real OI decrease, not a feed-reset artifact. Null on the first
+    /// cadence after startup, where there's no prior observation to diff against.
+    /// </summary>
+    public long? OpenInterestDelta { get; set; }
+
+    /// <summary>
+    /// <see cref="MarkPrice"/> change during this cadence -- same "diff against the previous
+    /// cadence" treatment as <see cref="OpenInterestDelta"/>, needed to classify this strike's
+    /// <see cref="OiBuildup"/>. Null on the first cadence after startup.
+    /// </summary>
+    public decimal? MarkPriceDelta { get; set; }
+
+    /// <summary>
+    /// This strike's own price-vs-OI quadrant this cadence (plan section 5.2), computed by
+    /// <c>NiftySignal.Features.OiBuildupClassifier.Classify</c> -- the same logic that already
+    /// feeds the composite score's largest component (OiBuildupNet), just recorded per strike
+    /// here instead of collapsed into one chain-wide net (2026-09-08: that net was a black box
+    /// with no visibility into which strikes actually drove it). Null, not Neutral, when either
+    /// delta above is null -- there's no prior cadence to classify against yet.
+    /// </summary>
+    public OiBuildupQuadrant? OiBuildup { get; set; }
+
     /// <summary>Instantaneous top-of-book bid as of this cadence tick -- not averaged, unlike <see cref="SpreadAbs"/> below.</summary>
     public decimal? BidPrice { get; set; }
 

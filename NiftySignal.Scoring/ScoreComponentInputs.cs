@@ -24,4 +24,8 @@ public sealed record ScoreComponentInputs(
     double? VixChangeZ = null,
     double? GammaExposureZ = null,
     double? VolumePcrZ = null,
-    double? SpreadRatioZ = null);
+    double? SpreadRatioZ = null,
+    double? VannaExposureZ = null,
+    double? CharmExposureZ = null,
+    double? CvdProxyZ = null,
+    double? StraddleRichnessZ = null);

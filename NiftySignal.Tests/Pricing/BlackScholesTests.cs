@@ -103,6 +103,67 @@ public class BlackScholesTests
     }
 
     [Fact]
+    public void Calculate_Vanna_MatchesFiniteDifferenceOfDeltaAgainstVolatility()
+    {
+        // Closed-form Vanna is a hand derivation -- verify it against the numerical derivative
+        // of the already-correct (textbook-matched) Delta rather than trusting the algebra.
+        const double epsilon = 1e-4;
+        var up = BlackScholes.Calculate(OptionType.Call, HullUnderlying, HullStrike, HullTime, HullRate, HullVolatility + epsilon);
+        var down = BlackScholes.Calculate(OptionType.Call, HullUnderlying, HullStrike, HullTime, HullRate, HullVolatility - epsilon);
+        var expectedVanna = (up.Greeks.Delta - down.Greeks.Delta) / (2 * epsilon);
+
+        var result = BlackScholes.Calculate(OptionType.Call, HullUnderlying, HullStrike, HullTime, HullRate, HullVolatility);
+
+        Assert.Equal(expectedVanna, result.Greeks.Vanna, 1e-4);
+    }
+
+    [Fact]
+    public void Calculate_Vanna_IsSameForCallAndPut_AtTheSameStrike()
+    {
+        // Delta_call - Delta_put = e^(-qT), a constant w.r.t. sigma, so their sigma-derivatives
+        // must be identical -- same identity Calculate_Vega_IsSameForCallAndPut relies on.
+        var call = BlackScholes.Calculate(OptionType.Call, HullUnderlying, HullStrike, HullTime, HullRate, HullVolatility);
+        var put = BlackScholes.Calculate(OptionType.Put, HullUnderlying, HullStrike, HullTime, HullRate, HullVolatility);
+
+        Assert.Equal(call.Greeks.Vanna, put.Greeks.Vanna, 1e-9);
+    }
+
+    [Fact]
+    public void Calculate_Charm_MatchesFiniteDifferenceOfDeltaAgainstCalendarTime()
+    {
+        // CharmPerDay is d Delta/d t (calendar time) -- as t increases, TimeToExpiry falls, so
+        // the finite difference bumps TimeToExpiry the opposite way from t and divides by the
+        // per-day step, not the per-year one.
+        const double dayInYears = 1.0 / 365.0;
+        const double epsilon = 1e-5;
+        var later = BlackScholes.Calculate(OptionType.Call, HullUnderlying, HullStrike, HullTime - (dayInYears * epsilon), HullRate, HullVolatility);
+        var earlier = BlackScholes.Calculate(OptionType.Call, HullUnderlying, HullStrike, HullTime + (dayInYears * epsilon), HullRate, HullVolatility);
+        var expectedCharmPerDay = (later.Greeks.Delta - earlier.Greeks.Delta) / (2 * epsilon);
+
+        var result = BlackScholes.Calculate(OptionType.Call, HullUnderlying, HullStrike, HullTime, HullRate, HullVolatility);
+
+        Assert.Equal(expectedCharmPerDay, result.Greeks.CharmPerDay, 1e-4);
+    }
+
+    [Fact]
+    public void Calculate_Charm_MatchesFiniteDifference_WithNonZeroDividendYield()
+    {
+        // The dividend-yield terms are the part of the Charm derivation most likely to have a
+        // sign error, and every call site in this codebase uses q=0 -- so the q=0 tests above
+        // would stay green even if this branch were wrong. Exercise it directly.
+        const double dividendYield = 0.02;
+        const double dayInYears = 1.0 / 365.0;
+        const double epsilon = 1e-5;
+        var later = BlackScholes.Calculate(OptionType.Put, HullUnderlying, HullStrike, HullTime - (dayInYears * epsilon), HullRate, HullVolatility, dividendYield);
+        var earlier = BlackScholes.Calculate(OptionType.Put, HullUnderlying, HullStrike, HullTime + (dayInYears * epsilon), HullRate, HullVolatility, dividendYield);
+        var expectedCharmPerDay = (later.Greeks.Delta - earlier.Greeks.Delta) / (2 * epsilon);
+
+        var result = BlackScholes.Calculate(OptionType.Put, HullUnderlying, HullStrike, HullTime, HullRate, HullVolatility, dividendYield);
+
+        Assert.Equal(expectedCharmPerDay, result.Greeks.CharmPerDay, 1e-4);
+    }
+
+    [Fact]
     public void Calculate_ThrowsForNonOptionInstrumentType()
     {
         Assert.Throws<ArgumentOutOfRangeException>(() =>

@@ -151,12 +151,12 @@ public class CompositeScoreCalculatorTests
     }
 
     [Fact]
-    public void Calculate_ComponentBreakdown_ContainsAllTenNamedComponents()
+    public void Calculate_ComponentBreakdown_ContainsAllFourteenNamedComponents()
     {
         var result = CompositeScoreCalculator.Calculate(FullyWarmInputs, ScoreWeights.Default, ComputedAt);
 
         var names = result.Components.Select(c => c.Name).ToHashSet();
-        Assert.Equal(10, result.Components.Count);
+        Assert.Equal(14, result.Components.Count);
         Assert.Contains("OiBuildupNet", names);
         Assert.Contains("Pcr", names);
         Assert.Contains("FuturesBasis", names);
@@ -167,6 +167,10 @@ public class CompositeScoreCalculatorTests
         Assert.Contains("GammaExposure", names);
         Assert.Contains("VolumePcr", names);
         Assert.Contains("SpreadRatio", names);
+        Assert.Contains("VannaExposure", names);
+        Assert.Contains("CharmExposure", names);
+        Assert.Contains("CvdProxy", names);
+        Assert.Contains("StraddleRichness", names);
     }
 
     [Fact]

@@ -60,6 +60,19 @@ public static class BlackScholes
         var vega = underlyingPrice * expNegQT * pdfD1 * sqrtT;
         var decayTerm = -(underlyingPrice * expNegQT * pdfD1 * volatility) / (2 * sqrtT);
 
+        // d Delta/d sigma -- identical for call and put (they differ only by the constant
+        // e^(-qT), whose sigma-derivative is zero), so no per-branch version needed.
+        var vanna = -expNegQT * pdfD1 * d2 / volatility;
+
+        // d Delta_call/d t (calendar time, i.e. -d Delta_call/d TimeToExpiry -- matches
+        // ThetaPerDay's calendar-time convention below, not the textbook time-to-expiry one).
+        // Delta_put = e^(-qT)(N(d1) - 1), a constant-in-T shift of Delta_call by -e^(-qT), so
+        // Charm_put = Charm_call - q*e^(-qT); the two branches share this term and diverge by
+        // exactly that constant, applied per option type further down.
+        var nD1ForCharm = NormalDistribution.Cdf(d1);
+        var charmCallAnnual = (dividendYield * expNegQT * nD1ForCharm)
+            - (expNegQT * pdfD1 * (((2 * (riskFreeRate - dividendYield) * timeToExpiryYears) - (d2 * volatility * sqrtT)) / (2 * timeToExpiryYears * volatility * sqrtT)));
+
         double price, delta, thetaAnnual, rho;
 
         if (optionType == OptionType.Call)
@@ -84,7 +97,9 @@ public static class BlackScholes
             rho = -strike * timeToExpiryYears * expNegRT * nMinusD2;
         }
 
-        var greeks = new OptionGreeks(delta, gamma, thetaAnnual / 365.0, vega, rho);
+        var charmAnnual = optionType == OptionType.Call ? charmCallAnnual : charmCallAnnual - (dividendYield * expNegQT);
+
+        var greeks = new OptionGreeks(delta, gamma, thetaAnnual / 365.0, vega, rho, vanna, charmAnnual / 365.0);
         return new BlackScholesResult(price, greeks);
     }
 }

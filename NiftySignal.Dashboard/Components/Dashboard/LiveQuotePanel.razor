@@ -26,6 +26,10 @@
                     <span class="text-faint">VIX</span>
                     <span class="mono quote-value">@FormatPriceWithChange(Live.VixLtp, Live.VixChange)</span>
                 </div>
+                <div class="quote-stat" title="Spot level where net Gamma Exposure crosses zero -- above it, dealer hedging tends to dampen moves; below it, to accelerate them.">
+                    <span class="text-faint">Gamma Flip</span>
+                    <span class="mono quote-value">@FormatGammaFlip()</span>
+                </div>
             </div>
 
             <div class="quote-spacer"></div>
@@ -145,6 +149,19 @@
         }
 
         return change is { } c ? $"{p:0.00} ({c:+0.00;-0.00})" : p.ToString("0.00");
+    }
+
+    string FormatGammaFlip()
+    {
+        if (Live.GammaFlipLevel is not { } flip)
+        {
+            return "—";
+        }
+
+        // "above/below" reads as the standard dealer-positioning regime (see the title tooltip):
+        // above the flip level, spot moves tend to get dampened; below it, amplified.
+        var regime = Live.SpotLtp is { } spot ? (spot >= (decimal)flip ? " (above)" : " (below)") : "";
+        return $"{flip:0.0}{regime}";
     }
 
     static string FormatQuote(QuickQuote? row, bool pending)

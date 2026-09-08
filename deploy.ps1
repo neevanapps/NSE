@@ -17,6 +17,11 @@
       - Only one machine may hold a FlatTrade session at a time (one API key, two approved
         IPs). Deploying to the VM while the desktop services are still running would leave
         both fighting for the feed, which shows up as phantom disconnections. Guarded below.
+      - VM deploys only copy files that actually changed (by hash, not timestamp -- publish
+        re-stamps every file regardless of content). A framework-dependent publish is mostly
+        unchanged runtime/dependency DLLs, and copying all of them over WinRM every time was
+        the multi-minute cost; a small code change now only transfers the handful of project
+        DLLs that actually differ.
 
 .EXAMPLE
     .\deploy.ps1
@@ -181,6 +186,55 @@ else {
 
             Write-Step "$($svc.Name) -> ${VmAddress}:$targetDir"
 
+            # --- Work out which files actually changed, before stopping the service -------
+            # Hashing, not size/timestamp: `dotnet publish` re-copies every output file on
+            # every run, so even byte-identical framework DLLs get a fresh timestamp -- a
+            # timestamp/size compare would think everything changed and defeat the point.
+            # Hashing costs a few seconds of CPU; the payoff is skipping the WinRM transfer
+            # for the ~90% of a framework-dependent publish that's unchanged runtime/
+            # dependency DLLs, which is the actual multi-minute cost here (copying, not
+            # compiling or testing).
+            $localFiles = Get-ChildItem -Path $staging -Recurse -File
+            $localHashes = @{}
+            foreach ($f in $localFiles) {
+                $rel = $f.FullName.Substring($staging.Length + 1)
+                $localHashes[$rel] = (Get-FileHash -Path $f.FullName -Algorithm MD5).Hash
+            }
+
+            $remoteHashes = Invoke-Command -Session $session -ArgumentList $targetDir -ScriptBlock {
+                param($dir)
+                $result = @{}
+                if (Test-Path $dir) {
+                    # logs\ is runtime output, not part of the deployed app, and Serilog holds
+                    # today's file open for writes while the service is running -- Get-FileHash
+                    # on a locked file throws, and with $ErrorActionPreference = 'Stop' upstream
+                    # that aborts the whole deploy (live-caught 2026-09-08). Skip the whole
+                    # folder rather than just catching the error, since it should never have
+                    # been part of a "did the deployed app change" comparison anyway.
+                    Get-ChildItem -Path $dir -Recurse -File |
+                        Where-Object { $_.FullName -notlike (Join-Path $dir 'logs\*') } |
+                        ForEach-Object {
+                            $file = $_
+                            $rel = $file.FullName.Substring($dir.Length + 1)
+                            try {
+                                $result[$rel] = (Get-FileHash -Path $file.FullName -Algorithm MD5 -ErrorAction Stop).Hash
+                            }
+                            catch {
+                                # Any other unexpectedly-locked file: treat as unknown rather than
+                                # aborting the deploy -- $toCopy below copies it since there's no
+                                # hash to compare against, which is the safe direction to be wrong in.
+                                Write-Warning "Could not hash $($file.FullName) on the remote side -- will copy the local version unconditionally: $($_.Exception.Message)"
+                            }
+                        }
+                }
+                $result
+            }
+
+            $toCopy = $localHashes.Keys | Where-Object {
+                -not $remoteHashes.ContainsKey($_) -or $remoteHashes[$_] -ne $localHashes[$_]
+            }
+            Write-Host "    $($toCopy.Count) of $($localHashes.Count) files changed"
+
             Invoke-Command -Session $session -ArgumentList $svc.Name -ScriptBlock {
                 param($name)
                 Stop-Service -Name $name -Force -ErrorAction SilentlyContinue
@@ -188,8 +242,24 @@ else {
             }
             Write-Host "    stopped"
 
-            Copy-Item -Path (Join-Path $staging '*') -Destination $targetDir -ToSession $session -Recurse -Force
-            Write-Host "    files copied"
+            if ($toCopy.Count -eq 0) {
+                Write-Host "    nothing to copy"
+            }
+            else {
+                # Create every needed destination folder in one round trip, not one per file.
+                $destDirs = $toCopy | ForEach-Object { Split-Path (Join-Path $targetDir $_) -Parent } | Sort-Object -Unique
+                Invoke-Command -Session $session -ArgumentList (, $destDirs) -ScriptBlock {
+                    param($dirs)
+                    foreach ($d in $dirs) {
+                        if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+                    }
+                }
+
+                foreach ($rel in $toCopy) {
+                    Copy-Item -Path (Join-Path $staging $rel) -Destination (Join-Path $targetDir $rel) -ToSession $session -Force
+                }
+                Write-Host "    files copied"
+            }
 
             $state = Invoke-Command -Session $session -ArgumentList $svc.Name -ScriptBlock {
                 param($name)

@@ -25,7 +25,15 @@ public static class CompositeScoreCalculator
     const string GammaExposureComponentName = "GammaExposure";
     const string VolumePcrComponentName = "VolumePcr";
     const string SpreadRatioComponentName = "SpreadRatio";
-    static readonly string[] OptionalComponentNames = [VixComponentName, GammaExposureComponentName, VolumePcrComponentName, SpreadRatioComponentName];
+    const string VannaExposureComponentName = "VannaExposure";
+    const string CharmExposureComponentName = "CharmExposure";
+    const string CvdProxyComponentName = "CvdProxy";
+    const string StraddleRichnessComponentName = "StraddleRichness";
+    static readonly string[] OptionalComponentNames =
+    [
+        VixComponentName, GammaExposureComponentName, VolumePcrComponentName, SpreadRatioComponentName,
+        VannaExposureComponentName, CharmExposureComponentName, CvdProxyComponentName, StraddleRichnessComponentName,
+    ];
 
     /// <summary>
     /// The pre-tanh weighted z-sum on its own (2026-09-04), for callers that need to build a
@@ -97,6 +105,10 @@ public static class CompositeScoreCalculator
         BuildComponent(GammaExposureComponentName, weights.GammaExposure, inputs.GammaExposureZ),
         BuildComponent(VolumePcrComponentName, weights.VolumePcr, inputs.VolumePcrZ),
         BuildComponent(SpreadRatioComponentName, weights.SpreadRatio, inputs.SpreadRatioZ),
+        BuildComponent(VannaExposureComponentName, weights.VannaExposure, inputs.VannaExposureZ),
+        BuildComponent(CharmExposureComponentName, weights.CharmExposure, inputs.CharmExposureZ),
+        BuildComponent(CvdProxyComponentName, weights.CvdProxy, inputs.CvdProxyZ),
+        BuildComponent(StraddleRichnessComponentName, weights.StraddleRichness, inputs.StraddleRichnessZ),
     ];
 
     static ScoreComponentBreakdown BuildComponent(string name, double weight, double? z)

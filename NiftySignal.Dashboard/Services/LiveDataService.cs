@@ -103,6 +103,14 @@ public sealed class LiveDataService : IDisposable
 
     public decimal? VixChange { get; private set; }
 
+    /// <summary>
+    /// The spot level where net Gamma Exposure crosses zero, per the latest cadence (2026-09-08)
+    /// -- see ScoreSnapshot.GammaFlipLevel's own doc comment. A price level, not a magnitude, so
+    /// it doesn't belong in <see cref="ScoreComponents"/> (which expects a Z-score/weight shape) --
+    /// shown instead next to SpotLtp, the same way it's meant to be read.
+    /// </summary>
+    public double? GammaFlipLevel { get; private set; }
+
     public LiveDataService(IDbContextFactory<NiftySignalDbContext> dbFactory, FlatTradeAuthClient authClient, ILogger<LiveDataService> logger)
     {
         _dbFactory = dbFactory;
@@ -136,8 +144,33 @@ public sealed class LiveDataService : IDisposable
     /// </summary>
     public void ApplyPushedTick(Tick tick)
     {
+        // Independent of _tokenRoles below (2026-09-08): an open position's own instrument
+        // isn't necessarily one of the tracked spot/future/vix/quick-quote roles, so this has
+        // to be its own check rather than a fifth TokenRole case. Positions.CurrentPremium
+        // otherwise only refreshed on the 5s poll or a trade-changed push (RefreshTradesAsync),
+        // both far coarser than the live tick stream everything else on this page already gets.
+        var matchedPosition = false;
+        lock (_lock)
+        {
+            for (var i = 0; i < _positions.Count; i++)
+            {
+                if (_positions[i].InstrumentToken == tick.Token)
+                {
+                    _positions[i] = _positions[i] with { CurrentPremium = tick.LastPrice };
+                    matchedPosition = true;
+                }
+            }
+        }
+
         if (!_tokenRoles.TryGetValue(tick.Token, out var info))
         {
+            // Preserves the original "unknown token, nothing changed, nothing to notify" drop --
+            // only fire when the position match above actually changed something.
+            if (matchedPosition)
+            {
+                QuoteUpdated?.Invoke();
+            }
+
             return;
         }
 
@@ -300,6 +333,7 @@ public sealed class LiveDataService : IDisposable
                 }
 
                 ScoreComponents = BuildComponentRows(latest, _firstSnapshotAt ?? latest.ComputedAt, _firstVixSnapshotAt);
+                GammaFlipLevel = latest.GammaFlipLevel;
             }
 
             var chain = await BuildOptionChainAsync(db);
@@ -432,6 +466,18 @@ public sealed class LiveDataService : IDisposable
             // Diagnostic-only (weight 0.0, see ScoreWeights.Default) -- same treatment as GammaExposure/VolumePcr.
             new("SpreadRatio", ScoreWeights.Default.SpreadRatio, s.SpreadRatioZ ?? 0, (s.SpreadRatioZ ?? 0) * ScoreWeights.Default.SpreadRatio,
                 s.SpreadRatioZ is not null, FeatureWindowLengths.SpreadRatio, Remaining(FeatureWindowLengths.SpreadRatio)),
+            // Diagnostic-only (weight 0.0, see ScoreWeights.Default) -- same treatment as the three above.
+            new("VannaExposure", ScoreWeights.Default.VannaExposure, s.VannaExposureZ ?? 0, (s.VannaExposureZ ?? 0) * ScoreWeights.Default.VannaExposure,
+                s.VannaExposureZ is not null, FeatureWindowLengths.VannaExposure, Remaining(FeatureWindowLengths.VannaExposure)),
+            new("CharmExposure", ScoreWeights.Default.CharmExposure, s.CharmExposureZ ?? 0, (s.CharmExposureZ ?? 0) * ScoreWeights.Default.CharmExposure,
+                s.CharmExposureZ is not null, FeatureWindowLengths.CharmExposure, Remaining(FeatureWindowLengths.CharmExposure)),
+            new("CvdProxy", ScoreWeights.Default.CvdProxy, s.CvdProxyZ ?? 0, (s.CvdProxyZ ?? 0) * ScoreWeights.Default.CvdProxy,
+                s.CvdProxyZ is not null, FeatureWindowLengths.CvdProxy, Remaining(FeatureWindowLengths.CvdProxy)),
+            // Volatility-demand, not directional (see ScoreSnapshot.StraddleRichnessRaw's doc
+            // comment) -- still rendered as an ordinary weighted row here since weight is 0.0
+            // either way; the distinction only matters once/if it's ever given a real weight.
+            new("StraddleRichness", ScoreWeights.Default.StraddleRichness, s.StraddleRichnessZ ?? 0, (s.StraddleRichnessZ ?? 0) * ScoreWeights.Default.StraddleRichness,
+                s.StraddleRichnessZ is not null, FeatureWindowLengths.StraddleRichness, Remaining(FeatureWindowLengths.StraddleRichness)),
         ];
     }
 
@@ -447,6 +493,10 @@ public sealed class LiveDataService : IDisposable
         new("GammaExposure", ScoreWeights.Default.GammaExposure, 0, 0, false, FeatureWindowLengths.GammaExposure, FeatureWindowLengths.GammaExposure),
         new("VolumePcr", ScoreWeights.Default.VolumePcr, 0, 0, false, FeatureWindowLengths.VolumePcr, FeatureWindowLengths.VolumePcr),
         new("SpreadRatio", ScoreWeights.Default.SpreadRatio, 0, 0, false, FeatureWindowLengths.SpreadRatio, FeatureWindowLengths.SpreadRatio),
+        new("VannaExposure", ScoreWeights.Default.VannaExposure, 0, 0, false, FeatureWindowLengths.VannaExposure, FeatureWindowLengths.VannaExposure),
+        new("CharmExposure", ScoreWeights.Default.CharmExposure, 0, 0, false, FeatureWindowLengths.CharmExposure, FeatureWindowLengths.CharmExposure),
+        new("CvdProxy", ScoreWeights.Default.CvdProxy, 0, 0, false, FeatureWindowLengths.CvdProxy, FeatureWindowLengths.CvdProxy),
+        new("StraddleRichness", ScoreWeights.Default.StraddleRichness, 0, 0, false, FeatureWindowLengths.StraddleRichness, FeatureWindowLengths.StraddleRichness),
     ];
 
     async Task<List<OptionChainRow>> BuildOptionChainAsync(NiftySignalDbContext db)
@@ -737,6 +787,7 @@ public sealed class LiveDataService : IDisposable
         var latestPriceByToken = latestTicks.ToDictionary(t => t.Token, t => t.LastPrice);
 
         return open.Select(t => new PositionRow(
+            InstrumentToken: t.InstrumentToken,
             TradingSymbol: t.TradingSymbol,
             Direction: t.Direction,
             EntryPremium: t.EntryPrice,

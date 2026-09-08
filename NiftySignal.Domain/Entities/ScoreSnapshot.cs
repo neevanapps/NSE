@@ -50,6 +50,54 @@ public sealed class ScoreSnapshot
     /// </summary>
     public double? SpreadRatioRaw { get; set; }
 
+    /// <summary>
+    /// Net Vanna exposure (2026-09-08, diagnostic-only, weight 0 -- same launch discipline as
+    /// GammaExposureRaw) across the full nearest-expiry chain -- see
+    /// LiveFeatureEngine.ComputeVannaExposure. Same per-option-type dealer-positioning sign
+    /// convention as GammaExposureRaw (call +, put -); Vanna itself is identical for call and
+    /// put at a given strike (see OptionGreeks' doc comment), same as Gamma is.
+    /// </summary>
+    public double? VannaExposureRaw { get; set; }
+
+    /// <summary>
+    /// Net Charm (delta decay per day) exposure (2026-09-08, diagnostic-only, weight 0) across
+    /// the full nearest-expiry chain -- see LiveFeatureEngine.ComputeCharmExposure. Particularly
+    /// relevant on expiry day, when OTM deltas decay fastest in the final hours before close.
+    /// </summary>
+    public double? CharmExposureRaw { get; set; }
+
+    /// <summary>
+    /// Quote-rule aggressor-volume proxy (2026-09-08, diagnostic-only) across the full
+    /// nearest-expiry chain -- see LiveFeatureEngine.ComputeVolumePcrAndCvdProxy. Not true CVD:
+    /// the feed has no per-trade tape (touchline LTP/cumulative volume/5-level depth only), so
+    /// aggressor side is inferred from whether LTP sat closer to ask or bid each cadence, not
+    /// from tagged prints. Positive = net buy-leaning volume classified bullish (calls bought,
+    /// puts sold), same per-option-type sign convention as OiBuildupNetRaw.
+    /// </summary>
+    public double? CvdProxyRaw { get; set; }
+
+    /// <summary>
+    /// ATM straddle's actual price change this cadence minus what its own Delta and Theta (from
+    /// the previous cadence, applied to the realized underlying move and elapsed time) predicted
+    /// -- see LiveFeatureEngine.ComputeStraddleRichness. Unlike every other component here, this
+    /// is a volatility-demand signal, not a directional one: positive means the straddle priced
+    /// richer than a delta+theta-only prediction (vol expanding), negative means it decayed
+    /// faster than predicted (vol crush). Null whenever the ATM strike rolled to a new strike
+    /// since the previous cadence -- comparing two different straddles would be meaningless.
+    /// </summary>
+    public double? StraddleRichnessRaw { get; set; }
+
+    /// <summary>
+    /// The strike level where net Gamma Exposure crosses zero (2026-09-08, diagnostic-only),
+    /// found by evaluating GammaExposureRaw's own aggregation at each tracked strike as a
+    /// hypothetical spot and linearly interpolating between the two adjacent strikes where its
+    /// sign flips -- see LiveFeatureEngine.ComputeGammaFlipLevel. A price level, not a magnitude,
+    /// so unlike every other diagnostic here it has no Z counterpart and was never a candidate
+    /// for the composite sum; it's read by comparing SpotPrice to it, not by z-scoring it. Null
+    /// when no sign flip exists within the currently tracked strike range.
+    /// </summary>
+    public double? GammaFlipLevel { get; set; }
+
     public double? OiBuildupNetZ { get; set; }
     public double? PcrZ { get; set; }
     public double? FuturesBasisZ { get; set; }
@@ -60,6 +108,10 @@ public sealed class ScoreSnapshot
     public double? GammaExposureZ { get; set; }
     public double? VolumePcrZ { get; set; }
     public double? SpreadRatioZ { get; set; }
+    public double? VannaExposureZ { get; set; }
+    public double? CharmExposureZ { get; set; }
+    public double? CvdProxyZ { get; set; }
+    public double? StraddleRichnessZ { get; set; }
 
     /// <summary>
     /// The pre-tanh weighted z-sum (2026-09-04) -- persisted so the dynamic-k rolling window

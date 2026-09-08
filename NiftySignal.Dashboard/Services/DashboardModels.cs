@@ -67,6 +67,10 @@ public sealed record OptionChainRow(
 }
 
 public sealed record PositionRow(
+    // Not rendered -- kept so ApplyPushedTick (2026-09-08) can match a live tick to an open
+    // position without a DB round trip, the same "no DB access on the push path" rule
+    // QuickQuotes already follows.
+    string InstrumentToken,
     string TradingSymbol,
     EntryDirection Direction,
     decimal EntryPremium,

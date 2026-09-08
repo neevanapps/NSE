@@ -30,7 +30,12 @@ public static class LiveRulesetConfig
             MinAbsScore: 55,
             MinScoreSustainedSeconds: 45,
             ReEntryGapSameDirectionMinutes: 2,
-            MaxTradesPerDay: 7,
+            // Raised from 7 to 30 (2026-09-08) -- the 7 cap got spent by 10:48 today, well
+            // before a later well-sustained bearish move (score to -96.7) could be evaluated,
+            // so the cap itself was the binding constraint rather than the scoring/rules being
+            // wrong. 30 is deliberately loose for now to observe unconstrained behaviour for a
+            // session or two before picking a real steady-state number.
+            MaxTradesPerDay: 30,
             MaxIvRankForEntry: 70),
         // Narrowed 2026-09-07 (from 150-200) after the first live session -- cheaper premium
         // means a smaller capital commitment per lot and generally higher gamma/more strikes

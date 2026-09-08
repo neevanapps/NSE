@@ -233,6 +233,15 @@ public sealed class MarketDataIngestionWorker(
                         await tradingEngine.EvaluateCadenceAsync(snapshot, _engine, stoppingToken);
                     }
                 }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    // Live-caught 2026-09-08: an uncaught DbUpdateException here (ScoreWeightsVersion
+                    // too long for its column) escaped the while loop and silently ended scoring/trading
+                    // for the rest of the session, while ticks kept flowing on their own separate loop --
+                    // nothing else in the process noticed. One bad cadence must never take down the rest
+                    // of the day; log it and let the next tick try again.
+                    logger.LogError(ex, "Score cadence tick failed -- continuing with the next cadence");
+                }
                 finally
                 {
                     _engineSync.Release();

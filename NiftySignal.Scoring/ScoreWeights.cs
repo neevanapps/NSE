@@ -17,7 +17,11 @@ public sealed record ScoreWeights(
     double VixChange = 0.0,
     double GammaExposure = 0.0,
     double VolumePcr = 0.0,
-    double SpreadRatio = 0.0)
+    double SpreadRatio = 0.0,
+    double VannaExposure = 0.0,
+    double CharmExposure = 0.0,
+    double CvdProxy = 0.0,
+    double StraddleRichness = 0.0)
 {
     /// <summary>
     /// The plan's own starting weights (section 6: 25/20/15/15/15/10), rescaled by 0.95 to
@@ -69,8 +73,29 @@ public sealed record ScoreWeights(
     /// of the three new diagnostic components. Still launches at 0.0 regardless: one day is one
     /// day, not multi-day validated evidence.
     /// </summary>
+    /// <summary>
+    /// VannaExposure and CharmExposure (2026-09-08) both start at weight 0.0 for the same
+    /// reason every other diagnostic component has -- zero days of validated evidence. Unlike
+    /// GammaExposure/VolumePcr/SpreadRatio, these went in without even a same-day correlation
+    /// check (built ahead of today's expiry-day afternoon decay window specifically, so there
+    /// would be *something* to check afterwards) -- treat these two as earlier-stage than the
+    /// other three diagnostics until that first real evaluation happens.
+    /// </summary>
+    /// <summary>
+    /// CvdProxy and StraddleRichness (2026-09-08) both start at weight 0.0 -- same reasoning as
+    /// VannaExposure/CharmExposure, built ahead of evidence rather than after it. StraddleRichness
+    /// in particular is not even the same *kind* of signal as the other twelve: it reads
+    /// volatility demand, not price direction, so a validated nonzero weight for it would likely
+    /// need a different integration shape than a plain addition to the directional weighted sum
+    /// -- a decision for whenever it's actually validated, not now.
+    /// </summary>
     public static ScoreWeights Default { get; } = new(
-        Version: "plan-section-6-default+vix-2026-09-04+momentum-cut-2026-09-07+diagnostics-2026-09-07",
+        // Short and date-stamped, matching RulesetVersion's convention -- not a changelog. The
+        // full history of what changed and why lives in this record's doc comments above (and
+        // in git blame), not in an ever-growing string that a live trade insert has to fit
+        // inside a database column (live-caught 2026-09-08: the old descriptive-suffix version
+        // grew past ScoreWeightsVersion's column length and silently killed the trading loop).
+        Version: "live-2026-09-08",
         OiBuildupNet: 0.2775,
         Pcr: 0.19,
         FuturesBasis: 0.1425,
@@ -80,7 +105,12 @@ public sealed record ScoreWeights(
         VixChange: 0.05,
         GammaExposure: 0.0,
         VolumePcr: 0.0,
-        SpreadRatio: 0.0);
+        SpreadRatio: 0.0,
+        VannaExposure: 0.0,
+        CharmExposure: 0.0,
+        CvdProxy: 0.0,
+        StraddleRichness: 0.0);
 
-    public double Total => OiBuildupNet + Pcr + FuturesBasis + IvSkew + PriceMomentum + DepthImbalance + VixChange + GammaExposure + VolumePcr + SpreadRatio;
+    public double Total => OiBuildupNet + Pcr + FuturesBasis + IvSkew + PriceMomentum + DepthImbalance + VixChange
+        + GammaExposure + VolumePcr + SpreadRatio + VannaExposure + CharmExposure + CvdProxy + StraddleRichness;
 }

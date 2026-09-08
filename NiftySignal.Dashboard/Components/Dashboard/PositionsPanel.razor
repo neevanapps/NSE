@@ -57,9 +57,21 @@
         return held.TotalMinutes >= 60 ? $"{held.TotalHours:0.0}h" : $"{held.TotalMinutes:0}m";
     }
 
-    protected override void OnInitialized() => Live.Updated += OnDemoUpdated;
+    protected override void OnInitialized()
+    {
+        Live.Updated += OnDemoUpdated;
+        // Live.QuoteUpdated (2026-09-08): CurrentPremium/UnrealizedPnl now update on every live
+        // tick for an open position's own instrument (see LiveDataService.ApplyPushedTick), not
+        // just the 5s poll -- this panel needs the fast path too or it would keep re-rendering
+        // stale numbers between polls.
+        Live.QuoteUpdated += OnDemoUpdated;
+    }
 
     void OnDemoUpdated() => InvokeAsync(StateHasChanged);
 
-    public void Dispose() => Live.Updated -= OnDemoUpdated;
+    public void Dispose()
+    {
+        Live.Updated -= OnDemoUpdated;
+        Live.QuoteUpdated -= OnDemoUpdated;
+    }
 }

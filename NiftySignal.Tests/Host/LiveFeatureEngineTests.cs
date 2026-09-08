@@ -220,6 +220,183 @@ public class LiveFeatureEngineTests
     }
 
     [Fact]
+    public void ComputeCadence_ComputesVannaAndCharmExposure_WheneverGammaExposureIsAvailable()
+    {
+        // Same ATM-reference-vol gate as GammaExposure (ComputeVannaExposure/ComputeCharmExposure
+        // are called right alongside it in ComputeCadence, reusing the same solve) -- whenever
+        // GEX produces a value, these two must as well.
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, oi: 100_000, depth: Depth(bidQty: 500, askQty: 400, bid: 99.5m, ask: 100.5m)));
+        engine.OnTick(MakeTick(PutToken, 80m, Start, oi: 100_000, depth: Depth(bidQty: 300, askQty: 600, bid: 79.5m, ask: 80.5m)));
+
+        var snapshot = engine.ComputeCadence(Start);
+
+        Assert.NotNull(snapshot!.GammaExposureRaw);
+        Assert.NotNull(snapshot.VannaExposureRaw);
+        Assert.NotNull(snapshot.CharmExposureRaw);
+        Assert.True(double.IsFinite(snapshot.VannaExposureRaw!.Value));
+        Assert.True(double.IsFinite(snapshot.CharmExposureRaw!.Value));
+    }
+
+    [Fact]
+    public void ComputeCadence_CvdProxy_ReadsBuyLeaningCallVolume_AsBullish()
+    {
+        // LTP at/above the bid/ask midpoint classifies this cadence's traded call volume as
+        // buy-leaning -- bullish, same sign convention as OiBuildupNetRaw.
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, oi: 100_000, volume: 1_000, depth: Depth(500, 400, bid: 99.5m, ask: 100.5m)));
+        engine.OnTick(MakeTick(PutToken, 80m, Start, oi: 100_000, volume: 500, depth: Depth(300, 600, bid: 79.5m, ask: 80.5m)));
+        engine.ComputeCadence(Start);
+
+        // Call: 200 more traded, LTP 100.5 >= midpoint 100.0 -- buy-leaning.
+        // Put: volume unchanged (delta 0) -- excluded, isolating the signal to the call.
+        engine.OnTick(MakeTick(CallToken, 100.5m, Start.AddSeconds(15), oi: 100_000, volume: 1_200, depth: Depth(500, 400, bid: 99.5m, ask: 100.5m)));
+        engine.OnTick(MakeTick(PutToken, 80m, Start.AddSeconds(15), oi: 100_000, volume: 500, depth: Depth(300, 600, bid: 79.5m, ask: 80.5m)));
+
+        var second = engine.ComputeCadence(Start.AddSeconds(15));
+
+        Assert.Equal(200.0, second!.CvdProxyRaw);
+    }
+
+    [Fact]
+    public void ComputeCadence_CvdProxy_ReadsSellLeaningCallVolume_AsBearish()
+    {
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, oi: 100_000, volume: 1_000, depth: Depth(500, 400, bid: 99.5m, ask: 100.5m)));
+        engine.OnTick(MakeTick(PutToken, 80m, Start, oi: 100_000, volume: 500, depth: Depth(300, 600, bid: 79.5m, ask: 80.5m)));
+        engine.ComputeCadence(Start);
+
+        // LTP 99.5 < midpoint 100.0 -- sell-leaning, so the call's contribution flips negative.
+        engine.OnTick(MakeTick(CallToken, 99.5m, Start.AddSeconds(15), oi: 100_000, volume: 1_200, depth: Depth(500, 400, bid: 99.5m, ask: 100.5m)));
+        engine.OnTick(MakeTick(PutToken, 80m, Start.AddSeconds(15), oi: 100_000, volume: 500, depth: Depth(300, 600, bid: 79.5m, ask: 80.5m)));
+
+        var second = engine.ComputeCadence(Start.AddSeconds(15));
+
+        Assert.Equal(-200.0, second!.CvdProxyRaw);
+    }
+
+    [Fact]
+    public void ComputeCadence_ComputesGammaFlipLevel_AsTheZeroCrossingBetweenNetNegativeAndNetPositiveStrikes()
+    {
+        // A far put-only strike (net GEX negative there) and a far call-only strike (net GEX
+        // positive there), spaced widely enough that each dominates its own end of the range --
+        // guarantees a sign flip for ComputeGammaFlipLevel to interpolate across.
+        const string PutOnlyToken = "88001";
+        const string CallOnlyToken = "88002";
+        var universe = BaseUniverse();
+        universe.Add(Option(PutOnlyToken, OptionType.Put, 23800m));
+        universe.Add(Option(CallOnlyToken, OptionType.Call, 24100m));
+
+        var engine = new LiveFeatureEngine(universe);
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, oi: 1_000, depth: Depth(500, 400, bid: 99.5m, ask: 100.5m)));
+        engine.OnTick(MakeTick(PutToken, 80m, Start, oi: 1_000, depth: Depth(300, 600, bid: 79.5m, ask: 80.5m)));
+        engine.OnTick(MakeTick(PutOnlyToken, 10m, Start, oi: 1_000_000));
+        engine.OnTick(MakeTick(CallOnlyToken, 10m, Start, oi: 1_000_000));
+
+        var snapshot = engine.ComputeCadence(Start);
+
+        Assert.NotNull(snapshot!.GammaFlipLevel);
+        Assert.InRange(snapshot.GammaFlipLevel!.Value, 23800.0, 24100.0);
+    }
+
+    [Fact]
+    public void ComputeCadence_GammaFlipLevel_IsNull_WhenNoSignFlipExistsAcrossTrackedStrikes()
+    {
+        // Two strikes, both call-only (Put OI zeroed out) -- net GEX is positive everywhere on
+        // the grid, so there is genuinely no crossing to find, not merely "fewer than 2 strikes".
+        const string SecondCallToken = "88003";
+        var universe = BaseUniverse();
+        universe.Add(Option(SecondCallToken, OptionType.Call, 24100m));
+
+        var engine = new LiveFeatureEngine(universe);
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, oi: 100_000, depth: Depth(500, 400, bid: 99.5m, ask: 100.5m)));
+        engine.OnTick(MakeTick(PutToken, 80m, Start, oi: 0));
+        engine.OnTick(MakeTick(SecondCallToken, 10m, Start, oi: 500_000));
+
+        var snapshot = engine.ComputeCadence(Start);
+
+        Assert.Null(snapshot!.GammaFlipLevel);
+    }
+
+    [Fact]
+    public void ComputeCadence_StraddleRichness_IsNull_OnTheFirstCadence()
+    {
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, oi: 100_000, depth: Depth(500, 400, bid: 99.5m, ask: 100.5m)));
+        engine.OnTick(MakeTick(PutToken, 80m, Start, oi: 100_000, depth: Depth(300, 600, bid: 79.5m, ask: 80.5m)));
+
+        var snapshot = engine.ComputeCadence(Start);
+
+        Assert.Null(snapshot!.StraddleRichnessRaw);
+    }
+
+    [Fact]
+    public void ComputeCadence_StraddleRichness_IsNonNull_OnASecondCadenceAtTheSameAtmStrike()
+    {
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, oi: 100_000, depth: Depth(500, 400, bid: 99.5m, ask: 100.5m)));
+        engine.OnTick(MakeTick(PutToken, 80m, Start, oi: 100_000, depth: Depth(300, 600, bid: 79.5m, ask: 80.5m)));
+        engine.ComputeCadence(Start);
+
+        engine.OnTick(MakeTick(SpotToken, 23955m, Start.AddSeconds(15)));
+        engine.OnTick(MakeTick(FutureToken, 24005m, Start.AddSeconds(15)));
+        engine.OnTick(MakeTick(CallToken, 102m, Start.AddSeconds(15), oi: 100_000, depth: Depth(500, 400, bid: 101.5m, ask: 102.5m)));
+        engine.OnTick(MakeTick(PutToken, 78m, Start.AddSeconds(15), oi: 100_000, depth: Depth(300, 600, bid: 77.5m, ask: 78.5m)));
+
+        var second = engine.ComputeCadence(Start.AddSeconds(15));
+
+        Assert.NotNull(second!.StraddleRichnessRaw);
+        Assert.True(double.IsFinite(second.StraddleRichnessRaw!.Value));
+    }
+
+    [Fact]
+    public void ComputeCadence_StraddleRichness_IsNull_WhenTheAtmStrikeRollsToADifferentStrike()
+    {
+        // Comparing two different straddles' prices would be meaningless -- must be null, not a
+        // fabricated comparison, exactly like ComputeOiBuildupNet's stale-gap case.
+        const string FarCallToken = "88010";
+        const string FarPutToken = "88011";
+        var universe = BaseUniverse();
+        universe.Add(Option(FarCallToken, OptionType.Call, 24200m));
+        universe.Add(Option(FarPutToken, OptionType.Put, 24200m));
+
+        var engine = new LiveFeatureEngine(universe);
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, oi: 100_000, depth: Depth(500, 400, bid: 99.5m, ask: 100.5m)));
+        engine.OnTick(MakeTick(PutToken, 80m, Start, oi: 100_000, depth: Depth(300, 600, bid: 79.5m, ask: 80.5m)));
+        engine.OnTick(MakeTick(FarCallToken, 5m, Start, oi: 100_000, depth: Depth(500, 400, bid: 4.5m, ask: 5.5m)));
+        engine.OnTick(MakeTick(FarPutToken, 250m, Start, oi: 100_000, depth: Depth(300, 600, bid: 249.5m, ask: 250.5m)));
+        engine.ComputeCadence(Start); // ATM = 23950, the nearest strike to spot 23950.
+
+        // Push spot right onto the far strike -- now that one is nearest, a genuine roll.
+        engine.OnTick(MakeTick(SpotToken, 24200m, Start.AddSeconds(15)));
+        engine.OnTick(MakeTick(FutureToken, 24250m, Start.AddSeconds(15)));
+        engine.OnTick(MakeTick(CallToken, 250m, Start.AddSeconds(15), oi: 100_000, depth: Depth(500, 400, bid: 249.5m, ask: 250.5m)));
+        engine.OnTick(MakeTick(PutToken, 5m, Start.AddSeconds(15), oi: 100_000, depth: Depth(300, 600, bid: 4.5m, ask: 5.5m)));
+        engine.OnTick(MakeTick(FarCallToken, 100m, Start.AddSeconds(15), oi: 100_000, depth: Depth(500, 400, bid: 99.5m, ask: 100.5m)));
+        engine.OnTick(MakeTick(FarPutToken, 80m, Start.AddSeconds(15), oi: 100_000, depth: Depth(300, 600, bid: 79.5m, ask: 80.5m)));
+
+        var second = engine.ComputeCadence(Start.AddSeconds(15));
+
+        Assert.Null(second!.StraddleRichnessRaw);
+    }
+
+    [Fact]
     public void ComputeCadence_ComputesVolumePcr_AsNotionalNotContractCount_AcrossTheFullChain()
     {
         // A strike far outside any plausible persisted band, same reasoning as the GammaExposure
@@ -457,6 +634,77 @@ public class LiveFeatureEngineTests
         var afterReset = engine.BuildStrikeSnapshots(Start.AddSeconds(15));
 
         Assert.Equal(0, Assert.Single(afterReset, s => s.Token == CallToken).VolumeDelta);
+    }
+
+    [Fact]
+    public void BuildStrikeSnapshots_ReportsOpenInterestChangeThisCadence_NotTheRunningLevel()
+    {
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, oi: 1_000_000));
+
+        // First pass has no prior observation to diff against -- null, not a fabricated zero.
+        var first = engine.BuildStrikeSnapshots(Start);
+        Assert.Null(Assert.Single(first, s => s.Token == CallToken).OpenInterestDelta);
+
+        engine.OnTick(MakeTick(CallToken, 101m, Start.AddSeconds(15), oi: 1_045_000));
+
+        var second = engine.BuildStrikeSnapshots(Start.AddSeconds(15));
+
+        Assert.Equal(45_000, Assert.Single(second, s => s.Token == CallToken).OpenInterestDelta);
+    }
+
+    [Fact]
+    public void BuildStrikeSnapshots_ReportsOpenInterestDeltaAsNegative_WhenOpenInterestFalls()
+    {
+        // Unlike VolumeDelta, OI is a real level, not a cumulative day counter -- a fall is
+        // genuine information (positions closing), not a feed-reset artifact, so it must not be
+        // clamped to zero the way VolumeDelta is.
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, oi: 1_000_000));
+        engine.BuildStrikeSnapshots(Start);
+
+        engine.OnTick(MakeTick(CallToken, 100m, Start.AddSeconds(15), oi: 960_000));
+        var second = engine.BuildStrikeSnapshots(Start.AddSeconds(15));
+
+        Assert.Equal(-40_000, Assert.Single(second, s => s.Token == CallToken).OpenInterestDelta);
+    }
+
+    [Fact]
+    public void BuildStrikeSnapshots_ClassifiesOiBuildup_UsingPriceAndOiDeltaTogether()
+    {
+        // Price up + OI up on a call is the textbook LongBuildup quadrant (plan section 5.2) --
+        // same classifier OiBuildupNet already uses, just recorded per strike here.
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, oi: 1_000_000, depth: Depth(500, 400, bid: 99.5m, ask: 100.5m)));
+
+        // First pass has no prior cadence to classify against -- null, not Neutral.
+        var first = engine.BuildStrikeSnapshots(Start);
+        Assert.Null(Assert.Single(first, s => s.Token == CallToken).OiBuildup);
+        Assert.Null(Assert.Single(first, s => s.Token == CallToken).MarkPriceDelta);
+
+        engine.OnTick(MakeTick(CallToken, 105m, Start.AddSeconds(15), oi: 1_045_000, depth: Depth(500, 400, bid: 104.5m, ask: 105.5m)));
+        var second = engine.BuildStrikeSnapshots(Start.AddSeconds(15));
+        var call = Assert.Single(second, s => s.Token == CallToken);
+
+        Assert.Equal(5.0m, call.MarkPriceDelta);
+        Assert.Equal(OiBuildupQuadrant.LongBuildup, call.OiBuildup);
+    }
+
+    [Fact]
+    public void BuildStrikeSnapshots_ClassifiesShortCovering_WhenPriceRisesButOiFalls()
+    {
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, oi: 1_000_000, depth: Depth(500, 400, bid: 99.5m, ask: 100.5m)));
+        engine.BuildStrikeSnapshots(Start);
+
+        engine.OnTick(MakeTick(CallToken, 105m, Start.AddSeconds(15), oi: 960_000, depth: Depth(500, 400, bid: 104.5m, ask: 105.5m)));
+        var second = engine.BuildStrikeSnapshots(Start.AddSeconds(15));
+
+        Assert.Equal(OiBuildupQuadrant.ShortCovering, Assert.Single(second, s => s.Token == CallToken).OiBuildup);
     }
 
     [Fact]

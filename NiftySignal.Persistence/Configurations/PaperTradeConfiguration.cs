@@ -13,9 +13,14 @@ public sealed class PaperTradeConfiguration : IEntityTypeConfiguration<PaperTrad
         builder.HasKey(t => t.Id);
 
         builder.Property(t => t.InstrumentToken).HasMaxLength(32).IsRequired();
-        builder.Property(t => t.TradingSymbol).HasMaxLength(64).IsRequired();
-        builder.Property(t => t.RulesetVersion).HasMaxLength(64).IsRequired();
-        builder.Property(t => t.ScoreWeightsVersion).HasMaxLength(64).IsRequired();
+        builder.Property(t => t.TradingSymbol).HasMaxLength(128).IsRequired();
+        // 128, not 64 (live-caught 2026-09-08): these are free-text version tags that get a
+        // new suffix appended every time the ruleset or weights change, so 64 chars is a trap
+        // that eventually overflows and fails the insert -- it took the very first live trade
+        // attempt down silently. 128 gives real headroom; RulesetVersion/ScoreWeights.Version
+        // are also being kept short from now on rather than relying on the wider column alone.
+        builder.Property(t => t.RulesetVersion).HasMaxLength(128).IsRequired();
+        builder.Property(t => t.ScoreWeightsVersion).HasMaxLength(128).IsRequired();
 
         builder.Property(t => t.EntryPrice).HasPrecision(18, 4);
         builder.Property(t => t.PartialExitPrice).HasPrecision(18, 4);

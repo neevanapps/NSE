@@ -72,4 +72,30 @@ public static class FeatureWindowLengths
     /// like OiBuildupNet/GammaExposure/VolumePcr.
     /// </summary>
     public static readonly TimeSpan SpreadRatio = TimeSpan.FromMinutes(15);
+
+    /// <summary>
+    /// Net Vanna and Charm exposure across the full nearest-expiry chain (2026-09-08,
+    /// diagnostic-only -- see ScoreWeights.Default's VannaExposure/CharmExposure weights).
+    /// Same nature as GammaExposure -- OI-weighted, changes mostly as OI shifts rather than
+    /// tick-by-tick -- so the same 30-minute window applies to both.
+    /// </summary>
+    public static readonly TimeSpan VannaExposure = TimeSpan.FromMinutes(30);
+
+    public static readonly TimeSpan CharmExposure = TimeSpan.FromMinutes(30);
+
+    /// <summary>
+    /// Quote-rule aggressor-volume proxy (2026-09-08, diagnostic-only -- see
+    /// ScoreWeights.Default's CvdProxy weight), across the full nearest-expiry chain. A genuine
+    /// interval delta driven by trading activity, same as VolumePcr (its closest sibling, whose
+    /// full-chain volume-delta tracking this reuses directly) -- same 30-minute window.
+    /// </summary>
+    public static readonly TimeSpan CvdProxy = TimeSpan.FromMinutes(30);
+
+    /// <summary>
+    /// ATM straddle richness-vs-expected (2026-09-08, diagnostic-only -- see
+    /// ScoreWeights.Default's StraddleRichness weight). Driven by option quotes moving
+    /// cadence-to-cadence, not by OI updates, so it's the noisier, quote-driven kind of metric --
+    /// same 15-minute window as IvSkew/SpreadRatio rather than the 30-minute OI-driven ones.
+    /// </summary>
+    public static readonly TimeSpan StraddleRichness = TimeSpan.FromMinutes(15);
 }

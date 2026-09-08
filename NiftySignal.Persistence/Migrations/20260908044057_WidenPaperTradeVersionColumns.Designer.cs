@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using NiftySignal.Persistence;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace NiftySignal.Persistence.Migrations
 {
     [DbContext(typeof(NiftySignalDbContext))]
-    partial class NiftySignalDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260908044057_WidenPaperTradeVersionColumns")]
+    partial class WidenPaperTradeVersionColumns
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -275,12 +278,6 @@ namespace NiftySignal.Persistence.Migrations
 
                     NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
 
-                    b.Property<double?>("CharmExposureRaw")
-                        .HasColumnType("double precision");
-
-                    b.Property<double?>("CharmExposureZ")
-                        .HasColumnType("double precision");
-
                     b.Property<double?>("CompositeScore")
                         .HasColumnType("double precision");
 
@@ -292,12 +289,6 @@ namespace NiftySignal.Persistence.Migrations
 
                     b.Property<DateTimeOffset>("ComputedAt")
                         .HasColumnType("timestamp with time zone");
-
-                    b.Property<double?>("CvdProxyRaw")
-                        .HasColumnType("double precision");
-
-                    b.Property<double?>("CvdProxyZ")
-                        .HasColumnType("double precision");
 
                     b.Property<double?>("DepthImbalanceRaw")
                         .HasColumnType("double precision");
@@ -315,9 +306,6 @@ namespace NiftySignal.Persistence.Migrations
                         .HasColumnType("double precision");
 
                     b.Property<double?>("GammaExposureZ")
-                        .HasColumnType("double precision");
-
-                    b.Property<double?>("GammaFlipLevel")
                         .HasColumnType("double precision");
 
                     b.Property<bool>("IsWarmedUp")
@@ -354,18 +342,6 @@ namespace NiftySignal.Persistence.Migrations
                         .HasColumnType("double precision");
 
                     b.Property<double?>("SpreadRatioZ")
-                        .HasColumnType("double precision");
-
-                    b.Property<double?>("StraddleRichnessRaw")
-                        .HasColumnType("double precision");
-
-                    b.Property<double?>("StraddleRichnessZ")
-                        .HasColumnType("double precision");
-
-                    b.Property<double?>("VannaExposureRaw")
-                        .HasColumnType("double precision");
-
-                    b.Property<double?>("VannaExposureZ")
                         .HasColumnType("double precision");
 
                     b.Property<double?>("VixChangeRaw")
@@ -427,17 +403,7 @@ namespace NiftySignal.Persistence.Migrations
                         .HasPrecision(18, 4)
                         .HasColumnType("numeric(18,4)");
 
-                    b.Property<decimal?>("MarkPriceDelta")
-                        .HasPrecision(18, 4)
-                        .HasColumnType("numeric(18,4)");
-
-                    b.Property<int?>("OiBuildup")
-                        .HasColumnType("integer");
-
                     b.Property<long?>("OpenInterest")
-                        .HasColumnType("bigint");
-
-                    b.Property<long?>("OpenInterestDelta")
                         .HasColumnType("bigint");
 
                     b.Property<int>("OptionType")
