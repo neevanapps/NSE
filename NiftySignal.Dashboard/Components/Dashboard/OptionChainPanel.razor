@@ -24,8 +24,19 @@
         <table class="data-table chain-table">
             <thead>
                 <tr>
-                    <th>Strike</th>
-                    <th>Type</th>
+                    <th colspan="8" class="text-bull" style="text-align:center;">Calls</th>
+                    <th rowspan="2">Strike</th>
+                    <th colspan="8" class="text-bear" style="text-align:center;">Puts</th>
+                </tr>
+                <tr>
+                    <th>Buildup</th>
+                    <th>Depth Imb.</th>
+                    <th>IV</th>
+                    <th>OI %</th>
+                    <th>OI</th>
+                    <th>Diff</th>
+                    <th>Theo.</th>
+                    <th>LTP</th>
                     <th>LTP</th>
                     <th>Theo.</th>
                     <th>Diff</th>
@@ -37,21 +48,26 @@
                 </tr>
             </thead>
             <tbody>
-                @foreach (var row in VisibleRows)
+                @foreach (var row in VisibleStrikeRows)
                 {
                     <tr class="@(row.IsAtm ? "atm-row" : "")">
+                        <td><span class="badge @BuildupClass(row.Call)">@FormatBuildup(row.Call)</span></td>
+                        <td class="@DepthImbClass(row.Call)">@FormatDepthImb(row.Call)</td>
+                        <td>@FormatIv(row.Call)</td>
+                        <td class="@OiChangeClass(row.Call)">@FormatOiChangePct(row.Call)</td>
+                        <td>@FormatOi(row.Call)</td>
+                        <td class="@DiffClass(row.Call?.PriceVsTheoretical)">@FormatDiffCell(row.Call)</td>
+                        <td class="text-dim">@FormatTheo(row.Call)</td>
+                        <td>@FormatLtp(row.Call)</td>
                         <td class="mono">@row.Strike.ToString("0")@(row.IsAtm ? " •" : "")</td>
-                        <td><span class="badge @(row.OptionType == OptionType.Call ? "badge-bull" : "badge-bear")">@(row.OptionType == OptionType.Call ? "CE" : "PE")</span></td>
-                        <td>@row.Ltp.ToString("0.00")</td>
-                        <td class="text-dim">@(row.TheoreticalPrice is { } theo ? theo.ToString("0.00") : "—")</td>
-                        <td class="@DiffClass(row.PriceVsTheoretical)">
-                            @(row.PriceVsTheoretical is { } diff ? FormatDiff(diff) : "—")
-                        </td>
-                        <td>@row.OpenInterest.ToString("N0")</td>
-                        <td class="@(row.OiChangePct >= 0 ? "text-bull" : "text-bear")">@row.OiChangePct.ToString("+0.0;-0.0")%</td>
-                        <td>@(row.ImpliedVolatility is { } iv ? $"{iv * 100:0.0}%" : "—")</td>
-                        <td class="@(row.DepthImbalance >= 0 ? "text-bull" : "text-bear")">@row.DepthImbalance.ToString("+0.00;-0.00")</td>
-                        <td><span class="badge @BuildupClass(row.Buildup)">@FormatBuildup(row.Buildup)</span></td>
+                        <td>@FormatLtp(row.Put)</td>
+                        <td class="text-dim">@FormatTheo(row.Put)</td>
+                        <td class="@DiffClass(row.Put?.PriceVsTheoretical)">@FormatDiffCell(row.Put)</td>
+                        <td>@FormatOi(row.Put)</td>
+                        <td class="@OiChangeClass(row.Put)">@FormatOiChangePct(row.Put)</td>
+                        <td>@FormatIv(row.Put)</td>
+                        <td class="@DepthImbClass(row.Put)">@FormatDepthImb(row.Put)</td>
+                        <td><span class="badge @BuildupClass(row.Put)">@FormatBuildup(row.Put)</span></td>
                     </tr>
                 }
             </tbody>
@@ -83,13 +99,19 @@
         }
     }
 
-    // ATM +/- StrikesEachSide (7 strikes total, both CE and PE -- 14 rows) rather than the
-    // full tracked chain (2026-09-08, dashboard request): the wide chain was mostly deep
-    // OTM strikes nobody reads at a glance. Centered on whichever row IsAtm marks, not a
-    // separately-tracked ATM value -- BuildOptionChainAsync already computes that once.
+    // ATM +/- StrikesEachSide (7 strikes total, both CE and PE) rather than the full tracked
+    // chain (2026-09-08, dashboard request): the wide chain was mostly deep OTM strikes nobody
+    // reads at a glance. Centered on whichever row IsAtm marks, not a separately-tracked ATM
+    // value -- BuildOptionChainAsync already computes that once.
     const int StrikesEachSide = 3;
 
-    IEnumerable<OptionChainRow> VisibleRows
+    /// <summary>One row per strike, call leg and put leg side by side (2026-09-08 dashboard
+    /// request) instead of the call and put as two separate rows -- a classic option-chain
+    /// read: calls on the left, strike in the middle, puts on the right, both sides sharing the
+    /// exact same column set so a level can be compared left-to-right at a glance. Either leg
+    /// can be null (an instrument dropped from the tracked universe, or no tick yet) -- the
+    /// per-cell formatters below render "—" rather than assuming both always exist.</summary>
+    IEnumerable<(decimal Strike, bool IsAtm, OptionChainRow? Call, OptionChainRow? Put)> VisibleStrikeRows
     {
         get
         {
@@ -100,21 +122,22 @@
 
             var expiryRows = Live.OptionChain.Where(r => r.ExpiryDate == expiry).ToList();
             var strikes = expiryRows.Select(r => r.Strike).Distinct().OrderBy(s => s).ToList();
-            var atmIndex = strikes.IndexOf(expiryRows.FirstOrDefault(r => r.IsAtm)?.Strike ?? decimal.MinValue);
+            var atmStrike = expiryRows.FirstOrDefault(r => r.IsAtm)?.Strike;
+            var atmIndex = atmStrike is { } atm ? strikes.IndexOf(atm) : -1;
 
             // No ATM resolved yet (e.g. no live spot tick this session) -- fall back to the
             // full chain rather than showing nothing.
-            if (atmIndex < 0)
-            {
-                return expiryRows.OrderBy(r => r.Strike).ThenBy(r => r.OptionType);
-            }
+            var visibleStrikes = atmIndex < 0
+                ? strikes
+                : strikes
+                    .Skip(Math.Max(0, Math.Min(atmIndex - StrikesEachSide, strikes.Count - (2 * StrikesEachSide + 1))))
+                    .Take(2 * StrikesEachSide + 1);
 
-            var visibleStrikes = strikes
-                .Skip(Math.Max(0, Math.Min(atmIndex - StrikesEachSide, strikes.Count - (2 * StrikesEachSide + 1))))
-                .Take(2 * StrikesEachSide + 1)
-                .ToHashSet();
-
-            return expiryRows.Where(r => visibleStrikes.Contains(r.Strike)).OrderBy(r => r.Strike).ThenBy(r => r.OptionType);
+            return visibleStrikes.Select(s => (
+                Strike: s,
+                IsAtm: s == atmStrike,
+                Call: expiryRows.FirstOrDefault(r => r.Strike == s && r.OptionType == OptionType.Call),
+                Put: expiryRows.FirstOrDefault(r => r.Strike == s && r.OptionType == OptionType.Put)));
         }
     }
 
@@ -123,24 +146,46 @@
     // "08 Sep" is enough to tell the two tracked weeklies apart at a glance.
     static string FormatExpiry(DateOnly expiry) => expiry.ToString("dd MMM");
 
+    static string FormatLtp(OptionChainRow? r) => r is null ? "—" : r.Ltp.ToString("0.00");
+
+    static string FormatTheo(OptionChainRow? r) => r?.TheoreticalPrice is { } t ? t.ToString("0.00") : "—";
+
     // Round before formatting, and give zero its own branch. Two reasons: a difference that
     // *displays* as zero shouldn't carry a sign, and IEEE-754 negative zero (which
     // actual-minus-theoretical produces whenever they're equal, e.g. at the ATM strike whose
     // own vol is the reference) otherwise renders as the nonsense "-+0.00" -- .NET Core 3.0+
     // preserves -0.0's sign but picks the positive section for it, then prepends the minus.
-    static string FormatDiff(double diff)
+    static string FormatDiffCell(OptionChainRow? r)
     {
+        if (r?.PriceVsTheoretical is not { } diff)
+        {
+            return "—";
+        }
+
         var rounded = Math.Round(diff, 2);
         return rounded == 0 ? "0.00" : rounded.ToString("+0.00;-0.00");
     }
 
     // Coloured off the same rounded value the cell displays, so a "0.00" is never tinted
-    // bearish by a residue too small to see.
+    // bearish by a residue too small to see. Also the shared null-row fallback ("—" isn't
+    // bull or bear) since it already treats a missing diff as "text-dim".
     static string DiffClass(double? diff) => diff is { } d && Math.Round(d, 2) is var r && r != 0
         ? (r > 0 ? "text-bull" : "text-bear")
         : "text-dim";
 
-    static string BuildupClass(OiBuildupClassification b) => b switch
+    static string FormatOi(OptionChainRow? r) => r is null ? "—" : r.OpenInterest.ToString("N0");
+
+    static string FormatOiChangePct(OptionChainRow? r) => r is null ? "—" : r.OiChangePct.ToString("+0.0;-0.0") + "%";
+
+    static string OiChangeClass(OptionChainRow? r) => r is null ? "text-dim" : (r.OiChangePct >= 0 ? "text-bull" : "text-bear");
+
+    static string FormatIv(OptionChainRow? r) => r?.ImpliedVolatility is { } iv ? $"{iv * 100:0.0}%" : "—";
+
+    static string FormatDepthImb(OptionChainRow? r) => r is null ? "—" : r.DepthImbalance.ToString("+0.00;-0.00");
+
+    static string DepthImbClass(OptionChainRow? r) => r is null ? "text-dim" : (r.DepthImbalance >= 0 ? "text-bull" : "text-bear");
+
+    static string BuildupClass(OptionChainRow? r) => r?.Buildup switch
     {
         OiBuildupClassification.LongBuildup => "badge-bull",
         OiBuildupClassification.ShortCovering => "badge-bull",
@@ -149,12 +194,13 @@
         _ => "badge-neutral",
     };
 
-    static string FormatBuildup(OiBuildupClassification b) => b switch
+    static string FormatBuildup(OptionChainRow? r) => r?.Buildup switch
     {
         OiBuildupClassification.LongBuildup => "Long Buildup",
         OiBuildupClassification.ShortBuildup => "Short Buildup",
         OiBuildupClassification.LongUnwinding => "Long Unwinding",
         OiBuildupClassification.ShortCovering => "Short Covering",
+        null => "—",
         _ => "Neutral",
     };
 
