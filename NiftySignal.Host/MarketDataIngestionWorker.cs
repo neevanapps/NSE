@@ -487,6 +487,21 @@ public sealed class MarketDataIngestionWorker(
         logger.LogInformation("Replayed {Count} historical score snapshots into the rolling windows", history.Count);
     }
 
+    // PENDING (audit finding F34, 2026-09-09, live-caught): no try/catch here or around the
+    // await foreach loop in RunTickLoopAsync -- a transient DB failure (live-caught: a routine
+    // Postgres service restart, mid-session) throws straight out of this method, out of the
+    // await foreach in RunTickLoopAsync, and crashes the whole BackgroundService. NiftySignalHost
+    // went to Stopped and needed a manual Start-Service to recover; had a position been open at
+    // the time, it would have gone unmonitored (no stop-loss/exit-rule evaluation) until someone
+    // noticed. This is the exact same failure class RunScoreCadenceLoopAsync was already fixed
+    // against on 2026-09-08 (see its own catch block's doc comment: "One bad cadence must never
+    // take down the rest of the day") -- that fix was never extended to this loop, or to
+    // RunSampleLoopAsync/RunPendingSubscriptionLoopAsync, both of which have the identical gap
+    // (no catch around their own per-tick work, including RunPendingSubscriptionLoopAsync's own
+    // real DB reads/writes). Fix: wrap each loop's per-iteration body in the same
+    // catch (Exception ex) when (ex is not OperationCanceledException) -> log and continue
+    // pattern RunScoreCadenceLoopAsync already uses, applied consistently across all four loops,
+    // not just the one that happened to get live-caught first.
     async Task FlushAsync(List<Tick> buffer, CancellationToken ct)
     {
         await using var scope = scopeFactory.CreateAsyncScope();
