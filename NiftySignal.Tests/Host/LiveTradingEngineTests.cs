@@ -218,6 +218,46 @@ public class LiveTradingEngineTests
         Assert.Contains(fixture.Telegram.Sent, s => s.Category == NotificationCategory.TradeEntry);
     }
 
+    static ScoreSnapshot WarmedSnapshotWithOpposingRatioScore(double score, DateTimeOffset at) => new()
+    {
+        ComputedAt = at,
+        CompositeScore = score,
+        IsWarmedUp = true,
+        WeightSetVersion = "test-weights-1",
+        // Strongly bearish and warmed up -- the opposite direction and sign from `score`
+        // above, and clearly past any threshold that would matter if this were ever read.
+        RatioCompositeScore = -99,
+        RatioIsWarmedUp = true,
+        RatioWeightSetVersion = "ratio-test-1",
+    };
+
+    [Fact]
+    public async Task EvaluateCadenceAsync_IgnoresRatioCompositeScore_EvenWhenStronglyOppositeToCompositeScore()
+    {
+        // Structural-safety proof (weekend build, 2026-09-09): LiveTradingEngine reads only
+        // ScoreSnapshot.CompositeScore to decide entries -- a RatioCompositeScore strongly
+        // opposite in sign must have zero effect. Same four-cadence sustain sequence as
+        // EvaluateCadenceAsync_EntersTrade_WhenScoreSustainedAndStrikeCandidateValid above,
+        // and must produce the identical outcome despite the added opposing ratio score.
+        await using var fixture = new Fixture();
+        var t0 = new DateTimeOffset(2026, 9, 4, 10, 0, 0, Ist);
+        var featureEngine = WarmedFeatureEngineWithAtmCall(t0);
+
+        await fixture.Engine.EvaluateCadenceAsync(WarmedSnapshotWithOpposingRatioScore(70, t0), featureEngine, CancellationToken.None);
+        await fixture.Engine.EvaluateCadenceAsync(WarmedSnapshotWithOpposingRatioScore(70, t0.AddSeconds(15)), featureEngine, CancellationToken.None);
+        await fixture.Engine.EvaluateCadenceAsync(WarmedSnapshotWithOpposingRatioScore(70, t0.AddSeconds(30)), featureEngine, CancellationToken.None);
+        await fixture.Engine.EvaluateCadenceAsync(WarmedSnapshotWithOpposingRatioScore(70, t0.AddSeconds(45)), featureEngine, CancellationToken.None);
+
+        await fixture.WithDbAsync(async db =>
+        {
+            var trade = Assert.Single(await db.PaperTrades.ToListAsync());
+            Assert.Equal(AtmCallToken, trade.InstrumentToken);
+            Assert.Equal(EntryDirection.Bullish, trade.Direction);
+            Assert.Equal(70, trade.EntryScore);
+            Assert.Equal(125.34m, trade.EntryPrice);
+        });
+    }
+
     [Fact]
     public async Task EvaluateCadenceAsync_SquareOff_ClosesOpenPosition()
     {

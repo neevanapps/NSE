@@ -102,7 +102,7 @@ public sealed class MarketDataIngestionWorker(
         var instruments = await ResolveInstrumentsAsync(session.Token, asOfDate, stoppingToken);
         var subscriptions = instruments.Select(i => (i.Exchange, i.Token)).ToList();
 
-        _engine = new LiveFeatureEngine(instruments, scoreWeightsOptions, pricingOptions);
+        _engine = new LiveFeatureEngine(instruments, scoreWeightsOptions, pricingOptions, logger);
         await SeedEngineHistoryAsync(_engine, asOfDate, stoppingToken);
         await SeedPriorSessionIvHistoryAsync(_engine, asOfDate, stoppingToken);
         await dashboardPush.StartAsync(stoppingToken);

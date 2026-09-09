@@ -1598,4 +1598,202 @@ public class LiveFeatureEngineTests
         var exception = Record.Exception(() => engine.SeedHistory(history));
         Assert.Null(exception);
     }
+
+    // --- Ratio-based composite score (weekend build, 2026-09-09) ---------------------------
+
+    /// <summary>ATM+/-5 strikes at 50-point spacing, offset 0 == the 23950 ATM strike used everywhere else in this file -- BaseUniverse's single pair is insufficient for the ratio composite's wider bands (metrics 1/2's ATM+/-5).</summary>
+    static string WideCallToken(int offsetFromAtm) => $"7{offsetFromAtm + 5:00}";
+    static string WidePutToken(int offsetFromAtm) => $"8{offsetFromAtm + 5:00}";
+
+    static List<Instrument> WideRatioUniverse()
+    {
+        var universe = new List<Instrument> { Spot(), Future() };
+        for (var offset = -5; offset <= 5; offset++)
+        {
+            var strike = 23950m + (offset * 50m);
+            universe.Add(Option(WideCallToken(offset), OptionType.Call, strike));
+            universe.Add(Option(WidePutToken(offset), OptionType.Put, strike));
+        }
+
+        return universe;
+    }
+
+    /// <summary>
+    /// Ticks every strike in <see cref="WideRatioUniverse"/> with real Black-Scholes-consistent
+    /// two-way quotes (priced from <paramref name="underlying"/>/<paramref name="vol"/> at each
+    /// strike) rather than an arbitrary linear price ladder -- a hand-rolled price scheme
+    /// produces strike/price combinations the IV solver can't reliably round-trip (or that
+    /// don't bracket a real 25-delta strike for metric 4's selection), where a real BS price at
+    /// a known vol always converges cleanly. Shared setup for the tests below.
+    /// </summary>
+    static void TickWideRatioUniverse(LiveFeatureEngine engine, DateTimeOffset at, decimal underlying = 23950m, double vol = 0.40, long oi = 100_000, long volume = 1_000)
+    {
+        var t = TimeToExpiry.YearsUntilExpiry(NearestExpiry, at);
+        for (var offset = -5; offset <= 5; offset++)
+        {
+            var strike = 23950m + (offset * 50m);
+            var callPrice = Math.Max(0.5m, (decimal)BlackScholes.Calculate(OptionType.Call, (double)underlying, (double)strike, t, 0.065, vol).Price);
+            var putPrice = Math.Max(0.5m, (decimal)BlackScholes.Calculate(OptionType.Put, (double)underlying, (double)strike, t, 0.065, vol).Price);
+            engine.OnTick(MakeTick(WideCallToken(offset), callPrice, at, oi: oi, depth: Depth(500, 400, bid: callPrice - 0.5m, ask: callPrice + 0.5m), volume: volume));
+            engine.OnTick(MakeTick(WidePutToken(offset), putPrice, at, oi: oi, depth: Depth(500, 400, bid: putPrice - 0.5m, ask: putPrice + 0.5m), volume: volume));
+        }
+    }
+
+    [Fact]
+    public void ComputeCadence_RatioFlowMetricsAreNull_OnTheFirstCadence_WithNoPriorStateToDeltaAgainst()
+    {
+        var engine = new LiveFeatureEngine(WideRatioUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        TickWideRatioUniverse(engine, Start);
+
+        var snapshot = engine.ComputeCadence(Start);
+
+        Assert.NotNull(snapshot);
+        // Metrics 1 (notional volume delta), 2 (sized OI flow delta) and 3 (residual, needs a
+        // previous cadence's Greeks) all need a prior cadence to delta against -- null on the
+        // very first cadence, same as OiBuildupNetRaw's own well-established behavior.
+        Assert.Null(snapshot!.RatioNotionalVolumeRaw);
+        Assert.Null(snapshot.RatioSizedOiFlowRaw);
+        Assert.Null(snapshot.RatioResidualDifferenceRaw);
+        // Metrics 4 (IV skew) and 5 (spread ratio) are point-in-time reads -- no history needed.
+        Assert.NotNull(snapshot.RatioIvSkew25dRaw);
+        Assert.NotNull(snapshot.RatioSpreadAtmRaw);
+    }
+
+    [Fact]
+    public void ComputeCadence_PopulatesAllFiveRatioMetrics_AndWarmsUp_OnceThereIsPriorStateToDeltaAgainst()
+    {
+        var engine = new LiveFeatureEngine(WideRatioUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        TickWideRatioUniverse(engine, Start);
+        engine.ComputeCadence(Start);
+
+        var next = Start.AddSeconds(15);
+        engine.OnTick(MakeTick(SpotToken, 23960m, next)); // spot up -> call OI-up strikes classify LongBuildup (constructive)
+        engine.OnTick(MakeTick(FutureToken, 24010m, next));
+        TickWideRatioUniverse(engine, next, underlying: 23960m, vol: 0.42, oi: 105_000, volume: 1_500);
+
+        var snapshot = engine.ComputeCadence(next);
+
+        Assert.NotNull(snapshot);
+        Assert.NotNull(snapshot!.RatioNotionalVolumeRaw);
+        Assert.NotNull(snapshot.RatioSizedOiFlowRaw);
+        Assert.NotNull(snapshot.RatioResidualDifferenceRaw);
+        Assert.NotNull(snapshot.RatioIvSkew25dRaw);
+        Assert.NotNull(snapshot.RatioSpreadAtmRaw);
+        Assert.True(snapshot.RatioIsWarmedUp);
+        Assert.NotNull(snapshot.RatioCompositeScore);
+        Assert.NotNull(snapshot.RatioWeightSetVersion);
+    }
+
+    [Fact]
+    public void ComputeRatioNotionalVolumeRaw_ExcludesStrikesBeyondTheWideBand()
+    {
+        // A strike far outside ATM+/-5 with an enormous volume delta must not move metric 1 at
+        // all -- proves the band restriction is real, not just documented.
+        var universe = WideRatioUniverse();
+        universe.Add(Option("90001", OptionType.Call, 30000m)); // ~41 strikes away, nowhere near ATM+/-5
+        var engineWithFarStrike = new LiveFeatureEngine(universe);
+        var engineWithoutFarStrike = new LiveFeatureEngine(WideRatioUniverse());
+
+        foreach (var engine in new[] { engineWithFarStrike, engineWithoutFarStrike })
+        {
+            engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+            engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+            TickWideRatioUniverse(engine, Start);
+            engine.ComputeCadence(Start);
+        }
+
+        engineWithFarStrike.OnTick(MakeTick("90001", 500m, Start.AddSeconds(15), depth: Depth(100, 100, bid: 499.5m, ask: 500.5m), volume: 1_000_000));
+
+        var next = Start.AddSeconds(15);
+        foreach (var engine in new[] { engineWithFarStrike, engineWithoutFarStrike })
+        {
+            engine.OnTick(MakeTick(SpotToken, 23950m, next));
+            engine.OnTick(MakeTick(FutureToken, 24000m, next));
+            TickWideRatioUniverse(engine, next, volume: 1_500);
+        }
+
+        var withFarStrike = engineWithFarStrike.ComputeCadence(next);
+        var withoutFarStrike = engineWithoutFarStrike.ComputeCadence(next);
+
+        Assert.NotNull(withFarStrike!.RatioNotionalVolumeRaw);
+        Assert.NotNull(withoutFarStrike!.RatioNotionalVolumeRaw);
+        Assert.Equal(withoutFarStrike.RatioNotionalVolumeRaw!.Value, withFarStrike.RatioNotionalVolumeRaw!.Value, 6);
+    }
+
+    [Fact]
+    public void ComputeResidualDifference_IsNull_WhenTheAtmStrikeHasRolled()
+    {
+        var engine = new LiveFeatureEngine(WideRatioUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        TickWideRatioUniverse(engine, Start);
+        engine.ComputeCadence(Start);
+
+        // A large spot jump moves the nearest-strike ATM pick from 23950 to a different strike
+        // (23950 + 250 = 24200, the edge of the tracked band) -- comparing this cadence's new
+        // ATM legs against last cadence's *different* ATM legs would be meaningless, same guard
+        // ComputeStraddleRichness already has.
+        var next = Start.AddSeconds(15);
+        engine.OnTick(MakeTick(SpotToken, 24200m, next));
+        engine.OnTick(MakeTick(FutureToken, 24250m, next));
+        TickWideRatioUniverse(engine, next, underlying: 24200m, volume: 1_500);
+
+        var snapshot = engine.ComputeCadence(next);
+
+        Assert.NotNull(snapshot);
+        Assert.Null(snapshot!.RatioResidualDifferenceRaw);
+    }
+
+    [Fact]
+    public void RatioCompositeScore_IsNonNull_WithOnlyThreeOfFiveMetricsPresent()
+    {
+        // Optional-components proof (2026-09-09 review amendment): both flow metrics (1, 2)
+        // deliberately starved below their liquidity floors by ticking zero volume/OI change
+        // this cadence, leaving only metrics 3, 4, 5 -- the composite must still publish a
+        // score, renormalized over the three present components, not go cold.
+        var engine = new LiveFeatureEngine(WideRatioUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        TickWideRatioUniverse(engine, Start);
+        engine.ComputeCadence(Start);
+
+        var next = Start.AddSeconds(15);
+        engine.OnTick(MakeTick(SpotToken, 23960m, next));
+        engine.OnTick(MakeTick(FutureToken, 24010m, next));
+        // Same OI and same volume as last cadence -- zero delta on both, so metrics 1 and 2
+        // fall below their liquidity floors and come back null. The vol shift still moves the
+        // residual (metric 3), and skew/spread (4, 5) are point-in-time reads regardless.
+        TickWideRatioUniverse(engine, next, underlying: 23960m, vol: 0.42);
+
+        var snapshot = engine.ComputeCadence(next);
+
+        Assert.NotNull(snapshot);
+        Assert.Null(snapshot!.RatioNotionalVolumeRaw);
+        Assert.Null(snapshot.RatioSizedOiFlowRaw);
+        Assert.NotNull(snapshot.RatioResidualDifferenceRaw);
+        Assert.NotNull(snapshot.RatioIvSkew25dRaw);
+        Assert.NotNull(snapshot.RatioSpreadAtmRaw);
+        Assert.True(snapshot.RatioIsWarmedUp);
+        Assert.NotNull(snapshot.RatioCompositeScore);
+    }
+
+    [Fact]
+    public void SeedHistory_ReplaysTheRatioCompositeFifo_SoARestartDoesNotResetItsWarmUp()
+    {
+        var history = new List<ScoreSnapshot>
+        {
+            new() { ComputedAt = Start, RatioCompositeScoreRawInstant = 0.4, WeightSetVersion = "v1" },
+            new() { ComputedAt = Start.AddSeconds(15), RatioCompositeScoreRawInstant = 0.6, WeightSetVersion = "v1" },
+        };
+
+        var engine = new LiveFeatureEngine(WideRatioUniverse());
+
+        var exception = Record.Exception(() => engine.SeedHistory(history));
+
+        Assert.Null(exception);
+    }
 }

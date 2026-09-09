@@ -204,4 +204,40 @@ public sealed class ScoreSnapshot
     public bool IsWarmedUp { get; set; }
 
     public required string WeightSetVersion { get; set; }
+
+    // --- Ratio-based composite score (weekend build, 2026-09-09) -----------------------------
+    // A second, independent scoring pipeline running alongside the composite above -- not a
+    // replacement. LiveTradingEngine reads none of the columns below (see
+    // LiveTradingEngineTests' trading-safety parity test, which asserts this directly rather
+    // than leaving it as a code-reading claim). See NiftySignal.Scoring.RatioScoreCalculator
+    // and LiveFeatureEngine's ratio-metric methods for how each is computed.
+
+    /// <summary>Call notional / put notional, ATM+/-5, log-ratio-clipped -- see LiveFeatureEngine.ComputeRatioNotionalVolumeRaw. Null when combined notional is below RatioMetricScales.MinNotionalForVolumeRatio (no real signal that bar, not a divide-by-zero guard).</summary>
+    public double? RatioNotionalVolumeRaw { get; set; }
+
+    /// <summary>Sized, spot-classified constructive OI flow ratio, ATM+/-5, log-ratio-clipped -- see LiveFeatureEngine.ComputeRatioSizedOiFlowRaw. Null when combined constructive flow is below RatioMetricScales.MinContractsForOiFlow.</summary>
+    public double? RatioSizedOiFlowRaw { get; set; }
+
+    /// <summary>ATM call residual minus ATM put residual (rupees), each leg's actual mark change minus its own Delta+Gamma+Theta+Vega-predicted change -- see LiveFeatureEngine.ComputeResidualDifference. A difference, not a ratio (a ratio blows up near zero). Null on an ATM strike roll, same guard as StraddleRichnessRaw.</summary>
+    public double? RatioResidualDifferenceRaw { get; set; }
+
+    /// <summary>25-delta put IV / 25-delta call IV -- see LiveFeatureEngine.ComputeIvSkewRatio25Delta. A materially different quantity from IvSkewOneSigmaRaw (~16-delta, F8) -- never treat the two as the same series.</summary>
+    public double? RatioIvSkew25dRaw { get; set; }
+
+    /// <summary>OI-weighted put spread% / call spread%, ATM+/-2 -- see LiveFeatureEngine.ComputeRatioSpreadAtmRaw. Reuses the same per-cadence spread samples SpreadRatioRaw does.</summary>
+    public double? RatioSpreadAtmRaw { get; set; }
+
+    /// <summary>The single-cadence ratio-composite raw before smoothing -- transparency/future-analysis only, same role as CompositeScoreRawInstant.</summary>
+    public double? RatioCompositeScoreRawInstant { get; set; }
+
+    /// <summary>The smoothed (12-cadence FIFO, ~RatioCompositeSmoothingCadences) ratio-composite raw -- the tradable value, if this pipeline is ever wired into a decision. Persisted so the smoothing FIFO can be replayed on restart via SeedHistory, same reason CompositeScoreRaw is.</summary>
+    public double? RatioCompositeScoreRaw { get; set; }
+
+    /// <summary><c>100 * tanh(RatioCompositeScoreRaw / k)</c>, k = RatioScoreCalculator.DefaultK. Null until at least RatioScoreCalculator.MinRequiredComponents of the five Ratio*Raw values above are non-null this cadence.</summary>
+    public double? RatioCompositeScore { get; set; }
+
+    public bool RatioIsWarmedUp { get; set; }
+
+    /// <summary>Nullable unlike the required WeightSetVersion above -- this composite can legitimately fail to warm up (fewer than 3 of 5 metrics present), in which case there's no weight set to attribute the (absent) score to.</summary>
+    public string? RatioWeightSetVersion { get; set; }
 }

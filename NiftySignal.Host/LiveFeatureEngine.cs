@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using NiftySignal.Domain.Configuration;
 using NiftySignal.Domain.Entities;
@@ -120,11 +121,17 @@ public sealed class LiveFeatureEngine
     /// </summary>
     const int PersistedStrikeBand = 2;
 
+    /// <summary>ATM+/-5 band for the ratio composite's flow metrics (1: notional volume, 2: sized OI flow) -- wider than <see cref="PersistedStrikeBand"/> since these are flow quantities meant to capture broader positioning, not just the immediate ATM neighborhood. Well within the tracked ATM+/-10 universe.</summary>
+    const int RatioWideStrikeBand = 5;
+
     // 3 minutes at the 15s cadence (started at 5 min on 2026-09-07, chosen for a deliberately
     // low-frequency, 1-5-trades-a-day strategy; shortened the same day after watching the
     // first live session -- still meaningfully smoothed versus no averaging at all, just less
     // lag between a real move and the score reflecting it).
     const int CompositeSmoothingCadences = 12;
+
+    /// <summary>~12 minutes at the 15s cadence -- inside the ratio composite's requested 10-15 minute smoothing range (weekend build, 2026-09-09).</summary>
+    const int RatioCompositeSmoothingCadences = 48;
 
     readonly IReadOnlyList<Instrument> _instruments;
     readonly Instrument _spot;
@@ -177,8 +184,34 @@ public sealed class LiveFeatureEngine
     double? _previousStraddleThetaPerDay;
     double? _previousStraddleUnderlying;
 
+    /// <summary>
+    /// Same "previous cadence's ATM leg state" pattern as <see cref="_previousStraddleStrike"/>
+    /// and its siblings above, but for the ratio composite's residual metric (weekend build,
+    /// 2026-09-09) -- call and put legs tracked independently rather than combined into one
+    /// straddle, and Gamma/Vega carried alongside Delta/Theta since the residual needs the full
+    /// second-order Taylor prediction. Not restart-seedable, same accepted one-cadence cost
+    /// every other <c>_previousXxx</c> tracker in this class already has.
+    /// </summary>
+    decimal? _previousResidualStrike;
+    DateTimeOffset? _previousResidualAt;
+    decimal? _previousResidualCallMid;
+    decimal? _previousResidualPutMid;
+    double? _previousResidualCallDelta;
+    double? _previousResidualPutDelta;
+    double? _previousResidualCallGamma;
+    double? _previousResidualPutGamma;
+    double? _previousResidualCallTheta;
+    double? _previousResidualPutTheta;
+    double? _previousResidualCallVega;
+    double? _previousResidualPutVega;
+    double? _previousResidualUnderlying;
+    double? _previousResidualVol;
+
     /// <summary>Last <see cref="CompositeSmoothingCadences"/> single-cadence composite raw values, oldest first -- see ComputeCadence's smoothing comment.</summary>
     readonly Queue<double> _compositeRawHistory = new();
+
+    /// <summary>Same FIFO-smoothing mechanism as <see cref="_compositeRawHistory"/>, sized <see cref="RatioCompositeSmoothingCadences"/> (~12 min) instead -- the ratio-based composite's own smoothed raw history (weekend build, 2026-09-09). Deliberately not a new EMA mechanism; the existing pattern already does the job.</summary>
+    readonly Queue<double> _ratioCompositeRawHistory = new();
 
     readonly RunningAverage _basisSamples = new();
     readonly RunningAverage _parityGapSamples = new();
@@ -186,6 +219,9 @@ public sealed class LiveFeatureEngine
     readonly RunningAverage _pcrSamples = new();
     readonly RunningAverage _depthImbalanceSamples = new();
     readonly RunningAverage _ivSkewSamples = new();
+
+    /// <summary>Ratio-composite metric 4 (25-delta put IV / 25-delta call IV), sampled every ~3s like the five metrics above and averaged at cadence time -- see <see cref="ComputeIvSkewRatio25Delta"/>.</summary>
+    readonly RunningAverage _ivSkewRatioSamples = new();
 
     /// <summary>
     /// Per-strike spread samples, fed by <see cref="Sample"/> every ~3s like the five score
@@ -233,6 +269,14 @@ public sealed class LiveFeatureEngine
     readonly Dictionary<string, long> _previousVolumeByToken = [];
 
     /// <summary>
+    /// Cumulative day volume per token as of the last ratio-composite metric-1 computation
+    /// (weekend build, 2026-09-09) -- own independent baseline, not shared with
+    /// <see cref="_previousVolumeByToken"/> or <see cref="_previousVolumeByTokenFullChain"/>,
+    /// same "no accidental cross-method ordering dependency" reasoning those two already state.
+    /// </summary>
+    readonly Dictionary<string, long> _previousVolumeByTokenRatio = [];
+
+    /// <summary>
     /// OI per token as of the last <see cref="BuildStrikeSnapshots"/> pass -- same independent-
     /// baseline reasoning as <see cref="_previousVolumeByToken"/>, and not <see cref="_previousCadence"/>
     /// (see BuildStrikeSnapshots' own doc comment for why). Only holds the persisted band's tokens.
@@ -267,14 +311,25 @@ public sealed class LiveFeatureEngine
 
     ScoreWeights Weights => _scoreWeightsOptions?.Current ?? ScoreWeights.Default;
 
+    /// <summary>
+    /// Logs a ratio-composite metric's own try/catch failures (weekend build, 2026-09-09) --
+    /// optional and trailing, zero-churn for the ~60 existing positional test call sites, same
+    /// reasoning as <see cref="_scoreWeightsOptions"/>/<see cref="_pricingOptions"/> above. Null
+    /// in tests/NiftySignal.ScoreReplay simply means a ratio-metric failure there is silent
+    /// (acceptable -- neither exercises that failure path deliberately).
+    /// </summary>
+    readonly ILogger? _logger;
+
     public LiveFeatureEngine(
         IReadOnlyList<Instrument> instruments,
         IValidatedOptions<ScoreWeights>? scoreWeightsOptions = null,
-        IOptionsMonitor<PricingOptions>? pricingOptions = null)
+        IOptionsMonitor<PricingOptions>? pricingOptions = null,
+        ILogger? logger = null)
     {
         _instruments = instruments;
         _scoreWeightsOptions = scoreWeightsOptions;
         _pricingOptions = pricingOptions;
+        _logger = logger;
         _spot = instruments.First(i => i.InstrumentType == InstrumentType.Index);
         _future = instruments.First(i => i.InstrumentType == InstrumentType.Future);
         _vix = instruments.FirstOrDefault(i => i.InstrumentType == InstrumentType.Vix);
@@ -351,6 +406,20 @@ public sealed class LiveFeatureEngine
                 while (_compositeRawHistory.Count > CompositeSmoothingCadences)
                 {
                     _compositeRawHistory.Dequeue();
+                }
+            }
+
+            // Same restart-safety as the composite's own smoothing FIFO above -- not optional
+            // (weekend build, 2026-09-09): skipping this reintroduces the exact bug the existing
+            // composite's smoothing already had fixed for it (2026-09-04 incident), just for the
+            // ratio composite instead -- every Host restart would silently reset its ~12-minute
+            // warm-up to zero.
+            if (snapshot.RatioCompositeScoreRawInstant is { } ratioCompositeRawInstant)
+            {
+                _ratioCompositeRawHistory.Enqueue(ratioCompositeRawInstant);
+                while (_ratioCompositeRawHistory.Count > RatioCompositeSmoothingCadences)
+                {
+                    _ratioCompositeRawHistory.Dequeue();
                 }
             }
 
@@ -582,6 +651,19 @@ public sealed class LiveFeatureEngine
         _depthImbalanceSamples.Add(ComputeDepthImbalance(spot.LastPrice));
         _ivSkewSamples.Add(ComputeIvSkew(spot.LastPrice, now));
         SampleSpreads();
+
+        // Ratio-composite metric 4 (weekend build, 2026-09-09) -- own try/catch, same "one bad
+        // metric must not take down everything else" discipline as ComputeCadence's own five
+        // ratio wiring points below, so a bug here can't stop the other four noisy metrics
+        // above from sampling this tick.
+        try
+        {
+            _ivSkewRatioSamples.Add(ComputeIvSkewRatio25Delta(spot.LastPrice, now));
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Ratio composite metric 4 (IV skew 25-delta) sample failed");
+        }
     }
 
     /// <summary>
@@ -675,6 +757,65 @@ public sealed class LiveFeatureEngine
         return callMean > 0 ? putMean / callMean : null;
     }
 
+    /// <summary>
+    /// Ratio-composite metric 5 (weekend build, 2026-09-09): OI-weighted put spread% / call
+    /// spread%, restricted to <see cref="PersistedStrikeBand"/> (ATM+/-2, a level quantity --
+    /// unlike metrics 1/2's wider ATM+/-5 flow band). Reuses
+    /// <see cref="_spreadPctOfMidSamplesByToken"/> directly (already filled by
+    /// <see cref="SampleSpreads"/> every ~3s) -- must run before <see cref="BuildStrikeSnapshots"/>
+    /// clears that dictionary, same constraint <see cref="ComputeSpreadRatio"/> already
+    /// documents. Unlike <see cref="ComputeSpreadRatio"/> (unweighted mean, full chain), each
+    /// strike's average spread is weighted by its own OpenInterest before averaging per side --
+    /// a wide spread on a thin, barely-traded strike shouldn't move this metric as much as the
+    /// same spread on a strike everyone is actually quoting. Null when either side has no
+    /// OI-bearing, spread-sampled strike in the band this cadence.
+    /// </summary>
+    double? ComputeRatioSpreadAtmRaw(decimal spotPrice)
+    {
+        var bandStrikes = _nearestExpiryOptions
+            .Select(o => o.StrikePrice!.Value)
+            .Distinct()
+            .OrderBy(s => Math.Abs(s - spotPrice))
+            .Take((PersistedStrikeBand * 2) + 1)
+            .ToHashSet();
+
+        double callWeightedSum = 0, callWeightTotal = 0, putWeightedSum = 0, putWeightTotal = 0;
+
+        foreach (var option in _nearestExpiryOptions.Where(o => bandStrikes.Contains(o.StrikePrice!.Value)))
+        {
+            if (!_spreadPctOfMidSamplesByToken.TryGetValue(option.Token, out var samples) || samples.Average is not { } avgSpreadPct)
+            {
+                continue;
+            }
+
+            if (!_latest.TryGetValue(option.Token, out var state) || state.OpenInterest is not { } oi || oi <= 0)
+            {
+                continue;
+            }
+
+            var weight = (double)oi;
+            if (option.OptionType == OptionType.Call)
+            {
+                callWeightedSum += avgSpreadPct * weight;
+                callWeightTotal += weight;
+            }
+            else if (option.OptionType == OptionType.Put)
+            {
+                putWeightedSum += avgSpreadPct * weight;
+                putWeightTotal += weight;
+            }
+        }
+
+        if (callWeightTotal <= 0 || putWeightTotal <= 0)
+        {
+            return null;
+        }
+
+        var callWeighted = callWeightedSum / callWeightTotal;
+        var putWeighted = putWeightedSum / putWeightTotal;
+        return callWeighted > 0 ? putWeighted / callWeighted : (double?)null;
+    }
+
     /// <summary>Null until the spot and future have at least one tick each.</summary>
     public ScoreSnapshot? ComputeCadence(DateTimeOffset now)
     {
@@ -717,6 +858,20 @@ public sealed class LiveFeatureEngine
             _oiBuildupWindow.Add(now, oiBuildup);
         }
 
+        // Ratio-composite metrics 1+2 (weekend build, 2026-09-09) -- own try/catch, so a bug in
+        // either can't take down the rest of ComputeCadence (F34-style discipline, applied
+        // fresh here rather than retrofitted).
+        double? ratioNotionalVolumeRaw = null, ratioSizedOiFlowRaw = null;
+        try
+        {
+            ratioNotionalVolumeRaw = ComputeRatioNotionalVolumeRaw(spot.LastPrice);
+            ratioSizedOiFlowRaw = ComputeRatioSizedOiFlowRaw(now, spot.LastPrice);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Ratio composite metrics 1/2 (notional volume / sized OI flow) failed");
+        }
+
         var depthImbalanceRaw = _depthImbalanceSamples.Average;
         if (depthImbalanceRaw is { } di)
         {
@@ -729,6 +884,11 @@ public sealed class LiveFeatureEngine
             _ivSkewWindow.Add(now, skew);
         }
 
+        // Captured now, not read later via _ivSkewRatioSamples directly -- ResetSamples() below
+        // clears it, same reason ivSkewRaw above is captured into a local before that call
+        // rather than re-read afterward.
+        var ratioIvSkew25dRaw = _ivSkewRatioSamples.Average;
+
         // Reads _spreadPctOfMidSamplesByToken, which BuildStrikeSnapshots clears later this
         // same cadence -- must run before that, which ResetSamples() below doesn't touch
         // anyway (see SampleSpreads' own doc comment on why it's independent of ResetSamples).
@@ -736,6 +896,18 @@ public sealed class LiveFeatureEngine
         if (spreadRatioRaw is { } sr)
         {
             _spreadRatioWindow.Add(now, sr);
+        }
+
+        // Ratio-composite metric 5 (weekend build, 2026-09-09) -- must run before ResetSamples()
+        // clears _spreadPctOfMidSamplesByToken, same constraint ComputeSpreadRatio itself has.
+        double? ratioSpreadAtmRaw = null;
+        try
+        {
+            ratioSpreadAtmRaw = ComputeRatioSpreadAtmRaw(spot.LastPrice);
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Ratio composite metric 5 (spread ratio ATM) failed");
         }
 
         ResetSamples();
@@ -750,6 +922,7 @@ public sealed class LiveFeatureEngine
         // Not smoothed either -- same reasoning as VixChange (a full-chain aggregate, not a
         // point-in-time price/quote read that benefits from within-cadence averaging).
         double? gammaExposureRaw = null, vannaExposureRaw = null, charmExposureRaw = null, gammaFlipLevel = null, straddleRichnessRaw = null, ivRankRaw = null, atmIvRaw = null;
+        double? ratioResidualDifferenceRaw = null;
         if (_nearestExpiryOptions.Count > 0)
         {
             var gexStrikesByDistance = _nearestExpiryOptions.Select(o => o.StrikePrice!.Value).Distinct().OrderBy(s => Math.Abs(s - spot.LastPrice)).ToList();
@@ -767,6 +940,19 @@ public sealed class LiveFeatureEngine
             straddleRichnessRaw = ComputeStraddleRichness(gexUnderlying, gexAtmVol, gexT, now);
             atmIvRaw = gexAtmVol;
             ivRankRaw = ComputeIvRank(gexAtmVol, now);
+
+            // Ratio-composite metric 3 (weekend build, 2026-09-09) -- reuses this block's
+            // already-solved gexUnderlying/gexAtmVol/gexT rather than an independent ATM solve.
+            // Own try/catch so a bug here can't prevent GEX/Vanna/Charm/StraddleRichness/IvRank
+            // above (already computed by this point) from making it into the snapshot.
+            try
+            {
+                ratioResidualDifferenceRaw = ComputeResidualDifference(gexUnderlying, gexAtmVol, gexT, now);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Ratio composite metric 3 (residual difference) failed");
+            }
         }
 
         if (gammaExposureRaw is { } gex)
@@ -851,6 +1037,49 @@ public sealed class LiveFeatureEngine
         var composite = CompositeScoreCalculator.Calculate(
             inputs, weights, now, CompositeScoreCalculator.DefaultK, compositeRawSmoothed);
 
+        // Ratio-based composite (weekend build, 2026-09-09) -- a second, independent scoring
+        // pipeline; LiveTradingEngine reads none of the fields this produces (see
+        // LiveTradingEngineTests' trading-safety parity test). Own try/catch so a bug here can
+        // never prevent _previousCadence/_lastCadenceAt below from updating, which every
+        // existing metric's *next* cadence depends on.
+        double? ratioCompositeScoreRawInstant = null, ratioCompositeScoreRaw = null, ratioCompositeScore = null;
+        var ratioIsWarmedUp = false;
+        string? ratioWeightSetVersion = null;
+        try
+        {
+            var ratioInputs = new RatioComponentInputs(
+                NotionalVolumeRatio: RatioMetricMath.ClipLogRatio(ratioNotionalVolumeRaw, RatioMetricScales.NotionalVolumeRatioRMax),
+                SizedOiFlowRatio: RatioMetricMath.ClipLogRatio(ratioSizedOiFlowRaw, RatioMetricScales.SizedOiFlowRatioRMax),
+                ResidualDifference: RatioMetricMath.ClipScaledDifference(ratioResidualDifferenceRaw, RatioMetricScales.ResidualDifferenceScale),
+                IvSkew25Delta: RatioMetricMath.ClipLogRatio(ratioIvSkew25dRaw, RatioMetricScales.IvSkewRatioRMax),
+                SpreadRatioAtm: RatioMetricMath.ClipLogRatio(ratioSpreadAtmRaw, RatioMetricScales.SpreadRatioAtmRMax));
+
+            ratioCompositeScoreRawInstant = RatioScoreCalculator.ComputeRaw(ratioInputs, RatioScoreWeights.Default);
+            if (ratioCompositeScoreRawInstant is { } ratioInstantRaw)
+            {
+                _ratioCompositeRawHistory.Enqueue(ratioInstantRaw);
+                while (_ratioCompositeRawHistory.Count > RatioCompositeSmoothingCadences)
+                {
+                    _ratioCompositeRawHistory.Dequeue();
+                }
+
+                ratioCompositeScoreRaw = _ratioCompositeRawHistory.Average();
+            }
+
+            var ratioComposite = RatioScoreCalculator.Calculate(
+                ratioInputs, RatioScoreWeights.Default, now, RatioScoreCalculator.DefaultK, ratioCompositeScoreRaw);
+            ratioCompositeScore = ratioComposite.Score;
+            ratioIsWarmedUp = ratioComposite.IsWarmedUp;
+            if (ratioComposite.IsWarmedUp)
+            {
+                ratioWeightSetVersion = ratioComposite.WeightSetVersion;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Ratio composite combine step failed");
+        }
+
         _previousCadence = new Dictionary<string, InstrumentState>(_latest);
         _lastCadenceAt = now;
 
@@ -896,6 +1125,16 @@ public sealed class LiveFeatureEngine
             SpotPrice = (double)spot.LastPrice,
             IsWarmedUp = composite.IsWarmedUp,
             WeightSetVersion = composite.WeightSetVersion,
+            RatioNotionalVolumeRaw = ratioNotionalVolumeRaw,
+            RatioSizedOiFlowRaw = ratioSizedOiFlowRaw,
+            RatioResidualDifferenceRaw = ratioResidualDifferenceRaw,
+            RatioIvSkew25dRaw = ratioIvSkew25dRaw,
+            RatioSpreadAtmRaw = ratioSpreadAtmRaw,
+            RatioCompositeScoreRawInstant = ratioCompositeScoreRawInstant,
+            RatioCompositeScoreRaw = ratioCompositeScoreRaw,
+            RatioCompositeScore = ratioCompositeScore,
+            RatioIsWarmedUp = ratioIsWarmedUp,
+            RatioWeightSetVersion = ratioWeightSetVersion,
         };
     }
 
@@ -1100,6 +1339,7 @@ public sealed class LiveFeatureEngine
         _pcrSamples.Reset();
         _depthImbalanceSamples.Reset();
         _ivSkewSamples.Reset();
+        _ivSkewRatioSamples.Reset();
     }
 
     double ComputeMomentum(DateTimeOffset now, decimal futuresPrice)
@@ -1275,6 +1515,76 @@ public sealed class LiveFeatureEngine
         return net;
     }
 
+    /// <summary>
+    /// Ratio-composite metric 2 (weekend build, 2026-09-09): sized, spot-classified
+    /// constructive OI flow ratio, ATM+/-<see cref="RatioWideStrikeBand"/> -- same staleness
+    /// gate and spot-driven classification as <see cref="ComputeOiBuildupNet"/> (F17), but
+    /// split by side (call-constructive vs put-constructive |dOI|, summed) instead of netted
+    /// into a single directional number, and over a wider band since this is a flow quantity
+    /// (matches metric 1's own ATM+/-5). "Constructive" uses the same sign table
+    /// ComputeOiBuildupNet does: LongBuildup/ShortCovering for calls, ShortBuildup/LongUnwinding
+    /// for puts -- the classifications that mean fresh, price-confirmed positioning on that
+    /// side, not unwinding.
+    ///
+    /// Null below <see cref="RatioMetricScales.MinContractsForOiFlow"/> combined constructive
+    /// flow -- a quiet bar with near-zero constructive OI on both sides has no real signal, not
+    /// just a numerically awkward ratio. Above the floor, returns <c>(call+1)/(put+1)</c>
+    /// (contracts) rather than the bare ratio -- see <c>RatioMetricMath.ClipLogRatio</c>'s own
+    /// doc comment for why this method, not that one, owns the epsilon pad.
+    /// </summary>
+    double? ComputeRatioSizedOiFlowRaw(DateTimeOffset now, decimal spotPrice)
+    {
+        if (_previousCadence is null || !_previousCadence.TryGetValue(_spot.Token, out var prevSpot))
+        {
+            return null;
+        }
+
+        if (_lastCadenceAt is { } lastAt && now - lastAt > MaxCadenceGapForOiBuildup)
+        {
+            return null;
+        }
+
+        var spotPriceChange = spotPrice - prevSpot.LastPrice;
+
+        var bandStrikes = _nearestExpiryOptions
+            .Select(o => o.StrikePrice!.Value)
+            .Distinct()
+            .OrderBy(s => Math.Abs(s - spotPrice))
+            .Take((RatioWideStrikeBand * 2) + 1)
+            .ToHashSet();
+
+        double callConstructive = 0, putConstructive = 0;
+        foreach (var opt in _nearestExpiryOptions.Where(o => bandStrikes.Contains(o.StrikePrice!.Value)))
+        {
+            if (!_latest.TryGetValue(opt.Token, out var curr) || !_previousCadence.TryGetValue(opt.Token, out var prev))
+            {
+                continue;
+            }
+
+            var oiChange = (curr.OpenInterest ?? 0) - (prev.OpenInterest ?? 0);
+            var classification = OiBuildupClassifier.Classify(spotPriceChange, oiChange);
+
+            if (opt.OptionType == OptionType.Call && classification is OiBuildupClassification.LongBuildup or OiBuildupClassification.ShortCovering)
+            {
+                callConstructive += Math.Abs(oiChange);
+            }
+            else if (opt.OptionType == OptionType.Put && classification is OiBuildupClassification.ShortBuildup or OiBuildupClassification.LongUnwinding)
+            {
+                putConstructive += Math.Abs(oiChange);
+            }
+        }
+
+        if (callConstructive + putConstructive < RatioMetricScales.MinContractsForOiFlow)
+        {
+            return null;
+        }
+
+        // Numerical-safety pad only, 1 contract -- the floor above is what decides "this bar
+        // has no real signal," not this epsilon.
+        const double epsilon = 1.0;
+        return (callConstructive + epsilon) / (putConstructive + epsilon);
+    }
+
     // DEFERRED (audit finding F30, 2026-09-08 lead review -- see fix plan Batch 6/7, "Deferred"
     // section): this reads two option strikes' own depth, which is market-maker inventory, not
     // Nifty order flow. Feasible alternative checked: the future instrument already flows through
@@ -1395,6 +1705,61 @@ public sealed class LiveFeatureEngine
         // currently reads bullish -- the opposite of the standard reading. Needs the same
         // scatter/correlation validation as F23 before changing either.
         return callIv is null || putIv is null ? null : putIv - callIv;
+    }
+
+    /// <summary>
+    /// Ratio-composite metric 4 (weekend build, 2026-09-09): 25-delta put IV / 25-delta call
+    /// IV. Phase 1 approximation (audit finding F36 tracks true smile interpolation as a later
+    /// step) -- picks the tracked strike whose delta, estimated cheaply off the shared ATM
+    /// reference vol rather than its own IV, sits closest to |delta|=0.25 on each side; same
+    /// shortcut <see cref="ComputeGammaExposure"/> already uses (a closed-form BlackScholes
+    /// call per strike, no extra Newton-Raphson solves, and it doesn't require every strike to
+    /// have a fresh two-sided quote). That estimate is used only to pick *which* strike --
+    /// the actual skew read then solves each picked strike's own market-implied IV from its
+    /// real quote, same as <see cref="ComputeIvSkew"/> does for its expected-move-selected
+    /// strikes. Persisted separately from that method's own <c>IvSkewOneSigmaRaw</c> (F8,
+    /// ~1-sigma/16-delta) -- a materially different quantity, never to be read as the same
+    /// series. Sampled every ~3s from <see cref="Sample"/>, like the other four noisy metrics,
+    /// and averaged at cadence time.
+    /// </summary>
+    double? ComputeIvSkewRatio25Delta(decimal spotPrice, DateTimeOffset now)
+    {
+        var t = TimeToExpiry.YearsUntilExpiry(_nearestExpiry, now);
+        var underlying = ComputeUnderlyingPrice(spotPrice, t);
+
+        var atmStrike = _nearestExpiryOptions.Select(o => o.StrikePrice!.Value).Distinct().OrderBy(s => Math.Abs(s - spotPrice)).FirstOrDefault();
+        if (atmStrike == 0 || SolveAtmReferenceVol(atmStrike, underlying, t) is not { } atmVol)
+        {
+            return null;
+        }
+
+        const double targetAbsDelta = 0.25;
+        var underlyingAsDouble = (double)underlying;
+
+        var callOpt = _nearestExpiryOptions
+            .Where(o => o.OptionType == OptionType.Call)
+            .MinBy(o => Math.Abs(Math.Abs(BlackScholes.Calculate(OptionType.Call, underlyingAsDouble, (double)o.StrikePrice!.Value, t, RiskFreeRate, atmVol).Greeks.Delta) - targetAbsDelta));
+        var putOpt = _nearestExpiryOptions
+            .Where(o => o.OptionType == OptionType.Put)
+            .MinBy(o => Math.Abs(Math.Abs(BlackScholes.Calculate(OptionType.Put, underlyingAsDouble, (double)o.StrikePrice!.Value, t, RiskFreeRate, atmVol).Greeks.Delta) - targetAbsDelta));
+
+        if (callOpt is null || putOpt is null
+            || !_latest.TryGetValue(callOpt.Token, out var callState) || !_latest.TryGetValue(putOpt.Token, out var putState))
+        {
+            return null;
+        }
+
+        var callMid = MidPrice(callState);
+        var putMid = MidPrice(putState);
+        if (callMid is not { } cm || putMid is not { } pm)
+        {
+            return null;
+        }
+
+        var callIv = ImpliedVolatilitySolver.Solve(OptionType.Call, (double)cm, (double)underlying, (double)callOpt.StrikePrice!.Value, t, RiskFreeRate);
+        var putIv = ImpliedVolatilitySolver.Solve(OptionType.Put, (double)pm, (double)underlying, (double)putOpt.StrikePrice!.Value, t, RiskFreeRate);
+
+        return callIv is null or <= 0 || putIv is null ? null : putIv / callIv;
     }
 
     /// <summary>
@@ -1686,6 +2051,95 @@ public sealed class LiveFeatureEngine
     }
 
     /// <summary>
+    /// Ratio-composite metric 3 (weekend build, 2026-09-09): ATM call residual minus ATM put
+    /// residual, where each leg's own residual is its actual mark-price change this cadence
+    /// minus what its own previous-cadence Delta/Gamma/Theta/Vega predicted (a proper
+    /// second-order Taylor expansion in spot plus a first-order term in ATM vol) -- a
+    /// difference, not a ratio, since a ratio blows up near zero (both the friend's proposal and
+    /// an independent second review reached this same conclusion). Structurally mirrors
+    /// <see cref="ComputeStraddleRichness"/>'s ATM-strike-roll guard (null, and the tracking
+    /// reset, whenever the ATM strike has moved since last cadence -- comparing two different
+    /// strikes' legs would be meaningless), but tracks the call and put legs independently
+    /// rather than combining them into one straddle, and carries Gamma+Vega in addition to
+    /// Delta+Theta since the residual needs the full prediction, not just the straddle's linear
+    /// approximation. Confirmed still a valid metric after the separate lag-1-autocorrelation
+    /// research thread closed negative (docs/dazzling-orbiting-whistle.md's "Research thread"
+    /// section) -- that finding killed a different claim (mean-reversion of a single leg's
+    /// residual over time), not this one (same-bar call-residual-minus-put-residual as an
+    /// input). Reuses the GEX block's already-solved <paramref name="atmReferenceVol"/> rather
+    /// than an independent ATM-vol solve.
+    /// </summary>
+    double? ComputeResidualDifference(decimal underlying, double? atmReferenceVol, double t, DateTimeOffset now)
+    {
+        if (atmReferenceVol is not { } vol || _nearestExpiryOptions.Count == 0)
+        {
+            return null;
+        }
+
+        var atmStrike = _nearestExpiryOptions.Select(o => o.StrikePrice!.Value).Distinct().OrderBy(s => Math.Abs(s - underlying)).First();
+        var call = _nearestExpiryOptions.FirstOrDefault(o => o.OptionType == OptionType.Call && o.StrikePrice == atmStrike);
+        var put = _nearestExpiryOptions.FirstOrDefault(o => o.OptionType == OptionType.Put && o.StrikePrice == atmStrike);
+        if (call is null || put is null
+            || !_latest.TryGetValue(call.Token, out var callState) || !_latest.TryGetValue(put.Token, out var putState))
+        {
+            return null;
+        }
+
+        if (MidPrice(callState) is not { } callMid || MidPrice(putState) is not { } putMid)
+        {
+            return null;
+        }
+
+        var underlyingAsDouble = (double)underlying;
+        var callGreeks = BlackScholes.Calculate(OptionType.Call, underlyingAsDouble, (double)atmStrike, t, RiskFreeRate, vol).Greeks;
+        var putGreeks = BlackScholes.Calculate(OptionType.Put, underlyingAsDouble, (double)atmStrike, t, RiskFreeRate, vol).Greeks;
+
+        double? residualDifference = null;
+        if (_previousResidualStrike == atmStrike
+            && _previousResidualAt is { } prevAt
+            && _previousResidualCallMid is { } prevCallMid && _previousResidualPutMid is { } prevPutMid
+            && _previousResidualCallDelta is { } prevCallDelta && _previousResidualPutDelta is { } prevPutDelta
+            && _previousResidualCallGamma is { } prevCallGamma && _previousResidualPutGamma is { } prevPutGamma
+            && _previousResidualCallTheta is { } prevCallTheta && _previousResidualPutTheta is { } prevPutTheta
+            && _previousResidualCallVega is { } prevCallVega && _previousResidualPutVega is { } prevPutVega
+            && _previousResidualUnderlying is { } prevUnderlying && _previousResidualVol is { } prevVol)
+        {
+            var elapsedDays = (now - prevAt).TotalSeconds / 86400.0;
+            var spotChange = underlyingAsDouble - prevUnderlying;
+            var volChange = vol - prevVol;
+
+            var callActualChange = (double)(callMid - prevCallMid);
+            var callPredictedChange = (prevCallDelta * spotChange) + (0.5 * prevCallGamma * spotChange * spotChange)
+                + (prevCallTheta * elapsedDays) + (prevCallVega * volChange);
+            var callResidual = callActualChange - callPredictedChange;
+
+            var putActualChange = (double)(putMid - prevPutMid);
+            var putPredictedChange = (prevPutDelta * spotChange) + (0.5 * prevPutGamma * spotChange * spotChange)
+                + (prevPutTheta * elapsedDays) + (prevPutVega * volChange);
+            var putResidual = putActualChange - putPredictedChange;
+
+            residualDifference = callResidual - putResidual;
+        }
+
+        _previousResidualStrike = atmStrike;
+        _previousResidualAt = now;
+        _previousResidualCallMid = callMid;
+        _previousResidualPutMid = putMid;
+        _previousResidualCallDelta = callGreeks.Delta;
+        _previousResidualPutDelta = putGreeks.Delta;
+        _previousResidualCallGamma = callGreeks.Gamma;
+        _previousResidualPutGamma = putGreeks.Gamma;
+        _previousResidualCallTheta = callGreeks.ThetaPerDay;
+        _previousResidualPutTheta = putGreeks.ThetaPerDay;
+        _previousResidualCallVega = callGreeks.Vega;
+        _previousResidualPutVega = putGreeks.Vega;
+        _previousResidualUnderlying = underlyingAsDouble;
+        _previousResidualVol = vol;
+
+        return residualDifference;
+    }
+
+    /// <summary>
     /// Where today's ATM IV sits against a reference distribution, 0-100 (2026-09-08, audit
     /// finding F3; amended 2026-09-09 external review). Originally ranked against a same-day
     /// rolling window (<c>FeatureWindowLengths.IvRank</c>, 2 hours) -- exactly the same "fades
@@ -1832,6 +2286,71 @@ public sealed class LiveFeatureEngine
         double? volumePcr = callNotional > 0 ? putNotional / callNotional : null;
         double? cvdProxy = anyCvd ? cvdNet : null;
         return (volumePcr, cvdProxy);
+    }
+
+    /// <summary>
+    /// Ratio-composite metric 1 (weekend build, 2026-09-09): call notional / put notional,
+    /// ATM+/-<see cref="RatioWideStrikeBand"/>, summed per cadence -- same notional-volume-delta
+    /// pattern as <see cref="ComputeVolumePcrAndCvdProxy"/>, but band-restricted and with its
+    /// own independent volume baseline (<see cref="_previousVolumeByTokenRatio"/>) rather than
+    /// sharing that method's full-chain one, same "no accidental cross-method ordering
+    /// dependency" reasoning <see cref="_previousVolumeByToken"/> already documents.
+    ///
+    /// Null below <see cref="RatioMetricScales.MinNotionalForVolumeRatio"/> combined notional --
+    /// no real signal that quiet, not just a numerically awkward one. No epsilon needed above
+    /// the floor (unlike metric 2): if one side happens to be exactly 0 while combined clears
+    /// the floor, the plain ratio divides out to +/-Infinity, which <c>Math.Clamp</c> inside
+    /// <c>RatioMetricMath.ClipLogRatio</c> handles gracefully (clamps to +/-1, not NaN) -- only
+    /// a genuine 0/0 would be a problem, and the floor already rules that out.
+    /// </summary>
+    double? ComputeRatioNotionalVolumeRaw(decimal spotPrice)
+    {
+        var bandStrikes = _nearestExpiryOptions
+            .Select(o => o.StrikePrice!.Value)
+            .Distinct()
+            .OrderBy(s => Math.Abs(s - spotPrice))
+            .Take((RatioWideStrikeBand * 2) + 1)
+            .ToHashSet();
+
+        double callNotionalRatio = 0, putNotionalRatio = 0;
+
+        foreach (var option in _nearestExpiryOptions.Where(o => bandStrikes.Contains(o.StrikePrice!.Value)))
+        {
+            if (!_latest.TryGetValue(option.Token, out var state))
+            {
+                continue;
+            }
+
+            var volumeDelta = _previousVolumeByTokenRatio.TryGetValue(option.Token, out var previousVolume)
+                ? Math.Max(0, state.Volume - previousVolume)
+                : 0;
+            _previousVolumeByTokenRatio[option.Token] = state.Volume;
+
+            if (volumeDelta <= 0)
+            {
+                continue;
+            }
+
+            if (MidPrice(state) is { } mark and > 0)
+            {
+                var notional = (double)volumeDelta * (double)mark;
+                if (option.OptionType == OptionType.Call)
+                {
+                    callNotionalRatio += notional;
+                }
+                else if (option.OptionType == OptionType.Put)
+                {
+                    putNotionalRatio += notional;
+                }
+            }
+        }
+
+        if (callNotionalRatio + putNotionalRatio < RatioMetricScales.MinNotionalForVolumeRatio)
+        {
+            return null;
+        }
+
+        return callNotionalRatio / putNotionalRatio;
     }
 
     // Plan 4.2: mid of bid/ask when the depth snapshot is available, LTP fallback otherwise.
