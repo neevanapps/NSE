@@ -608,6 +608,23 @@ public sealed class MarketDataIngestionWorker(
     // this loop yet. RunTickLoopAsync now catches around its own per-tick body (see there);
     // RunSampleLoopAsync and RunPendingSubscriptionLoopAsync got the same treatment alongside it,
     // since both had the identical gap.
+    //
+    // PENDING (audit finding F45, 2026-09-09, found while validating a routine deploy): a
+    // *normal*, intentional service stop still logs as if F34 had recurred. Stopping the
+    // service cancels stoppingToken, which makes RunTickLoopAsync's channel read throw
+    // OperationCanceledException -- deliberately NOT caught by the per-iteration guards above
+    // (`when (ex is not OperationCanceledException)`), since cancellation during a real
+    // shutdown is expected and shouldn't be treated as a per-tick failure. But nothing catches
+    // it gracefully at the *top* either, so it propagates out of ExecuteAsync, .NET's default
+    // BackgroundServiceExceptionBehavior (StopHost) logs it FTL as an unhandled exception, and
+    // the host stops -- which is what should happen on a stop request, just not logged as if
+    // something broke. Live-observed 2026-09-09: a routine Stop-Service (ahead of a VM
+    // shutdown) produced the exact same FTL stack trace and log shape as F34's actual crash,
+    // indistinguishable without checking whether a stop was actually requested. Fix: catch
+    // OperationCanceledException once at the top of ExecuteAsync (or check
+    // stoppingToken.IsCancellationRequested before logging) and log it as a normal stop, not a
+    // fatal error -- cosmetic (the service does stop correctly either way), but worth fixing so
+    // a future real crash isn't lost in a history of identical-looking "normal" stops.
     async Task FlushAsync(List<Tick> buffer, CancellationToken ct)
     {
         await using var scope = scopeFactory.CreateAsyncScope();
