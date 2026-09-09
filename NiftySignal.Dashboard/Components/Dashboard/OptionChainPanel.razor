@@ -24,50 +24,42 @@
         <table class="data-table chain-table">
             <thead>
                 <tr>
-                    <th colspan="8" class="text-bull" style="text-align:center;">Calls</th>
+                    <th colspan="6" class="text-bull" style="text-align:center;">Calls</th>
                     <th rowspan="2">Strike</th>
-                    <th colspan="8" class="text-bear" style="text-align:center;">Puts</th>
+                    <th colspan="6" class="text-bear" style="text-align:center;">Puts</th>
                 </tr>
                 <tr>
-                    <th>Buildup</th>
                     <th>Depth Imb.</th>
                     <th>IV</th>
                     <th>OI %</th>
                     <th>OI</th>
                     <th>Diff</th>
-                    <th>Theo.</th>
                     <th>LTP</th>
                     <th>LTP</th>
-                    <th>Theo.</th>
                     <th>Diff</th>
                     <th>OI</th>
                     <th>OI %</th>
                     <th>IV</th>
                     <th>Depth Imb.</th>
-                    <th>Buildup</th>
                 </tr>
             </thead>
             <tbody>
                 @foreach (var row in VisibleStrikeRows)
                 {
                     <tr class="@(row.IsAtm ? "atm-row" : "")">
-                        <td><span class="badge @BuildupClass(row.Call)">@FormatBuildup(row.Call)</span></td>
                         <td class="@DepthImbClass(row.Call)">@FormatDepthImb(row.Call)</td>
                         <td>@FormatIv(row.Call)</td>
                         <td class="@OiChangeClass(row.Call)">@FormatOiChangePct(row.Call)</td>
                         <td>@FormatOi(row.Call)</td>
                         <td class="@DiffClass(row.Call?.PriceVsTheoretical)">@FormatDiffCell(row.Call)</td>
-                        <td class="text-dim">@FormatTheo(row.Call)</td>
                         <td>@FormatLtp(row.Call)</td>
                         <td class="mono">@row.Strike.ToString("0")@(row.IsAtm ? " •" : "")</td>
                         <td>@FormatLtp(row.Put)</td>
-                        <td class="text-dim">@FormatTheo(row.Put)</td>
                         <td class="@DiffClass(row.Put?.PriceVsTheoretical)">@FormatDiffCell(row.Put)</td>
                         <td>@FormatOi(row.Put)</td>
                         <td class="@OiChangeClass(row.Put)">@FormatOiChangePct(row.Put)</td>
                         <td>@FormatIv(row.Put)</td>
                         <td class="@DepthImbClass(row.Put)">@FormatDepthImb(row.Put)</td>
-                        <td><span class="badge @BuildupClass(row.Put)">@FormatBuildup(row.Put)</span></td>
                     </tr>
                 }
             </tbody>
