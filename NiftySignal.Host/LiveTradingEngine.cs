@@ -128,7 +128,8 @@ public sealed class LiveTradingEngine(
             IsExpiryDay: isExpiryDay,
             DailyProfitTargetReached: dailyProfitTargetReached,
             CurrentIvRank: snapshot.IvRankRaw,
-            ConsecutiveLossesToday: consecutiveLossesToday);
+            ConsecutiveLossesToday: consecutiveLossesToday,
+            IvRankSessionCount: snapshot.IvRankSessionCount);
 
         var decision = EntryRuleEvaluator.Evaluate(context, _config);
         if (!decision.ShouldEnter)

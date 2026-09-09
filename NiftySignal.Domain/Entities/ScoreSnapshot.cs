@@ -16,7 +16,27 @@ public sealed class ScoreSnapshot
     public double? OiBuildupNetRaw { get; set; }
     public double? PcrRaw { get; set; }
     public double? FuturesBasisRaw { get; set; }
-    public double? IvSkewRaw { get; set; }
+
+    /// <summary>
+    /// Synthetic-forward (put-call parity S) minus spot mid (2026-09-09 external review,
+    /// alongside reverting audit finding F11's original fix). A quote-quality/parity-gap
+    /// diagnostic, not a basis measurement -- <see cref="FuturesBasisRaw"/> above stays the
+    /// honestly-named real future's mid minus spot mid. Typically small and near zero on
+    /// clean data; a wider reading usually means a stale or wide wing-strike quote fed the
+    /// put-call-parity solve, not a real sentiment signal. Weight 0 by construction: no Z
+    /// counterpart, never feeds the composite -- see LiveFeatureEngine.Sample's doc comment.
+    /// </summary>
+    public double? ParityGapRaw { get; set; }
+
+    /// <summary>
+    /// Put/call IV skew, anchored to the expiry's own ~1-sigma expected move (spot x sigma x
+    /// sqrt(t)) rather than a fixed point offset -- see LiveFeatureEngine.ComputeIvSkew (audit
+    /// finding F8). Renamed from IvSkewRaw (2026-09-09 external review) to stay unambiguous
+    /// against the ratio sidecar's RatioIvSkew25dRaw, a materially different (25-delta) skew
+    /// reading -- the two must never be read as the same series.
+    /// </summary>
+    public double? IvSkewOneSigmaRaw { get; set; }
+
     public double? PriceMomentumRaw { get; set; }
     public double? DepthImbalanceRaw { get; set; }
 
@@ -107,6 +127,30 @@ public sealed class ScoreSnapshot
     /// against -- a single point (or a perfectly flat window) can't produce a meaningful rank.
     /// </summary>
     public double? IvRankRaw { get; set; }
+
+    /// <summary>
+    /// The raw ATM reference vol IvRankRaw was ranked against this cadence (2026-09-09
+    /// external review amendment to audit finding F3) -- see LiveFeatureEngine.ComputeIvRank.
+    /// Persisted so today's own observations can be replayed into the cold-start fallback
+    /// distribution on restart (SeedHistory) and so a prior day's session mean can later be
+    /// computed for the next day's 20-session ranking distribution (see
+    /// MarketDataIngestionWorker's prior-session seed query) -- without this column, "rank
+    /// against the last 20 sessions" would have no persisted per-session series to average.
+    /// </summary>
+    public double? AtmIv { get; set; }
+
+    /// <summary>
+    /// How many prior sessions' worth of ATM IV history <see cref="IvRankRaw"/> was actually
+    /// ranked against this cadence (2026-09-09 external review amendment to audit finding F3):
+    /// 0 until at least one prior session's mean is seeded, up to
+    /// LiveFeatureEngine.MaxPriorSessionsForIvRank once mature. Below
+    /// LiveFeatureEngine.MinPriorSessionsForIvRank, IvRankRaw is a same-day-only rank (not
+    /// trustworthy yet -- a genuinely high-vol day would still read as "normal" for its own
+    /// first couple of hours) -- EntryRuleEvaluator's MaxIvRankForEntry gate reads this
+    /// alongside IvRankRaw and skips the gate entirely below that threshold, rather than
+    /// acting on an unreliable same-day rank.
+    /// </summary>
+    public int IvRankSessionCount { get; set; }
 
     public double? OiBuildupNetZ { get; set; }
     public double? PcrZ { get; set; }

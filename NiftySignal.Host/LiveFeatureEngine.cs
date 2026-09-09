@@ -156,6 +156,7 @@ public sealed class LiveFeatureEngine
     readonly Queue<double> _compositeRawHistory = new();
 
     readonly RunningAverage _basisSamples = new();
+    readonly RunningAverage _parityGapSamples = new();
     readonly RunningAverage _momentumSamples = new();
     readonly RunningAverage _pcrSamples = new();
     readonly RunningAverage _depthImbalanceSamples = new();
@@ -175,7 +176,28 @@ public sealed class LiveFeatureEngine
 
     readonly Queue<(DateTimeOffset At, decimal FuturesPrice)> _momentumLookback = new();
     readonly Queue<(DateTimeOffset At, decimal Vix)> _vixLookback = new();
-    readonly Queue<(DateTimeOffset At, double Iv)> _ivRankLookback = new();
+
+    /// <summary>Session count bounds for <see cref="ComputeIvRank"/> -- see its own doc comment.</summary>
+    const int MinPriorSessionsForIvRank = 5;
+    const int MaxPriorSessionsForIvRank = 20;
+
+    /// <summary>
+    /// Last <see cref="MaxPriorSessionsForIvRank"/> prior sessions' representative ATM IV (one
+    /// value per session, session mean), seeded once at Host startup -- see
+    /// <see cref="SeedPriorSessionIvHistory"/>. Not a rolling window: unlike every other field
+    /// in this class, this list is replaced wholesale at startup and never mutated intraday.
+    /// </summary>
+    List<double> _priorSessionAtmIv = [];
+
+    /// <summary>
+    /// Today's own ATM IV observations so far, used only as <see cref="ComputeIvRank"/>'s
+    /// cold-start fallback while <see cref="_priorSessionAtmIv"/> doesn't yet hold
+    /// <see cref="MinPriorSessionsForIvRank"/> sessions. Naturally bounded by the trading
+    /// session itself (no time-window eviction needed, unlike every other lookback in this
+    /// class) -- restart-safe via <see cref="SeedHistory"/> replaying persisted
+    /// <see cref="ScoreSnapshot.AtmIv"/> values back in.
+    /// </summary>
+    readonly List<double> _todaySessionAtmIv = [];
 
     /// <summary>
     /// Cumulative day volume per token as of the last <see cref="BuildStrikeSnapshots"/> pass.
@@ -261,7 +283,7 @@ public sealed class LiveFeatureEngine
                 _basisWindow.Add(snapshot.ComputedAt, basis);
             }
 
-            if (snapshot.IvSkewRaw is { } ivSkew)
+            if (snapshot.IvSkewOneSigmaRaw is { } ivSkew)
             {
                 _ivSkewWindow.Add(snapshot.ComputedAt, ivSkew);
             }
@@ -327,6 +349,13 @@ public sealed class LiveFeatureEngine
             if (snapshot.StraddleRichnessRaw is { } straddleRichness)
             {
                 _straddleRichnessWindow.Add(snapshot.ComputedAt, straddleRichness);
+            }
+
+            // Today's own IV-rank cold-start fallback (2026-09-09 review amendment to F3) --
+            // not IvRankRaw itself, which is already the computed rank, not a raw IV value.
+            if (snapshot.AtmIv is { } atmIv)
+            {
+                _todaySessionAtmIv.Add(atmIv);
             }
         }
     }
@@ -469,22 +498,32 @@ public sealed class LiveFeatureEngine
         // use, so this degrades to the old behavior if depth isn't available.
         var futureMark = MidPrice(future) ?? future.LastPrice;
 
-        // Basis measured against the synthetic forward, not the tracked future (2026-09-08,
-        // audit finding F11): the tracked future is a *monthly* contract, while the options
-        // being traded expire this week -- a monthly future's premium shrinks toward zero as
-        // its own (later) expiry approaches, purely from time passing, which has nothing to do
-        // with sentiment but landed in the score anyway (today's raw basis implied ~9.2%
-        // annualised carry, far above anything cost-of-carry explains). ComputeUnderlyingPrice
-        // already builds this via put-call parity for GEX/Vanna/Charm/theoretical pricing --
-        // reused here, not recomputed, so basis is measured against the option's own expiry.
+        // Basis measured against the real monthly future's own mid, not a synthetic forward
+        // (2026-09-09 external review, reverting audit finding F11's original fix): the tracked
+        // future genuinely is a *monthly* contract, distinct from the weeklies being traded, so
+        // this stays honestly named -- FuturesBasisRaw is futureMid minus spotMid, nothing more.
+        // The original F11 fix (2026-09-08) swapped in ComputeUnderlyingPrice (the put-call-
+        // parity synthetic forward) on the theory that basis should track the option's own
+        // expiry -- but parity S isn't a real traded future and doesn't carry a monthly
+        // contract's actual cost-of-carry; that swap produced a value that mostly sits near zero
+        // and occasionally spikes on a stale wing-strike quote, not a basis reading. See
+        // ParityGapRaw below for that same synthetic-forward-vs-spot value, kept as its own,
+        // honestly-named, weight-0 diagnostic instead of overloading FuturesBasisRaw with it.
+        // PENDING (audit finding F25, 2026-09-08 lead review -- see fix plan Batch 7): this
+        // component may simply have near-zero forward correlation intraday for weeklies (current
+        // weight 0.1425, tied for second-largest) even when correctly computed -- validate via
+        // forward correlation before touching the weight, don't assume it should drop to 0.
+        _basisSamples.Add((double)(futureMark - spot.LastPrice));
+
+        // Parity-gap diagnostic (2026-09-09 review, new alongside the F11 revert above):
+        // synthetic forward S via put-call parity (same ComputeUnderlyingPrice already used by
+        // GEX/Vanna/Charm/theoretical pricing) minus spot mid. A quote-quality signal -- stale
+        // or wide wing-strike quotes show up here -- typically small and near zero on clean
+        // data. Deliberately never fed into the composite: no ParityGapZ, no rolling window,
+        // persisted purely for inspection (see ScoreSnapshot.ParityGapRaw).
         var basisT = TimeToExpiry.YearsUntilExpiry(_nearestExpiry, now);
         var syntheticForward = ComputeUnderlyingPrice(spot.LastPrice, basisT);
-        // PENDING (audit finding F25, 2026-09-08 lead review -- see fix plan Batch 7): F11 (above)
-        // fixed *what* this is measured against; separately, this component may simply have near-
-        // zero forward correlation intraday for weeklies (current weight 0.1425, tied for second-
-        // largest) even when correctly computed -- validate via forward correlation before
-        // touching the weight, don't assume it should drop to 0.
-        _basisSamples.Add((double)(syntheticForward - spot.LastPrice));
+        _parityGapSamples.Add((double)(syntheticForward - spot.LastPrice));
 
         // Momentum deliberately keeps using the raw tracked future, not the synthetic forward --
         // it measures a *relative* short-window change, where the monthly contract's own slow
@@ -608,6 +647,10 @@ public sealed class LiveFeatureEngine
         var basisRaw = _basisSamples.Average!.Value;
         _basisWindow.Add(now, basisRaw);
 
+        // Same non-null guarantee as basisRaw above -- computed unconditionally alongside it
+        // in Sample(). No window/Z: weight-0 diagnostic, see ScoreSnapshot.ParityGapRaw.
+        var parityGapRaw = _parityGapSamples.Average!.Value;
+
         var momentumRaw = _momentumSamples.Average!.Value;
         _momentumWindow.Add(now, momentumRaw);
 
@@ -658,7 +701,7 @@ public sealed class LiveFeatureEngine
 
         // Not smoothed either -- same reasoning as VixChange (a full-chain aggregate, not a
         // point-in-time price/quote read that benefits from within-cadence averaging).
-        double? gammaExposureRaw = null, vannaExposureRaw = null, charmExposureRaw = null, gammaFlipLevel = null, straddleRichnessRaw = null, ivRankRaw = null;
+        double? gammaExposureRaw = null, vannaExposureRaw = null, charmExposureRaw = null, gammaFlipLevel = null, straddleRichnessRaw = null, ivRankRaw = null, atmIvRaw = null;
         if (_nearestExpiryOptions.Count > 0)
         {
             var gexStrikesByDistance = _nearestExpiryOptions.Select(o => o.StrikePrice!.Value).Distinct().OrderBy(s => Math.Abs(s - spot.LastPrice)).ToList();
@@ -674,6 +717,7 @@ public sealed class LiveFeatureEngine
             charmExposureRaw = ComputeCharmExposure(gexUnderlying, gexAtmVol, gexT);
             gammaFlipLevel = ComputeGammaFlipLevel(gexAtmVol, gexT);
             straddleRichnessRaw = ComputeStraddleRichness(gexUnderlying, gexAtmVol, gexT, now);
+            atmIvRaw = gexAtmVol;
             ivRankRaw = ComputeIvRank(gexAtmVol, now);
         }
 
@@ -765,7 +809,8 @@ public sealed class LiveFeatureEngine
             OiBuildupNetRaw = oiBuildupRaw,
             PcrRaw = pcrRaw,
             FuturesBasisRaw = basisRaw,
-            IvSkewRaw = ivSkewRaw,
+            ParityGapRaw = parityGapRaw,
+            IvSkewOneSigmaRaw = ivSkewRaw,
             PriceMomentumRaw = momentumRaw,
             DepthImbalanceRaw = depthImbalanceRaw,
             VixChangeRaw = vixChangeRaw,
@@ -778,6 +823,8 @@ public sealed class LiveFeatureEngine
             StraddleRichnessRaw = straddleRichnessRaw,
             GammaFlipLevel = gammaFlipLevel,
             IvRankRaw = ivRankRaw,
+            AtmIv = atmIvRaw,
+            IvRankSessionCount = IvRankSessionCount,
             OiBuildupNetZ = inputs.OiBuildupNetZ,
             PcrZ = inputs.PcrZ,
             FuturesBasisZ = inputs.FuturesBasisZ,
@@ -997,6 +1044,7 @@ public sealed class LiveFeatureEngine
     void ResetSamples()
     {
         _basisSamples.Reset();
+        _parityGapSamples.Reset();
         _momentumSamples.Reset();
         _pcrSamples.Reset();
         _depthImbalanceSamples.Reset();
@@ -1011,12 +1059,13 @@ public sealed class LiveFeatureEngine
             _momentumLookback.Dequeue();
         }
 
-        // PENDING (audit finding F26, 2026-09-08 lead review -- see fix plan Batch 7):
-        // ScoreWeights.Default's own doc comment already documents this raw value's backward
-        // r=+0.48 / forward r=-0.08 (why PriceMomentum was already cut 0.1425 -> 0.07 on
-        // 2026-09-07) -- a forward r of -0.08 reads mildly anti-predictive, not just uninformative,
-        // which argues for going the rest of the way to weight 0 rather than a partial cut.
-        // Revisit with more sessions of data before deciding; one session's r is still a small sample.
+        // Audit finding F26 resolved (2026-09-09, external review, folded into F4): this raw
+        // value's backward r=+0.48 / forward r=-0.08 (documented on ScoreWeights.Default) argued
+        // for going the rest of the way to weight 0 rather than the 2026-09-07 partial cut
+        // (0.1425 -> 0.07) -- see ScoreWeights.Default.PriceMomentum's own doc comment for the
+        // 0.07 -> 0.0 change. Still computed and persisted (PriceMomentumRaw/Z) even at weight 0
+        // -- a required composite component and a visible diagnostic series, just with no say
+        // in the score.
         return (double)(futuresPrice - _momentumLookback.Peek().FuturesPrice);
     }
 
@@ -1596,13 +1645,26 @@ public sealed class LiveFeatureEngine
     }
 
     /// <summary>
-    /// Where the current ATM IV sits within its own rolling-window range, 0-100 (2026-09-08,
-    /// audit finding F3). No multi-day IV history exists yet, so this is a rolling-window rank
-    /// against itself, not a true 52-week percentile -- see FeatureWindowLengths.IvRank. Null
-    /// until the window holds at least two observations with a real (non-degenerate) spread --
-    /// a single point, or a perfectly flat window, can't produce a meaningful rank, and
+    /// Where today's ATM IV sits against a reference distribution, 0-100 (2026-09-08, audit
+    /// finding F3; amended 2026-09-09 external review). Originally ranked against a same-day
+    /// rolling window (<c>FeatureWindowLengths.IvRank</c>, 2 hours) -- exactly the same "fades
+    /// toward neutral the moment a genuinely extreme level stops *changing*" bug this finding
+    /// exists to fix, just wearing an IV-rank badge instead of a z-score: a genuinely high-vol
+    /// day would still read as "normal" for its own first couple of hours. Now ranks against
+    /// the last <see cref="MaxPriorSessionsForIvRank"/> prior sessions' representative ATM IV
+    /// (<see cref="_priorSessionAtmIv"/>, seeded once at Host startup) once at least
+    /// <see cref="MinPriorSessionsForIvRank"/> of them exist; below that, falls back to ranking
+    /// against today's own observations so far (<see cref="_todaySessionAtmIv"/> -- the
+    /// original min-max-within-window math, just against an unbounded same-day list instead of
+    /// a 2-hour rolling one). <see cref="IvRankSessionCount"/> tells which mode produced the
+    /// value, so <see cref="Rules.EntryRuleEvaluator"/>'s MaxIvRankForEntry gate can refuse to
+    /// act on a same-day-only rank that isn't trustworthy yet. Null until the ranked-against
+    /// distribution holds at least two observations with a real (non-degenerate) spread -- a
+    /// single point, or a perfectly flat distribution, can't produce a meaningful rank, and
     /// fabricating a "neutral 50" would be exactly the kind of made-up value this codebase
-    /// avoids everywhere else.
+    /// avoids everywhere else. Clamped to [0,100]: a mature-mode rank is measured against a
+    /// *fixed* prior-session distribution that doesn't include today, so a session more extreme
+    /// than anything in the last 20 would otherwise read outside that range.
     /// </summary>
     double? ComputeIvRank(double? currentVol, DateTimeOffset now)
     {
@@ -1611,25 +1673,48 @@ public sealed class LiveFeatureEngine
             return null;
         }
 
-        _ivRankLookback.Enqueue((now, vol));
-        while (_ivRankLookback.Count > 1 && now - _ivRankLookback.Peek().At > FeatureWindowLengths.IvRank)
+        if (_priorSessionAtmIv.Count < MinPriorSessionsForIvRank)
         {
-            _ivRankLookback.Dequeue();
+            _todaySessionAtmIv.Add(vol);
+            return RankWithinDistribution(_todaySessionAtmIv, vol);
         }
 
-        if (_ivRankLookback.Count < 2)
+        return RankWithinDistribution(_priorSessionAtmIv, vol);
+    }
+
+    static double? RankWithinDistribution(IReadOnlyList<double> distribution, double value)
+    {
+        if (distribution.Count < 2)
         {
             return null;
         }
 
-        var min = _ivRankLookback.Min(e => e.Iv);
-        var max = _ivRankLookback.Max(e => e.Iv);
+        var min = distribution.Min();
+        var max = distribution.Max();
         if (max - min < 1e-9)
         {
             return null;
         }
 
-        return (vol - min) / (max - min) * 100.0;
+        return Math.Clamp((value - min) / (max - min) * 100.0, 0.0, 100.0);
+    }
+
+    /// <summary>How many prior sessions <see cref="ComputeIvRank"/> is currently ranking against -- see its own doc comment and <see cref="ScoreSnapshot.IvRankSessionCount"/>.</summary>
+    public int IvRankSessionCount => _priorSessionAtmIv.Count;
+
+    /// <summary>
+    /// Seeds the prior-session ATM IV distribution <see cref="ComputeIvRank"/> ranks against
+    /// once mature (2026-09-09 external review amendment to audit finding F3). Called once at
+    /// Host startup with each of the last <see cref="MaxPriorSessionsForIvRank"/> prior
+    /// sessions' representative ATM IV (session mean) -- see
+    /// MarketDataIngestionWorker's prior-session seed query. Deliberately not restart-seedable
+    /// from today's own <see cref="SeedHistory"/> replay the way the rolling windows are: this
+    /// is cross-session state, not same-day state, and gets set exactly once per process
+    /// lifetime rather than replayed every restart.
+    /// </summary>
+    public void SeedPriorSessionIvHistory(IReadOnlyList<double> sessionMeans)
+    {
+        _priorSessionAtmIv = [.. sessionMeans.TakeLast(MaxPriorSessionsForIvRank)];
     }
 
     /// <summary>

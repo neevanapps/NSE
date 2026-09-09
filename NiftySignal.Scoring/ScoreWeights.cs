@@ -107,13 +107,27 @@ public sealed record ScoreWeights(
         // in git blame), not in an ever-growing string that a live trade insert has to fit
         // inside a database column (live-caught 2026-09-08: the old descriptive-suffix version
         // grew past ScoreWeightsVersion's column length and silently killed the trading loop).
-        Version: "live-2026-09-08",
-        OiBuildupNet: 0.2775,
+        Version: "live-2026-09-09",
+        // OiBuildupNet/DepthImbalance raised again (2026-09-09, F4, external review): the same
+        // 0.07 PriceMomentum carried below is now fully cut to 0, not just window-fixed -- see
+        // PriceMomentum's own comment. Freed weight split evenly between these two again, same
+        // reasoning and same two recipients as the 2026-09-07 cut (0.1425->0.07): they're the
+        // components whose raw values actually change most cadences.
+        OiBuildupNet: 0.3125,
         Pcr: 0.19, // PENDING (audit finding F23) -- sign vs. bullish/bearish reading, see LiveFeatureEngine.ComputePcr
         FuturesBasis: 0.1425, // PENDING (audit finding F25) -- may warrant weight 0, see LiveFeatureEngine.Sample's basis comment
         IvSkew: 0.1425, // PENDING (audit finding F24) -- sign, and 25-delta rigor, see LiveFeatureEngine.ComputeIvSkew
-        PriceMomentum: 0.07, // PENDING (audit finding F26) -- may warrant weight 0, see LiveFeatureEngine's momentum raw comment
-        DepthImbalance: 0.1275,
+        // Cut from 0.07 to 0.0 (2026-09-09, audit finding F4, external review): the 2026-09-08
+        // window fix (see PriceMomentumZScoreWindow) only addressed the z-scoring bug, not the
+        // underlying finding it was layered on top of -- the 2026-09-07 correlation check (see
+        // this record's own history above) already showed momentum is a lagging, not leading,
+        // signal (backward r=+0.48, forward r=-0.08). No amount of z-window tuning fixes that;
+        // the honest move is weight 0, not a retuned k around a component known to be cut.
+        // Not deleted from the composite entirely (ScoreComponentInputs/ScoreSnapshot keep
+        // PriceMomentumRaw/Z) -- it's a required component still, so it still gates warm-up and
+        // stays visible for anyone watching the raw series, just with zero say in the score.
+        PriceMomentum: 0.0,
+        DepthImbalance: 0.1625,
         VixChange: 0.05, // PENDING (audit finding F27) -- open-baseline vs. rolling lookback, see LiveFeatureEngine.ComputeVixChange
         GammaExposure: 0.0,
         VolumePcr: 0.0,

@@ -344,16 +344,17 @@ public class CompositeScoreCalculatorTests
     {
         // Plan section 6's 25/20/15/15/15/10, each x0.95, plus a conservative 0.05 for the
         // VixChange component (2026-09-04), then PriceMomentum cut 0.1425 -> 0.07 with the
-        // freed 0.0725 moved to OiBuildupNet/DepthImbalance (2026-09-07) -- see
-        // ScoreWeights.Default's own doc comment.
+        // freed 0.0725 moved to OiBuildupNet/DepthImbalance (2026-09-07), then PriceMomentum
+        // cut again to 0.0 with the freed 0.07 split the same way (2026-09-09, F4, external
+        // review) -- see ScoreWeights.Default's own doc comments.
         var weights = ScoreWeights.Default;
 
-        Assert.Equal(0.2775, weights.OiBuildupNet, 1e-9);
+        Assert.Equal(0.3125, weights.OiBuildupNet, 1e-9);
         Assert.Equal(0.19, weights.Pcr, 1e-9);
         Assert.Equal(0.1425, weights.FuturesBasis, 1e-9);
         Assert.Equal(0.1425, weights.IvSkew, 1e-9);
-        Assert.Equal(0.07, weights.PriceMomentum, 1e-9);
-        Assert.Equal(0.1275, weights.DepthImbalance, 1e-9);
+        Assert.Equal(0.0, weights.PriceMomentum, 1e-9);
+        Assert.Equal(0.1625, weights.DepthImbalance, 1e-9);
         Assert.Equal(0.05, weights.VixChange, 1e-9);
         Assert.Equal(0.0, weights.GammaExposure, 1e-9);
         Assert.Equal(0.0, weights.VolumePcr, 1e-9);

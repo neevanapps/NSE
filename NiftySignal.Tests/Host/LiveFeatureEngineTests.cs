@@ -101,14 +101,41 @@ public class LiveFeatureEngineTests
     }
 
     [Fact]
-    public void ComputeCadence_ComputesFuturesBasis_AsSyntheticForwardMinusSpot_IndependentOfTheTrackedFuture()
+    public void ComputeCadence_ComputesFuturesBasis_AsFutureMidMinusSpot()
     {
-        // Audit finding F11 (2026-09-08): basis must be measured against the option-derived
-        // synthetic forward (this weekly expiry), not the tracked monthly future -- a monthly
-        // future's own time-decay drift isn't sentiment, and it isn't even the contract these
-        // options expire with. Proven here the opposite way from before the fix: the tracked
-        // future's price now has ZERO effect on basis once a real synthetic forward can be
-        // solved from the option chain, because the future is no longer read at all.
+        // Basis is the real monthly future's own mid minus spot mid (2026-09-09 external
+        // review, reverting audit finding F11's original fix -- see the ParityGapRaw test
+        // below for the synthetic-forward-based diagnostic that replaced the reverted
+        // version). Two engines differing only in the future's price must produce genuinely
+        // different basis readings -- the opposite assertion from before this revert.
+        var engineA = new LiveFeatureEngine(BaseUniverse());
+        engineA.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engineA.OnTick(MakeTick(FutureToken, 24028.35m, Start));
+        engineA.OnTick(MakeTick(CallToken, 100m, Start, depth: Depth(bidQty: 10, askQty: 10, bid: 99.5m, ask: 100.5m)));
+        engineA.OnTick(MakeTick(PutToken, 80m, Start, depth: Depth(bidQty: 10, askQty: 10, bid: 79.5m, ask: 80.5m)));
+
+        var engineB = new LiveFeatureEngine(BaseUniverse());
+        engineB.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engineB.OnTick(MakeTick(FutureToken, 23200m, Start)); // wildly different future price
+        engineB.OnTick(MakeTick(CallToken, 100m, Start, depth: Depth(bidQty: 10, askQty: 10, bid: 99.5m, ask: 100.5m)));
+        engineB.OnTick(MakeTick(PutToken, 80m, Start, depth: Depth(bidQty: 10, askQty: 10, bid: 79.5m, ask: 80.5m)));
+
+        var snapshotA = engineA.ComputeCadence(Start);
+        var snapshotB = engineB.ComputeCadence(Start);
+
+        Assert.NotNull(snapshotA);
+        Assert.NotNull(snapshotB);
+        Assert.Equal(24028.35 - 23950, snapshotA!.FuturesBasisRaw!.Value, precision: 6);
+        Assert.Equal(23200 - 23950, snapshotB!.FuturesBasisRaw!.Value, precision: 6);
+    }
+
+    [Fact]
+    public void ComputeCadence_ComputesParityGap_AsSyntheticForwardMinusSpot_IndependentOfTheTrackedFuture()
+    {
+        // ParityGapRaw (2026-09-09 review, new alongside the F11 revert above): synthetic
+        // forward via put-call parity minus spot -- a quote-quality diagnostic, deliberately
+        // independent of the tracked future's own price (unlike FuturesBasisRaw above). This
+        // is exactly the assertion FuturesBasisRaw itself carried before the revert.
         var engineA = new LiveFeatureEngine(BaseUniverse());
         engineA.OnTick(MakeTick(SpotToken, 23950m, Start));
         engineA.OnTick(MakeTick(FutureToken, 24028.35m, Start)); // deliberately far from spot
@@ -126,8 +153,8 @@ public class LiveFeatureEngineTests
 
         Assert.NotNull(snapshotA);
         Assert.NotNull(snapshotB);
-        Assert.NotEqual(0, snapshotA!.FuturesBasisRaw!.Value, 6);
-        Assert.Equal(snapshotA.FuturesBasisRaw!.Value, snapshotB!.FuturesBasisRaw!.Value, precision: 6);
+        Assert.NotEqual(0, snapshotA!.ParityGapRaw!.Value, 6);
+        Assert.Equal(snapshotA.ParityGapRaw!.Value, snapshotB!.ParityGapRaw!.Value, precision: 6);
     }
 
     [Fact]
@@ -361,6 +388,36 @@ public class LiveFeatureEngineTests
         // or the new max -- rank must land exactly at 0 or 100, not somewhere in between.
         Assert.NotNull(snapshot!.IvRankRaw);
         Assert.True(snapshot.IvRankRaw is 0.0 or 100.0);
+        Assert.Equal(0, snapshot.IvRankSessionCount);
+    }
+
+    [Fact]
+    public void IvRankSessionCount_IsZero_BeforeAnyPriorSessionHistoryIsSeeded()
+    {
+        var engine = new LiveFeatureEngine(BaseUniverse());
+
+        Assert.Equal(0, engine.IvRankSessionCount);
+    }
+
+    [Fact]
+    public void ComputeCadence_IvRank_UsesPriorSessionDistribution_OnceFiveSessionsAreSeeded()
+    {
+        // 2026-09-09 review amendment to F3: once >= 5 prior sessions are seeded, IvRankRaw
+        // ranks against that fixed distribution starting from the very first cadence of the
+        // day -- no longer gated behind accumulating 2 same-day observations first (contrast
+        // with the unseeded cold-start test above, which is null on its first cadence).
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.SeedPriorSessionIvHistory([0.10, 0.12, 0.14, 0.16, 0.18]);
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, oi: 100_000, depth: Depth(bidQty: 500, askQty: 400, bid: 99.5m, ask: 100.5m)));
+        engine.OnTick(MakeTick(PutToken, 80m, Start, oi: 100_000, depth: Depth(bidQty: 300, askQty: 600, bid: 79.5m, ask: 80.5m)));
+
+        var snapshot = engine.ComputeCadence(Start);
+
+        Assert.Equal(5, engine.IvRankSessionCount);
+        Assert.Equal(5, snapshot!.IvRankSessionCount);
+        Assert.NotNull(snapshot.IvRankRaw);
     }
 
     [Fact]
@@ -1314,8 +1371,8 @@ public class LiveFeatureEngineTests
         var snapshot = engine.ComputeCadence(Start);
 
         Assert.NotNull(snapshot);
-        Assert.NotNull(snapshot!.IvSkewRaw);
-        Assert.Equal(0.0, snapshot.IvSkewRaw!.Value, 1e-3);
+        Assert.NotNull(snapshot!.IvSkewOneSigmaRaw);
+        Assert.Equal(0.0, snapshot.IvSkewOneSigmaRaw!.Value, 1e-3);
     }
 
     [Fact]
@@ -1373,8 +1430,8 @@ public class LiveFeatureEngineTests
 
             var snapshot = engine.ComputeCadence(Start);
             Assert.NotNull(snapshot);
-            Assert.NotNull(snapshot!.IvSkewRaw);
-            return snapshot.IvSkewRaw!.Value;
+            Assert.NotNull(snapshot!.IvSkewOneSigmaRaw);
+            return snapshot.IvSkewOneSigmaRaw!.Value;
         }
 
         var lowVolSkew = SkewAtAtmVol(0.12);
@@ -1493,7 +1550,7 @@ public class LiveFeatureEngineTests
                 OiBuildupNetRaw = Wave(1.0, i),
                 PcrRaw = 0.8 + Wave(0.1, i),
                 FuturesBasisRaw = 100 + Wave(20, i),
-                IvSkewRaw = Wave(0.05, i),
+                IvSkewOneSigmaRaw = Wave(0.05, i),
                 PriceMomentumRaw = Wave(10, i),
                 DepthImbalanceRaw = Wave(0.3, i),
                 WeightSetVersion = "v1",

@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NiftySignal.Domain\NiftySignal.Domain.csproj" />
+    <ProjectReference Include="..\NiftySignal.Persistence\NiftySignal.Persistence.csproj" />
+    <ProjectReference Include="..\NiftySignal.Backtest\NiftySignal.Backtest.csproj" />
+    <ProjectReference Include="..\NiftySignal.Host\NiftySignal.Host.csproj" />
+    <ProjectReference Include="..\NiftySignal.Rules\NiftySignal.Rules.csproj" />
+  </ItemGroup>
+
+</Project>

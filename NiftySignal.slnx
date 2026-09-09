@@ -13,6 +13,7 @@
   <Project Path="NiftySignal.Persistence/NiftySignal.Persistence.csproj" />
   <Project Path="NiftySignal.Pricing/NiftySignal.Pricing.csproj" />
   <Project Path="NiftySignal.Rules/NiftySignal.Rules.csproj" />
+  <Project Path="NiftySignal.ScoreReplay/NiftySignal.ScoreReplay.csproj" />
   <Project Path="NiftySignal.Scoring/NiftySignal.Scoring.csproj" />
   <Project Path="NiftySignal.Tests/NiftySignal.Tests.csproj" />
 </Solution>

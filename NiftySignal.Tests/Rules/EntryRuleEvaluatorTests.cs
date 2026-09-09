@@ -288,8 +288,10 @@ public class EntryRuleEvaluatorTests
     public void Evaluate_Blocks_WhenIvRankAboveMaxIvRankForEntry()
     {
         // Audit finding F3: buying premium when IV is already rich is how a directionally
-        // correct trade still loses to a vol crush.
-        var context = HappyPath() with { CurrentIvRank = 70.01 }; // MaxIvRankForEntry is 70
+        // correct trade still loses to a vol crush. IvRankSessionCount must be at/above the
+        // 5-session floor (2026-09-09 review amendment) for the gate to act at all -- see the
+        // cold-start test below for the case where it isn't.
+        var context = HappyPath() with { CurrentIvRank = 70.01, IvRankSessionCount = 5 }; // MaxIvRankForEntry is 70
 
         var result = EntryRuleEvaluator.Evaluate(context, TestRulesetConfigs.Default());
 
@@ -300,7 +302,7 @@ public class EntryRuleEvaluatorTests
     [Fact]
     public void Evaluate_AllowsEntry_WhenIvRankIsExactlyAtMaxIvRankForEntry()
     {
-        var context = HappyPath() with { CurrentIvRank = 70 };
+        var context = HappyPath() with { CurrentIvRank = 70, IvRankSessionCount = 5 };
 
         var result = EntryRuleEvaluator.Evaluate(context, TestRulesetConfigs.Default());
 
@@ -310,11 +312,26 @@ public class EntryRuleEvaluatorTests
     [Fact]
     public void Evaluate_AllowsEntry_WhenCurrentIvRankIsNull_NotEnoughHistoryYetToRankAgainst()
     {
-        var context = HappyPath() with { CurrentIvRank = null };
+        var context = HappyPath() with { CurrentIvRank = null, IvRankSessionCount = 5 };
 
         var result = EntryRuleEvaluator.Evaluate(context, TestRulesetConfigs.Default());
 
         Assert.True(result.ShouldEnter);
+    }
+
+    [Fact]
+    public void Evaluate_AllowsEntry_WhenIvRankAboveThreshold_ButFewerThanFiveSessionsExist()
+    {
+        // 2026-09-09 review amendment to F3: a same-day-only rank (fewer than 5 prior sessions
+        // seeded yet) isn't trustworthy -- the gate must not act on it even when the raw value
+        // happens to be high, since a genuinely high-vol day would still read "normal" for its
+        // own first couple of hours under a same-day-only rank.
+        var context = HappyPath() with { CurrentIvRank = 95, IvRankSessionCount = 4 };
+
+        var result = EntryRuleEvaluator.Evaluate(context, TestRulesetConfigs.Default());
+
+        Assert.True(result.ShouldEnter);
+        Assert.DoesNotContain(result.FailedConditions, f => f.Contains("IV rank"));
     }
 
     [Fact]

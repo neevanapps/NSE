@@ -27,24 +27,34 @@ public static class LiveRulesetConfig
             ExpiryDayEnabled: true,
             ExpiryDayNoEntryAfterTime: new TimeOnly(14, 0)),
         Entry: new EntryConfig(
-            // MinAbsScore and MinScoreSustainedSeconds (audit finding F13, 2026-09-08): both
-            // tuned watching a score that sat at +/-99 roughly a third of the day under the old
-            // dynamic-k mechanism (see F1 / CompositeScoreCalculator.DefaultK's doc comment) --
-            // left unchanged here rather than guessed at, since a new number picked before k's
-            // corrected scale exists would just be tuning against a distribution about to shift
-            // again. Revisit both from a live session's qualification-rate data on the fixed-k,
-            // Batch-3-corrected score (target "top 5-10% of cadences" per the audit) once that
-            // data exists.
+            // MinAbsScore (audit finding F13, 2026-09-09): re-derived from a real distribution
+            // instead of guessed at. 55 was tuned watching a score that sat at +/-99 roughly a
+            // third of the day under the old dynamic-k mechanism (see F1 / CompositeScoreCalculator.
+            // DefaultK's doc comment) -- left unchanged for months rather than picking a new number
+            // before k's corrected scale existed, since that would just be tuning against a
+            // distribution about to shift again. That data now exists: NiftySignal.ScoreReplay
+            // (2026-09-09) replayed 09-Sep's already-recorded ticks through the fully-corrected
+            // Batch 1-3 engine (fixed k, F2/F4/F5/F7/F8, F6/F11 reverts) -- not a live session, but
+            // real market data under the exact code this config now ships with. |CompositeScore|
+            // over 936 scored cadences: p50=32.7, p75=46.3, p90=60.7, p92.5=63.8, p95=68.6. The
+            // audit's own target ("top 5-10% of cadences") is bracketed by p90/p95; 64 (~p92.5,
+            // ~7.6% of cadences) sits in the middle of that band. One partial day, VM-restart
+            // gaps and all -- a real starting point, not a final answer; watch qualification rate
+            // over the next several live sessions and revisit if it drifts from ~5-10%.
+            //
+            // MinScoreSustainedSeconds/MinScoreSustainedCadences: the same replay's sustain check
+            // (ScoreSustainTracker fed the replayed series at each candidate threshold) found 5-6
+            // of 8 streaks still clearing 45s/3 cadences even at the tighter 92.5-95th percentile
+            // thresholds, with real streaks running as long as 315s -- no evidence either number
+            // needs to change, so both stay as-is rather than moved without data behind it.
             //
             // PENDING (audit finding F15, 2026-09-08 lead review -- see fix plan Batch 6):
             // LiveFeatureEngine.CompositeSmoothingCadences already averages the raw composite
             // over ~3 minutes (12 cadences) before MinScoreSustainedSeconds/MinScoreSustainedCadences
             // demand additional time above threshold on top of that -- a double lag on an already-
-            // smoothed series. Factor this into the same recalibration pass as F13 above rather
-            // than picking MinScoreSustainedSeconds independently: either cut it to ~1-2 cadences
-            // given the 12-cadence MA already provides lag, or drop the MA and rely on the sustain
-            // timer alone.
-            MinAbsScore: 55,
+            // smoothed series. The replay's own healthy streak lengths (above) suggest this isn't
+            // costing qualifying opportunities today, but revisit if that changes.
+            MinAbsScore: 64,
             MinScoreSustainedSeconds: 45,
             ReEntryGapSameDirectionMinutes: 2,
             // Raised from 7 to 30 (2026-09-08) -- the 7 cap got spent by 10:48 today, well

@@ -5,40 +5,40 @@ namespace NiftySignal.Tests.Pricing;
 public class TimeToExpiryTests
 {
     [Fact]
-    public void YearsUntilExpiry_ForOneYearOut_ExcludesWeekends()
+    public void YearsUntilExpiry_ForOneYearOut_IsCalendarTime_NotTradingDays()
     {
-        // 02 Jan 2026 (Friday) to 02 Jan 2027 (Saturday) inclusive contains 105 weekend days --
-        // trading time is calendar time minus those, not a plain calendar year (audit F6: the
-        // old calendar-days/365 formula would have asserted this at ~1.0).
+        // 02 Jan 2026 (Friday) to 02 Jan 2027 (Saturday) inclusive is 365 calendar days --
+        // 2026-09-09 external review reverted audit finding F6's trading-day (weekday-count)
+        // version: index options price on calendar time, and a weekday loop with no NSE
+        // holiday calendar would silently undercharge any week containing a market holiday.
         var asOf = new DateTimeOffset(2026, 1, 2, 9, 15, 0, TimeSpan.FromHours(5.5));
         var expiry = new DateOnly(2027, 1, 2);
 
         var years = TimeToExpiry.YearsUntilExpiry(expiry, asOf);
 
         var calendarDays = (new DateTimeOffset(2027, 1, 2, 15, 30, 0, TimeSpan.FromHours(5.5)) - asOf).TotalDays;
-        var expected = (calendarDays - 105) / 365.0;
-        Assert.Equal(expected, years, 1e-9);
-        Assert.True(years < 0.75, "365 calendar days should be well under 0.75 trading years once ~105 weekend days are excluded.");
+        Assert.Equal(calendarDays / 365.0, years, 1e-9);
+        Assert.True(years > 0.99, "A calendar year out should be close to 1.0 trading years, not discounted for weekends.");
     }
 
     [Fact]
-    public void YearsUntilExpiry_ExcludesExactlyTheWeekendDays_ForASpanCrossingOneWeekend()
+    public void YearsUntilExpiry_IncludesWeekendDays_ForASpanCrossingOneWeekend()
     {
-        // Friday close to Monday close, in the exact market-close instant both endpoints use
-        // -- 3 calendar days, 2 of them weekend, so trading time is deterministically exactly
-        // 1 trading day, not the noisier fractional cases the other tests use.
+        // Friday close to Monday close: 3 calendar days, all counted -- weekend theta decay
+        // is real, not excluded (contrast with the reverted trading-day version, which would
+        // have asserted this at 1 day, not 3).
         var fridayClose = new DateTimeOffset(2026, 1, 2, 15, 30, 0, TimeSpan.FromHours(5.5));
         var mondayExpiry = new DateOnly(2026, 1, 5);
 
         var years = TimeToExpiry.YearsUntilExpiry(mondayExpiry, fridayClose);
 
-        Assert.Equal(1.0 / 365.0, years, 1e-9);
+        Assert.Equal(3.0 / 365.0, years, 1e-9);
     }
 
     [Fact]
     public void YearsUntilExpiry_ComputesToMarketCloseOnExpiryDate_NotMidnight()
     {
-        // 5.5 hours before close -- comfortably above the 1-hour floor, so this isolates
+        // 5.5 hours before close -- comfortably above the 2-minute floor, so this isolates
         // "measured against 15:30, not midnight" from the flooring behavior tested below.
         var expiry = new DateOnly(2026, 9, 3);
         var tenAm = new DateTimeOffset(2026, 9, 3, 10, 0, 0, TimeSpan.FromHours(5.5));
@@ -50,20 +50,36 @@ public class TimeToExpiryTests
     }
 
     [Fact]
-    public void YearsUntilExpiry_FloorsAtOneHour_WhenLessThanAnHourRemainsBeforeClose()
+    public void YearsUntilExpiry_FloorsAtTwoMinutes_WhenLessThanThatRemainsBeforeClose()
     {
-        // One minute to go -- below the floor, so this must clamp to the minimum rather
-        // than return the true (numerically dangerous) near-zero remaining time.
+        // 30 seconds to go -- below the floor, so this must clamp to the minimum rather
+        // than return the true (numerically dangerous) near-zero remaining time. Floor
+        // tightened from 1 hour to 2 minutes (2026-09-09 external review, resolving audit
+        // finding F20): the 1-hour floor kept every Greek/IV/theoretical price pretending
+        // T=1h for the entire final hour before expiry, exactly the highest-gamma stretch.
         var expiry = new DateOnly(2026, 9, 3);
-        var oneMinuteBeforeClose = new DateTimeOffset(2026, 9, 3, 15, 29, 0, TimeSpan.FromHours(5.5));
+        var thirtySecondsBeforeClose = new DateTimeOffset(2026, 9, 3, 15, 29, 30, TimeSpan.FromHours(5.5));
 
-        var years = TimeToExpiry.YearsUntilExpiry(expiry, oneMinuteBeforeClose);
+        var years = TimeToExpiry.YearsUntilExpiry(expiry, thirtySecondsBeforeClose);
 
         Assert.Equal(TimeToExpiry.Minimum.TotalDays / 365.0, years, 1e-9);
     }
 
     [Fact]
-    public void YearsUntilExpiry_FloorsAtOneHour_WhenExpiryHasEffectivelyPassed()
+    public void YearsUntilExpiry_DoesNotFloor_WhenJustAboveTheTwoMinuteFloor()
+    {
+        // 3 minutes to go -- above the floor, so the true remaining time should be used,
+        // not clamped. Boundary companion to the floor test above.
+        var expiry = new DateOnly(2026, 9, 3);
+        var threeMinutesBeforeClose = new DateTimeOffset(2026, 9, 3, 15, 27, 0, TimeSpan.FromHours(5.5));
+
+        var years = TimeToExpiry.YearsUntilExpiry(expiry, threeMinutesBeforeClose);
+
+        Assert.Equal(TimeSpan.FromMinutes(3).TotalDays / 365.0, years, 1e-9);
+    }
+
+    [Fact]
+    public void YearsUntilExpiry_FloorsAtTwoMinutes_WhenExpiryHasEffectivelyPassed()
     {
         var expiry = new DateOnly(2026, 9, 3);
         var wellAfterClose = new DateTimeOffset(2026, 9, 3, 16, 0, 0, TimeSpan.FromHours(5.5));
@@ -74,7 +90,7 @@ public class TimeToExpiryTests
     }
 
     [Fact]
-    public void YearsUntilExpiry_FloorsAtOneHour_WhenExpiryIsInThePast()
+    public void YearsUntilExpiry_FloorsAtTwoMinutes_WhenExpiryIsInThePast()
     {
         var expiry = new DateOnly(2026, 1, 1);
         var muchLater = new DateTimeOffset(2026, 9, 3, 10, 0, 0, TimeSpan.FromHours(5.5));

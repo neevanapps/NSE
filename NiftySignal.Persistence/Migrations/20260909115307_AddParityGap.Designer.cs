@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using NiftySignal.Persistence;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace NiftySignal.Persistence.Migrations
 {
     [DbContext(typeof(NiftySignalDbContext))]
-    partial class NiftySignalDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260909115307_AddParityGap")]
+    partial class AddParityGap
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -278,9 +281,6 @@ namespace NiftySignal.Persistence.Migrations
 
                     NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
 
-                    b.Property<double?>("AtmIv")
-                        .HasColumnType("double precision");
-
                     b.Property<double?>("CharmExposureRaw")
                         .HasColumnType("double precision");
 
@@ -332,10 +332,7 @@ namespace NiftySignal.Persistence.Migrations
                     b.Property<double?>("IvRankRaw")
                         .HasColumnType("double precision");
 
-                    b.Property<int>("IvRankSessionCount")
-                        .HasColumnType("integer");
-
-                    b.Property<double?>("IvSkewOneSigmaRaw")
+                    b.Property<double?>("IvSkewRaw")
                         .HasColumnType("double precision");
 
                     b.Property<double?>("IvSkewZ")

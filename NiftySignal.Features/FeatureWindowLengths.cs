@@ -112,13 +112,4 @@ public static class FeatureWindowLengths
     /// same 15-minute window as IvSkew/SpreadRatio rather than the 30-minute OI-driven ones.
     /// </summary>
     public static readonly TimeSpan StraddleRichness = TimeSpan.FromMinutes(15);
-
-    /// <summary>
-    /// ATM IV rank lookback (2026-09-08, audit finding F3 -- "the single biggest omission for
-    /// a strategy that buys premium"). No multi-day IV history exists yet, so this ranks
-    /// today's ATM IV against itself over a rolling window rather than a true 52-week rank --
-    /// same "calm and active regimes both represented" reasoning as VixChangeZScoreWindow,
-    /// long enough that one flat stretch can't dominate the observed min/max range.
-    /// </summary>
-    public static readonly TimeSpan IvRank = TimeSpan.FromHours(2);
 }

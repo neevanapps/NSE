@@ -59,6 +59,17 @@ public sealed class MarketDataIngestionWorker(
     readonly SemaphoreSlim _engineSync = new(1, 1);
     LiveFeatureEngine? _engine;
 
+    /// <summary>
+    /// Edge-triggered guard for the F10 warm-up-blocker log below -- true while the current
+    /// not-warmed-up stretch has already logged once. 2026-09-09: the original F10 fix logged
+    /// unconditionally on every cadence while blocked, which the plan's own throttling
+    /// requirement ("once per gap, not every 15s") explicitly ruled out -- a multi-minute
+    /// warm-up window would otherwise produce a duplicate line every 15s for its entire
+    /// duration. Reset to false the moment warm-up succeeds, so a later, genuinely new
+    /// not-warmed-up stretch logs again.
+    /// </summary>
+    bool _warmUpBlockedLogged;
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         await WaitForMarketHoursAsync(stoppingToken);
@@ -89,6 +100,7 @@ public sealed class MarketDataIngestionWorker(
 
         _engine = new LiveFeatureEngine(instruments);
         await SeedEngineHistoryAsync(_engine, asOfDate, stoppingToken);
+        await SeedPriorSessionIvHistoryAsync(_engine, asOfDate, stoppingToken);
         await dashboardPush.StartAsync(stoppingToken);
 
         logger.LogInformation("Starting FlatTrade feed with {Count} subscriptions for {AsOfDate}", subscriptions.Count, asOfDate);
@@ -263,12 +275,22 @@ public sealed class MarketDataIngestionWorker(
                             // throw. Named directly against ScoreSnapshot's own properties
                             // (compiler-checked: a renamed/removed property breaks the build)
                             // rather than a second, independently-maintained list of the six
-                            // required names.
-                            var blocking = DescribeWarmUpBlockers(snapshot);
-                            if (blocking.Count > 0)
+                            // required names. Throttled to once per not-warmed-up stretch, not
+                            // every 15s cadence (see _warmUpBlockedLogged's own doc comment) --
+                            // fixed 2026-09-09, the original version logged unconditionally.
+                            if (!_warmUpBlockedLogged)
                             {
-                                logger.LogWarning("Composite score not warmed up -- blocked by: {Blocking}", string.Join(", ", blocking));
+                                var blocking = DescribeWarmUpBlockers(snapshot);
+                                if (blocking.Count > 0)
+                                {
+                                    logger.LogWarning("Composite score not warmed up -- blocked by: {Blocking}", string.Join(", ", blocking));
+                                    _warmUpBlockedLogged = true;
+                                }
                             }
+                        }
+                        else
+                        {
+                            _warmUpBlockedLogged = false;
                         }
 
                         await PersistSnapshotAsync(snapshot, _engine.BuildStrikeSnapshots(now), stoppingToken);
@@ -529,6 +551,48 @@ public sealed class MarketDataIngestionWorker(
 
         engine.SeedHistory(history);
         logger.LogInformation("Replayed {Count} historical score snapshots into the rolling windows", history.Count);
+    }
+
+    /// <summary>
+    /// Seeds the prior-session ATM IV distribution the F3 IV-rank gate ranks against once
+    /// mature (2026-09-09 external review amendment -- see
+    /// LiveFeatureEngine.SeedPriorSessionIvHistory). One representative value per prior session
+    /// (that session's mean of its own persisted AtmIv), most recent first, capped at the same
+    /// 20-session window LiveFeatureEngine itself caps at. Best-effort: a query failure here
+    /// must not stop ingestion from starting -- it just leaves the IV-rank gate in cold-start
+    /// (same-day-only) mode for this run, same as any other day with fewer than 5 prior
+    /// sessions of history.
+    /// </summary>
+    async Task SeedPriorSessionIvHistoryAsync(LiveFeatureEngine engine, DateOnly asOfDate, CancellationToken ct)
+    {
+        await using var scope = scopeFactory.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
+
+        try
+        {
+            // Must match LiveFeatureEngine.MaxPriorSessionsForIvRank's own limit of 20.
+            var sessionMeans = await db.Database.SqlQuery<double>(
+                $"""
+                SELECT AVG("AtmIv") AS "Value"
+                FROM score_snapshots
+                WHERE "AtmIv" IS NOT NULL
+                  AND ("ComputedAt" AT TIME ZONE 'Asia/Kolkata')::date < {asOfDate}
+                GROUP BY ("ComputedAt" AT TIME ZONE 'Asia/Kolkata')::date
+                ORDER BY ("ComputedAt" AT TIME ZONE 'Asia/Kolkata')::date DESC
+                LIMIT 20
+                """).ToListAsync(ct);
+
+            // Oldest-first, matching SeedHistory's chronological-replay convention elsewhere --
+            // harmless either way, since ComputeIvRank only ever reads min/max over the whole
+            // set, but consistent ordering keeps this easier to reason about if that changes.
+            sessionMeans.Reverse();
+            engine.SeedPriorSessionIvHistory(sessionMeans);
+            logger.LogInformation("Seeded IV-rank gate with {Count} prior sessions' ATM IV", sessionMeans.Count);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Failed to seed prior-session IV-rank history -- gate stays in cold-start (same-day-only) mode for this run");
+        }
     }
 
     // Audit finding F34 (2026-09-09, live-caught): a transient DB failure here used to throw
