@@ -1045,6 +1045,7 @@ public sealed class LiveFeatureEngine
         double? ratioCompositeScoreRawInstant = null, ratioCompositeScoreRaw = null, ratioCompositeScore = null;
         var ratioIsWarmedUp = false;
         string? ratioWeightSetVersion = null;
+        var ratioComponentsPresent = 0;
         try
         {
             var ratioInputs = new RatioComponentInputs(
@@ -1053,6 +1054,13 @@ public sealed class LiveFeatureEngine
                 ResidualDifference: RatioMetricMath.ClipScaledDifference(ratioResidualDifferenceRaw, RatioMetricScales.ResidualDifferenceScale),
                 IvSkew25Delta: RatioMetricMath.ClipLogRatio(ratioIvSkew25dRaw, RatioMetricScales.IvSkewRatioRMax),
                 SpreadRatioAtm: RatioMetricMath.ClipLogRatio(ratioSpreadAtmRaw, RatioMetricScales.SpreadRatioAtmRMax));
+
+            ratioComponentsPresent =
+                (ratioInputs.NotionalVolumeRatio is not null ? 1 : 0) +
+                (ratioInputs.SizedOiFlowRatio is not null ? 1 : 0) +
+                (ratioInputs.ResidualDifference is not null ? 1 : 0) +
+                (ratioInputs.IvSkew25Delta is not null ? 1 : 0) +
+                (ratioInputs.SpreadRatioAtm is not null ? 1 : 0);
 
             ratioCompositeScoreRawInstant = RatioScoreCalculator.ComputeRaw(ratioInputs, RatioScoreWeights.Default);
             if (ratioCompositeScoreRawInstant is { } ratioInstantRaw)
@@ -1135,6 +1143,7 @@ public sealed class LiveFeatureEngine
             RatioCompositeScore = ratioCompositeScore,
             RatioIsWarmedUp = ratioIsWarmedUp,
             RatioWeightSetVersion = ratioWeightSetVersion,
+            RatioComponentsPresent = ratioComponentsPresent,
         };
     }
 
@@ -1708,17 +1717,13 @@ public sealed class LiveFeatureEngine
     }
 
     /// <summary>
-    /// Ratio-composite metric 4 (weekend build, 2026-09-09): 25-delta put IV / 25-delta call
-    /// IV. Phase 1 approximation (audit finding F36 tracks true smile interpolation as a later
-    /// step) -- picks the tracked strike whose delta, estimated cheaply off the shared ATM
-    /// reference vol rather than its own IV, sits closest to |delta|=0.25 on each side; same
-    /// shortcut <see cref="ComputeGammaExposure"/> already uses (a closed-form BlackScholes
-    /// call per strike, no extra Newton-Raphson solves, and it doesn't require every strike to
-    /// have a fresh two-sided quote). That estimate is used only to pick *which* strike --
-    /// the actual skew read then solves each picked strike's own market-implied IV from its
-    /// real quote, same as <see cref="ComputeIvSkew"/> does for its expected-move-selected
-    /// strikes. Persisted separately from that method's own <c>IvSkewOneSigmaRaw</c> (F8,
-    /// ~1-sigma/16-delta) -- a materially different quantity, never to be read as the same
+    /// Ratio-composite metric 4 (weekend build, 2026-09-09; true smile interpolation added
+    /// audit finding F36, 2026-09-09): 25-delta put IV / 25-delta call IV, each leg linearly
+    /// interpolated between the two solved strikes whose own market-implied deltas bracket
+    /// |delta|=0.25 -- not the single nearest tracked strike (Phase 1's approximation). See
+    /// <see cref="InterpolateIvAtDelta25"/> for how each side is solved and interpolated.
+    /// Persisted separately from <see cref="ComputeIvSkew"/>'s own <c>IvSkewOneSigmaRaw</c>
+    /// (F8, ~1-sigma/16-delta) -- a materially different quantity, never to be read as the same
     /// series. Sampled every ~3s from <see cref="Sample"/>, like the other four noisy metrics,
     /// and averaged at cadence time.
     /// </summary>
@@ -1733,33 +1738,85 @@ public sealed class LiveFeatureEngine
             return null;
         }
 
-        const double targetAbsDelta = 0.25;
-        var underlyingAsDouble = (double)underlying;
-
-        var callOpt = _nearestExpiryOptions
-            .Where(o => o.OptionType == OptionType.Call)
-            .MinBy(o => Math.Abs(Math.Abs(BlackScholes.Calculate(OptionType.Call, underlyingAsDouble, (double)o.StrikePrice!.Value, t, RiskFreeRate, atmVol).Greeks.Delta) - targetAbsDelta));
-        var putOpt = _nearestExpiryOptions
-            .Where(o => o.OptionType == OptionType.Put)
-            .MinBy(o => Math.Abs(Math.Abs(BlackScholes.Calculate(OptionType.Put, underlyingAsDouble, (double)o.StrikePrice!.Value, t, RiskFreeRate, atmVol).Greeks.Delta) - targetAbsDelta));
-
-        if (callOpt is null || putOpt is null
-            || !_latest.TryGetValue(callOpt.Token, out var callState) || !_latest.TryGetValue(putOpt.Token, out var putState))
-        {
-            return null;
-        }
-
-        var callMid = MidPrice(callState);
-        var putMid = MidPrice(putState);
-        if (callMid is not { } cm || putMid is not { } pm)
-        {
-            return null;
-        }
-
-        var callIv = ImpliedVolatilitySolver.Solve(OptionType.Call, (double)cm, (double)underlying, (double)callOpt.StrikePrice!.Value, t, RiskFreeRate);
-        var putIv = ImpliedVolatilitySolver.Solve(OptionType.Put, (double)pm, (double)underlying, (double)putOpt.StrikePrice!.Value, t, RiskFreeRate);
+        var callIv = InterpolateIvAtDelta25(OptionType.Call, underlying, t, atmVol);
+        var putIv = InterpolateIvAtDelta25(OptionType.Put, underlying, t, atmVol);
 
         return callIv is null or <= 0 || putIv is null ? null : putIv / callIv;
+    }
+
+    /// <summary>
+    /// Audit finding F36 (2026-09-09): true 25-delta smile interpolation for one option side,
+    /// replacing the ratio composite's Phase 1 nearest-tracked-strike approximation. Two
+    /// passes, cheap-then-precise: (1) rank every strike on <paramref name="optionType"/>'s
+    /// side by a delta estimated off the shared <paramref name="atmVol"/> -- same closed-form
+    /// shortcut <see cref="ComputeGammaExposure"/> already uses -- and take the 6 closest to
+    /// |delta|=0.25, so the expensive step below never has to run across the full chain; (2)
+    /// for those candidates only, solve each strike's own market-implied IV from its real quote
+    /// (skipping any with no live two-sided market) and recompute delta from that solved IV,
+    /// same as <see cref="ComputeIvSkew"/> does for its own selected strikes. Sorting the
+    /// solved candidates by distance from ATM (ascending strike for calls, descending for
+    /// puts) makes delta monotonically decrease along the list, so the first adjacent pair
+    /// whose deltas straddle 0.25 is the true bracket -- linear-interpolate IV between them.
+    /// Falls back to the single closest-by-solved-delta candidate when no bracket exists among
+    /// the 6 (a thin or gappy chain, typically near expiry) rather than extrapolating past a
+    /// real quote. Null when no candidate on this side has a usable market quote at all.
+    /// </summary>
+    double? InterpolateIvAtDelta25(OptionType optionType, decimal underlying, double t, double atmVol)
+    {
+        const double targetAbsDelta = 0.25;
+        const int candidateCount = 6;
+        var underlyingAsDouble = (double)underlying;
+
+        var candidates = _nearestExpiryOptions
+            .Where(o => o.OptionType == optionType)
+            .Select(o => (Option: o, EstimatedAbsDelta: Math.Abs(BlackScholes.Calculate(optionType, underlyingAsDouble, (double)o.StrikePrice!.Value, t, RiskFreeRate, atmVol).Greeks.Delta)))
+            .OrderBy(x => Math.Abs(x.EstimatedAbsDelta - targetAbsDelta))
+            .Take(candidateCount);
+
+        var solved = new List<(decimal Strike, double AbsDelta, double Iv)>();
+        foreach (var (option, _) in candidates)
+        {
+            if (!_latest.TryGetValue(option.Token, out var state) || MidPrice(state) is not { } mid)
+            {
+                continue;
+            }
+
+            if (ImpliedVolatilitySolver.Solve(optionType, (double)mid, underlyingAsDouble, (double)option.StrikePrice!.Value, t, RiskFreeRate) is not ({ } iv and > 0))
+            {
+                continue;
+            }
+
+            var absDelta = Math.Abs(BlackScholes.Calculate(optionType, underlyingAsDouble, (double)option.StrikePrice!.Value, t, RiskFreeRate, iv).Greeks.Delta);
+            solved.Add((option.StrikePrice!.Value, absDelta, iv));
+        }
+
+        if (solved.Count == 0)
+        {
+            return null;
+        }
+
+        var byDistanceFromAtm = optionType == OptionType.Call
+            ? solved.OrderBy(x => x.Strike).ToList()
+            : solved.OrderByDescending(x => x.Strike).ToList();
+
+        for (var i = 0; i < byDistanceFromAtm.Count - 1; i++)
+        {
+            var (near, far) = (byDistanceFromAtm[i], byDistanceFromAtm[i + 1]);
+            if ((near.AbsDelta - targetAbsDelta) * (far.AbsDelta - targetAbsDelta) > 0)
+            {
+                continue; // both on the same side of the target -- not a bracket
+            }
+
+            if (near.AbsDelta == far.AbsDelta)
+            {
+                return near.Iv;
+            }
+
+            var frac = (near.AbsDelta - targetAbsDelta) / (near.AbsDelta - far.AbsDelta);
+            return near.Iv + frac * (far.Iv - near.Iv);
+        }
+
+        return solved.OrderBy(x => Math.Abs(x.AbsDelta - targetAbsDelta)).First().Iv;
     }
 
     /// <summary>

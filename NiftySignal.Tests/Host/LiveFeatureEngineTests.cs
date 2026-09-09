@@ -1686,6 +1686,7 @@ public class LiveFeatureEngineTests
         Assert.True(snapshot.RatioIsWarmedUp);
         Assert.NotNull(snapshot.RatioCompositeScore);
         Assert.NotNull(snapshot.RatioWeightSetVersion);
+        Assert.Equal(5, snapshot.RatioComponentsPresent);
     }
 
     [Fact]
@@ -1779,6 +1780,7 @@ public class LiveFeatureEngineTests
         Assert.NotNull(snapshot.RatioSpreadAtmRaw);
         Assert.True(snapshot.RatioIsWarmedUp);
         Assert.NotNull(snapshot.RatioCompositeScore);
+        Assert.Equal(3, snapshot.RatioComponentsPresent);
     }
 
     [Fact]
@@ -1795,5 +1797,62 @@ public class LiveFeatureEngineTests
         var exception = Record.Exception(() => engine.SeedHistory(history));
 
         Assert.Null(exception);
+    }
+
+    [Fact]
+    public void ComputeIvSkewRatio25Delta_InterpolatesBetweenBracketingStrikes_UnlikePhase1sNearestSinglePick()
+    {
+        // Audit finding F36: metric 4 must linearly interpolate between the two solved strikes
+        // whose own real deltas bracket |delta|=0.25, not just snap to whichever tracked
+        // strike's cheap ATM-vol-*estimated* delta happens to be nearest -- that was Phase 1's
+        // approximation. This universe deliberately widens the vol gap between the call side's
+        // two bracket strikes (24650@20%, 24700@60%) so the two algorithms disagree: Phase 1
+        // would pick 24700 alone (its estimated delta, off the shared 40% ATM vol, is nearer
+        // 0.25) and return callIv=0.60 outright; true interpolation must land strictly between
+        // 0.20 and 0.60. The put side is pinned flat at 40% on both its bracket strikes so
+        // putIv is unambiguous (0.40) regardless of which algorithm runs -- isolating the call
+        // side as the only source of any difference in the persisted ratio.
+        var t = TimeToExpiry.YearsUntilExpiry(NearestExpiry, Start);
+        decimal PriceAt(OptionType type, decimal strike, double vol) =>
+            Math.Max(0.5m, (decimal)BlackScholes.Calculate(type, 23950, (double)strike, t, 0.065, vol).Price);
+
+        var universe = new List<Instrument>
+        {
+            Spot(), Future(),
+            Option("90101", OptionType.Call, 23950m), // ATM call -- anchors the shared ATM-vol estimate at ~40%
+            Option("90102", OptionType.Put, 23950m),  // ATM put
+            Option("90103", OptionType.Call, 24650m), // call bracket, near side -- 20% vol
+            Option("90104", OptionType.Call, 24700m), // call bracket, far side -- 60% vol; Phase 1's lone pick
+            Option("90105", OptionType.Put, 23300m),  // put bracket, both flat 40% -- putIv unambiguous
+            Option("90106", OptionType.Put, 23350m),
+        };
+        var engine = new LiveFeatureEngine(universe);
+
+        void TickOption(string token, OptionType type, decimal strike, double vol, DateTimeOffset at)
+        {
+            var price = PriceAt(type, strike, vol);
+            engine.OnTick(MakeTick(token, price, at, oi: 100_000, depth: Depth(500, 400, bid: price - 0.5m, ask: price + 0.5m), volume: 1_000));
+        }
+
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        TickOption("90101", OptionType.Call, 23950m, 0.40, Start);
+        TickOption("90102", OptionType.Put, 23950m, 0.40, Start);
+        TickOption("90103", OptionType.Call, 24650m, 0.20, Start);
+        TickOption("90104", OptionType.Call, 24700m, 0.60, Start);
+        TickOption("90105", OptionType.Put, 23300m, 0.40, Start);
+        TickOption("90106", OptionType.Put, 23350m, 0.40, Start);
+
+        var snapshot = engine.ComputeCadence(Start);
+
+        Assert.NotNull(snapshot);
+        Assert.NotNull(snapshot!.RatioIvSkew25dRaw);
+
+        // putIv is pinned to 0.40 by construction; back out the implied callIv from the
+        // persisted ratio and confirm it sits strictly inside the (0.20, 0.60) bracket -- proof
+        // of genuine interpolation -- and is not Phase 1's nearest-single-strike pick (0.60).
+        var impliedCallIv = 0.40 / snapshot.RatioIvSkew25dRaw!.Value;
+        Assert.InRange(impliedCallIv, 0.21, 0.59);
+        Assert.True(Math.Abs(impliedCallIv - 0.60) > 0.05, $"Interpolated call IV ({impliedCallIv:F4}) must not equal Phase 1's nearest-single-strike pick (0.60).");
     }
 }

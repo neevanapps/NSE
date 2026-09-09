@@ -27,6 +27,22 @@ public sealed record ScoreComponentRow(
     TimeSpan Remaining);
 
 /// <summary>
+/// One ratio-composite metric's weight/clipped-value/contribution (audit finding F35, 2026-09-09
+/// -- the ratio sidecar's own dashboard panel, mirroring ScoreComponentRow's shape for the
+/// original composite). <paramref name="ClippedValue"/> holds the metric's already-clipped
+/// [-1,1] s_i (see NiftySignal.Features.RatioMetricMath), not a z-score -- there's no rolling
+/// window here, so unlike ScoreComponentRow there's no Window/Remaining warm-up countdown: a
+/// ratio metric is either present this cadence (its own liquidity floor cleared) or it isn't,
+/// per <paramref name="IsPresent"/>.
+/// </summary>
+public sealed record RatioComponentRow(
+    string Name,
+    double Weight,
+    double? ClippedValue,
+    double? WeightedContribution,
+    bool IsPresent);
+
+/// <summary>
 /// Three additions on 2026-09-05: <paramref name="ExpiryDate"/> (rows for both tracked weeklies
 /// now come back together, filtered per-viewer rather than in the shared singleton),
 /// <paramref name="LotSize"/> (needed to express OI as money rather than contract count), and

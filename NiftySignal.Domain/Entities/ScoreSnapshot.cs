@@ -240,4 +240,14 @@ public sealed class ScoreSnapshot
 
     /// <summary>Nullable unlike the required WeightSetVersion above -- this composite can legitimately fail to warm up (fewer than 3 of 5 metrics present), in which case there's no weight set to attribute the (absent) score to.</summary>
     public string? RatioWeightSetVersion { get; set; }
+
+    /// <summary>
+    /// Count (0-5) of the five ratio metrics that were non-null this cadence, after the same
+    /// RatioMetricMath clip each goes through before RatioScoreCalculator ever sees it -- so this
+    /// counts the same "present" RatioScoreCalculator.MinRequiredComponents checks, not raw-value
+    /// nullness (a raw value can be non-null yet clip to null, e.g. a non-positive ratio).
+    /// Audit finding F41 -- makes a 3-of-5 bar (e.g. only skew+spread+residual) distinguishable
+    /// from a 5-of-5 bar without re-deriving presence from the five Ratio*Raw columns' nullness.
+    /// </summary>
+    public int RatioComponentsPresent { get; set; }
 }

@@ -55,6 +55,8 @@ public sealed class LiveDataService : IDisposable
 
     double _currentScore;
     List<ScoreHistoryPoint> _scoreHistory = [];
+    double? _currentRatioScore;
+    List<ScoreHistoryPoint> _ratioScoreHistory = [];
     List<OptionChainRow> _optionChain = [];
     List<PositionRow> _positions = [];
     List<ClosedTradeRow> _closedTrades = [];
@@ -92,16 +94,21 @@ public sealed class LiveDataService : IDisposable
 
     public IReadOnlyList<ScoreComponentRow> ScoreComponents { get; private set; } = BuildDefaultComponentRows();
 
-    // PENDING (audit finding F35, 2026-09-09 -- ratio sidecar weekend build, deliberately
-    // deferred from the start: "No Dashboard changes this weekend", see fix plan's own
-    // Deferred section and ship-order table): the ratio composite is real and persisting --
-    // ScoreSnapshot.RatioCompositeScore/RatioIsWarmedUp/RatioWeightSetVersion and the five
-    // RatioXxxRaw columns all exist -- but nothing here reads them yet. A panel would need a
-    // parallel ScoreComponents/BuildComponentRows pair (RatioScoreComponents/
-    // BuildRatioComponentRows) reading the five Ratio*Raw columns the same way this class
-    // already reads the six original raw components, plus its own small Razor panel (mirrors
-    // ScorePanel.razor). Not started -- deliberately watched via direct DB query this weekend
-    // instead (see the fix plan's verification approach), not the dashboard.
+    /// <summary>
+    /// Audit finding F35 (2026-09-09): the ratio sidecar's own dashboard reads, mirroring
+    /// <see cref="CurrentScore"/>/<see cref="ScoreHistory"/>/<see cref="ScoreComponents"/>
+    /// exactly. Null (not 0) whenever <c>RatioCompositeScore</c> itself is null this cadence --
+    /// fewer than <c>RatioScoreCalculator.MinRequiredComponents</c> of the five metrics present
+    /// -- so RatioScorePanel can render "warming up" instead of a misleading flat zero.
+    /// </summary>
+    public double? CurrentRatioScore { get { lock (_lock) return _currentRatioScore; } }
+
+    public IReadOnlyList<ScoreHistoryPoint> RatioScoreHistory { get { lock (_lock) return _ratioScoreHistory; } }
+
+    public IReadOnlyList<RatioComponentRow> RatioScoreComponents { get; private set; } = BuildDefaultRatioComponentRows();
+
+    /// <summary>Count (0-5) of ratio metrics present in the latest cadence -- see ScoreSnapshot.RatioComponentsPresent (F41), the direct source rather than re-deriving it from RatioScoreComponents' own IsPresent flags.</summary>
+    public int RatioComponentsPresent { get; private set; }
 
     public IReadOnlyList<OptionChainRow> OptionChain { get { lock (_lock) return _optionChain; } }
 
@@ -392,9 +399,13 @@ public sealed class LiveDataService : IDisposable
                 {
                     _currentScore = latest.CompositeScore ?? _currentScore;
                     _scoreHistory = [.. snapshots.Select(s => new ScoreHistoryPoint(s.ComputedAt, s.CompositeScore ?? 0, s.SpotPrice))];
+                    _currentRatioScore = latest.RatioCompositeScore;
+                    _ratioScoreHistory = [.. snapshots.Select(s => new ScoreHistoryPoint(s.ComputedAt, s.RatioCompositeScore ?? 0, s.SpotPrice))];
                 }
 
                 ScoreComponents = BuildComponentRows(latest, _firstSnapshotAt ?? latest.ComputedAt, _firstVixSnapshotAt);
+                RatioScoreComponents = BuildRatioComponentRows(latest);
+                RatioComponentsPresent = latest.RatioComponentsPresent;
                 GammaFlipLevel = latest.GammaFlipLevel;
             }
 
@@ -560,6 +571,48 @@ public sealed class LiveDataService : IDisposable
         new("CvdProxy", ScoreWeights.Default.CvdProxy, 0, 0, false, FeatureWindowLengths.CvdProxy, FeatureWindowLengths.CvdProxy),
         new("StraddleRichness", ScoreWeights.Default.StraddleRichness, 0, 0, false, FeatureWindowLengths.StraddleRichness, FeatureWindowLengths.StraddleRichness),
     ];
+
+    /// <summary>
+    /// Audit finding F35 (2026-09-09): the ratio sidecar's own component breakdown, mirroring
+    /// <see cref="BuildComponentRows"/> but re-deriving each metric's clipped [-1,1] value from
+    /// its persisted <c>Ratio*Raw</c> column and <see cref="RatioMetricScales"/> constant
+    /// (rather than persisting the clip itself -- see ScoreSnapshot's own doc comment on why
+    /// that's a deliberate, cheap-to-recompute omission) via the exact same
+    /// <see cref="RatioMetricMath"/> calls <see cref="NiftySignal.Host.LiveFeatureEngine"/>
+    /// uses when it builds <c>RatioComponentInputs</c> for <c>RatioScoreCalculator</c>.
+    /// </summary>
+    static List<RatioComponentRow> BuildRatioComponentRows(ScoreSnapshot s)
+    {
+        var weights = RatioScoreWeights.Default;
+
+        static RatioComponentRow Row(string name, double weight, double? clipped)
+        {
+            var contribution = clipped is { } c ? weight * c : (double?)null;
+            return new RatioComponentRow(name, weight, clipped, contribution, clipped is not null);
+        }
+
+        return
+        [
+            Row("NotionalVolumeRatio", weights.NotionalVolumeRatio, RatioMetricMath.ClipLogRatio(s.RatioNotionalVolumeRaw, RatioMetricScales.NotionalVolumeRatioRMax)),
+            Row("SizedOiFlowRatio", weights.SizedOiFlowRatio, RatioMetricMath.ClipLogRatio(s.RatioSizedOiFlowRaw, RatioMetricScales.SizedOiFlowRatioRMax)),
+            Row("ResidualDifference", weights.ResidualDifference, RatioMetricMath.ClipScaledDifference(s.RatioResidualDifferenceRaw, RatioMetricScales.ResidualDifferenceScale)),
+            Row("IvSkew25Delta", weights.IvSkew25Delta, RatioMetricMath.ClipLogRatio(s.RatioIvSkew25dRaw, RatioMetricScales.IvSkewRatioRMax)),
+            Row("SpreadRatioAtm", weights.SpreadRatioAtm, RatioMetricMath.ClipLogRatio(s.RatioSpreadAtmRaw, RatioMetricScales.SpreadRatioAtmRMax)),
+        ];
+    }
+
+    static List<RatioComponentRow> BuildDefaultRatioComponentRows()
+    {
+        var weights = RatioScoreWeights.Default;
+        return
+        [
+            new("NotionalVolumeRatio", weights.NotionalVolumeRatio, null, null, false),
+            new("SizedOiFlowRatio", weights.SizedOiFlowRatio, null, null, false),
+            new("ResidualDifference", weights.ResidualDifference, null, null, false),
+            new("IvSkew25Delta", weights.IvSkew25Delta, null, null, false),
+            new("SpreadRatioAtm", weights.SpreadRatioAtm, null, null, false),
+        ];
+    }
 
     async Task<List<OptionChainRow>> BuildOptionChainAsync(NiftySignalDbContext db)
     {
