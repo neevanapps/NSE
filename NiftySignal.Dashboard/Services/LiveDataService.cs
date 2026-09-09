@@ -92,6 +92,17 @@ public sealed class LiveDataService : IDisposable
 
     public IReadOnlyList<ScoreComponentRow> ScoreComponents { get; private set; } = BuildDefaultComponentRows();
 
+    // PENDING (audit finding F35, 2026-09-09 -- ratio sidecar weekend build, deliberately
+    // deferred from the start: "No Dashboard changes this weekend", see fix plan's own
+    // Deferred section and ship-order table): the ratio composite is real and persisting --
+    // ScoreSnapshot.RatioCompositeScore/RatioIsWarmedUp/RatioWeightSetVersion and the five
+    // RatioXxxRaw columns all exist -- but nothing here reads them yet. A panel would need a
+    // parallel ScoreComponents/BuildComponentRows pair (RatioScoreComponents/
+    // BuildRatioComponentRows) reading the five Ratio*Raw columns the same way this class
+    // already reads the six original raw components, plus its own small Razor panel (mirrors
+    // ScorePanel.razor). Not started -- deliberately watched via direct DB query this weekend
+    // instead (see the fix plan's verification approach), not the dashboard.
+
     public IReadOnlyList<OptionChainRow> OptionChain { get { lock (_lock) return _optionChain; } }
 
     // Snapshot copy, not the live dictionary (2026-09-08, same bug class as Positions' own fix
