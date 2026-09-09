@@ -39,6 +39,8 @@ try
 
     builder.Services.Configure<KillSwitchOptions>(
         builder.Configuration.GetSection(KillSwitchOptions.SectionName));
+    builder.Services.Configure<PricingOptions>(
+        builder.Configuration.GetSection(PricingOptions.SectionName));
 
     builder.Services.AddDbContext<NiftySignalDbContext>(options =>
         options.UseNpgsql(builder.Configuration.GetConnectionString("NiftySignalDb")));

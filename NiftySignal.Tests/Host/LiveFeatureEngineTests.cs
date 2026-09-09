@@ -1311,6 +1311,21 @@ public class LiveFeatureEngineTests
     }
 
     [Fact]
+    public void BuildStrikeCandidates_ReportsCumulativeDayVolume_NotAHardcodedZero()
+    {
+        // Audit finding F19: Volume used to be hardcoded 0, making StrikeSelector's own
+        // volume tie-break a permanent no-op (always 0 vs 0).
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, oi: 1_000_000, depth: Depth(500, 400, bid: 99.9m, ask: 100.1m), volume: 42_000));
+
+        var candidate = Assert.Single(engine.BuildStrikeCandidates(OptionType.Call, Start));
+
+        Assert.Equal(42_000, candidate.Volume);
+    }
+
+    [Fact]
     public void BuildStrikeCandidates_PricesIvAgainstSpot_NotTheMismatchedTrackedFuture()
     {
         // Regression test for the 2026-09-04 live-caught bug ("all put IVs read >10, call

@@ -1,5 +1,7 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 using NiftySignal.Domain;
+using NiftySignal.Domain.Configuration;
 using NiftySignal.Domain.Entities;
 using NiftySignal.Domain.Enums;
 using NiftySignal.Features;
@@ -138,10 +140,15 @@ public sealed class LiveDataService : IDisposable
     /// </summary>
     public double? GammaFlipLevel { get; private set; }
 
-    public LiveDataService(IDbContextFactory<NiftySignalDbContext> dbFactory, FlatTradeAuthClient authClient, ILogger<LiveDataService> logger)
+    public LiveDataService(
+        IDbContextFactory<NiftySignalDbContext> dbFactory,
+        FlatTradeAuthClient authClient,
+        IOptionsMonitor<PricingOptions> pricingOptions,
+        ILogger<LiveDataService> logger)
     {
         _dbFactory = dbFactory;
         _authClient = authClient;
+        _pricingOptions = pricingOptions;
         _logger = logger;
         _timer = new Timer(_ => Poll(), null, TimeSpan.Zero, PollInterval);
     }
@@ -637,7 +644,7 @@ public sealed class LiveDataService : IDisposable
         // NiftySignal.Pricing.SyntheticForward's doc comment and
         // LiveFeatureEngine.ComputeUnderlyingPrice (same fix, same day, same root cause).
         var forwardByExpiry = spotLtp is { } spotForForward
-            ? BuildSyntheticForwardByExpiry(instruments, latestByToken, spotForForward, yearsToExpiry)
+            ? BuildSyntheticForwardByExpiry(instruments, latestByToken, spotForForward, yearsToExpiry, RiskFreeRate)
             : [];
 
         // Reference vol for theoretical pricing (2026-09-05), solved per expiry at the ATM
@@ -647,7 +654,7 @@ public sealed class LiveDataService : IDisposable
         // premium in rupee terms, i.e. how much more (or less) the market is paying for this
         // strike than the at-the-money baseline implies. Above theoretical reads as demand
         // bidding premium up; below reads as supply/writing pressure.
-        var atmVolByExpiry = BuildAtmReferenceVol(instruments, latestByToken, forwardByExpiry, atmStrike, yearsToExpiry);
+        var atmVolByExpiry = BuildAtmReferenceVol(instruments, latestByToken, forwardByExpiry, atmStrike, yearsToExpiry, RiskFreeRate);
 
         var rows = new List<OptionChainRow>();
         foreach (var instrument in instruments.OrderBy(i => i.ExpiryDate).ThenBy(i => i.StrikePrice))
@@ -723,20 +730,20 @@ public sealed class LiveDataService : IDisposable
     /// if the call's solve fails. Expiries with no usable ATM quote are simply absent from the
     /// result, and their rows get no theoretical price rather than one built on a guess.
     ///
-    /// DEFERRED (audit finding F33, 2026-09-08 third-party review -- see fix plan): structurally
-    /// parallel to, but not shared with, LiveFeatureEngine.SolveAtmReferenceVol -- a
-    /// maintainability risk, not a correctness bug today (the two currently agree), but the next
-    /// fix to one has to be remembered and manually re-applied to the other or the dashboard will
-    /// quietly start showing different numbers than what's actually driving trades. Extract the
-    /// shared logic into NiftySignal.Pricing/NiftySignal.Features (which Dashboard could
-    /// reference) so there's exactly one implementation.
+    /// Audit finding F33 fixed (2026-09-09): the fallback/solve step (call preferred, put as
+    /// fallback) is now shared with LiveFeatureEngine.SolveAtmReferenceVol via
+    /// AtmReferenceVolSolver (NiftySignal.Pricing) -- only this method's own multi-expiry
+    /// iteration and LTP-based mark price stay local, since those are legitimate, pre-existing
+    /// differences from the live engine's single-expiry/mid-price read (this is a display value,
+    /// not a live scoring input), not something that needed sharing.
     /// </summary>
     static Dictionary<DateOnly, double> BuildAtmReferenceVol(
         List<Instrument> instruments,
         Dictionary<string, Tick> latestByToken,
         Dictionary<DateOnly, decimal> forwardByExpiry,
         decimal atmStrike,
-        Dictionary<DateOnly, double> yearsToExpiry)
+        Dictionary<DateOnly, double> yearsToExpiry,
+        double riskFreeRate)
     {
         var result = new Dictionary<DateOnly, double>();
 
@@ -749,23 +756,16 @@ public sealed class LiveDataService : IDisposable
 
             var atmLegs = instruments
                 .Where(i => i.ExpiryDate == expiry && i.StrikePrice == atmStrike)
-                .OrderBy(i => i.OptionType == OptionType.Call ? 0 : 1);
+                .OrderBy(i => i.OptionType == OptionType.Call ? 0 : 1)
+                .Select(i => latestByToken.TryGetValue(i.Token, out var tick)
+                    ? new AtmReferenceVolSolver.Leg(i.OptionType, tick.LastPrice)
+                    : (AtmReferenceVolSolver.Leg?)null)
+                .Where(leg => leg is not null)
+                .Select(leg => leg!.Value);
 
-            foreach (var leg in atmLegs)
+            if (AtmReferenceVolSolver.Solve(atmLegs, atmStrike, underlying, yearsToExpiry[expiry], riskFreeRate) is { } vol)
             {
-                if (!latestByToken.TryGetValue(leg.Token, out var tick) || tick.LastPrice <= 0)
-                {
-                    continue;
-                }
-
-                var solved = ImpliedVolatilitySolver.Solve(
-                    leg.OptionType, (double)tick.LastPrice, (double)underlying, (double)atmStrike, yearsToExpiry[expiry], RiskFreeRate);
-
-                if (solved is { } vol)
-                {
-                    result[expiry] = vol;
-                    break;
-                }
+                result[expiry] = vol;
             }
         }
 
@@ -786,7 +786,8 @@ public sealed class LiveDataService : IDisposable
         List<Instrument> instruments,
         Dictionary<string, Tick> latestByToken,
         decimal spotLtp,
-        Dictionary<DateOnly, double> yearsToExpiry)
+        Dictionary<DateOnly, double> yearsToExpiry,
+        double riskFreeRate)
     {
         var result = new Dictionary<DateOnly, decimal>();
 
@@ -809,7 +810,7 @@ public sealed class LiveDataService : IDisposable
                 pairs.Add(((double)strike, (double)callMid, (double)putMid));
             }
 
-            result[expiry] = SyntheticForward.Compute(pairs, t, RiskFreeRate) is { } forward ? (decimal)forward : spotLtp;
+            result[expiry] = SyntheticForward.Compute(pairs, t, riskFreeRate) is { } forward ? (decimal)forward : spotLtp;
         }
 
         return result;
@@ -965,10 +966,13 @@ public sealed class LiveDataService : IDisposable
         new DateTimeOffset(DateTimeOffset.UtcNow.ToIst().Date, IstTime.Offset).ToUniversalTime();
 
     // 91-day T-bill proxy -- same starting value as LiveFeatureEngine (plan 4.1).
-    // PENDING (audit finding F21, 2026-09-08 lead review -- see fix plan Batch 6): duplicated
-    // identically in NiftySignal.Host/LiveFeatureEngine.cs. Move both to config so a rate change
-    // can't land in one copy and not the other.
-    const double RiskFreeRate = 0.065;
+    // Audit finding F21 fixed (2026-09-09): was a hardcoded const duplicated identically in
+    // NiftySignal.Host/LiveFeatureEngine.cs; both now read the same-shaped "Pricing" config
+    // section (PricingOptions, NiftySignal.Domain.Configuration) from their own appsettings.json
+    // instead -- see PricingOptions' own doc comment for why this is two config entries kept in
+    // sync by hand, not one shared source.
+    readonly IOptionsMonitor<PricingOptions> _pricingOptions;
+    double RiskFreeRate => _pricingOptions.CurrentValue.RiskFreeRate;
 
     public void Dispose() => _timer.Dispose();
 }

@@ -7,6 +7,7 @@ using Microsoft.Extensions.Options;
 using NiftySignal.Dashboard.Components;
 using NiftySignal.Dashboard.Hubs;
 using NiftySignal.Dashboard.Services;
+using NiftySignal.Domain.Configuration;
 using NiftySignal.Ingestion.FlatTrade;
 using NiftySignal.Persistence;
 
@@ -38,6 +39,7 @@ builder.Services.AddDbContextFactory<NiftySignalDbContext>(options =>
     options.UseNpgsql(builder.Configuration.GetConnectionString("NiftySignalDb")));
 
 builder.Services.Configure<FlatTradeOptions>(builder.Configuration.GetSection(FlatTradeOptions.SectionName));
+builder.Services.Configure<PricingOptions>(builder.Configuration.GetSection(PricingOptions.SectionName));
 builder.Services.AddHttpClient<FlatTradeAuthClient>();
 
 builder.Services.AddSingleton<LiveDataService>();

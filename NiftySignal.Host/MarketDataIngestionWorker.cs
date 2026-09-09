@@ -3,6 +3,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using NiftySignal.Domain;
 using NiftySignal.Domain.Abstractions;
+using NiftySignal.Domain.Configuration;
 using NiftySignal.Domain.Entities;
 using NiftySignal.Ingestion.FlatTrade;
 using NiftySignal.Notifications;
@@ -26,6 +27,7 @@ public sealed class MarketDataIngestionWorker(
     LiveTradingEngine tradingEngine,
     DashboardPushClient dashboardPush,
     IValidatedOptions<ScoreWeights> scoreWeightsOptions,
+    IOptionsMonitor<PricingOptions> pricingOptions,
     ILogger<MarketDataIngestionWorker> logger) : BackgroundService
 {
     static readonly TimeSpan IstOffset = TimeSpan.FromHours(5.5);
@@ -100,7 +102,7 @@ public sealed class MarketDataIngestionWorker(
         var instruments = await ResolveInstrumentsAsync(session.Token, asOfDate, stoppingToken);
         var subscriptions = instruments.Select(i => (i.Exchange, i.Token)).ToList();
 
-        _engine = new LiveFeatureEngine(instruments, scoreWeightsOptions);
+        _engine = new LiveFeatureEngine(instruments, scoreWeightsOptions, pricingOptions);
         await SeedEngineHistoryAsync(_engine, asOfDate, stoppingToken);
         await SeedPriorSessionIvHistoryAsync(_engine, asOfDate, stoppingToken);
         await dashboardPush.StartAsync(stoppingToken);
@@ -247,6 +249,21 @@ public sealed class MarketDataIngestionWorker(
             try
             {
                 await FlushAsync(buffer, stoppingToken);
+            }
+            catch (OperationCanceledException)
+            {
+                // Audit finding F45 fixed (2026-09-09): stoppingToken is already cancelled by
+                // the time a genuine shutdown reaches here -- FlushAsync's own SaveChangesAsync
+                // throws the same OperationCanceledException the tick-reading loop above already
+                // caught, but this second occurrence had no catch of its own, so it propagated
+                // out of RunTickLoopAsync into ExecuteAsync uncaught, triggering .NET's default
+                // BackgroundServiceExceptionBehavior (StopHost) to FTL-log a *normal* stop as if
+                // it were an unhandled crash -- live-observed as indistinguishable in the logs
+                // from F34's actual incident. A handful of buffered-but-unflushed ticks lost on
+                // shutdown is an acceptable, already-established tradeoff (see the per-tick
+                // catch above) -- there's no "next successful flush" to retry them on once the
+                // service is actually stopping.
+                logger.LogWarning("Final flush of {Count} buffered ticks skipped -- shutdown already in progress", buffer.Count);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -609,22 +626,18 @@ public sealed class MarketDataIngestionWorker(
     // RunSampleLoopAsync and RunPendingSubscriptionLoopAsync got the same treatment alongside it,
     // since both had the identical gap.
     //
-    // PENDING (audit finding F45, 2026-09-09, found while validating a routine deploy): a
-    // *normal*, intentional service stop still logs as if F34 had recurred. Stopping the
-    // service cancels stoppingToken, which makes RunTickLoopAsync's channel read throw
-    // OperationCanceledException -- deliberately NOT caught by the per-iteration guards above
-    // (`when (ex is not OperationCanceledException)`), since cancellation during a real
-    // shutdown is expected and shouldn't be treated as a per-tick failure. But nothing catches
-    // it gracefully at the *top* either, so it propagates out of ExecuteAsync, .NET's default
-    // BackgroundServiceExceptionBehavior (StopHost) logs it FTL as an unhandled exception, and
-    // the host stops -- which is what should happen on a stop request, just not logged as if
-    // something broke. Live-observed 2026-09-09: a routine Stop-Service (ahead of a VM
-    // shutdown) produced the exact same FTL stack trace and log shape as F34's actual crash,
-    // indistinguishable without checking whether a stop was actually requested. Fix: catch
-    // OperationCanceledException once at the top of ExecuteAsync (or check
-    // stoppingToken.IsCancellationRequested before logging) and log it as a normal stop, not a
-    // fatal error -- cosmetic (the service does stop correctly either way), but worth fixing so
-    // a future real crash isn't lost in a history of identical-looking "normal" stops.
+    // Audit finding F45 fixed (2026-09-09, found while validating a routine deploy): a
+    // *normal*, intentional service stop was logging as if F34 had recurred -- not from this
+    // method's own per-tick guards (correctly excluded above), but from RunTickLoopAsync's
+    // *final flush* after the tick loop's own OperationCanceledException was already caught.
+    // That flush reused the already-cancelled stoppingToken, so FlushAsync's SaveChangesAsync
+    // threw the identical exception a second time, uncaught this time, propagating out of
+    // RunTickLoopAsync into ExecuteAsync and triggering .NET's default
+    // BackgroundServiceExceptionBehavior (StopHost) to FTL-log a normal stop as an unhandled
+    // crash. Live-observed 2026-09-09: a routine Stop-Service ahead of a VM shutdown produced
+    // the exact same FTL stack trace and log shape as F34's actual crash, indistinguishable
+    // without checking whether a stop was actually requested. See RunTickLoopAsync's own
+    // catch (OperationCanceledException) around the final flush for the fix.
     async Task FlushAsync(List<Tick> buffer, CancellationToken ct)
     {
         await using var scope = scopeFactory.CreateAsyncScope();

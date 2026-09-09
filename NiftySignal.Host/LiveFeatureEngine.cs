@@ -1,3 +1,5 @@
+using Microsoft.Extensions.Options;
+using NiftySignal.Domain.Configuration;
 using NiftySignal.Domain.Entities;
 using NiftySignal.Domain.Enums;
 using NiftySignal.Domain.ValueObjects;
@@ -96,12 +98,18 @@ readonly record struct InstrumentState(decimal LastPrice, long Volume, long? Ope
 /// </summary>
 public sealed class LiveFeatureEngine
 {
-    // 91-day T-bill proxy (plan 4.1: "static config value, reviewed weekly") -- hardcoded
-    // starting point since no config surface exists yet for it.
-    // PENDING (audit finding F21, 2026-09-08 lead review -- see fix plan Batch 6): duplicated
-    // identically in NiftySignal.Dashboard/Services/LiveDataService.cs. Move both to config
-    // (Pricing: { RiskFreeRate: 0.065 }) so a rate change can't land in one copy and not the other.
-    const double RiskFreeRate = 0.065;
+    // 91-day T-bill proxy (plan 4.1: "static config value, reviewed weekly"). Audit finding F21
+    // fixed (2026-09-09): was a hardcoded const duplicated identically in
+    // NiftySignal.Dashboard/Services/LiveDataService.cs; both now read the same-shaped
+    // "Pricing" config section (PricingOptions, NiftySignal.Domain.Configuration) from their
+    // own appsettings.json instead -- see PricingOptions' own doc comment for why this is two
+    // config entries kept in sync by hand, not one shared source. Optional and trailing, like
+    // _scoreWeightsOptions above, so the ~280 existing tests and NiftySignal.ScoreReplay (which
+    // construct this engine directly, not through DI) fall back to the same 0.065 default
+    // rather than needing a config source of their own.
+    const double DefaultRiskFreeRate = 0.065;
+    readonly IOptionsMonitor<PricingOptions>? _pricingOptions;
+    double RiskFreeRate => _pricingOptions?.CurrentValue.RiskFreeRate ?? DefaultRiskFreeRate;
 
     /// <summary>
     /// Strikes each side of ATM whose per-cadence analytics get persisted (2026-09-05) --
@@ -259,10 +267,14 @@ public sealed class LiveFeatureEngine
 
     ScoreWeights Weights => _scoreWeightsOptions?.Current ?? ScoreWeights.Default;
 
-    public LiveFeatureEngine(IReadOnlyList<Instrument> instruments, IValidatedOptions<ScoreWeights>? scoreWeightsOptions = null)
+    public LiveFeatureEngine(
+        IReadOnlyList<Instrument> instruments,
+        IValidatedOptions<ScoreWeights>? scoreWeightsOptions = null,
+        IOptionsMonitor<PricingOptions>? pricingOptions = null)
     {
         _instruments = instruments;
         _scoreWeightsOptions = scoreWeightsOptions;
+        _pricingOptions = pricingOptions;
         _spot = instruments.First(i => i.InstrumentType == InstrumentType.Index);
         _future = instruments.First(i => i.InstrumentType == InstrumentType.Future);
         _vix = instruments.FirstOrDefault(i => i.InstrumentType == InstrumentType.Vix);
@@ -496,11 +508,16 @@ public sealed class LiveFeatureEngine
                 BidPrice: bid,
                 AskPrice: ask,
                 OpenInterest: state.OpenInterest ?? 0,
-                // PENDING (audit finding F19, 2026-09-08 lead review -- see fix plan Batch 6):
+                // Audit finding F19 fixed (2026-09-09): was hardcoded 0, making
                 // StrikeSelector.SelectBestCandidate's .ThenByDescending(c => c.Volume) tie-break
-                // therefore always compares 0 to 0 -- a no-op presented as a real rank step. Wire
-                // real per-instrument volume delta here, or delete that dead ThenByDescending.
-                Volume: 0, // not tracked per-instrument yet -- see class doc comment's other scoped-down v1s
+                // a no-op (always 0 vs 0). Cumulative day volume-so-far, not a per-cadence delta
+                // -- already sitting on `state` with no new tracking needed, and a perfectly
+                // legitimate liquidity signal in its own right (this tie-break is about ranking
+                // by liquidity, per this class' own doc comment -- volume-to-date answers that
+                // as well as a delta would, without the timing complexity of a delta computed
+                // after ComputeCadence has already rolled its own "previous volume" baseline
+                // forward for the next cadence).
+                Volume: state.Volume,
                 Delta: delta,
                 ImpliedVolatility: iv));
         }
@@ -1390,31 +1407,21 @@ public sealed class LiveFeatureEngine
     /// </summary>
     double? SolveAtmReferenceVol(decimal atmStrike, decimal underlyingPrice, double t)
     {
+        // Audit finding F33 fixed (2026-09-09): the fallback/solve step itself is now shared
+        // with LiveDataService's own ATM-vol solve (AtmReferenceVolSolver, NiftySignal.Pricing)
+        // -- only this method's own iteration and mid-price mark choice stay local, since
+        // preferring mid over LTP for live scoring stability is a deliberate, pre-existing
+        // difference from the dashboard's LTP-based read, not something that needed sharing.
         var atmLegs = _nearestExpiryOptions
             .Where(o => o.StrikePrice == atmStrike)
-            .OrderBy(o => o.OptionType == OptionType.Call ? 0 : 1);
+            .OrderBy(o => o.OptionType == OptionType.Call ? 0 : 1)
+            .Select(o => _latest.TryGetValue(o.Token, out var state) && MidPrice(state) is { } mark
+                ? new AtmReferenceVolSolver.Leg(o.OptionType, mark)
+                : (AtmReferenceVolSolver.Leg?)null)
+            .Where(leg => leg is not null)
+            .Select(leg => leg!.Value);
 
-        foreach (var leg in atmLegs)
-        {
-            if (!_latest.TryGetValue(leg.Token, out var state))
-            {
-                continue;
-            }
-
-            var mark = MidPrice(state);
-            if (mark is not { } markPrice || markPrice <= 0)
-            {
-                continue;
-            }
-
-            var solved = ImpliedVolatilitySolver.Solve(leg.OptionType, (double)markPrice, (double)underlyingPrice, (double)atmStrike, t, RiskFreeRate);
-            if (solved is { } vol)
-            {
-                return vol;
-            }
-        }
-
-        return null;
+        return AtmReferenceVolSolver.Solve(atmLegs, atmStrike, underlyingPrice, t, RiskFreeRate);
     }
 
     /// <summary>
