@@ -8,6 +8,8 @@ using NiftySignal.Domain.ValueObjects;
 using NiftySignal.Host;
 using NiftySignal.Notifications;
 using NiftySignal.Persistence;
+using NiftySignal.Rules;
+using NiftySignal.Tests.Rules;
 
 namespace NiftySignal.Tests.Host;
 
@@ -35,6 +37,12 @@ public class LiveTradingEngineTests
             Sent.Add((category, message));
             return Task.CompletedTask;
         }
+    }
+
+    /// <summary>Fixed, never-reloading stand-in for the real hot-reloaded config -- these tests assert against TestRulesetConfigs' known values, not whatever's live.</summary>
+    sealed class FixedOptions<T>(T value) : IValidatedOptions<T>
+    {
+        public T Current { get; } = value;
     }
 
     sealed class Fixture : IAsyncDisposable
@@ -67,6 +75,7 @@ public class LiveTradingEngineTests
                 _provider.GetRequiredService<IServiceScopeFactory>(),
                 Telegram,
                 _dashboardPush,
+                new FixedOptions<RulesetConfig>(TestRulesetConfigs.Default()),
                 NullLogger<LiveTradingEngine>.Instance);
         }
 

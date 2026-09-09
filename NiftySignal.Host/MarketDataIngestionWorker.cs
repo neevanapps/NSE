@@ -7,6 +7,7 @@ using NiftySignal.Domain.Entities;
 using NiftySignal.Ingestion.FlatTrade;
 using NiftySignal.Notifications;
 using NiftySignal.Persistence;
+using NiftySignal.Scoring;
 
 namespace NiftySignal.Host;
 
@@ -24,6 +25,7 @@ public sealed class MarketDataIngestionWorker(
     ITelegramNotifier telegram,
     LiveTradingEngine tradingEngine,
     DashboardPushClient dashboardPush,
+    IValidatedOptions<ScoreWeights> scoreWeightsOptions,
     ILogger<MarketDataIngestionWorker> logger) : BackgroundService
 {
     static readonly TimeSpan IstOffset = TimeSpan.FromHours(5.5);
@@ -98,7 +100,7 @@ public sealed class MarketDataIngestionWorker(
         var instruments = await ResolveInstrumentsAsync(session.Token, asOfDate, stoppingToken);
         var subscriptions = instruments.Select(i => (i.Exchange, i.Token)).ToList();
 
-        _engine = new LiveFeatureEngine(instruments);
+        _engine = new LiveFeatureEngine(instruments, scoreWeightsOptions);
         await SeedEngineHistoryAsync(_engine, asOfDate, stoppingToken);
         await SeedPriorSessionIvHistoryAsync(_engine, asOfDate, stoppingToken);
         await dashboardPush.StartAsync(stoppingToken);

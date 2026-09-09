@@ -89,6 +89,13 @@ public sealed record ScoreWeights(
     /// need a different integration shape than a plain addition to the directional weighted sum
     /// -- a decision for whenever it's actually validated, not now.
     ///
+    /// PENDING (audit finding F43, standing rule, 2026-09-09 external review): none of the seven diagnostic weights above
+    /// (GammaExposure/VolumePcr/SpreadRatio/VannaExposure/CharmExposure/CvdProxy/
+    /// StraddleRichness) move off 0.0 until scripts/batch5-component-correlation.sql has run
+    /// against several *clean* live sessions (not VM-restart-interrupted ones) on the current,
+    /// corrected formulas. This is not a one-time gate to clear -- re-check it every time before
+    /// raising any of these, not just the first time.
+    ///
     /// PENDING (audit finding F9, from the score-reactivity discussion 2026-09-08 -- see fix
     /// plan dazzling-orbiting-whistle.md's Batch 5, "ongoing, not a one-time fix"): OiBuildupNet,
     /// Pcr, and IvSkew all read option positioning; FuturesBasis and PriceMomentum both come off

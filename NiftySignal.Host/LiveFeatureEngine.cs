@@ -76,6 +76,23 @@ readonly record struct InstrumentState(decimal LastPrice, long Volume, long? Ope
 /// the composite from a session-open or multi-day-anchored value instead of the rolling z, and
 /// keep the short z as a journal-only diagnostic. Deserves its own design pass once F23/F24/F27's
 /// individual sign questions are settled -- see the plan for why order matters here.
+///
+/// PENDING (audit finding F44, 2026-09-09 external review -- "extract scoring math out of
+/// LiveFeatureEngine so replay and live cannot diverge"): checked before deferring, not just
+/// assumed -- there is no hidden non-determinism here today (grepped for DateTimeOffset.UtcNow/
+/// DateTime.Now inside this file: none), and NiftySignal.ScoreReplay already drives ticks
+/// through this exact class' OnTick/Sample/ComputeCadence, not a reimplementation, so live and
+/// replay provably cannot diverge numerically right now. The real gap is structural: that
+/// guarantee is emergent (both happen to reuse this one class) rather than enforced by the type
+/// system, and the ~15 raw-value Compute* methods read instance state (_latest,
+/// _previousCadence, the rolling windows) directly rather than taking it as an explicit
+/// parameter -- a future consumer could reimplement instead of reuse without anything catching
+/// it. Proper fix: give an immutable MarketState-shaped input to each raw-value method and move
+/// them out of this class into their own independently-testable module, so "the shared math" is
+/// an explicit contract, not a convention. Deliberately not attempted the night this was found --
+/// a real, multi-hour, correctness-sensitive refactor of the file that computes every live
+/// (paper) trade decision deserves its own careful pass, not one done under time pressure
+/// alongside three other changes.
 /// </summary>
 public sealed class LiveFeatureEngine
 {
@@ -229,9 +246,23 @@ public sealed class LiveFeatureEngine
     /// </summary>
     readonly Dictionary<string, long> _previousVolumeByTokenFullChain = [];
 
-    public LiveFeatureEngine(IReadOnlyList<Instrument> instruments)
+    /// <summary>
+    /// Hot-reloaded, already-validated weights (2026-09-09, external review) -- optional and
+    /// trailing so the ~280 existing tests and NiftySignal.ScoreReplay, which construct this
+    /// engine directly rather than through DI, are unaffected: they fall back to
+    /// <see cref="ScoreWeights.Default"/>, which is exactly what they want (a fixed, known
+    /// weight set to assert against, not whatever happens to be hot-reloaded on a live VM).
+    /// Read fresh on every <see cref="ComputeCadence"/> call via <see cref="Weights"/>, not
+    /// cached at construction, so a config change takes effect on the very next cadence.
+    /// </summary>
+    readonly IValidatedOptions<ScoreWeights>? _scoreWeightsOptions;
+
+    ScoreWeights Weights => _scoreWeightsOptions?.Current ?? ScoreWeights.Default;
+
+    public LiveFeatureEngine(IReadOnlyList<Instrument> instruments, IValidatedOptions<ScoreWeights>? scoreWeightsOptions = null)
     {
         _instruments = instruments;
+        _scoreWeightsOptions = scoreWeightsOptions;
         _spot = instruments.First(i => i.InstrumentType == InstrumentType.Index);
         _future = instruments.First(i => i.InstrumentType == InstrumentType.Future);
         _vix = instruments.FirstOrDefault(i => i.InstrumentType == InstrumentType.Vix);
@@ -781,7 +812,10 @@ public sealed class LiveFeatureEngine
         // reconnect where OiBuildupNet has no reliable baseline (see ComputeOiBuildupNet) --
         // Calculate's own warm-up check (from `inputs`, not this) already suppresses the score
         // for that cadence regardless, so there is nothing meaningful to add.
-        var compositeRawInstant = CompositeScoreCalculator.ComputeRaw(inputs, ScoreWeights.Default);
+        // Captured once, not read twice via the Weights property -- both calls below must see
+        // the exact same weight set even if a hot reload lands mid-cadence on another thread.
+        var weights = Weights;
+        var compositeRawInstant = CompositeScoreCalculator.ComputeRaw(inputs, weights);
         double? compositeRawSmoothed = null;
         if (compositeRawInstant is { } instantRaw)
         {
@@ -798,7 +832,7 @@ public sealed class LiveFeatureEngine
         // self-normalizing version this replaced was actually driving the saturation it was
         // meant to prevent.
         var composite = CompositeScoreCalculator.Calculate(
-            inputs, ScoreWeights.Default, now, CompositeScoreCalculator.DefaultK, compositeRawSmoothed);
+            inputs, weights, now, CompositeScoreCalculator.DefaultK, compositeRawSmoothed);
 
         _previousCadence = new Dictionary<string, InstrumentState>(_latest);
         _lastCadenceAt = now;

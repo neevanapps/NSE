@@ -60,7 +60,7 @@ public static class EntryRuleEvaluator
     // 2026-09-09 external review amendment to F3 -- must match LiveFeatureEngine's
     // MinPriorSessionsForIvRank exactly (that's the threshold IvRankSessionCount is measured
     // against); duplicated as a literal here rather than shared, same as every other config
-    // duplicate already in this codebase (see LiveRulesetConfig's own doc comment).
+    // duplicate already in this codebase (see RulesetConfigOptions' own doc comment).
     const int MinIvRankSessionsForGate = 5;
 
     // NSE trading hours are always IST regardless of where this process runs or what offset

@@ -20,13 +20,19 @@ public sealed class LiveTradingEngine(
     IServiceScopeFactory scopeFactory,
     ITelegramNotifier telegram,
     DashboardPushClient dashboardPush,
+    IValidatedOptions<RulesetConfig> rulesetOptions,
     ILogger<LiveTradingEngine> logger)
 {
     static readonly TimeSpan IstOffset = TimeSpan.FromHours(5.5);
 
     readonly IStrikeSelector _strikeSelector = new StrikeSelector();
     readonly ScoreSustainTracker _sustainTracker = new();
-    readonly RulesetConfig _config = LiveRulesetConfig.Default();
+
+    // A property, not a field -- reads the current hot-reloaded, already-validated value fresh
+    // on every access (2026-09-09, external review), so a config change takes effect on the
+    // very next cadence rather than requiring a redeploy/restart. See ValidatedOptionsMonitor's
+    // own doc comment for why a bad reload can never make it into rulesetOptions.Current.
+    RulesetConfig _config => rulesetOptions.Current;
 
     public async Task EvaluateCadenceAsync(ScoreSnapshot snapshot, LiveFeatureEngine featureEngine, CancellationToken ct)
     {
