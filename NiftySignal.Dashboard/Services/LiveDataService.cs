@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using NiftySignal.Domain;
 using NiftySignal.Domain.Entities;
 using NiftySignal.Domain.Enums;
 using NiftySignal.Features;
@@ -58,6 +59,16 @@ public sealed class LiveDataService : IDisposable
     Dictionary<(decimal Strike, OptionType Type), QuickQuote> _quickQuotes = [];
     Dictionary<string, TokenInfo> _tokenRoles = [];
     Dictionary<string, decimal> _dayOpenByToken = [];
+
+    // PENDING (2026-09-09, found while fixing the "last 24h" leaks -- see TodayIstMidnightUtc):
+    // both fields below are set once via ??= and never reset, so if this Dashboard process ever
+    // runs across a midnight without restarting (the same "process outlives the trading day"
+    // scenario F22 already tracks for the Host side's WelfordRollingWindow), day 2's warm-up
+    // countdown would silently keep reading off day 1's start time instead of today's. Low
+    // priority -- display-only (BuildComponentRows' "Remaining" countdown), not score-affecting,
+    // and this process gets redeployed most days in practice -- but a latent gap, not a
+    // guarantee. Fix properly alongside F22: detect day rollover (compare against
+    // TodayIstMidnightUtc each poll) and reset to null rather than relying on process restart.
     DateTimeOffset? _firstSnapshotAt;
 
     /// <summary>
@@ -329,14 +340,31 @@ public sealed class LiveDataService : IDisposable
                 ? ConnectionStatus.Connected
                 : latestTick is null ? ConnectionStatus.Disconnected : ConnectionStatus.Reconnecting;
 
-            var snapshots = await db.ScoreSnapshots.OrderByDescending(s => s.ComputedAt).Take(120).ToListAsync();
+            var todayIstMidnightUtc = TodayIstMidnightUtc();
+            // Floored at today's IST midnight (2026-09-09) -- Take(120) alone (30 min at the 15s
+            // cadence) self-corrects once today has that much history, but a session's first few
+            // minutes, before 120 of today's own snapshots exist, would otherwise pull in
+            // yesterday's tail end. See TodayIstMidnightUtc's doc comment.
+            var snapshots = await db.ScoreSnapshots
+                .Where(s => s.ComputedAt >= todayIstMidnightUtc)
+                .OrderByDescending(s => s.ComputedAt)
+                .Take(120)
+                .ToListAsync();
             snapshots.Reverse();
 
             if (snapshots.Count > 0)
             {
-                _firstSnapshotAt ??= await db.ScoreSnapshots.OrderBy(s => s.ComputedAt).Select(s => (DateTimeOffset?)s.ComputedAt).FirstOrDefaultAsync();
+                // Same today-only floor (2026-09-09) -- these used to find the all-time-earliest
+                // snapshot in the whole table with no date filter, so the warm-up "Remaining"
+                // countdown these feed (BuildComponentRows) would read as already-elapsed the
+                // instant a session started, off a stopwatch that actually started days ago.
+                _firstSnapshotAt ??= await db.ScoreSnapshots
+                    .Where(s => s.ComputedAt >= todayIstMidnightUtc)
+                    .OrderBy(s => s.ComputedAt)
+                    .Select(s => (DateTimeOffset?)s.ComputedAt)
+                    .FirstOrDefaultAsync();
                 _firstVixSnapshotAt ??= await db.ScoreSnapshots
-                    .Where(s => s.VixChangeRaw != null)
+                    .Where(s => s.ComputedAt >= todayIstMidnightUtc && s.VixChangeRaw != null)
                     .OrderBy(s => s.ComputedAt)
                     .Select(s => (DateTimeOffset?)s.ComputedAt)
                     .FirstOrDefaultAsync();
@@ -428,7 +456,7 @@ public sealed class LiveDataService : IDisposable
         }
 
         var allTokens = instruments.Select(i => i.Token).ToArray();
-        var dayOpenTicks = await EarliestTicksAsync(db, allTokens);
+        var dayOpenTicks = await EarliestTicksAsync(db, allTokens, TodayIstMidnightUtc());
         var dayOpenByToken = dayOpenTicks.ToDictionary(t => t.Token, t => t.LastPrice);
 
         _tokenRoles = roles;
@@ -544,15 +572,22 @@ public sealed class LiveDataService : IDisposable
         var latestTicks = await LatestTicksAsync(db, tokens);
         var latestByToken = latestTicks.ToDictionary(t => t.Token);
 
+        var todayIstMidnightUtc = TodayIstMidnightUtc();
+
         // OI itself only updates on the exchange side every ~3 minutes -- comparing
         // against the immediately-prior poll (5s ago) was structurally almost always a
         // no-op, which is why this always read 0.0%. Compare against ~30 minutes ago
-        // instead, a window long enough to always span at least one real OI update.
+        // instead, a window long enough to always span at least one real OI update. Floored at
+        // today's IST midnight (2026-09-09, via LatestTicksAtOrBeforeAsync's sinceUtc) -- for the
+        // first ~30 minutes of every session, "30 minutes ago" falls before today's first tick;
+        // with no lower bound in the query, that silently fell back to yesterday's closing OI.
+        // The floor means those first 30 minutes correctly find no row (OiChangePct's existing
+        // "no prior tick" default of 0%) instead of a real-looking but cross-day number.
         var oiLookbackCutoff = DateTimeOffset.UtcNow.AddMinutes(-30);
-        var oi30MinAgoTicks = await LatestTicksAtOrBeforeAsync(db, tokens, oiLookbackCutoff);
+        var oi30MinAgoTicks = await LatestTicksAtOrBeforeAsync(db, tokens, todayIstMidnightUtc, oiLookbackCutoff);
         var oi30MinAgoByToken = oi30MinAgoTicks.ToDictionary(t => t.Token, t => t.OpenInterest);
 
-        var dayOpenTicks = await EarliestTicksAsync(db, tokens);
+        var dayOpenTicks = await EarliestTicksAsync(db, tokens, todayIstMidnightUtc);
         var dayOpenByToken = dayOpenTicks.ToDictionary(t => t.Token, t => t.LastPrice);
 
         // Spot/Future LTP+change are ApplyPushedTick's job now (push, not poll) -- still
@@ -829,10 +864,14 @@ public sealed class LiveDataService : IDisposable
             .ToList();
     }
 
-    /// <summary>Closed trades in the last 24h, matching PerformancePanel's own "(last 24h)" title.</summary>
+    /// <summary>
+    /// Closed trades from today's IST session, matching PerformancePanel's own "(today)" title
+    /// (2026-09-09 -- was a rolling AddHours(-24) window, so a trade from yesterday evening was
+    /// still "recent" hours into today's session; see TodayIstMidnightUtc's doc comment).
+    /// </summary>
     async Task<List<ClosedTradeRow>> BuildClosedTradesAsync(NiftySignalDbContext db)
     {
-        var cutoff = DateTimeOffset.UtcNow.AddHours(-24);
+        var cutoff = TodayIstMidnightUtc();
         var closed = await db.PaperTrades
             .Where(t => t.ExitTime != null && t.ExitTime >= cutoff)
             .OrderByDescending(t => t.ExitTime)
@@ -873,29 +912,57 @@ public sealed class LiveDataService : IDisposable
                 .AsNoTracking()
                 .ToListAsync();
 
-    /// <summary>Same as <see cref="LatestTicksAsync"/> but the earliest tick per token (today's open).</summary>
-    static Task<List<Tick>> EarliestTicksAsync(NiftySignalDbContext db, string[] tokens) =>
+    /// <summary>
+    /// Same as <see cref="LatestTicksAsync"/> but the earliest tick per token at or after
+    /// <paramref name="sinceUtc"/> -- today's open, not a token's all-time-earliest tick (that
+    /// was the bug: with no date floor, a token that already had ticks from a prior day, e.g.
+    /// the spot index, returned an ancient tick as "today's open").
+    /// </summary>
+    static Task<List<Tick>> EarliestTicksAsync(NiftySignalDbContext db, string[] tokens, DateTimeOffset sinceUtc) =>
         tokens.Length == 0
             ? Task.FromResult(new List<Tick>())
             : db.Ticks.FromSqlInterpolated($@"
                 SELECT lt.* FROM unnest({tokens}) AS tok(token)
                 CROSS JOIN LATERAL (
-                    SELECT * FROM ticks t WHERE t.""Token"" = tok.token ORDER BY t.""ExchangeTimestamp"" ASC LIMIT 1
+                    SELECT * FROM ticks t WHERE t.""Token"" = tok.token AND t.""ExchangeTimestamp"" >= {sinceUtc} ORDER BY t.""ExchangeTimestamp"" ASC LIMIT 1
                 ) lt")
                 .AsNoTracking()
                 .ToListAsync();
 
-    /// <summary>Same as <see cref="LatestTicksAsync"/> but the latest tick at or before <paramref name="cutoff"/> per token.</summary>
-    static Task<List<Tick>> LatestTicksAtOrBeforeAsync(NiftySignalDbContext db, string[] tokens, DateTimeOffset cutoff) =>
+    /// <summary>
+    /// Same as <see cref="LatestTicksAsync"/> but the latest tick at or before
+    /// <paramref name="cutoff"/> and at or after <paramref name="sinceUtc"/> per token. The lower
+    /// bound matters: with only an upper bound, a token with no tick between <paramref
+    /// name="sinceUtc"/> and <paramref name="cutoff"/> would keep walking backward past it into
+    /// a prior day's ticks instead of correctly finding none (the OI-lookback bug this was added
+    /// for -- see <see cref="TodayIstMidnightUtc"/>'s doc comment).
+    /// </summary>
+    static Task<List<Tick>> LatestTicksAtOrBeforeAsync(NiftySignalDbContext db, string[] tokens, DateTimeOffset sinceUtc, DateTimeOffset cutoff) =>
         tokens.Length == 0
             ? Task.FromResult(new List<Tick>())
             : db.Ticks.FromSqlInterpolated($@"
                 SELECT lt.* FROM unnest({tokens}) AS tok(token)
                 CROSS JOIN LATERAL (
-                    SELECT * FROM ticks t WHERE t.""Token"" = tok.token AND t.""ExchangeTimestamp"" <= {cutoff} ORDER BY t.""ExchangeTimestamp"" DESC LIMIT 1
+                    SELECT * FROM ticks t WHERE t.""Token"" = tok.token AND t.""ExchangeTimestamp"" <= {cutoff} AND t.""ExchangeTimestamp"" >= {sinceUtc} ORDER BY t.""ExchangeTimestamp"" DESC LIMIT 1
                 ) lt")
                 .AsNoTracking()
                 .ToListAsync();
+
+    /// <summary>
+    /// Today's IST midnight, as the UTC instant EF/Npgsql needs for a timestamptz comparison
+    /// (2026-09-09) -- the one floor every "today, not last-24h" query in this class shares.
+    /// Before this, ClosedTrades used a rolling AddHours(-24) window (so a trade from yesterday
+    /// evening was still "recent" hours into today), EarliestTicksAsync had no date filter at all
+    /// (returning a token's all-time-earliest tick as "today's open" -- wrong the moment a token,
+    /// e.g. the spot index, has ticks from a prior day), the OI 30-min lookback had no lower
+    /// bound (silently comparing against yesterday's close for the first ~30 minutes of every
+    /// session, before today has 30 real minutes of its own history), and the score-history chart
+    /// bounded itself by count (Take(120)) rather than by day, so a session's first few minutes
+    /// could pull in yesterday's tail-end snapshots. Same IST-midnight boundary
+    /// MarketDataIngestionWorker.SeedEngineHistoryAsync already uses on the Host side.
+    /// </summary>
+    static DateTimeOffset TodayIstMidnightUtc() =>
+        new DateTimeOffset(DateTimeOffset.UtcNow.ToIst().Date, IstTime.Offset).ToUniversalTime();
 
     // 91-day T-bill proxy -- same starting value as LiveFeatureEngine (plan 4.1).
     // PENDING (audit finding F21, 2026-09-08 lead review -- see fix plan Batch 6): duplicated
