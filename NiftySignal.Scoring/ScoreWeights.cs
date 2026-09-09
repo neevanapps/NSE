@@ -88,6 +88,18 @@ public sealed record ScoreWeights(
     /// volatility demand, not price direction, so a validated nonzero weight for it would likely
     /// need a different integration shape than a plain addition to the directional weighted sum
     /// -- a decision for whenever it's actually validated, not now.
+    ///
+    /// PENDING (audit finding F9, from the score-reactivity discussion 2026-09-08 -- see fix
+    /// plan dazzling-orbiting-whistle.md's Batch 5, "ongoing, not a one-time fix"): OiBuildupNet,
+    /// Pcr, and IvSkew all read option positioning; FuturesBasis and PriceMomentum both come off
+    /// the futures price -- these weights assume the fourteen components are independent inputs,
+    /// which they're likely not. Tooling exists (scripts/batch5-component-correlation.sql,
+    /// ranks pairwise |correlation| across all fourteen) but hasn't been run yet -- needs several
+    /// sessions of live data on the Batch 3/4/6-corrected formulas first, not just one or two, per
+    /// the plan's own reasoning (computing this against still-buggy components would just encode
+    /// those bugs more precisely). Folds into the three-parallel-scoring-system idea (current
+    /// weights / correlation-ranked / decorrelated minimal set) already discussed and agreed to
+    /// think over, not a one-off reweighting pass.
     /// </summary>
     public static ScoreWeights Default { get; } = new(
         // Short and date-stamped, matching RulesetVersion's convention -- not a changelog. The
