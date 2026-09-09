@@ -186,32 +186,58 @@ public sealed class MarketDataIngestionWorker(
         var buffer = new List<Tick>(FlushBatchSize);
         var lastFlush = DateTimeOffset.UtcNow;
 
-        await foreach (var tick in tickSource.ReadTicksAsync(stoppingToken))
+        try
         {
-            await _engineSync.WaitAsync(stoppingToken);
-            try
+            await foreach (var tick in tickSource.ReadTicksAsync(stoppingToken))
             {
-                _engine!.OnTick(tick);
-            }
-            finally
-            {
-                _engineSync.Release();
-            }
+                try
+                {
+                    await _engineSync.WaitAsync(stoppingToken);
+                    try
+                    {
+                        _engine!.OnTick(tick);
+                    }
+                    finally
+                    {
+                        _engineSync.Release();
+                    }
 
-            await dashboardPush.PushTickAsync(tick, stoppingToken);
+                    await dashboardPush.PushTickAsync(tick, stoppingToken);
 
-            buffer.Add(tick);
-            if (buffer.Count >= FlushBatchSize || DateTimeOffset.UtcNow - lastFlush >= FlushInterval)
-            {
-                await FlushAsync(buffer, stoppingToken);
-                buffer.Clear();
-                lastFlush = DateTimeOffset.UtcNow;
+                    buffer.Add(tick);
+                    if (buffer.Count >= FlushBatchSize || DateTimeOffset.UtcNow - lastFlush >= FlushInterval)
+                    {
+                        await FlushAsync(buffer, stoppingToken);
+                        buffer.Clear();
+                        lastFlush = DateTimeOffset.UtcNow;
+                    }
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    // Audit finding F34 (2026-09-09, live-caught) -- see FlushAsync's own doc
+                    // comment for the incident this fixes. A tick not yet added to `buffer` when
+                    // this fires is simply skipped (same "log and move on" tolerance as a single
+                    // bad score cadence); ticks already in `buffer` from earlier in this batch are
+                    // deliberately left there, not cleared, so they're retried on the next
+                    // successful flush instead of lost.
+                    logger.LogError(ex, "Tick processing failed for {Token} -- continuing with the next tick", tick.Token);
+                }
             }
+        }
+        catch (OperationCanceledException)
+        {
         }
 
         if (buffer.Count > 0)
         {
-            await FlushAsync(buffer, stoppingToken);
+            try
+            {
+                await FlushAsync(buffer, stoppingToken);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                logger.LogError(ex, "Final flush of {Count} buffered ticks failed during shutdown", buffer.Count);
+            }
         }
     }
 
@@ -301,6 +327,13 @@ public sealed class MarketDataIngestionWorker(
                 {
                     _engine!.Sample(DateTimeOffset.UtcNow);
                 }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    // Audit finding F34 (2026-09-09) -- same "one bad tick must not take down the
+                    // rest of the day" resilience as RunTickLoopAsync/FlushAsync; see FlushAsync's
+                    // own doc comment for the incident this fixes.
+                    logger.LogError(ex, "Sample tick failed -- continuing with the next one");
+                }
                 finally
                 {
                     _engineSync.Release();
@@ -325,20 +358,31 @@ public sealed class MarketDataIngestionWorker(
         {
             while (await timer.WaitForNextTickAsync(stoppingToken))
             {
-                await using var scope = scopeFactory.CreateAsyncScope();
-                var db = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
-                var pending = await db.Instruments.Where(i => i.AsOfDate == asOfDate && !i.Subscribed).ToListAsync(stoppingToken);
-
-                foreach (var instrument in pending)
+                try
                 {
-                    tickSource.RequestSubscribe(instrument.Exchange, instrument.Token);
-                    instrument.Subscribed = true;
-                    logger.LogInformation("Requested on-demand subscribe: {Symbol} ({Token})", instrument.TradingSymbol, instrument.Token);
+                    await using var scope = scopeFactory.CreateAsyncScope();
+                    var db = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
+                    var pending = await db.Instruments.Where(i => i.AsOfDate == asOfDate && !i.Subscribed).ToListAsync(stoppingToken);
+
+                    foreach (var instrument in pending)
+                    {
+                        tickSource.RequestSubscribe(instrument.Exchange, instrument.Token);
+                        instrument.Subscribed = true;
+                        logger.LogInformation("Requested on-demand subscribe: {Symbol} ({Token})", instrument.TradingSymbol, instrument.Token);
+                    }
+
+                    if (pending.Count > 0)
+                    {
+                        await db.SaveChangesAsync(stoppingToken);
+                    }
                 }
-
-                if (pending.Count > 0)
+                catch (Exception ex) when (ex is not OperationCanceledException)
                 {
-                    await db.SaveChangesAsync(stoppingToken);
+                    // Audit finding F34 (2026-09-09) -- same resilience as the other three loops;
+                    // this one does real DB I/O (Instruments query + SaveChangesAsync), so it
+                    // shares the exact transient-Postgres-failure risk that crashed
+                    // RunTickLoopAsync -- see FlushAsync's own doc comment for that incident.
+                    logger.LogError(ex, "Pending-subscription poll failed -- continuing with the next one");
                 }
             }
         }
@@ -487,21 +531,17 @@ public sealed class MarketDataIngestionWorker(
         logger.LogInformation("Replayed {Count} historical score snapshots into the rolling windows", history.Count);
     }
 
-    // PENDING (audit finding F34, 2026-09-09, live-caught): no try/catch here or around the
-    // await foreach loop in RunTickLoopAsync -- a transient DB failure (live-caught: a routine
-    // Postgres service restart, mid-session) throws straight out of this method, out of the
-    // await foreach in RunTickLoopAsync, and crashes the whole BackgroundService. NiftySignalHost
-    // went to Stopped and needed a manual Start-Service to recover; had a position been open at
-    // the time, it would have gone unmonitored (no stop-loss/exit-rule evaluation) until someone
-    // noticed. This is the exact same failure class RunScoreCadenceLoopAsync was already fixed
-    // against on 2026-09-08 (see its own catch block's doc comment: "One bad cadence must never
-    // take down the rest of the day") -- that fix was never extended to this loop, or to
-    // RunSampleLoopAsync/RunPendingSubscriptionLoopAsync, both of which have the identical gap
-    // (no catch around their own per-tick work, including RunPendingSubscriptionLoopAsync's own
-    // real DB reads/writes). Fix: wrap each loop's per-iteration body in the same
-    // catch (Exception ex) when (ex is not OperationCanceledException) -> log and continue
-    // pattern RunScoreCadenceLoopAsync already uses, applied consistently across all four loops,
-    // not just the one that happened to get live-caught first.
+    // Audit finding F34 (2026-09-09, live-caught): a transient DB failure here used to throw
+    // straight out of this method, out of the await foreach in RunTickLoopAsync, and crash the
+    // whole BackgroundService -- live-caught for real from a routine Postgres service restart,
+    // mid-session. NiftySignalHost went to Stopped and needed a manual Start-Service to recover;
+    // had a position been open at the time, it would have gone unmonitored (no stop-loss/exit-
+    // rule evaluation) until someone noticed. Same failure class RunScoreCadenceLoopAsync was
+    // already fixed against on 2026-09-08 (see its own catch block's doc comment: "One bad
+    // cadence must never take down the rest of the day") -- that fix just hadn't been extended to
+    // this loop yet. RunTickLoopAsync now catches around its own per-tick body (see there);
+    // RunSampleLoopAsync and RunPendingSubscriptionLoopAsync got the same treatment alongside it,
+    // since both had the identical gap.
     async Task FlushAsync(List<Tick> buffer, CancellationToken ct)
     {
         await using var scope = scopeFactory.CreateAsyncScope();
