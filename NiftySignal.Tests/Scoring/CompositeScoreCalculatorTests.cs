@@ -112,6 +112,33 @@ public class CompositeScoreCalculatorTests
     }
 
     [Fact]
+    public void DescribeMissingRequiredComponents_ExcludesPriceMomentum_EvenWhenItIsNull()
+    {
+        // Live-caught 2026-09-10 while validating this same day's F47 deploy:
+        // MarketDataIngestionWorker's warm-up-blocked diagnostic log used a hardcoded six-name
+        // list that kept blaming PriceMomentumZ for blocking warm-up even after F47 made it
+        // optional -- actively misleading. Fixed by having that log call this shared method
+        // instead of duplicating the required/optional rule. Both DepthImbalance (real,
+        // nonzero weight -- genuinely still required) and PriceMomentum (weight 0.0 -- no
+        // longer required) missing at once, to prove the method reports the former and not the
+        // latter, not just "reports something."
+        var inputs = FullyWarmInputs with { PriceMomentumZ = null, DepthImbalanceZ = null };
+
+        var missing = CompositeScoreCalculator.DescribeMissingRequiredComponents(inputs, ScoreWeights.Default);
+
+        Assert.Contains("DepthImbalance", missing);
+        Assert.DoesNotContain("PriceMomentum", missing);
+    }
+
+    [Fact]
+    public void DescribeMissingRequiredComponents_IsEmpty_WhenFullyWarm()
+    {
+        var missing = CompositeScoreCalculator.DescribeMissingRequiredComponents(FullyWarmInputs, ScoreWeights.Default);
+
+        Assert.Empty(missing);
+    }
+
+    [Fact]
     public void Calculate_ReturnsNullScore_WhenNoComponentsAreWarmedUp()
     {
         var allNull = new ScoreComponentInputs(null, null, null, null, null, null);

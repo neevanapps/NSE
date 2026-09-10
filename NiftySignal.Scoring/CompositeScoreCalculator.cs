@@ -107,6 +107,19 @@ public static class CompositeScoreCalculator
 
     static bool IsOptional(ScoreComponentBreakdown c) => OptionalComponentNames.Contains(c.Name) || c.Weight == 0.0;
 
+    /// <summary>
+    /// Names of the required components currently missing a z-score -- i.e. the ones actually
+    /// responsible for <see cref="Calculate"/> returning a null score this cadence. Exists so a
+    /// caller wanting to log *why* warm-up is blocked (audit finding F10) reads this class's own
+    /// required/optional rule directly instead of hand-maintaining a second, parallel list that
+    /// can silently drift out of sync with it -- which is exactly what happened to
+    /// MarketDataIngestionWorker's old hardcoded six-name list once F47 made PriceMomentum
+    /// optional: the log kept blaming PriceMomentumZ for blocking warm-up long after it no
+    /// longer could.
+    /// </summary>
+    public static IReadOnlyList<string> DescribeMissingRequiredComponents(ScoreComponentInputs inputs, ScoreWeights weights) =>
+        BuildComponents(inputs, weights).Where(c => !IsOptional(c) && c.ZScore is null).Select(c => c.Name).ToList();
+
     static List<ScoreComponentBreakdown> BuildComponents(ScoreComponentInputs inputs, ScoreWeights weights) =>
     [
         BuildComponent("OiBuildupNet", weights.OiBuildupNet, inputs.OiBuildupNetZ),

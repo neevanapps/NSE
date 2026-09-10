@@ -56,6 +56,18 @@ current source before being kept or dropped.
   risk-behavior decision (should a missing depth book silently contribute 0 like VixChange does,
   or keep blocking the composite?), not something this fix touches. Regression test:
   `CompositeScoreCalculatorTests.Calculate_StillWarmsUp_WhenPriceMomentumZIsNull_BecauseItsWeightIsZero`.
+  **Follow-on bug caught live** while validating this same fix's VM deploy (Host log,
+  10-Sep): `MarketDataIngestionWorker`'s own warm-up-blocked diagnostic log
+  (`"Composite score not warmed up -- blocked by: ..."`, audit finding F10) had its own
+  hardcoded, independently-maintained six-name list — exactly the kind of duplication this
+  file's F48 entry already warns about elsewhere — and kept naming `PriceMomentumZ` as a
+  blocker after this fix made it optional, actively misleading anyone reading the log about
+  why warm-up was actually stalled. Fixed by adding
+  `CompositeScoreCalculator.DescribeMissingRequiredComponents(inputs, weights)` (single source
+  of truth, reused by both the composite's own gating and this diagnostic) and having the
+  worker's log call it instead of duplicating the rule. Regression tests:
+  `CompositeScoreCalculatorTests.DescribeMissingRequiredComponents_ExcludesPriceMomentum_EvenWhenItIsNull`,
+  `..._IsEmpty_WhenFullyWarm`.
 
 - **F48 — Capital gate is a position count, not a capital sum.**
   Fixed, using the "after strike selection" design (your call): `LiveTradingEngine.EvaluateEntryAsync`

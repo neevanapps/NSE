@@ -394,22 +394,32 @@ public sealed class MarketDataIngestionWorker(
     }
 
     /// <summary>
-    /// The six components CompositeScoreCalculator treats as required (everything except
-    /// VixChange and the diagnostic-only Gamma/Vanna/Charm/VolumePcr/SpreadRatio/CvdProxy/
-    /// StraddleRichness set) -- named here explicitly rather than reflected, since this list
-    /// changes only when the plan's original six change, which is rare enough that an explicit
-    /// list reads better than reflection magic.
+    /// Delegates to CompositeScoreCalculator.DescribeMissingRequiredComponents -- the live
+    /// weights (<see cref="scoreWeightsOptions"/>) decide required-vs-optional there, so this
+    /// reads the exact same rule the composite itself gates on rather than a second,
+    /// independently-maintained list. Fixed 2026-09-10 (found while validating this same day's
+    /// F47 deploy): the old hardcoded "the original six" list kept naming PriceMomentumZ as a
+    /// blocker in this log long after F47 made it optional, actively misleading anyone reading
+    /// it about why warm-up was actually stalled.
     /// </summary>
-    static List<string> DescribeWarmUpBlockers(ScoreSnapshot snapshot)
+    List<string> DescribeWarmUpBlockers(ScoreSnapshot snapshot)
     {
-        var blocking = new List<string>();
-        if (snapshot.OiBuildupNetZ is null) blocking.Add(nameof(ScoreSnapshot.OiBuildupNetZ));
-        if (snapshot.PcrZ is null) blocking.Add(nameof(ScoreSnapshot.PcrZ));
-        if (snapshot.FuturesBasisZ is null) blocking.Add(nameof(ScoreSnapshot.FuturesBasisZ));
-        if (snapshot.IvSkewZ is null) blocking.Add(nameof(ScoreSnapshot.IvSkewZ));
-        if (snapshot.PriceMomentumZ is null) blocking.Add(nameof(ScoreSnapshot.PriceMomentumZ));
-        if (snapshot.DepthImbalanceZ is null) blocking.Add(nameof(ScoreSnapshot.DepthImbalanceZ));
-        return blocking;
+        var inputs = new ScoreComponentInputs(
+            OiBuildupNetZ: snapshot.OiBuildupNetZ,
+            PcrZ: snapshot.PcrZ,
+            FuturesBasisZ: snapshot.FuturesBasisZ,
+            IvSkewZ: snapshot.IvSkewZ,
+            PriceMomentumZ: snapshot.PriceMomentumZ,
+            DepthImbalanceZ: snapshot.DepthImbalanceZ,
+            VixChangeZ: snapshot.VixChangeZ,
+            GammaExposureZ: snapshot.GammaExposureZ,
+            VolumePcrZ: snapshot.VolumePcrZ,
+            SpreadRatioZ: snapshot.SpreadRatioZ,
+            VannaExposureZ: snapshot.VannaExposureZ,
+            CharmExposureZ: snapshot.CharmExposureZ,
+            CvdProxyZ: snapshot.CvdProxyZ,
+            StraddleRichnessZ: snapshot.StraddleRichnessZ);
+        return [.. CompositeScoreCalculator.DescribeMissingRequiredComponents(inputs, scoreWeightsOptions.Current)];
     }
 
     /// <summary>Feeds LiveFeatureEngine.Sample every few seconds so ComputeCadence has more than one instant to average over -- see LiveFeatureEngine's class doc comment.</summary>
