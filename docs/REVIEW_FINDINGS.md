@@ -163,6 +163,63 @@ real data anyway.
 
 ---
 
+## 2026-09-10 — Live-caught: OI compared against the wrong window
+
+While looking at why the Dashboard's Sized OI Flow Ratio tile kept flipping from "warmed up" to
+"pending" on consecutive refreshes, the user correctly identified the root cause from first
+principles (independent of anything in the friend's review): NSE/the broker only refresh OI
+every ~3 minutes, not every 15 seconds.
+
+### Fixed (2026-09-10)
+
+- **F50 — OI compared against the previous 15s cadence instead of a window long enough to span
+  a real update.** Confirmed by reading `FlatTradeFeedState.ApplyDelta` ([FlatTradeFeedState.cs:64](../NiftySignal.Ingestion/FlatTrade/FlatTradeFeedState.cs:64)):
+  `if (msg.OpenInterest is not null) OpenInterest = ParseLong(msg.OpenInterest);` — between real
+  broker OI prints, the same value is carried forward unchanged on every tick, so
+  `ComputeOiBuildupNet`/`ComputeRatioSizedOiFlowRaw` comparing current OI against
+  `_previousCadence` (15s ago) were mostly comparing an unchanged value against itself, with the
+  full ~3 minutes' worth of change landing in one lumpy spike on whichever cadence a real print
+  happened to fall in. **This is the exact same root cause already found and fixed once in this
+  codebase**, for a different (display-only) case — `LiveDataService.cs:648`'s own comment on
+  the Dashboard's "OI Change %" panel: *"comparing against the immediately-prior poll (5s ago)
+  was structurally almost always a no-op."* Worst here for `ComputeOiBuildupNet`, whose weight
+  (0.3125) is the single largest in the whole composite.
+
+  Fixed with a new `OiLookbackWindow` class (`NiftySignal.Features`) — per-token, time-windowed
+  "what was OI approximately `FeatureWindowLengths.OiComparisonWindow` (4 minutes, a provisional
+  constant comfortably longer than the confirmed ~3-minute refresh) ago," used by both methods in
+  place of `_previousCadence` for the OI-specific comparison only (spot price comparison for
+  classification direction is untouched — see below). Recorded once per cadence, for every
+  tracked option, right where `_previousCadence` itself gets updated at the end of
+  `ComputeCadence`, so both methods' `Lookback` calls earlier in the same cadence see state
+  strictly before that cadence's own recording.
+
+  **Known, documented, not-yet-fixed follow-on gaps** (deliberately left out of this fix's scope,
+  each flagged in source rather than silently left):
+  - `spotPriceChange` (used to classify each strike's OI change as buildup/unwinding) still
+    compares against the previous 15s cadence, not the same ~4-minute window `oiChange` now
+    uses — spot ticks continuously so a 15s-old direction is usually still representative,
+    unlike OI's genuinely lumpy refresh, but the two are no longer measuring the same span.
+  - `_oiLookback` is not restart-seeded (unlike most other rolling state in `LiveFeatureEngine`)
+    — every Host restart costs up to `OiComparisonWindow` of `ComputeOiBuildupNet` reading
+    exactly 0 rather than a real value. Raw per-token OI history isn't in `ScoreSnapshot` to
+    replay from; would need new seeding plumbing off `StrikeSnapshot`'s own persisted per-strike
+    OI if this turns out to matter in practice.
+  - `BuildStrikeSnapshots`' own per-strike `_previousOpenInterestByToken` (feeding the
+    diagnostic, unweighted `StrikeSnapshot.OiChangeDelta`/`OiBuildup` columns) has the identical
+    15s-comparison structure and was **not** touched by this fix — display/diagnostic-only, not
+    fed into any score, lower priority than the two weighted metrics above.
+
+  Regression tests: `NiftySignal.Tests/Features/OiLookbackWindowTests.cs` (new, 7 tests covering
+  the class in isolation) plus updates to
+  `LiveFeatureEngineTests.ComputeCadence_OiBuildupNet_WeighsEachStrikeByOiChangeMagnitude_NotAFlatVote`
+  and `..._PopulatesAllFiveRatioMetrics_AndWarmsUp_OnceThereIsPriorStateToDeltaAgainst`, both of
+  which now tick every 15s across the full comparison window (matching real cadence spacing --
+  a single big jump trips `ComputeOiBuildupNet`'s own `MaxCadenceGapForOiBuildup` feed-outage
+  guard) instead of one 15s-cadence jump.
+
+---
+
 ## F32 — The backtest runner (scoped 2026-09-10, not yet built)
 
 **Why this is the one thing that unblocks everything else in the review:** almost every

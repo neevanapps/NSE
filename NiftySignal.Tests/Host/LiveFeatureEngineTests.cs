@@ -690,18 +690,38 @@ public class LiveFeatureEngineTests
         // a 200-contract strike counted as loud as a 500,000-contract one, on the component
         // carrying the single largest weight in the composite. Weighted by |OI change|, the
         // far larger put buildup correctly dominates instead.
+        //
+        // Spans FeatureWindowLengths.OiComparisonWindow, not just one 15s cadence (audit
+        // finding F50, 2026-09-10): ComputeOiBuildupNet now compares OI against ~that long ago,
+        // not the previous cadence, matching how NSE/the broker actually refresh OI (~3
+        // minutes, not every 15s) -- see OiLookbackWindow. Ticks every 15s throughout (real
+        // cadence spacing, not one big jump) with OI held flat -- ComputeOiBuildupNet's own
+        // MaxCadenceGapForOiBuildup guard rejects a single >20s gap as looking like a feed
+        // outage, same as production calling ComputeCadence every 15s while the exchange's own
+        // OI print just lags behind underneath.
         var engine = new LiveFeatureEngine(BaseUniverse());
-        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
-        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
-        engine.OnTick(MakeTick(CallToken, 100m, Start, oi: 100_000));
-        engine.OnTick(MakeTick(PutToken, 80m, Start, oi: 100_000));
-        engine.ComputeCadence(Start);
+        var at = Start;
+        engine.OnTick(MakeTick(SpotToken, 23950m, at));
+        engine.OnTick(MakeTick(FutureToken, 24000m, at));
+        engine.OnTick(MakeTick(CallToken, 100m, at, oi: 100_000));
+        engine.OnTick(MakeTick(PutToken, 80m, at, oi: 100_000));
+        engine.ComputeCadence(at);
+
+        for (var elapsed = TimeSpan.FromSeconds(15); elapsed <= FeatureWindowLengths.OiComparisonWindow + TimeSpan.FromSeconds(15); elapsed += TimeSpan.FromSeconds(15))
+        {
+            at = Start + elapsed;
+            engine.OnTick(MakeTick(SpotToken, 23950m, at));
+            engine.OnTick(MakeTick(FutureToken, 24000m, at));
+            engine.OnTick(MakeTick(CallToken, 100m, at, oi: 100_000));
+            engine.OnTick(MakeTick(PutToken, 80m, at, oi: 100_000));
+            engine.ComputeCadence(at);
+        }
 
         // Spot up (classification is spot-driven since F17, not each leg's own price -- see
         // ComputeOiBuildupNet). Call: OI up by a small 1,000 -- LongBuildup, bullish, +1 sign,
         // small size. Put: OI up by a large 50,000 -- LongBuildup, bearish for a put, -1 sign,
         // large size. Old formula: (+1) + (-1) = 0. New formula: (+1,000) + (-50,000) = -49,000.
-        var next = Start.AddSeconds(15);
+        var next = at + TimeSpan.FromSeconds(15);
         engine.OnTick(MakeTick(SpotToken, 23960m, next));
         engine.OnTick(MakeTick(FutureToken, 24000m, next));
         engine.OnTick(MakeTick(CallToken, 105m, next, oi: 101_000));
@@ -1736,12 +1756,28 @@ public class LiveFeatureEngineTests
     public void ComputeCadence_PopulatesAllFiveRatioMetrics_AndWarmsUp_OnceThereIsPriorStateToDeltaAgainst()
     {
         var engine = new LiveFeatureEngine(WideRatioUniverse());
-        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
-        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
-        TickWideRatioUniverse(engine, Start);
-        engine.ComputeCadence(Start);
+        var at = Start;
+        engine.OnTick(MakeTick(SpotToken, 23950m, at));
+        engine.OnTick(MakeTick(FutureToken, 24000m, at));
+        TickWideRatioUniverse(engine, at);
+        engine.ComputeCadence(at);
 
-        var next = Start.AddSeconds(15);
+        // Metric 2 (sized OI flow) needs at least FeatureWindowLengths.OiComparisonWindow to
+        // elapse before OiLookbackWindow trusts a comparison (audit finding F50, 2026-09-10) --
+        // 15s alone would leave it null here, same reason
+        // ComputeCadence_OiBuildupNet_WeighsEachStrikeByOiChangeMagnitude_NotAFlatVote needed
+        // the same change. Ticks every 15s throughout with OI held flat (default 100_000),
+        // real cadence spacing rather than one big jump -- see that test's own comment on why.
+        for (var elapsed = TimeSpan.FromSeconds(15); elapsed <= FeatureWindowLengths.OiComparisonWindow + TimeSpan.FromSeconds(15); elapsed += TimeSpan.FromSeconds(15))
+        {
+            at = Start + elapsed;
+            engine.OnTick(MakeTick(SpotToken, 23950m, at));
+            engine.OnTick(MakeTick(FutureToken, 24000m, at));
+            TickWideRatioUniverse(engine, at);
+            engine.ComputeCadence(at);
+        }
+
+        var next = at + TimeSpan.FromSeconds(15);
         engine.OnTick(MakeTick(SpotToken, 23960m, next)); // spot up -> call OI-up strikes classify LongBuildup (constructive)
         engine.OnTick(MakeTick(FutureToken, 24010m, next));
         TickWideRatioUniverse(engine, next, underlying: 23960m, vol: 0.42, oi: 105_000, volume: 1_500);

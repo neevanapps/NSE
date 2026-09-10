@@ -33,6 +33,21 @@ public static class FeatureWindowLengths
     /// <summary>OI updates are not tick-frequency.</summary>
     public static readonly TimeSpan OiBuildupNet = TimeSpan.FromMinutes(30);
 
+    /// <summary>
+    /// How far back <c>OiLookbackWindow</c> compares raw OI against, for both
+    /// <c>LiveFeatureEngine.ComputeOiBuildupNet</c> and <c>ComputeRatioSizedOiFlowRaw</c> --
+    /// distinct from <see cref="OiBuildupNet"/> above, which governs how the resulting *raw*
+    /// value gets z-scored, not how it's computed. Audit finding F50 (2026-09-10, user-caught
+    /// live): NSE/the broker only refresh OI every ~3 minutes -- comparing against the previous
+    /// 15s cadence was structurally almost always a no-op, the exact same root cause the
+    /// Dashboard's own "OI Change %" panel was already fixed for once (see
+    /// LiveDataService.cs's own comment on the same underlying reality). Comfortably longer
+    /// than the confirmed ~3 minutes so the comparison reliably spans at least one real
+    /// update -- a provisional constant like every other assumed-but-unvalidated number in this
+    /// class, not yet derived from measuring the real print-to-print gap in live data.
+    /// </summary>
+    public static readonly TimeSpan OiComparisonWindow = TimeSpan.FromMinutes(4);
+
     /// <summary>Slow structural signal.</summary>
     public static readonly TimeSpan IvSkew = TimeSpan.FromMinutes(15);
 

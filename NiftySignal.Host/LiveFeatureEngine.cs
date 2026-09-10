@@ -151,6 +151,11 @@ public sealed class LiveFeatureEngine
     // between cadences, not ordinary scheduling jitter.
     static readonly TimeSpan MaxCadenceGapForOiBuildup = TimeSpan.FromSeconds(20);
 
+    // Audit finding F50 (2026-09-10, user-caught live) -- see FeatureWindowLengths.
+    // OiComparisonWindow's own doc comment for why this needs to be much longer than the 15s
+    // cadence, and OiLookbackWindow's for the full mechanism.
+    readonly OiLookbackWindow _oiLookback = new(FeatureWindowLengths.OiComparisonWindow);
+
     readonly WelfordRollingWindow _oiBuildupWindow = new(FeatureWindowLengths.OiBuildupNet);
     readonly WelfordRollingWindow _pcrWindow = new(FeatureWindowLengths.Pcr);
     readonly WelfordRollingWindow _basisWindow = new(FeatureWindowLengths.FuturesBasis);
@@ -361,6 +366,18 @@ public sealed class LiveFeatureEngine
     /// regardless. That costs one cadence tick's OiBuildupNet reading (reported as 0 instead
     /// of the true delta) and one tick where momentum/VixChange fall back to 0 -- a single
     /// slightly-wrong point inside a multi-minute window, not a warm-up reset.
+    ///
+    /// <see cref="_oiLookback"/> (audit finding F50, 2026-09-10) is not restart-seeded either,
+    /// and costs more than "one tick": ComputeOiBuildupNet/ComputeRatioSizedOiFlowRaw both read
+    /// through it, so every strike reads as "not enough history yet" (skipped, not a fabricated
+    /// 0) for a full <see cref="FeatureWindowLengths.OiComparisonWindow"/> after every restart -- up to a few
+    /// minutes of OiBuildupNet returning exactly 0 (contributing nothing, same as any other
+    /// cadence with no qualifying strikes) rather than a real reading. Accepted for now, same
+    /// spirit as the _previousCadence gap above: raw per-token OI history isn't in
+    /// ScoreSnapshot to replay from (only the already-aggregated OiBuildupNetRaw is), and
+    /// StrikeSnapshot's own persisted per-strike OI would need new seeding plumbing of its own
+    /// to reach this -- worth doing if the restart-frequency cost turns out to matter in
+    /// practice, not assumed up front.
     /// </summary>
     public void SeedHistory(IEnumerable<ScoreSnapshot> history)
     {
@@ -1118,6 +1135,18 @@ public sealed class LiveFeatureEngine
             _logger?.LogError(ex, "Ratio composite combine step failed");
         }
 
+        // Audit finding F50 (2026-09-10): records this cadence's OI for the lookback window
+        // ComputeOiBuildupNet/ComputeRatioSizedOiFlowRaw both read from above -- after every
+        // read this cadence, same before/after ordering _previousCadence itself follows, so
+        // both methods see state strictly before this cadence's own recording.
+        foreach (var opt in _nearestExpiryOptions)
+        {
+            if (_latest.TryGetValue(opt.Token, out var optState))
+            {
+                _oiLookback.Record(opt.Token, now, optState.OpenInterest ?? 0);
+            }
+        }
+
         _previousCadence = new Dictionary<string, InstrumentState>(_latest);
         _lastCadenceAt = now;
 
@@ -1507,6 +1536,14 @@ public sealed class LiveFeatureEngine
             return null;
         }
 
+        // PENDING (audit finding F50, 2026-09-10, follow-up not yet done): still the previous
+        // 15s cadence's spot, not ~OiComparisonWindow ago -- oiChange below now spans the OI
+        // lookback window (up to a few minutes), so pairing it with a 15s-old price direction
+        // can occasionally disagree with the direction spot actually moved over that same
+        // longer span. Left as-is for this fix (spot ticks continuously, so a 15s-old direction
+        // is usually still representative, unlike OI's genuinely lumpy refresh) rather than
+        // widening scope into a second lookback window without being asked -- worth doing if
+        // classification accuracy turns out to matter more than expected.
         var spotPriceChange = spotPrice - prevSpot.LastPrice;
 
         var bandStrikes = _nearestExpiryOptions
@@ -1519,12 +1556,22 @@ public sealed class LiveFeatureEngine
         double net = 0;
         foreach (var opt in _nearestExpiryOptions.Where(o => bandStrikes.Contains(o.StrikePrice!.Value)))
         {
-            if (!_latest.TryGetValue(opt.Token, out var curr) || !_previousCadence.TryGetValue(opt.Token, out var prev))
+            if (!_latest.TryGetValue(opt.Token, out var curr))
             {
                 continue;
             }
 
-            var oiChange = (curr.OpenInterest ?? 0) - (prev.OpenInterest ?? 0);
+            // Audit finding F50 (2026-09-10): OI compared against ~OiComparisonWindow ago, not
+            // the previous 15s cadence -- see OiLookbackWindow's own doc comment. Null (skip
+            // this strike, not a fabricated 0) until this token has enough history for a
+            // trustworthy answer, same "don't guess" rule the method-level gap check above
+            // already applies to spotPriceChange.
+            if (_oiLookback.Lookback(opt.Token, now) is not { } prevOi)
+            {
+                continue;
+            }
+
+            var oiChange = (curr.OpenInterest ?? 0) - prevOi;
             var classification = OiBuildupClassifier.Classify(spotPriceChange, oiChange);
 
             // Standard NSE option-chain reading: call buildup/short-covering is bullish for
@@ -1583,6 +1630,8 @@ public sealed class LiveFeatureEngine
             return null;
         }
 
+        // Still 15s-old, not ~OiComparisonWindow ago -- same known, deliberate gap as
+        // ComputeOiBuildupNet's own copy of this line; see that one's comment for why.
         var spotPriceChange = spotPrice - prevSpot.LastPrice;
 
         var bandStrikes = _nearestExpiryOptions
@@ -1595,12 +1644,20 @@ public sealed class LiveFeatureEngine
         double callConstructive = 0, putConstructive = 0;
         foreach (var opt in _nearestExpiryOptions.Where(o => bandStrikes.Contains(o.StrikePrice!.Value)))
         {
-            if (!_latest.TryGetValue(opt.Token, out var curr) || !_previousCadence.TryGetValue(opt.Token, out var prev))
+            if (!_latest.TryGetValue(opt.Token, out var curr))
             {
                 continue;
             }
 
-            var oiChange = (curr.OpenInterest ?? 0) - (prev.OpenInterest ?? 0);
+            // Audit finding F50 (2026-09-10): same fix as ComputeOiBuildupNet -- OI compared
+            // against ~OiComparisonWindow ago, not the previous 15s cadence. See
+            // OiLookbackWindow's own doc comment.
+            if (_oiLookback.Lookback(opt.Token, now) is not { } prevOi)
+            {
+                continue;
+            }
+
+            var oiChange = (curr.OpenInterest ?? 0) - prevOi;
             var classification = OiBuildupClassifier.Classify(spotPriceChange, oiChange);
 
             if (opt.OptionType == OptionType.Call && classification is OiBuildupClassification.LongBuildup or OiBuildupClassification.ShortCovering)
