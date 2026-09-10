@@ -9,10 +9,10 @@ so effort doesn't get spent twice or spent on the wrong thing.
 
 Numbering continues the existing `PENDING (audit finding FNN)` / `DEFERRED (audit finding FNN)`
 source-comment convention (see `[[feedback_pending_items_in_source]]`-style discipline already
-used throughout this codebase) — F46 is the next free number as of 2026-09-10. Nothing here has
-been added as a source comment yet; this file is the tracking layer until each item is actually
-implemented, at which point it gets the usual PENDING comment at its code site and a line here
-marking it done.
+used throughout this codebase) — F53 is the next free number as of 2026-09-10 (F46-F52 used
+below). Findings that are already fixed get their `audit finding FNN` marker inline in source at
+the point of the fix, same as every other batch this project has done; this file stays the
+durable index of what F-number maps to what, and why.
 
 ---
 
@@ -217,6 +217,64 @@ every ~3 minutes, not every 15 seconds.
   which now tick every 15s across the full comparison window (matching real cadence spacing --
   a single big jump trips `ComputeOiBuildupNet`'s own `MaxCadenceGapForOiBuildup` feed-outage
   guard) instead of one 15s-cadence jump.
+
+---
+
+## 2026-09-10 — Live-caught: dashboard bar charts and ratio-panel sign confusion
+
+User reported three things while looking at the live Ratio Composite Score panel: (1) most
+individual metrics showed positive `s`, yet the overall score was negative; (2) bar length
+didn't visually track a component's magnitude, in any panel; (3) the panel was meant to average
+each metric over 10-15 minutes so it wouldn't swing sign every cadence, and evidently didn't.
+All three were real, and (1)/(3) turned out to be the same root cause.
+
+### Fixed (2026-09-10)
+
+- **F52 — Bar length not proportional to magnitude, worst/invisible for negative values.**
+  `ScorePanel.razor.css` and `RatioScorePanel.razor.css`'s `.component-bar.bear` rule carried a
+  redundant `transform: translateX(-100%);` on top of the inline `right:50%; width:X%` the
+  Razor code already emits. `right:50%; width:X%` alone already positions a box correctly —
+  right edge pinned at the center, extending left by `X%` — so the box already renders a
+  correctly-proportional, correctly-anchored bar with no transform needed at all. Adding
+  `translateX(-100%)` shifts that already-correct box an *additional* 100% of its own width
+  further left: for a half-scale bar (`X=50`) this pushes it half a track-width past the
+  container's left edge; for a near-full-scale bar (`X≈100`) the entire box lands off-screen,
+  clipped invisible by the track's `overflow:hidden`. Bull bars (`left:50%`, no transform) were
+  never affected — which is exactly why the bug read as "negative values don't show a bar" in
+  particular, not "bars are broken." Fix: delete the `transform` line from both files; the
+  existing `right:50%` positioning was already correct on its own. Verified visually against a
+  seeded snapshot with strongly negative z/s values in both panels — bars now render fully
+  visible and length-proportional in both directions.
+
+- **F51 — Ratio panel's individual metrics were single-cadence instant reads shown next to an
+  already-smoothed score.** `RatioCompositeScore` (the number at the top of the panel) is the
+  combined value averaged over `RatioCompositeSmoothingCadences` (~12 min) — but the five
+  component rows below it (`Ratio*Raw`, hence the displayed `s=` values and their bars) were
+  each a *single 15-second cadence's* raw read, re-clipped fresh every poll. A metric could
+  genuinely flip sign from one 15s cadence to the next (order flow is lumpy at that granularity
+  — see F50 above for OI specifically), while the headline score, built from many cadences'
+  worth of history, stayed comparatively stable — reading as contradictory even though both
+  numbers were individually correct for what they represented. Matches what the user recalled
+  deciding during the original build: each metric should itself be smoothed over ~10-15 minutes,
+  not just the combined total.
+
+  Fixed with the same FIFO-average mechanism the combined score already uses
+  (`RatioCompositeSmoothingCadences`, ~12 min), applied one level earlier — each of the five raw
+  metrics now gets its own smoothing FIFO, fed every cadence, averaged before being clipped into
+  `RatioComponentInputs` and before being persisted to `ScoreSnapshot.Ratio*Raw`. A quiet bar
+  (below a metric's own liquidity floor) is skipped, not zero-filled, so it doesn't drag the
+  average down artificially. The combined-level smoothing on top was deliberately **not**
+  retired — a smoothed-then-combined-then-smoothed-again result costs a bit more lag, but is the
+  more conservative direction and mirrors how the original composite's own z-scores already draw
+  from smoothed rolling-window baselines and then get combined-level smoothing on top of that.
+  `SeedHistory` replays each persisted (now-smoothed) `Ratio*Raw` value back into its own FIFO on
+  restart, same restart-safety discipline as the combined FIFO already has (a known, documented
+  approximation, same spirit as `_previousCadence`'s own accepted restart limitations — see F50).
+
+  Regression test:
+  `LiveFeatureEngineTests.RatioNotionalVolumeRaw_IsTheSmoothedAverage_NotJustThisCadencesInstantValue`
+  — two cadences with deliberately different instant ratios (20, then 0) prove the persisted
+  value is their average (10), not either instant alone.
 
 ---
 

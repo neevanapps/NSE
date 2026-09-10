@@ -218,6 +218,27 @@ public sealed class LiveFeatureEngine
     /// <summary>Same FIFO-smoothing mechanism as <see cref="_compositeRawHistory"/>, sized <see cref="RatioCompositeSmoothingCadences"/> (~12 min) instead -- the ratio-based composite's own smoothed raw history (weekend build, 2026-09-09). Deliberately not a new EMA mechanism; the existing pattern already does the job.</summary>
     readonly Queue<double> _ratioCompositeRawHistory = new();
 
+    // Audit finding F51 (2026-09-10, user-caught live): the five ratio metrics feeding the
+    // above were each single-cadence instant reads -- combined into one instant raw, THEN only
+    // the *combined* result got smoothed. That let an individual metric's clipped s_i swing
+    // sign entirely between adjacent 15s cadences (visible on the dashboard as the persisted
+    // Ratio*Raw columns, and hence the displayed "s=" bars, flickering), even though the
+    // composite SCORE displayed alongside them was already the smoothed value -- the two could
+    // disagree in sign from a viewer's perspective for no obvious reason. Each of the five raw
+    // metrics is now smoothed individually over the same RatioCompositeSmoothingCadences (~12
+    // min) window, using the identical FIFO+Average mechanism as _ratioCompositeRawHistory
+    // above, BEFORE clipping/combining -- not a new mechanism, the existing pattern applied one
+    // level earlier. The combined-level smoothing above is left in place on top (not retired):
+    // a smoothed-then-combined-then-smoothed-again signal costs a bit more lag but is the more
+    // conservative direction, consistent with how the original composite's own z-scores already
+    // draw from smoothed rolling-window baselines *and* get an additional combined-level FIFO
+    // on top.
+    readonly Queue<double> _ratioNotionalVolumeHistory = new();
+    readonly Queue<double> _ratioSizedOiFlowHistory = new();
+    readonly Queue<double> _ratioResidualDifferenceHistory = new();
+    readonly Queue<double> _ratioIvSkew25dHistory = new();
+    readonly Queue<double> _ratioSpreadAtmHistory = new();
+
     readonly RunningAverage _basisSamples = new();
     readonly RunningAverage _parityGapSamples = new();
     readonly RunningAverage _momentumSamples = new();
@@ -439,6 +460,31 @@ public sealed class LiveFeatureEngine
                     _ratioCompositeRawHistory.Dequeue();
                 }
             }
+
+            // Audit finding F51 (2026-09-10): same restart-safety, one level earlier -- the
+            // five per-metric smoothing FIFOs above the combined one. Each persisted Ratio*Raw
+            // value already IS that cadence's smoothed reading (SmoothRatioMetric replaced the
+            // instant value before persistence), so replaying it back into a fresh FIFO isn't
+            // exactly replaying the original instant samples -- a known, accepted approximation
+            // (a bit of extra effective lag right after a restart, not a correctness bug), same
+            // spirit as _previousCadence's own documented restart limitations.
+            static void ReplayRatioMetricHistory(Queue<double> history, double? raw, int limit)
+            {
+                if (raw is { } value)
+                {
+                    history.Enqueue(value);
+                    while (history.Count > limit)
+                    {
+                        history.Dequeue();
+                    }
+                }
+            }
+
+            ReplayRatioMetricHistory(_ratioNotionalVolumeHistory, snapshot.RatioNotionalVolumeRaw, RatioCompositeSmoothingCadences);
+            ReplayRatioMetricHistory(_ratioSizedOiFlowHistory, snapshot.RatioSizedOiFlowRaw, RatioCompositeSmoothingCadences);
+            ReplayRatioMetricHistory(_ratioResidualDifferenceHistory, snapshot.RatioResidualDifferenceRaw, RatioCompositeSmoothingCadences);
+            ReplayRatioMetricHistory(_ratioIvSkew25dHistory, snapshot.RatioIvSkew25dRaw, RatioCompositeSmoothingCadences);
+            ReplayRatioMetricHistory(_ratioSpreadAtmHistory, snapshot.RatioSpreadAtmRaw, RatioCompositeSmoothingCadences);
 
             if (snapshot.VixChangeRaw is { } vixChange)
             {
@@ -833,6 +879,29 @@ public sealed class LiveFeatureEngine
         return callWeighted > 0 ? putWeighted / callWeighted : (double?)null;
     }
 
+    /// <summary>
+    /// Audit finding F51 (2026-09-10): folds this cadence's instant raw into <paramref
+    /// name="history"/> (skipped, not zero-filled, when null -- a quiet bar contributes no
+    /// sample rather than dragging the average toward a fabricated 0, same "don't guess"
+    /// discipline as everywhere else this raw came from) and returns the FIFO's average --
+    /// null only when no sample has ever landed in it yet. Same mechanism as
+    /// <see cref="_ratioCompositeRawHistory"/>'s own smoothing, applied one level earlier (per
+    /// metric, before combining) rather than only after.
+    /// </summary>
+    static double? SmoothRatioMetric(Queue<double> history, double? instantRaw)
+    {
+        if (instantRaw is { } raw)
+        {
+            history.Enqueue(raw);
+            while (history.Count > RatioCompositeSmoothingCadences)
+            {
+                history.Dequeue();
+            }
+        }
+
+        return history.Count > 0 ? history.Average() : null;
+    }
+
     /// <summary>Null until the spot and future have at least one tick each.</summary>
     public ScoreSnapshot? ComputeCadence(DateTimeOffset now)
     {
@@ -1095,6 +1164,17 @@ public sealed class LiveFeatureEngine
         var ratioComponentsPresent = 0;
         try
         {
+            // Audit finding F51 (2026-09-10): each metric smoothed over the same
+            // ~12-minute window as the combined score, before clipping/combining -- see
+            // SmoothRatioMetric's own doc comment. Instant raw is still what gets fed in
+            // (Enqueue happens inside SmoothRatioMetric); what comes back, and what's clipped
+            // and persisted below, is the smoothed value.
+            ratioNotionalVolumeRaw = SmoothRatioMetric(_ratioNotionalVolumeHistory, ratioNotionalVolumeRaw);
+            ratioSizedOiFlowRaw = SmoothRatioMetric(_ratioSizedOiFlowHistory, ratioSizedOiFlowRaw);
+            ratioResidualDifferenceRaw = SmoothRatioMetric(_ratioResidualDifferenceHistory, ratioResidualDifferenceRaw);
+            ratioIvSkew25dRaw = SmoothRatioMetric(_ratioIvSkew25dHistory, ratioIvSkew25dRaw);
+            ratioSpreadAtmRaw = SmoothRatioMetric(_ratioSpreadAtmHistory, ratioSpreadAtmRaw);
+
             var ratioInputs = new RatioComponentInputs(
                 NotionalVolumeRatio: RatioMetricMath.ClipLogRatio(ratioNotionalVolumeRaw, RatioMetricScales.NotionalVolumeRatioRMax),
                 SizedOiFlowRatio: RatioMetricMath.ClipLogRatio(ratioSizedOiFlowRaw, RatioMetricScales.SizedOiFlowRatioRMax),

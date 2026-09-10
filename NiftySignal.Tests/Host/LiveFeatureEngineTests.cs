@@ -1857,6 +1857,51 @@ public class LiveFeatureEngineTests
     }
 
     [Fact]
+    public void RatioNotionalVolumeRaw_IsTheSmoothedAverage_NotJustThisCadencesInstantValue()
+    {
+        // Audit finding F51 (2026-09-10, user-caught live): before this fix, RatioNotionalVolumeRaw
+        // (and the other four ratio metrics) persisted the single-cadence instant read -- able to
+        // swing sign entirely cadence to cadence even though the combined score shown alongside it
+        // was already smoothed. Two cadences with deliberately different instant ratios (call-heavy
+        // then put-heavy) prove the persisted value is their FIFO average, not either instant alone.
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        var t0 = Start;
+        engine.OnTick(MakeTick(SpotToken, 23950m, t0));
+        engine.OnTick(MakeTick(FutureToken, 24000m, t0));
+        // Baseline volume only -- the first tick's own volume delta is always 0 (no prior
+        // baseline yet), so this cadence contributes no notional signal on its own.
+        engine.OnTick(MakeTick(CallToken, 100m, t0, volume: 1_000, depth: Depth(400, 400, bid: 99.5m, ask: 100.5m)));
+        engine.OnTick(MakeTick(PutToken, 50m, t0, volume: 1_000, depth: Depth(400, 400, bid: 49.5m, ask: 50.5m)));
+        engine.ComputeCadence(t0);
+
+        // Cadence 1: call volume +100 @ ~100 => Rs 10,000 call notional; put volume +10 @ ~50 =>
+        // Rs 500 put notional. Instant ratio = 10,000/500 = 20.
+        var t1 = t0.AddSeconds(15);
+        engine.OnTick(MakeTick(SpotToken, 23950m, t1));
+        engine.OnTick(MakeTick(FutureToken, 24000m, t1));
+        engine.OnTick(MakeTick(CallToken, 100m, t1, volume: 1_100, depth: Depth(400, 400, bid: 99.5m, ask: 100.5m)));
+        engine.OnTick(MakeTick(PutToken, 50m, t1, volume: 1_010, depth: Depth(400, 400, bid: 49.5m, ask: 50.5m)));
+        var snapshot1 = engine.ComputeCadence(t1);
+
+        Assert.NotNull(snapshot1);
+        Assert.Equal(20.0, snapshot1!.RatioNotionalVolumeRaw!.Value, precision: 6);
+
+        // Cadence 2: call volume unchanged (delta 0 -> contributes nothing, same as a genuinely
+        // quiet bar on that side); put volume +100 @ ~50 => Rs 5,000 put notional, zero call
+        // notional. Instant ratio = 0/5,000 = 0 -- sharply different from cadence 1's 20.
+        var t2 = t1.AddSeconds(15);
+        engine.OnTick(MakeTick(SpotToken, 23950m, t2));
+        engine.OnTick(MakeTick(FutureToken, 24000m, t2));
+        engine.OnTick(MakeTick(CallToken, 100m, t2, volume: 1_100, depth: Depth(400, 400, bid: 99.5m, ask: 100.5m)));
+        engine.OnTick(MakeTick(PutToken, 50m, t2, volume: 1_110, depth: Depth(400, 400, bid: 49.5m, ask: 50.5m)));
+        var snapshot2 = engine.ComputeCadence(t2);
+
+        Assert.NotNull(snapshot2);
+        // Neither cadence 2's own instant (0) nor cadence 1's (20) alone -- their average, 10.
+        Assert.Equal(10.0, snapshot2!.RatioNotionalVolumeRaw!.Value, precision: 6);
+    }
+
+    [Fact]
     public void RatioCompositeScore_IsNonNull_WithOnlyThreeOfFiveMetricsPresent()
     {
         // Optional-components proof (2026-09-09 review amendment): both flow metrics (1, 2)

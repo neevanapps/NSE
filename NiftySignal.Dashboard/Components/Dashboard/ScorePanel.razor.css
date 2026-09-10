@@ -89,7 +89,6 @@
 
     .component-bar.bear {
         background: var(--bear);
-        transform: translateX(-100%);
     }
 
 .component-weight, .component-z {

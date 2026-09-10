@@ -211,14 +211,23 @@ public sealed class ScoreSnapshot
     // LiveTradingEngineTests' trading-safety parity test, which asserts this directly rather
     // than leaving it as a code-reading claim). See NiftySignal.Scoring.RatioScoreCalculator
     // and LiveFeatureEngine's ratio-metric methods for how each is computed.
+    //
+    // Audit finding F51 (2026-09-10, user-caught live): all five Ratio*Raw columns below hold a
+    // smoothed value (LiveFeatureEngine.SmoothRatioMetric, ~RatioCompositeSmoothingCadences /
+    // 12 minutes), not the single-cadence instant read -- before this fix, an individual
+    // metric's clipped s_i could swing sign entirely between adjacent 15s cadences even though
+    // the combined score shown alongside it (RatioCompositeScore, its own separate,
+    // combined-level smoothing) was already stable, which read as contradictory on the
+    // dashboard. The instant read still feeds the smoothing FIFO each cadence (see
+    // SmoothRatioMetric) but is no longer persisted anywhere on its own.
 
-    /// <summary>Call notional / put notional, ATM+/-5, log-ratio-clipped -- see LiveFeatureEngine.ComputeRatioNotionalVolumeRaw. Null when combined notional is below RatioMetricScales.MinNotionalForVolumeRatio (no real signal that bar, not a divide-by-zero guard).</summary>
+    /// <summary>Call notional / put notional, ATM+/-5, log-ratio-clipped -- see LiveFeatureEngine.ComputeRatioNotionalVolumeRaw. Null when combined notional is below RatioMetricScales.MinNotionalForVolumeRatio (no real signal that bar, not a divide-by-zero guard) AND no sample has ever cleared that floor yet this session (F51: a bar below the floor is simply skipped, not zero-filled, so the smoothed value persists across a quiet bar once at least one real sample exists).</summary>
     public double? RatioNotionalVolumeRaw { get; set; }
 
-    /// <summary>Sized, spot-classified constructive OI flow ratio, ATM+/-5, log-ratio-clipped -- see LiveFeatureEngine.ComputeRatioSizedOiFlowRaw. Null when combined constructive flow is below RatioMetricScales.MinContractsForOiFlow.</summary>
+    /// <summary>Sized, spot-classified constructive OI flow ratio, ATM+/-5, log-ratio-clipped -- see LiveFeatureEngine.ComputeRatioSizedOiFlowRaw. Null when combined constructive flow is below RatioMetricScales.MinContractsForOiFlow and no sample has ever cleared that floor yet this session -- see RatioNotionalVolumeRaw's own doc comment (F51) for why a single quiet bar no longer blanks this out.</summary>
     public double? RatioSizedOiFlowRaw { get; set; }
 
-    /// <summary>ATM call residual minus ATM put residual (rupees), each leg's actual mark change minus its own Delta+Gamma+Theta+Vega-predicted change -- see LiveFeatureEngine.ComputeResidualDifference. A difference, not a ratio (a ratio blows up near zero). Null on an ATM strike roll, same guard as StraddleRichnessRaw.</summary>
+    /// <summary>ATM call residual minus ATM put residual (rupees), each leg's actual mark change minus its own Delta+Gamma+Theta+Vega-predicted change -- see LiveFeatureEngine.ComputeResidualDifference. A difference, not a ratio (a ratio blows up near zero). Null on an ATM strike roll (same guard as StraddleRichnessRaw) only once every smoothed sample has aged out of the window -- see RatioNotionalVolumeRaw's own doc comment (F51).</summary>
     public double? RatioResidualDifferenceRaw { get; set; }
 
     /// <summary>25-delta put IV / 25-delta call IV -- see LiveFeatureEngine.ComputeIvSkewRatio25Delta. A materially different quantity from IvSkewOneSigmaRaw (~16-delta, F8) -- never treat the two as the same series.</summary>
@@ -227,10 +236,10 @@ public sealed class ScoreSnapshot
     /// <summary>OI-weighted put spread% / call spread%, ATM+/-2 -- see LiveFeatureEngine.ComputeRatioSpreadAtmRaw. Reuses the same per-cadence spread samples SpreadRatioRaw does.</summary>
     public double? RatioSpreadAtmRaw { get; set; }
 
-    /// <summary>The single-cadence ratio-composite raw before smoothing -- transparency/future-analysis only, same role as CompositeScoreRawInstant.</summary>
+    /// <summary>The five (now-smoothed, F51) clipped inputs combined for this cadence -- transparency/future-analysis only, same role as CompositeScoreRawInstant. Already meaningfully more stable than a true single-cadence instant read would be, since each of its five inputs is itself a ~12-minute average; RatioCompositeScoreRaw below smooths it again on top (deliberately layered, not retired -- see the ratio-columns block comment above).</summary>
     public double? RatioCompositeScoreRawInstant { get; set; }
 
-    /// <summary>The smoothed (12-cadence FIFO, ~RatioCompositeSmoothingCadences) ratio-composite raw -- the tradable value, if this pipeline is ever wired into a decision. Persisted so the smoothing FIFO can be replayed on restart via SeedHistory, same reason CompositeScoreRaw is.</summary>
+    /// <summary>The combined-level-smoothed (12-cadence FIFO, ~RatioCompositeSmoothingCadences) ratio-composite raw -- the tradable value, if this pipeline is ever wired into a decision. Persisted so the smoothing FIFO can be replayed on restart via SeedHistory, same reason CompositeScoreRaw is.</summary>
     public double? RatioCompositeScoreRaw { get; set; }
 
     /// <summary><c>100 * tanh(RatioCompositeScoreRaw / k)</c>, k = RatioScoreCalculator.DefaultK. Null until at least RatioScoreCalculator.MinRequiredComponents of the five Ratio*Raw values above are non-null this cadence.</summary>
