@@ -1936,8 +1936,13 @@ public class LiveFeatureEngineTests
     }
 
     [Fact]
-    public void SeedHistory_ReplaysTheRatioCompositeFifo_SoARestartDoesNotResetItsWarmUp()
+    public void SeedHistory_AcceptsHistoryCarryingRatioCompositeScoreRawInstant_WithoutThrowing()
     {
+        // RatioCompositeScoreRawInstant is diagnostic-only (no FIFO of its own to replay into
+        // as of audit finding F51 -- see RatioCompositeScoreRaw's own doc comment for why), but
+        // SeedHistory must still accept a history carrying it without erroring, since
+        // MarketDataIngestionWorker.SeedEngineHistoryAsync replays every persisted snapshot
+        // unconditionally rather than filtering by which fields happen to still be load-bearing.
         var history = new List<ScoreSnapshot>
         {
             new() { ComputedAt = Start, RatioCompositeScoreRawInstant = 0.4, WeightSetVersion = "v1" },
@@ -1949,6 +1954,40 @@ public class LiveFeatureEngineTests
         var exception = Record.Exception(() => engine.SeedHistory(history));
 
         Assert.Null(exception);
+    }
+
+    [Fact]
+    public void SeedHistory_ReplaysEachRatioMetricsOwnFifo_SoARestartDoesNotResetItsSmoothing()
+    {
+        // Audit finding F51 follow-up (2026-09-10): the combined-level ratio FIFO the test above
+        // was originally written for is gone (see RatioCompositeScoreRaw's own doc comment) --
+        // restart-safety for the ratio composite now lives in the five per-metric FIFOs
+        // instead. Seed two historical cadences' RatioNotionalVolumeRaw (already-smoothed values,
+        // per F51), then run one real cadence with a sharply different instant reading -- the
+        // persisted result must reflect all three (the two replayed plus the new instant), not
+        // just the new instant alone, proving the seed actually reached the new per-metric FIFO.
+        var history = new List<ScoreSnapshot>
+        {
+            new() { ComputedAt = Start - TimeSpan.FromSeconds(30), RatioNotionalVolumeRaw = 20.0, WeightSetVersion = "v1" },
+            new() { ComputedAt = Start - TimeSpan.FromSeconds(15), RatioNotionalVolumeRaw = 20.0, WeightSetVersion = "v1" },
+        };
+
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.SeedHistory(history);
+
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        // First-ever ticks for these tokens -- volume delta is 0 (no prior baseline), so this
+        // cadence alone contributes no new notional sample, isolating the replayed history's
+        // own effect on the result below.
+        engine.OnTick(MakeTick(CallToken, 100m, Start, volume: 1_000, depth: Depth(400, 400, bid: 99.5m, ask: 100.5m)));
+        engine.OnTick(MakeTick(PutToken, 50m, Start, volume: 1_000, depth: Depth(400, 400, bid: 49.5m, ask: 50.5m)));
+        var snapshot = engine.ComputeCadence(Start);
+
+        Assert.NotNull(snapshot);
+        // No new instant sample this cadence, so the result is exactly the replayed history's
+        // own average (20, 20) -- proving the seed reached the FIFO, not just that it didn't throw.
+        Assert.Equal(20.0, snapshot!.RatioNotionalVolumeRaw!.Value, precision: 6);
     }
 
     [Fact]

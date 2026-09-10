@@ -263,18 +263,26 @@ All three were real, and (1)/(3) turned out to be the same root cause.
   metrics now gets its own smoothing FIFO, fed every cadence, averaged before being clipped into
   `RatioComponentInputs` and before being persisted to `ScoreSnapshot.Ratio*Raw`. A quiet bar
   (below a metric's own liquidity floor) is skipped, not zero-filled, so it doesn't drag the
-  average down artificially. The combined-level smoothing on top was deliberately **not**
-  retired — a smoothed-then-combined-then-smoothed-again result costs a bit more lag, but is the
-  more conservative direction and mirrors how the original composite's own z-scores already draw
-  from smoothed rolling-window baselines and then get combined-level smoothing on top of that.
-  `SeedHistory` replays each persisted (now-smoothed) `Ratio*Raw` value back into its own FIFO on
-  restart, same restart-safety discipline as the combined FIFO already has (a known, documented
-  approximation, same spirit as `_previousCadence`'s own accepted restart limitations — see F50).
+  average down artificially. `SeedHistory` replays each persisted (now-smoothed) `Ratio*Raw`
+  value back into its own FIFO on restart (a known, documented approximation, same spirit as
+  `_previousCadence`'s own accepted restart limitations — see F50).
 
-  Regression test:
+  **Follow-up, same day, on direct user instruction:** the first version of this fix also kept
+  the pre-existing combined-level FIFO on top (smoothing the already-smoothed combination a
+  second time) as a deliberately conservative choice. The user pointed out that once every input
+  is already a ~12-minute average, smoothing their combination again adds lag for no benefit —
+  correct, and simpler besides. Retired the combined-level FIFO (`_ratioCompositeRawHistory`)
+  entirely: `RatioCompositeScoreRaw` is now set identically to `RatioCompositeScoreRawInstant`
+  every cadence, with no separate history of its own. Both columns are kept (removing one would
+  need a migration and touch every reader) rather than collapsed into one.
+
+  Regression tests:
   `LiveFeatureEngineTests.RatioNotionalVolumeRaw_IsTheSmoothedAverage_NotJustThisCadencesInstantValue`
-  — two cadences with deliberately different instant ratios (20, then 0) prove the persisted
-  value is their average (10), not either instant alone.
+  (two cadences with deliberately different instant ratios, 20 then 0, prove the persisted value
+  is their average, 10, not either instant alone) and
+  `SeedHistory_ReplaysEachRatioMetricsOwnFifo_SoARestartDoesNotResetItsSmoothing` (replaces the
+  old combined-FIFO seed test, which no longer tests anything real now that FIFO is gone —
+  proves the *per-metric* FIFOs are what actually gets restored on restart).
 
 ---
 

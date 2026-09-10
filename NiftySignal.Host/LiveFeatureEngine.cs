@@ -215,24 +215,26 @@ public sealed class LiveFeatureEngine
     /// <summary>Last <see cref="CompositeSmoothingCadences"/> single-cadence composite raw values, oldest first -- see ComputeCadence's smoothing comment.</summary>
     readonly Queue<double> _compositeRawHistory = new();
 
-    /// <summary>Same FIFO-smoothing mechanism as <see cref="_compositeRawHistory"/>, sized <see cref="RatioCompositeSmoothingCadences"/> (~12 min) instead -- the ratio-based composite's own smoothed raw history (weekend build, 2026-09-09). Deliberately not a new EMA mechanism; the existing pattern already does the job.</summary>
-    readonly Queue<double> _ratioCompositeRawHistory = new();
-
-    // Audit finding F51 (2026-09-10, user-caught live): the five ratio metrics feeding the
-    // above were each single-cadence instant reads -- combined into one instant raw, THEN only
-    // the *combined* result got smoothed. That let an individual metric's clipped s_i swing
-    // sign entirely between adjacent 15s cadences (visible on the dashboard as the persisted
-    // Ratio*Raw columns, and hence the displayed "s=" bars, flickering), even though the
-    // composite SCORE displayed alongside them was already the smoothed value -- the two could
-    // disagree in sign from a viewer's perspective for no obvious reason. Each of the five raw
-    // metrics is now smoothed individually over the same RatioCompositeSmoothingCadences (~12
-    // min) window, using the identical FIFO+Average mechanism as _ratioCompositeRawHistory
-    // above, BEFORE clipping/combining -- not a new mechanism, the existing pattern applied one
-    // level earlier. The combined-level smoothing above is left in place on top (not retired):
-    // a smoothed-then-combined-then-smoothed-again signal costs a bit more lag but is the more
-    // conservative direction, consistent with how the original composite's own z-scores already
-    // draw from smoothed rolling-window baselines *and* get an additional combined-level FIFO
-    // on top.
+    // Audit finding F51 (2026-09-10, user-caught live, then refined by user instruction): the
+    // five ratio metrics feeding the combined score were each single-cadence instant reads --
+    // combined into one instant raw, THEN only the *combined* result got smoothed. That let an
+    // individual metric's clipped s_i swing sign entirely between adjacent 15s cadences
+    // (visible on the dashboard as the persisted Ratio*Raw columns, and hence the displayed
+    // "s=" bars, flickering), even though the composite SCORE displayed alongside them was
+    // already the smoothed value -- the two could disagree in sign from a viewer's perspective
+    // for no obvious reason.
+    //
+    // Fixed by smoothing each of the five raw metrics individually over
+    // RatioCompositeSmoothingCadences (~12 min), using the same FIFO+Average mechanism the
+    // combined score used to use, BEFORE clipping/combining -- not a new mechanism, the
+    // existing pattern applied one level earlier (see SmoothRatioMetric). An earlier version of
+    // this fix ALSO kept the old combined-level FIFO on top (a deliberately conservative
+    // "smooth twice" choice) -- removed on explicit user instruction once the per-metric
+    // smoothing landed: since every input to the combine step is now already a ~12-minute
+    // average, smoothing their combination again added lag with no benefit. The combined-level
+    // FIFO (previously _ratioCompositeRawHistory) is gone; RatioCompositeScoreRaw is now set
+    // identically to RatioCompositeScoreRawInstant in ComputeCadence -- see that assignment's
+    // own comment for why both columns are still kept rather than one removed outright.
     readonly Queue<double> _ratioNotionalVolumeHistory = new();
     readonly Queue<double> _ratioSizedOiFlowHistory = new();
     readonly Queue<double> _ratioResidualDifferenceHistory = new();
@@ -447,22 +449,17 @@ public sealed class LiveFeatureEngine
                 }
             }
 
-            // Same restart-safety as the composite's own smoothing FIFO above -- not optional
-            // (weekend build, 2026-09-09): skipping this reintroduces the exact bug the existing
-            // composite's smoothing already had fixed for it (2026-09-04 incident), just for the
-            // ratio composite instead -- every Host restart would silently reset its ~12-minute
-            // warm-up to zero.
-            if (snapshot.RatioCompositeScoreRawInstant is { } ratioCompositeRawInstant)
-            {
-                _ratioCompositeRawHistory.Enqueue(ratioCompositeRawInstant);
-                while (_ratioCompositeRawHistory.Count > RatioCompositeSmoothingCadences)
-                {
-                    _ratioCompositeRawHistory.Dequeue();
-                }
-            }
-
-            // Audit finding F51 (2026-09-10): same restart-safety, one level earlier -- the
-            // five per-metric smoothing FIFOs above the combined one. Each persisted Ratio*Raw
+            // Audit finding F51 (2026-09-10): the combined-level smoothing FIFO that used to be
+            // replayed here (_ratioCompositeRawHistory) is retired -- see that field's own
+            // removal comment. Restart-safety for the ratio composite now lives entirely in the
+            // five per-metric FIFOs below, since RatioCompositeScoreRaw is derived from them
+            // (via ratioInputs) fresh every cadence rather than carrying its own separate
+            // history.
+            //
+            // Same restart-safety discipline as the original composite's own smoothing FIFO
+            // above -- not optional: skipping this reintroduces the exact bug the existing
+            // composite's smoothing already had fixed for it (2026-09-04 incident), just for
+            // the ratio composite's five inputs instead. Each persisted Ratio*Raw
             // value already IS that cadence's smoothed reading (SmoothRatioMetric replaced the
             // instant value before persistence), so replaying it back into a fresh FIFO isn't
             // exactly replaying the original instant samples -- a known, accepted approximation
@@ -884,9 +881,11 @@ public sealed class LiveFeatureEngine
     /// name="history"/> (skipped, not zero-filled, when null -- a quiet bar contributes no
     /// sample rather than dragging the average toward a fabricated 0, same "don't guess"
     /// discipline as everywhere else this raw came from) and returns the FIFO's average --
-    /// null only when no sample has ever landed in it yet. Same mechanism as
-    /// <see cref="_ratioCompositeRawHistory"/>'s own smoothing, applied one level earlier (per
-    /// metric, before combining) rather than only after.
+    /// null only when no sample has ever landed in it yet. Same mechanism <see cref="_compositeRawHistory"/>
+    /// uses for the original composite, applied here per ratio metric (before combining) --
+    /// the ratio composite's own combined-level FIFO this used to also feed was retired once
+    /// per-metric smoothing landed (audit finding F51, 2026-09-10) rather than smoothing an
+    /// already-smoothed signal a second time.
     /// </summary>
     static double? SmoothRatioMetric(Queue<double> history, double? instantRaw)
     {
@@ -1189,17 +1188,14 @@ public sealed class LiveFeatureEngine
                 (ratioInputs.IvSkew25Delta is not null ? 1 : 0) +
                 (ratioInputs.SpreadRatioAtm is not null ? 1 : 0);
 
+            // Audit finding F51 follow-up (2026-09-10, user instruction): no combined-level
+            // smoothing anymore -- each of the five inputs above is already a ~12-minute
+            // average (SmoothRatioMetric), so smoothing their combination again would smooth
+            // an already-smoothed signal for no benefit, just extra lag. RatioCompositeScoreRaw
+            // is therefore identical to RatioCompositeScoreRawInstant now; both columns are
+            // kept (no migration needed) rather than one removed outright.
             ratioCompositeScoreRawInstant = RatioScoreCalculator.ComputeRaw(ratioInputs, RatioScoreWeights.Default);
-            if (ratioCompositeScoreRawInstant is { } ratioInstantRaw)
-            {
-                _ratioCompositeRawHistory.Enqueue(ratioInstantRaw);
-                while (_ratioCompositeRawHistory.Count > RatioCompositeSmoothingCadences)
-                {
-                    _ratioCompositeRawHistory.Dequeue();
-                }
-
-                ratioCompositeScoreRaw = _ratioCompositeRawHistory.Average();
-            }
+            ratioCompositeScoreRaw = ratioCompositeScoreRawInstant;
 
             var ratioComposite = RatioScoreCalculator.Calculate(
                 ratioInputs, RatioScoreWeights.Default, now, RatioScoreCalculator.DefaultK, ratioCompositeScoreRaw);

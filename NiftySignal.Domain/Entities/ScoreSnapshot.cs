@@ -212,14 +212,17 @@ public sealed class ScoreSnapshot
     // than leaving it as a code-reading claim). See NiftySignal.Scoring.RatioScoreCalculator
     // and LiveFeatureEngine's ratio-metric methods for how each is computed.
     //
-    // Audit finding F51 (2026-09-10, user-caught live): all five Ratio*Raw columns below hold a
-    // smoothed value (LiveFeatureEngine.SmoothRatioMetric, ~RatioCompositeSmoothingCadences /
-    // 12 minutes), not the single-cadence instant read -- before this fix, an individual
-    // metric's clipped s_i could swing sign entirely between adjacent 15s cadences even though
-    // the combined score shown alongside it (RatioCompositeScore, its own separate,
-    // combined-level smoothing) was already stable, which read as contradictory on the
-    // dashboard. The instant read still feeds the smoothing FIFO each cadence (see
-    // SmoothRatioMetric) but is no longer persisted anywhere on its own.
+    // Audit finding F51 (2026-09-10, user-caught live, then refined by user instruction): all
+    // five Ratio*Raw columns below hold a smoothed value (LiveFeatureEngine.SmoothRatioMetric,
+    // ~RatioCompositeSmoothingCadences / 12 minutes), not the single-cadence instant read --
+    // before this fix, an individual metric's clipped s_i could swing sign entirely between
+    // adjacent 15s cadences even though the combined score shown alongside it
+    // (RatioCompositeScore) was, at the time, additionally smoothed at the combined level too --
+    // which read as contradictory on the dashboard. The instant read still feeds each metric's
+    // own smoothing FIFO every cadence but is no longer persisted anywhere on its own. The
+    // combined score's own separate smoothing layer was retired once this landed (see
+    // RatioCompositeScoreRaw's own doc comment) -- it's stable now because every one of its
+    // inputs already is, not because of an additional smoothing step of its own.
 
     /// <summary>Call notional / put notional, ATM+/-5, log-ratio-clipped -- see LiveFeatureEngine.ComputeRatioNotionalVolumeRaw. Null when combined notional is below RatioMetricScales.MinNotionalForVolumeRatio (no real signal that bar, not a divide-by-zero guard) AND no sample has ever cleared that floor yet this session (F51: a bar below the floor is simply skipped, not zero-filled, so the smoothed value persists across a quiet bar once at least one real sample exists).</summary>
     public double? RatioNotionalVolumeRaw { get; set; }
@@ -236,10 +239,19 @@ public sealed class ScoreSnapshot
     /// <summary>OI-weighted put spread% / call spread%, ATM+/-2 -- see LiveFeatureEngine.ComputeRatioSpreadAtmRaw. Reuses the same per-cadence spread samples SpreadRatioRaw does.</summary>
     public double? RatioSpreadAtmRaw { get; set; }
 
-    /// <summary>The five (now-smoothed, F51) clipped inputs combined for this cadence -- transparency/future-analysis only, same role as CompositeScoreRawInstant. Already meaningfully more stable than a true single-cadence instant read would be, since each of its five inputs is itself a ~12-minute average; RatioCompositeScoreRaw below smooths it again on top (deliberately layered, not retired -- see the ratio-columns block comment above).</summary>
+    /// <summary>The five (smoothed, F51) clipped inputs combined for this cadence -- transparency/future-analysis only, same role as CompositeScoreRawInstant. Already meaningfully stable on its own, since each of its five inputs is itself a ~12-minute average.</summary>
     public double? RatioCompositeScoreRawInstant { get; set; }
 
-    /// <summary>The combined-level-smoothed (12-cadence FIFO, ~RatioCompositeSmoothingCadences) ratio-composite raw -- the tradable value, if this pipeline is ever wired into a decision. Persisted so the smoothing FIFO can be replayed on restart via SeedHistory, same reason CompositeScoreRaw is.</summary>
+    /// <summary>
+    /// Identical to <see cref="RatioCompositeScoreRawInstant"/> as of audit finding F51
+    /// (2026-09-10, user instruction): this used to be that value smoothed again over its own
+    /// combined-level 12-cadence FIFO, but once every one of the five inputs feeding it was
+    /// already a ~12-minute average in its own right, smoothing the combination a second time
+    /// only added lag with no benefit -- the combined-level FIFO was retired. Kept as its own
+    /// column (rather than removed, which would need a migration and touch every reader) so
+    /// existing call sites reading "the tradable raw, if this pipeline is ever wired into a
+    /// decision" don't need to know which of the two columns to prefer.
+    /// </summary>
     public double? RatioCompositeScoreRaw { get; set; }
 
     /// <summary><c>100 * tanh(RatioCompositeScoreRaw / k)</c>, k = RatioScoreCalculator.DefaultK. Null until at least RatioScoreCalculator.MinRequiredComponents of the five Ratio*Raw values above are non-null this cadence.</summary>
