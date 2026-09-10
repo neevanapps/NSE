@@ -429,4 +429,49 @@ public class LiveTradingEngineTests
         });
         Assert.DoesNotContain(fixture.Telegram.Sent, s => s.Category == NotificationCategory.TradeEntry);
     }
+
+    [Fact]
+    public async Task EvaluateCadenceAsync_NoEntry_WhenCommittedCapitalWouldExceedTotal_EvenUnderMaxConcurrentPositions()
+    {
+        // Audit finding F48 (2026-09-10): two open positions at a high entry price (150 each,
+        // qty 130 -> Rs 19,500 apiece, Rs 39,000 committed) leave MaxConcurrentPositions (3)
+        // unbroken -- only 2 of 3 slots used, so the position-COUNT gate alone would let a
+        // third entry through. But a third position at this test's own ~125.34 fill x 130 qty
+        // (~Rs 16,294) would bring total committed capital to ~Rs 55,294, over Capital.Total
+        // (Rs 50,000) -- proving the capital-SUM gate is the one actually doing the rejecting
+        // here, not MaxConcurrentPositions (which this scenario deliberately never trips).
+        await using var fixture = new Fixture();
+        var t0 = new DateTimeOffset(2026, 9, 4, 10, 0, 0, Ist);
+
+        await fixture.WithDbAsync(async db =>
+        {
+            for (var i = 0; i < 2; i++)
+            {
+                db.PaperTrades.Add(new PaperTrade
+                {
+                    InstrumentToken = $"OPEN-{i}", TradingSymbol = $"NIFTY08SEP26C2{i}000", Direction = EntryDirection.Bullish,
+                    EntryTime = t0.AddHours(-1), EntryPrice = 150m, Quantity = 130, EntryScore = 70,
+                    RulesetVersion = "live-v1-2026-09-04", ScoreWeightsVersion = "test-weights-1",
+                });
+            }
+
+            await db.SaveChangesAsync();
+        });
+
+        var featureEngine = WarmedFeatureEngineWithAtmCall(t0);
+
+        await fixture.Engine.EvaluateCadenceAsync(WarmedSnapshot(70, t0), featureEngine, CancellationToken.None);
+        await fixture.Engine.EvaluateCadenceAsync(WarmedSnapshot(70, t0.AddSeconds(15)), featureEngine, CancellationToken.None);
+        await fixture.Engine.EvaluateCadenceAsync(WarmedSnapshot(70, t0.AddSeconds(30)), featureEngine, CancellationToken.None);
+        await fixture.Engine.EvaluateCadenceAsync(WarmedSnapshot(70, t0.AddSeconds(45)), featureEngine, CancellationToken.None);
+
+        await fixture.WithDbAsync(async db =>
+        {
+            // Still just the two pre-existing open positions -- the third was rejected.
+            var trades = await db.PaperTrades.ToListAsync();
+            Assert.Equal(2, trades.Count);
+            Assert.All(trades, t => Assert.Null(t.ExitTime));
+        });
+        Assert.DoesNotContain(fixture.Telegram.Sent, s => s.Category == NotificationCategory.TradeEntry);
+    }
 }

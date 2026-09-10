@@ -50,20 +50,21 @@ public sealed class LiveTradingEngine(
         // Exits first: a position closing this tick frees a MaxConcurrentPositions slot
         // for a fresh entry evaluated in the same tick.
         var openPositions = await db.PaperTrades.Where(p => p.ExitTime == null).ToListAsync(ct);
-        var stillOpenCount = openPositions.Count;
         foreach (var position in openPositions)
         {
-            if (await EvaluateExitAsync(db, position, score, now, featureEngine, ct))
-            {
-                stillOpenCount--;
-            }
+            await EvaluateExitAsync(db, position, score, now, featureEngine, ct);
         }
 
-        await EvaluateEntryAsync(db, score, sustained, stillOpenCount, now, featureEngine, snapshot, ct);
+        // Positions closed by the loop above have ExitTime set on the same tracked entity
+        // (EvaluateExitAsync mutates position in place) -- re-filtering in memory reflects
+        // this cadence's exits without a second DB round trip.
+        var stillOpenPositions = openPositions.Where(p => p.ExitTime is null).ToList();
+
+        await EvaluateEntryAsync(db, score, sustained, stillOpenPositions, now, featureEngine, snapshot, ct);
     }
 
     async Task EvaluateEntryAsync(
-        NiftySignalDbContext db, double score, SustainStatus sustained, int openConcurrentPositions,
+        NiftySignalDbContext db, double score, SustainStatus sustained, IReadOnlyList<PaperTrade> openPositions,
         DateTimeOffset now, LiveFeatureEngine featureEngine, ScoreSnapshot snapshot, CancellationToken ct)
     {
         // UTC, not IST -- Npgsql only accepts Offset=0 DateTimeOffset values for
@@ -129,7 +130,7 @@ public sealed class LiveTradingEngine(
             AllFeaturesWarmedUp: snapshot.IsWarmedUp,
             HasOpenDataGap: hasOpenGap,
             TradesSoFarToday: tradesToday,
-            OpenConcurrentPositions: openConcurrentPositions,
+            OpenConcurrentPositions: openPositions.Count,
             LastEntryTimeSameDirection: lastEntrySameDirection,
             IsExpiryDay: isExpiryDay,
             DailyProfitTargetReached: dailyProfitTargetReached,
@@ -171,6 +172,27 @@ public sealed class LiveTradingEngine(
         var tickSize = instrument?.TickSize ?? 0.05m;
         var quantity = _config.Capital.LotSize * _config.Capital.LotsPerTrade;
         var fill = PaperTradeSimulator.FillEntry(ask, tickSize, quantity, _config.Costs);
+
+        // Audit finding F48 (2026-09-10): MaxConcurrentPositions (checked inside
+        // EntryRuleEvaluator, above) is a position COUNT, not a capital check -- it assumed a
+        // roughly fixed premium band made count-based gating a safe proxy for capital, which
+        // breaks at the band's own upper edge (3 positions at the strike-selection band's max
+        // premium can commit more than Capital.Total even though the count gate never fires).
+        // Checked here, after the real strike and its real ask-plus-slippage fill price are
+        // known, rather than as an early estimate against the band's max -- an estimate would
+        // either reject trades that actually fit or admit ones that don't, at the band's edges.
+        // Premium x quantity only (matching EntryPrice x Quantity below for the already-open
+        // side) -- brokerage is a sunk transaction cost already spent regardless of position
+        // size, not capital still tied up in a position, so it's deliberately excluded here.
+        var newPositionValue = fill.FillPrice * quantity;
+        var committedCapital = openPositions.Sum(p => p.EntryPrice * p.Quantity) + newPositionValue;
+        if (committedCapital > _config.Capital.Total)
+        {
+            logger.LogInformation(
+                "Entry signal ({Direction}, score {Score:F1}) but committing {NewPosition:F2} to {Symbol} would bring total open capital to {Committed:F2}, over Capital.Total {Total:F2} -- skipped",
+                decision.Direction, score, newPositionValue, chosen.TradingSymbol, committedCapital, _config.Capital.Total);
+            return;
+        }
 
         var trade = new PaperTrade
         {

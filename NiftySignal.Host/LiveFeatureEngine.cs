@@ -834,6 +834,11 @@ public sealed class LiveFeatureEngine
         Sample(now);
 
         var basisRaw = _basisSamples.Average!.Value;
+        // Audit finding F46 (2026-09-10): z-score computed against the window BEFORE this
+        // observation is added to it, not after -- the current value must never contaminate
+        // the mean/stddev it's then compared against. Same capture-before-Add discipline at
+        // every _xWindow site in this method from here on.
+        var futuresBasisZ = _basisWindow.ComputeZScore(basisRaw);
         _basisWindow.Add(now, basisRaw);
 
         // Same non-null guarantee as basisRaw above -- computed unconditionally alongside it
@@ -841,11 +846,14 @@ public sealed class LiveFeatureEngine
         var parityGapRaw = _parityGapSamples.Average!.Value;
 
         var momentumRaw = _momentumSamples.Average!.Value;
+        var priceMomentumZ = _momentumWindow.ComputeZScore(momentumRaw);
         _momentumWindow.Add(now, momentumRaw);
 
         var pcrRaw = _pcrSamples.Average;
+        double? pcrZ = null;
         if (pcrRaw is { } pcr)
         {
+            pcrZ = _pcrWindow.ComputeZScore(pcr);
             _pcrWindow.Add(now, pcr);
         }
 
@@ -853,8 +861,10 @@ public sealed class LiveFeatureEngine
         // cadence tick to state at the last one. Null (not a fabricated delta) when the "last
         // cadence" is stale by more than one normal interval -- see ComputeOiBuildupNet.
         var oiBuildupRaw = ComputeOiBuildupNet(now, spot.LastPrice);
+        double? oiBuildupNetZ = null;
         if (oiBuildupRaw is { } oiBuildup)
         {
+            oiBuildupNetZ = _oiBuildupWindow.ComputeZScore(oiBuildup);
             _oiBuildupWindow.Add(now, oiBuildup);
         }
 
@@ -873,14 +883,18 @@ public sealed class LiveFeatureEngine
         }
 
         var depthImbalanceRaw = _depthImbalanceSamples.Average;
+        double? depthImbalanceZ = null;
         if (depthImbalanceRaw is { } di)
         {
+            depthImbalanceZ = _depthImbalanceWindow.ComputeZScore(di);
             _depthImbalanceWindow.Add(now, di);
         }
 
         var ivSkewRaw = _ivSkewSamples.Average;
+        double? ivSkewZ = null;
         if (ivSkewRaw is { } skew)
         {
+            ivSkewZ = _ivSkewWindow.ComputeZScore(skew);
             _ivSkewWindow.Add(now, skew);
         }
 
@@ -893,8 +907,10 @@ public sealed class LiveFeatureEngine
         // same cadence -- must run before that, which ResetSamples() below doesn't touch
         // anyway (see SampleSpreads' own doc comment on why it's independent of ResetSamples).
         var spreadRatioRaw = ComputeSpreadRatio();
+        double? spreadRatioZ = null;
         if (spreadRatioRaw is { } sr)
         {
+            spreadRatioZ = _spreadRatioWindow.ComputeZScore(sr);
             _spreadRatioWindow.Add(now, sr);
         }
 
@@ -914,8 +930,10 @@ public sealed class LiveFeatureEngine
 
         // Not smoothed like the other five -- see class doc comment.
         var vixChangeRaw = ComputeVixChange(now);
+        double? vixChangeZ = null;
         if (vixChangeRaw is { } vc)
         {
+            vixChangeZ = _vixWindow.ComputeZScore(vc);
             _vixWindow.Add(now, vc);
         }
 
@@ -955,53 +973,65 @@ public sealed class LiveFeatureEngine
             }
         }
 
+        double? gammaExposureZ = null;
         if (gammaExposureRaw is { } gex)
         {
+            gammaExposureZ = _gammaExposureWindow.ComputeZScore(gex);
             _gammaExposureWindow.Add(now, gex);
         }
 
+        double? vannaExposureZ = null;
         if (vannaExposureRaw is { } vanna)
         {
+            vannaExposureZ = _vannaExposureWindow.ComputeZScore(vanna);
             _vannaExposureWindow.Add(now, vanna);
         }
 
+        double? charmExposureZ = null;
         if (charmExposureRaw is { } charm)
         {
+            charmExposureZ = _charmExposureWindow.ComputeZScore(charm);
             _charmExposureWindow.Add(now, charm);
         }
 
         // Not smoothed either -- see ComputeVolumePcrAndCvdProxy's own doc comment.
         var (volumePcrRaw, cvdProxyRaw) = ComputeVolumePcrAndCvdProxy();
+        double? volumePcrZ = null;
         if (volumePcrRaw is { } vpcr)
         {
+            volumePcrZ = _volumePcrWindow.ComputeZScore(vpcr);
             _volumePcrWindow.Add(now, vpcr);
         }
 
+        double? cvdProxyZ = null;
         if (cvdProxyRaw is { } cvd)
         {
+            cvdProxyZ = _cvdProxyWindow.ComputeZScore(cvd);
             _cvdProxyWindow.Add(now, cvd);
         }
 
+        double? straddleRichnessZ = null;
         if (straddleRichnessRaw is { } richness)
         {
+            straddleRichnessZ = _straddleRichnessWindow.ComputeZScore(richness);
             _straddleRichnessWindow.Add(now, richness);
         }
 
         var inputs = new ScoreComponentInputs(
-            OiBuildupNetZ: oiBuildupRaw is { } oi ? _oiBuildupWindow.ComputeZScore(oi) : null,
-            PcrZ: pcrRaw is { } p ? _pcrWindow.ComputeZScore(p) : null,
-            FuturesBasisZ: _basisWindow.ComputeZScore(basisRaw),
-            IvSkewZ: ivSkewRaw is { } iv ? _ivSkewWindow.ComputeZScore(iv) : null,
-            PriceMomentumZ: _momentumWindow.ComputeZScore(momentumRaw),
-            DepthImbalanceZ: depthImbalanceRaw is { } d ? _depthImbalanceWindow.ComputeZScore(d) : null,
-            VixChangeZ: vixChangeRaw is { } vcr ? _vixWindow.ComputeZScore(vcr) : null,
-            GammaExposureZ: gammaExposureRaw is { } gexr ? _gammaExposureWindow.ComputeZScore(gexr) : null,
-            VolumePcrZ: volumePcrRaw is { } vpcrr ? _volumePcrWindow.ComputeZScore(vpcrr) : null,
-            SpreadRatioZ: spreadRatioRaw is { } srr ? _spreadRatioWindow.ComputeZScore(srr) : null,
-            VannaExposureZ: vannaExposureRaw is { } vannar ? _vannaExposureWindow.ComputeZScore(vannar) : null,
-            CharmExposureZ: charmExposureRaw is { } charmr ? _charmExposureWindow.ComputeZScore(charmr) : null,
-            CvdProxyZ: cvdProxyRaw is { } cvdr ? _cvdProxyWindow.ComputeZScore(cvdr) : null,
-            StraddleRichnessZ: straddleRichnessRaw is { } richr ? _straddleRichnessWindow.ComputeZScore(richr) : null);
+            OiBuildupNetZ: oiBuildupNetZ,
+            PcrZ: pcrZ,
+            FuturesBasisZ: futuresBasisZ,
+            IvSkewZ: ivSkewZ,
+            PriceMomentumZ: priceMomentumZ,
+            DepthImbalanceZ: depthImbalanceZ,
+            VixChangeZ: vixChangeZ,
+            GammaExposureZ: gammaExposureZ,
+            VolumePcrZ: volumePcrZ,
+            SpreadRatioZ: spreadRatioZ,
+            VannaExposureZ: vannaExposureZ,
+            CharmExposureZ: charmExposureZ,
+            CvdProxyZ: cvdProxyZ,
+            StraddleRichnessZ: straddleRichnessZ);
 
         // Multi-cadence smoothing (2026-09-07): a composite recomputed from scratch every 15s
         // with no memory of its own recent behavior was too noisy to sustain past the entry

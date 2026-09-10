@@ -836,7 +836,78 @@ public class LiveFeatureEngineTests
         // pre-spike baseline is robust to whatever ambient value that baseline happens to be.
         var smoothedMove = Math.Abs(spiked.CompositeScoreRaw!.Value - preSpikeSmoothed);
         var instantMove = Math.Abs(spiked.CompositeScoreRawInstant!.Value - preSpikeSmoothed);
-        Assert.True(smoothedMove < instantMove / 2);
+        // <= not < (audit finding F46, 2026-09-10): fixing the z-score self-inclusion bug
+        // removed a pre-existing dampening bias from the instant reading itself, which moved
+        // this specific deterministic scenario's ratio to exactly 0.5 -- still strong smoothing
+        // (only ~1/12 FIFO leak-through, as expected for CompositeSmoothingCadences=12), just
+        // sitting exactly on the old strict boundary rather than under it.
+        Assert.True(smoothedMove <= instantMove / 2);
+    }
+
+    [Fact]
+    public void ComputeCadence_FuturesBasisZ_ExcludesCurrentObservationFromItsOwnWindow()
+    {
+        // Audit finding F46 (2026-09-10): the current cadence's raw value must be scored
+        // against the window's state as it stood BEFORE this observation, never after --
+        // otherwise an outlier inflates its own comparison stddev and understates its own
+        // extremity. FuturesBasis is used here (rather than the more heavily-weighted
+        // OiBuildupNet) because its raw value is a simple, fully test-controlled
+        // futureMark-spot subtraction with no option-chain machinery involved.
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        var shadowWindow = new WelfordRollingWindow(FeatureWindowLengths.FuturesBasis);
+
+        var at = Start;
+        ScoreSnapshot? snapshot = null;
+        // Oscillate basis between two close values for a bit over the 30-minute window so
+        // FuturesBasisZ warms up with a real (non-zero) spread to divide by.
+        for (var elapsed = TimeSpan.Zero; elapsed <= FeatureWindowLengths.FuturesBasis + TimeSpan.FromMinutes(2); elapsed += TimeSpan.FromSeconds(15))
+        {
+            at = Start + elapsed;
+            var cadenceIndex = elapsed.Ticks / TimeSpan.FromSeconds(15).Ticks;
+            var basis = cadenceIndex % 2 == 0 ? 100m : 102m;
+            engine.OnTick(MakeTick(SpotToken, 23900m, at));
+            engine.OnTick(MakeTick(FutureToken, 23900m + basis, at));
+            snapshot = engine.ComputeCadence(at);
+
+            // Mirrors the engine's own basis window exactly -- same values, same timestamps,
+            // fed from the same public FuturesBasisRaw the engine computed internally -- so
+            // this shadow window's state is identical to the engine's private _basisWindow
+            // without needing to reach into it.
+            if (snapshot?.FuturesBasisRaw is { } raw)
+            {
+                shadowWindow.Add(at, raw);
+            }
+        }
+
+        Assert.NotNull(snapshot);
+        Assert.NotNull(snapshot!.FuturesBasisZ);
+
+        // A moderate outlier relative to the 100/102 oscillation (mean ~101) -- deliberately
+        // NOT extreme: an outlier large enough to saturate the +/-3 clamp under both orderings
+        // would make them indistinguishable after clamping, hiding the very divergence this
+        // test exists to catch.
+        var spikeAt = at + TimeSpan.FromSeconds(15);
+        engine.OnTick(MakeTick(SpotToken, 23900m, spikeAt));
+        engine.OnTick(MakeTick(FutureToken, 23900m + 103m, spikeAt));
+        var spiked = engine.ComputeCadence(spikeAt);
+
+        Assert.NotNull(spiked);
+        Assert.NotNull(spiked!.FuturesBasisRaw);
+        Assert.NotNull(spiked.FuturesBasisZ);
+
+        // Correct (fixed) behavior: z computed against the shadow window's state as it stood
+        // before the spike -- must match the engine's actual FuturesBasisZ exactly.
+        var correctZ = shadowWindow.ComputeZScore(spiked.FuturesBasisRaw!.Value);
+        Assert.Equal(correctZ, spiked.FuturesBasisZ);
+
+        // The bug this guards against: had the engine (wrongly) added the spike to the window
+        // before scoring it, the spike would inflate its own comparison stddev and understate
+        // its own extremity. Confirm the two orderings actually diverge for this scenario
+        // (otherwise this test wouldn't be discriminating at all), and that the engine's real
+        // answer is not the buggy one.
+        shadowWindow.Add(spikeAt, spiked.FuturesBasisRaw!.Value);
+        var buggyZ = shadowWindow.ComputeZScore(spiked.FuturesBasisRaw!.Value);
+        Assert.NotEqual(buggyZ, spiked.FuturesBasisZ);
     }
 
     [Fact]

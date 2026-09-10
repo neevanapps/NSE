@@ -16,12 +16,12 @@ Solo developer, one machine, running 24/7. Splitting ingestion/features/scoring/
 | `NiftySignal.Pricing` | Black-Scholes, IV solver, Greeks. |
 | `NiftySignal.Features` | Rolling stats (Welford z-scores), OI buildup classification, warm-up tracking. |
 | `NiftySignal.Scoring` | Composite universal directional score. |
-| `NiftySignal.Rules` | Rule engine (NCalc), ruleset config, hot-reload + validation. |
+| `NiftySignal.Rules` | Hand-written entry/exit rule evaluators, ruleset config, hot-reload + validation (`IOptionsMonitor` + `ValidatedOptionsMonitor`, not NCalc — that was the original plan, never built; see `docs/REVIEW_FINDINGS.md`). |
 | `NiftySignal.Ingestion` | FlatTrade REST/WebSocket client, instrument master, tick demux. All FlatTrade-specific mapping is isolated here — nothing outside this project should see a FlatTrade type. |
 | `NiftySignal.Persistence` | EF Core `NiftySignalDbContext`, `IEntityTypeConfiguration<T>` per entity, migrations, repositories. |
 | `NiftySignal.Notifications` | Telegram alerts, with per-category rate limiting. |
 | `NiftySignal.Execution` | Strike selection, paper trade simulator, position tracking. |
-| `NiftySignal.Backtest` | Replay harness — implements `ITickSource` over stored ticks, running the same pipeline as live. |
+| `NiftySignal.Backtest` | `BacktestTickSource` (implements `ITickSource` over stored ticks) and `PerformanceReportBuilder` exist and are tested, but nothing wires them through the live entry/exit pipeline yet — see audit finding F32 in `docs/REVIEW_FINDINGS.md` for the scoped, not-yet-built runner. |
 | `NiftySignal.Host` | Worker Service composition root. Wires DI, hosts `BackgroundService` workers, runs as a Windows Service. |
 | `NiftySignal.Dashboard` | Blazor Server UI — kill switch, live score, option chain, trade history, config editor. |
 | `NiftySignal.Tests` | xUnit. Mirrors the module layout (`Tests/<Module>/...`), naming convention `MethodName_Scenario_ExpectedResult`. |

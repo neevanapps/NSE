@@ -74,14 +74,67 @@ public sealed class MarketDataIngestionWorker(
     /// </summary>
     bool _warmUpBlockedLogged;
 
+    /// <summary>
+    /// Audit finding F49 (2026-09-10): this used to run exactly one trading day's session and
+    /// return -- <see cref="BackgroundService"/> treats a returned <c>ExecuteAsync</c> as "this
+    /// service is permanently done," so without a manual service restart, ingestion/scoring
+    /// silently never resumed on day 2. Now loops: wait for market hours, run one day's session,
+    /// repeat.
+    ///
+    /// Two things are started here, once, outside the day loop -- neither belongs inside
+    /// <see cref="RunTradingSessionAsync"/>, and re-starting either one per day would itself be
+    /// a bug, not a fix:
+    /// <list type="bullet">
+    /// <item><see cref="dashboardPush"/> -- its SignalR connection auto-reconnects on its own
+    /// (<c>WithAutomaticReconnect</c>) and is designed to persist across the overnight
+    /// market-closed gap; calling <c>StartAsync</c> again on an already-connected
+    /// <c>HubConnection</c> throws.</item>
+    /// <item><see cref="RunPaperTradeSummaryLoopAsync"/> -- deliberately runs on this method's
+    /// full-lifetime <paramref name="stoppingToken"/>, not a day-scoped one (see that method's
+    /// own comment: it keeps sending summaries after a day's market-hours loops have already
+    /// wound down), so it never completes during normal operation. Awaiting it inside the day
+    /// loop would therefore block forever on day 1 and defeat the loop entirely -- it's started
+    /// once here and only awaited once, after the day loop itself exits.</item>
+    /// </list>
+    /// </summary>
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        await WaitForMarketHoursAsync(stoppingToken);
-        if (stoppingToken.IsCancellationRequested)
+        await dashboardPush.StartAsync(stoppingToken);
+        var paperTradeSummaryLoop = RunPaperTradeSummaryLoopAsync(stoppingToken);
+
+        while (!stoppingToken.IsCancellationRequested)
         {
-            return;
+            await WaitForMarketHoursAsync(stoppingToken);
+            if (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+
+            if (!await RunTradingSessionAsync(stoppingToken))
+            {
+                // A hard-stop condition (today: only a missing/invalid FlatTrade session --
+                // see RunTradingSessionAsync's own doc comment for why that deliberately still
+                // ends the service rather than retrying next day automatically). Everything
+                // else that can go wrong during a session is already caught and logged inside
+                // the per-loop try/catches (audit finding F34) without ending the session early.
+                break;
+            }
         }
 
+        await paperTradeSummaryLoop;
+    }
+
+    /// <summary>
+    /// One trading day's ingestion/scoring/trading session, from FlatTrade session validation
+    /// through market close. Returns <c>false</c> when <see cref="ExecuteAsync"/>'s day loop
+    /// should stop entirely rather than wait for tomorrow -- currently only when there's no
+    /// valid FlatTrade session, which needs a human to fix via the Dashboard (plan 4.3: "do not
+    /// silently retry"), not an automatic next-day retry that could mask the same problem
+    /// recurring silently every morning. Everything else (feed drops, a bad score cadence, a
+    /// failed DB write) is already resilient at the per-loop level and returns <c>true</c>.
+    /// </summary>
+    async Task<bool> RunTradingSessionAsync(CancellationToken stoppingToken)
+    {
         var session = await LoadSessionAsync(stoppingToken);
         if (session?.Token is null || session.ClientId is null || !session.IsValidAt(DateTimeOffset.UtcNow))
         {
@@ -95,8 +148,14 @@ public sealed class MarketDataIngestionWorker(
                 NotificationCategory.TokenExpiry,
                 $"NiftySignal: no valid FlatTrade session. Log in and save a token via the Dashboard: {loginUrl}",
                 stoppingToken);
-            return;
+            return false;
         }
+
+        // Reset for this session's own warm-up stretch -- a prior day's leftover true here
+        // would wrongly suppress today's first genuine warm-up-blocked log (audit finding F49:
+        // this field was never revisited when the day loop was added, since previously the
+        // whole process only ever ran one day and this was set at most once, ever).
+        _warmUpBlockedLogged = false;
 
         var asOfDate = DateOnly.FromDateTime(DateTimeOffset.UtcNow.ToOffset(IstOffset).Date);
         var instruments = await ResolveInstrumentsAsync(session.Token, asOfDate, stoppingToken);
@@ -105,7 +164,6 @@ public sealed class MarketDataIngestionWorker(
         _engine = new LiveFeatureEngine(instruments, scoreWeightsOptions, pricingOptions, logger);
         await SeedEngineHistoryAsync(_engine, asOfDate, stoppingToken);
         await SeedPriorSessionIvHistoryAsync(_engine, asOfDate, stoppingToken);
-        await dashboardPush.StartAsync(stoppingToken);
 
         logger.LogInformation("Starting FlatTrade feed with {Count} subscriptions for {AsOfDate}", subscriptions.Count, asOfDate);
         await telegram.SendAsync(
@@ -128,24 +186,23 @@ public sealed class MarketDataIngestionWorker(
             $"NiftySignal: FlatTrade feed has failed {failures} times consecutively and may be down.",
             stoppingToken);
 
-        // A separate, linked token for the feed/cadence/sample/subscription loops only --
+        // A separate, linked token for THIS DAY's feed/cadence/sample/subscription loops only --
         // StopAtMarketCloseAsync cancels *this* once MarketHardClose is reached, so those loops
         // wind down (they already handle OperationCanceledException) without needing the whole
-        // service stopped. The paper-trade summary loop deliberately stays on the full-lifetime
-        // stoppingToken -- it's cheap (once/30min) and still useful to send after close.
+        // service stopped. Deliberately NOT used for the paper-trade summary loop, which lives
+        // in ExecuteAsync on the full-lifetime token instead -- see that method's own comment.
         using var feedCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
         var closeWatchdog = StopAtMarketCloseAsync(feedCts, stoppingToken);
 
         var cadenceLoop = RunScoreCadenceLoopAsync(feedCts.Token);
         var sampleLoop = RunSampleLoopAsync(feedCts.Token);
         var pendingSubscriptionLoop = RunPendingSubscriptionLoopAsync(tickSource, asOfDate, feedCts.Token);
-        var paperTradeSummaryLoop = RunPaperTradeSummaryLoopAsync(stoppingToken);
         await RunTickLoopAsync(tickSource, feedCts.Token);
         await cadenceLoop;
         await sampleLoop;
         await pendingSubscriptionLoop;
         await closeWatchdog;
-        await paperTradeSummaryLoop;
+        return true;
     }
 
     /// <summary>Waits (checking once a minute) until the current IST time is within [MarketPreOpen, MarketHardClose) on a weekday -- keeps the worker from attempting a live feed connection at all outside that window.</summary>
@@ -440,7 +497,23 @@ public sealed class MarketDataIngestionWorker(
         {
             while (await timer.WaitForNextTickAsync(stoppingToken))
             {
-                await SendPaperTradeSummaryAsync(stoppingToken);
+                try
+                {
+                    await SendPaperTradeSummaryAsync(stoppingToken);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    // Audit finding F49 (2026-09-10): this loop now runs unattended for the
+                    // whole process lifetime (see ExecuteAsync's own comment on why it's started
+                    // once, outside the day loop, and only awaited at final shutdown) rather
+                    // than being awaited to completion within a few minutes of starting --
+                    // previously an uncaught exception here would surface (and crash the whole
+                    // host, same F34 risk as every other loop) shortly after the process
+                    // started; now it could otherwise sit silent for hours before the final
+                    // await at shutdown ever observed it. Same "one bad tick must not take down
+                    // the rest of the day" resilience as every other loop in this class.
+                    logger.LogError(ex, "Paper trade summary failed -- continuing with the next one");
+                }
             }
         }
         catch (OperationCanceledException)
