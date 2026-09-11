@@ -286,7 +286,7 @@ All three were real, and (1)/(3) turned out to be the same root cause.
 
 ---
 
-## F32 — The backtest runner (scoped 2026-09-10, not yet built)
+## F32 — The backtest runner (scoped 2026-09-10, built 2026-09-11)
 
 **Why this is the one thing that unblocks everything else in the review:** almost every
 metric-level question above (is PCR's sign right? is IV skew's sign right? does depth imbalance
@@ -363,12 +363,34 @@ tradeoffs:
   Higher fidelity (byte-for-byte the same provider as live), but needs the schema migrated and reset
   between runs, and is slower per run.
 
-**Recommendation, not yet decided:** start with A for iteration speed while the runner itself is
-being built and validated, keep B available as a periodic cross-check once the runner's output looks
-trustworthy — the same "don't fully trust a new measurement tool until it's been sanity-checked
-against a known-good path" discipline this project already applies everywhere else (BS-consistent
-test pricing, the F19-F45 verification-by-test pattern from this week). This needs your call before
-any of it gets built, not mine.
+**Decided 2026-09-11: option A.** User confirmed EF `InMemoryDatabase` for the runner's own trial
+`ScoreSnapshot`/`PaperTrade` writes. Real ticks/instruments are still read from real Postgres
+(read-only) — the two were never meant to be the same DbContext, and aren't. Option B (a real,
+separate Postgres schema) stays available as a future periodic cross-check per the recommendation
+above, not built now.
+
+**Built 2026-09-11** — `BacktestRunner` (`NiftySignal.Backtest/BacktestRunner.cs`) implements
+exactly the 5 steps above, one `LiveFeatureEngine` per trading day (fresh instrument resolution,
+matching live's own daily reset) driving `LiveTradingEngine.EvaluateCadenceAsync` per cadence
+against the isolated InMemory store, with `PerformanceReportBuilder.Build` over the resulting
+trades. `NiftySignal.Backtest` is now a runnable console tool
+(`NiftySignal.Backtest/Program.cs`) that loads the **real, currently-live** `RulesetConfig` and
+`ScoreWeights` from `NiftySignal.Host`'s own appsettings (not test defaults), so a run validates
+the rules actually in production, not a fixture. Tested in
+`NiftySignal.Tests/Backtest/BacktestRunnerTests.cs` (day-skip on missing instruments, isolation of
+trial writes from the real read-only DB, and an end-to-end run producing a real `PaperTrade` from
+a genuinely warmed-up composite score). All 359 tests green.
+
+Also corrected `BacktestTickSource.cs`'s 2026-09-08 doc comment, which claimed
+`LiveTradingEngine` hardcoded `DateTimeOffset.UtcNow` — false; this section's own "what already
+exists" analysis above had already found zero `UtcNow` calls there, and a full re-read confirms
+`EvaluateCadenceAsync` derives `now` entirely from `snapshot.ComputedAt`. That earlier comment
+should not have been trusted at face value; this section's own analysis was right the first time.
+
+**Not yet done, worth doing before trusting output at scale** (per this section's own "Rough
+effort shape" above): the backtest-vs-live parity/sanity check — comparing backtest-computed
+`ScoreSnapshot`s against the real ones already persisted live for the same historical days. Real
+4-day tick data now exists (≥98% coverage) to actually run this comparison.
 
 ### Explicitly out of scope for a first version (matches the review's own restraint)
 

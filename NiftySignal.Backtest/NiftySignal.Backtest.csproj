@@ -1,5 +1,17 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
+  <PropertyGroup>
+    <!-- F32 (2026-09-11): a runnable console tool now, not just a class library.
+         Program.cs drives BacktestRunner against real historical data. -->
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- BacktestRunner's own trial ScoreSnapshot/PaperTrade writes (see its own doc comment)
+         go to an isolated EF InMemoryDatabase, never the real live/local Postgres DB. -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore.InMemory" />
+  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\NiftySignal.Domain\NiftySignal.Domain.csproj" />
     <ProjectReference Include="..\NiftySignal.Persistence\NiftySignal.Persistence.csproj" />
@@ -8,6 +20,9 @@
     <ProjectReference Include="..\NiftySignal.Rules\NiftySignal.Rules.csproj" />
     <ProjectReference Include="..\NiftySignal.Execution\NiftySignal.Execution.csproj" />
     <ProjectReference Include="..\NiftySignal.Ingestion\NiftySignal.Ingestion.csproj" />
+    <!-- LiveFeatureEngine and LiveTradingEngine live in Host, same cross-reference
+         NiftySignal.ScoreReplay already uses successfully (see its Program.cs). -->
+    <ProjectReference Include="..\NiftySignal.Host\NiftySignal.Host.csproj" />
   </ItemGroup>
 
 </Project>
