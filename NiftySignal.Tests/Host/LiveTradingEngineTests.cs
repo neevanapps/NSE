@@ -269,7 +269,7 @@ public class LiveTradingEngineTests
         {
             db.PaperTrades.Add(new PaperTrade
             {
-                InstrumentToken = AtmCallToken, TradingSymbol = "NIFTY08SEP26C24000", Direction = EntryDirection.Bullish,
+                InstrumentToken = AtmCallToken, TradingSymbol = "NIFTY08SEP26C24000", StrategyId = StrategyId.LegacyComposite, Direction = EntryDirection.Bullish,
                 EntryTime = entryTime, EntryPrice = 164.34m, Quantity = 130, EntryScore = 70,
                 RulesetVersion = "live-v1-2026-09-04", ScoreWeightsVersion = "test-weights-1",
             });
@@ -298,7 +298,7 @@ public class LiveTradingEngineTests
         {
             db.PaperTrades.Add(new PaperTrade
             {
-                InstrumentToken = AtmCallToken, TradingSymbol = "NIFTY08SEP26C24000", Direction = EntryDirection.Bullish,
+                InstrumentToken = AtmCallToken, TradingSymbol = "NIFTY08SEP26C24000", StrategyId = StrategyId.LegacyComposite, Direction = EntryDirection.Bullish,
                 EntryTime = entryTime, EntryPrice = 100m, Quantity = 65, EntryScore = 70,
                 RulesetVersion = "live-v1-2026-09-04", ScoreWeightsVersion = "test-weights-1",
             });
@@ -359,7 +359,7 @@ public class LiveTradingEngineTests
         {
             db.PaperTrades.Add(new PaperTrade
             {
-                InstrumentToken = AtmCallToken, TradingSymbol = "NIFTY08SEP26C24000", Direction = EntryDirection.Bullish,
+                InstrumentToken = AtmCallToken, TradingSymbol = "NIFTY08SEP26C24000", StrategyId = StrategyId.LegacyComposite, Direction = EntryDirection.Bullish,
                 EntryTime = entryTime, EntryPrice = 100m, Quantity = 130, EntryScore = 70,
                 RulesetVersion = "live-v1-2026-09-04", ScoreWeightsVersion = "test-weights-1",
             });
@@ -404,7 +404,7 @@ public class LiveTradingEngineTests
         {
             db.PaperTrades.Add(new PaperTrade
             {
-                InstrumentToken = AtmCallToken, TradingSymbol = "NIFTY08SEP26C24000", Direction = EntryDirection.Bullish,
+                InstrumentToken = AtmCallToken, TradingSymbol = "NIFTY08SEP26C24000", StrategyId = StrategyId.LegacyComposite, Direction = EntryDirection.Bullish,
                 EntryTime = t0.AddHours(-1), EntryPrice = 100m, Quantity = 130, EntryScore = 70,
                 ExitTime = t0.AddMinutes(-30), ExitPrice = 150m, ExitReason = ExitReason.PartialBook,
                 GrossPnl = 15_250m, NetPnl = 15_100m,
@@ -449,7 +449,7 @@ public class LiveTradingEngineTests
             {
                 db.PaperTrades.Add(new PaperTrade
                 {
-                    InstrumentToken = $"OPEN-{i}", TradingSymbol = $"NIFTY08SEP26C2{i}000", Direction = EntryDirection.Bullish,
+                    InstrumentToken = $"OPEN-{i}", TradingSymbol = $"NIFTY08SEP26C2{i}000", StrategyId = StrategyId.LegacyComposite, Direction = EntryDirection.Bullish,
                     EntryTime = t0.AddHours(-1), EntryPrice = 150m, Quantity = 130, EntryScore = 70,
                     RulesetVersion = "live-v1-2026-09-04", ScoreWeightsVersion = "test-weights-1",
                 });

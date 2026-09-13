@@ -24,7 +24,8 @@ public sealed class MarketDataIngestionWorker(
     IServiceScopeFactory scopeFactory,
     IOptions<FlatTradeOptions> flatTradeOptions,
     ITelegramNotifier telegram,
-    LiveTradingEngine tradingEngine,
+    CoreScoreHysteresisTradingEngine hysteresisEngine,
+    CoreScoreCrossoverTradingEngine crossoverEngine,
     DashboardPushClient dashboardPush,
     IValidatedOptions<ScoreWeights> scoreWeightsOptions,
     IOptionsMonitor<PricingOptions> pricingOptions,
@@ -369,8 +370,23 @@ public sealed class MarketDataIngestionWorker(
                             _warmUpBlockedLogged = false;
                         }
 
-                        await PersistSnapshotAsync(snapshot, _engine.LastCoreScoreSnapshot, _engine.BuildStrikeSnapshots(now), stoppingToken);
-                        await tradingEngine.EvaluateCadenceAsync(snapshot, _engine, stoppingToken);
+                        var coreScoreSnapshot = _engine.LastCoreScoreSnapshot;
+                        await PersistSnapshotAsync(snapshot, coreScoreSnapshot, _engine.BuildStrikeSnapshots(now), stoppingToken);
+
+                        // Batch 5 cutover (2026-09-13, live-wiring plan A10): the legacy engine's
+                        // own EvaluateCadenceAsync call is REMOVED here, not kept-but-inert -- the
+                        // 14-component composite is retired from live trading (LiveTradingEngine.cs
+                        // itself stays fully intact, just uncalled). Net effect: one call becomes
+                        // two, reading the new CoreScoreSnapshot instead of the old ScoreSnapshot.
+                        // Both engines internally no-op on a not-yet-warmed-up/null CoreScore, same
+                        // as the legacy engine's own snapshot.CompositeScore null-guard, but that
+                        // guard needs a real object to check -- skip entirely on a genuinely null
+                        // snapshot (the Core-score combine step itself failed this cadence).
+                        if (coreScoreSnapshot is not null)
+                        {
+                            await hysteresisEngine.EvaluateCadenceAsync(coreScoreSnapshot, _engine, stoppingToken);
+                            await crossoverEngine.EvaluateCadenceAsync(coreScoreSnapshot, _engine, stoppingToken);
+                        }
                     }
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
@@ -673,6 +689,13 @@ public sealed class MarketDataIngestionWorker(
 
         engine.SeedCoreScoreHistory(coreHistory);
         logger.LogInformation("Replayed {Count} historical Core-score snapshots into the rolling windows", coreHistory.Count);
+
+        // Batch 5 (2026-09-13, plan A7's own correction): the Crossover strategy's own
+        // previousDiffSign, from this SAME persisted history -- required, not an accepted gap,
+        // since an already-open crossover position depends on it to ever detect its next flip.
+        // See CoreScoreCrossoverTradingEngine.SeedFromHistory's own doc comment.
+        crossoverEngine.SeedFromHistory(coreHistory);
+        logger.LogInformation("Replayed {Count} historical Core-score snapshots into the Crossover strategy's own previousDiffSign", coreHistory.Count);
     }
 
     /// <summary>

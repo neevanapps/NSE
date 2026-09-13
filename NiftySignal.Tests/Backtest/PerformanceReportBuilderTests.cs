@@ -12,6 +12,7 @@ public class PerformanceReportBuilderTests
     {
         InstrumentToken = "12345",
         TradingSymbol = "NIFTY25SEP26C25000",
+        StrategyId = StrategyId.LegacyComposite,
         Direction = EntryDirection.Bullish,
         EntryTime = Start.AddHours(hoursFromStart),
         EntryPrice = 175m,
@@ -30,6 +31,7 @@ public class PerformanceReportBuilderTests
     {
         InstrumentToken = "12345",
         TradingSymbol = "NIFTY25SEP26C25000",
+        StrategyId = StrategyId.LegacyComposite,
         Direction = EntryDirection.Bullish,
         EntryTime = Start.AddHours(hoursFromStart),
         EntryPrice = 175m,

@@ -74,7 +74,29 @@ try
         ScoreWeightsValidator.Validate,
         sp.GetRequiredService<ILogger<ValidatedOptionsMonitor<ScoreWeightsOptions, ScoreWeights>>>()));
 
+    // Batch 5 (2026-09-13, live-wiring plan A9) -- the two new Core-score strategies' own
+    // hot-reloaded, validate-before-swap risk config, same pattern as RulesetConfig/ScoreWeights
+    // above. Both still read the EXISTING IValidatedOptions<RulesetConfig> registered above for
+    // their shared Capital/Session/StrikeSelection/Costs/KillSwitch sections.
+    builder.Services.Configure<CoreScoreHysteresisConfigOptions>(builder.Configuration.GetSection(CoreScoreHysteresisConfigOptions.SectionName));
+    builder.Services.Configure<CoreScoreCrossoverConfigOptions>(builder.Configuration.GetSection(CoreScoreCrossoverConfigOptions.SectionName));
+    builder.Services.AddSingleton<IValidatedOptions<CoreScoreHysteresisConfig>>(sp => new ValidatedOptionsMonitor<CoreScoreHysteresisConfigOptions, CoreScoreHysteresisConfig>(
+        sp.GetRequiredService<IOptionsMonitor<CoreScoreHysteresisConfigOptions>>(),
+        options => options.ToConfig(),
+        CoreScoreHysteresisConfigValidator.Validate,
+        sp.GetRequiredService<ILogger<ValidatedOptionsMonitor<CoreScoreHysteresisConfigOptions, CoreScoreHysteresisConfig>>>()));
+    builder.Services.AddSingleton<IValidatedOptions<CoreScoreCrossoverConfig>>(sp => new ValidatedOptionsMonitor<CoreScoreCrossoverConfigOptions, CoreScoreCrossoverConfig>(
+        sp.GetRequiredService<IOptionsMonitor<CoreScoreCrossoverConfigOptions>>(),
+        options => options.ToConfig(),
+        CoreScoreCrossoverConfigValidator.Validate,
+        sp.GetRequiredService<ILogger<ValidatedOptionsMonitor<CoreScoreCrossoverConfigOptions, CoreScoreCrossoverConfig>>>()));
+
+    // LiveTradingEngine stays registered (left in place, fully functional, just no longer called
+    // from the cadence loop -- see MarketDataIngestionWorker's own A10 cutover comment) in case
+    // it's ever wanted again. The two new engines are what the cadence loop actually calls now.
     builder.Services.AddSingleton<LiveTradingEngine>();
+    builder.Services.AddSingleton<CoreScoreHysteresisTradingEngine>();
+    builder.Services.AddSingleton<CoreScoreCrossoverTradingEngine>();
 
     builder.Services.Configure<DashboardPushOptions>(builder.Configuration.GetSection(DashboardPushOptions.SectionName));
     builder.Services.AddSingleton<DashboardPushClient>();
@@ -94,6 +116,8 @@ try
         // hours from now to discover a malformed Ruleset/ScoreWeights config section.
         scope.ServiceProvider.GetRequiredService<IValidatedOptions<RulesetConfig>>();
         scope.ServiceProvider.GetRequiredService<IValidatedOptions<ScoreWeights>>();
+        scope.ServiceProvider.GetRequiredService<IValidatedOptions<CoreScoreHysteresisConfig>>();
+        scope.ServiceProvider.GetRequiredService<IValidatedOptions<CoreScoreCrossoverConfig>>();
     }
 
     host.Run();

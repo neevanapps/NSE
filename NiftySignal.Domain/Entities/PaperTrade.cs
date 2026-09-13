@@ -17,6 +17,14 @@ public sealed class PaperTrade
 
     public required string TradingSymbol { get; set; }
 
+    /// <summary>
+    /// Which trading engine opened this position (2026-09-13, Batch 5) -- every query that reads
+    /// open positions, today's trade count, or today's closed P&amp;L for risk-limit purposes
+    /// must filter on this, or one strategy's activity silently leaks into another's risk gates.
+    /// See <see cref="Enums.StrategyId"/>'s own doc comment.
+    /// </summary>
+    public required StrategyId StrategyId { get; set; }
+
     public required EntryDirection Direction { get; set; }
 
     public required DateTimeOffset EntryTime { get; set; }

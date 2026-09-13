@@ -48,8 +48,10 @@ public sealed class LiveTradingEngine(
         var db = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
 
         // Exits first: a position closing this tick frees a MaxConcurrentPositions slot
-        // for a fresh entry evaluated in the same tick.
-        var openPositions = await db.PaperTrades.Where(p => p.ExitTime == null).ToListAsync(ct);
+        // for a fresh entry evaluated in the same tick. StrategyId-scoped (2026-09-13, Batch 5) --
+        // this engine only ever sees/manages its own LegacyComposite positions, never the two new
+        // Core-score strategies' own.
+        var openPositions = await db.PaperTrades.Where(p => p.ExitTime == null && p.StrategyId == StrategyId.LegacyComposite).ToListAsync(ct);
         foreach (var position in openPositions)
         {
             await EvaluateExitAsync(db, position, score, now, featureEngine, ct);
@@ -80,11 +82,13 @@ public sealed class LiveTradingEngine(
 
         var killSwitch = await db.KillSwitchStates.FindAsync([KillSwitchState.SingletonId], ct);
         var hasOpenGap = await db.DataGaps.AnyAsync(g => g.EndedAt == null, ct);
-        var tradesToday = await db.PaperTrades.CountAsync(p => p.EntryTime >= todayIstMidnight, ct);
+        // StrategyId-scoped (2026-09-13, Batch 5) -- every count/streak/P&L below is this
+        // engine's own LegacyComposite activity only, never the two new Core-score strategies'.
+        var tradesToday = await db.PaperTrades.CountAsync(p => p.EntryTime >= todayIstMidnight && p.StrategyId == StrategyId.LegacyComposite, ct);
         var lastEntrySameDirection = prospectiveDirection == EntryDirection.None
             ? null
             : await db.PaperTrades
-                .Where(p => p.EntryTime >= todayIstMidnight && p.Direction == prospectiveDirection)
+                .Where(p => p.EntryTime >= todayIstMidnight && p.Direction == prospectiveDirection && p.StrategyId == StrategyId.LegacyComposite)
                 .OrderByDescending(p => p.EntryTime)
                 .Select(p => (DateTimeOffset?)p.EntryTime)
                 .FirstOrDefaultAsync(ct);
@@ -92,7 +96,7 @@ public sealed class LiveTradingEngine(
         // Newest first: both closedTodayNetPnl (sum) and the F3 consecutive-losses streak
         // (2026-09-08) come from this one fetch -- no separate round trip for either.
         var closedTodayPnls = await db.PaperTrades
-            .Where(p => p.ExitTime != null && p.ExitTime >= todayIstMidnight && p.NetPnl != null)
+            .Where(p => p.ExitTime != null && p.ExitTime >= todayIstMidnight && p.NetPnl != null && p.StrategyId == StrategyId.LegacyComposite)
             .OrderByDescending(p => p.ExitTime)
             .Select(p => p.NetPnl!.Value)
             .ToListAsync(ct);
@@ -184,8 +188,13 @@ public sealed class LiveTradingEngine(
         // Premium x quantity only (matching EntryPrice x Quantity below for the already-open
         // side) -- brokerage is a sunk transaction cost already spent regardless of position
         // size, not capital still tied up in a position, so it's deliberately excluded here.
+        // Unscoped across ALL strategies (2026-09-13, Batch 5, A8) -- Capital.Total is one
+        // shared pool across the legacy engine and both new Core-score strategies, not a
+        // per-strategy allowance, so this must sum every open position regardless of which
+        // engine holds it, not just this engine's own (already-StrategyId-scoped) openPositions.
         var newPositionValue = fill.FillPrice * quantity;
-        var committedCapital = openPositions.Sum(p => p.EntryPrice * p.Quantity) + newPositionValue;
+        var allOpenPositionsValue = await db.PaperTrades.Where(p => p.ExitTime == null).SumAsync(p => p.EntryPrice * p.Quantity, ct);
+        var committedCapital = allOpenPositionsValue + newPositionValue;
         if (committedCapital > _config.Capital.Total)
         {
             logger.LogInformation(
@@ -198,6 +207,7 @@ public sealed class LiveTradingEngine(
         {
             InstrumentToken = chosen.Token,
             TradingSymbol = chosen.TradingSymbol,
+            StrategyId = StrategyId.LegacyComposite,
             Direction = decision.Direction,
             EntryTime = now,
             EntryPrice = fill.FillPrice,
