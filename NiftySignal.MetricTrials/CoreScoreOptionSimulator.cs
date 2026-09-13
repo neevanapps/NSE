@@ -134,6 +134,24 @@ public sealed record CoreScoreTrade(
     public decimal NetPnlPercent => NetPnlPoints / EntryPrice * 100m;
 }
 
+/// <summary>
+/// One cadence's full diagnostic breakdown (2026-09-13, Batch 3 historical replay validation) --
+/// every raw/signed value plus the final CoreScore and its fast/slow smoothed reads, for diffing
+/// against the live LiveFeatureEngine port's own CoreScoreSnapshot at matching timestamps. See
+/// <see cref="CoreScoreOptionSimulator.BuildDiagnostics"/>.
+/// </summary>
+public sealed record CoreScoreCadenceDiagnostics(
+    DateTimeOffset Timestamp,
+    double? DepthImbalanceRaw, double? DepthImbalanceSigned,
+    double? ItmSkewRaw, double? ItmSkewSigned,
+    double? FutureCvdNet5MinRaw, double? FutureCvdNet5MinSigned,
+    double? NotionalVolumeRatioRaw, double? NotionalVolumeRatioSigned,
+    double? GammaExposureRaw, double? GammaExposureSigned,
+    double? TrendReversion15mRaw, double? TrendReversion15mSigned,
+    double? BasisChangeRaw, double? BasisChangeSigned,
+    double? OiChangeDiff15mRaw, double? OiChangeDiff15mSigned,
+    double? CoreScore, double? CoreScoreFast, double? CoreScoreSlow);
+
 public sealed record CoreScoreDayResult(DateOnly AsOfDate, IReadOnlyList<CoreScoreTrade> Trades)
 {
     public decimal NetPnlPoints => Trades.Sum(t => t.NetPnlPoints);
@@ -168,9 +186,23 @@ public static class CoreScoreOptionSimulator
         decimal? Mark, double? Depth, double? Iv, long? VolumeDeltaRaw, double? Gamma, long? OpenInterest,
         long? OpenInterestDeltaRaw);
 
-    /// <summary>One cadence's resolved composite score plus everything a trading strategy needs to act on it -- shared by both SimulateDay and SimulateDayCrossover so the 8-metric computation exists in exactly one place.</summary>
+    /// <summary>
+    /// One cadence's resolved composite score plus everything a trading strategy needs to act on
+    /// it -- shared by both SimulateDay and SimulateDayCrossover so the 8-metric computation
+    /// exists in exactly one place. The 8 raw/signed pairs (2026-09-13, Batch 3 historical replay
+    /// validation) are carried here purely as diagnostics -- SimulateDay/SimulateDayCrossover
+    /// never read them, only BuildDiagnostics does.
+    /// </summary>
     sealed record ScoreCadence(DateTimeOffset Timestamp, TimeOnly LocalTime, bool EntryWindowOpen, bool MustForceClose,
-        double? Score, List<FilledRow> Rows);
+        double? Score, List<FilledRow> Rows,
+        double? DepthImbalanceRaw, double? DepthImbalanceSigned,
+        double? ItmSkewRaw, double? ItmSkewSigned,
+        double? FutureCvdNet5MinRaw, double? FutureCvdNet5MinSigned,
+        double? NotionalVolumeRatioRaw, double? NotionalVolumeRatioSigned,
+        double? GammaExposureRaw, double? GammaExposureSigned,
+        double? TrendReversion15mRaw, double? TrendReversion15mSigned,
+        double? BasisChangeRaw, double? BasisChangeSigned,
+        double? OiChangeDiff15mRaw, double? OiChangeDiff15mSigned);
 
     /// <summary>
     /// 2026-09-13: entry per explicit instruction picks the strike priced near [low,high], not ATM --
@@ -397,7 +429,15 @@ public static class CoreScoreOptionSimulator
                 score = 100.0 * Math.Tanh(raw / weights.K);
             }
 
-            cadences.Add(new ScoreCadence(timestamp, localTime, entryWindowOpen, mustForceClose, score, rows));
+            cadences.Add(new ScoreCadence(timestamp, localTime, entryWindowOpen, mustForceClose, score, rows,
+                depthImbalanceRaw, depthSigned,
+                itmSkewRaw, skewSigned,
+                futureCvdRaw, cvdSigned,
+                notionalLogRatioRaw, notionalSigned,
+                gammaExposureRaw, gammaSigned,
+                trendReversionSigned, trendSigned,
+                basisChangeRaw, basisSigned,
+                oiChangeDiff15mRaw, oiDiffSigned));
         }
 
         return (cadences, priceByStrikeAndTime);
@@ -491,6 +531,84 @@ public static class CoreScoreOptionSimulator
     }
 
     /// <summary>
+    /// Feeds one cadence's score into both real-time trailing windows and returns their current
+    /// averages -- extracted (2026-09-13, Batch 3 historical replay validation) from
+    /// SimulateDayCrossover's own inline logic so BuildDiagnostics can compute the identical
+    /// fast/slow series without a second, independently-maintained copy of this windowing code.
+    /// Null in either return slot means that window hasn't seen any observation yet.
+    /// </summary>
+    static (double? Fast, double? Slow) UpdateFastSlow(
+        Queue<(DateTimeOffset Timestamp, double Score)> fastWindow, Queue<(DateTimeOffset Timestamp, double Score)> slowWindow,
+        DateTimeOffset timestamp, double? score, TimeSpan fastSpan, TimeSpan slowSpan)
+    {
+        if (score is { } scoreValue)
+        {
+            fastWindow.Enqueue((timestamp, scoreValue));
+            slowWindow.Enqueue((timestamp, scoreValue));
+        }
+
+        while (fastWindow.Count > 0 && timestamp - fastWindow.Peek().Timestamp > fastSpan)
+        {
+            fastWindow.Dequeue();
+        }
+
+        while (slowWindow.Count > 0 && timestamp - slowWindow.Peek().Timestamp > slowSpan)
+        {
+            slowWindow.Dequeue();
+        }
+
+        double? fast = fastWindow.Count > 0 ? fastWindow.Average(w => w.Score) : null;
+        double? slow = slowWindow.Count > 0 ? slowWindow.Average(w => w.Score) : null;
+        return (fast, slow);
+    }
+
+    /// <summary>
+    /// 2026-09-13, Batch 3 (historical replay validation, docs/replication_plan.md): every
+    /// intermediate value the live LiveFeatureEngine port needs to be diffed against, at every
+    /// cadence -- the 8 raw values, the 8 signed values, CoreScore, and CoreScoreFast/Slow (using
+    /// the SAME fast/slow windowing SimulateDayCrossover uses, via UpdateFastSlow, so this can't
+    /// silently drift from what SimulateDayCrossover itself would compute). Trading decisions are
+    /// deliberately NOT included here -- this method only proves the SCORE replicates; Batch 3's
+    /// own would-enter/would-exit comparison is done separately by the diff tool itself, driving
+    /// CoreScoreHysteresisRules/CoreScoreCrossoverRules against these same values.
+    /// </summary>
+    public static List<CoreScoreCadenceDiagnostics> BuildDiagnostics(
+        IReadOnlyList<StrikeCadenceSnapshot> dayStrikeRows, IReadOnlyList<CadenceContext> dayCadenceContexts,
+        DateOnly thisWeekExpiry, CoreScoreWeights? weights = null, int fastWindowMinutes = 10, int slowWindowMinutes = 30)
+    {
+        if (dayStrikeRows.Count == 0)
+        {
+            throw new ArgumentException("A day's rows must be non-empty.", nameof(dayStrikeRows));
+        }
+
+        var (cadences, _) = BuildScoreCadences(dayStrikeRows, dayCadenceContexts, thisWeekExpiry, weights ?? new CoreScoreWeights());
+
+        var fastWindow = new Queue<(DateTimeOffset Timestamp, double Score)>();
+        var slowWindow = new Queue<(DateTimeOffset Timestamp, double Score)>();
+        var fastSpan = TimeSpan.FromMinutes(fastWindowMinutes);
+        var slowSpan = TimeSpan.FromMinutes(slowWindowMinutes);
+
+        var result = new List<CoreScoreCadenceDiagnostics>();
+        foreach (var cadence in cadences)
+        {
+            var (fast, slow) = UpdateFastSlow(fastWindow, slowWindow, cadence.Timestamp, cadence.Score, fastSpan, slowSpan);
+            result.Add(new CoreScoreCadenceDiagnostics(
+                cadence.Timestamp,
+                cadence.DepthImbalanceRaw, cadence.DepthImbalanceSigned,
+                cadence.ItmSkewRaw, cadence.ItmSkewSigned,
+                cadence.FutureCvdNet5MinRaw, cadence.FutureCvdNet5MinSigned,
+                cadence.NotionalVolumeRatioRaw, cadence.NotionalVolumeRatioSigned,
+                cadence.GammaExposureRaw, cadence.GammaExposureSigned,
+                cadence.TrendReversion15mRaw, cadence.TrendReversion15mSigned,
+                cadence.BasisChangeRaw, cadence.BasisChangeSigned,
+                cadence.OiChangeDiff15mRaw, cadence.OiChangeDiff15mSigned,
+                cadence.Score, fast, slow));
+        }
+
+        return result;
+    }
+
+    /// <summary>
     /// 2026-09-13, experimental (see CoreScoreCrossoverOptions' own doc comment). Smooths the SAME
     /// composite score over two real-time trailing windows (fast/slow, plain moving average of
     /// every non-null score observed in each window) and trades the crossover: when the fast
@@ -555,19 +673,9 @@ public static class CoreScoreOptionSimulator
                 }
             }
 
-            if (cadence.Score is { } scoreValue)
-            {
-                fastWindow.Enqueue((timestamp, scoreValue));
-                slowWindow.Enqueue((timestamp, scoreValue));
-            }
-            while (fastWindow.Count > 0 && timestamp - fastWindow.Peek().Timestamp > fastWindowSpan)
-            {
-                fastWindow.Dequeue();
-            }
-            while (slowWindow.Count > 0 && timestamp - slowWindow.Peek().Timestamp > slowWindowSpan)
-            {
-                slowWindow.Dequeue();
-            }
+            // Extracted into UpdateFastSlow (2026-09-13, Batch 3) so BuildDiagnostics computes
+            // the identical fast/slow series -- same windowing code, not a second copy.
+            var (fast, slow) = UpdateFastSlow(fastWindow, slowWindow, timestamp, cadence.Score, fastWindowSpan, slowWindowSpan);
 
             if (cadence.MustForceClose)
             {
@@ -575,13 +683,11 @@ public static class CoreScoreOptionSimulator
                 continue;
             }
 
-            if (fastWindow.Count == 0 || slowWindow.Count == 0)
+            if (fast is not { } fastAvg || slow is not { } slowAvg)
             {
                 continue; // not warmed up yet -- no crossover can be evaluated
             }
 
-            var fastAvg = fastWindow.Average(w => w.Score);
-            var slowAvg = slowWindow.Average(w => w.Score);
             var diffSign = Math.Sign(fastAvg - slowAvg);
 
             if (diffSign == 0)

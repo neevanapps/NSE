@@ -1205,7 +1205,6 @@ public sealed class OptionInstrumentState(decimal strikePrice, OptionType option
 
     long _cadenceVolumeDelta;
     decimal _cadenceNotionalDelta;
-    long? _cadenceOpenInterestDelta;
     decimal? _cadenceMarkPrice;
     decimal? _cadenceBidPrice;
     decimal? _cadenceAskPrice;
@@ -1239,7 +1238,22 @@ public sealed class OptionInstrumentState(decimal strikePrice, OptionType option
     /// <summary>True once a real prior OI observation exists to diff against -- same null-vs-zero distinction as HasVolumeBaseline.</summary>
     public bool CadenceHasOiBaseline => _priorKnownOpenInterest is not null;
 
-    public long? CadenceOpenInterestDelta => _cadenceOpenInterestDelta;
+    /// <summary>
+    /// PENDING fix (Batch 3 replication check, 2026-09-13, CoreScoreReplayDiff finding): this used
+    /// to be a field accumulated per-tick in ApplyTick (`_cadenceOpenInterestDelta += oi - priorOi`
+    /// on every OI-bearing tick), which double/triple/N-counted the SAME underlying OI change once
+    /// per tick this cadence, since OI itself refreshes far slower than tick frequency (this
+    /// project's own prior finding: ~60s) -- a strike ticking 10 times this cadence with an
+    /// unchanged OI would add the same delta 10 times. Caught via NiftySignal.CoreScoreReplayDiff
+    /// comparing this pipeline's OiChangeDiff15mRaw against live's own clean per-cadence diff:
+    /// backtest values ran up to ~500M on a metric that should plausibly cap in the low millions.
+    /// Now computed directly from <see cref="LatestOpenInterest"/> (held over across cadences,
+    /// correctly reflecting "current known OI" regardless of whether THIS cadence had a fresh OI
+    /// tick) minus the OI as of this cadence's own start -- a single, correct delta, computed once,
+    /// with no per-tick accumulation to over-count. A quiet cadence (no new OI tick) now correctly
+    /// yields 0 (OI genuinely unchanged), not an inflated multiple of some earlier tick's delta.
+    /// </summary>
+    public long? CadenceOpenInterestDelta => CadenceHasOiBaseline && LatestOpenInterest is { } latestOi ? latestOi - _priorKnownOpenInterest!.Value : null;
 
     /// <summary>
     /// Feeds this cadence's own MarkPrice (if any) into the 1-minute valuation window and returns
@@ -1270,7 +1284,7 @@ public sealed class OptionInstrumentState(decimal strikePrice, OptionType option
 
         var avgPrice = (decimal)_oiValuationPriceWindow.Mean;
         var oiNotional = LatestOpenInterest is { } oi ? oi * avgPrice : (decimal?)null;
-        var oiChangeNotional = CadenceHasOiBaseline ? _cadenceOpenInterestDelta * avgPrice : (decimal?)null;
+        var oiChangeNotional = CadenceOpenInterestDelta is { } oiDelta ? oiDelta * avgPrice : (decimal?)null;
         return (oiNotional, oiChangeNotional);
     }
 
@@ -1301,11 +1315,10 @@ public sealed class OptionInstrumentState(decimal strikePrice, OptionType option
 
         if (tick.OpenInterest is { } oi)
         {
-            if (_priorKnownOpenInterest is { } priorOi)
-            {
-                _cadenceOpenInterestDelta = (_cadenceOpenInterestDelta ?? 0) + (oi - priorOi);
-            }
-
+            // No per-tick delta accumulation here -- CadenceOpenInterestDelta is computed on
+            // demand from LatestOpenInterest vs. _priorKnownOpenInterest (see its own doc comment
+            // for why accumulating per-tick was a real bug: OI refreshes far slower than ticks
+            // arrive, so a busy strike would count the same delta once per tick).
             LatestOpenInterest = oi;
         }
 
@@ -1335,7 +1348,6 @@ public sealed class OptionInstrumentState(decimal strikePrice, OptionType option
 
         _cadenceVolumeDelta = 0;
         _cadenceNotionalDelta = 0;
-        _cadenceOpenInterestDelta = null;
         _cadenceMarkPrice = null;
         _cadenceBidPrice = null;
         _cadenceAskPrice = null;

@@ -369,7 +369,7 @@ public sealed class MarketDataIngestionWorker(
                             _warmUpBlockedLogged = false;
                         }
 
-                        await PersistSnapshotAsync(snapshot, _engine.BuildStrikeSnapshots(now), stoppingToken);
+                        await PersistSnapshotAsync(snapshot, _engine.LastCoreScoreSnapshot, _engine.BuildStrikeSnapshots(now), stoppingToken);
                         await tradingEngine.EvaluateCadenceAsync(snapshot, _engine, stoppingToken);
                     }
                 }
@@ -591,7 +591,7 @@ public sealed class MarketDataIngestionWorker(
         return sb.ToString().TrimEnd();
     }
 
-    async Task PersistSnapshotAsync(ScoreSnapshot snapshot, List<StrikeSnapshot> strikeSnapshots, CancellationToken ct)
+    async Task PersistSnapshotAsync(ScoreSnapshot snapshot, CoreScoreSnapshot? coreScoreSnapshot, List<StrikeSnapshot> strikeSnapshots, CancellationToken ct)
     {
         await using var scope = scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
@@ -599,6 +599,15 @@ public sealed class MarketDataIngestionWorker(
 
         // Same transaction as the score row -- they describe the same cadence instant, so a
         // partial write would leave analysis joining against a cadence that only half exists.
+        // Core score (2026-09-13, live-wiring plan A2): its own table, same cadence, same
+        // transaction -- coreScoreSnapshot is only null if LiveFeatureEngine's own combine step
+        // threw (logged there already) or ComputeCadence itself returned null, neither of which
+        // should ever happen here since snapshot is already known non-null at the call site.
+        if (coreScoreSnapshot is not null)
+        {
+            db.CoreScoreSnapshots.Add(coreScoreSnapshot);
+        }
+
         if (strikeSnapshots.Count > 0)
         {
             db.StrikeSnapshots.AddRange(strikeSnapshots);
@@ -606,8 +615,8 @@ public sealed class MarketDataIngestionWorker(
 
         await db.SaveChangesAsync(ct);
         logger.LogInformation(
-            "Score cadence: composite={Score} warmedUp={WarmedUp} strikeRows={StrikeRows}",
-            snapshot.CompositeScore, snapshot.IsWarmedUp, strikeSnapshots.Count);
+            "Score cadence: composite={Score} coreScore={CoreScore} warmedUp={WarmedUp} strikeRows={StrikeRows}",
+            snapshot.CompositeScore, coreScoreSnapshot?.CoreScore, snapshot.IsWarmedUp, strikeSnapshots.Count);
     }
 
     async Task<FlatTradeSession?> LoadSessionAsync(CancellationToken ct)
@@ -653,6 +662,17 @@ public sealed class MarketDataIngestionWorker(
 
         engine.SeedHistory(history);
         logger.LogInformation("Replayed {Count} historical score snapshots into the rolling windows", history.Count);
+
+        // Core score (2026-09-13, live-wiring plan A1/A5) -- separate table, separate replay call;
+        // see LiveFeatureEngine.SeedCoreScoreHistory's own doc comment for why this one is
+        // required (not an accepted gap) for the Crossover strategy's fast/slow windows.
+        var coreHistory = await db.CoreScoreSnapshots
+            .Where(s => s.ComputedAt >= todayIstMidnightUtc)
+            .OrderBy(s => s.ComputedAt)
+            .ToListAsync(ct);
+
+        engine.SeedCoreScoreHistory(coreHistory);
+        logger.LogInformation("Replayed {Count} historical Core-score snapshots into the rolling windows", coreHistory.Count);
     }
 
     /// <summary>

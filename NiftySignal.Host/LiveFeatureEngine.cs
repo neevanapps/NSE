@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using NiftySignal.Domain;
 using NiftySignal.Domain.Configuration;
 using NiftySignal.Domain.Entities;
 using NiftySignal.Domain.Enums;
@@ -11,6 +12,42 @@ using NiftySignal.Scoring;
 namespace NiftySignal.Host;
 
 readonly record struct InstrumentState(decimal LastPrice, long Volume, long? OpenInterest, MarketDepth? Depth);
+
+/// <summary>
+/// Per-strike depth-imbalance accumulator for the Core score's DepthImbalance term (Batch 3 fix,
+/// 2026-09-13) -- ported byte-for-byte from NiftySignal.BacktestData/CadencePopulator.cs's own
+/// DepthImbalanceAccumulator (same fields, same per-tick formula, same null-if-no-samples
+/// semantics), so live's per-strike tick-level average matches the backtest's exactly instead of
+/// the original 3s-instant-sample approximation of it (see LiveFeatureEngine's
+/// _coreDepthImbalanceByToken field for the full mismatch this replaces).
+/// </summary>
+sealed class CoreDepthImbalanceAccumulator
+{
+    double _imbalanceSum;
+    int _imbalanceCount;
+
+    public void ApplyTick(MarketDepth depth)
+    {
+        var bid = depth.TotalBidQty;
+        var ask = depth.TotalAskQty;
+        if (bid + ask <= 0)
+        {
+            return;
+        }
+
+        _imbalanceSum += (double)(bid - ask) / (bid + ask);
+        _imbalanceCount++;
+    }
+
+    /// <summary>Average of the per-tick imbalance ratio this cadence -- null if no depth-bearing tick arrived this cadence.</summary>
+    public double? CadenceImbalance => _imbalanceCount > 0 ? _imbalanceSum / _imbalanceCount : null;
+
+    public void Reset()
+    {
+        _imbalanceSum = 0;
+        _imbalanceCount = 0;
+    }
+}
 
 /// <summary>
 /// Turns the live tick stream into the six weighted z-scores + composite score (plan
@@ -207,6 +244,172 @@ public sealed class LiveFeatureEngine
     readonly WelfordRollingWindow _charmExposureWindow = new(FeatureWindowLengths.CharmExposure);
     readonly WelfordRollingWindow _cvdProxyWindow = new(FeatureWindowLengths.CvdProxy);
     readonly WelfordRollingWindow _straddleRichnessWindow = new(FeatureWindowLengths.StraddleRichness);
+
+    // ---- Core score (2026-09-13, live-wiring plan Batch 2, docs/replication_plan.md) ----
+    // A third, independent scoring pipeline (see CoreScoreSnapshot's own doc comment) --
+    // deliberately NOT sharing the 14-component composite's or the ratio composite's own
+    // Compute* methods, fields, or bands, even where the underlying idea overlaps (plan A3's
+    // own rationale: the old methods must stay untouched so their still-computed diagnostic
+    // values never silently change shape, and the Core-score methods are free to use the exact
+    // band/formula CoreScoreOptionSimulator.cs actually validated).
+
+    /// <summary>7 of the 8 Core-score terms are session-rank-transformed (see RankSigned below); TrendReversion15m is the one exception (already bounded [-1,1] by construction) and has no tracker.</summary>
+    readonly SessionRankTracker _coreDepthImbalanceRank = new();
+    readonly SessionRankTracker _coreItmSkewRank = new();
+    readonly SessionRankTracker _coreFutureCvdRank = new();
+    readonly SessionRankTracker _coreNotionalVolumeRatioRank = new();
+    readonly SessionRankTracker _coreGammaExposureRank = new();
+    readonly SessionRankTracker _coreBasisChangeRank = new();
+    readonly SessionRankTracker _coreOiChangeDiffRank = new();
+
+    /// <summary>
+    /// DepthImbalance/ItmSkew (Batch 3 fix, 2026-09-13): NOT "noisy instantaneous" 3s-sampled
+    /// averages like the 14-component composite's own DepthImbalance/IvSkew -- CoreScoreReplayDiff
+    /// caught the original 3s-instant-then-averaged implementation diverging from
+    /// CoreScoreOptionSimulator by up to ~0.37 (DepthImbalance) on effectively every cadence, a
+    /// genuine structural mismatch, not floating-point noise. Fed per-TICK in OnTick instead,
+    /// exactly matching NiftySignal.BacktestData/CadencePopulator.cs's own OptionInstrumentState:
+    /// DepthImbalance is averaged across every tick THIS cadence per strike (not sampled every
+    /// ~3s), and ItmSkew's IV is solved from the LAST two-sided-quote mid THIS cadence specifically
+    /// (null if none arrived, never held over from an earlier cadence) rather than a 5-sample
+    /// average of _latest's possibly-stale state. Reset once per cadence in ComputeCadence itself
+    /// (after the Core-score combine block reads them), NOT in ResetSamples() -- that runs too
+    /// early (before the combine block), which would silently zero these out before they're ever
+    /// read.
+    /// </summary>
+    readonly Dictionary<string, CoreDepthImbalanceAccumulator> _coreDepthImbalanceByToken = [];
+    readonly Dictionary<string, decimal?> _coreCadenceMidPriceByToken = [];
+
+    /// <summary>
+    /// GammaExposure (Batch 3 fix, 2026-09-13): each strike's LAST successfully-solved Gamma,
+    /// frozen and reused on any cadence with no fresh two-sided quote for that strike -- ported
+    /// from NiftySignal.BacktestData/CadencePopulator.cs's own forward-fill
+    /// (<c>lastGamma = row.Gamma ?? lastGamma</c> in BuildScoreCadences), which the original live
+    /// implementation did NOT replicate: it re-solved Gamma fresh every cadence from
+    /// <c>_latest</c>'s held-over (possibly many-cadences-stale) mid combined with the CURRENT
+    /// (continuously changing) underlying/time-to-expiry, silently drifting the Gamma of any
+    /// quiet strike away from what the backtest's frozen value holds -- caught by
+    /// CoreScoreReplayDiff as a persistent, large-magnitude GammaExposureRaw mismatch (max
+    /// ~51,360 on a metric whose own typical scale is comparable). Deliberately NOT reset
+    /// per-cadence or per-day boundary (a new LiveFeatureEngine instance starts with an empty
+    /// cache each trading day anyway, matching CadencePopulator's own fresh-per-day forward-fill).
+    /// </summary>
+    readonly Dictionary<string, double> _coreLastGammaByToken = [];
+
+    /// <summary>
+    /// DepthImbalance/ItmSkew (Batch 3 fix, 2026-09-13, second pass): the SAME forward-fill
+    /// pattern as <see cref="_coreLastGammaByToken"/>, one layer down -- CoreScoreOptionSimulator's
+    /// own BuildScoreCadences forward-fills each strike's raw Depth/Iv value across quiet cadences
+    /// too (<c>lastDepth = row.DepthImbalanceFromLastCadence ?? lastDepth</c>/<c>lastIv = row.
+    /// ImpliedVolatility ?? lastIv</c>), on TOP of the per-cadence accumulator/mid-price the first
+    /// pass already fixed. A strike that ticked before but goes quiet for a cadence or two keeps
+    /// contributing its last known Depth ratio / solved IV, not nothing -- caught by
+    /// CoreScoreReplayDiff as a small residual null-mismatch (backtest non-null, live null) on
+    /// ~1% of cadences, cascading into a larger session-rank (*Signed) mismatch downstream since a
+    /// wrongly-excluded cadence permanently diverges the two SessionRankTracker populations from
+    /// that point on. Deliberately NOT reset per-cadence (same reasoning as _coreLastGammaByToken).
+    /// </summary>
+    readonly Dictionary<string, double> _coreLastDepthImbalanceByToken = [];
+    readonly Dictionary<string, double> _coreLastIvByToken = [];
+
+    /// <summary>
+    /// GammaExposure (Batch 3 fix, 2026-09-13, third pass): each strike's last known OpenInterest,
+    /// held over across ticks that don't carry OI data (<see cref="Domain.Entities.Tick.OpenInterest"/>
+    /// is itself nullable -- not every tick payload includes it). `_latest[token].OpenInterest`
+    /// does NOT hold over this way: OnTick replaces the WHOLE InstrumentState on every tick, so an
+    /// OI-less tick silently nulls out a strike's previously-known OI until its next OI-bearing
+    /// tick. CadencePopulator's own OptionInstrumentState.LatestOpenInterest is a dedicated
+    /// property updated only when `tick.OpenInterest is {} oi` (see its own ApplyTick), never
+    /// cleared by an OI-less tick -- this cache replicates that specifically for GammaExposure's
+    /// OI read, scoped to Core-score use only. Deliberately NOT touching `_latest`'s own
+    /// construction or ComputeCoreOiChangeDiffRaw's existing _previousCadence-based OI reads --
+    /// that method already matches the backtest exactly on the narrower ATM+/-2 band it uses,
+    /// where this gap apparently doesn't surface in practice, and _previousCadence is a
+    /// pre-existing, broadly-shared field the old composite also depends on.
+    /// </summary>
+    readonly Dictionary<string, long> _coreLastOpenInterestByToken = [];
+
+    /// <summary>
+    /// NotionalVolumeRatio (Batch 3 fix, fourth pass): each strike's last known mark price
+    /// (this cadence's own fresh two-sided-quote mid where one exists, else forward-filled) --
+    /// see ComputeCoreNotionalVolumeRatioRaw's own doc comment for why this specific forward-fill
+    /// is needed (a strike can trade real volume without also getting a fresh depth quote the
+    /// same cadence). Same forward-fill shape as _coreLastGammaByToken/_coreLastIvByToken, just
+    /// caching the mark price itself rather than a value derived from it.
+    /// </summary>
+    readonly Dictionary<string, decimal> _coreLastMarkByToken = [];
+
+    /// <summary>Independent volume baseline for the Core score's own NotionalVolumeRatio (ATM+/-RatioWideStrikeBand) -- deliberately NOT sharing _previousVolumeByTokenRatio (the still-active ratio composite's own baseline for the same band), same "no accidental cross-method ordering dependency" reasoning _previousVolumeByToken's own doc comment already gives. The two methods will consolidate once the ratio composite is retired (plan Batch 4), not before.</summary>
+    readonly Dictionary<string, long> _previousVolumeByTokenCoreScore = [];
+
+    /// <summary>This cadence's net classified future volume, accumulated per-tick in OnTick (byte-for-byte port of NiftySignal.BacktestData/CadencePopulator.cs's FutureCvdProxyAccumulator.ApplyTick) and consumed/reset once per cadence by ComputeCoreFutureCvdNet5Min -- same instant/reset shape as FutureCvdProxyAccumulator's own CadenceNet/ResetCadence pair.</summary>
+    long _coreFutureCvdCadenceNet;
+    bool _coreFutureCvdCadenceHasContribution;
+    readonly Queue<(DateTimeOffset Timestamp, long Net)> _coreFutureCvdNet5MinWindow = new();
+    static readonly TimeSpan CoreFutureCvdNet5MinWindow = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// FutureCvdNet5Min (Batch 3 fix, 2026-09-13, second pass, refined third pass): the timestamp
+    /// of this metric's own first-ever cadence CONTRIBUTION (not the first cadence overall), set
+    /// once and never touched again -- ported from NiftySignal.BacktestData/CadencePopulator.cs's
+    /// own RollingNetSumWindow.IsWarmedUp (<c>latestTimestamp - firstSeenAt >= window</c>).
+    /// <see cref="_coreFutureCvdLatestTimestamp"/> is that same window's own <c>_latestTimestamp</c>
+    /// -- ALSO updated only on a contributing cadence, not simply read as <c>now</c>. Both fields,
+    /// plus the window itself, are updated ONLY when this cadence has a real classifiable tick
+    /// (<see cref="_coreFutureCvdCadenceHasContribution"/>) -- CadencePopulator's own comment on
+    /// its Add call is explicit: "skip a null cadence, never zero-fill it." An earlier version of
+    /// this fix zero-filled every quiet cadence into the window and warmed up 5 minutes after the
+    /// very first cadence regardless of contribution -- caught by CoreScoreReplayDiff as a
+    /// residual value-level FutureCvdNet5MinRaw mismatch even after the null/non-null warm-up gate
+    /// itself was already correct.
+    /// </summary>
+    DateTimeOffset? _coreFutureCvdFirstSeenAt;
+    DateTimeOffset? _coreFutureCvdLatestTimestamp;
+
+    /// <summary>
+    /// TrendReversion15m/BasisChange (Batch 3 fix, 2026-09-13): THIS cadence's own future/spot
+    /// open-to-close (first tick's price this cadence vs the latest), ported from
+    /// NiftySignal.BacktestData/CadencePopulator.cs's own InstrumentPriceState.CadenceOpen/
+    /// CadenceClose -- CadenceContext.FutureChangeFromLastCadence/SpotChangeFromLastCadence are
+    /// WITHIN-cadence candle bodies despite the "FromLastCadence" name, NOT a cross-cadence
+    /// mid-to-mid diff. The original implementation tracked a previous-cadence future MID and
+    /// spot LTP instead (a genuinely different, cross-cadence quantity) -- caught by
+    /// CoreScoreReplayDiff as a near-100% TrendReversion15m/BasisChange mismatch.
+    ///
+    /// The future's own open/close is fed with each tick's MID price (see OnTick's own comment on
+    /// this -- CadencePopulator's main loop mid-prices the future specifically, `futureState.
+    /// ApplyTick(MidPrice(tick) ?? tick.LastPrice)`, to dodge the future's LTP alternating between
+    /// two levels a few points apart within seconds); spot's own open/close is fed with raw LTP
+    /// (CadencePopulator's spotState.ApplyTick(tick.LastPrice) does NOT mid-price it) -- a first
+    /// attempt at this fix used LTP for both and still showed a real, moderate mismatch, caught by
+    /// re-running CoreScoreReplayDiff after the "within-cadence not cross-cadence" fix alone.
+    ///
+    /// Reset once per cadence right after the Core-score combine block reads them (same timing as
+    /// _coreDepthImbalanceByToken/_coreCadenceMidPriceByToken -- see their own doc comment for why
+    /// ResetSamples() itself is too early).
+    /// </summary>
+    decimal? _coreFutureCadenceOpen;
+    decimal? _coreFutureCadenceClose;
+    decimal? _coreSpotCadenceOpen;
+    decimal? _coreSpotCadenceClose;
+    readonly Queue<(DateTimeOffset Timestamp, double Change)> _coreTrendReversionWindow = new();
+    static readonly TimeSpan CoreTrendReversionWindow = TimeSpan.FromMinutes(15);
+
+    /// <summary>Rolling 15-real-minute SUM of (CallOiDelta-PutOiDelta), ATM+/-PersistedStrikeBand -- each cadence's own increment comes from _previousCadence (read BEFORE it's overwritten at the end of ComputeCadence), NOT _oiLookback's ~4-minute comparison ComputeOiBuildupNet uses -- feeding a 4-minute-lookback delta into a 15-minute rolling SUM would overlap successive readings and badly over-count flow (see docs/replication_plan.md A3's own explanation).</summary>
+    readonly Queue<(DateTimeOffset Timestamp, long CallDelta, long PutDelta)> _coreOiChangeDiffWindow = new();
+    static readonly TimeSpan CoreOiChangeDiffWindow = TimeSpan.FromMinutes(15);
+
+    /// <summary>ATM+/-10 for the Core score's own GammaExposure -- "version A" (each strike's own individually-solved IV), confirmed distinct from the 14-component composite's ComputeGammaExposure ("version B", one shared ATM vol) via docs/SCORE_CANDIDATES.md:697-698. See ComputeCoreGammaExposureRaw.</summary>
+    const int CoreGammaBandOffset = 10;
+
+    /// <summary>Real-time trailing moving averages of the already-computed, already-tanh'd CoreScore -- the Crossover strategy's fast/slow reads. MUST be replayed on restart (see SeedCoreScoreHistory) -- unlike the ratio composite's own fast FIFO, an already-open Crossover position depends on these to ever detect its next exit.</summary>
+    readonly Queue<(DateTimeOffset Timestamp, double Score)> _coreScoreFastHistory = new();
+    readonly Queue<(DateTimeOffset Timestamp, double Score)> _coreScoreSlowHistory = new();
+    static readonly TimeSpan CoreScoreFastWindow = TimeSpan.FromMinutes(10);
+    static readonly TimeSpan CoreScoreSlowWindow = TimeSpan.FromMinutes(30);
+
+    /// <summary>This cadence's Core-score snapshot, built inside ComputeCadence and exposed here rather than changing ComputeCadence's own return type (which ~280 existing call sites -- tests, NiftySignal.ScoreReplay -- all depend on staying ScoreSnapshot?). Null whenever ComputeCadence itself returns null (no spot/future tick yet) or hasn't been called yet this process lifetime.</summary>
+    public CoreScoreSnapshot? LastCoreScoreSnapshot { get; private set; }
 
     /// <summary>
     /// The ATM strike/quotes/Greeks <see cref="ComputeStraddleRichness"/> saw last cadence, kept
@@ -411,6 +614,16 @@ public sealed class LiveFeatureEngine
             .Select(i => i.ExpiryDate!.Value)
             .Min();
         _nearestExpiryOptions = [.. instruments.Where(i => i.InstrumentType == InstrumentType.Option && i.ExpiryDate == _nearestExpiry)];
+
+        // Core score DepthImbalance/ItmSkew (Batch 3 fix) -- one accumulator/mid-price slot per
+        // nearest-expiry option token, for the whole lifetime of this engine instance (the
+        // nearest-expiry universe never changes intraday). Fed per-tick in OnTick, read once per
+        // cadence in ComputeCadence's combine block, reset once per cadence right after.
+        foreach (var option in _nearestExpiryOptions)
+        {
+            _coreDepthImbalanceByToken[option.Token] = new CoreDepthImbalanceAccumulator();
+            _coreCadenceMidPriceByToken[option.Token] = null;
+        }
     }
 
     public void OnTick(Tick tick)
@@ -429,6 +642,64 @@ public sealed class LiveFeatureEngine
 
             _futureCumulativePriceVolume += (double)tick.LastPrice * volumeDelta;
             _futureCumulativeVolume += volumeDelta;
+
+            // Core score (2026-09-13, replication_plan.md A3, FutureCvdNet5Min) -- byte-for-byte
+            // port of NiftySignal.BacktestData/CadencePopulator.cs's FutureCvdProxyAccumulator.
+            // ApplyTick, applied to the future token here specifically. Reuses this same tick's
+            // volumeDelta (already computed above for VWAP) rather than tracking a second,
+            // independent previous-volume baseline -- both consumers need the identical
+            // per-tick volume delta of the same token, so sharing it is correct, not a violation
+            // of this class's usual "independent baselines" rule (that rule exists for consumers
+            // with genuinely different needs, not this one).
+            if (tick.Depth is { } depth && depth.Bid1Price > 0 && depth.Ask1Price > 0 && volumeDelta > 0)
+            {
+                var midpoint = (depth.Bid1Price + depth.Ask1Price) / 2m;
+                var signed = tick.LastPrice >= midpoint ? volumeDelta : -volumeDelta;
+                _coreFutureCvdCadenceNet += signed;
+                _coreFutureCvdCadenceHasContribution = true;
+            }
+
+            // TrendReversion15m/BasisChange (Batch 3 fix) -- this cadence's own open/close for the
+            // future, fed with the tick's own MID price (not LTP), byte-for-byte matching
+            // CadencePopulator's own main loop (`var mid = MidPrice(tick) ?? tick.LastPrice;
+            // futureState.ApplyTick(mid);`) -- the future's LTP alternates between two levels a
+            // few points apart within seconds (same bug Sample()'s own futureMark already guards
+            // against), so using it here (as an earlier version of this fix did) reintroduces
+            // exactly that noise into TrendReversion15m/BasisChange. Spot below stays LTP-based --
+            // CadencePopulator's own spotState.ApplyTick(tick.LastPrice) does NOT mid-price it.
+            var futureTickMid = tick.Depth is { } futureDepthForMid && futureDepthForMid.Bid1Price > 0 && futureDepthForMid.Ask1Price > 0
+                ? (futureDepthForMid.Bid1Price + futureDepthForMid.Ask1Price) / 2m
+                : tick.LastPrice;
+            _coreFutureCadenceOpen ??= futureTickMid;
+            _coreFutureCadenceClose = futureTickMid;
+        }
+        else if (tick.Token == _spot.Token)
+        {
+            // Same within-cadence LTP open/close as the future above, for BasisChange's spot side.
+            _coreSpotCadenceOpen ??= tick.LastPrice;
+            _coreSpotCadenceClose = tick.LastPrice;
+        }
+        else if (_coreDepthImbalanceByToken.TryGetValue(tick.Token, out var coreDepthAcc))
+        {
+            // Core score DepthImbalance/ItmSkew (Batch 3 fix, 2026-09-13) -- byte-for-byte port of
+            // NiftySignal.BacktestData/CadencePopulator.cs's own OptionInstrumentState.ApplyTick
+            // gating (same "two-sided quote present" condition, same per-tick timing) for exactly
+            // these two terms. DepthImbalance averages every tick's imbalance ratio; ItmSkew's mid
+            // is simply overwritten with this tick's own (not accumulated) -- see
+            // CoreDepthImbalanceAccumulator's and _coreCadenceMidPriceByToken's own doc comments.
+            if (tick.Depth is { } coreDepth && coreDepth.Bid1Price > 0 && coreDepth.Ask1Price > 0)
+            {
+                coreDepthAcc.ApplyTick(coreDepth);
+                _coreCadenceMidPriceByToken[tick.Token] = (coreDepth.Bid1Price + coreDepth.Ask1Price) / 2m;
+            }
+
+            // GammaExposure (Batch 3 fix, third pass) -- held over independently of whether THIS
+            // tick also carries a two-sided quote; see _coreLastOpenInterestByToken's own doc
+            // comment for why _latest's own OpenInterest can't be trusted for this.
+            if (tick.OpenInterest is { } oi)
+            {
+                _coreLastOpenInterestByToken[tick.Token] = oi;
+            }
         }
     }
 
@@ -612,6 +883,91 @@ public sealed class LiveFeatureEngine
             if (snapshot.AtmIv is { } atmIv)
             {
                 _todaySessionAtmIv.Add(atmIv);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Restart-safe warm-up for the Core score (2026-09-13, live-wiring plan A1/A5), mirroring
+    /// <see cref="SeedHistory"/>'s own chronological-replay pattern for a separate table. Two
+    /// distinct restart-safety needs, both handled here:
+    ///
+    /// 1. The 7 ranked terms' <see cref="SessionRankTracker"/> instances are seeded with
+    ///    <c>Math.Abs(rawValue)</c> from each persisted row -- matching exactly what would have
+    ///    been added had the process run continuously (<see cref="RankSigned"/> always calls
+    ///    <c>rank.Add(Math.Abs(value))</c>, never the signed value itself). <see
+    ///    cref="CoreScoreSnapshot.TrendReversion15mRaw"/> is deliberately NOT replayed into any
+    ///    tracker -- that term has none (see its own doc comment).
+    /// 2. <see cref="CoreScoreSnapshot.CoreScore"/> (the already-tanh'd value, not a raw) is
+    ///    replayed into both the fast and slow real-time windows -- REQUIRED, not an accepted gap
+    ///    like the ratio composite's own fast FIFO: the Crossover strategy is always-positioned,
+    ///    so an already-open position depends on these windows to ever detect its next exit (see
+    ///    docs/replication_plan.md A5's own correction for the full reasoning). Note: seeding
+    ///    <c>CoreScoreCrossoverRules</c>' own <c>previousDiffSign</c> from this same replayed
+    ///    history is a SEPARATE step the trading engine (plan Batch 5) is responsible for, once it
+    ///    exists -- this method only rebuilds the two moving-average windows themselves.
+    /// </summary>
+    public void SeedCoreScoreHistory(IEnumerable<CoreScoreSnapshot> history)
+    {
+        foreach (var snapshot in history.OrderBy(s => s.ComputedAt))
+        {
+            if (snapshot.DepthImbalanceRaw is { } depthImbalance)
+            {
+                _coreDepthImbalanceRank.Add(Math.Abs(depthImbalance));
+            }
+
+            if (snapshot.ItmSkewRaw is { } itmSkew)
+            {
+                _coreItmSkewRank.Add(Math.Abs(itmSkew));
+            }
+
+            if (snapshot.FutureCvdNet5MinRaw is { } futureCvd)
+            {
+                _coreFutureCvdRank.Add(Math.Abs(futureCvd));
+            }
+
+            if (snapshot.NotionalVolumeRatioRaw is { } notionalVolumeRatio)
+            {
+                _coreNotionalVolumeRatioRank.Add(Math.Abs(notionalVolumeRatio));
+            }
+
+            if (snapshot.GammaExposureRaw is { } gammaExposure)
+            {
+                _coreGammaExposureRank.Add(Math.Abs(gammaExposure));
+            }
+
+            if (snapshot.BasisChangeRaw is { } basisChange)
+            {
+                _coreBasisChangeRank.Add(Math.Abs(basisChange));
+            }
+
+            if (snapshot.OiChangeDiff15mRaw is { } oiChangeDiff)
+            {
+                _coreOiChangeDiffRank.Add(Math.Abs(oiChangeDiff));
+            }
+
+            if (snapshot.CoreScore is { } coreScore)
+            {
+                _coreScoreFastHistory.Enqueue((snapshot.ComputedAt, coreScore));
+                _coreScoreSlowHistory.Enqueue((snapshot.ComputedAt, coreScore));
+            }
+        }
+
+        // Trim to each window's own real-time span, same eviction rule ComputeCadence's own
+        // combine step uses every cadence -- replaying more history than either window needs is
+        // harmless (matches SeedHistory's own reasoning for WelfordRollingWindow), the trim below
+        // just keeps memory bounded rather than growing with the whole day's replay.
+        if (history.Any())
+        {
+            var lastTimestamp = history.Max(s => s.ComputedAt);
+            while (_coreScoreFastHistory.Count > 0 && lastTimestamp - _coreScoreFastHistory.Peek().Timestamp > CoreScoreFastWindow)
+            {
+                _coreScoreFastHistory.Dequeue();
+            }
+
+            while (_coreScoreSlowHistory.Count > 0 && lastTimestamp - _coreScoreSlowHistory.Peek().Timestamp > CoreScoreSlowWindow)
+            {
+                _coreScoreSlowHistory.Dequeue();
             }
         }
     }
@@ -818,6 +1174,11 @@ public sealed class LiveFeatureEngine
         {
             _logger?.LogError(ex, "Ratio composite metric 4 (IV skew 25-delta) sample failed");
         }
+
+        // Core score DepthImbalance/ItmSkew (Batch 3 fix, 2026-09-13): no longer sampled here --
+        // fed per-tick in OnTick instead (see _coreDepthImbalanceByToken's own doc comment for
+        // why the old 3s-instant-sample approach was a genuine mismatch from the backtest, not
+        // just a coarser approximation of it).
     }
 
     /// <summary>
@@ -1006,6 +1367,7 @@ public sealed class LiveFeatureEngine
         if (!_latest.TryGetValue(_spot.Token, out var spot) || !_latest.TryGetValue(_future.Token, out var future)
             || spot.LastPrice <= 0 || future.LastPrice <= 0)
         {
+            LastCoreScoreSnapshot = null;
             return null;
         }
 
@@ -1086,6 +1448,11 @@ public sealed class LiveFeatureEngine
         // clears it, same reason ivSkewRaw above is captured into a local before that call
         // rather than re-read afterward.
         var ratioIvSkew25dRaw = _ivSkewRatioSamples.Average;
+
+        // Core score DepthImbalance/ItmSkew (Batch 3 fix, 2026-09-13): no longer captured here --
+        // _coreDepthImbalanceByToken/_coreCadenceMidPriceByToken are untouched by ResetSamples()
+        // below (that call is too early; see those fields' own doc comments), so the Core-score
+        // combine block reads them directly, then resets them itself once it's done.
 
         // Reads _spreadPctOfMidSamplesByToken, which BuildStrikeSnapshots clears later this
         // same cadence -- must run before that, which ResetSamples() below doesn't touch
@@ -1376,6 +1743,148 @@ public sealed class LiveFeatureEngine
             _logger?.LogError(ex, "Futures VWAP deviation combine step failed");
         }
 
+        // ==================== Core score (2026-09-13, live-wiring plan Batch 2) ====================
+        // Own try/catch, same F34 discipline as every other combine block above -- a bug here must
+        // never prevent _previousCadence/_lastCadenceAt below from updating. Must run BEFORE
+        // _previousCadence is overwritten below -- ComputeCoreOiChangeDiffRaw reads it.
+        double? coreDepthImbalanceRaw = null, coreItmSkewRaw = null, coreFutureCvdRaw = null,
+            coreNotionalVolumeRatioRaw = null, coreGammaExposureRaw = null, coreTrendReversion15mRaw = null,
+            coreBasisChangeRaw = null, coreOiChangeDiff15mRaw = null;
+        double? coreDepthImbalanceSigned = null, coreItmSkewSigned = null, coreFutureCvdSigned = null,
+            coreNotionalVolumeRatioSigned = null, coreGammaExposureSigned = null, coreTrendReversion15mSigned = null,
+            coreBasisChangeSigned = null, coreOiChangeDiff15mSigned = null;
+        double? coreScoreRawInstant = null, coreScoreRaw = null, coreScore = null, coreScoreFast = null, coreScoreSlow = null;
+        var coreIsWarmedUp = false;
+        string? coreWeightSetVersion = null;
+        try
+        {
+            var coreStrikeOffsets = ComputeStrikeOffsets(spot.LastPrice);
+            coreDepthImbalanceRaw = ComputeCoreDepthImbalanceRaw(coreStrikeOffsets);
+            coreItmSkewRaw = ComputeCoreItmSkewRaw(coreStrikeOffsets, spot.LastPrice, now);
+
+            coreFutureCvdRaw = ComputeCoreFutureCvdNet5Min(now);
+
+            coreNotionalVolumeRatioRaw = ComputeCoreNotionalVolumeRatioRaw(coreStrikeOffsets);
+
+            var coreT = TimeToExpiry.YearsUntilExpiry(_nearestExpiry, now);
+            var coreUnderlying = ComputeUnderlyingPrice(spot.LastPrice, coreT);
+            coreGammaExposureRaw = ComputeCoreGammaExposureRaw(coreStrikeOffsets, coreUnderlying, coreT);
+
+            var (trendReversion, basisChange) = ComputeCoreTrendAndBasis(now);
+            coreTrendReversion15mRaw = trendReversion;
+            coreBasisChangeRaw = basisChange;
+
+            coreOiChangeDiff15mRaw = ComputeCoreOiChangeDiffRaw(now, spot.LastPrice);
+
+            coreDepthImbalanceSigned = RankSigned(coreDepthImbalanceRaw, _coreDepthImbalanceRank);
+            coreItmSkewSigned = RankSigned(coreItmSkewRaw, _coreItmSkewRank);
+            coreFutureCvdSigned = RankSigned(coreFutureCvdRaw, _coreFutureCvdRank);
+            coreNotionalVolumeRatioSigned = RankSigned(coreNotionalVolumeRatioRaw, _coreNotionalVolumeRatioRank);
+            coreGammaExposureSigned = RankSigned(coreGammaExposureRaw, _coreGammaExposureRank);
+            // Negate-then-rank, not rank-then-negate -- matches CoreScoreOptionSimulator.cs:370 exactly.
+            coreBasisChangeSigned = RankSigned(coreBasisChangeRaw is { } b ? -b : null, _coreBasisChangeRank);
+            coreOiChangeDiff15mSigned = RankSigned(coreOiChangeDiff15mRaw, _coreOiChangeDiffRank);
+            // NOT ranked -- already bounded [-1,1] by construction. See ComputeCoreTrendAndBasis.
+            coreTrendReversion15mSigned = coreTrendReversion15mRaw;
+
+            var coreInputs = new CoreScoreComponentInputs(
+                DepthImbalance: coreDepthImbalanceSigned,
+                ItmSkew: coreItmSkewSigned,
+                FutureCvdNet5Min: coreFutureCvdSigned,
+                NotionalVolumeRatio: coreNotionalVolumeRatioSigned,
+                GammaExposure: coreGammaExposureSigned,
+                TrendReversion15m: coreTrendReversion15mSigned,
+                BasisChange: coreBasisChangeSigned,
+                OiChangeDiff15m: coreOiChangeDiff15mSigned);
+
+            coreScoreRawInstant = CoreScoreCalculator.ComputeRaw(coreInputs, CoreScoreWeights.Default);
+            coreScoreRaw = coreScoreRawInstant;
+
+            var coreResult = CoreScoreCalculator.Calculate(coreInputs, CoreScoreWeights.Default, now, CoreScoreCalculator.DefaultK, coreScoreRaw);
+            coreScore = coreResult.Score;
+            coreIsWarmedUp = coreResult.IsWarmedUp;
+            if (coreResult.IsWarmedUp)
+            {
+                coreWeightSetVersion = coreResult.WeightSetVersion;
+            }
+
+            // Crossover's fast/slow smoothing (plan A5) -- plain post-tanh moving averages of the
+            // already-computed CoreScore, NOT routed back through CoreScoreCalculator (see
+            // CoreScoreCalculator's own rawOverride doc comment for why).
+            if (coreScore is { } scoreValue)
+            {
+                _coreScoreFastHistory.Enqueue((now, scoreValue));
+                _coreScoreSlowHistory.Enqueue((now, scoreValue));
+            }
+
+            while (_coreScoreFastHistory.Count > 0 && now - _coreScoreFastHistory.Peek().Timestamp > CoreScoreFastWindow)
+            {
+                _coreScoreFastHistory.Dequeue();
+            }
+
+            while (_coreScoreSlowHistory.Count > 0 && now - _coreScoreSlowHistory.Peek().Timestamp > CoreScoreSlowWindow)
+            {
+                _coreScoreSlowHistory.Dequeue();
+            }
+
+            coreScoreFast = _coreScoreFastHistory.Count > 0 ? _coreScoreFastHistory.Average(w => w.Score) : null;
+            coreScoreSlow = _coreScoreSlowHistory.Count > 0 ? _coreScoreSlowHistory.Average(w => w.Score) : null;
+
+            LastCoreScoreSnapshot = new CoreScoreSnapshot
+            {
+                ComputedAt = now,
+                DepthImbalanceRaw = coreDepthImbalanceRaw,
+                ItmSkewRaw = coreItmSkewRaw,
+                FutureCvdNet5MinRaw = coreFutureCvdRaw,
+                NotionalVolumeRatioRaw = coreNotionalVolumeRatioRaw,
+                GammaExposureRaw = coreGammaExposureRaw,
+                TrendReversion15mRaw = coreTrendReversion15mRaw,
+                BasisChangeRaw = coreBasisChangeRaw,
+                OiChangeDiff15mRaw = coreOiChangeDiff15mRaw,
+                DepthImbalanceSigned = coreDepthImbalanceSigned,
+                ItmSkewSigned = coreItmSkewSigned,
+                FutureCvdNet5MinSigned = coreFutureCvdSigned,
+                NotionalVolumeRatioSigned = coreNotionalVolumeRatioSigned,
+                GammaExposureSigned = coreGammaExposureSigned,
+                TrendReversion15mSigned = coreTrendReversion15mSigned,
+                BasisChangeSigned = coreBasisChangeSigned,
+                OiChangeDiff15mSigned = coreOiChangeDiff15mSigned,
+                CoreScoreRawInstant = coreScoreRawInstant,
+                CoreScoreRaw = coreScoreRaw,
+                CoreScore = coreScore,
+                IsWarmedUp = coreIsWarmedUp,
+                WeightSetVersion = coreWeightSetVersion,
+                CoreScoreFast = coreScoreFast,
+                CoreScoreSlow = coreScoreSlow,
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Core score combine step failed");
+            LastCoreScoreSnapshot = null;
+        }
+
+        // Reset for the NEXT cadence, unconditionally (outside the try/catch above) -- same
+        // "reset even if the combine step threw" requirement ResetSamples() itself satisfies by
+        // being called standalone, not inside a try. Run only after the combine block has had its
+        // chance to read this cadence's data (see _coreDepthImbalanceByToken's own doc comment for
+        // why this can't live inside ResetSamples(), which runs too early).
+        foreach (var accumulator in _coreDepthImbalanceByToken.Values)
+        {
+            accumulator.Reset();
+        }
+
+        foreach (var token in _coreCadenceMidPriceByToken.Keys.ToList())
+        {
+            _coreCadenceMidPriceByToken[token] = null;
+        }
+
+        _coreFutureCadenceOpen = null;
+        _coreFutureCadenceClose = null;
+        _coreSpotCadenceOpen = null;
+        _coreSpotCadenceClose = null;
+        // ================== end Core score ==================
+
         // Audit finding F50 (2026-09-10): records this cadence's OI for the lookback window
         // ComputeOiBuildupNet/ComputeRatioSizedOiFlowRaw both read from above -- after every
         // read this cadence, same before/after ordering _previousCadence itself follows, so
@@ -1654,6 +2163,9 @@ public sealed class LiveFeatureEngine
         _depthImbalanceSamples.Reset();
         _ivSkewSamples.Reset();
         _ivSkewRatioSamples.Reset();
+        // _coreDepthImbalanceByToken/_coreCadenceMidPriceByToken deliberately NOT reset here --
+        // this runs too early (before the Core-score combine block reads them); see their own
+        // doc comment. Reset happens in ComputeCadence itself, right after that block.
     }
 
     double ComputeMomentum(DateTimeOffset now, decimal futuresPrice)
@@ -2750,6 +3262,482 @@ public sealed class LiveFeatureEngine
 
         return callNotionalRatio / putNotionalRatio;
     }
+
+    // ==================== Core score (2026-09-13, live-wiring plan Batch 2) ====================
+    // See docs/replication_plan.md's A3 for the full per-term reuse/adapt/build-fresh rationale.
+
+    // Itm2Atm1: calls {-2,-1,0}, puts {0,+1,+2} by signed strike offset -- ported unchanged from
+    // NiftySignal.MetricTrials/CoreScoreOptionSimulator.cs's own InItm2Atm1, matches
+    // docs/CHILD_TABLE_SCHEMA.md exactly.
+    static bool InCoreItm2Atm1(OptionType type, int offset) =>
+        type == OptionType.Call ? offset is >= -2 and <= 0 : offset is >= 0 and <= 2;
+
+    /// <summary>
+    /// Signed strike offsets from ATM (0=ATM, negative=below spot, positive=above) -- matching
+    /// StrikeCadenceSnapshot.StrikeOffsetFromAtm's own convention exactly. Needed because the
+    /// Itm2Atm1 band is defined by signed offset, unlike every existing live band (PersistedStrikeBand,
+    /// RatioWideStrikeBand), which select "nearest N strikes to spot" without distinguishing
+    /// which side of spot they're on.
+    /// </summary>
+    Dictionary<decimal, int> ComputeStrikeOffsets(decimal spotPrice)
+    {
+        var distinctStrikes = _nearestExpiryOptions.Select(o => o.StrikePrice!.Value).Distinct().OrderBy(s => s).ToList();
+        if (distinctStrikes.Count == 0)
+        {
+            return [];
+        }
+
+        var atmIndex = 0;
+        var atmDistance = decimal.MaxValue;
+        for (var i = 0; i < distinctStrikes.Count; i++)
+        {
+            var distance = Math.Abs(distinctStrikes[i] - spotPrice);
+            if (distance < atmDistance)
+            {
+                atmDistance = distance;
+                atmIndex = i;
+            }
+        }
+
+        var offsets = new Dictionary<decimal, int>();
+        for (var i = 0; i < distinctStrikes.Count; i++)
+        {
+            offsets[distinctStrikes[i]] = i - atmIndex;
+        }
+
+        return offsets;
+    }
+
+    /// <summary>
+    /// Cadence-level DepthImbalance, Itm2Atm1 band (Batch 3 fix, 2026-09-13) -- each strike's own
+    /// tick-level-averaged imbalance ratio this cadence (<see cref="_coreDepthImbalanceByToken"/>,
+    /// fed per-tick in OnTick), THEN averaged per side (call avg minus put avg), NOT the
+    /// 14-component composite's ComputeDepthImbalance construction (sum raw quantities across
+    /// strikes first, normalize once). Matches CoreScoreOptionSimulator.cs:283-288/
+    /// CadencePopulator.cs's DepthImbalanceAccumulator exactly -- the original 3s-instant-sample
+    /// version of this method did NOT (see _coreDepthImbalanceByToken's own doc comment).
+    /// </summary>
+    double? ComputeCoreDepthImbalanceRaw(Dictionary<decimal, int> strikeOffsets)
+    {
+        var callImbalances = new List<double>();
+        var putImbalances = new List<double>();
+
+        foreach (var option in _nearestExpiryOptions)
+        {
+            if (!strikeOffsets.TryGetValue(option.StrikePrice!.Value, out var offset) || !InCoreItm2Atm1(option.OptionType, offset))
+            {
+                continue;
+            }
+
+            // Forward-fill (Batch 3 fix, second pass) -- see _coreLastDepthImbalanceByToken's own
+            // doc comment: a strike with no fresh tick THIS cadence still contributes its last
+            // known imbalance ratio, matching BuildScoreCadences' own lastDepth forward-fill.
+            if (_coreDepthImbalanceByToken.TryGetValue(option.Token, out var accumulator) && accumulator.CadenceImbalance is { } freshImbalance)
+            {
+                _coreLastDepthImbalanceByToken[option.Token] = freshImbalance;
+            }
+
+            if (!_coreLastDepthImbalanceByToken.TryGetValue(option.Token, out var imbalance))
+            {
+                continue;
+            }
+
+            (option.OptionType == OptionType.Call ? callImbalances : putImbalances).Add(imbalance);
+        }
+
+        return callImbalances.Count > 0 && putImbalances.Count > 0
+            ? callImbalances.Average() - putImbalances.Average()
+            : (double?)null;
+    }
+
+    /// <summary>
+    /// Cadence-level ItmSkew, Itm2Atm1 band (Batch 3 fix, 2026-09-13) -- plain arithmetic mean of
+    /// every call strike's IV in the band, separately the plain mean of every put strike's IV,
+    /// then putAvg-callAvg, each strike's IV solved from its own LAST two-sided-quote mid THIS
+    /// cadence specifically (<see cref="_coreCadenceMidPriceByToken"/>, fed per-tick in OnTick;
+    /// null -- excluded, not stale -- if no such tick arrived this cadence). Matches
+    /// CoreScoreOptionSimulator.cs:290-299/CadencePopulator's own CadenceMarkPrice semantics
+    /// exactly -- the original 3s-instant-sample-then-averaged version of this method read
+    /// _latest instead, which holds whatever tick last arrived regardless of how many cadences
+    /// ago, a genuine mismatch from the backtest's "this cadence only" semantics. NOT a
+    /// two-single-strike difference (unlike ComputeIvSkew's dynamic ~1-sigma OTM pair) and NOT
+    /// OI-weighted. Uses the same synthetic-forward underlying (ComputeUnderlyingPrice) every
+    /// other live IV/Greeks solve in this class already uses. Nulled outright on a 0-DTE (expiry)
+    /// day -- IV is known to distort severely on expiry day (docs/SCORE_CANDIDATES.md's
+    /// "expiry-day regime exclusion" finding). Deliberately duplicates the 0-DTE check as a
+    /// literal condition here rather than sharing a helper with LiveTradingEngine's own
+    /// isExpiryDay -- matches this codebase's stated convention (see
+    /// EntryRuleEvaluator.MinIvRankSessionsForGate's own doc comment).
+    /// </summary>
+    double? ComputeCoreItmSkewRaw(Dictionary<decimal, int> strikeOffsets, decimal spotPrice, DateTimeOffset now)
+    {
+        if (_nearestExpiry == DateOnly.FromDateTime(now.ToIst().DateTime))
+        {
+            return null;
+        }
+
+        var t = TimeToExpiry.YearsUntilExpiry(_nearestExpiry, now);
+        var underlying = ComputeUnderlyingPrice(spotPrice, t);
+
+        var callIvs = new List<double>();
+        var putIvs = new List<double>();
+
+        foreach (var option in _nearestExpiryOptions)
+        {
+            if (!strikeOffsets.TryGetValue(option.StrikePrice!.Value, out var offset) || !InCoreItm2Atm1(option.OptionType, offset))
+            {
+                continue;
+            }
+
+            // Forward-fill (Batch 3 fix, second pass) -- see _coreLastIvByToken's own doc
+            // comment: a strike with no fresh two-sided quote THIS cadence still contributes its
+            // last successfully-solved IV, matching BuildScoreCadences' own lastIv forward-fill.
+            if (_coreCadenceMidPriceByToken.TryGetValue(option.Token, out var mid) && mid is { } midValue && midValue > 0)
+            {
+                var freshIv = ImpliedVolatilitySolver.Solve(option.OptionType, (double)midValue, (double)underlying, (double)option.StrikePrice!.Value, t, RiskFreeRate);
+                if (freshIv is { } freshIvValue)
+                {
+                    _coreLastIvByToken[option.Token] = freshIvValue;
+                }
+            }
+
+            if (!_coreLastIvByToken.TryGetValue(option.Token, out var ivValue))
+            {
+                continue;
+            }
+
+            (option.OptionType == OptionType.Call ? callIvs : putIvs).Add(ivValue);
+        }
+
+        return callIvs.Count > 0 && putIvs.Count > 0 ? putIvs.Average() - callIvs.Average() : (double?)null;
+    }
+
+    /// <summary>
+    /// Rolling 5-real-minute SUM of this cadence's classified future volume (from OnTick's own
+    /// FutureCvdProxyAccumulator port) -- mirrors NiftySignal.BacktestData/CadencePopulator.cs's
+    /// RollingNetSumWindow. A cadence with no contributing tick records a genuine 0 (not skipped),
+    /// same "a real zero is a real zero" reasoning FutureCvdProxyAccumulator.CadenceNet's own
+    /// null-vs-zero split documents for a single cadence, extended here to the rolling sum. Resets
+    /// the per-cadence accumulator for the next cadence, same instant/reset shape as
+    /// FutureCvdProxyAccumulator.CadenceNet/ResetCadence.
+    /// </summary>
+    double? ComputeCoreFutureCvdNet5Min(DateTimeOffset now)
+    {
+        // "Skip a null cadence, never zero-fill it" (CadencePopulator's own comment on
+        // cvdNet5Min.Add's conditional call) -- the window, its own eviction, and both warm-up
+        // timestamps are all updated ONLY on a cadence with a real classifiable tick, matching
+        // RollingNetSumWindow.Add/EvictOlderThan's exact coupling (eviction runs INSIDE Add, so it
+        // never runs on a quiet cadence either). See _coreFutureCvdFirstSeenAt's own doc comment.
+        if (_coreFutureCvdCadenceHasContribution)
+        {
+            _coreFutureCvdFirstSeenAt ??= now;
+            _coreFutureCvdLatestTimestamp = now;
+
+            while (_coreFutureCvdNet5MinWindow.Count > 0 && now - _coreFutureCvdNet5MinWindow.Peek().Timestamp > CoreFutureCvdNet5MinWindow)
+            {
+                _coreFutureCvdNet5MinWindow.Dequeue();
+            }
+
+            _coreFutureCvdNet5MinWindow.Enqueue((now, _coreFutureCvdCadenceNet));
+        }
+
+        _coreFutureCvdCadenceNet = 0;
+        _coreFutureCvdCadenceHasContribution = false;
+
+        if (_coreFutureCvdFirstSeenAt is not { } firstSeenAt || _coreFutureCvdLatestTimestamp is not { } latestTimestamp
+            || latestTimestamp - firstSeenAt < CoreFutureCvdNet5MinWindow)
+        {
+            return null;
+        }
+
+        return _coreFutureCvdNet5MinWindow.Sum(w => (double)w.Net);
+    }
+
+    /// <summary>
+    /// Call notional / put notional, ATM+/-RatioWideStrikeBand, log-ratio inverted (put/call, not
+    /// call/put) -- matches CoreScoreOptionSimulator.cs:304-311 exactly (tested NEGATIVE
+    /// correlation with price, inverted so a positive log-ratio consistently means bullish like
+    /// the other terms). Structurally identical to ComputeRatioNotionalVolumeRaw (same ATM+/-5
+    /// band, same notional-by-side construction) but deliberately kept as its own method with its
+    /// own independent volume baseline (_previousVolumeByTokenCoreScore) rather than sharing or
+    /// renaming that one while the ratio composite it serves is still active -- the "move, don't
+    /// duplicate" consolidation from docs/replication_plan.md A3 happens in Batch 4, once the
+    /// ratio composite (and its own ComputeRatioNotionalVolumeRaw call) is retired, not before.
+    ///
+    /// Band membership (Batch 3 fix) uses the SAME signed index offset (<paramref
+    /// name="strikeOffsets"/>) DepthImbalance/ItmSkew/GammaExposure already use -- NOT "nearest N
+    /// strikes by raw price distance from spot" (an earlier version of this method), same
+    /// index-vs-price-distance mismatch GammaExposure's own fix already found. Mark price is this
+    /// cadence's own fresh two-sided-quote mid where one exists, else the LAST known mark,
+    /// forward-filled via <see cref="_coreLastMarkByToken"/> -- matches
+    /// CoreScoreOptionSimulator.cs's own <c>lastMark = row.MarkPrice ?? lastMark</c> forward-fill
+    /// exactly (a strike can have real VolumeDeltaRaw this cadence without ALSO having a fresh
+    /// two-sided depth quote this same cadence, if depth updates lag LTP/volume updates in the raw
+    /// feed) -- NOT `_latest`'s own MidPrice, which reads whatever depth object happens to be
+    /// sitting there regardless of which cadence it actually arrived in.
+    /// </summary>
+    double? ComputeCoreNotionalVolumeRatioRaw(Dictionary<decimal, int> strikeOffsets)
+    {
+        double callNotional = 0, putNotional = 0;
+
+        foreach (var option in _nearestExpiryOptions)
+        {
+            // Volume baseline and mark forward-fill are updated for EVERY tracked option,
+            // regardless of band membership THIS cadence -- matching CadencePopulator's own
+            // OptionInstrumentState, which tracks every strike's per-cadence volume delta
+            // unconditionally (see its own "history is never gapped by drifting in or out of the
+            // persisted band" doc comment on BuildStrikeRows). Scoping this update to only the
+            // currently-in-band strikes (an earlier version of this method) let a strike's
+            // baseline go stale while ATM drifted it out of the +/-5 band, so its volumeDelta on
+            // re-entry silently summed several cadences' worth of volume at once instead of one --
+            // caught by CoreScoreReplayDiff as a persistent, large NotionalVolumeRatioRaw
+            // mismatch that neither the band-selection nor the mark-forward-fill fix touched.
+            if (!_latest.TryGetValue(option.Token, out var state))
+            {
+                continue;
+            }
+
+            var volumeDelta = _previousVolumeByTokenCoreScore.TryGetValue(option.Token, out var previousVolume)
+                ? Math.Max(0, state.Volume - previousVolume)
+                : 0;
+            _previousVolumeByTokenCoreScore[option.Token] = state.Volume;
+
+            if (_coreCadenceMidPriceByToken.GetValueOrDefault(option.Token) is { } freshMark && freshMark > 0)
+            {
+                _coreLastMarkByToken[option.Token] = freshMark;
+            }
+
+            if (!strikeOffsets.TryGetValue(option.StrikePrice!.Value, out var offset) || Math.Abs(offset) > RatioWideStrikeBand)
+            {
+                continue;
+            }
+
+            if (volumeDelta <= 0 || !_coreLastMarkByToken.TryGetValue(option.Token, out var mark) || mark <= 0)
+            {
+                continue;
+            }
+
+            var notional = (double)volumeDelta * (double)mark;
+            if (option.OptionType == OptionType.Call)
+            {
+                callNotional += notional;
+            }
+            else if (option.OptionType == OptionType.Put)
+            {
+                putNotional += notional;
+            }
+        }
+
+        return callNotional > 0 && putNotional > 0 ? Math.Log(putNotional / callNotional) : null;
+    }
+
+    /// <summary>
+    /// Net gamma exposure, ATM+/-CoreGammaBandOffset, "version A" -- each strike's OWN
+    /// individually-solved IV feeds its own Gamma, NOT the 14-component composite's
+    /// ComputeGammaExposure ("version B": one shared ATM reference vol for every strike).
+    /// Confirmed distinct formulas via docs/SCORE_CANDIDATES.md:697-698 -- the backtest was
+    /// validated on version A specifically; reusing ComputeGammaExposure with just a band filter
+    /// would silently trade version B, a formula never actually backtested. Matches
+    /// CoreScoreOptionSimulator.cs:313-317's sign convention (+call, -put) exactly.
+    ///
+    /// Gamma itself is solved fresh only when a strike has a real two-sided quote THIS cadence
+    /// (<see cref="_coreCadenceMidPriceByToken"/>); otherwise the LAST successfully-solved value
+    /// is reused, frozen, via <see cref="_coreLastGammaByToken"/> (Batch 3 fix -- see that field's
+    /// own doc comment for why re-solving from a stale mid against the current, still-decaying
+    /// underlying/time-to-expiry was a genuine mismatch from the backtest's own forward-fill, not
+    /// a harmless approximation of it).
+    ///
+    /// Band membership (Batch 3 fix, fourth pass) uses the SAME signed INDEX offset
+    /// (<paramref name="strikeOffsets"/>, from <see cref="ComputeStrikeOffsets"/>) DepthImbalance/
+    /// ItmSkew already use, matching CoreScoreOptionSimulator.cs:346's own
+    /// <c>Math.Abs(r.Offset) &lt;= GammaBandOffset</c> exactly -- NOT "nearest 21 strikes by raw
+    /// price distance from spot" (an earlier version of this method), which coincides with the
+    /// index-based band for the narrow Itm2Atm1 strikes DepthImbalance/ItmSkew use (always
+    /// liquid, rarely gapped) but can silently diverge from it at the wide +/-10 band's own edges
+    /// whenever the tracked strike chain has ANY gap (a far, illiquid strike simply never
+    /// resolved as an Instrument) -- caught by CoreScoreReplayDiff as a persistent, moderate
+    /// GammaExposureRaw mismatch (backtest and live including a slightly different strike set at
+    /// the band's edge) that neither the Gamma-freeze fix nor the OI-holdover fix touched.
+    /// </summary>
+    double? ComputeCoreGammaExposureRaw(Dictionary<decimal, int> strikeOffsets, decimal underlying, double t)
+    {
+        double net = 0;
+        var any = false;
+
+        foreach (var option in _nearestExpiryOptions)
+        {
+            if (!strikeOffsets.TryGetValue(option.StrikePrice!.Value, out var offset) || Math.Abs(offset) > CoreGammaBandOffset)
+            {
+                continue;
+            }
+
+            if (!_coreLastOpenInterestByToken.TryGetValue(option.Token, out var oi) || oi <= 0)
+            {
+                continue;
+            }
+
+            if (_coreCadenceMidPriceByToken.GetValueOrDefault(option.Token) is { } freshMid && freshMid > 0)
+            {
+                var iv = ImpliedVolatilitySolver.Solve(option.OptionType, (double)freshMid, (double)underlying, (double)option.StrikePrice!.Value, t, RiskFreeRate);
+                if (iv is { } ivValue)
+                {
+                    _coreLastGammaByToken[option.Token] = BlackScholes.Calculate(option.OptionType, (double)underlying, (double)option.StrikePrice!.Value, t, RiskFreeRate, ivValue).Greeks.Gamma;
+                }
+            }
+
+            if (!_coreLastGammaByToken.TryGetValue(option.Token, out var gamma))
+            {
+                continue;
+            }
+
+            net += option.OptionType == OptionType.Call ? gamma * oi : -(gamma * oi);
+            any = true;
+        }
+
+        return any ? net : null;
+    }
+
+    /// <summary>
+    /// TrendReversion15m (signed net future-price change / path length over a trailing real 15
+    /// minutes, negated) and BasisChange (futureChange - spotChange per cadence) share the same
+    /// per-cadence future/spot price trackers -- computed together since BasisChange needs
+    /// TrendReversion15m's own futureChange as one of its two terms. Matches
+    /// CoreScoreOptionSimulator.cs:319-346 exactly, including TrendReversion15m's negation ("a
+    /// clean recent trend reads as a REVERSION signal, not continuation").
+    ///
+    /// Batch 3 fix (2026-09-13): futureChange/spotChange are THIS cadence's own LTP open-to-close
+    /// (<see cref="_coreFutureCadenceOpen"/>/<see cref="_coreFutureCadenceClose"/> and their spot
+    /// counterparts), matching CadenceContext.FutureChangeFromLastCadence/
+    /// SpotChangeFromLastCadence's actual definition (a within-cadence candle body, despite the
+    /// "FromLastCadence" name) exactly. The original implementation tracked a cross-cadence
+    /// previous-mid-to-current-mid diff instead -- a genuinely different quantity that
+    /// CoreScoreReplayDiff caught as a near-100% mismatch on both terms. Null whenever this
+    /// specific cadence had no future tick (or, for BasisChange, no spot tick either) -- NOT held
+    /// over from an earlier cadence, matching InstrumentPriceState's own per-cadence reset.
+    /// </summary>
+    (double? TrendReversion15m, double? BasisChange) ComputeCoreTrendAndBasis(DateTimeOffset now)
+    {
+        double? trendReversion = null;
+
+        double? futureChange = _coreFutureCadenceClose is { } futureClose && _coreFutureCadenceOpen is { } futureOpen
+            ? (double)(futureClose - futureOpen)
+            : null;
+        double? spotChange = _coreSpotCadenceClose is { } spotClose && _coreSpotCadenceOpen is { } spotOpen
+            ? (double)(spotClose - spotOpen)
+            : null;
+
+        // Enqueue conditionally (only a real futureChange this cadence contributes), but eviction
+        // AND the net/pathLength read run UNCONDITIONALLY every cadence -- matching
+        // CoreScoreOptionSimulator.cs:341-353 exactly. A quiet cadence for the future (no fresh
+        // tick) must still read whatever the window already holds from earlier cadences, not skip
+        // the read entirely -- an earlier version of this fix wrapped the whole eviction+read step
+        // inside the Enqueue's own `if`, silently going null on every quiet cadence even with
+        // plenty of still-fresh history in the window, caught by CoreScoreReplayDiff as a
+        // null-mismatch (backtest real value, live null) clustered on quiet-future cadences.
+        if (futureChange is { } change)
+        {
+            _coreTrendReversionWindow.Enqueue((now, change));
+        }
+
+        while (_coreTrendReversionWindow.Count > 0 && now - _coreTrendReversionWindow.Peek().Timestamp > CoreTrendReversionWindow)
+        {
+            _coreTrendReversionWindow.Dequeue();
+        }
+
+        if (_coreTrendReversionWindow.Count > 0)
+        {
+            var net = _coreTrendReversionWindow.Sum(w => w.Change);
+            var pathLength = _coreTrendReversionWindow.Sum(w => Math.Abs(w.Change));
+            if (pathLength > 0)
+            {
+                trendReversion = -1.0 * (net / pathLength);
+            }
+        }
+
+        double? basisChange = futureChange is { } fChange && spotChange is { } sChange ? fChange - sChange : null;
+
+        return (trendReversion, basisChange);
+    }
+
+    /// <summary>
+    /// Rolling 15-real-minute SUM of (CallOiDelta-PutOiDelta), ATM+/-PersistedStrikeBand -- each
+    /// cadence's own increment is a NAIVE previous-cadence-to-this-cadence OI diff read from
+    /// _previousCadence (must be called BEFORE ComputeCadence overwrites it at the end), NOT
+    /// _oiLookback's ~4-minute comparison ComputeOiBuildupNet uses specifically to dodge OI's slow
+    /// real-world refresh rate -- feeding that 4-minute-lookback delta into a 15-minute rolling SUM
+    /// here would overlap successive readings and badly over-count flow. Matches
+    /// CoreScoreOptionSimulator.cs:348-361's band and naive-diff construction exactly. Null only
+    /// on the very first cadence (no _previousCadence at all yet) -- after that, always a real
+    /// number (0 contributions from a strike with no comparable previous OI, never skipped/null),
+    /// same as the backtest's own unconditional Sum().
+    /// </summary>
+    double? ComputeCoreOiChangeDiffRaw(DateTimeOffset now, decimal spotPrice)
+    {
+        if (_previousCadence is null)
+        {
+            return null;
+        }
+
+        var bandStrikes = _nearestExpiryOptions
+            .Select(o => o.StrikePrice!.Value)
+            .Distinct()
+            .OrderBy(s => Math.Abs(s - spotPrice))
+            .Take((PersistedStrikeBand * 2) + 1)
+            .ToHashSet();
+
+        long callDelta = 0, putDelta = 0;
+
+        foreach (var option in _nearestExpiryOptions.Where(o => bandStrikes.Contains(o.StrikePrice!.Value)))
+        {
+            if (!_latest.TryGetValue(option.Token, out var curr) || curr.OpenInterest is not { } currOi)
+            {
+                continue;
+            }
+
+            if (!_previousCadence.TryGetValue(option.Token, out var prev) || prev.OpenInterest is not { } prevOi)
+            {
+                continue;
+            }
+
+            var delta = currOi - prevOi;
+            if (option.OptionType == OptionType.Call)
+            {
+                callDelta += delta;
+            }
+            else if (option.OptionType == OptionType.Put)
+            {
+                putDelta += delta;
+            }
+        }
+
+        _coreOiChangeDiffWindow.Enqueue((now, callDelta, putDelta));
+        while (_coreOiChangeDiffWindow.Count > 0 && now - _coreOiChangeDiffWindow.Peek().Timestamp > CoreOiChangeDiffWindow)
+        {
+            _coreOiChangeDiffWindow.Dequeue();
+        }
+
+        return _coreOiChangeDiffWindow.Sum(w => (double)(w.CallDelta - w.PutDelta));
+    }
+
+    /// <summary>
+    /// Ranks |raw| against this metric's own session-so-far distribution of magnitudes,
+    /// reattaches raw's sign -- ported unchanged from CoreScoreOptionSimulator.RankSigned. Reads
+    /// the rank BEFORE adding (self-inclusion-safe, no same-bar leakage) -- the one correctness
+    /// rule this whole project has been strictest about.
+    /// </summary>
+    static double? RankSigned(double? raw, SessionRankTracker rank)
+    {
+        if (raw is not { } value || value == 0)
+        {
+            return raw is 0 ? 0.0 : null;
+        }
+
+        var signed = Math.Sign(value) * (rank.Rank(Math.Abs(value)) / 100.0);
+        rank.Add(Math.Abs(value));
+        return signed;
+    }
+
+    // ================== end Core score ==================
 
     // Plan 4.2: mid of bid/ask when the depth snapshot is available, LTP fallback otherwise.
     static decimal? MidPrice(InstrumentState state)
