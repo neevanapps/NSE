@@ -127,4 +127,16 @@ public static class FeatureWindowLengths
     /// same 15-minute window as IvSkew/SpreadRatio rather than the 30-minute OI-driven ones.
     /// </summary>
     public static readonly TimeSpan StraddleRichness = TimeSpan.FromMinutes(15);
+
+    /// <summary>
+    /// How far back the tracked future's own price-vs-VWAP deviation is z-scored (audit finding
+    /// F55's price-led dynamic-hybrid mode, 2026-09-11). Deliberately a rolling window, not a
+    /// full-session one -- short enough to warm up in the first half hour (matching every other
+    /// window in this class) and to stay reactive to the *current* regime rather than averaging
+    /// across the whole day including calmer or more volatile earlier stretches, which is
+    /// actually the more F59-aligned choice here (a fixed full-session window would get
+    /// progressively less sensitive as the day went on, the same trap the DynamicHybrid rank
+    /// cutoff fell into against a growing distribution).
+    /// </summary>
+    public static readonly TimeSpan FuturesVwapDeviation = TimeSpan.FromMinutes(30);
 }

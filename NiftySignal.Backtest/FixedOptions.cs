@@ -1,5 +1,6 @@
 using NiftySignal.Host;
 using NiftySignal.Notifications;
+using NiftySignal.Rules;
 
 namespace NiftySignal.Backtest;
 
@@ -12,6 +13,19 @@ namespace NiftySignal.Backtest;
 public sealed class FixedOptions<T>(T value) : IValidatedOptions<T>
 {
     public T Current { get; } = value;
+}
+
+/// <summary>
+/// Audit finding F55's dynamic-hybrid mode (2026-09-11): unlike FixedOptions, this can be
+/// updated between cadences. LiveTradingEngine's own `_config => rulesetOptions.Current` reads
+/// this property fresh on every access (see its own doc comment) -- exactly the hot-reload
+/// behavior this was originally built for, repurposed here so BacktestRunner can hand it a
+/// freshly-derived RulesetConfig (session-rank-relative Entry.MinAbsScore/Exit.ExitOnScoreBelowAbs)
+/// before each EvaluateCadenceAsync call, with zero changes to LiveTradingEngine itself.
+/// </summary>
+public sealed class MutableRulesetOptions(RulesetConfig initial) : IValidatedOptions<RulesetConfig>
+{
+    public RulesetConfig Current { get; set; } = initial;
 }
 
 /// <summary>

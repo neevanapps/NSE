@@ -317,6 +317,15 @@ namespace NiftySignal.Persistence.Migrations
                     b.Property<double?>("FuturesBasisZ")
                         .HasColumnType("double precision");
 
+                    b.Property<double?>("FuturesVwap")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("FuturesVwapDeviationRaw")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("FuturesVwapDeviationZ")
+                        .HasColumnType("double precision");
+
                     b.Property<double?>("GammaExposureRaw")
                         .HasColumnType("double precision");
 
@@ -368,6 +377,9 @@ namespace NiftySignal.Persistence.Migrations
                     b.Property<double?>("RatioCompositeScore")
                         .HasColumnType("double precision");
 
+                    b.Property<double?>("RatioCompositeScoreFast")
+                        .HasColumnType("double precision");
+
                     b.Property<double?>("RatioCompositeScoreRaw")
                         .HasColumnType("double precision");
 
@@ -378,6 +390,9 @@ namespace NiftySignal.Persistence.Migrations
                         .HasColumnType("boolean");
 
                     b.Property<double?>("RatioIvSkew25dRaw")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("RatioMomentum")
                         .HasColumnType("double precision");
 
                     b.Property<double?>("RatioNotionalVolumeRaw")

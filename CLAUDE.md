@@ -71,6 +71,30 @@ an entry there.
   until there's a deliberate decision to wire it in — don't let a refactor accidentally add a
   read of `RatioCompositeScore` into the trading path.
 
+## Strategy goal
+
+Target is roughly **5 to 10 trades/day** — this has been the intent since
+`CompositeSmoothingCadences` was first tuned (`LiveFeatureEngine.cs`'s own 2026-09-07 comment: "a
+deliberately low-frequency, 1-5-trades-a-day strategy"), refined 2026-09-11 to a 5-10/day band.
+Judge any change to entry thresholds, smoothing windows, or sustain requirements against this — a
+change that pushes qualification rate far outside 5-10/day is a red flag worth surfacing
+explicitly, not something to tune past silently.
+
+## Backtesting is a long-term process
+
+Never treat one day's, or even one week's, backtest run as a verdict. A run is a data point in an
+accumulating series — frame it that way when reporting results, and don't recommend a threshold,
+weight, or sign change off a single run. Design data generation and analysis for continued,
+multi-session accumulation, not a one-off dataset sized for a single validation pass.
+
+## Backtesting process rules (2026-09-12)
+
+- **The user runs the backtest console themselves — never run `dotnet run --project NiftySignal.Backtest` (or any backtest command) unilaterally.** This is a major process the user wants full visibility into: they want to be aware of every line of code involved, and they run the console so they see it execute, not just its final printed report.
+- **Follow the user's backtesting instructions completely.** If an instruction looks wrong, internally inconsistent, or likely to produce a misleading result, **flag it immediately and propose the corrected path** before proceeding — don't silently comply with something that looks like a mistake, and don't silently deviate either.
+- **Don't modify `NiftySignal.Host` or `NiftySignal.Dashboard` until backtesting has found a real edge.** All backtest-only work stays inside `NiftySignal.Backtest`/the backtest-only substitution mechanism (see "Ratio score stays out of live trading" above) — the live paper-trading system is not a staging ground for in-progress backtest ideas.
+- **Every rule used for backtesting must be dynamic or DTE-based — no hardcoded threshold constants.** This generalizes the earlier DynamicHybrid-specific mandate ("no hardcoded metric or value for entry or exit") to backtesting rules generally: entry/exit thresholds, sustain requirements, rank cutoffs, etc. should be derived from the data (percentiles, rolling ranks, DTE-conditioned) rather than a fixed magnitude picked by eye. This does not extend to structural/architectural constants that aren't decision thresholds (e.g. a rolling window's duration, a strike band's width) — if that boundary is ever unclear for a specific rule, ask rather than assume.
+- **New backtest datasets need approval before creation.** Backtesting will work off a dataset built fresh from tick data (not reusing `niftysignal_vm_copy`'s existing `score_snapshots`/`strike_snapshots` tables as-is). Creating a new table or CSV file for this is allowed, but tell the user what's being created and why, and get explicit approval first — don't create it unprompted.
+
 ## Risk
 
 Risk/capital gates in `NiftySignal.Rules/EntryRuleEvaluator.cs` and
@@ -78,6 +102,54 @@ Risk/capital gates in `NiftySignal.Rules/EntryRuleEvaluator.cs` and
 never bypasses `MaxConcurrentPositions`, the capital-sum check (F48), `MaxDailyLossPct`, or the
 kill switch. If a change to entry/exit logic could weaken any of these under some input, say so
 explicitly before implementing, even if the change's main purpose is unrelated.
+
+## Metric-by-metric evaluation process (2026-09-12)
+
+Each candidate metric for the future unified score goes through the same cycle before it's
+trusted, one metric at a time: try multiple formulations/variations of it, correlate each against
+real price data (backward AND forward, same methodology every time — see `docs/REVIEW_FINDINGS.md`
+for the depth-imbalance and CVD-proxy examples), and reach an **explicit conclusion** — does this
+metric show real edge, yes or no. Only a metric explicitly concluded to have edge gets added to the
+scoring list. This is not a one-off exercise for `FutureDepthImbalance`/`FutureCvdProxy` — the same
+cycle repeats for every other candidate metric on the ranked list before any of them get a real
+weight. Record every iteration's findings in `docs/REVIEW_FINDINGS.md`, dated, whether the result
+is positive or negative — a metric that fails this cycle is itself a useful, worth-recording
+finding, not a dead end to discard quietly.
+
+**No gating during single-metric evaluation (2026-09-12).** A single metric's diagnostic trials
+(correlation, plain trade simulation) must not grow conditional logic — regime filters, flip-delay
+gates, confirmation-from-another-series — bolted on to rescue its results. That conflates "does
+this metric carry directional information" with "how would we act on it," and with only a handful
+of real days available, any such gate ends up fit to those specific days rather than a real
+distinction (confirmed directly: a trend-efficiency flip-gate built to fix one bad day in an
+always-positioned `FutureCvdProxy` simulation fixed that day and made a previously-good day much
+worse, net negative overall — see `docs/REVIEW_FINDINGS.md`, "six variants" section). If a
+candidate regime signal (trend efficiency, VIX, anything else) seems genuinely useful, it goes
+through its own entry in `docs/SCORE_CANDIDATES.md` and its own evaluation cycle — it does not get
+wired into another metric's trading rule ahead of that. Gating/regime-conditioning is a
+composite-score-stage or production-rule-stage concern, not a single-metric-stage one.
+
+## The endgame is a multi-metric composite score, not a single winning metric (2026-09-12)
+
+User's own words, worth keeping verbatim in spirit: the goal is **not** to find one single metric
+strong enough to trade on directly. It's to identify 5-8 metrics that each individually clear the
+evaluation cycle above, combine them into **one weighted composite score**, and trade off that
+score's direction. Individual metrics can (and will) disagree at any given moment — one reading
+bullish, another bearish — and the combined score is what resolves that disagreement into a single,
+more confident directional read, the same reasoning that motivated the original 14-component
+composite score in production. A more stable, multi-input score should also naturally support
+longer holding periods (fewer, higher-quality trades) without needing to force it artificially,
+since it won't whipsaw on the kind of single-metric noise a lone signal (like `FutureCvdProxyNet5Min`
+on its own) already showed (1-8 minute average trade durations in the first live-fire simulation).
+Real risk control (`MaxDailyLossPct`, `MaxConcurrentPositions`, the kill switch) is expected to live
+in the eventual production rules, not be reinvented inside exploratory single-metric trials.
+
+**What this means in practice**: exploratory single-metric simulations (`NiftySignal.MetricTrials`)
+are diagnostic tools for validating one metric's own directional edge in isolation — they are not a
+rehearsal of the final trading strategy's shape, and a single metric's simulated trade frequency/
+duration should not be over-optimized as if it were the end product. Don't lose sight of this when a
+single-metric experiment's results look thin — the real test is what the *combined* score does once
+enough individually-validated metrics exist to build it.
 
 ## Working process
 

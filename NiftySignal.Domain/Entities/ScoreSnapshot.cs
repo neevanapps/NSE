@@ -271,4 +271,52 @@ public sealed class ScoreSnapshot
     /// from a 5-of-5 bar without re-deriving presence from the five Ratio*Raw columns' nullness.
     /// </summary>
     public int RatioComponentsPresent { get; set; }
+
+    /// <summary>
+    /// Audit finding F55 (2026-09-11, live-caught: every ratio-score entry in an 11 Sep backtest
+    /// landed at a local price extreme, after the move that justified it had already run). The
+    /// same five ratio inputs, combined the same way (RatioScoreCalculator, same weights, same
+    /// k), but smoothed over LiveFeatureEngine.RatioFastSmoothingCadences (~2 min) instead of the
+    /// ~12-minute RatioCompositeSmoothingCadences RatioCompositeScore above uses -- structurally
+    /// identical to it, just faster to react. Warms up before RatioCompositeScore does, since its
+    /// window is shorter; not restart-replayed (see LiveFeatureEngine.SeedHistory's own comment)
+    /// since a 2-minute window self-heals from a cold FIFO quickly enough that the replay gap
+    /// that mattered for the 12-minute window doesn't apply here.
+    /// </summary>
+    public double? RatioCompositeScoreFast { get; set; }
+
+    /// <summary>
+    /// <see cref="RatioCompositeScoreFast"/> minus <see cref="RatioCompositeScore"/> (audit
+    /// finding F55) -- positive means the fast read has pulled bullish ahead of the slow read,
+    /// negative bearish. Null unless both are warmed up (the slow one is the binding constraint,
+    /// same as today). Trivially derivable from the two columns above but persisted directly so
+    /// it's queryable without every consumer re-deriving the subtraction.
+    /// </summary>
+    public double? RatioMomentum { get; set; }
+
+    /// <summary>
+    /// The tracked future's own cumulative VWAP, reset once per trading day (audit finding F55's
+    /// price-led dynamic-hybrid mode, 2026-09-11 -- see LiveFeatureEngine.OnTick's accumulation
+    /// and ComputeCadence's own comment for why price, not any option-derived metric, drives
+    /// entry timing). Null until the future has traded any volume yet today.
+    /// </summary>
+    public double? FuturesVwap { get; set; }
+
+    /// <summary>
+    /// The future's last price minus <see cref="FuturesVwap"/>, in price points -- the raw value
+    /// <see cref="FuturesVwapDeviationZ"/> is z-scored from. Persisted separately (not just
+    /// derivable from FuturesVwap and a price column) so LiveFeatureEngine.SeedHistory can replay
+    /// it back into the rolling window on restart, the same way every other z-scored component's
+    /// own Raw column already does.
+    /// </summary>
+    public double? FuturesVwapDeviationRaw { get; set; }
+
+    /// <summary>
+    /// <see cref="FuturesVwapDeviationRaw"/> z-scored against its own rolling window
+    /// (LiveFeatureEngine.FeatureWindowLengths.FuturesVwapDeviation, 30 min) -- self-scaling by
+    /// construction (normalized by the future's own real, current volatility), the primary
+    /// signal BacktestRunner's price-led dynamic-hybrid mode ranks and trades on. Null until the
+    /// window has warmed up.
+    /// </summary>
+    public double? FuturesVwapDeviationZ { get; set; }
 }

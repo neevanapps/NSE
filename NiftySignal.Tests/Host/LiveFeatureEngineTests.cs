@@ -2046,4 +2046,154 @@ public class LiveFeatureEngineTests
         Assert.InRange(impliedCallIv, 0.21, 0.59);
         Assert.True(Math.Abs(impliedCallIv - 0.60) > 0.05, $"Interpolated call IV ({impliedCallIv:F4}) must not equal Phase 1's nearest-single-strike pick (0.60).");
     }
+
+    [Fact]
+    public void RatioMomentum_IsNull_OnTheFirstCadence_BeforeEitherCompositeWarmsUp()
+    {
+        // Audit finding F55: RatioMomentum is RatioCompositeScoreFast minus RatioCompositeScore,
+        // so it can't exist before both exist -- mirrors the existing "null before warm-up"
+        // style already used for the slow composite's own first-cadence tests.
+        var engine = new LiveFeatureEngine(WideRatioUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        TickWideRatioUniverse(engine, Start);
+
+        var snapshot = engine.ComputeCadence(Start);
+
+        Assert.NotNull(snapshot);
+        Assert.Null(snapshot!.RatioCompositeScoreFast);
+        Assert.Null(snapshot.RatioMomentum);
+    }
+
+    [Fact]
+    public void RatioMomentum_GoesPositive_WhenTheMarketShiftsBullish_BeforeTheSlowCompositeCatchesUp()
+    {
+        // Audit finding F55 (2026-09-11, live-caught): every ratio-score entry in an 11 Sep
+        // backtest landed at a local price extreme because RatioCompositeScore's ~12-minute
+        // smoothing window was still "confirming" a move well after it had already run. This is
+        // the actual mechanism meant to fix that: a fast (RatioFastSmoothingCadences, ~2 min)
+        // and slow (RatioCompositeSmoothingCadences, ~12 min) copy of the same five metrics,
+        // combined the same way. A flat baseline, then a real bullish shift, proves the fast
+        // read moves toward the new regime while the slow read -- still carrying the flat
+        // baseline samples in its longer window -- lags behind it, exactly the divergence
+        // RatioMomentum (fast minus slow) exists to surface.
+        var engine = new LiveFeatureEngine(WideRatioUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+
+        var at = Start;
+        ScoreSnapshot? snapshot = null;
+
+        // Flat baseline: same underlying/vol every cadence, long enough that both FIFOs hold
+        // several identical samples (metrics 1/2 need a real prior tick to diff against, so the
+        // very first cadence alone wouldn't populate them).
+        for (var i = 0; i < 5; i++)
+        {
+            TickWideRatioUniverse(engine, at, underlying: 23950m, vol: 0.40);
+            snapshot = engine.ComputeCadence(at);
+            at = at.AddSeconds(15);
+        }
+
+        // Real bullish shift: underlying ramps up every cadence for several more cadences --
+        // comfortably within the fast window (8 cadences) but a small minority of the slow
+        // window's now-accumulated sample count, so the fast average should read meaningfully
+        // more bullish than the slow one.
+        for (var i = 1; i <= 8; i++)
+        {
+            TickWideRatioUniverse(engine, at, underlying: 23950m + (i * 15m), vol: 0.40);
+            snapshot = engine.ComputeCadence(at);
+            at = at.AddSeconds(15);
+        }
+
+        Assert.NotNull(snapshot);
+        Assert.NotNull(snapshot!.RatioCompositeScoreFast);
+        Assert.NotNull(snapshot.RatioCompositeScore);
+        Assert.NotNull(snapshot.RatioMomentum);
+        Assert.True(
+            snapshot.RatioCompositeScoreFast!.Value > snapshot.RatioCompositeScore!.Value,
+            $"Fast ({snapshot.RatioCompositeScoreFast.Value:F2}) should have pulled ahead of slow ({snapshot.RatioCompositeScore.Value:F2}) after a sustained bullish shift.");
+        Assert.Equal(snapshot.RatioCompositeScoreFast.Value - snapshot.RatioCompositeScore.Value, snapshot.RatioMomentum!.Value, precision: 6);
+        Assert.True(snapshot.RatioMomentum.Value > 0, $"RatioMomentum ({snapshot.RatioMomentum.Value:F2}) should be positive after a sustained bullish shift.");
+    }
+
+    [Fact]
+    public void FuturesVwapDeviationZ_IsNull_BeforeTheThirtyMinuteWindowWarmsUp()
+    {
+        // Audit finding F55's price-led dynamic-hybrid mode: FeatureWindowLengths.FuturesVwapDeviation
+        // is 30 minutes of real elapsed time (WelfordRollingWindow.IsWarmedUp), not a cadence
+        // count -- a single early cadence must not report a z-score.
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start, volume: 1_000));
+
+        var snapshot = engine.ComputeCadence(Start);
+
+        Assert.NotNull(snapshot);
+        Assert.Null(snapshot!.FuturesVwapDeviationZ);
+        // FuturesVwap itself is also null on this very first cadence -- the first tick for any
+        // token always contributes a zero volume delta (no prior baseline to diff against yet,
+        // same "no prior observation" convention every other VolumeDelta-based metric in this
+        // class already follows), so cumulative volume is still 0 here.
+        Assert.Null(snapshot.FuturesVwap);
+
+        // A second tick with real volume gives the future a real delta to accumulate -- VWAP
+        // becomes available (even though the z-score still isn't, real elapsed time is nowhere
+        // near 30 minutes yet).
+        var next = Start.AddSeconds(15);
+        engine.OnTick(MakeTick(FutureToken, 24010m, next, volume: 2_000));
+        var snapshot2 = engine.ComputeCadence(next);
+
+        Assert.NotNull(snapshot2);
+        Assert.Null(snapshot2!.FuturesVwapDeviationZ);
+        Assert.NotNull(snapshot2.FuturesVwap);
+    }
+
+    [Fact]
+    public void FuturesVwapDeviationZ_GoesPositive_WhenPriceJumpsAwayFromAnAlreadyWarmFlatBaseline()
+    {
+        // Audit finding F55's price-led dynamic-hybrid mode (2026-09-11, user's own diagnosis:
+        // every ratio metric is built from option chain data that *reacts* to price, so none of
+        // it can lead -- entries need something that moves *with* price instead). The future's
+        // own price relative to its own volume-weighted average price is the most direct,
+        // zero-lag signal available.
+        //
+        // Warm the 30-minute window on a long, FLAT baseline first (so its recent-history mean
+        // and stddev are small and stable), then check right after a fresh jump -- not at the end
+        // of a long climb. A first version of this test checked *after* a 100-cadence climb and
+        // got a *negative* z-score: VWAP is a cumulative, never-evicting average, so across a long
+        // climb it keeps catching up to the new price, meaning deviation itself decays over the
+        // climb -- by the end, current deviation can legitimately sit *below* the rolling window's
+        // own recent (still climb-dominated, still-elevated) mean, even though the raw deviation
+        // is still positive. That's the metric correctly measuring "still rising or already
+        // settling," not a bug -- but it means the right moment to see a clean positive spike is
+        // right as the jump happens, before VWAP has had time to react to it.
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+
+        var at = Start;
+        ScoreSnapshot? snapshot = null;
+
+        // Flat baseline, 130 cadences (32.5 min -- comfortably past the 30-minute warm-up mark),
+        // constant per-tick volume delta (Tick.Volume is cumulative day volume, so this must keep
+        // growing -- 1_000*(i+1) gives an exact 1_000 delta every tick, i.e. equal VWAP weighting
+        // per tick, not "no new volume" the way a literal constant Volume value would).
+        for (var i = 0; i < 130; i++)
+        {
+            engine.OnTick(MakeTick(FutureToken, 24000m + (i % 2), at, volume: 1_000 * (i + 1)));
+            snapshot = engine.ComputeCadence(at);
+            at = at.AddSeconds(15);
+        }
+
+        // A sharp jump to 24200, one cadence in: 130 flat ticks already anchor VWAP near 24000,
+        // so a single new tick barely moves it -- deviation jumps to roughly +200 while the
+        // window's recent mean/stddev are still small (dominated by the flat baseline), which is
+        // exactly the "fresh, sharp move" case this metric exists to catch fast.
+        engine.OnTick(MakeTick(FutureToken, 24200m, at, volume: 1_000 * 131));
+        var jumpSnapshot = engine.ComputeCadence(at);
+
+        Assert.NotNull(jumpSnapshot);
+        Assert.NotNull(jumpSnapshot!.FuturesVwapDeviationZ);
+        Assert.True(jumpSnapshot.FuturesVwapDeviationRaw > 0, $"Raw deviation ({jumpSnapshot.FuturesVwapDeviationRaw:F2}) should be positive right after the jump.");
+        Assert.True(jumpSnapshot.FuturesVwapDeviationZ!.Value > 0, $"FuturesVwapDeviationZ ({jumpSnapshot.FuturesVwapDeviationZ.Value:F2}) should be positive right after a fresh jump above an already-warm flat baseline.");
+    }
 }

@@ -128,10 +128,33 @@ public sealed class LiveFeatureEngine
     // low-frequency, 1-5-trades-a-day strategy; shortened the same day after watching the
     // first live session -- still meaningfully smoothed versus no averaging at all, just less
     // lag between a real move and the score reflecting it).
+    //
+    // PENDING (audit finding F53) -- this smooths only the combined raw composite, not each of
+    // the 14 components individually the way the ratio composite's five metrics already are
+    // (audit finding F51). See docs/REVIEW_FINDINGS.md.
     const int CompositeSmoothingCadences = 12;
 
-    /// <summary>~12 minutes at the 15s cadence -- inside the ratio composite's requested 10-15 minute smoothing range (weekend build, 2026-09-09).</summary>
+    /// <summary>
+    /// ~12 minutes at the 15s cadence -- inside the ratio composite's requested 10-15 minute
+    /// smoothing range (weekend build, 2026-09-09).
+    ///
+    /// PENDING (audit finding F59) -- fixed regardless of DTE or VIX regime; a window sized for
+    /// a normal session may not be right on expiry day or when VIX is elevated. See
+    /// docs/REVIEW_FINDINGS.md.
+    /// </summary>
     const int RatioCompositeSmoothingCadences = 48;
+
+    /// <summary>
+    /// ~2 minutes at the 15s cadence (audit finding F55, 2026-09-11) -- the "fast" window a
+    /// second copy of each ratio metric is smoothed over, alongside (not instead of) the ~12
+    /// minute <see cref="RatioCompositeSmoothingCadences"/> window above. Live-caught 11 Sep:
+    /// every ratio-score entry in a backtest landed at a local price extreme because a 12-minute
+    /// window was still "confirming" a ~10-minute spike after it had already reversed. Trading
+    /// the gap between a fast and slow read of the same signal (RatioMomentum) reacts within this
+    /// window instead of the slow one, without needing the slow window's own smoothing (still
+    /// used for the "is this a real, sustained level" read) to get any shorter.
+    /// </summary>
+    const int RatioFastSmoothingCadences = 8;
 
     readonly IReadOnlyList<Instrument> _instruments;
     readonly Instrument _spot;
@@ -169,6 +192,17 @@ public sealed class LiveFeatureEngine
     readonly WelfordRollingWindow _gammaExposureWindow = new(FeatureWindowLengths.GammaExposure);
     readonly WelfordRollingWindow _volumePcrWindow = new(FeatureWindowLengths.VolumePcr);
     readonly WelfordRollingWindow _spreadRatioWindow = new(FeatureWindowLengths.SpreadRatio);
+
+    // Audit finding F55's price-led dynamic-hybrid mode (2026-09-11): the tracked future's own
+    // cumulative VWAP, reset once per day (this class's own lifetime already resets per day --
+    // see BacktestRunner's one-LiveFeatureEngine-per-trading-day design). _previousFutureVolume
+    // is the same "diff cumulative day volume against the prior tick" baseline pattern
+    // _previousVolumeByToken already uses, just scoped to the single future token rather than a
+    // per-option dictionary.
+    long? _previousFutureVolume;
+    double _futureCumulativePriceVolume;
+    double _futureCumulativeVolume;
+    readonly WelfordRollingWindow _futuresVwapDeviationWindow = new(FeatureWindowLengths.FuturesVwapDeviation);
     readonly WelfordRollingWindow _vannaExposureWindow = new(FeatureWindowLengths.VannaExposure);
     readonly WelfordRollingWindow _charmExposureWindow = new(FeatureWindowLengths.CharmExposure);
     readonly WelfordRollingWindow _cvdProxyWindow = new(FeatureWindowLengths.CvdProxy);
@@ -240,6 +274,17 @@ public sealed class LiveFeatureEngine
     readonly Queue<double> _ratioResidualDifferenceHistory = new();
     readonly Queue<double> _ratioIvSkew25dHistory = new();
     readonly Queue<double> _ratioSpreadAtmHistory = new();
+
+    // Audit finding F55 (2026-09-11): a second, faster-windowed FIFO per ratio metric, alongside
+    // (not instead of) the slow ones above -- feeds a second RatioScoreCalculator.Calculate call
+    // producing RatioCompositeScoreFast, so RatioMomentum (fast minus slow) can react to a real
+    // move within RatioFastSmoothingCadences instead of RatioCompositeSmoothingCadences. See
+    // ComputeCadence's combine step and ScoreSnapshot.RatioMomentum's own doc comment.
+    readonly Queue<double> _ratioNotionalVolumeHistoryFast = new();
+    readonly Queue<double> _ratioSizedOiFlowHistoryFast = new();
+    readonly Queue<double> _ratioResidualDifferenceHistoryFast = new();
+    readonly Queue<double> _ratioIvSkew25dHistoryFast = new();
+    readonly Queue<double> _ratioSpreadAtmHistoryFast = new();
 
     readonly RunningAverage _basisSamples = new();
     readonly RunningAverage _parityGapSamples = new();
@@ -371,6 +416,20 @@ public sealed class LiveFeatureEngine
     public void OnTick(Tick tick)
     {
         _latest[tick.Token] = new InstrumentState(tick.LastPrice, tick.Volume, tick.OpenInterest, tick.Depth);
+
+        // Audit finding F55's price-led dynamic-hybrid mode (2026-09-11): accumulate the future's
+        // own VWAP per tick, not per cadence -- same reasoning as everywhere else ticks feed
+        // _latest directly rather than waiting for the next cadence, since the whole point of
+        // this metric is minimizing lag. Every tick contributes its volume delta at that tick's
+        // own price, exactly like a real VWAP -- not just a per-cadence sample of price.
+        if (tick.Token == _future.Token)
+        {
+            var volumeDelta = _previousFutureVolume is { } previousVolume ? Math.Max(0, tick.Volume - previousVolume) : 0;
+            _previousFutureVolume = tick.Volume;
+
+            _futureCumulativePriceVolume += (double)tick.LastPrice * volumeDelta;
+            _futureCumulativeVolume += volumeDelta;
+        }
     }
 
     /// <summary>
@@ -483,6 +542,16 @@ public sealed class LiveFeatureEngine
             ReplayRatioMetricHistory(_ratioIvSkew25dHistory, snapshot.RatioIvSkew25dRaw, RatioCompositeSmoothingCadences);
             ReplayRatioMetricHistory(_ratioSpreadAtmHistory, snapshot.RatioSpreadAtmRaw, RatioCompositeSmoothingCadences);
 
+            // Audit finding F55 (2026-09-11): the five *fast* FIFOs (_ratioNotionalVolumeHistoryFast
+            // etc.) are deliberately NOT replayed here, unlike the slow ones above. That replay
+            // exists because skipping it would silently re-introduce the exact smoothing-reset
+            // bug already fixed once for a ~12-minute window (2026-09-04 incident) -- at
+            // RatioFastSmoothingCadences' much shorter ~2-minute window, the cost of a cold start
+            // is genuinely small (self-heals from real ticks within ~2 minutes of any restart),
+            // so the extra complexity of also replaying a second set of FIFOs from the same
+            // already-slow-smoothed persisted values (which wouldn't even be a correct fast-FIFO
+            // seed -- see RatioCompositeScoreFast's own doc comment) isn't worth it.
+
             if (snapshot.VixChangeRaw is { } vixChange)
             {
                 _vixWindow.Add(snapshot.ComputedAt, vixChange);
@@ -506,6 +575,21 @@ public sealed class LiveFeatureEngine
             if (snapshot.VannaExposureRaw is { } vannaExposure)
             {
                 _vannaExposureWindow.Add(snapshot.ComputedAt, vannaExposure);
+            }
+
+            // Audit finding F55's price-led dynamic-hybrid mode (2026-09-11): same replay
+            // discipline as every other z-scored rolling window here -- not optional, skipping it
+            // would reset this 30-minute window's warm-up to zero on every restart, the exact
+            // 2026-09-04 bug class this replay method exists to prevent. Only the deviation
+            // window is replayed; _futureCumulativePriceVolume/_futureCumulativeVolume (the VWAP
+            // itself) are NOT -- a restart mid-session would need the day's full tick history to
+            // rebuild the true cumulative VWAP, which SeedHistory's snapshot-only replay can't
+            // provide (an accepted gap, same spirit as _previousCadence's own documented restart
+            // limitations -- VWAP rebuilds correctly from the next restart-to-restart span of real
+            // ticks, just starts from today's post-restart price as an implicit new baseline).
+            if (snapshot.FuturesVwapDeviationRaw is { } futuresVwapDeviation)
+            {
+                _futuresVwapDeviationWindow.Add(snapshot.ComputedAt, futuresVwapDeviation);
             }
 
             if (snapshot.CharmExposureRaw is { } charmExposure)
@@ -567,6 +651,16 @@ public sealed class LiveFeatureEngine
     /// <see cref="SyntheticForwardStrikeCount"/> strikes nearest spot, each with both a call
     /// and put quote -- falls back to spot itself when no strike has both legs quoted yet
     /// (e.g. very early in the session), rather than blocking every downstream calculation.
+    /// PENDING (external review, 2026-09-12): this spot-fallback reintroduces the too-low-S bias
+    /// on the exact cadences it triggers on, unlike CadencePopulator's equivalent
+    /// (ComputeSyntheticUnderlyingForChain), which nulls out instead of falling back -- "never
+    /// fabricate, always null when uncertain" is this codebase's own stated convention elsewhere.
+    /// Not fixed yet: doing so properly means changing this method's return type to nullable and
+    /// reviewing all 7 call sites' null-propagation (basis, GEX, IV/Delta/Gamma/Theta/Vega, and
+    /// others) -- a real refactor of live scoring code, not a one-line change, and everything it
+    /// currently feeds (GammaExposure/VannaExposure/CharmExposure) is zero-weighted in the live
+    /// composite today, so the practical exposure is low. Revisit deliberately, not as part of an
+    /// unrelated cleanup pass.
     /// </summary>
     decimal ComputeUnderlyingPrice(decimal spotPrice, double t)
     {
@@ -886,13 +980,18 @@ public sealed class LiveFeatureEngine
     /// the ratio composite's own combined-level FIFO this used to also feed was retired once
     /// per-metric smoothing landed (audit finding F51, 2026-09-10) rather than smoothing an
     /// already-smoothed signal a second time.
+    ///
+    /// <paramref name="windowCadences"/> added (audit finding F55, 2026-09-11) so the same
+    /// method can smooth a "slow" and a "fast" copy of each metric into two separate <paramref
+    /// name="history"/> queues -- the window length is no longer implicitly
+    /// RatioCompositeSmoothingCadences.
     /// </summary>
-    static double? SmoothRatioMetric(Queue<double> history, double? instantRaw)
+    static double? SmoothRatioMetric(Queue<double> history, double? instantRaw, int windowCadences)
     {
         if (instantRaw is { } raw)
         {
             history.Enqueue(raw);
-            while (history.Count > RatioCompositeSmoothingCadences)
+            while (history.Count > windowCadences)
             {
                 history.Dequeue();
             }
@@ -1161,18 +1260,28 @@ public sealed class LiveFeatureEngine
         var ratioIsWarmedUp = false;
         string? ratioWeightSetVersion = null;
         var ratioComponentsPresent = 0;
+        double? ratioCompositeScoreFast = null, ratioMomentum = null;
         try
         {
+            // Instants captured before either smoothing call overwrites the locals below --
+            // audit finding F55 (2026-09-11) needs the same instant fed into two FIFOs
+            // (RatioCompositeSmoothingCadences and RatioFastSmoothingCadences), not just one.
+            var instantNotionalVolume = ratioNotionalVolumeRaw;
+            var instantSizedOiFlow = ratioSizedOiFlowRaw;
+            var instantResidualDifference = ratioResidualDifferenceRaw;
+            var instantIvSkew25d = ratioIvSkew25dRaw;
+            var instantSpreadAtm = ratioSpreadAtmRaw;
+
             // Audit finding F51 (2026-09-10): each metric smoothed over the same
             // ~12-minute window as the combined score, before clipping/combining -- see
             // SmoothRatioMetric's own doc comment. Instant raw is still what gets fed in
             // (Enqueue happens inside SmoothRatioMetric); what comes back, and what's clipped
             // and persisted below, is the smoothed value.
-            ratioNotionalVolumeRaw = SmoothRatioMetric(_ratioNotionalVolumeHistory, ratioNotionalVolumeRaw);
-            ratioSizedOiFlowRaw = SmoothRatioMetric(_ratioSizedOiFlowHistory, ratioSizedOiFlowRaw);
-            ratioResidualDifferenceRaw = SmoothRatioMetric(_ratioResidualDifferenceHistory, ratioResidualDifferenceRaw);
-            ratioIvSkew25dRaw = SmoothRatioMetric(_ratioIvSkew25dHistory, ratioIvSkew25dRaw);
-            ratioSpreadAtmRaw = SmoothRatioMetric(_ratioSpreadAtmHistory, ratioSpreadAtmRaw);
+            ratioNotionalVolumeRaw = SmoothRatioMetric(_ratioNotionalVolumeHistory, instantNotionalVolume, RatioCompositeSmoothingCadences);
+            ratioSizedOiFlowRaw = SmoothRatioMetric(_ratioSizedOiFlowHistory, instantSizedOiFlow, RatioCompositeSmoothingCadences);
+            ratioResidualDifferenceRaw = SmoothRatioMetric(_ratioResidualDifferenceHistory, instantResidualDifference, RatioCompositeSmoothingCadences);
+            ratioIvSkew25dRaw = SmoothRatioMetric(_ratioIvSkew25dHistory, instantIvSkew25d, RatioCompositeSmoothingCadences);
+            ratioSpreadAtmRaw = SmoothRatioMetric(_ratioSpreadAtmHistory, instantSpreadAtm, RatioCompositeSmoothingCadences);
 
             var ratioInputs = new RatioComponentInputs(
                 NotionalVolumeRatio: RatioMetricMath.ClipLogRatio(ratioNotionalVolumeRaw, RatioMetricScales.NotionalVolumeRatioRMax),
@@ -1205,10 +1314,66 @@ public sealed class LiveFeatureEngine
             {
                 ratioWeightSetVersion = ratioComposite.WeightSetVersion;
             }
+
+            // Audit finding F55 (2026-09-11): the same five inputs, same weights, same k --
+            // smoothed over the much shorter RatioFastSmoothingCadences window instead. Purely
+            // additive: RatioCompositeScore/ratioComposite above are computed exactly as before
+            // this fix, so this can never change the slow (already-live-observed) score.
+            var ratioNotionalVolumeRawFast = SmoothRatioMetric(_ratioNotionalVolumeHistoryFast, instantNotionalVolume, RatioFastSmoothingCadences);
+            var ratioSizedOiFlowRawFast = SmoothRatioMetric(_ratioSizedOiFlowHistoryFast, instantSizedOiFlow, RatioFastSmoothingCadences);
+            var ratioResidualDifferenceRawFast = SmoothRatioMetric(_ratioResidualDifferenceHistoryFast, instantResidualDifference, RatioFastSmoothingCadences);
+            var ratioIvSkew25dRawFast = SmoothRatioMetric(_ratioIvSkew25dHistoryFast, instantIvSkew25d, RatioFastSmoothingCadences);
+            var ratioSpreadAtmRawFast = SmoothRatioMetric(_ratioSpreadAtmHistoryFast, instantSpreadAtm, RatioFastSmoothingCadences);
+
+            var ratioInputsFast = new RatioComponentInputs(
+                NotionalVolumeRatio: RatioMetricMath.ClipLogRatio(ratioNotionalVolumeRawFast, RatioMetricScales.NotionalVolumeRatioRMax),
+                SizedOiFlowRatio: RatioMetricMath.ClipLogRatio(ratioSizedOiFlowRawFast, RatioMetricScales.SizedOiFlowRatioRMax),
+                ResidualDifference: RatioMetricMath.ClipScaledDifference(ratioResidualDifferenceRawFast, RatioMetricScales.ResidualDifferenceScale),
+                IvSkew25Delta: RatioMetricMath.ClipLogRatio(ratioIvSkew25dRawFast, RatioMetricScales.IvSkewRatioRMax),
+                SpreadRatioAtm: RatioMetricMath.ClipLogRatio(ratioSpreadAtmRawFast, RatioMetricScales.SpreadRatioAtmRMax));
+
+            var ratioCompositeFast = RatioScoreCalculator.Calculate(
+                ratioInputsFast, RatioScoreWeights.Default, now, RatioScoreCalculator.DefaultK);
+            ratioCompositeScoreFast = ratioCompositeFast.Score;
+
+            // Null unless both are warmed up -- the slow one is the binding constraint (its
+            // window is longer), same as every other "needs two things" gate in this class.
+            if (ratioCompositeFast.IsWarmedUp && ratioCompositeFast.Score is { } fastScore
+                && ratioIsWarmedUp && ratioCompositeScore is { } slowScore)
+            {
+                ratioMomentum = fastScore - slowScore;
+            }
         }
         catch (Exception ex)
         {
             _logger?.LogError(ex, "Ratio composite combine step failed");
+        }
+
+        // Audit finding F55's price-led dynamic-hybrid mode (2026-09-11): own try/catch, same
+        // "one bad thing must not take down everything else" discipline as the ratio composite
+        // block above (audit finding F34) -- a bug here must never prevent _previousCadence/
+        // _lastCadenceAt below from updating.
+        double? futuresVwap = null, futuresVwapDeviationRaw = null, futuresVwapDeviationZ = null;
+        try
+        {
+            if (_latest.TryGetValue(_future.Token, out var futureState) && _futureCumulativeVolume > 0)
+            {
+                var vwap = _futureCumulativePriceVolume / _futureCumulativeVolume;
+                var deviation = (double)futureState.LastPrice - vwap;
+
+                // Compute the z-score BEFORE adding this cadence's own deviation to the window --
+                // the exact same self-inclusion-safe ordering audit finding F46 already fixed for
+                // every other z-scored component, applied here so this new metric doesn't
+                // reintroduce that bug class.
+                futuresVwapDeviationZ = _futuresVwapDeviationWindow.ComputeZScore(deviation);
+                _futuresVwapDeviationWindow.Add(now, deviation);
+                futuresVwap = vwap;
+                futuresVwapDeviationRaw = deviation;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Futures VWAP deviation combine step failed");
         }
 
         // Audit finding F50 (2026-09-10): records this cadence's OI for the lookback window
@@ -1279,6 +1444,11 @@ public sealed class LiveFeatureEngine
             RatioIsWarmedUp = ratioIsWarmedUp,
             RatioWeightSetVersion = ratioWeightSetVersion,
             RatioComponentsPresent = ratioComponentsPresent,
+            RatioCompositeScoreFast = ratioCompositeScoreFast,
+            RatioMomentum = ratioMomentum,
+            FuturesVwap = futuresVwap,
+            FuturesVwapDeviationRaw = futuresVwapDeviationRaw,
+            FuturesVwapDeviationZ = futuresVwapDeviationZ,
         };
     }
 
@@ -1687,6 +1857,14 @@ public sealed class LiveFeatureEngine
     /// ComputeOiBuildupNet does: LongBuildup/ShortCovering for calls, ShortBuildup/LongUnwinding
     /// for puts -- the classifications that mean fresh, price-confirmed positioning on that
     /// side, not unwinding.
+    ///
+    /// PENDING (audit finding F54) -- weighted by |dOI| in contracts, not notional (|dOI| x
+    /// premium). Unlike metric 1 (ComputeRatioNotionalVolumeRaw), which already sums true
+    /// notional per side, this metric currently treats a call-side and put-side OI change of
+    /// the same contract count as equally weighted even when their premiums differ materially.
+    /// A notional-weighted variant is a real, testable alternative, not obviously correct either
+    /// (OI is a position change, not a trade) -- needs an explain-first pass and an A/B backtest,
+    /// not a swap on intuition. See docs/REVIEW_FINDINGS.md.
     ///
     /// Null below <see cref="RatioMetricScales.MinContractsForOiFlow"/> combined constructive
     /// flow -- a quiet bar with near-zero constructive OI on both sides has no real signal, not

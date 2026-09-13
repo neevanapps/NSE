@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Builds the leakage-safe, per-cadence backtest dataset (docs/REVIEW_FINDINGS.md,
+         2026-09-12 design) from raw historical ticks into a brand-new, dedicated database,
+         kept fully isolated from NiftySignal.Persistence's live schema. -->
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="Microsoft.Extensions.Configuration" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Json" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.EnvironmentVariables" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Persistence, read-only here: the source of historical ticks/instruments
+         (niftysignal_vm_copy). This project never writes to NiftySignalDbContext's tables. -->
+    <ProjectReference Include="..\NiftySignal.Domain\NiftySignal.Domain.csproj" />
+    <ProjectReference Include="..\NiftySignal.Persistence\NiftySignal.Persistence.csproj" />
+    <ProjectReference Include="..\NiftySignal.Pricing\NiftySignal.Pricing.csproj" />
+    <ProjectReference Include="..\NiftySignal.Features\NiftySignal.Features.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -27,6 +27,8 @@
     <ProjectReference Include="..\NiftySignal.Notifications\NiftySignal.Notifications.csproj" />
     <ProjectReference Include="..\NiftySignal.Execution\NiftySignal.Execution.csproj" />
     <ProjectReference Include="..\NiftySignal.Backtest\NiftySignal.Backtest.csproj" />
+    <ProjectReference Include="..\NiftySignal.BacktestData\NiftySignal.BacktestData.csproj" />
+    <ProjectReference Include="..\NiftySignal.MetricTrials\NiftySignal.MetricTrials.csproj" />
     <ProjectReference Include="..\NiftySignal.Host\NiftySignal.Host.csproj" />
   </ItemGroup>
 

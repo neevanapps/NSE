@@ -6,10 +6,14 @@ public readonly record struct BlackScholesResult(double Price, OptionGreeks Gree
 
 /// <summary>
 /// Black-Scholes-Merton, European style -- correct for cash-settled Nifty index options
-/// (plan section 4.1). Underlying is expected to be the futures price, not spot (that
-/// implicitly handles the dividend/carry adjustment for index options); dividendYield
-/// defaults to 0 per the plan's documented simplification, kept as a parameter rather than
-/// hardcoded in case that assumption is revisited.
+/// (plan section 4.1). Underlying is expected to be the put-call-parity synthetic forward
+/// (see SyntheticForward.Compute -- both current call sites, CadencePopulator and
+/// LiveFeatureEngine.ComputeUnderlyingPrice, feed that value, not raw spot or the tracked
+/// future's own price), which already implicitly handles the dividend/carry adjustment for
+/// index options; dividendYield defaults to 0 per the plan's documented simplification, kept
+/// as a parameter rather than hardcoded in case that assumption is revisited. (2026-09-13:
+/// corrected from an earlier version of this comment that said "the futures price" -- stale
+/// and contradicted by both current call sites, flagged by external review.)
 /// </summary>
 public static class BlackScholes
 {
