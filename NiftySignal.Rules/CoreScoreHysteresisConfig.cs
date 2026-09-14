@@ -20,5 +20,14 @@ public sealed record CoreScoreRiskLimitsConfig(double MaxDailyLossPct, int MaxCo
 /// (Capital/Session/StrikeSelection/Costs/KillSwitch) continues reading the EXISTING shared
 /// <see cref="RulesetConfig"/> unchanged (Assumption 1 in docs/replication_plan.md -- one shared
 /// capital pool, one shared session window, across both new strategies and the legacy engine).
+///
+/// <see cref="ShadowMode"/> (Batch 6, 2026-09-14) -- when true, the engine runs the FULL entry/exit
+/// decision logic (including the hysteresis band, all risk gates, strike selection) and logs what
+/// it would have done, but never touches <c>db.PaperTrades</c> -- "purely computing and logging
+/// what each strategy would do, with zero trading side effects" (docs/replication_plan.md
+/// Assumption 4). Defaults to <c>true</c> deliberately: a fresh deploy of either new strategy must
+/// require an explicit config change to start writing real rows, not silently go live the moment
+/// this ships. See <c>CoreScoreHysteresisTradingEngine</c>'s own doc comment for how the
+/// hypothetical open position is tracked (in-memory, not persisted) while shadow mode is on.
 /// </summary>
-public sealed record CoreScoreHysteresisConfig(double EntryScoreThreshold, CoreScoreRiskLimitsConfig RiskLimits);
+public sealed record CoreScoreHysteresisConfig(double EntryScoreThreshold, CoreScoreRiskLimitsConfig RiskLimits, bool ShadowMode = true);

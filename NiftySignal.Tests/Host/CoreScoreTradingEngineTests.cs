@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using NiftySignal.Domain.Entities;
@@ -50,6 +51,19 @@ public class CoreScoreTradingEngineTests
         public T Current { get; } = value;
     }
 
+    /// <summary>Captures formatted log lines so ShadowMode's "[SHADOW] Would ENTER/EXIT" logging (Batch 6) can be asserted on directly, since nothing reaches the DB or Telegram in that mode.</summary>
+    sealed class CapturingLogger<T> : ILogger<T>
+    {
+        public List<string> Messages { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+            => Messages.Add(formatter(state, exception));
+    }
+
     /// <summary>Both new engines share ONE in-memory DB (and one Capital.Total) -- required for the cross-strategy capital/risk-isolation tests below to mean anything.</summary>
     sealed class Fixture : IAsyncDisposable
     {
@@ -58,6 +72,8 @@ public class CoreScoreTradingEngineTests
         public CoreScoreHysteresisTradingEngine Hysteresis { get; }
         public CoreScoreCrossoverTradingEngine Crossover { get; }
         public FakeTelegramNotifier Telegram { get; } = new();
+        public CapturingLogger<CoreScoreHysteresisTradingEngine> HysteresisLog { get; } = new();
+        public CapturingLogger<CoreScoreCrossoverTradingEngine> CrossoverLog { get; } = new();
 
         public Fixture(CoreScoreHysteresisConfig? hysteresisConfig = null, CoreScoreCrossoverConfig? crossoverConfig = null)
         {
@@ -75,14 +91,14 @@ public class CoreScoreTradingEngineTests
                 _dashboardPush,
                 rulesetOptions,
                 new FixedOptions<CoreScoreHysteresisConfig>(hysteresisConfig ?? TestCoreScoreConfigs.Hysteresis()),
-                NullLogger<CoreScoreHysteresisTradingEngine>.Instance);
+                HysteresisLog);
             Crossover = new CoreScoreCrossoverTradingEngine(
                 _provider.GetRequiredService<IServiceScopeFactory>(),
                 Telegram,
                 _dashboardPush,
                 rulesetOptions,
                 new FixedOptions<CoreScoreCrossoverConfig>(crossoverConfig ?? TestCoreScoreConfigs.Crossover()),
-                NullLogger<CoreScoreCrossoverTradingEngine>.Instance);
+                CrossoverLog);
         }
 
         public async Task WithDbAsync(Func<NiftySignalDbContext, Task> action)
@@ -368,5 +384,61 @@ public class CoreScoreTradingEngineTests
             var crossoverOpen = await db.PaperTrades.CountAsync(p => p.StrategyId == StrategyId.CoreScoreCrossover && p.ExitTime == null);
             Assert.Equal(1, crossoverOpen);
         });
+    }
+
+    // ==================== ShadowMode (Batch 6, 2026-09-14) ====================
+
+    [Fact]
+    public async Task Hysteresis_ShadowMode_EntersAndExits_WithoutWritingAnyDbRowOrNotification()
+    {
+        await using var fixture = new Fixture(hysteresisConfig: TestCoreScoreConfigs.Hysteresis(shadowMode: true));
+        var t0 = new DateTimeOffset(2026, 9, 4, 10, 0, 0, Ist);
+        var featureEngine = WarmedFeatureEngine(t0);
+
+        await fixture.Hysteresis.EvaluateCadenceAsync(HysteresisSnapshot(30, t0), featureEngine, CancellationToken.None);
+        Assert.Contains(fixture.HysteresisLog.Messages, m => m.Contains("[SHADOW]") && m.Contains("Would ENTER"));
+
+        // A second qualifying cadence must NOT open a second shadow position -- proves
+        // MaxConcurrentPositions=1 is still enforced against the in-memory _shadowPosition, not
+        // just against (an always-empty, in shadow mode) db.PaperTrades.
+        await fixture.Hysteresis.EvaluateCadenceAsync(HysteresisSnapshot(30, t0.AddSeconds(15)), featureEngine, CancellationToken.None);
+        Assert.Single(fixture.HysteresisLog.Messages, m => m.Contains("Would ENTER"));
+
+        // Score crosses below -30 -- the open shadow position must exit.
+        await fixture.Hysteresis.EvaluateCadenceAsync(HysteresisSnapshot(-31, t0.AddSeconds(30)), featureEngine, CancellationToken.None);
+        Assert.Contains(fixture.HysteresisLog.Messages, m => m.Contains("[SHADOW]") && m.Contains("Would EXIT"));
+
+        // A fresh entry should be possible again once the shadow position is cleared (the Bearish
+        // reentry the real-mode test also exercises) -- proves _shadowPosition was actually reset
+        // to null on exit, not left stuck "open" forever.
+        Assert.Equal(2, fixture.HysteresisLog.Messages.Count(m => m.Contains("Would ENTER")));
+
+        await fixture.WithDbAsync(async db => Assert.Empty(await db.PaperTrades.ToListAsync()));
+        Assert.Empty(fixture.Telegram.Sent);
+    }
+
+    [Fact]
+    public async Task Crossover_ShadowMode_FlipsAcrossCrossovers_WithoutWritingAnyDbRowOrNotification()
+    {
+        await using var fixture = new Fixture(crossoverConfig: TestCoreScoreConfigs.Crossover(shadowMode: true));
+        var t0 = new DateTimeOffset(2026, 9, 4, 10, 0, 0, Ist);
+        var featureEngine = WarmedFeatureEngine(t0);
+
+        await fixture.Crossover.EvaluateCadenceAsync(CrossoverSnapshot(fast: 5, slow: 2, t0), featureEngine, CancellationToken.None);
+        Assert.DoesNotContain(fixture.CrossoverLog.Messages, m => m.Contains("Would ENTER"));
+
+        var t1 = t0.AddSeconds(15);
+        await fixture.Crossover.EvaluateCadenceAsync(CrossoverSnapshot(fast: -3, slow: 1, t1), featureEngine, CancellationToken.None);
+        Assert.Contains(fixture.CrossoverLog.Messages, m => m.Contains("[SHADOW]") && m.Contains("Would ENTER") && m.Contains("Bearish"));
+
+        // Flip back -- must close the (in-memory) put and open a call, proving the shadow position's
+        // own InstrumentToken (needed by CloseAsync's TryGetLatestQuote) round-trips correctly.
+        var t2 = t1.AddSeconds(15);
+        await fixture.Crossover.EvaluateCadenceAsync(CrossoverSnapshot(fast: 4, slow: 1, t2), featureEngine, CancellationToken.None);
+        Assert.Contains(fixture.CrossoverLog.Messages, m => m.Contains("[SHADOW]") && m.Contains("Would EXIT"));
+        Assert.Contains(fixture.CrossoverLog.Messages, m => m.Contains("[SHADOW]") && m.Contains("Would ENTER") && m.Contains("Bullish"));
+
+        await fixture.WithDbAsync(async db => Assert.Empty(await db.PaperTrades.ToListAsync()));
+        Assert.Empty(fixture.Telegram.Sent);
     }
 }

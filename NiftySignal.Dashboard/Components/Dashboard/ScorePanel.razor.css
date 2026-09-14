@@ -95,3 +95,30 @@
     text-align: right;
     white-space: nowrap;
 }
+
+.fast-slow-readout {
+    font-size: 12px;
+}
+
+.strategy-positions {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.strategy-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 12px;
+    flex-wrap: wrap;
+}
+
+.strategy-name {
+    min-width: 78px;
+    font-weight: 600;
+}
+
+.strategy-symbol {
+    flex: 1;
+}

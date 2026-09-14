@@ -8,11 +8,13 @@ public sealed class CoreScoreCrossoverConfigOptions
     public int FastWindowMinutes { get; set; } = 10;
     public int SlowWindowMinutes { get; set; } = 30;
     public CoreScoreRiskLimitsConfigOptions RiskLimits { get; set; } = new();
+    public bool ShadowMode { get; set; } = true;
 
     public CoreScoreCrossoverConfig ToConfig() => new(
         FastWindowMinutes: FastWindowMinutes,
         SlowWindowMinutes: SlowWindowMinutes,
-        RiskLimits: new CoreScoreRiskLimitsConfig(RiskLimits.MaxDailyLossPct, RiskLimits.MaxConsecutiveLosses, RiskLimits.MaxTradesPerDay));
+        RiskLimits: new CoreScoreRiskLimitsConfig(RiskLimits.MaxDailyLossPct, RiskLimits.MaxConsecutiveLosses, RiskLimits.MaxTradesPerDay),
+        ShadowMode: ShadowMode);
 }
 
 public static class CoreScoreCrossoverConfigValidator

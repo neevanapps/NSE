@@ -28,6 +28,14 @@ namespace NiftySignal.Host;
 /// <c>CoreScoreSlow</c> history on every restart via <see cref="SeedFromHistory"/> -- see that
 /// method's own doc comment and <see cref="CoreScoreCrossoverRules"/>'s for why this is required,
 /// not an accepted gap like <see cref="LiveFeatureEngine"/>'s own SeedHistory-adjacent fast FIFOs.
+///
+/// <see cref="CoreScoreCrossoverConfig.ShadowMode"/> (Batch 6, 2026-09-14) -- see
+/// <see cref="CoreScoreHysteresisTradingEngine"/>'s own doc comment for the shared design (an
+/// in-memory <see cref="_shadowPosition"/>, never <c>db.PaperTrades.Add</c>-ed, standing in for
+/// "the current open position" while shadow mode is on). Note that <see cref="_crossoverRules"/>
+/// itself (the fast/slow diff-sign state machine) keeps running exactly as normal in shadow mode --
+/// only the resulting PaperTrade bookkeeping is diverted to memory; the crossover detection logic
+/// this dry run exists to validate is untouched either way.
 /// </summary>
 public sealed class CoreScoreCrossoverTradingEngine(
     IServiceScopeFactory scopeFactory,
@@ -42,6 +50,9 @@ public sealed class CoreScoreCrossoverTradingEngine(
 
     readonly IStrikeSelector _strikeSelector = new StrikeSelector();
     readonly CoreScoreCrossoverRules _crossoverRules = new();
+
+    // In-memory hypothetical open position while ShadowMode is on -- see class doc comment.
+    PaperTrade? _shadowPosition;
 
     RulesetConfig _shared => rulesetOptions.Current;
     CoreScoreCrossoverConfig _strategy => strategyOptions.Current;
@@ -78,8 +89,17 @@ public sealed class CoreScoreCrossoverTradingEngine(
         await using var scope = scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
 
-        var openPositions = await db.PaperTrades.Where(p => p.ExitTime == null && p.StrategyId == Strategy).ToListAsync(ct);
-        var openPosition = openPositions.Count > 0 ? openPositions[0] : null;
+        var shadowMode = _strategy.ShadowMode;
+        PaperTrade? openPosition;
+        if (shadowMode)
+        {
+            openPosition = _shadowPosition;
+        }
+        else
+        {
+            var openPositions = await db.PaperTrades.Where(p => p.ExitTime == null && p.StrategyId == Strategy).ToListAsync(ct);
+            openPosition = openPositions.Count > 0 ? openPositions[0] : null;
+        }
 
         // SquareOff first, unconditional, BEFORE the crossover check -- matches
         // CoreScoreOptionSimulator.SimulateDayCrossover's own MustForceClose priority exactly
@@ -105,7 +125,7 @@ public sealed class CoreScoreCrossoverTradingEngine(
             // No crossover this cadence -- still roll MFE/MAE on any open position, matching
             // LiveTradingEngine's own "update excursions every cadence regardless of exit" behavior.
             if (openPosition is not null && featureEngine.TryGetLatestQuote(openPosition.InstrumentToken, out var ltp, out var bid)
-                && UpdateExcursions(openPosition, bid ?? ltp))
+                && UpdateExcursions(openPosition, bid ?? ltp) && !shadowMode)
             {
                 await db.SaveChangesAsync(ct);
             }
@@ -244,6 +264,13 @@ public sealed class CoreScoreCrossoverTradingEngine(
             RulesetVersion = config.RulesetVersion,
             ScoreWeightsVersion = snapshot.WeightSetVersion ?? "unknown",
         };
+        if (strategyConfig.ShadowMode)
+        {
+            _shadowPosition = trade;
+            logger.LogInformation("[SHADOW][CoreScoreCrossover] Would ENTER: {Symbol} {Direction} @ {Price}", trade.TradingSymbol, trade.Direction, trade.EntryPrice);
+            return;
+        }
+
         db.PaperTrades.Add(trade);
         await db.SaveChangesAsync(ct);
         await dashboardPush.PushTradesChangedAsync(ct);
@@ -287,6 +314,16 @@ public sealed class CoreScoreCrossoverTradingEngine(
         position.ExitReason = reason;
         position.GrossPnl = grossPnl;
         position.NetPnl = netPnl;
+
+        if (_strategy.ShadowMode)
+        {
+            _shadowPosition = null;
+            logger.LogInformation(
+                "[SHADOW][CoreScoreCrossover] Would EXIT: {Symbol} {Reason} @ {Price} netPnl={NetPnl:F2}",
+                position.TradingSymbol, reason, fill.FillPrice, netPnl);
+            return;
+        }
+
         await db.SaveChangesAsync(ct);
         await dashboardPush.PushTradesChangedAsync(ct);
 

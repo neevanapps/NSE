@@ -99,6 +99,30 @@ public sealed record ClosedTradeRow(
     ExitReason ExitReason);
 
 /// <summary>
+/// One Core-score term's weight/signed-value/contribution plus its own warm-up status (Batch 7,
+/// 2026-09-14) -- deliberately its own type rather than reusing <see cref="ScoreComponentRow"/>:
+/// that record's <c>Window</c>/<c>Remaining</c> fields are a fixed-duration Welford warm-up
+/// countdown, which doesn't apply here -- a Core-score term warms up once its
+/// <c>SessionRankTracker</c> has seen enough of TODAY's own observations, not once a fixed
+/// wall-clock window has elapsed, so there's no "time remaining" to show, only warmed/not yet.
+/// </summary>
+public sealed record CoreScoreComponentRow(
+    string Name,
+    double Weight,
+    double? SignedValue,
+    double WeightedContribution,
+    bool IsWarmedUp);
+
+/// <summary>
+/// One of the two new Core-score strategies' current open position, if any (Batch 7, 2026-09-14)
+/// -- <see cref="Position"/> is null when that strategy is flat. Reuses <see cref="PositionRow"/>
+/// as-is rather than a bespoke shape: an open Hysteresis/Crossover position and an open legacy
+/// position display identically (symbol, direction, entry/current premium, P&amp;L, held time) --
+/// the only new thing here is which <see cref="StrategyId"/> it belongs to.
+/// </summary>
+public sealed record StrategyPositionRow(StrategyId StrategyId, PositionRow? Position);
+
+/// <summary>
 /// The Live Quote panel's fast (1s) refresh -- deliberately a small subset of
 /// <see cref="OptionChainRow"/>'s fields (no IV, no 30-min OI lookback) so that path stays
 /// cheap enough to poll every second without dragging the whole option chain along with it.

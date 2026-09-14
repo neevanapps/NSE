@@ -18,5 +18,8 @@ namespace NiftySignal.Rules;
 /// <see cref="CoreScoreRiskLimitsConfig"/>'s own doc comment. Every other input
 /// (Capital/Session/StrikeSelection/Costs/KillSwitch) continues reading the EXISTING shared
 /// <see cref="RulesetConfig"/> unchanged (Assumption 1 in docs/replication_plan.md).
+///
+/// <see cref="ShadowMode"/> (Batch 6, 2026-09-14) -- see <see cref="CoreScoreHysteresisConfig.ShadowMode"/>'s
+/// own doc comment; identical meaning and default here.
 /// </summary>
-public sealed record CoreScoreCrossoverConfig(int FastWindowMinutes, int SlowWindowMinutes, CoreScoreRiskLimitsConfig RiskLimits);
+public sealed record CoreScoreCrossoverConfig(int FastWindowMinutes, int SlowWindowMinutes, CoreScoreRiskLimitsConfig RiskLimits, bool ShadowMode = true);

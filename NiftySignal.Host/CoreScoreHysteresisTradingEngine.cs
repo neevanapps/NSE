@@ -30,6 +30,24 @@ namespace NiftySignal.Host;
 /// MaxConcurrentPositions is hardcoded to 1 here (<see cref="MaxConcurrentPositions"/>), not read
 /// from <see cref="RulesetConfig.Capital"/> -- the user's explicit "max concurrent trades should
 /// be 1 per strategy" instruction, a fixed architectural fact of this plan, not a tunable.
+///
+/// <see cref="CoreScoreHysteresisConfig.ShadowMode"/> (Batch 6, 2026-09-14) -- when true, this
+/// engine still runs the FULL entry/exit decision logic above (every gate, the strike selection,
+/// the hysteresis band) but never calls <c>db.PaperTrades.Add</c>/<c>SaveChangesAsync</c>. The
+/// "current open position" it evaluates exits/re-entry against is instead tracked in the
+/// in-memory <see cref="_shadowPosition"/> field -- a plain, never-persisted <c>PaperTrade</c>
+/// instance (the entity is a plain mutable class, so it can be constructed and mutated freely
+/// without ever touching the DbContext). This is what makes "full decision logic, zero trading
+/// side effects" possible at all: the hysteresis exit rule needs to know what position (if any)
+/// is open and at what entry score, and that state has to live somewhere across cadences even
+/// though nothing may be written to the database. Risk-limit queries (tradesToday/closedTodayPnls/
+/// consecutiveLosses) deliberately keep reading the real DB even in shadow mode -- an accepted
+/// simplification, since they will simply never find a shadow trade to count and therefore never
+/// block; shadow mode's purpose is validating scoring/entry-decision sanity, not exercising risk
+/// gates (already covered by <c>CoreScoreTradingEngineTests</c>). <see cref="_shadowPosition"/> is
+/// NOT restart-seeded, same accepted gap as every other restart-reset piece of engine state in
+/// this plan (see <c>CoreScoreCrossoverTradingEngine.SeedFromHistory</c>'s doc comment for the one
+/// exception that specifically required seeding).
 /// </summary>
 public sealed class CoreScoreHysteresisTradingEngine(
     IServiceScopeFactory scopeFactory,
@@ -43,6 +61,11 @@ public sealed class CoreScoreHysteresisTradingEngine(
     const int MaxConcurrentPositions = 1;
 
     readonly IStrikeSelector _strikeSelector = new StrikeSelector();
+
+    // In-memory hypothetical open position while ShadowMode is on -- see class doc comment.
+    // Never persisted; a plain mutable PaperTrade the shadow entry/exit logic reads and writes
+    // directly instead of going through db.PaperTrades.
+    PaperTrade? _shadowPosition;
 
     // Properties, not fields -- read the current hot-reloaded, already-validated value fresh on
     // every access, same reasoning as LiveTradingEngine's own _config property.
@@ -63,7 +86,9 @@ public sealed class CoreScoreHysteresisTradingEngine(
 
         // Exits first: a position closing this tick frees the (single) MaxConcurrentPositions
         // slot for a fresh entry evaluated in the same tick.
-        var openPositions = await db.PaperTrades.Where(p => p.ExitTime == null && p.StrategyId == Strategy).ToListAsync(ct);
+        List<PaperTrade> openPositions = _strategy.ShadowMode
+            ? (_shadowPosition is { } shadow ? [shadow] : [])
+            : await db.PaperTrades.Where(p => p.ExitTime == null && p.StrategyId == Strategy).ToListAsync(ct);
         foreach (var position in openPositions)
         {
             await EvaluateExitAsync(db, position, score, now, featureEngine, ct);
@@ -204,6 +229,14 @@ public sealed class CoreScoreHysteresisTradingEngine(
             RulesetVersion = config.RulesetVersion,
             ScoreWeightsVersion = snapshot.WeightSetVersion ?? "unknown",
         };
+
+        if (strategyConfig.ShadowMode)
+        {
+            _shadowPosition = trade;
+            logger.LogInformation("[SHADOW][CoreScoreHysteresis] Would ENTER: {Symbol} {Direction} @ {Price} (score {Score:F1})", trade.TradingSymbol, trade.Direction, trade.EntryPrice, score);
+            return;
+        }
+
         db.PaperTrades.Add(trade);
         await db.SaveChangesAsync(ct);
         await dashboardPush.PushTradesChangedAsync(ct);
@@ -223,13 +256,16 @@ public sealed class CoreScoreHysteresisTradingEngine(
             return; // no live quote yet this cadence -- re-evaluate next tick
         }
 
+        var shadowMode = _strategy.ShadowMode;
         var markPrice = bid ?? ltp;
         var excursionMoved = UpdateExcursions(position, markPrice);
 
         var decision = CoreScoreHysteresisRules.EvaluateExit(position.Direction, score, _strategy.EntryScoreThreshold, now, _shared.Session.SquareOffTime);
         if (!decision.ShouldExit)
         {
-            if (excursionMoved)
+            // In shadow mode `position` IS `_shadowPosition` -- the mutation above already stuck
+            // in memory, no DB round-trip needed (it was never db.PaperTrades.Add-ed).
+            if (excursionMoved && !shadowMode)
             {
                 await db.SaveChangesAsync(ct);
             }
@@ -250,6 +286,16 @@ public sealed class CoreScoreHysteresisTradingEngine(
         position.ExitReason = decision.Reason;
         position.GrossPnl = grossPnl;
         position.NetPnl = netPnl;
+
+        if (shadowMode)
+        {
+            _shadowPosition = null;
+            logger.LogInformation(
+                "[SHADOW][CoreScoreHysteresis] Would EXIT: {Symbol} {Reason} @ {Price} netPnl={NetPnl:F2}",
+                position.TradingSymbol, decision.Reason, fill.FillPrice, netPnl);
+            return;
+        }
+
         await db.SaveChangesAsync(ct);
         await dashboardPush.PushTradesChangedAsync(ct);
 

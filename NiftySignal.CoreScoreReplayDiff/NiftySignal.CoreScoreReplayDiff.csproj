@@ -6,7 +6,14 @@
          as CoreScoreOptionSimulator's backtest math, not "a cousin of it" (external review's own
          words). Read-only against both the live-schema and niftysignal_backtest_analysis
          databases; never writes anything. Per standing instruction, this is a tool the user runs
-         themselves. -->
+         themselves.
+
+         Also hosts the Batch 6 (2026-09-14) "shadow" mode (`... shadow [date] [restartTimeIst]`),
+         an offline dry run of both new trading engines in ShadowMode against a real historical
+         day's ticks, standing in for a live-session watch on a day the exchange is closed. Uses an
+         EF Core InMemory NiftySignalDbContext for the trading engines' own risk/kill-switch/data-gap
+         queries only, still never writing a real row anywhere; the InMemory package below exists
+         purely for that. -->
     <OutputType>Exe</OutputType>
   </PropertyGroup>
 
@@ -17,6 +24,12 @@
     <ProjectReference Include="..\NiftySignal.Host\NiftySignal.Host.csproj" />
     <ProjectReference Include="..\NiftySignal.BacktestData\NiftySignal.BacktestData.csproj" />
     <ProjectReference Include="..\NiftySignal.MetricTrials\NiftySignal.MetricTrials.csproj" />
+    <ProjectReference Include="..\NiftySignal.Rules\NiftySignal.Rules.csproj" />
+    <ProjectReference Include="..\NiftySignal.Notifications\NiftySignal.Notifications.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore.InMemory" />
   </ItemGroup>
 
 </Project>

@@ -17,10 +17,12 @@ public sealed class CoreScoreHysteresisConfigOptions
 
     public double EntryScoreThreshold { get; set; } = 30.0;
     public CoreScoreRiskLimitsConfigOptions RiskLimits { get; set; } = new();
+    public bool ShadowMode { get; set; } = true;
 
     public CoreScoreHysteresisConfig ToConfig() => new(
         EntryScoreThreshold: EntryScoreThreshold,
-        RiskLimits: new CoreScoreRiskLimitsConfig(RiskLimits.MaxDailyLossPct, RiskLimits.MaxConsecutiveLosses, RiskLimits.MaxTradesPerDay));
+        RiskLimits: new CoreScoreRiskLimitsConfig(RiskLimits.MaxDailyLossPct, RiskLimits.MaxConsecutiveLosses, RiskLimits.MaxTradesPerDay),
+        ShadowMode: ShadowMode);
 }
 
 /// <summary>Shared bindable shape for both new strategies' own <see cref="CoreScoreRiskLimitsConfig"/> -- see that record's own doc comment for why it isn't the existing <see cref="RiskLimitsConfigOptions"/>.</summary>
