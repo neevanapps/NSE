@@ -1,5 +1,10 @@
 .oi-profile-panel {
-    grid-column: span 5;
+    /* Paired with PositionsPanel as parallel columns (2026-09-15) -- 8/4 rather than an even
+       6/6: this chart needs real width to keep strike bars legible (the whole reason it was
+       briefly full-width on its own row before this), while Positions already has its own
+       horizontal-scroll fallback and, with 1 max position per strategy, rarely shows more than
+       a row or two at once. */
+    grid-column: span 8;
 }
 
 .oi-totals {

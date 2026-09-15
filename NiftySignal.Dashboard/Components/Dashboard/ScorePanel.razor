@@ -17,9 +17,9 @@
             <div class="score-label badge @ScoreBadgeClass">@ScoreLabel</div>
             <div class="mono text-faint fast-slow-readout">fast @FormatFastSlow(Live.CurrentCoreScoreFast) / slow @FormatFastSlow(Live.CurrentCoreScoreSlow)</div>
         </div>
-        <div class="score-chart">
-            <canvas id="core-score-history-chart"></canvas>
-        </div>
+    </div>
+    <div class="score-chart">
+        <canvas id="core-score-history-chart"></canvas>
     </div>
 
     <div class="components">
@@ -152,23 +152,27 @@
         }
     }
 
-    // Spot rides on the same time axis as the score so the two can be read against each other --
-    // same reasoning as the old composite panel's own BuildSeries, joined here against
-    // CoreScoreSnapshot's cadence timestamps instead (see LiveDataService.PollAsync's own join).
-    (string[] Labels, double[] Scores, double?[] Prices) BuildSeries()
+    // Fast/slow ride the same time axis as the instant score (2026-09-15) -- exactly the two
+    // trailing reads the Crossover strategy trades on, so their crossover is visible on the same
+    // plot as the Hysteresis strategy's own +-30 threshold read. Spot rides alongside on its own
+    // axis, joined here against CoreScoreSnapshot's cadence timestamps (see LiveDataService.
+    // PollAsync's own join).
+    (string[] Labels, double[] Scores, double?[] Fast, double?[] Slow, double?[] Prices) BuildSeries()
     {
         var history = Live.CoreScoreHistory;
         return (
             history.Select(h => h.Timestamp.ToIst().ToString("HH:mm:ss")).ToArray(),
             history.Select(h => Math.Round(h.Score, 1)).ToArray(),
+            history.Select(h => h.Fast).ToArray(),
+            history.Select(h => h.Slow).ToArray(),
             history.Select(h => h.SpotPrice).ToArray());
     }
 
     async Task RenderChart()
     {
         if (_module is null) return;
-        var (labels, scores, prices) = BuildSeries();
-        await _module.InvokeVoidAsync("renderScoreWithPriceChart", "core-score-history-chart", labels, scores, prices, "#38bdf8", "#fbbf24");
+        var (labels, scores, fast, slow, prices) = BuildSeries();
+        await _module.InvokeVoidAsync("renderCoreScoreChart", "core-score-history-chart", labels, scores, fast, slow, prices);
     }
 
     // async void is required here -- Live.Updated is a plain event Action?, and it fires for
@@ -188,8 +192,8 @@
                 StateHasChanged();
                 if (_rendered && _module is not null)
                 {
-                    var (labels, scores, prices) = BuildSeries();
-                    await _module.InvokeVoidAsync("updateScoreWithPriceChart", "core-score-history-chart", labels, scores, prices);
+                    var (labels, scores, fast, slow, prices) = BuildSeries();
+                    await _module.InvokeVoidAsync("updateCoreScoreChart", "core-score-history-chart", labels, scores, fast, slow, prices);
                 }
             });
         }

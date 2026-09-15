@@ -56,11 +56,13 @@ export function renderLineChart(canvasId, labels, data, color) {
     });
 }
 
-// Score and spot price share a time axis but live on wildly different numeric ranges
-// (-100..+100 vs ~24,000), so each gets its own y-axis: score left, price right. Reading them
-// together is the point -- it turns "was the score leading or lagging price?" into something
-// visible at a glance instead of a manual query.
-export function renderScoreWithPriceChart(canvasId, labels, scoreData, priceData, scoreColor, priceColor) {
+// Score, its fast (10m)/slow (30m) trailing reads, and spot price on one time axis. Score/fast/
+// slow share one y-axis (all the same -100..+100 scale); price gets its own on the right (wildly
+// different numeric range, ~24,000). Reading fast vs slow together is the point -- their
+// crossover is exactly what the Crossover strategy trades on, and seeing it alongside the instant
+// score (which the Hysteresis strategy trades on) and spot price turns "did the score lead or lag
+// price, and is a flip coming" into something visible at a glance instead of a manual query.
+export function renderCoreScoreChart(canvasId, labels, scoreData, fastData, slowData, priceData) {
     const ctx = document.getElementById(canvasId);
     if (!ctx) return;
 
@@ -76,8 +78,8 @@ export function renderScoreWithPriceChart(canvasId, labels, scoreData, priceData
                 {
                     label: "Score",
                     data: scoreData,
-                    borderColor: scoreColor,
-                    backgroundColor: scoreColor + "22",
+                    borderColor: "#38bdf8",
+                    backgroundColor: "#38bdf822",
                     borderWidth: 2,
                     pointRadius: 0,
                     tension: 0.3,
@@ -85,9 +87,31 @@ export function renderScoreWithPriceChart(canvasId, labels, scoreData, priceData
                     yAxisID: "score",
                 },
                 {
+                    label: "Fast (10m)",
+                    data: fastData,
+                    borderColor: "#a78bfa",
+                    borderWidth: 1.5,
+                    pointRadius: 0,
+                    tension: 0.3,
+                    fill: false,
+                    borderDash: [2, 2],
+                    yAxisID: "score",
+                },
+                {
+                    label: "Slow (30m)",
+                    data: slowData,
+                    borderColor: "#2dd4bf",
+                    borderWidth: 1.5,
+                    pointRadius: 0,
+                    tension: 0.3,
+                    fill: false,
+                    borderDash: [7, 3],
+                    yAxisID: "score",
+                },
+                {
                     label: "Spot",
                     data: priceData,
-                    borderColor: priceColor,
+                    borderColor: "#fbbf24",
                     borderWidth: 1.5,
                     pointRadius: 0,
                     tension: 0.3,
@@ -113,19 +137,21 @@ export function renderScoreWithPriceChart(canvasId, labels, scoreData, priceData
                 x: { ...timeAxisOptions() },
                 score: { ...baseGridOptions(), position: "left" },
                 // Price gets no gridlines of its own -- two overlapping grids on one plot is
-                // visual noise; the score's grid is the reference.
+                // visual noise; the score axis is the reference.
                 price: { ...baseGridOptions(), position: "right", grid: { display: false } },
             },
         },
     });
 }
 
-export function updateScoreWithPriceChart(canvasId, labels, scoreData, priceData) {
+export function updateCoreScoreChart(canvasId, labels, scoreData, fastData, slowData, priceData) {
     const chart = charts[canvasId];
     if (!chart) return;
     chart.data.labels = labels;
     chart.data.datasets[0].data = scoreData;
-    chart.data.datasets[1].data = priceData;
+    chart.data.datasets[1].data = fastData;
+    chart.data.datasets[2].data = slowData;
+    chart.data.datasets[3].data = priceData;
     chart.update("none");
 }
 

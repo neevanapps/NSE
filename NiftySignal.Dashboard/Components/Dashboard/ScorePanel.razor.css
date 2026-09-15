@@ -1,33 +1,36 @@
 .score-panel {
-    grid-column: span 7;
+    /* Full width (2026-09-15, was span 7) -- this panel now carries 4 chart series (score,
+       fast, slow, spot) plus 8 component rows plus Strategy Positions; the old 7/12 split
+       (paired with OiProfilePanel at span 5) left the chart too cramped to read once fast/slow
+       were added. OiProfilePanel goes full-width too (its own CSS) rather than sitting alone
+       in a half-empty row. */
+    grid-column: span 12;
 }
 
 .score-top {
     display: flex;
-    gap: 24px;
-    align-items: stretch;
-    margin-bottom: 18px;
+    align-items: center;
+    gap: 20px;
+    flex-wrap: wrap;
+    margin-bottom: 14px;
 }
 
 .score-readout {
     display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 8px;
-    min-width: 140px;
+    align-items: baseline;
+    gap: 14px;
 }
 
 .score-number {
     font-family: var(--font-mono);
-    font-size: 56px;
+    font-size: 40px;
     font-weight: 700;
     line-height: 1;
 }
 
 .score-chart {
-    flex: 1;
-    height: 110px;
+    width: 100%;
+    height: 300px;
     position: relative;
 }
 

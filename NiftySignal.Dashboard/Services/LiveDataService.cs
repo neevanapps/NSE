@@ -58,7 +58,7 @@ public sealed class LiveDataService : IDisposable
     double _currentCoreScore;
     double? _currentCoreScoreFast;
     double? _currentCoreScoreSlow;
-    List<ScoreHistoryPoint> _coreScoreHistory = [];
+    List<CoreScoreHistoryPoint> _coreScoreHistory = [];
     List<OptionChainRow> _optionChain = [];
     List<PositionRow> _positions = [];
     List<StrategyPositionRow> _strategyPositions = [];
@@ -106,7 +106,7 @@ public sealed class LiveDataService : IDisposable
 
     public double? CurrentCoreScoreSlow { get { lock (_lock) return _currentCoreScoreSlow; } }
 
-    public IReadOnlyList<ScoreHistoryPoint> CoreScoreHistory { get { lock (_lock) return _coreScoreHistory; } }
+    public IReadOnlyList<CoreScoreHistoryPoint> CoreScoreHistory { get { lock (_lock) return _coreScoreHistory; } }
 
     public IReadOnlyList<CoreScoreComponentRow> CoreScoreComponents { get; private set; } = BuildDefaultCoreScoreComponentRows();
 
@@ -444,7 +444,7 @@ public sealed class LiveDataService : IDisposable
                     _currentCoreScore = latestCore.CoreScore ?? _currentCoreScore;
                     _currentCoreScoreFast = latestCore.CoreScoreFast;
                     _currentCoreScoreSlow = latestCore.CoreScoreSlow;
-                    _coreScoreHistory = [.. coreSnapshots.Select(s => new ScoreHistoryPoint(s.ComputedAt, s.CoreScore ?? 0, spotByTimestamp.GetValueOrDefault(s.ComputedAt)))];
+                    _coreScoreHistory = [.. coreSnapshots.Select(s => new CoreScoreHistoryPoint(s.ComputedAt, s.CoreScore ?? 0, s.CoreScoreFast, s.CoreScoreSlow, spotByTimestamp.GetValueOrDefault(s.ComputedAt)))];
                 }
 
                 CoreScoreComponents = BuildCoreScoreComponentRows(latestCore);

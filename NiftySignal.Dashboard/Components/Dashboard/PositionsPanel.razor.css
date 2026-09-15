@@ -1,3 +1,6 @@
 .positions-panel {
-    grid-column: span 12;
+    /* Paired with OiProfilePanel as parallel columns (2026-09-15) -- see that panel's own CSS
+       comment for the 8/4 reasoning. The data-table's existing .scroll-x wrapper absorbs the
+       narrower width if a row's columns don't all fit. */
+    grid-column: span 4;
 }

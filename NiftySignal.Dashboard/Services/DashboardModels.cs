@@ -12,6 +12,18 @@ namespace NiftySignal.Dashboard.Services;
 public sealed record ScoreHistoryPoint(DateTimeOffset Timestamp, double Score, double? SpotPrice);
 
 /// <summary>
+/// One Core-score history point, alongside <see cref="ScoreHistoryPoint"/> rather than reusing it
+/// (Batch 7 follow-up, 2026-09-15) -- the old composite has no fast/slow smoothing concept at all,
+/// so bolting those fields onto the shared record would leave them permanently unused on that
+/// path. <see cref="Fast"/>/<see cref="Slow"/> are the same 10-min/30-min trailing reads the
+/// Crossover strategy itself trades on (<see cref="NiftySignal.Domain.Entities.CoreScoreSnapshot.CoreScoreFast"/>/
+/// <c>CoreScoreSlow</c>), carried per-point so the chart can plot them on the same time axis as
+/// the instant score -- seeing whether fast/slow have crossed, and whether the instant score is
+/// approaching the +-30 hysteresis threshold, together is the point.
+/// </summary>
+public sealed record CoreScoreHistoryPoint(DateTimeOffset Timestamp, double Score, double? Fast, double? Slow, double? SpotPrice);
+
+/// <summary>
 /// One score component's weight/z-score/contribution plus its own warm-up status
 /// (2026-09-04, folded in from the former standalone Data Health panel -- see
 /// LiveDataService.BuildComponentRows) so ScorePanel doesn't need to correlate two
