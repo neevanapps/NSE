@@ -95,7 +95,15 @@ public sealed record CoreScoreSimulationOptions(
     // boundary, not an artificial hold length) since a position can't carry overnight here.
     decimal EntryPriceRangeLow = 100m,
     decimal EntryPriceRangeHigh = 150m,
-    CoreScoreWeights? Weights = null)
+    CoreScoreWeights? Weights = null,
+    // 2026-09-14, experimental (see SimulateDay's own UpdateScoreSmoothing note): 1 (default) means
+    // unsmoothed, exactly today's live behavior -- both entry and the hysteresis exit read the
+    // instant per-cadence score. >1 trails the last N cadences' raw scores (a plain count-based
+    // average, NOT a real-time window like CoreScoreCrossoverOptions' fast/slow -- "4 cadences"
+    // means the last 4 computed values, however far apart in wall-clock time a quiet session made
+    // them). Applied to BOTH entry and exit checks, not just one -- a smoothed entry gated by a
+    // razor-sharp exit (or vice versa) would just be a different, undocumented strategy shape.
+    int ScoreSmoothingCadences = 1)
 {
     public CoreScoreWeights EffectiveWeights => Weights ?? new CoreScoreWeights();
 }
@@ -460,11 +468,12 @@ public static class CoreScoreOptionSimulator
         var trades = new List<CoreScoreTrade>();
         (DateTimeOffset EntryTime, decimal EntryPrice, OptionType Side, decimal StrikePrice, double EntryScore,
             int CadencesHeld, decimal RunningMfe, decimal RunningMae)? open = null;
+        var scoreSmoothingWindow = new Queue<double>();
 
         foreach (var cadence in cadences)
         {
             var timestamp = cadence.Timestamp;
-            var score = cadence.Score;
+            var score = UpdateScoreSmoothing(scoreSmoothingWindow, cadence.Score, options.ScoreSmoothingCadences);
             var rows = cadence.Rows;
 
             if (open is { } position)
@@ -528,6 +537,34 @@ public static class CoreScoreOptionSimulator
         }
 
         return new CoreScoreDayResult(asOfDate, trades);
+    }
+
+    /// <summary>
+    /// 2026-09-14, experimental (see CoreScoreSimulationOptions.ScoreSmoothingCadences' own doc
+    /// comment): a plain count-based trailing average over the last N cadences' RAW scores, distinct
+    /// from <see cref="UpdateFastSlow"/>'s real-time window -- "N cadences" here means exactly N
+    /// observations, skipped-not-zero-filled on a null cadence (same "skip a null cadence, never
+    /// zero-fill it" convention as CadencePopulator's own rolling-sum metrics), not N*15s of wall
+    /// clock. cadenceCount &lt;= 1 is a no-op fast path returning the raw score unchanged, so the
+    /// default (1) behaves exactly like the pre-2026-09-14 code with zero smoothing overhead.
+    /// </summary>
+    static double? UpdateScoreSmoothing(Queue<double> window, double? rawScore, int cadenceCount)
+    {
+        if (cadenceCount <= 1)
+        {
+            return rawScore;
+        }
+
+        if (rawScore is { } value)
+        {
+            window.Enqueue(value);
+            while (window.Count > cadenceCount)
+            {
+                window.Dequeue();
+            }
+        }
+
+        return window.Count > 0 ? window.Average() : null;
     }
 
     /// <summary>

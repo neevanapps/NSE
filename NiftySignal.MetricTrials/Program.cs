@@ -22,7 +22,7 @@ using NiftySignal.MetricTrials;
 //
 // Usage: dotnet run --project NiftySignal.MetricTrials --
 //   [--core-entry-score=N] [--core-entry-price-low=N] [--core-entry-price-high=N]
-//   [--crossover-fast-min=N] [--crossover-slow-min=N]
+//   [--core-score-smoothing-cadences=N] [--crossover-fast-min=N] [--crossover-slow-min=N]
 //
 // Reads every populated day from niftysignal_backtest_analysis (read-only). Entry picks whichever
 // strike is priced near [entryPriceRangeLow, entryPriceRangeHigh] (not ATM) for the signaled side
@@ -110,14 +110,16 @@ foreach (var asOfDate in asOfDates)
 var entryScoreThreshold = ParseOverride("--core-entry-score=", 30.0);
 var entryPriceRangeLow = (decimal)ParseOverride("--core-entry-price-low=", 100.0);
 var entryPriceRangeHigh = (decimal)ParseOverride("--core-entry-price-high=", 150.0);
+var scoreSmoothingCadences = (int)ParseOverride("--core-score-smoothing-cadences=", 1.0);
 
-Console.WriteLine($"=== Core score option simulation - HYSTERESIS THRESHOLD (entry-score>={entryScoreThreshold}, strike price in [{entryPriceRangeLow},{entryPriceRangeHigh}]) ===");
+Console.WriteLine($"=== Core score option simulation - HYSTERESIS THRESHOLD (entry-score>={entryScoreThreshold}, smoothing={scoreSmoothingCadences} cadence(s), strike price in [{entryPriceRangeLow},{entryPriceRangeHigh}]) ===");
 var hysteresisResults = new List<CoreScoreDayResult>();
 foreach (var day in dayData)
 {
     var result = CoreScoreOptionSimulator.SimulateDay(day.StrikeRows, day.CadenceContexts, day.ThisWeekExpiry,
         new CoreScoreSimulationOptions(EntryScoreThreshold: entryScoreThreshold,
-            EntryPriceRangeLow: entryPriceRangeLow, EntryPriceRangeHigh: entryPriceRangeHigh));
+            EntryPriceRangeLow: entryPriceRangeLow, EntryPriceRangeHigh: entryPriceRangeHigh,
+            ScoreSmoothingCadences: scoreSmoothingCadences));
     hysteresisResults.Add(result);
     PrintDayResult(day.AsOfDate, day.ThisWeekExpiry, result);
 }
