@@ -174,22 +174,28 @@ public class CoreScoreCalculatorTests
     }
 
     [Fact]
-    public void DefaultWeights_MatchTheBacktestExactly_AndDoNotSumToOne()
+    public void DefaultWeights_ZeroOutItmSkewAndGammaExposure_AndSumToOne()
     {
-        // Deliberate: the backtest's own weights sum to 0.915, not 1.0, and are never rescaled --
-        // see CoreScoreWeights.Total's own doc comment. This test exists specifically to catch a
-        // future "helpful" rescale to 1.0, which would silently diverge from what was backtested.
+        // Revised 2026-09-16 (see CoreScoreWeights's own class doc comment for the full evidence):
+        // ItmSkew and GammaExposure were both found structurally unreliable at real scale (ItmSkew
+        // never once read bullish across every testable day/chain; GammaExposure's stuck direction
+        // flips depending on which chain computes it) and zeroed out; the remaining 6 are rescaled
+        // to sum to 1.0 for readability -- a uniform rescale that changes no computed score, since
+        // CoreScoreCalculator renormalizes by whichever weight is present each cadence regardless.
+        // This test replaces the previous guardrail (which asserted the pre-2026-09-16 values and
+        // that Total deliberately did NOT sum to 1.0) -- update it again, deliberately, the next
+        // time these weights change; don't let it silently drift.
         var weights = CoreScoreWeights.Default;
 
-        Assert.Equal(0.25, weights.DepthImbalance, 1e-9);
-        Assert.Equal(0.065, weights.ItmSkew, 1e-9);
-        Assert.Equal(0.12, weights.FutureCvdNet5Min, 1e-9);
-        Assert.Equal(0.14, weights.NotionalVolumeRatio, 1e-9);
-        Assert.Equal(0.06, weights.GammaExposure, 1e-9);
-        Assert.Equal(0.10, weights.TrendReversion15m, 1e-9);
-        Assert.Equal(0.08, weights.BasisChange, 1e-9);
-        Assert.Equal(0.10, weights.OiChangeDiff15m, 1e-9);
-        Assert.Equal(0.915, weights.Total, 1e-9);
+        Assert.Equal(0.316456, weights.DepthImbalance, 1e-6);
+        Assert.Equal(0.0, weights.ItmSkew, 1e-9);
+        Assert.Equal(0.151899, weights.FutureCvdNet5Min, 1e-6);
+        Assert.Equal(0.177215, weights.NotionalVolumeRatio, 1e-6);
+        Assert.Equal(0.0, weights.GammaExposure, 1e-9);
+        Assert.Equal(0.126582, weights.TrendReversion15m, 1e-6);
+        Assert.Equal(0.101266, weights.BasisChange, 1e-6);
+        Assert.Equal(0.126582, weights.OiChangeDiff15m, 1e-6);
+        Assert.Equal(1.0, weights.Total, 1e-5);
     }
 
     [Fact]

@@ -102,6 +102,75 @@ depth imbalance's resting-state read) may behave differently at 10 or 30 minutes
 horizons that make sense for the specific metric's own nature, not just the two that happened to
 be convenient for the first few candidates.
 
+## Backtest-vs-live parity (CoreScoreReplayDiff) — 2026-09-17 findings
+
+Distinct from the metric-quality findings below — this section is about whether `LiveFeatureEngine`'s
+real-time CoreScore computation actually matches `CoreScoreOptionSimulator`'s backtest math, not
+about whether either formula has a real edge. Investigated after the user asked why a live-observed
+"score reads bullish while Nifty falls" pattern didn't seem fully explained by the metric-level
+findings alone. Ran `NiftySignal.CoreScoreReplayDiff` (full tick-by-tick replay vs backtest, all
+19 published fields, 3-5 days) to check directly rather than infer from code reading alone.
+
+**Found and FIXED**:
+- **`BasisChangeSigned` — was wrong on 54% of all matched cadences (4016/7385), now 0/7385.** Root
+  cause: `LiveFeatureEngine.ComputeCoreTrendAndBasis` combined `futureChange`/`spotChange` in DOUBLE
+  arithmetic after each was independently cast from decimal, instead of subtracting in DECIMAL
+  arithmetic first (matching `CoreScoreOptionSimulator`'s own `(double)(fChg - sChg)` order) and
+  casting once. The resulting noise was too small to trip `BasisChangeRaw`'s own comparison
+  (0 raw mismatches reported, always under 1e-6) — but `SessionRankTracker.Rank()` compares every
+  new value against the *entire* accumulated session history via strict `<=`, and `BasisChange`'s
+  distribution (derived from tick-granular decimal prices) is dense with near-exact ties, so a
+  few-ULP difference in even one historical entry cascaded into disagreeing on the majority of the
+  day's rank lookups. Fixed by recombining from the original decimal opens/closes, one cast at the
+  end, matching the backtest exactly.
+- **`OiChangeDiff15m` band selection** — `ComputeCoreOiChangeDiffRaw` was still selecting "nearest
+  N strikes by raw price distance from spot," the same pattern already found and fixed for
+  `GammaExposureRaw` (an earlier fix elsewhere on this file, referenced in that method's own doc
+  comment) but never migrated here. Switched to the shared index-based `strikeOffsets` (from
+  `ComputeStrikeOffsets`) every other Core-score band method already uses. Empirically inert on the
+  5 days checked (0 value mismatches even before the fix, only 5 null-mismatches out of 7500) — a
+  latent correctness issue, not one currently biting, but worth having fixed before it does.
+- **`CoreScoreReplayDiff` itself was comparing against stale weights.** It called
+  `CoreScoreOptionSimulator.BuildDiagnostics` without specifying weights, silently falling back to
+  the backtest tool's own defaults (the original, pre-2026-09-16 values) — stale ever since the live
+  composite's weights were revised (`ItmSkew`/`GammaExposure` zeroed, rest rescaled to sum to 1.0).
+  That alone made `CoreScore`/`CoreScoreFast`/`CoreScoreSlow` disagree on 100% of cadences,
+  masquerading as a parity bug on top of the real one. Fixed by mapping
+  `NiftySignal.Scoring.CoreScoreWeights.Default` across before building the backtest side. With both
+  real fixes in place and honest matching weights, `CoreScore` mismatches dropped to 37 of 7500
+  cadences (0.5%).
+
+**Investigated, NOT fixed — revisit once more days of data exist (per user's own instruction,
+2026-09-17)**:
+- **`ItmSkewSigned`**: 328 of 4500 mismatches, despite `ItmSkewRaw` itself differing on only 2
+  cadences (max 0.000374) — same cascade-via-rank-tracker amplification as `BasisChange` had, but
+  the raw noise here (0.000374) is ~374x larger than the IV solver's own 1e-6 convergence tolerance,
+  meaning it's likely NOT pure solver noise but a small, real input difference (mid-price or
+  underlying timing) at those 2 specific cadences — same family of issue as `GammaExposureRaw`
+  below, just far rarer (`ItmSkew`'s Itm2Atm1 band is 5 strikes vs Gamma's 21).
+- **`GammaExposureRaw`**: 26 of 7500 mismatches, max diff 2471.27 (a real, large divergence, not
+  floating-point noise) — e.g. 09-08 04:26:45 UTC (09:56:45 IST): backtest=62227.38, live=59756.11.
+  This method has already had two prior fix attempts (a "Gamma-freeze fix" and an "OI-holdover fix,"
+  both referenced in its own doc comment) that didn't close this specific gap — consistent with the
+  remaining cause being live's real-time instrument resolution/subscription momentarily disagreeing
+  with backtest's historical tracked-chain set at the wide ±10 band's edge, not a code-logic bug
+  fixable by editing the scoring formula itself.
+- Deliberately did NOT add an epsilon-tolerant comparison to `SessionRankTracker` (shared, 3x-
+  duplicated, used by every ranked term in both pipelines) as a blanket fix for either of the above
+  — no data-driven justification yet for a specific tolerance value, and doing so risks quietly
+  masking a real future issue the same way the original bug hid for a while. Bounded next step, not
+  yet done: dump the exact 2 `ItmSkewRaw` mismatch instances and trace which specific input
+  (mid-price/underlying/T) diverged, to determine whether it's a timing artifact or something else.
+
+**Deployment status (2026-09-17): NONE of the above is live yet.** The user has not run `deploy.ps1`
+since these fixes (or since the `ItmSkew`/`GammaExposure` weight revision, or the `ShadowMode=false`
+change) landed. Production is still running the ORIGINAL composite weights (`ItmSkewWeight=0.065`,
+`GammaExposureWeight=0.06`, no rolling-change terms) AND the buggy pre-fix `BasisChangeSigned`/
+`OiChangeDiff15m` implementations. Any live-observed "score behaves strangely" pattern right now is
+seeing the un-fixed, un-revised system, layered on top of whatever genuine metric-level miscalibration
+already exists in the formula itself (see 09-15's own correlation findings elsewhere in this file) --
+the two are compounding, not the same problem.
+
 ## Known confounds in the current sample (update as more days are added)
 
 Every metric evaluated so far uses the same 4 real trading days (08–11 Sep 2026). These days are
@@ -207,6 +276,123 @@ things."
   explanation: DTE, VIX — both real findings, neither conclusive); needs more real days, ideally
   spanning another expiry day and another mid-cycle day, before either the edge-sign or the
   regime-dependence read is treated as settled.
+
+- **2026-09-17 red flag, as `FutureCvdNet5Min` inside the separate CoreScore 8-metric composite
+  (`ctx?.FutureCvdProxyNet5Min`, read directly, "no inversion" per that class's own doc comment)**:
+  user asked whether all 6 currently-live-weighted terms (besides the two already revised) are
+  correctly behaving, prompting the same per-term correlation pass already used for `ItmSkew`/
+  `GammaExposure`, checked against BOTH targets and BOTH the 5-min and 15-min horizon:
+
+  | Day | vs future, 5m | vs future, 15m | vs option, 5m | vs option, 15m |
+  |---|---|---|---|---|
+  | 09-08 | 46.0% | 43.8% | 43.9% | 45.5% |
+  | 09-09 | 58.2% | 54.6% | 57.0% | 53.8% |
+  | 09-10 | 50.3% | 42.9% | 47.7% | 43.0% |
+  | 09-11 | 49.1% | 42.0% | 50.8% | 44.0% |
+  | 09-15 | 44.7% | 42.8% | 44.5% | 43.4% |
+
+  Below 50% (worse than a coin flip) on **4 of 5 days, both targets, both horizons** — only 09-09
+  works, and it works cleanly at every target/horizon combination. Inverting the sign would flip
+  every cell's hit rate to its complement, turning 4 of 5 days positive at the cost of breaking the
+  one day that currently works. **But the day pattern itself doesn't match this file's own original
+  finding above** ("positive on 3 of 4 days; 10 Sep is the recurring exception" — i.e. 08/09/11 Sep
+  good, 10 Sep the outlier). Here it's nearly the opposite: 09 Sep is the one good day, 08/10/11 (and
+  15) are the weak ones. That mismatch is the real finding — it suggests something differs between
+  the original SQL-based validation and this composite's own pipeline (different aggregation,
+  different day alignment, or a genuine discrepancy in what `FutureCvdProxyNet5Min` holds by the
+  time `LiveFeatureEngine`/`CoreScoreOptionSimulator` reads it), not a simple "the sign was always
+  backwards."
+- **Root-cause investigation (2026-09-17), two candidate explanations checked and both ruled out**:
+  1. **The percentile-rank transform (`RankSigned`/`SessionRankTracker`) changing which days look
+     good** — ruled out. Correlated the RAW, untransformed `CadenceContext.FutureCvdProxyNet5Min`
+     value directly (bypassing `BuildScoreCadences`/`RankSigned` entirely): same day pattern, same
+     magnitudes (e.g. 09-08 raw: -0.059 corr/43.9% hit at 15m vs. the signed version's -0.087/43.8%
+     — indistinguishable). The transform isn't manufacturing this.
+  2. **Row-count-based forward window (the original `scripts/validate-and-correlate-cvd-rolling.sql`
+     uses `LEAD(20 rows)` on `FutureCloseFromLastCadence`, assuming no gaps in the cadence sequence)
+     vs. this session's time-based lookup on cumulative `FutureChangeForDay`** — ruled out.
+     Reproduced the SQL script's exact method (fixed `LEAD(20)`/`LEAD(60)` row-count offset) directly
+     in the backtest tool and got numbers matching the time-based version almost exactly (09-08:
+     0.099/46.0% row-count vs. 0.104/45.9% time-based). A direct gap check confirms why: **0 of 1480
+     windows per day deviate from 5 real minutes by more than 15 seconds** — this dataset has zero
+     cadence gaps, so the two methods are mathematically equivalent here.
+  - **Conclusion: neither checkable methodology difference explains it — the most likely remaining
+    explanation is that the underlying data itself changed since the original 2026-09-12
+    investigation.** This project has an established, documented pattern of exactly this: several
+    other candidates above (`Pcr`, `OiChangeDiff15m`) were originally analyzed with a buggy
+    script, found wrong, and re-run under a `*-corrected.sql` script with a different verdict.
+    `CadencePopulator`'s own doc comment confirms days get deliberately deleted and repopulated
+    "after a real calculation mistake has been found and fixed." Something upstream of
+    `FutureCvdProxyNet5Min` or `FutureCloseFromLastCadence` plausibly got fixed and the affected
+    days repopulated at some point after 09-12, and the day-by-day characterization written down
+    then is now stale relative to the current data. This wasn't independently re-provable here
+    (the pre-fix data no longer exists to diff against), but it's the only explanation consistent
+    with everything checked.
+  - **Practical implication**: whatever caused it, the CURRENT data — which is what any live
+    decision actually runs against — shows this term below a coin flip on 4 of 5 days, at every
+    target and horizon checked. The original "positive on 3 of 4 days" line above should be read as
+    superseded/stale, not as a live contradiction to resolve. **Status: real finding, root cause
+    understood (stale documentation vs. re-validated current data), sign decision (keep/invert)
+    deliberately not made here** — that's a separate decision needing the same "test the actual
+    consequence, don't just flip on hit-rate arithmetic" discipline used everywhere else in this
+    file, not something to rush off the back of a root-cause investigation alone.
+  - **General lesson for this file**: a candidate's verdict is only as fresh as the data it was
+    checked against. Given how often this project's own data pipeline gets corrected, any
+    "confirmed" or "closed" verdict here could in principle go stale the same way — worth
+    periodically spot-re-checking older verdicts against current data, not just trusting the
+    written status indefinitely.
+- **Backtested three options directly (2026-09-17), CoreScore composite, ThisWeek, crossover 15/30,
+  levels of ItmSkew/GammaExposure already zeroed as the baseline** — keep as-is, invert the sign, or
+  zero the weight entirely (same treatment `ItmSkew`/`GammaExposure` already got):
+
+  | Strategy (5-day total) | Keep as-is | Invert | Drop entirely |
+  |---|---|---|---|
+  | Hysteresis | **+119.60** | +37.15 | +41.45 |
+  | Crossover 15/30 | +254.50 | **+396.33** | +290.28 |
+  | Combined (either) | +163.78 | +200.30 | **+243.33** |
+  | Combined (both) | +231.08 | +190.95 | **+319.83** |
+
+  **No universal winner** — each of the three options wins at least one strategy outright, keep-as-is
+  wins Hysteresis specifically. Inverting rescues 09-15 dramatically (the day that started this whole
+  investigation: e.g. Crossover -52.08 -> +197.65) but badly damages 09-11, one of the genuinely good
+  days in the original dataset (Crossover +211.85 -> +60.50; Combined-both +211.93 -> +28.30) —
+  essentially betting the *other* days are the "true" sign and 09-11 is now the exception, a
+  different arbitrary bet, not a resolved answer. Dropping degrades 09-11 far more mildly and never
+  bets on a direction at all.
+- **Checked whether a longer window rescues it, the same way it rescued `ItmSkew` (which was flat
+  noise at a tick-to-tick delta but real and consistent at a 15-min rolling change) — it does not.**
+  `CadencePopulator` already computes `FutureCvdProxyNet15Min` alongside `Net5Min` (and the original
+  `validate-and-correlate-cvd-rolling.sql` tested both), but the composite only ever reads `Net5Min`.
+  Checked the 15-min version raw, both forward horizons, all 5 days:
+
+  | Day | vs 5-min forward | vs 15-min forward |
+  |---|---|---|
+  | 09-08 | 46.1% (-0.044) | 44.3% (-0.111) |
+  | 09-09 | 55.8% (+0.176) | 52.9% (-0.002) |
+  | 09-10 | 50.3% (-0.050) | 51.7% (-0.044) |
+  | 09-11 | 48.8% (+0.172) | 44.3% (+0.070) |
+  | 09-15 | 49.9% (+0.055) | 50.8% (+0.170) |
+
+  Every hit rate sits within a few points of a coin flip, correlation sign flips across days with no
+  pattern — **flatter and noisier than the already-inconsistent 5-min version**, the opposite of what
+  happened for `ItmSkew`. A genuine 10-min version was not built (no precomputed column exists; would
+  require re-deriving the CVD accumulator from raw ticks rather than reading an existing one) —
+  flagged as untried rather than ruled out, but given both bracketing windows (5m, 15m) already show
+  the same "no stable direction" character, a 10-min version sitting between them is unlikely to
+  differ qualitatively.
+- **Status: real, multi-angle-confirmed finding (wrong-more-than-right on the current data, at every
+  target/horizon/window tried), but deliberately NOT resolved into a keep/invert/drop decision here**
+  — none of the three backtested options is a clean win, and picking whichever number looks best
+  across three options on 5 days is exactly the curve-fitting trap this file's own discipline exists
+  to avoid. Needs more days before any of the three should be adopted.
+- **The other 5 live-weighted CoreScore terms checked the same way (`DepthImbalance`,
+  `NotionalVolumeRatio`, `TrendReversion15m`, `BasisChange`, `OiChangeDiff15m`) all look genuinely
+  healthy** — correct sign, hit rate meaningfully above 50% at the 15-min horizon on 4 of 5 days,
+  with 09-15 (today, the day that started this whole investigation) as the one common exception
+  across literally every term checked, consistent with 09-15 being a broadly anomalous session
+  rather than any one term being individually mis-specified. `OiChangeDiff15m` in particular looks
+  better here (57-59% hit rate, 4 of 5 days) than its own "sign unresolved, day-dependent" label
+  above suggests — worth a dedicated re-look given how much data now exists.
 
 ### VIX change vs. future price change (leverage effect) — *concluded, contemporaneous only, not promoted*
 
@@ -551,7 +737,7 @@ both weeks, per-day):
   ±3-strike band average (avoiding the ATM-only choice's single-contract noise) changes the
   picture — not yet tried with the corrected partitioning.
 
-### IV skew (`PutAvgIv − CallAvgIv`), Table 3, option chain — *CONFIRMED among non-expiry ThisWeek days*
+### IV skew (`PutAvgIv − CallAvgIv`), Table 3, option chain — *REVISED 2026-09-16: level closed (structurally one-sided); REOPENED same day as a 15-min rolling-change watch candidate*
 
 - **What it measures**: a genuinely different character from every other Table 3 candidate — a
   pricing-surface (implied vol) read, not an activity/position-flow read. `CallAvgIv`/`PutAvgIv`
@@ -588,18 +774,105 @@ both weeks, per-day):
   didn't hold (after OI-diff, PCR-OI, and PCR) — not explained away, just reported as tested.
   NextWeek is messier (only 09/11 Sep coherent), consistent with the same ThisWeek-vs-NextWeek
   dynamics-difference already established for OI-diff.
-- **Status**: **CONFIRMED among non-expiry ThisWeek days** (2026-09-13) — unanimous across the 3
-  clean days tested, both targets, both cadences. Caveat attached deliberately: only 3 days behind
-  this (fewer than depth imbalance's 4-day/16-combination base), so treat as an early confirmation
-  to keep accumulating evidence against, not a fully settled result. Expiry-day (0 DTE) behavior is
-  flagged as its own separate, distinct question — not folded into this metric's scope, worth
-  testing on its own terms once enough expiry days exist.
+- **Status (superseded below)**: was **CONFIRMED among non-expiry ThisWeek days** (2026-09-13) —
+  unanimous across the 3 clean days tested, both targets, both cadences, flagged even then as an
+  early confirmation on a thin (3-day) base.
 - **Score formula**: not yet finalized — level-based, so session-rank normalization is the natural
   fit (same reasoning as every other level-shaped candidate here).
-- **Days validated**: 08–11 Sep 2026 (08 Sep excluded from scope as the ThisWeek expiry day).
-- **Open questions**: does the reversed sign and Itm2Atm1-specificity hold up over more non-expiry
-  days; what IV skew actually looks like ON expiry day itself (a distinct, not-yet-tested
-  question); whether NextWeek's messier picture resolves with more days the way ThisWeek's did.
+- **Days validated (original 2026-09-13 finding)**: 08–11 Sep 2026 (08 Sep excluded from scope as
+  the ThisWeek expiry day).
+
+- **REVISED 2026-09-16 (as `ItmSkew` in the separate CoreScore 8-metric composite, same formula,
+  same band, reused directly per this file's own 2026-09-13 confirmation)**: user's own live
+  observation ("score reads bullish while Nifty is falling") led to correlating each of that
+  composite's 8 terms against forward price independently. `ItmSkew`'s signed value (percentile
+  rank of magnitude, sign reattached from the raw `PutAvgIv − CallAvgIv`) was checked across every
+  day/chain combination where the 0-DTE exclusion doesn't apply — **ThisWeek non-expiry days
+  (09/10/11 Sep) and NextWeek on all 5 days, 8 combinations total** — and came back **negative
+  (bearish) on literally 100% of ~1,436 cadences in every single one, zero exceptions**:
+
+  | Day | Chain | Bullish reads | Bearish reads |
+  |---|---|---|---|
+  | 09-09 | ThisWeek | 0 | 1436 |
+  | 09-10 | ThisWeek | 0 | 1436 |
+  | 09-11 | ThisWeek | 0 | 1432 |
+  | 09-08 | NextWeek | 0 | 1436 |
+  | 09-09 | NextWeek | 0 | 1436 |
+  | 09-10 | NextWeek | 0 | 1434 |
+  | 09-11 | NextWeek | 0 | 1439 |
+  | 09-15 | NextWeek | 0 | 1436 |
+
+  This is not "mostly negative" (which the original 3-day evidence already showed and correctly
+  read as a real, if reversed-from-textbook, sign) — it is **never once positive**, across a much
+  larger sample than the original confirmation. A metric that can structurally never read bullish
+  isn't measuring a fluctuating market view; it's a near-constant offset.
+- **Root cause identified — the band, not the IV solver**: `Itm2Atm1` compares ITM calls (strikes
+  *below* spot, `InItm2Atm1` offsets -2..0) against ITM puts (strikes *above* spot, offsets 0..+2)
+  — genuinely different points on the strike axis, not the same strike read through both option
+  types. Equity indices (Nifty included) run a near-permanent downward-sloping skew (IV rises as
+  strike falls), so "low strikes via calls" minus "high strikes via puts" reproduces that
+  structural skew shape by construction, independent of any actual day's sentiment. Reviewed the
+  IV pipeline itself (`ImpliedVolatilitySolver.cs`, `SyntheticForward.cs`) looking for a residual
+  version of the 2026-09-07 systematic-bias bug this file already documents fixing (understated
+  underlying $\to$ call IV up / put IV down) — the solver (Newton-Raphson + bisection fallback,
+  gated on a minimum-reliable-Vega check) and the put-call-parity synthetic forward both look sound;
+  no defect found there. The always-negative sign is consistent with **real, structurally-driven
+  index skew being measured correctly**, not a miscalculation — it's the metric's *design* (an
+  across-strike, cross-option-type comparison) that can't distinguish "normal daily skew" from
+  "today's sentiment," not the arithmetic behind it.
+- **Status**: **REVISED 2026-09-16 — one-sided by construction, not usable as a directional score
+  input in its current form.** Downgraded from CONFIRMED. Not necessarily dead: the *level* of the
+  skew (how steep, not its sign) or its *day-to-day change* might still carry real information —
+  neither has been tested this way. As a signed contributor to a composite the way `ItmSkew` is
+  used today, it should be treated as a near-constant bearish offset, functionally equivalent to
+  zero-weighting it (backtested directly: see `GammaExposure`'s revision below for the joint
+  drop-both result).
+- **Days validated**: 08–11 Sep 2026 (original), 08–11 and 15 Sep 2026 (2026-09-16 revision, both
+  weeks).
+- **Open questions**:
+  - **Its own cadence-to-cadence (~15s) delta — closed, but see the corrected re-test below before
+    treating "change" as settled**: checked across ThisWeek 09-09/10/11 and NextWeek all 5 days.
+    Correlation is essentially zero everywhere (\|corr\| <= 0.016 in all 8 combinations), hit rate
+    within a point or two of 50% in every one. This specific granularity is noise. **But this is the
+    WRONG formulation of "change over time"** for a demand/supply-shift read, by this project's own
+    established convention — every other successfully-tested change metric here
+    (`FutureCvdProxyNet5Min`, `BasisChange`, `OiChangeDiff15m`) is a multi-minute ROLLING WINDOW, not
+    a tick-to-tick delta, precisely because a real shift plays out over minutes, not one 15-second
+    print to the next. User caught this inconsistency directly (2026-09-16) — re-tested properly
+    below.
+  - **15-minute ROLLING change (current level minus the level 15 real minutes ago), ThisWeek,
+    2026-09-16 — genuinely promising, not closed**:
+
+    | Date | Correlation | Hit rate |
+    |---|---|---|
+    | 09-09 | +0.127 | 59.0% |
+    | 09-10 | +0.194 | 58.2% |
+    | 09-11 | +0.119 | 52.9% |
+
+    Same sign on all 3 non-expiry ThisWeek days, moderate magnitude, two of three with a real
+    hit-rate lift over a coin flip — categorically different from both the dead level and the
+    tick-to-tick delta above. The 5-minute window is weaker and less consistent (-0.003 to +0.094)
+    on the same 3 days, so 15 minutes specifically looks like the right horizon, not just "any
+    window works." **Status: REOPENED as a watch candidate on the 15-min-rolling-change
+    formulation specifically** — same 3-day base as the original (now-superseded) level
+    confirmation, so treat with the identical caution (early signal, needs more days), not as
+    settled. NextWeek is weak/sign-inconsistent on the same test (-0.045 to +0.098), consistent
+    with NextWeek's already-established pattern of being messier than ThisWeek for nearly every
+    candidate in this file — not a red flag, an expected confirmation of that pattern.
+  - **Not yet tried**: this rolling-change formulation against the option's own price (only future
+    price checked so far, via `CadenceContext.FutureChangeForDay`) and against a 5/15/30-min
+    horizon sweep beyond the two tested; whether it holds up once 08 Sep (excluded here as the
+    ThisWeek expiry day) or more non-expiry days are added.
+  - **Same-strike Put-Call IV skew** (forward-filled per `(OptionType, StrikePrice)`, averaged over
+    every strike quoted on both sides that cadence — removes the Itm2Atm1 band's cross-strike
+    confound entirely): checked the same 8 combinations. Sign flips across days and chains with no
+    pattern (positive on 08/09 Sep ThisWeek and 08 Sep NextWeek, negative on 11 Sep both chains and
+    09/10/15 Sep NextWeek), magnitudes mostly under 0.15 with two exceptions that don't agree with
+    each other in sign (NextWeek 11 Sep: -0.221 at 15m; ThisWeek 15 Sep: -0.133 at 15m). Removing
+    the structural artifact did not uncover a hidden same-strike mispricing signal. **Closed, no
+    edge found this way either.** Both `ItmSkew` framings tried (level, delta) and both `ItmSkew`
+    band designs tried (cross-strike Itm2Atm1, same-strike) are now closed; no remaining untried
+    formulation of this idea is apparent.
 
 ### OiBuildupNet — Table 2/3, option chain — *CLOSED, no edge found*
 
@@ -690,7 +963,7 @@ both weeks, per-day):
   untested weights.
 - **Days validated**: 08–11 Sep 2026.
 
-### Live `GammaExposure` (sum of per-strike Gamma×OI, ATM±10 chain) — *watch candidate*
+### Live `GammaExposure` (sum of per-strike Gamma×OI, ATM±10 chain) — *REVISED 2026-09-16: downgraded, one-sided in the CoreScore composite's own usage*
 
 - **What it measures**: `Σ(call: +Gamma·OI, put: −Gamma·OI)` across the full nearest-expiry chain
   (now ATM±10, matching the actually-subscribed universe, unblocked by the 2026-09-13 schema
@@ -715,12 +988,106 @@ both weeks, per-day):
   those, there's a real competing economic explanation: dealer gamma-hedging pressure is a feedback
   mechanism that plausibly accumulates over a session rather than acting instantly, so a longer
   horizon mattering more is at least as plausible as a spurious co-trend. Not resolved either way.
-- **Status**: **watch candidate** (2026-09-13) — meaningfully better-supported than the three
-  closures the same day, not yet at depth-imbalance/IV-skew confirmation tier.
-- **Days validated**: 08–11 Sep 2026, ThisWeek only.
-- **Open questions**: does the horizon-strengthening shape hold up as real (dealer-hedging feedback)
-  or fade as more days accumulate (co-trend artifact); how version B (live's exact shared-ATM-vol
-  formula) compares to this per-strike-own-IV version.
+- **Status (original 2026-09-13 finding, on the rigorous 4-day/dual-target battery above)**: was
+  **watch candidate** — meaningfully better-supported than the three closures the same day, not yet
+  at depth-imbalance/IV-skew confirmation tier.
+- **Days validated (original)**: 08–11 Sep 2026, ThisWeek only.
+
+- **REVISED 2026-09-16 (as `GammaExposure` in the separate CoreScore 8-metric composite — same
+  economic idea, ATM±10, but reading `StrikeCadenceSnapshot.Gamma` directly rather than this
+  entry's own per-strike-own-IV recomputation, and correlated only against forward future price,
+  not both targets)**: same user-prompted per-term correlation pass as `ItmSkew` above. Checked its
+  signed value against forward 15-min price on every day, **both chains this time (ThisWeek and
+  NextWeek, 10 combinations)**:
+
+  | Day | Chain | Bullish reads | Bearish reads | Hit rate |
+  |---|---|---|---|---|
+  | 09-08 | ThisWeek | 626 | 3 | 43.9% |
+  | 09-08 | NextWeek | 626 | 0 | 43.6% |
+  | 09-09 | ThisWeek | 639 | 786 | 58.2% |
+  | 09-09 | NextWeek | 831 | 516 | 50.9% |
+  | 09-10 | ThisWeek | 964 | 456 | 61.4% |
+  | 09-10 | NextWeek | 0 | 1392 | 53.0% |
+  | 09-11 | ThisWeek | 100 | 1323 | 51.1% |
+  | 09-11 | NextWeek | 1210 | 143 | 50.0% |
+  | 09-15 | ThisWeek | 1428 | 1 | 31.1% |
+  | 09-15 | NextWeek | 445 | 974 | 31.4% |
+
+  Genuinely two-sided on 2 of 10 (09-09 both chains, 09-10 ThisWeek) — real evidence the term isn't
+  *always* degenerate, consistent with the original 2026-09-13 finding on those same days. But
+  stuck heavily one-sided on the other 8, and the two clearest cases (09-10, 09-11) **flip which
+  direction it's stuck in depending purely on which chain computes it, same day, same underlying
+  market**. That rules out a market-wide directional explanation for the stuck cases — whatever's
+  driving the sign when it does get stuck is chain-specific.
+- **Root cause is very unlikely to be IV, mechanically**: unlike `ItmSkew` (a direct function of
+  `PutAvgIv − CallAvgIv`), Black-Scholes Gamma is **non-negative for both calls and puts, always** —
+  IV only scales Gamma's *magnitude*, never its sign. This term's sign comes entirely from
+  `Σ(+Gamma·OI for calls) − Σ(Gamma·OI for puts)`, i.e. purely from which side carries more
+  Gamma-weighted open interest that chain, that day. The ThisWeek/NextWeek sign-flip on the same
+  day is exactly what you'd expect from call/put OI being distributed differently across two
+  separate expiry chains — not from a shared IV computation feeding both. A residual IV bug could
+  still be nudging magnitudes (and therefore borderline sign calls when Gamma-weighted OI is close
+  between sides), but it isn't the primary driver of the multi-hundred-cadence one-sided stretches
+  observed here.
+- **Status**: **REVISED 2026-09-16 — downgraded from watch candidate.** The original 4-day,
+  dual-target battery (above) still stands as real, separately-gathered evidence of a positive
+  correlation using a more careful per-strike-IV Gamma recomputation; this newer check, using the
+  simpler pipeline the live CoreScore composite actually reads, shows the term is unreliable in
+  practice (one-sided, OI-driven, chain-dependent) more often than it's a clean two-sided signal.
+  Backtested directly, zeroing this term's weight alongside `ItmSkew`'s (both derive from the
+  option chain's Greeks/IV surface, both showed one-sidedness) **improved every one of the
+  Hysteresis/Crossover/Combined strategy variants' 5-day totals** in `CoreScoreOptionSimulator`
+  (e.g. Hysteresis +75.03 → +119.60 pts; Crossover 15/30 +248.15 → +254.50 pts) — though it did not
+  fix the one day (09-15) that prompted this whole check, since that day's miscalibration was
+  spread across nearly all 8 terms, not concentrated in these two.
+- **Days validated**: 08–11 Sep 2026, ThisWeek only (original); 08–11 and 15 Sep 2026, both weeks
+  (2026-09-16 revision).
+- **Magnitude-gating follow-up, closed (2026-09-16)**: hypothesis was that GammaExposure might be a
+  real signal specifically when call/put Gamma-weighted OI is decisively imbalanced (large \|raw\|)
+  and pure noise near balance (small \|raw\|) — worth separating rather than judging the term as one
+  blend of both. Median-split each day/chain by \|GammaExposureRaw\| and correlated each half
+  against forward 15-min move independently (10 day/chain combinations, 20 buckets total). **Not
+  supported — if anything, mildly the opposite**: on NextWeek, the LOW-magnitude (near-balanced)
+  half had a *higher* hit rate than the HIGH-magnitude half on 4 of 5 days (e.g. 10 Sep: 63.5% low
+  vs 43.0% high; 11 Sep: 56.0% low vs 42.7% high). ThisWeek showed no consistent pattern either way
+  (sometimes low wins, sometimes roughly tied, never a clean high-magnitude win). **Closed — gating
+  by the term's own decisiveness doesn't rescue it**, and there's a hint (not yet explained) that
+  extreme readings might be *less* trustworthy than moderate ones, worth remembering if this term is
+  revisited.
+- **Rolling-change follow-up (2026-09-16, same correction as `ItmSkew` above — a real demand/supply
+  shift plays out over minutes, not one 15-second tick)**: is dealer positioning building up or
+  unwinding, rather than its raw level — 5-min and 15-min rolling change (current minus N-minutes-
+  ago) vs forward 15-min move:
+
+  | Date | Chain | 5-min window | 15-min window |
+  |---|---|---|---|
+  | 09-08 | ThisWeek | +0.068 / 53.2% | +0.115 / 54.2% |
+  | 09-09 | ThisWeek | +0.162 / 52.9% | +0.282 / 55.0% |
+  | 09-10 | ThisWeek | +0.254 / 60.7% | +0.045 / 55.0% |
+  | 09-11 | ThisWeek | +0.106 / 54.6% | +0.071 / 45.7% |
+  | 09-15 | ThisWeek | -0.115 / 47.8% | -0.261 / 44.3% |
+  | 09-08 | NextWeek | -0.109 / 51.5% | -0.131 / 41.6% |
+  | 09-09 | NextWeek | +0.177 / 56.0% | +0.169 / 51.7% |
+  | 09-10 | NextWeek | -0.069 / 51.0% | -0.314 / 39.3% |
+  | 09-11 | NextWeek | +0.007 / 47.2% | -0.130 / 44.9% |
+  | 09-15 | NextWeek | -0.062 / 45.3% | -0.222 / 35.9% |
+
+  ThisWeek leans positive on 4 of 5 days (0.05–0.28) with today (09-15, the day that prompted this
+  whole check) the clear exception, flipping negative on both windows — consistent with today being
+  a broadly anomalous session rather than this reformulation being wrong. But unlike `ItmSkew`'s
+  15-min result, the two windows don't agree on which is stronger day to day (09-10: 5-min far
+  beats 15-min; 09-09: the reverse), and NextWeek shows no consistent sign at all. **Status: open,
+  not closed and not confirmed** — real enough to keep as a lead (worth re-checking as more days
+  accumulate, ideally settling the 5-vs-15-min question first), not clean enough to reopen as a
+  watch candidate the way `ItmSkew`'s 15-min change was.
+- **Open questions**: does the original per-strike-own-IV recomputation (version A above) show the
+  same chain-dependent sign-flip if re-run on NextWeek — would isolate whether the live pipeline's
+  simpler Gamma source is itself adding noise beyond what version A already has; how much of the
+  magnitude difference between the two pipelines traces to `ItmSkew`'s own identified band-driven
+  skew bias flowing into each strike's own solved IV; why extreme readings underperform moderate
+  ones in the magnitude-gating check above, if that pattern replicates on more days; which rolling
+  window (5 or 15 min) is actually right for the change formulation, since the two disagree day to
+  day above.
 
 ### Live `VannaExposure` (sum of per-strike Vanna×OI, ATM±10 chain) — *CLOSED, no edge*
 

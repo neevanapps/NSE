@@ -177,7 +177,27 @@ foreach (var asOfDate in asOfDates)
     var thisWeekExpiry = strikeRows.Select(s => s.ExpiryDate).Distinct().OrderBy(e => e).First();
 
     // --- Backtest side: exactly CoreScoreOptionSimulator's own math, no re-derivation here. ---
-    var backtestDiagnostics = CoreScoreOptionSimulator.BuildDiagnostics(strikeRows, cadenceContexts, thisWeekExpiry);
+    // 2026-09-17 fix: pass the SAME weights the live side actually uses (NiftySignal.Scoring.
+    // CoreScoreWeights.Default), mapped field-by-field into the backtest tool's own weights record.
+    // Before this fix, BuildDiagnostics silently fell back to ITS OWN default weights (the original,
+    // pre-2026-09-16 values: ItmSkewWeight=0.065, GammaExposureWeight=0.06, no rolling-change terms)
+    // -- stale ever since the live composite's weights were revised (ItmSkew/GammaExposure zeroed,
+    // the rest rescaled to sum to 1.0; see NiftySignal.Scoring/CoreScoreWeights.cs's own doc comment).
+    // That mismatch alone was enough to make CoreScore/CoreScoreFast/CoreScoreSlow disagree on 100%
+    // of cadences, masquerading as a parity bug when the actual per-term math was mostly fine (see
+    // the field-level rows below, e.g. BasisChangeSigned's real fix the same day this was found).
+    var liveWeights = NiftySignal.Scoring.CoreScoreWeights.Default;
+    var matchingWeights = new CoreScoreWeights(
+        DepthImbalanceWeight: liveWeights.DepthImbalance,
+        ItmSkewWeight: liveWeights.ItmSkew,
+        FutureCvdNet5MinWeight: liveWeights.FutureCvdNet5Min,
+        NotionalVolumeRatioWeight: liveWeights.NotionalVolumeRatio,
+        GammaExposureWeight: liveWeights.GammaExposure,
+        TrendReversion15mWeight: liveWeights.TrendReversion15m,
+        BasisChangeWeight: liveWeights.BasisChange,
+        OiChangeDiff15mWeight: liveWeights.OiChangeDiff15m,
+        K: NiftySignal.Scoring.CoreScoreCalculator.DefaultK);
+    var backtestDiagnostics = CoreScoreOptionSimulator.BuildDiagnostics(strikeRows, cadenceContexts, thisWeekExpiry, matchingWeights);
     var backtestByTimestamp = backtestDiagnostics.ToDictionary(d => d.Timestamp);
 
     // --- Live side: replay real ticks through LiveFeatureEngine on CadencePopulator's own

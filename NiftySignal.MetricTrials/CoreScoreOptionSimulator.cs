@@ -76,6 +76,23 @@ public sealed record CoreScoreWeights(
     double TrendReversion15mWeight = 0.10,
     double BasisChangeWeight = 0.08,
     double OiChangeDiff15mWeight = 0.10,
+    // 2026-09-17, experimental -- zero by default (preserves every existing caller's/test's
+    // behavior unchanged). See BuildScoreCadences's own doc comment on ItmSkewChangeHistory: these
+    // are NOT the same terms as ItmSkewWeight/GammaExposureWeight above (those stay on the LEVEL,
+    // now closed per docs/SCORE_CANDIDATES.md) -- these score the rolling CHANGE instead, the
+    // reformulation that showed a real, dual-target-confirmed signal for ItmSkew specifically.
+    double ItmSkewChange15mWeight = 0.0,
+    double GammaExposureChange5mWeight = 0.0,
+    // 2026-09-17, experimental -- false by default (preserves every existing caller's/test's
+    // behavior unchanged). FutureCvdNet5Min was found reading below a coin flip on 4 of 5 days, at
+    // every target/horizon checked, in THIS composite's own current data -- see
+    // docs/SCORE_CANDIDATES.md's 2026-09-17 root-cause section (ruled out the percentile-rank
+    // transform and the row-count-vs-time forward-window methodology as explanations; most likely
+    // the underlying data changed since the original 2026-09-12 "positive on 3 of 4 days"
+    // confirmation, making that verdict stale). A flag, not a permanent sign flip in the formula
+    // itself below -- the actual keep-vs-invert decision needs a real backtest first, same
+    // discipline as every other change here.
+    bool InvertFutureCvdNet5Min = false,
     // Provisional starting point, not a tuned value -- same "starting point, not the answer"
     // framing as every other k in this project's history (see CompositeScoreCalculator.DefaultK's
     // own doc comment).
@@ -83,7 +100,8 @@ public sealed record CoreScoreWeights(
 {
     /// <summary>Sums to 0.915, not 1.00 -- left as-is rather than silently rescaled, same reasoning as every other total here. The renormalize-by-present-weight step divides by whatever total is actually present each cadence, so this doesn't break anything.</summary>
     public double Total => DepthImbalanceWeight + ItmSkewWeight + FutureCvdNet5MinWeight + NotionalVolumeRatioWeight
-        + GammaExposureWeight + TrendReversion15mWeight + BasisChangeWeight + OiChangeDiff15mWeight;
+        + GammaExposureWeight + TrendReversion15mWeight + BasisChangeWeight + OiChangeDiff15mWeight
+        + ItmSkewChange15mWeight + GammaExposureChange5mWeight;
 }
 
 public sealed record CoreScoreSimulationOptions(
@@ -342,9 +360,51 @@ public static class CoreScoreOptionSimulator
         var gammaRank = new SessionRankTracker();
         var basisRank = new SessionRankTracker();
         var oiDiffRank = new SessionRankTracker();
+        var itmSkewChangeRank = new SessionRankTracker();
+        var gammaExposureChangeRank = new SessionRankTracker();
 
         var trendWindow = new Queue<(DateTimeOffset Timestamp, double Change)>();
         var oiDiffWindow = new Queue<(DateTimeOffset Timestamp, long Call, long Put)>();
+
+        // 2026-09-17, experimental: ItmSkew's and GammaExposure's LEVELS are both closed (see
+        // docs/SCORE_CANDIDATES.md's 2026-09-16 revisions -- ItmSkew structurally one-sided,
+        // GammaExposure OI-driven and chain-dependent). But a genuine demand/supply SHIFT plays out
+        // over minutes, not as a static level -- user's own diagnosis, confirmed by a rolling-window
+        // re-test that found ItmSkew's 15-min change (NOT its level, NOT a tick-to-tick delta) real
+        // and same-signed against BOTH future and option price on all 3 non-expiry ThisWeek days
+        // (+0.12 to +0.19 vs future, +0.13 to +0.16 vs option). GammaExposure's own change was
+        // checked too but is far less consistent (window disagreement, incoherent on NextWeek) --
+        // included anyway per explicit instruction, at a correspondingly smaller weight. Two-pointer
+        // history buffers below: `*ChangeHistory` grows once per cadence (append-only, chronological
+        // by construction since `byTimestamp` is itself ordered), `*ChangeRefIndex` only ever moves
+        // forward -- O(1) amortized "value as of (now - window)" lookup, not an O(n) rescan.
+        var itmSkewChangeHistory = new List<(DateTimeOffset Timestamp, double Value)>();
+        var itmSkewChangeRefIndex = 0;
+        var gammaExposureChangeHistory = new List<(DateTimeOffset Timestamp, double Value)>();
+        var gammaExposureChangeRefIndex = 0;
+        var itmSkewChangeWindow = TimeSpan.FromMinutes(15); // the window that actually showed signal; 5-min was weaker/inconsistent on the same days
+        var gammaExposureChangeWindow = TimeSpan.FromMinutes(5); // less-validated than ItmSkew's; 5-min leaned marginally more consistent across days than 15-min
+
+        double? RollingChange(List<(DateTimeOffset Timestamp, double Value)> history, ref int refIndex, DateTimeOffset timestamp, TimeSpan window, double? currentValue)
+        {
+            double? change = null;
+            if (currentValue is { } current)
+            {
+                while (refIndex + 1 < history.Count && history[refIndex + 1].Timestamp <= timestamp - window)
+                {
+                    refIndex++;
+                }
+
+                if (history.Count > 0 && history[refIndex].Timestamp <= timestamp - window)
+                {
+                    change = current - history[refIndex].Value;
+                }
+
+                history.Add((timestamp, current));
+            }
+
+            return change;
+        }
 
         var cadences = new List<ScoreCadence>();
 
@@ -376,6 +436,10 @@ public static class CoreScoreOptionSimulator
                 itmSkewRaw = callIv.Count > 0 && putIv.Count > 0 ? putIv.Average() - callIv.Average() : null;
             }
 
+            // --- ItmSkewChange15m: rolling 15-min CHANGE in the level above, not the level itself
+            // (2026-09-17 -- see this method's own doc comment on the two-pointer history buffers) ---
+            var itmSkewChange15mRaw = RollingChange(itmSkewChangeHistory, ref itmSkewChangeRefIndex, timestamp, itmSkewChangeWindow, itmSkewRaw);
+
             // --- FutureCvdNet5Min (PROMOTED, sign confirmed positive, read directly) ---
             double? futureCvdRaw = ctx?.FutureCvdProxyNet5Min;
 
@@ -393,6 +457,9 @@ public static class CoreScoreOptionSimulator
             double? gammaExposureRaw = gexRows.Count > 0
                 ? gexRows.Sum(r => (r.OptionType == OptionType.Call ? 1.0 : -1.0) * r.Gamma!.Value * r.OpenInterest!.Value)
                 : null;
+
+            // --- GammaExposureChange5m: rolling 5-min CHANGE in the level above (2026-09-17) ---
+            var gammaExposureChange5mRaw = RollingChange(gammaExposureChangeHistory, ref gammaExposureChangeRefIndex, timestamp, gammaExposureChangeWindow, gammaExposureRaw);
 
             // --- TrendReversion15m: signed net Future change / path length, trailing 15 real min ---
             // Already bounded [-1,1] by construction (net <= path always) -- used directly as this
@@ -442,12 +509,14 @@ public static class CoreScoreOptionSimulator
             // ordering already established this session for the DynamicHybrid same-bar fix.
             var depthSigned = RankSigned(depthImbalanceRaw, depthRank);
             var skewSigned = RankSigned(itmSkewRaw, skewRank);
-            var cvdSigned = RankSigned(futureCvdRaw, cvdRank);
+            var cvdSigned = RankSigned(weights.InvertFutureCvdNet5Min && futureCvdRaw is { } fcvd ? -fcvd : futureCvdRaw, cvdRank);
             var notionalSigned = RankSigned(notionalLogRatioRaw, notionalRank);
             var gammaSigned = RankSigned(gammaExposureRaw, gammaRank);
             var basisSigned = RankSigned(basisChangeRaw is { } b ? -b : null, basisRank); // negated: sign confirmed negative
             var oiDiffSigned = RankSigned(oiChangeDiff15mRaw, oiDiffRank);
             var trendSigned = trendReversionSigned; // already bounded, not ranked
+            var itmSkewChangeSigned = RankSigned(itmSkewChange15mRaw, itmSkewChangeRank);
+            var gammaExposureChangeSigned = RankSigned(gammaExposureChange5mRaw, gammaExposureChangeRank);
 
             // Renormalize by the weight of whichever terms are actually present this cadence --
             // same optional-component pattern CompositeScoreCalculator/RatioScoreCalculator both
@@ -459,7 +528,9 @@ public static class CoreScoreOptionSimulator
                 + (gammaSigned is not null ? weights.GammaExposureWeight : 0)
                 + (trendSigned is not null ? weights.TrendReversion15mWeight : 0)
                 + (basisSigned is not null ? weights.BasisChangeWeight : 0)
-                + (oiDiffSigned is not null ? weights.OiChangeDiff15mWeight : 0);
+                + (oiDiffSigned is not null ? weights.OiChangeDiff15mWeight : 0)
+                + (itmSkewChangeSigned is not null ? weights.ItmSkewChange15mWeight : 0)
+                + (gammaExposureChangeSigned is not null ? weights.GammaExposureChange5mWeight : 0);
 
             double? score = null;
             if (presentWeight > 0)
@@ -471,7 +542,9 @@ public static class CoreScoreOptionSimulator
                     + (gammaSigned ?? 0) * weights.GammaExposureWeight
                     + (trendSigned ?? 0) * weights.TrendReversion15mWeight
                     + (basisSigned ?? 0) * weights.BasisChangeWeight
-                    + (oiDiffSigned ?? 0) * weights.OiChangeDiff15mWeight) / presentWeight;
+                    + (oiDiffSigned ?? 0) * weights.OiChangeDiff15mWeight
+                    + (itmSkewChangeSigned ?? 0) * weights.ItmSkewChange15mWeight
+                    + (gammaExposureChangeSigned ?? 0) * weights.GammaExposureChange5mWeight) / presentWeight;
                 score = 100.0 * Math.Tanh(raw / weights.K);
             }
 

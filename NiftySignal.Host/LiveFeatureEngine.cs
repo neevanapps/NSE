@@ -1397,7 +1397,7 @@ public sealed class LiveFeatureEngine
             coreTrendReversion15mRaw = trendReversion;
             coreBasisChangeRaw = basisChange;
 
-            coreOiChangeDiff15mRaw = ComputeCoreOiChangeDiffRaw(now, spot.LastPrice);
+            coreOiChangeDiff15mRaw = ComputeCoreOiChangeDiffRaw(now, coreStrikeOffsets);
 
             coreDepthImbalanceSigned = RankSigned(coreDepthImbalanceRaw, _coreDepthImbalanceRank);
             coreItmSkewSigned = RankSigned(coreItmSkewRaw, _coreItmSkewRank);
@@ -2922,7 +2922,27 @@ public sealed class LiveFeatureEngine
             }
         }
 
-        double? basisChange = futureChange is { } fChange && spotChange is { } sChange ? fChange - sChange : null;
+        // 2026-09-17 fix: recombine from the ORIGINAL DECIMAL opens/closes in decimal arithmetic,
+        // ONE cast to double at the end -- matching CoreScoreOptionSimulator.cs's own
+        // `(double)(fChg - sChg)` order-of-operations exactly, where fChg/sChg are themselves
+        // already-decimal per-cadence changes (CadenceContext.FutureChangeFromLastCadence/
+        // SpotChangeFromLastCadence). The previous version combined `futureChange`/`spotChange`
+        // AFTER each had already been independently cast to double above -- two independent
+        // decimal-to-binary roundings then a double subtraction, instead of one decimal subtraction
+        // then a single rounding. CoreScoreReplayDiff found the resulting BasisChangeRaw noise too
+        // small to trip its own 1e-6 epsilon (0 raw mismatches reported) -- but SessionRankTracker's
+        // Rank() compares each new value against every prior value added this session via a strict
+        // `<=`, and BasisChange's own distribution (derived from tick-granular decimal prices) is
+        // dense with near-exact ties; once one historical entry lands a few ULPs off from where
+        // backtest's tracker put it, every later Rank() call that falls near that entry can disagree
+        // -- which is how a difference too small to see in BasisChangeRaw cascaded into
+        // BasisChangeSigned mismatching on 54% of all cadences (4016 of 7385, see the 2026-09-17
+        // CoreScoreReplayDiff run). `futureChange`/`spotChange` above are left untouched -- they
+        // still feed TrendReversion15m, which already matched exactly.
+        double? basisChange = _coreFutureCadenceClose is { } fc && _coreFutureCadenceOpen is { } fo
+            && _coreSpotCadenceClose is { } sc && _coreSpotCadenceOpen is { } so
+            ? (double)((fc - fo) - (sc - so))
+            : null;
 
         return (trendReversion, basisChange);
     }
@@ -2938,25 +2958,34 @@ public sealed class LiveFeatureEngine
     /// on the very first cadence (no _previousCadence at all yet) -- after that, always a real
     /// number (0 contributions from a strike with no comparable previous OI, never skipped/null),
     /// same as the backtest's own unconditional Sum().
+    ///
+    /// 2026-09-17 fix: band membership now uses the SAME signed INDEX offset
+    /// (<paramref name="strikeOffsets"/>, from <see cref="ComputeStrikeOffsets"/>) every other
+    /// Core-score strike band already uses, matching CoreScoreOptionSimulator.cs's own
+    /// <c>Math.Abs(r.Offset) &lt;= OiDiffBandOffset</c> exactly. The previous version selected
+    /// "nearest (PersistedStrikeBand*2)+1 strikes by raw price distance from spot" -- the same
+    /// "earlier version" pattern already found and fixed for GammaExposureRaw (see that method's
+    /// own doc comment): coincides with the index-based band whenever the tracked strike chain has
+    /// no gaps near the money, but is a structurally different selection whenever it does. Every
+    /// sibling Core-score band method already carries a doc comment cross-referencing the backtest
+    /// line it matches; this one never got migrated during that pass.
     /// </summary>
-    double? ComputeCoreOiChangeDiffRaw(DateTimeOffset now, decimal spotPrice)
+    double? ComputeCoreOiChangeDiffRaw(DateTimeOffset now, Dictionary<decimal, int> strikeOffsets)
     {
         if (_previousCadence is null)
         {
             return null;
         }
 
-        var bandStrikes = _nearestExpiryOptions
-            .Select(o => o.StrikePrice!.Value)
-            .Distinct()
-            .OrderBy(s => Math.Abs(s - spotPrice))
-            .Take((PersistedStrikeBand * 2) + 1)
-            .ToHashSet();
-
         long callDelta = 0, putDelta = 0;
 
-        foreach (var option in _nearestExpiryOptions.Where(o => bandStrikes.Contains(o.StrikePrice!.Value)))
+        foreach (var option in _nearestExpiryOptions)
         {
+            if (!strikeOffsets.TryGetValue(option.StrikePrice!.Value, out var offset) || Math.Abs(offset) > PersistedStrikeBand)
+            {
+                continue;
+            }
+
             if (!_latest.TryGetValue(option.Token, out var curr) || curr.OpenInterest is not { } currOi)
             {
                 continue;
