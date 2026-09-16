@@ -240,6 +240,12 @@ public sealed class LiveFeatureEngine
     readonly SessionRankTracker _coreBasisChangeRank = new();
     readonly SessionRankTracker _coreOiChangeDiffRank = new();
 
+    // TEMPORARY DIAGNOSTIC (2026-09-16) -- see SessionRankTracker.Count's own comment. Public
+    // (not internal) so NiftySignal.CoreScoreReplayDiff, a separate assembly, can read it. No
+    // production caller.
+    public int CoreBasisChangeRankCountDiagnostic => _coreBasisChangeRank.Count;
+    public IReadOnlyList<double> CoreBasisChangeRankValuesDiagnostic => _coreBasisChangeRank.Values;
+
     /// <summary>
     /// DepthImbalance/ItmSkew (Batch 3 fix, 2026-09-13): NOT "noisy instantaneous" 3s-sampled
     /// averages like the 14-component composite's own DepthImbalance/IvSkew -- CoreScoreReplayDiff

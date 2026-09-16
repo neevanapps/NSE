@@ -201,6 +201,9 @@ foreach (var asOfDate in asOfDates)
 
     var engine = new LiveFeatureEngine(instruments);
     var liveByTimestamp = new Dictionary<DateTimeOffset, CoreScoreSnapshot>();
+    // TEMPORARY DIAGNOSTIC (2026-09-16) -- see SessionRankTracker.Count's own comment.
+    var liveBasisChangeRankCountByTimestamp = new Dictionary<DateTimeOffset, int>();
+    var liveBasisChangeRankValuesByTimestamp = new Dictionary<DateTimeOffset, IReadOnlyList<double>>();
 
     var tickIndex = 0;
     var nextSample = dayStartUtc;
@@ -232,10 +235,72 @@ foreach (var asOfDate in asOfDates)
             {
                 liveByTimestamp[boundary] = snapshot;
             }
+            // TEMPORARY DIAGNOSTIC (2026-09-16)
+            liveBasisChangeRankCountByTimestamp[boundary] = engine.CoreBasisChangeRankCountDiagnostic;
+            liveBasisChangeRankValuesByTimestamp[boundary] = engine.CoreBasisChangeRankValuesDiagnostic;
         }
     }
 
     Console.WriteLine($"  {ticks.Count} ticks replayed, {backtestDiagnostics.Count} backtest cadences, {liveByTimestamp.Count} live cadences with a CoreScoreSnapshot.");
+
+    // TEMPORARY DIAGNOSTIC (2026-09-16) -- round 2. Round 1 (count-only) found the counts match
+    // at every cadence, all day -- which, combined with BasisChangeRaw being provably identical
+    // every cadence, should mean the two SORTED value lists are identical too, which would mean
+    // Rank() always agrees. It doesn't (771 mismatches on 09-15). So this round compares the
+    // actual SORTED CONTENTS, not just the count, and prints the first index where they differ --
+    // that pinpoints exactly which stored value is wrong, which points at exactly which Add() call
+    // added the wrong number.
+    if (dumpDate == asOfDate)
+    {
+        Console.WriteLine("  --- BasisChangeRank VALUES diagnostic (backtest vs live) ---");
+        var diagnosticDiverged = false;
+        foreach (var (timestamp, backtestDiag) in backtestByTimestamp.OrderBy(kv => kv.Key))
+        {
+            if (!liveBasisChangeRankValuesByTimestamp.TryGetValue(timestamp, out var liveValues)
+                || backtestDiag.BasisChangeRankValues is not { } backtestValues)
+            {
+                continue;
+            }
+
+            var backtestSorted = backtestValues.OrderBy(v => v).ToArray();
+            var liveSorted = liveValues.OrderBy(v => v).ToArray();
+
+            if (backtestSorted.Length != liveSorted.Length)
+            {
+                Console.WriteLine($"    {timestamp:HH:mm:ss} COUNT MISMATCH backtestCount={backtestSorted.Length} liveCount={liveSorted.Length} (should not happen -- round 1 found none)");
+                continue;
+            }
+
+            var firstDiffIndex = -1;
+            for (var idx = 0; idx < backtestSorted.Length; idx++)
+            {
+                if (Math.Abs(backtestSorted[idx] - liveSorted[idx]) > 1e-9)
+                {
+                    firstDiffIndex = idx;
+                    break;
+                }
+            }
+
+            if (firstDiffIndex >= 0 && !diagnosticDiverged)
+            {
+                diagnosticDiverged = true;
+                Console.WriteLine($"    FIRST DIVERGENCE at {timestamp:HH:mm:ss}, sorted index {firstDiffIndex} of {backtestSorted.Length}:");
+                Console.WriteLine($"      backtest[{firstDiffIndex}]={backtestSorted[firstDiffIndex]:F9} live[{firstDiffIndex}]={liveSorted[firstDiffIndex]:F9}");
+                // Print a small window around the divergence point on both sides for context.
+                var windowStart = Math.Max(0, firstDiffIndex - 3);
+                var windowEnd = Math.Min(backtestSorted.Length - 1, firstDiffIndex + 3);
+                Console.WriteLine($"      backtest[{windowStart}..{windowEnd}] = [{string.Join(", ", backtestSorted[windowStart..(windowEnd + 1)].Select(v => v.ToString("F9")))}]");
+                Console.WriteLine($"      live[{windowStart}..{windowEnd}]     = [{string.Join(", ", liveSorted[windowStart..(windowEnd + 1)].Select(v => v.ToString("F9")))}]");
+                break;
+            }
+        }
+
+        if (!diagnosticDiverged)
+        {
+            Console.WriteLine("    No divergence found -- sorted value lists matched at every cadence.");
+        }
+        Console.WriteLine();
+    }
 
     var dayMaxAbsDiff = new double[fieldNames.Length];
     var dayMismatchCount = new int[fieldNames.Length];

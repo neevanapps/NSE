@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Daily VM to desktop raw-data replication (2026-09-15). Exports/imports Instruments and
+         Ticks only; see this project's own Program.cs doc comment for why those two tables
+         specifically. Deployed standalone to the VM (published and copied, like NiftySignal.Host
+         and NiftySignal.Dashboard already are) and also run from source on the desktop via
+         "dotnet run" against this project. -->
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NiftySignal.Persistence\NiftySignal.Persistence.csproj" />
+  </ItemGroup>
+
+</Project>

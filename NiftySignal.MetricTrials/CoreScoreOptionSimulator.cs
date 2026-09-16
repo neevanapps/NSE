@@ -90,9 +90,9 @@ public sealed record CoreScoreSimulationOptions(
     double EntryScoreThreshold = 30.0,
     // 2026-09-13: fixed-cadence hold removed per explicit instruction ("no mechanical time gate").
     // Exit uses a hysteresis band (see the state machine below) -- a position closes only once the
-    // score crosses all the way to the OPPOSITE threshold. Still no SL/TP: the trigger is the
-    // score, never the option's own price. ForceCloseTime remains as a backstop (data/session
-    // boundary, not an artificial hold length) since a position can't carry overnight here.
+    // score crosses all the way to the OPPOSITE threshold. ForceCloseTime remains as a backstop
+    // (data/session boundary, not an artificial hold length) since a position can't carry overnight
+    // here.
     decimal EntryPriceRangeLow = 100m,
     decimal EntryPriceRangeHigh = 150m,
     CoreScoreWeights? Weights = null,
@@ -103,7 +103,27 @@ public sealed record CoreScoreSimulationOptions(
     // means the last 4 computed values, however far apart in wall-clock time a quiet session made
     // them). Applied to BOTH entry and exit checks, not just one -- a smoothed entry gated by a
     // razor-sharp exit (or vice versa) would just be a different, undocumented strategy shape.
-    int ScoreSmoothingCadences = 1)
+    int ScoreSmoothingCadences = 1,
+    // 2026-09-16, experimental (live-caught 2026-09-15: two Hysteresis trades held 135/172 minutes
+    // on a stuck score lost 58%/72% of premium with nothing to stop it -- see this class's own
+    // "no SL/TP" note above, now qualified by this parameter). Percent of ENTRY PREMIUM, e.g. 30
+    // means "exit once the position is down 30% from its own entry price" -- independent of the
+    // score, checked every cadence a fresh quote exists for the held contract (same quote source
+    // MFE/MAE already use). null (default) disables it entirely, preserving every existing
+    // caller's/test's behavior unchanged. Deliberately a percent of premium, not a fixed point
+    // amount -- premiums here range from EntryPriceRangeLow to EntryPriceRangeHigh, so a fixed
+    // point stop would be a wildly different fraction of risk depending on which strike got picked.
+    decimal? StopLossPct = null,
+    // 2026-09-16, added alongside StopLossPct after backtesting showed the stop ALONE makes a
+    // stuck-score session worse, not better: a tight stop on a persistently-miscalibrated score
+    // (09-15's own composite stayed bullish essentially all session while the market fell -- see
+    // the correlation check that found this) just re-enters the SAME losing side over and over,
+    // each loss compounding off a lower base than the last -- literally a bigger cumulative loss
+    // than one long, unstopped ride would have been. Same semantics as the LIVE engine's own
+    // RiskLimits.MaxConsecutiveLosses (CoreScoreHysteresisTradingEngine.EvaluateEntryAsync) --
+    // once this many CLOSED trades in a row lost money, no new entry until a win resets the streak.
+    // null (default) disables it, preserving every existing caller's/test's behavior unchanged.
+    int? MaxConsecutiveLosses = null)
 {
     public CoreScoreWeights EffectiveWeights => Weights ?? new CoreScoreWeights();
 }
@@ -126,6 +146,19 @@ public sealed record CoreScoreCrossoverOptions(
     decimal EntryPriceRangeLow = 100m,
     decimal EntryPriceRangeHigh = 150m,
     CoreScoreWeights? Weights = null)
+{
+    public CoreScoreWeights EffectiveWeights => Weights ?? new CoreScoreWeights();
+}
+
+/// <summary>2026-09-15, experimental -- see <see cref="CoreScoreOptionSimulator.SimulateDayCombined"/>'s own doc comment.</summary>
+public sealed record CoreScoreCombinedOptions(
+    double EntryScoreThreshold = 30.0,
+    int FastWindowMinutes = 10,
+    int SlowWindowMinutes = 30,
+    decimal EntryPriceRangeLow = 100m,
+    decimal EntryPriceRangeHigh = 150m,
+    CoreScoreWeights? Weights = null,
+    bool ExitOnEitherOpposite = true)
 {
     public CoreScoreWeights EffectiveWeights => Weights ?? new CoreScoreWeights();
 }
@@ -158,7 +191,10 @@ public sealed record CoreScoreCadenceDiagnostics(
     double? TrendReversion15mRaw, double? TrendReversion15mSigned,
     double? BasisChangeRaw, double? BasisChangeSigned,
     double? OiChangeDiff15mRaw, double? OiChangeDiff15mSigned,
-    double? CoreScore, double? CoreScoreFast, double? CoreScoreSlow);
+    double? CoreScore, double? CoreScoreFast, double? CoreScoreSlow,
+    // TEMPORARY DIAGNOSTIC (2026-09-16) -- see SessionRankTracker.Count's own comment. Safe to
+    // remove once the BasisChangeSigned live-vs-backtest divergence is resolved.
+    int BasisChangeRankCount = 0, IReadOnlyList<double>? BasisChangeRankValues = null);
 
 public sealed record CoreScoreDayResult(DateOnly AsOfDate, IReadOnlyList<CoreScoreTrade> Trades)
 {
@@ -210,7 +246,9 @@ public static class CoreScoreOptionSimulator
         double? GammaExposureRaw, double? GammaExposureSigned,
         double? TrendReversion15mRaw, double? TrendReversion15mSigned,
         double? BasisChangeRaw, double? BasisChangeSigned,
-        double? OiChangeDiff15mRaw, double? OiChangeDiff15mSigned);
+        double? OiChangeDiff15mRaw, double? OiChangeDiff15mSigned,
+        // TEMPORARY DIAGNOSTIC (2026-09-16) -- see SessionRankTracker.Count's own comment.
+        int BasisChangeRankCount = 0, IReadOnlyList<double>? BasisChangeRankValues = null);
 
     /// <summary>
     /// 2026-09-13: entry per explicit instruction picks the strike priced near [low,high], not ATM --
@@ -445,7 +483,9 @@ public static class CoreScoreOptionSimulator
                 gammaExposureRaw, gammaSigned,
                 trendReversionSigned, trendSigned,
                 basisChangeRaw, basisSigned,
-                oiChangeDiff15mRaw, oiDiffSigned));
+                oiChangeDiff15mRaw, oiDiffSigned,
+                // TEMPORARY DIAGNOSTIC (2026-09-16)
+                BasisChangeRankCount: basisRank.Count, BasisChangeRankValues: basisRank.Values));
         }
 
         return (cadences, priceByStrikeAndTime);
@@ -469,6 +509,7 @@ public static class CoreScoreOptionSimulator
         (DateTimeOffset EntryTime, decimal EntryPrice, OptionType Side, decimal StrikePrice, double EntryScore,
             int CadencesHeld, decimal RunningMfe, decimal RunningMae)? open = null;
         var scoreSmoothingWindow = new Queue<double>();
+        var consecutiveLosses = 0;
 
         foreach (var cadence in cadences)
         {
@@ -481,6 +522,7 @@ public static class CoreScoreOptionSimulator
                 // Track this SPECIFIC contract's own price at this timestamp -- never "whatever is
                 // ATM now", the exact strike-identity guard this whole project already learned it
                 // needs the hard way.
+                var stopLossHit = false;
                 if (priceByStrikeAndTime.TryGetValue((position.Side, position.StrikePrice), out var series)
                     && series.TryGetValue(timestamp, out var currentMark) && currentMark is { } price)
                 {
@@ -491,6 +533,15 @@ public static class CoreScoreOptionSimulator
                         RunningMae = Math.Min(position.RunningMae, excursion),
                     };
                     position = open.Value;
+
+                    // Checked off the SAME fresh quote MFE/MAE just used, not a separate lookup --
+                    // a cadence with no quote for this contract can't be stopped out on a stale
+                    // price any more than MFE/MAE can be updated on one.
+                    if (options.StopLossPct is { } stopLossPct)
+                    {
+                        var excursionPct = excursion / position.EntryPrice * 100m;
+                        stopLossHit = excursionPct <= -stopLossPct;
+                    }
                 }
 
                 position = position with { CadencesHeld = position.CadencesHeld + 1 };
@@ -504,18 +555,24 @@ public static class CoreScoreOptionSimulator
                 var scoreInvalidated = score is { } liveScore
                     && (position.Side == OptionType.Call ? liveScore < -options.EntryScoreThreshold : liveScore > options.EntryScoreThreshold);
 
-                if (cadence.MustForceClose || scoreInvalidated)
+                if (cadence.MustForceClose || scoreInvalidated || stopLossHit)
                 {
                     var exitPrice = priceByStrikeAndTime.TryGetValue((position.Side, position.StrikePrice), out var s2) && s2.TryGetValue(timestamp, out var m2) && m2 is { } exitMark
                         ? exitMark
                         : position.EntryPrice; // no fresh quote this exact cadence -- fall back to entry, never fabricate a price
-                    trades.Add(new CoreScoreTrade(position.EntryTime, position.EntryPrice, position.Side, position.StrikePrice,
-                        timestamp, exitPrice, cadence.MustForceClose ? "ForceClose" : "ScoreInvalidated",
-                        position.RunningMfe, position.RunningMae, position.EntryScore));
+                    var closedTrade = new CoreScoreTrade(position.EntryTime, position.EntryPrice, position.Side, position.StrikePrice,
+                        timestamp, exitPrice, cadence.MustForceClose ? "ForceClose" : stopLossHit ? "StopLoss" : "ScoreInvalidated",
+                        position.RunningMfe, position.RunningMae, position.EntryScore);
+                    trades.Add(closedTrade);
                     open = null;
+
+                    // Same rolling-streak semantics as the live engine's own F3 (LiveTradingEngine)/
+                    // consecutive-losses check: any non-negative close resets it, a loss extends it.
+                    consecutiveLosses = closedTrade.NetPnlPoints < 0 ? consecutiveLosses + 1 : 0;
                 }
             }
-            else if (cadence.EntryWindowOpen && !cadence.MustForceClose && score is { } sc && Math.Abs(sc) >= options.EntryScoreThreshold)
+            else if (cadence.EntryWindowOpen && !cadence.MustForceClose && score is { } sc && Math.Abs(sc) >= options.EntryScoreThreshold
+                && (options.MaxConsecutiveLosses is not { } maxLosses || consecutiveLosses < maxLosses))
             {
                 var side = sc > 0 ? OptionType.Call : OptionType.Put;
                 var picked = PickEntryStrike(rows, side, options.EntryPriceRangeLow, options.EntryPriceRangeHigh);
@@ -639,7 +696,9 @@ public static class CoreScoreOptionSimulator
                 cadence.TrendReversion15mRaw, cadence.TrendReversion15mSigned,
                 cadence.BasisChangeRaw, cadence.BasisChangeSigned,
                 cadence.OiChangeDiff15mRaw, cadence.OiChangeDiff15mSigned,
-                cadence.Score, fast, slow));
+                cadence.Score, fast, slow,
+                // TEMPORARY DIAGNOSTIC (2026-09-16)
+                BasisChangeRankCount: cadence.BasisChangeRankCount, BasisChangeRankValues: cadence.BasisChangeRankValues));
         }
 
         return result;
@@ -754,6 +813,138 @@ public static class CoreScoreOptionSimulator
                 }
 
                 previousDiffSign = diffSign;
+            }
+        }
+
+        if (open is { } stillOpen)
+        {
+            var lastTimestamp = cadences[^1].Timestamp;
+            var exitPrice = priceByStrikeAndTime.TryGetValue((stillOpen.Side, stillOpen.StrikePrice), out var s3) && s3.TryGetValue(lastTimestamp, out var m3) && m3 is { } exitMark
+                ? exitMark
+                : stillOpen.EntryPrice;
+            trades.Add(new CoreScoreTrade(stillOpen.EntryTime, stillOpen.EntryPrice, stillOpen.Side, stillOpen.StrikePrice,
+                lastTimestamp, exitPrice, "EndOfData", stillOpen.RunningMfe, stillOpen.RunningMae, stillOpen.EntryScore));
+        }
+
+        return new CoreScoreDayResult(asOfDate, trades);
+    }
+
+    /// <summary>
+    /// 2026-09-15, experimental: neither of the two locked-in live strategies alone -- a third,
+    /// untested combination requiring BOTH the Hysteresis strategy's own entry condition (|score|
+    /// &gt;= threshold) and the Crossover strategy's own CURRENT directional read (sign of
+    /// fast-slow) to agree, at the same cadence, before entering. <see
+    /// cref="CoreScoreCombinedOptions.ExitOnEitherOpposite"/> selects between two exit variants:
+    /// exit the moment EITHER rule turns opposite (quicker, matches whichever side's own tested
+    /// exit condition fires first), or only once BOTH have turned opposite (more patient, requires
+    /// full agreement reversal before giving up the position). "Opposite" for each rule matches its
+    /// own already-tested definition exactly -- Hysteresis's own hysteresis band (score crosses
+    /// past the OPPOSITE threshold, not a symmetric zero-cross) and Crossover's own flip (fast/slow
+    /// diff sign reverses) -- reimplemented inline here rather than calling
+    /// CoreScoreHysteresisRules/CoreScoreCrossoverRules directly, so this backtest-only experiment
+    /// never touches the classes the live trading engines actually depend on. NOT "always
+    /// positioned" like pure Crossover -- a close leaves the strategy flat until both conditions
+    /// agree again, same cadence or later (same-cadence reentry is still allowed, matching both
+    /// underlying strategies' own "a closing tick frees the slot" convention).
+    /// </summary>
+    public static CoreScoreDayResult SimulateDayCombined(IReadOnlyList<StrikeCadenceSnapshot> dayStrikeRows,
+        IReadOnlyList<CadenceContext> dayCadenceContexts, DateOnly thisWeekExpiry, CoreScoreCombinedOptions options)
+    {
+        if (dayStrikeRows.Count == 0)
+        {
+            throw new ArgumentException("A day's rows must be non-empty.", nameof(dayStrikeRows));
+        }
+
+        var asOfDate = dayStrikeRows[0].AsOfDate;
+        var (cadences, priceByStrikeAndTime) = BuildScoreCadences(dayStrikeRows, dayCadenceContexts, thisWeekExpiry, options.EffectiveWeights);
+
+        var fastWindowSpan = TimeSpan.FromMinutes(options.FastWindowMinutes);
+        var slowWindowSpan = TimeSpan.FromMinutes(options.SlowWindowMinutes);
+        var fastWindow = new Queue<(DateTimeOffset Timestamp, double Score)>();
+        var slowWindow = new Queue<(DateTimeOffset Timestamp, double Score)>();
+
+        var trades = new List<CoreScoreTrade>();
+        (DateTimeOffset EntryTime, decimal EntryPrice, OptionType Side, decimal StrikePrice, double EntryScore,
+            decimal RunningMfe, decimal RunningMae)? open = null;
+
+        void CloseOpen(DateTimeOffset timestamp, string reason)
+        {
+            if (open is not { } position)
+            {
+                return;
+            }
+
+            var exitPrice = priceByStrikeAndTime.TryGetValue((position.Side, position.StrikePrice), out var series) && series.TryGetValue(timestamp, out var mark) && mark is { } exitMark
+                ? exitMark
+                : position.EntryPrice; // no fresh quote this exact cadence -- fall back to entry, never fabricate a price
+            trades.Add(new CoreScoreTrade(position.EntryTime, position.EntryPrice, position.Side, position.StrikePrice,
+                timestamp, exitPrice, reason, position.RunningMfe, position.RunningMae, position.EntryScore));
+            open = null;
+        }
+
+        foreach (var cadence in cadences)
+        {
+            var timestamp = cadence.Timestamp;
+            var rows = cadence.Rows;
+
+            if (open is { } position)
+            {
+                if (priceByStrikeAndTime.TryGetValue((position.Side, position.StrikePrice), out var series)
+                    && series.TryGetValue(timestamp, out var currentMark) && currentMark is { } price)
+                {
+                    var excursion = price - position.EntryPrice;
+                    open = position with
+                    {
+                        RunningMfe = Math.Max(position.RunningMfe, excursion),
+                        RunningMae = Math.Min(position.RunningMae, excursion),
+                    };
+                }
+            }
+
+            var (fast, slow) = UpdateFastSlow(fastWindow, slowWindow, timestamp, cadence.Score, fastWindowSpan, slowWindowSpan);
+
+            if (cadence.MustForceClose)
+            {
+                CloseOpen(timestamp, "ForceClose");
+                continue;
+            }
+
+            // A's own read this cadence -- the instant score, exactly SimulateDay's own condition.
+            var score = cadence.Score;
+            // B's own read this cadence -- sign of fast-slow, exactly SimulateDayCrossover's own
+            // directional condition (which side fast is CURRENTLY on, not "did a flip just happen").
+            int? bSign = fast is { } f && slow is { } s ? Math.Sign(f - s) : null;
+
+            if (open is { } held)
+            {
+                var aOpposite = score is { } liveScore
+                    && (held.Side == OptionType.Call ? liveScore < -options.EntryScoreThreshold : liveScore > options.EntryScoreThreshold);
+                var bOpposite = bSign is { } sign && sign != 0
+                    && (held.Side == OptionType.Call ? sign < 0 : sign > 0);
+
+                var shouldExit = options.ExitOnEitherOpposite ? aOpposite || bOpposite : aOpposite && bOpposite;
+                if (shouldExit)
+                {
+                    CloseOpen(timestamp, aOpposite && bOpposite ? "BothOpposite" : aOpposite ? "AOpposite" : "BOpposite");
+                }
+            }
+
+            // Not an "else" -- a position closed above this SAME cadence is eligible to reopen
+            // immediately if the fresh, still-current A/B reading already qualifies (matching
+            // SimulateDay's own "a closing tick frees the slot" reentry convention).
+            if (open is null && cadence.EntryWindowOpen && score is { } sc && Math.Abs(sc) >= options.EntryScoreThreshold
+                && bSign is { } bs && bs != 0)
+            {
+                var aSide = sc > 0 ? OptionType.Call : OptionType.Put;
+                var bSide = bs > 0 ? OptionType.Call : OptionType.Put;
+                if (aSide == bSide)
+                {
+                    var picked = PickEntryStrike(rows, aSide, options.EntryPriceRangeLow, options.EntryPriceRangeHigh);
+                    if (picked is { } chosen)
+                    {
+                        open = (timestamp, chosen.Price, aSide, chosen.Strike, sc, 0m, 0m);
+                    }
+                }
             }
         }
 

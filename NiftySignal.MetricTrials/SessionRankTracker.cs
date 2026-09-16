@@ -21,6 +21,11 @@ public sealed class SessionRankTracker
 {
     readonly List<double> _values = [];
 
+    // TEMPORARY DIAGNOSTIC (2026-09-16) -- see NiftySignal.Features/SessionRankTracker.cs's own
+    // copy of this same comment. Safe to remove once the BasisChangeSigned divergence is resolved.
+    public int Count => _values.Count;
+    public IReadOnlyList<double> Values => _values.ToArray();
+
     public void Add(double value) => _values.Add(value);
 
     /// <summary>Percentile rank (0-100, inclusive of <paramref name="value"/> itself) within every value added so far. 0 (not null) when nothing has been added yet.</summary>

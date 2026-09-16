@@ -8,6 +8,7 @@ using NiftySignal.Domain.Entities;
 using NiftySignal.Ingestion.FlatTrade;
 using NiftySignal.Notifications;
 using NiftySignal.Persistence;
+using NiftySignal.Rules;
 using NiftySignal.Scoring;
 
 namespace NiftySignal.Host;
@@ -74,6 +75,13 @@ public sealed class MarketDataIngestionWorker(
     /// not-warmed-up stretch logs again.
     /// </summary>
     bool _warmUpBlockedLogged;
+
+    /// <summary>
+    /// Edge-triggered guard, same shape as <see cref="_warmUpBlockedLogged"/>: logs once when the
+    /// cadence loop's own market-open gate (see <see cref="RunScoreCadenceLoopAsync"/>) first lets
+    /// a cadence through for the day, not on every pre-open tick it skips before that.
+    /// </summary>
+    bool _marketOpenCadenceStartLogged;
 
     /// <summary>
     /// Audit finding F49 (2026-09-10): this used to run exactly one trading day's session and
@@ -157,6 +165,7 @@ public sealed class MarketDataIngestionWorker(
         // this field was never revisited when the day loop was added, since previously the
         // whole process only ever ran one day and this was set at most once, ever).
         _warmUpBlockedLogged = false;
+        _marketOpenCadenceStartLogged = false;
 
         var asOfDate = DateOnly.FromDateTime(DateTimeOffset.UtcNow.ToOffset(IstOffset).Date);
         var instruments = await ResolveInstrumentsAsync(session.Token, asOfDate, stoppingToken);
@@ -341,6 +350,35 @@ public sealed class MarketDataIngestionWorker(
                 try
                 {
                     var now = DateTimeOffset.UtcNow;
+
+                    // Live-caught 2026-09-15: MarketPreOpen (08:45) is a deliberate head start for
+                    // feed connection/subscription/tick warm-up (see that constant's own doc
+                    // comment) -- it was never meant to gate cadence SCORING too, but with no
+                    // separate check here, this loop had been computing (and PersistSnapshotAsync
+                    // writing) real ScoreSnapshot/CoreScoreSnapshot rows for the whole 08:45-09:15
+                    // pre-open window since the cadence loop's own inception. CadencePopulator's
+                    // backtest dataset -- what every Core-score band/weight was actually tuned and
+                    // validated against -- anchors its own cadence grid to dayStart = MarketOpen
+                    // exactly and has never included a pre-open cadence. SessionRankTracker never
+                    // expires a value once added, so those ~120 pre-open cadences/day were
+                    // permanently skewing each ranked term's percentile baseline for the entire
+                    // session (diluted as real volume accumulates, never fully removed) -- against
+                    // pre-open conditions (thin book, pre-open-auction dynamics, indicative pricing)
+                    // that don't resemble continuous trading at all. Gated HERE, not inside
+                    // LiveFeatureEngine.ComputeCadence itself, so the engine's own tested contract
+                    // (and LiveFeatureEngineTests' many non-9:15 synthetic timestamps) stays
+                    // untouched -- this is a Host-side scheduling decision, not a scoring rule.
+                    if (TimeOnly.FromDateTime(now.ToIst().DateTime) < EntryRuleEvaluator.MarketOpen)
+                    {
+                        continue;
+                    }
+
+                    if (!_marketOpenCadenceStartLogged)
+                    {
+                        _marketOpenCadenceStartLogged = true;
+                        logger.LogInformation("Market open reached -- score cadence computation/persistence starting");
+                    }
+
                     var snapshot = _engine!.ComputeCadence(now);
                     if (snapshot is not null)
                     {
@@ -665,14 +703,20 @@ public sealed class MarketDataIngestionWorker(
     /// <summary>Restart-safe warm-up (see LiveFeatureEngine.SeedHistory) -- replays today's already-persisted cadence snapshots instead of starting every rolling window from zero.</summary>
     async Task SeedEngineHistoryAsync(LiveFeatureEngine engine, DateOnly asOfDate, CancellationToken ct)
     {
-        // Npgsql only accepts UTC (Offset=0) DateTimeOffset values for timestamptz
+        // Anchored at today's MarketOpen (09:15), not midnight (2026-09-15 fix, see the cadence
+        // loop's own doc comment on the same-day gate this pairs with) -- a Host restart before
+        // this fix shipped could still have pre-open ScoreSnapshot/CoreScoreSnapshot rows sitting
+        // in the DB from earlier in the day (or, before the loop-side gate above existed, from any
+        // prior day); replaying those into SessionRankTracker on restart would silently reintroduce
+        // the exact contamination the loop-side gate now prevents from being written in the first
+        // place. Npgsql only accepts UTC (Offset=0) DateTimeOffset values for timestamptz
         // parameters -- the same rule that bit ReceivedAt/UpdatedAt earlier this session.
-        var todayIstMidnightUtc = new DateTimeOffset(asOfDate.ToDateTime(TimeOnly.MinValue), IstOffset).ToUniversalTime();
+        var todayMarketOpenUtc = new DateTimeOffset(asOfDate.ToDateTime(EntryRuleEvaluator.MarketOpen), IstOffset).ToUniversalTime();
 
         await using var scope = scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
         var history = await db.ScoreSnapshots
-            .Where(s => s.ComputedAt >= todayIstMidnightUtc)
+            .Where(s => s.ComputedAt >= todayMarketOpenUtc)
             .OrderBy(s => s.ComputedAt)
             .ToListAsync(ct);
 
@@ -683,7 +727,7 @@ public sealed class MarketDataIngestionWorker(
         // see LiveFeatureEngine.SeedCoreScoreHistory's own doc comment for why this one is
         // required (not an accepted gap) for the Crossover strategy's fast/slow windows.
         var coreHistory = await db.CoreScoreSnapshots
-            .Where(s => s.ComputedAt >= todayIstMidnightUtc)
+            .Where(s => s.ComputedAt >= todayMarketOpenUtc)
             .OrderBy(s => s.ComputedAt)
             .ToListAsync(ct);
 
