@@ -26,7 +26,9 @@ using NiftySignal.MetricTrials;
 //   [--core-score-smoothing-cadences=N] [--crossover-fast-min=N] [--crossover-slow-min=N] [--next-week]
 //   [--stop-loss-pct=N] [--max-consecutive-losses=N] (both Hysteresis only) [--correlation]
 //   [--followups] (requires --correlation) [--date=yyyy-MM-dd] [--drop-itm-skew-and-gamma]
-//   [--use-rolling-changes] [--invert-cvd] (composable with each other)
+//   [--use-rolling-changes] [--itm-skew-change-weight=N] [--gamma-exposure-change-weight=N]
+//   (both only meaningful with --use-rolling-changes) [--invert-cvd] [--drop-cvd]
+//   [--depth-imbalance-smoothing-minutes=N] (composable with each other)
 //
 // Reads every populated day from niftysignal_backtest_analysis (read-only). Entry picks whichever
 // strike is priced near [entryPriceRangeLow, entryPriceRangeHigh] (not ATM) for the signaled side
@@ -562,10 +564,19 @@ if (HasFlag("correlation"))
 var weights = HasFlag("drop-itm-skew-and-gamma") || HasFlag("use-rolling-changes")
     ? new CoreScoreWeights(ItmSkewWeight: 0, GammaExposureWeight: 0)
     : new CoreScoreWeights();
+// --itm-skew-change-weight=N / --gamma-exposure-change-weight=N (2026-09-17): override the
+// provisional 0.065/0.03 --use-rolling-changes weights below, for testing a specific candidate
+// weight through the evaluation cycle (docs/SCORE_CANDIDATES.md's "WATCH, NOT YET CONFIRMED"
+// verdict) without hand-editing this file each time. Only meaningful combined with
+// --use-rolling-changes -- silently has no effect otherwise, since both weights stay 0 unless
+// that flag (or one of these overrides) sets them.
 if (HasFlag("use-rolling-changes"))
 {
     weights = weights with { ItmSkewChange15mWeight = 0.065, GammaExposureChange5mWeight = 0.03 };
 }
+var itmSkewChangeWeightOverride = ParseOverride("--itm-skew-change-weight=", weights.ItmSkewChange15mWeight);
+var gammaExposureChangeWeightOverride = ParseOverride("--gamma-exposure-change-weight=", weights.GammaExposureChange5mWeight);
+weights = weights with { ItmSkewChange15mWeight = itmSkewChangeWeightOverride, GammaExposureChange5mWeight = gammaExposureChangeWeightOverride };
 // --invert-cvd (2026-09-17): composable with the flags above -- tests FutureCvdNet5Min's sign
 // flipped, on top of whatever else is already configured. See CoreScoreWeights.InvertFutureCvdNet5Min's
 // own doc comment for why this is being tested at all.
@@ -580,6 +591,27 @@ if (HasFlag("drop-cvd"))
 {
     weights = weights with { FutureCvdNet5MinWeight = 0 };
 }
+// --invert-depth-imbalance (2026-09-16, user's own microstructure hypothesis) tested and REVERTED
+// the same day -- underperformed every other configuration tried (raw, every smoothing window,
+// both signs). See docs/SCORE_CANDIDATES.md's "Depth Imbalance sign inversion" entry for the
+// verdict. Flag removed rather than left in at false -- this was a single, fully-resolved
+// experiment, not ongoing infrastructure like --invert-cvd (still open) or the smoothing flag
+// (still being evaluated).
+// --depth-imbalance-smoothing-minutes=N (2026-09-16, scoping audit finding F-A's own follow-up):
+// routes DepthImbalance's otherwise-instant (single 15s cadence) raw value through a
+// CoreScoreRollingMeanTracker of N minutes before ranking, in all three strategies below. 0
+// (default, no flag) preserves today's exact unsmoothed behavior. See
+// CoreScoreSimulationOptions.DepthImbalanceSmoothingMinutes' own doc comment for why -- the
+// correlation scoping pass found this term's forward correlation roughly doubles at a 10-minute
+// window versus the raw instant read, monotonically improving through every window tested up to
+// 10 minutes, unlike PriceMomentum's own smoothing (which made things worse) -- this flag tests
+// whether that correlation gain shows up in real trade P&L.
+var depthImbalanceSmoothingMinutes = (int)ParseOverride("--depth-imbalance-smoothing-minutes=", 0.0);
+if (depthImbalanceSmoothingMinutes > 0)
+{
+    Console.WriteLine($"*** DepthImbalance smoothed over a {depthImbalanceSmoothingMinutes}-minute rolling window before ranking (--depth-imbalance-smoothing-minutes={depthImbalanceSmoothingMinutes}) ***");
+    Console.WriteLine();
+}
 if (HasFlag("drop-itm-skew-and-gamma"))
 {
     Console.WriteLine("*** ItmSkew and GammaExposure weights zeroed out (--drop-itm-skew-and-gamma) ***");
@@ -587,7 +619,7 @@ if (HasFlag("drop-itm-skew-and-gamma"))
 }
 if (HasFlag("use-rolling-changes"))
 {
-    Console.WriteLine("*** ItmSkew/GammaExposure LEVELS zeroed; ItmSkewChange15m=0.065, GammaExposureChange5m=0.03 added (--use-rolling-changes) ***");
+    Console.WriteLine($"*** ItmSkew/GammaExposure LEVELS zeroed; ItmSkewChange15m={weights.ItmSkewChange15mWeight}, GammaExposureChange5m={weights.GammaExposureChange5mWeight} added (--use-rolling-changes) ***");
     Console.WriteLine();
 }
 if (HasFlag("invert-cvd"))
@@ -613,7 +645,8 @@ foreach (var day in dayData)
     var result = CoreScoreOptionSimulator.SimulateDay(day.StrikeRows, day.CadenceContexts, day.ScoredExpiry,
         new CoreScoreSimulationOptions(EntryScoreThreshold: entryScoreThreshold,
             EntryPriceRangeLow: entryPriceRangeLow, EntryPriceRangeHigh: entryPriceRangeHigh,
-            ScoreSmoothingCadences: scoreSmoothingCadences, StopLossPct: stopLossPct, MaxConsecutiveLosses: maxConsecutiveLosses, Weights: weights));
+            ScoreSmoothingCadences: scoreSmoothingCadences, StopLossPct: stopLossPct, MaxConsecutiveLosses: maxConsecutiveLosses, Weights: weights,
+            DepthImbalanceSmoothingMinutes: depthImbalanceSmoothingMinutes));
     hysteresisResults.Add(result);
     PrintDayResult(day.AsOfDate, day.ScoredExpiry, expiryLabel, result);
 }
@@ -629,7 +662,8 @@ foreach (var day in dayData)
 {
     var result = CoreScoreOptionSimulator.SimulateDayCrossover(day.StrikeRows, day.CadenceContexts, day.ScoredExpiry,
         new CoreScoreCrossoverOptions(FastWindowMinutes: crossoverFastMinutes, SlowWindowMinutes: crossoverSlowMinutes,
-            EntryPriceRangeLow: entryPriceRangeLow, EntryPriceRangeHigh: entryPriceRangeHigh, Weights: weights));
+            EntryPriceRangeLow: entryPriceRangeLow, EntryPriceRangeHigh: entryPriceRangeHigh, Weights: weights,
+            DepthImbalanceSmoothingMinutes: depthImbalanceSmoothingMinutes));
     crossoverResults.Add(result);
     PrintDayResult(day.AsOfDate, day.ScoredExpiry, expiryLabel, result);
 }
@@ -646,7 +680,8 @@ foreach (var exitOnEither in new[] { true, false })
     {
         var result = CoreScoreOptionSimulator.SimulateDayCombined(day.StrikeRows, day.CadenceContexts, day.ScoredExpiry,
             new CoreScoreCombinedOptions(EntryScoreThreshold: entryScoreThreshold, FastWindowMinutes: crossoverFastMinutes, SlowWindowMinutes: crossoverSlowMinutes,
-                EntryPriceRangeLow: entryPriceRangeLow, EntryPriceRangeHigh: entryPriceRangeHigh, ExitOnEitherOpposite: exitOnEither, Weights: weights));
+                EntryPriceRangeLow: entryPriceRangeLow, EntryPriceRangeHigh: entryPriceRangeHigh, ExitOnEitherOpposite: exitOnEither, Weights: weights,
+                DepthImbalanceSmoothingMinutes: depthImbalanceSmoothingMinutes));
         combinedResults.Add(result);
         PrintDayResult(day.AsOfDate, day.ScoredExpiry, expiryLabel, result);
     }

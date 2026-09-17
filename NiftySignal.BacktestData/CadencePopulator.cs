@@ -996,99 +996,11 @@ public sealed class DepthImbalanceAccumulator
     }
 }
 
-/// <summary>
-/// The future's own trade-aggressor volume proxy (audit finding: 2026-09-12, user-raised) --
-/// same "quote rule" as production's existing option-chain <c>CvdProxy</c>: a tick's ENTIRE
-/// volume delta since the previous tick is classified buy-leaning if LastPrice sat at/above the
-/// bid-ask midpoint, sell-leaning otherwise. FlatTrade's feed has no per-trade tape -- confirmed
-/// directly against real ticks (11 Sep 13:55-13:56): single reported volume deltas routinely
-/// bundle thousands of lots that almost certainly traded across many individual prints, some of
-/// which could have gone the other direction. This is a proxy, not true CVD, exactly like the
-/// option-chain version it mirrors -- a cadence with a large classified delta but few
-/// TicksObservedFuture is exactly where this proxy is least trustworthy. A tick with no
-/// two-sided depth quote, or zero volume delta, contributes nothing (not a guessed zero) -- see
-/// <see cref="CadenceNet"/>/<see cref="CumulativeNet"/>'s own null semantics.
-/// </summary>
-public sealed class FutureCvdProxyAccumulator
-{
-    long _cadenceNet;
-    int _cadenceContributingTicks;
-    long _cumulativeNet;
-    int _cumulativeContributingTicks;
-
-    /// <summary>Net buy-minus-sell classified volume this cadence. Null if no tick this cadence had both a two-sided depth quote and nonzero volume to classify.</summary>
-    public long? CadenceNet => _cadenceContributingTicks > 0 ? _cadenceNet : null;
-
-    /// <summary>Running total for the whole trading day -- read by its slope, same convention real CVD indicators use, not smoothed with a rolling window.</summary>
-    public long? CumulativeNet => _cumulativeContributingTicks > 0 ? _cumulativeNet : null;
-
-    public void ApplyTick(decimal lastPrice, MarketDepth depth, long volumeDelta)
-    {
-        if (depth.Bid1Price <= 0 || depth.Ask1Price <= 0 || volumeDelta <= 0)
-        {
-            return;
-        }
-
-        var midpoint = (depth.Bid1Price + depth.Ask1Price) / 2m;
-        var signed = lastPrice >= midpoint ? volumeDelta : -volumeDelta;
-
-        _cadenceNet += signed;
-        _cadenceContributingTicks++;
-        _cumulativeNet += signed;
-        _cumulativeContributingTicks++;
-    }
-
-    public void ResetCadence()
-    {
-        _cadenceNet = 0;
-        _cadenceContributingTicks = 0;
-    }
-}
-
-/// <summary>
-/// A time-based rolling SUM (not mean) of per-cadence values, evicting anything older than
-/// <paramref name="window"/> as it's fed -- same eviction shape as <c>NiftySignal.Features.
-/// WelfordRollingWindow</c>/<c>OiLookbackWindow</c>, but tracking a plain running sum since a
-/// flow quantity (net classified volume) is naturally read as a total over a window, not an
-/// average per cadence. Built specifically because the day-long <see cref="FutureCvdProxyAccumulator.CumulativeNet"/>
-/// drags along everything since market open -- a real 2026-09-12 finding: its forward
-/// correlation with price flipped sign across days, plausibly because a strong morning trend
-/// can still dominate the running total hours later even after the market has genuinely turned.
-/// A rolling window isolates recent flow instead.
-/// </summary>
-public sealed class RollingNetSumWindow(TimeSpan window)
-{
-    readonly Queue<(DateTimeOffset Timestamp, long Value)> _points = new();
-    long _sum;
-    DateTimeOffset? _firstSeenAt;
-    DateTimeOffset? _latestTimestamp;
-
-    /// <summary>True once real elapsed time since the first observation reaches the full window duration -- same "don't trust a partially-filled window" rule every other rolling window in this codebase applies.</summary>
-    public bool IsWarmedUp => _firstSeenAt is { } firstSeenAt && _latestTimestamp is { } latestTimestamp && latestTimestamp - firstSeenAt >= window;
-
-    /// <summary>Sum of every value currently inside the window. Only meaningful once <see cref="IsWarmedUp"/>.</summary>
-    public long Sum => _sum;
-
-    public void Add(DateTimeOffset timestamp, long value)
-    {
-        _firstSeenAt ??= timestamp;
-        _latestTimestamp = timestamp;
-
-        EvictOlderThan(timestamp - window);
-
-        _points.Enqueue((timestamp, value));
-        _sum += value;
-    }
-
-    void EvictOlderThan(DateTimeOffset cutoff)
-    {
-        while (_points.Count > 0 && _points.Peek().Timestamp < cutoff)
-        {
-            var (_, value) = _points.Dequeue();
-            _sum -= value;
-        }
-    }
-}
+// FutureCvdProxyAccumulator and RollingNetSumWindow moved to NiftySignal.Features (2026-09-17,
+// Phase 3 unification) so NiftySignal.Host/LiveFeatureEngine.cs can reference the SAME classes
+// instead of maintaining its own hand-inlined port of their exact logic -- see
+// NiftySignal.Features/FutureCvdProxyAccumulator.cs and RollingNetSumWindow.cs for the full doc
+// comments (unchanged) and docs/SCORE_CANDIDATES.md's Phase 3 section for the rationale.
 
 /// <summary>
 /// Aggressor-volume-proxy classifier for one option instrument (2026-09-12; renamed in spirit,

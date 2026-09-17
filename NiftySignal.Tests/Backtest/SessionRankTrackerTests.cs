@@ -1,4 +1,4 @@
-using NiftySignal.Backtest;
+using NiftySignal.Features;
 
 namespace NiftySignal.Tests.Backtest;
 

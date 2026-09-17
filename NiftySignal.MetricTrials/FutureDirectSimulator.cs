@@ -1,4 +1,5 @@
 using NiftySignal.BacktestData;
+using NiftySignal.Features;
 
 namespace NiftySignal.MetricTrials;
 

@@ -14,6 +14,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\NiftySignal.BacktestData\NiftySignal.BacktestData.csproj" />
+    <ProjectReference Include="..\NiftySignal.Features\NiftySignal.Features.csproj" />
+    <ProjectReference Include="..\NiftySignal.Scoring\NiftySignal.Scoring.csproj" />
   </ItemGroup>
 
 </Project>

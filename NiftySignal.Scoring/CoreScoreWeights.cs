@@ -40,7 +40,12 @@ public sealed record CoreScoreWeights(
     double GammaExposure,
     double TrendReversion15m,
     double BasisChange,
-    double OiChangeDiff15m)
+    double OiChangeDiff15m,
+    // 2026-09-17, backtest/Phase-1 unification: weight for CoreScoreComponentInputs.ItmSkewChange15m
+    // (see its own doc comment). Default 0 -- inert, not yet deployed live.
+    double ItmSkewChange15m = 0.0,
+    // 2026-09-17, same as above, for CoreScoreComponentInputs.GammaExposureChange5m.
+    double GammaExposureChange5m = 0.0)
 {
     public static CoreScoreWeights Default { get; } = new(
         Version: "core-score-live-2026-09-16-drop-itmskew-gamma",
@@ -55,5 +60,6 @@ public sealed record CoreScoreWeights(
 
     /// <summary>Rescaled to sum to 1.0 as of the 2026-09-16 revision (see class doc comment) -- previously deliberately left at 0.915 to match the backtest exactly. <see cref="CoreScoreCalculator"/> renormalizes by whichever weight is actually present each cadence regardless, so this has never been required to sum to 1; it's set to 1.0 now purely so each remaining weight reads as its literal share of the composite.</summary>
     public double Total => DepthImbalance + ItmSkew + FutureCvdNet5Min + NotionalVolumeRatio
-        + GammaExposure + TrendReversion15m + BasisChange + OiChangeDiff15m;
+        + GammaExposure + TrendReversion15m + BasisChange + OiChangeDiff15m
+        + ItmSkewChange15m + GammaExposureChange5m;
 }

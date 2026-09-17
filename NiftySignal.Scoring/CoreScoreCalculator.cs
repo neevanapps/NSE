@@ -80,6 +80,8 @@ public static class CoreScoreCalculator
         BuildComponent("TrendReversion15m", weights.TrendReversion15m, inputs.TrendReversion15m),
         BuildComponent("BasisChange", weights.BasisChange, inputs.BasisChange),
         BuildComponent("OiChangeDiff15m", weights.OiChangeDiff15m, inputs.OiChangeDiff15m),
+        BuildComponent("ItmSkewChange15m", weights.ItmSkewChange15m, inputs.ItmSkewChange15m),
+        BuildComponent("GammaExposureChange5m", weights.GammaExposureChange5m, inputs.GammaExposureChange5m),
     ];
 
     /// <summary>

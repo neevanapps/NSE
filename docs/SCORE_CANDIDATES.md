@@ -162,6 +162,169 @@ findings alone. Ran `NiftySignal.CoreScoreReplayDiff` (full tick-by-tick replay 
   yet done: dump the exact 2 `ItmSkewRaw` mismatch instances and trace which specific input
   (mid-price/underlying/T) diverged, to determine whether it's a timing artifact or something else.
 
+**Unifying backtest and live onto one shared CoreScore implementation (2026-09-17)** — per explicit
+user instruction to close this parity gap permanently rather than keep catching drift after the
+fact. Phased plan; Phase 0 and Phase 1 implemented and verified this session:
+- **Phase 0 (done): consolidated `SessionRankTracker`.** There were 3 verbatim-duplicate copies
+  (`NiftySignal.Backtest`, `NiftySignal.MetricTrials`, `NiftySignal.Features` — diffed directly,
+  only doc comments differed, the algorithm was byte-identical). Removed the two duplicates; both
+  projects now reference `NiftySignal.Features/SessionRankTracker.cs` directly.
+- **Phase 1 (done): unified the combine+tanh step.** `CoreScoreOptionSimulator.BuildScoreCadences`
+  no longer has its own inline weighted-sum/tanh expression — it now builds a
+  `NiftySignal.Scoring.CoreScoreComponentInputs`/`CoreScoreWeights` from its own signed values and
+  weights and calls `NiftySignal.Scoring.CoreScoreCalculator.Calculate`, the SAME function
+  `NiftySignal.Host/LiveFeatureEngine.cs` calls live. The combine arithmetic itself can no longer
+  drift between backtest and live by construction, closing that specific class of bug for good
+  (this is exactly the class of bug `BasisChangeSigned`'s ordering mismatch was, just one level up).
+  The backtest's own `CoreScoreWeights` record (with its "Weight"-suffixed field names and the
+  `InvertFutureCvdNet5Min` experimental flag, which belongs to a per-metric RAW computation, not the
+  combine step) was kept as-is for CLI ergonomics — it's mapped into the shared type at the point of
+  calling the shared calculator, fully qualified to avoid a naming collision with the shared type.
+  The 2 backtest-only experimental rolling-change terms (`ItmSkewChange15mWeight`/
+  `GammaExposureChange5mWeight`, `--use-rolling-changes`, still default-0/unvalidated) required
+  extending `NiftySignal.Scoring.CoreScoreComponentInputs`/`CoreScoreWeights` with 2 new optional
+  fields (default null/0) so the backtest didn't lose that experiment by migrating — inert for live
+  by construction (live never populates or weights them).
+  - **Verified zero behavior change**: full `dotnet test` (529/529 passing, unchanged) plus a full
+    `CoreScoreReplayDiff` re-run across all 5 days — the OVERALL row came back byte-identical to the
+    pre-refactor baseline (`CoreScore` 37/7500 mismatches, `CoreScoreFast` 1125, `CoreScoreSlow`
+    2256, every per-field row unchanged, e.g. `ItmSkewSigned` still 328, `GammaExposureRaw` still 26
+    with the same 2471.27 max diff). Confirms Phase 0/1 are pure refactors, not formula changes.
+- **Phase 2 (in progress) — `DepthImbalance` and `ItmSkew` done (2026-09-17)**: extracted the two
+  metrics' final raw formulas into `NiftySignal.Scoring/CoreScoreRawFormulas.cs`
+  (`DepthImbalance(callDepth, putDepth)` / `ItmSkew(callIv, putIv)`, both a shared
+  "average one side, average the other, subtract" helper) plus the shared Itm2Atm1 band-boundary
+  check in `NiftySignal.Scoring/CoreScoreBands.cs`. Picked these two first (together, not
+  one-at-a-time as originally planned) because they turned out to share the IDENTICAL formula shape
+  once each side's own data was already resolved -- doing both cost barely more than doing one.
+  Deliberately did NOT fold band selection or forward-fill timing into the shared functions --
+  each side keeps its OWN loop deciding which strikes to consider and when to forward-fill THIS
+  cadence's value (`CoreScoreOptionSimulator.cs`'s row-level forward-fill vs
+  `LiveFeatureEngine.cs`'s per-token accumulator/dictionary), only calling into the shared code for
+  the final band-boundary predicate and the arithmetic. Folding forward-fill timing in too would
+  have risked a subtle behavior change (e.g. whether a strike that's out-of-band THIS cadence but
+  was in-band earlier still contributes a stale forward-filled value) that a straight formula
+  extraction has no business introducing.
+  - Added 15 new unit tests (`NiftySignal.Tests/Scoring/CoreScoreRawFormulasTests.cs`) directly
+    against the new shared functions -- this is now load-bearing code for both pipelines and hadn't
+    been covered by anything of its own before.
+  - **Verified zero behavior change**: `dotnet test` (544/544 passing -- 529 existing + 15 new) plus
+    a full `CoreScoreReplayDiff` re-run across all 5 days, byte-identical to the Phase 0/1 baseline
+    in every field: `DepthImbalanceRaw`/`Signed` still 0 mismatches, `ItmSkewRaw` still 2/4500 (max
+    0.000374), `ItmSkewSigned` still 328/4500 -- confirming the known, deferred IV-timing issue
+    wasn't touched or masked by this refactor -- and `CoreScore`/`Fast`/`Slow` unchanged at
+    37/1125/2256 mismatches respectively.
+- **Phase 2 continued — `GammaExposure` and `NotionalVolumeRatio` done (2026-09-17)**: extracted
+  both into `CoreScoreRawFormulas.cs` (`GammaExposure(strikes)`: signed sum of gamma*openInterest,
+  call:+1/put:-1, null only when the collection is empty, not when the sum happens to be zero;
+  `NotionalVolumeRatio(callNotional, putNotional)`: log(putSum/callSum), null unless both sums are
+  positive). Same design as `DepthImbalance`/`ItmSkew` -- each side keeps its own band-selection
+  loop and forward-fill state, only the terminal aggregate arithmetic is shared. `GammaExposure`'s
+  known residual parity gap (26/7500 cadences, max diff ~2471, different STRIKE SET at the wide
+  band's edge, not the arithmetic) is deliberately left untouched by this extraction -- confirmed
+  unchanged by the verification run below, as expected.
+  - Added 5 more unit tests, including one asserting a real net-zero exposure across a non-empty
+    set returns `0.0`, not `null` -- the exact distinction `GammaExposure`'s own null guard exists
+    to preserve, and easy to get wrong in a careless rewrite.
+  - **Verified zero behavior change**: `dotnet test` (549/549) plus a full `CoreScoreReplayDiff`
+    re-run, byte-identical to the Phase 0/1 baseline in every field, `GammaExposureRaw` still 26/7500
+    (max 2471.27) and `NotionalVolumeRatioRaw` still 2/7435 included.
+- **Phase 2 continued — `TrendReversion15m` and `BasisChange` done (2026-09-17)**: paired since both
+  sides compute them together (they share the same per-cadence future/spot price trackers).
+  - `TrendReversion15m` needed a genuinely different kind of extraction than every other term so
+    far: both sides had duplicated an actual STATEFUL sliding-window queue (enqueue-conditionally-
+    but-evict-and-read-unconditionally, so a quiet cadence with no fresh tick still reads whatever
+    the window already holds instead of going null), not just a stateless formula applied to
+    already-resolved values. Extracted as a new shared class,
+    `NiftySignal.Scoring/CoreScoreTrendReversionTracker.cs` (one instance per session/day, same
+    lifetime as `SessionRankTracker`), with the negation ("clean recent trend reads as reversion")
+    baked into its own `Observe` return value since both sides applied it identically and
+    unconditionally.
+  - `BasisChange` is a genuinely trivial one-line formula (`futureChange - spotChange`, NOT negated
+    here -- callers still negate it themselves for the ranked/signed value, matching
+    `BasisChangeRaw`'s own diagnostic convention) -- but it's exactly where the 2026-09-17
+    `BasisChangeSigned` bug (54% mismatch, see above) lived: decimal-subtract-then-cast vs
+    cast-then-double-subtract. Added to `CoreScoreRawFormulas.cs` taking the two already-computed
+    DECIMAL changes and doing the subtraction in decimal, one cast at the very end -- sharing this
+    one-liner is deliberate insurance against that exact bug class recurring, not merely a
+    formula-sharing exercise like the others in this file. Live's `ComputeCoreTrendAndBasis` was
+    restructured to compute `futureChange`/`spotChange` as decimal ONCE (previously it computed a
+    double version for the trend window and a separate decimal version for basis) and feed both the
+    tracker and the shared `BasisChange` function from that one pair of decimals.
+  - Added 9 more unit tests (6 for the tracker, including eviction-on-a-quiet-cadence coverage; 3
+    for `BasisChange`, including one that reproduces the exact double-vs-decimal floating-point
+    divergence the original bug hinged on).
+  - **Verified zero behavior change**: `dotnet test` (558/558) plus a full `CoreScoreReplayDiff`
+    re-run, byte-identical to baseline in every field -- `TrendReversion15mRaw`/`Signed` and
+    `BasisChangeRaw`/`Signed` still 0 mismatches, `CoreScore`/`Fast`/`Slow` unchanged at
+    37/1125/2256.
+- **Phase 2 continued — `OiChangeDiff15m` done (2026-09-17), completing everything in Phase 2's
+  scope**: another duplicated STATEFUL sliding window (like `TrendReversion15m`), but simpler --
+  unconditional enqueue every cadence (there's always a real call/put OI-delta pair to record, even
+  when both are zero, unlike `TrendReversion15m`'s conditional enqueue), no net/path ratio, just a
+  plain rolling SUM of (call - put). Extracted as `NiftySignal.Scoring/CoreScoreRollingNetDiffTracker.cs`.
+  Takes `long` call/put values and casts to `double` only once per entry at the point of summing
+  across the window, matching both sides' own `(double)(w.Call - w.Put)` order exactly (same
+  discipline as `BasisChange`, though this cast order was never actually buggy here -- long
+  subtraction has no precision-loss risk at realistic OI magnitudes, so this is preventive
+  consistency, not a second bug fix).
+  - Added 4 more unit tests, including one confirming a net-zero-movement cadence is still enqueued
+    (unconditionally) rather than skipped -- the exact behavior that would silently break if this
+    tracker were ever confused with `CoreScoreTrendReversionTracker`'s conditional-enqueue design.
+  - **Verified zero behavior change**: `dotnet test` (562/562) plus a full `CoreScoreReplayDiff`
+    re-run, byte-identical to baseline in every field -- `OiChangeDiff15mRaw`/`Signed` still 5/7495
+    null-mismatches (0 value mismatches), `CoreScore`/`Fast`/`Slow` unchanged at 37/1125/2256.
+  - **This closes out everything Phase 2 can address.** `FutureCvdNet5Min` is the one CoreScore term
+    left unshared, and deliberately stays that way for now -- it doesn't fit this phase's pattern:
+    backtest reads it as a pre-aggregated column (`CadenceContext.FutureCvdProxyNet5Min`) computed
+    entirely inside `NiftySignal.BacktestData/CadencePopulator.cs`'s own ETL, while live reimplements
+    the same tick-classification + rolling-window logic itself in `LiveFeatureEngine.cs`; the real
+    duplication is between `LiveFeatureEngine.cs` and `CadencePopulator.cs`, not
+    `CoreScoreOptionSimulator.cs` -- Phase 3 territory, not Phase 2.
+- **Phase 3 (done, 2026-09-17): unified `FutureCvdNet5Min` between `CadencePopulator.cs`'s ETL and
+  `LiveFeatureEngine.cs`** -- closing the one gap Phase 2 structurally couldn't reach, per explicit
+  instruction not to hold off. Different shape from every Phase 2 extraction: live didn't call a
+  duplicated FORMULA, it maintained a hand-inlined, doc-comment-labeled "byte-for-byte port" of two
+  entire STATEFUL classes backtest already had (`FutureCvdProxyAccumulator`'s tick-classification
+  accumulator, `RollingNetSumWindow`'s warm-up-gated rolling sum) -- real classes on one side, raw
+  scalar fields doing the same math by hand on the other. Moved both classes from
+  `NiftySignal.BacktestData/CadencePopulator.cs` to `NiftySignal.Features/` (unchanged logic; that
+  project already sat on both sides' dependency graph, same reasoning as `SessionRankTracker`'s own
+  Phase 0 move) and had `LiveFeatureEngine.cs` instantiate the shared classes directly --
+  `_coreFutureCvdCadenceNet`/`_coreFutureCvdCadenceHasContribution` collapsed into one
+  `FutureCvdProxyAccumulator` field; the hand-rolled Queue plus two warm-up timestamp fields
+  collapsed into one `RollingNetSumWindow` field. `OnTick`'s classification block and
+  `ComputeCoreFutureCvdNet5Min` both shrank to a few lines each, calling the shared class instead of
+  re-deriving its logic.
+  - Relocated the pre-existing `FutureCvdProxyAccumulator`/`RollingNetSumWindow` unit tests from
+    `NiftySignal.Tests/BacktestData/` to `NiftySignal.Tests/Features/` to match the classes' new
+    home -- unchanged content, this project's own precedent for where a shared type's tests live.
+  - **Verified zero behavior change** despite being the largest single rewrite of any phase so far
+    (replacing duplicated STATE, not just a formula): `dotnet test` (562/562, unchanged count --
+    pure relocation, no tests added or removed) plus a full `CoreScoreReplayDiff` re-run,
+    byte-identical to baseline in every field -- `FutureCvdNet5MinRaw`/`Signed` still 0 mismatches
+    (7400/7500 `BothNonNull`, matching every prior run), `CoreScore`/`Fast`/`Slow` unchanged at
+    37/1125/2256.
+
+**Phase 3 summary: the entire CoreScore composite -- all 8 raw formulas, the combine+tanh step, and
+`SessionRankTracker` -- now runs through single, shared implementations on both backtest and live.**
+No CoreScore-related code duplication remains between `CoreScoreOptionSimulator.cs`,
+`LiveFeatureEngine.cs`, and `CadencePopulator.cs` for this composite. Every phase (0 through 3) was
+verified zero-behavior-change via `dotnet test` plus a full `CoreScoreReplayDiff` re-run before being
+called done; none of the 15 extractions touched or altered the two still-open, deliberately deferred
+parity issues (`ItmSkewSigned`: 328/4500 mismatches; `GammaExposureRaw`: 26/7500, max diff 2471.27) --
+both remain exactly as they were at the start of this unification effort, still waiting on more days
+of data per the user's own instruction to revisit them later, not on a code fix here.
+
+**Phase 2 summary**: of the CoreScore's 8 terms, 7 now share their final combine step
+(`CoreScoreCalculator`, Phase 1) and 7 of 8 raw formulas are shared between backtest and live
+(`DepthImbalance`, `ItmSkew`, `GammaExposure`, `NotionalVolumeRatio`, `TrendReversion15m`,
+`BasisChange`, `OiChangeDiff15m`) -- only `FutureCvdNet5Min` remains genuinely duplicated, and for a
+structural reason (a different codebase pair, not `CoreScoreOptionSimulator.cs`/`LiveFeatureEngine.cs`)
+that puts it out of this phase's scope. Every extraction across Phases 0-2 was verified zero-behavior-
+change via `dotnet test` and a full `CoreScoreReplayDiff` re-run before being considered done; none
+touched the two still-open, deliberately deferred parity issues (`ItmSkewSigned`, `GammaExposureRaw`).
+
 **Deployment status (2026-09-17): NONE of the above is live yet.** The user has not run `deploy.ps1`
 since these fixes (or since the `ItmSkew`/`GammaExposure` weight revision, or the `ShadowMode=false`
 change) landed. Production is still running the ORIGINAL composite weights (`ItmSkewWeight=0.065`,
@@ -173,12 +336,12 @@ the two are compounding, not the same problem.
 
 ## Known confounds in the current sample (update as more days are added)
 
-Every metric evaluated so far uses the same 4 real trading days (08–11 Sep 2026). These days are
-**not 4 independent draws of "a normal day"** — each sits at a different, unrepeated point in the
-weekly-expiry cycle, so day-of-week, DTE, and market regime are currently confounded with each
-other and cannot be separated. Any per-day pattern found in a candidate below should be read
-against this table before being trusted as "regime-dependence" rather than "one of these other
-things."
+Every metric evaluated so far uses the same real trading days (08–11 Sep 2026, now joined by 15
+Sep). These days are **not independent draws of "a normal day"** — each sits at a different,
+mostly-unrepeated point in the weekly-expiry cycle, so day-of-week, DTE, and market regime are
+still confounded with each other and cannot be fully separated. Any per-day pattern found in a
+candidate below should be read against this table before being trusted as "regime-dependence"
+rather than "one of these other things."
 
 | Date | Day of week | Nearest weekly expiry | DTE | India VIX (day open→close) | Notes |
 |---|---|---|---|---|---|
@@ -186,6 +349,93 @@ things."
 | 2026-09-09 | Wed | 15 Sep | 6 | 11.50 → 11.98 (+4.17%) | |
 | 2026-09-10 | Thu | 15 Sep | 5 | 11.86 → 11.74 (−1.01%) | Only day VIX fell intraday; recurring anomaly across multiple metrics (see below), cause still unresolved |
 | 2026-09-11 | Fri | 15 Sep | 4 | 12.13 → 12.24 (+0.91%) | |
+| 2026-09-15 | Tue | 15 Sep (same day) | **0 — expiry day itself** | — | Sharp, sustained decline (−319 pts, largest single-day move in the sample); opened at the day's high, closed near the day's low |
+
+### DTE split, first real test: DepthImbalance (2026-09-16)
+
+Prompted by the user's own framing: this is fundamentally a market of *human (and dealer) behavior*,
+and that behavior is not the same 5 days before expiry as it is on expiry day itself — theta decay,
+gamma concentration/pinning, and who's even placing orders (fresh directional positioning vs.
+unwinds/rolls/lottery-ticket flow) all change close to expiry. `docs/REVIEW_FINDINGS.md`'s F57
+asked this exact question in the abstract and was left open for lack of data. With 15 Sep now
+populated, there are finally **two** 0-DTE days to compare against three mid-week (4–6 DTE) days —
+still thin, but enough for a first real split instead of continued pooling.
+
+Re-ran the existing `DepthImbalance` band-coherence check
+(`scripts/dte-split-analysis.sql`), splitting by DTE bucket instead of pooling all 5 days:
+
+**fwd-15m correlation, Itm2Atm1 band:**
+
+| DTE bucket | n | Call side | Put side |
+|---|---|---|---|
+| 0-DTE (08+15 Sep) | 150 | +0.103 | **−0.016** (essentially dead) |
+| 4–6 DTE (09/10/11 Sep) | 225 | +0.257 | **−0.304** (strong, coherent) |
+
+Symmetric `Strike5` band shows the identical split (0-DTE put side: **+0.006**, arguably the wrong
+sign; 4–6 DTE put side: **−0.277**). The DepthImbalance-smoothing sweep from the same session
+(1/3/5/10-minute rolling mean) shows the same pattern — smoothing's ~2x correlation improvement is
+almost entirely a mid-week effect (4–6 DTE raw→10m: −0.171→−0.304 fwd15m put; 0-DTE raw→10m:
+−0.017→−0.034, still near zero throughout).
+
+**Not a clean "0-DTE is broken" story — stated honestly**: the two available 0-DTE days actively
+*disagree* with each other (08 Sep put side −0.277, strong and correctly signed; 15 Sep put side
++0.023, weak and wrong-signed), which is what averages out to the near-zero 0-DTE bucket number
+above. The three mid-week days, by contrast, are unanimous. So the safest current read is: **mid-week
+DepthImbalance behavior is clean and consistent; expiry-day behavior is not yet understood and may
+not even be one single regime** (a calm expiry vs. a large-move expiry, like 15 Sep's −319-point
+session, may behave oppositely). Needs more 0-DTE days to separate "DTE effect" from "this specific
+expiry day's move size" — not resolved by this pass, only clarified.
+
+**Real trading-level confirmation, not just correlation**: re-running the actual Hysteresis/
+Crossover/Combined backtests with `--depth-imbalance-smoothing-minutes=10/15` gave noisy,
+non-monotonic P&L results across the four strategy shapes — unlike the clean correlation story. One
+consistent thread did emerge: **15 Sep's net loss got monotonically WORSE with more smoothing** in
+every breakdown that showed it (Hysteresis: −136.28 → −150.95 → −166.33; Combined-both: −128.55 →
+−147.03 → −147.10) — smoothing made the strategy hold its (wrong, per the correlation table above)
+conviction longer into a session where DepthImbalance's usual read didn't apply. Directly consistent
+with the correlation-level finding: whatever's happening to DepthImbalance on 15 Sep specifically,
+it's real enough to cost money, not just weaken a correlation coefficient.
+
+**Verdict: DTE is a real, load-bearing dimension for DepthImbalance, not yet enough data to build a
+DTE-conditioned rule.** Recommend: (1) keep pooling per-day rather than pure DTE-bucket averages
+until more 0-DTE days exist, since 2 days pointing opposite ways is not evidence of anything beyond
+"expiry days aren't interchangeable with each other, let alone with mid-week days"; (2) the same
+DTE split should be run against every other CoreScore term, not just this one, once more data
+exists — some terms may turn out DTE-indifferent.
+
+### Depth Imbalance sign inversion — CLOSED, reverted (2026-09-16)
+
+User's own microstructure hypothesis, distinct from the DTE work above: `DepthImbalance`'s current
+sign reads a bid-heavy book (more resting size on the buy side) as bullish — the textbook reading.
+But the underlying per-strike quantity is **resting order-book STATE**, not executed trade flow
+(confirmed directly: `DepthImbalanceAccumulator.ApplyTick` accumulates `(bidQty−askQty)/(bidQty+askQty)`
+from `MarketDepth`, never from a trade print) — the same limitation already documented for the
+future's own depth-imbalance candidate earlier in this file, where a bid-heavy book was found to
+more often *follow* a decline (bargain-hunters resting fresh bids) than lead one. The hypothesis:
+aggressive buyers sweeping the call-side ask to express a bullish view could leave the book looking
+**ask-heavy** in the cadence right after the sweep — sellers/writers replenishing or stepping in at
+the new, higher price — the opposite of what the buying pressure itself implied. Plausible, not
+obviously right or wrong, and directly testable.
+
+Built as `--invert-depth-imbalance` on `NiftySignal.MetricTrials` (mirrored the existing
+`--invert-cvd` pattern — a backtest-only flag, composable with `--depth-imbalance-smoothing-minutes`,
+zero effect on live). **Explicitly scoped by the user as a reversible experiment.**
+
+**Result: the worst-performing configuration tried across this whole DepthImbalance investigation**
+— underperformed the un-inverted raw baseline and every smoothing window tested (raw, 1m, 3m, 5m,
+10m, 15m), both alone and combined with smoothing. Consistent with the correlation evidence: the
+confirmed, un-inverted sign is real and coherent on mid-week days (see the DTE split above), so
+flipping it there straightforwardly converts a working signal into a wrong one — the mid-week
+majority of the sample dominates, and no amount of expiry-day weirdness in the other direction was
+enough to make the inverted version competitive overall.
+
+**Verdict: CLOSED, reverted the same day.** `InvertDepthImbalance` and `--invert-depth-imbalance`
+removed from `CoreScoreOptionSimulator.cs`/`Program.cs` entirely (not left in at a default-off
+state) — this was a single, fully-resolved experiment, not ongoing infrastructure. The underlying
+hypothesis (resting book state can run opposite to aggressive trade flow, per the future
+depth-imbalance precedent earlier in this file) isn't wrong in general — it just doesn't win out for
+`DepthImbalance` specifically, on this data. `dotnet build`/`dotnet test` clean after the revert
+(569/569).
 
 ## Normalization and gating — general approach, not yet finalized per-candidate
 
@@ -863,6 +1113,34 @@ both weeks, per-day):
     price checked so far, via `CadenceContext.FutureChangeForDay`) and against a 5/15/30-min
     horizon sweep beyond the two tested; whether it holds up once 08 Sep (excluded here as the
     ThisWeek expiry day) or more non-expiry days are added.
+  - **Evaluation cycle, actual trading backtest, 2026-09-17 — `NiftySignal.MetricTrials
+    --use-rolling-changes` (`ItmSkewChange15mWeight=0.065`, `GammaExposureChange5mWeight=0.03`,
+    both provisional, not tuned) vs `--drop-itm-skew-and-gamma` baseline, both with
+    `--crossover-fast-min=15 --crossover-slow-min=30`, all 5 populated days**:
+
+    | Strategy | Baseline | Candidate | Δ |
+    |---|---|---|---|
+    | Hysteresis | 83 trades, 67.5% WR, +119.60 pts | 74 trades, 71.6% WR, +119.43 pts | −0.17 (flat) |
+    | Crossover 15/30 | 112 trades, 56.2% WR, +254.50 pts | 104 trades, 60.6% WR, +269.83 pts | +15.33 |
+    | Combined (either) | 95 trades, 62.1% WR, +163.78 pts | 81 trades, 65.4% WR, +195.03 pts | +31.25 |
+    | Combined (both) | 59 trades, 67.8% WR, +231.08 pts | 58 trades, 69.0% WR, +255.58 pts | +24.50 |
+
+    Aggregate totals read positive on 3 of 4 strategy views and flat on the 4th — but the per-day
+    breakdown does not support a broad edge. Crossover day-by-day (baseline → candidate): 09-08
+    +47.4→+44.0 (worse), 09-09 −37.8→−42.1 (worse), 09-10 +85.1→+90.9 (slightly better), 09-11
+    +211.9→+199.1 (worse), **09-15 −52.1→−22.0 (+30 pts)** — nearly the entire aggregate Crossover
+    gain traces to one day getting less bad, not a consistent lift; 3 of 5 days got worse. Hysteresis
+    moves the OPPOSITE direction on that same day (09-15: −137.2→−161.5, worse), while 09-08/09-11
+    improve there instead -- the same day swings in opposite directions depending on which strategy
+    trades it, which is inconsistent-signal territory, not a coherent edge.
+  - **Status: WATCH, NOT YET CONFIRMED (2026-09-17).** Consistent with the caution already flagged
+    when the correlation evidence itself was found ("early signal, needs more days, not settled") --
+    the actual-trading backtest doesn't upgrade that. Weight stays at 0 in both
+    `NiftySignal.Scoring.CoreScoreWeights.Default` (live) and every non-`--use-rolling-changes`
+    backtest path; `--use-rolling-changes` remains available in `NiftySignal.MetricTrials` as an
+    opt-in comparison mode, not a default. Revisit once more days of data exist -- both to grow the
+    5-day sample this verdict rests on, and to see whether the day-level inconsistency persists or
+    resolves. Not deployed, not scheduled.
   - **Same-strike Put-Call IV skew** (forward-filled per `(OptionType, StrikePrice)`, averaged over
     every strike quoted on both sides that cadence — removes the Itm2Atm1 band's cross-strike
     confound entirely): checked the same 8 combinations. Sign flips across days and chains with no

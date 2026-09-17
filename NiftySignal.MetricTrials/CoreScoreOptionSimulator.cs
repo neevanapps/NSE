@@ -1,5 +1,6 @@
 using NiftySignal.BacktestData;
 using NiftySignal.Domain.Enums;
+using NiftySignal.Features;
 
 namespace NiftySignal.MetricTrials;
 
@@ -141,7 +142,17 @@ public sealed record CoreScoreSimulationOptions(
     // RiskLimits.MaxConsecutiveLosses (CoreScoreHysteresisTradingEngine.EvaluateEntryAsync) --
     // once this many CLOSED trades in a row lost money, no new entry until a win resets the streak.
     // null (default) disables it, preserving every existing caller's/test's behavior unchanged.
-    int? MaxConsecutiveLosses = null)
+    int? MaxConsecutiveLosses = null,
+    // 2026-09-16, experimental (scoping audit finding F-A's own follow-up): 0 (default) means
+    // unsmoothed, exactly today's behavior -- DepthImbalanceRaw is BuildScoreCadences' own
+    // single-15s-cadence instant read, unchanged. >0 routes that same raw value through a
+    // CoreScoreRollingMeanTracker of this many minutes BEFORE ranking, instead of ranking the
+    // instant value -- see CoreScoreRollingMeanTracker's own doc comment for why (correlation
+    // evidence in docs/SCORE_CANDIDATES.md showed this term's forward correlation roughly doubles
+    // at a 10-minute window versus the raw instant read, unlike PriceMomentum's own smoothing,
+    // which made things worse -- this flag exists to confirm whether that correlation gain
+    // actually shows up in real trade P&L, not just in the correlation number).
+    int DepthImbalanceSmoothingMinutes = 0)
 {
     public CoreScoreWeights EffectiveWeights => Weights ?? new CoreScoreWeights();
 }
@@ -163,7 +174,9 @@ public sealed record CoreScoreCrossoverOptions(
     int SlowWindowMinutes = 15,
     decimal EntryPriceRangeLow = 100m,
     decimal EntryPriceRangeHigh = 150m,
-    CoreScoreWeights? Weights = null)
+    CoreScoreWeights? Weights = null,
+    // See CoreScoreSimulationOptions' own doc comment on this same field.
+    int DepthImbalanceSmoothingMinutes = 0)
 {
     public CoreScoreWeights EffectiveWeights => Weights ?? new CoreScoreWeights();
 }
@@ -176,7 +189,9 @@ public sealed record CoreScoreCombinedOptions(
     decimal EntryPriceRangeLow = 100m,
     decimal EntryPriceRangeHigh = 150m,
     CoreScoreWeights? Weights = null,
-    bool ExitOnEitherOpposite = true)
+    bool ExitOnEitherOpposite = true,
+    // See CoreScoreSimulationOptions' own doc comment on this same field.
+    int DepthImbalanceSmoothingMinutes = 0)
 {
     public CoreScoreWeights EffectiveWeights => Weights ?? new CoreScoreWeights();
 }
@@ -229,10 +244,10 @@ public sealed record CoreScoreDayResult(DateOnly AsOfDate, IReadOnlyList<CoreSco
 
 public static class CoreScoreOptionSimulator
 {
-    // Itm2Atm1: calls {-2,-1,0}, puts {0,+1,+2} -- ITM is below ATM for calls, above for puts.
-    // Confirmed band definition, matches docs/CHILD_TABLE_SCHEMA.md exactly.
-    static bool InItm2Atm1(OptionType type, int offset) =>
-        type == OptionType.Call ? offset is >= -2 and <= 0 : offset is >= 0 and <= 2;
+    // Itm2Atm1 band definition (calls {-2,-1,0}, puts {0,+1,+2}) moved to the shared
+    // NiftySignal.Scoring.CoreScoreBands.InItm2Atm1 as part of 2026-09-17 Phase 2 unification --
+    // DepthImbalance/ItmSkew above are the only two callers here, both now routed through
+    // NiftySignal.Scoring.CoreScoreRawFormulas, which applies the band internally.
 
     const int NotionalBandOffset = 5; // ATM+/-5, matches RatioWideStrikeBand
     const int GammaBandOffset = 10; // ATM+/-10, matches the live GammaExposure test's full-chain universe
@@ -310,10 +325,17 @@ public static class CoreScoreOptionSimulator
     /// </summary>
     static (List<ScoreCadence> Cadences, Dictionary<(OptionType, decimal), Dictionary<DateTimeOffset, decimal?>> PriceByStrikeAndTime)
         BuildScoreCadences(IReadOnlyList<StrikeCadenceSnapshot> dayStrikeRows, IReadOnlyList<CadenceContext> dayCadenceContexts,
-            DateOnly thisWeekExpiry, CoreScoreWeights weights)
+            DateOnly thisWeekExpiry, CoreScoreWeights weights, int depthImbalanceSmoothingMinutes = 0)
     {
         var asOfDate = dayStrikeRows[0].AsOfDate;
         var isExpiryDay = asOfDate == thisWeekExpiry; // 0 DTE -- nulls ItmSkew below, per user's own instruction.
+
+        // Experimental (see CoreScoreSimulationOptions.DepthImbalanceSmoothingMinutes' own doc
+        // comment) -- null when the flag is off (0), preserving today's exact unsmoothed behavior.
+        // One instance per call, i.e. per day, matching every other per-day tracker in this method.
+        var depthImbalanceSmoother = depthImbalanceSmoothingMinutes > 0
+            ? new NiftySignal.Scoring.CoreScoreRollingMeanTracker(TimeSpan.FromMinutes(depthImbalanceSmoothingMinutes))
+            : null;
 
         var thisWeekRows = dayStrikeRows.Where(r => r.ExpiryDate == thisWeekExpiry).ToList();
         var cadenceContextByTimestamp = dayCadenceContexts.ToDictionary(c => c.Timestamp);
@@ -363,8 +385,12 @@ public static class CoreScoreOptionSimulator
         var itmSkewChangeRank = new SessionRankTracker();
         var gammaExposureChangeRank = new SessionRankTracker();
 
-        var trendWindow = new Queue<(DateTimeOffset Timestamp, double Change)>();
-        var oiDiffWindow = new Queue<(DateTimeOffset Timestamp, long Call, long Put)>();
+        // Shared with LiveFeatureEngine.cs's own _coreTrendReversionWindow (2026-09-17 Phase 2
+        // unification) -- the sliding window itself, not just the formula, was duplicated.
+        var trendReversionTracker = new NiftySignal.Scoring.CoreScoreTrendReversionTracker(TrendReversionWindow);
+        // Shared with LiveFeatureEngine.cs's own _coreOiChangeDiffWindow (2026-09-17 Phase 2
+        // unification) -- the sliding window itself, not just the formula, was duplicated.
+        var oiDiffTracker = new NiftySignal.Scoring.CoreScoreRollingNetDiffTracker(OiDiffWindow);
 
         // 2026-09-17, experimental: ItmSkew's and GammaExposure's LEVELS are both closed (see
         // docs/SCORE_CANDIDATES.md's 2026-09-16 revisions -- ItmSkew structurally one-sided,
@@ -418,22 +444,36 @@ public static class CoreScoreOptionSimulator
             var rows = cadence.ToList();
             cadenceContextByTimestamp.TryGetValue(timestamp, out var ctx);
 
-            // --- Depth imbalance, Itm2Atm1 (CONFIRMED) ---
-            var callDepth = rows.Where(r => r.OptionType == OptionType.Call && InItm2Atm1(OptionType.Call, r.Offset) && r.Depth is not null)
+            // --- Depth imbalance, Itm2Atm1 (CONFIRMED) -- band check + final average-difference
+            // shared with NiftySignal.Host/LiveFeatureEngine.cs's ComputeCoreDepthImbalanceRaw
+            // (2026-09-17 Phase 2 unification). Fully qualified (not a blanket `using
+            // NiftySignal.Scoring;`) since this file's own CoreScoreWeights would otherwise
+            // collide with NiftySignal.Scoring.CoreScoreWeights -- same reasoning as Phase 1's
+            // combine-step call site below. ---
+            var callDepth = rows.Where(r => r.OptionType == OptionType.Call && NiftySignal.Scoring.CoreScoreBands.InItm2Atm1(OptionType.Call, r.Offset) && r.Depth is not null)
                 .Select(r => r.Depth!.Value).ToList();
-            var putDepth = rows.Where(r => r.OptionType == OptionType.Put && InItm2Atm1(OptionType.Put, r.Offset) && r.Depth is not null)
+            var putDepth = rows.Where(r => r.OptionType == OptionType.Put && NiftySignal.Scoring.CoreScoreBands.InItm2Atm1(OptionType.Put, r.Offset) && r.Depth is not null)
                 .Select(r => r.Depth!.Value).ToList();
-            double? depthImbalanceRaw = callDepth.Count > 0 && putDepth.Count > 0 ? callDepth.Average() - putDepth.Average() : null;
+            double? depthImbalanceRaw = NiftySignal.Scoring.CoreScoreRawFormulas.DepthImbalance(callDepth, putDepth);
+            // Experimental smoothing (see CoreScoreSimulationOptions.DepthImbalanceSmoothingMinutes'
+            // own doc comment) -- substitutes the rolling-window mean for the instant value used by
+            // BOTH ranking and the diagnostic field below, when enabled. depthImbalanceSmoother is
+            // null (flag off) leaves this line's result identical to the instant value above.
+            if (depthImbalanceSmoother is not null)
+            {
+                depthImbalanceRaw = depthImbalanceSmoother.Observe(timestamp, depthImbalanceRaw);
+            }
 
-            // --- ITM skew, Itm2Atm1 (CONFIRMED among non-expiry days -- nulled on 0 DTE) ---
+            // --- ITM skew, Itm2Atm1 (CONFIRMED among non-expiry days -- nulled on 0 DTE) -- shared
+            // formula, 2026-09-17 Phase 2 unification (see DepthImbalance's own comment above). ---
             double? itmSkewRaw = null;
             if (!isExpiryDay)
             {
-                var callIv = rows.Where(r => r.OptionType == OptionType.Call && InItm2Atm1(OptionType.Call, r.Offset) && r.Iv is not null)
+                var callIv = rows.Where(r => r.OptionType == OptionType.Call && NiftySignal.Scoring.CoreScoreBands.InItm2Atm1(OptionType.Call, r.Offset) && r.Iv is not null)
                     .Select(r => r.Iv!.Value).ToList();
-                var putIv = rows.Where(r => r.OptionType == OptionType.Put && InItm2Atm1(OptionType.Put, r.Offset) && r.Iv is not null)
+                var putIv = rows.Where(r => r.OptionType == OptionType.Put && NiftySignal.Scoring.CoreScoreBands.InItm2Atm1(OptionType.Put, r.Offset) && r.Iv is not null)
                     .Select(r => r.Iv!.Value).ToList();
-                itmSkewRaw = callIv.Count > 0 && putIv.Count > 0 ? putIv.Average() - callIv.Average() : null;
+                itmSkewRaw = NiftySignal.Scoring.CoreScoreRawFormulas.ItmSkew(callIv, putIv);
             }
 
             // --- ItmSkewChange15m: rolling 15-min CHANGE in the level above, not the level itself
@@ -443,67 +483,54 @@ public static class CoreScoreOptionSimulator
             // --- FutureCvdNet5Min (PROMOTED, sign confirmed positive, read directly) ---
             double? futureCvdRaw = ctx?.FutureCvdProxyNet5Min;
 
-            // --- NotionalVolumeRatio, ATM+/-5, callNotional/putNotional (watch, inverted) ---
+            // --- NotionalVolumeRatio, ATM+/-5, callNotional/putNotional (watch, inverted) -- final
+            // log-ratio shared with NiftySignal.Host/LiveFeatureEngine.cs's
+            // ComputeCoreNotionalVolumeRatioRaw (2026-09-17 Phase 2 unification). ---
             var callNotional = rows.Where(r => r.OptionType == OptionType.Call && Math.Abs(r.Offset) <= NotionalBandOffset && r.VolumeDeltaRaw is > 0 && r.Mark is > 0)
-                .Sum(r => (double)r.VolumeDeltaRaw!.Value * (double)r.Mark!.Value);
+                .Select(r => (double)r.VolumeDeltaRaw!.Value * (double)r.Mark!.Value).ToList();
             var putNotional = rows.Where(r => r.OptionType == OptionType.Put && Math.Abs(r.Offset) <= NotionalBandOffset && r.VolumeDeltaRaw is > 0 && r.Mark is > 0)
-                .Sum(r => (double)r.VolumeDeltaRaw!.Value * (double)r.Mark!.Value);
+                .Select(r => (double)r.VolumeDeltaRaw!.Value * (double)r.Mark!.Value).ToList();
             // Tested NEGATIVE correlation with price -- inverted here (put/call instead of
             // call/put) so a positive log-ratio consistently means "bullish" like the other terms.
-            double? notionalLogRatioRaw = callNotional > 0 && putNotional > 0 ? Math.Log(putNotional / callNotional) : null;
+            double? notionalLogRatioRaw = NiftySignal.Scoring.CoreScoreRawFormulas.NotionalVolumeRatio(callNotional, putNotional);
 
-            // --- GammaExposure, ATM+/-10, sum(call:+Gamma*OI, put:-Gamma*OI) (watch, positive sign) ---
-            var gexRows = rows.Where(r => Math.Abs(r.Offset) <= GammaBandOffset && r.Gamma is not null && r.OpenInterest is not null).ToList();
-            double? gammaExposureRaw = gexRows.Count > 0
-                ? gexRows.Sum(r => (r.OptionType == OptionType.Call ? 1.0 : -1.0) * r.Gamma!.Value * r.OpenInterest!.Value)
-                : null;
+            // --- GammaExposure, ATM+/-10, sum(call:+Gamma*OI, put:-Gamma*OI) (watch, positive sign)
+            // -- shared with LiveFeatureEngine.cs's ComputeCoreGammaExposureRaw (2026-09-17 Phase 2
+            // unification). Known residual parity gap (26/7500 cadences, max diff ~2471, per
+            // docs/SCORE_CANDIDATES.md) is a different STRIKE SET at the band's edge, not this
+            // arithmetic -- extracting it here doesn't fix or mask that, by design. ---
+            var gexRows = rows.Where(r => Math.Abs(r.Offset) <= GammaBandOffset && r.Gamma is not null && r.OpenInterest is not null)
+                .Select(r => (r.OptionType, r.Gamma!.Value, (double)r.OpenInterest!.Value)).ToList();
+            double? gammaExposureRaw = NiftySignal.Scoring.CoreScoreRawFormulas.GammaExposure(gexRows);
 
             // --- GammaExposureChange5m: rolling 5-min CHANGE in the level above (2026-09-17) ---
             var gammaExposureChange5mRaw = RollingChange(gammaExposureChangeHistory, ref gammaExposureChangeRefIndex, timestamp, gammaExposureChangeWindow, gammaExposureRaw);
 
-            // --- TrendReversion15m: signed net Future change / path length, trailing 15 real min ---
-            // Already bounded [-1,1] by construction (net <= path always) -- used directly as this
-            // term's signed contribution, no session-rank needed. Negated: a clean recent trend
-            // reads as a REVERSION signal (opposite direction), not continuation -- the confirmed,
-            // if counter-intuitive, sign from SCORE_CANDIDATES.md.
-            if (ctx?.FutureChangeFromLastCadence is { } futureChange)
-            {
-                trendWindow.Enqueue((timestamp, (double)futureChange));
-            }
-            while (trendWindow.Count > 0 && timestamp - trendWindow.Peek().Timestamp > TrendReversionWindow)
-            {
-                trendWindow.Dequeue();
-            }
-            double? trendReversionSigned = null;
-            if (trendWindow.Count > 0)
-            {
-                var net = trendWindow.Sum(w => w.Change);
-                var path = trendWindow.Sum(w => Math.Abs(w.Change));
-                if (path > 0)
-                {
-                    trendReversionSigned = -1.0 * (net / path);
-                }
-            }
+            // --- TrendReversion15m: signed net Future change / path length, trailing 15 real min --
+            // shared sliding-window tracker with LiveFeatureEngine.cs (2026-09-17 Phase 2
+            // unification). Already bounded [-1,1] by construction (net <= path always) -- used
+            // directly as this term's signed contribution, no session-rank needed. ---
+            double? trendReversionSigned = trendReversionTracker.Observe(
+                timestamp, ctx?.FutureChangeFromLastCadence is { } futureChange ? (double)futureChange : null);
 
-            // --- BasisChange: FutureChange - SpotChange, per cadence (provisionally promoted, negated) ---
-            double? basisChangeRaw = ctx?.FutureChangeFromLastCadence is { } fChg && ctx?.SpotChangeFromLastCadence is { } sChg
-                ? (double)(fChg - sChg)
-                : null;
+            // --- BasisChange: FutureChange - SpotChange, per cadence (provisionally promoted,
+            // negated) -- shared with LiveFeatureEngine.cs's own ComputeCoreTrendAndBasis
+            // (2026-09-17 Phase 2 unification); see CoreScoreRawFormulas.BasisChange's own doc
+            // comment for why this specific one-line function is shared. ---
+            double? basisChangeRaw = NiftySignal.Scoring.CoreScoreRawFormulas.BasisChange(
+                ctx?.FutureChangeFromLastCadence, ctx?.SpotChangeFromLastCadence);
 
-            // --- OiChangeDiff15m: rolling 15-min sum of (CallOiDelta-PutOiDelta), ATM+/-2 ---
-            // Sign UNRESOLVED per SCORE_CANDIDATES.md -- used naive (uninverted) here, matching the
-            // majority (3 of 4 days) at this specific 15-min-bucket horizon. Weakest-evidence term
-            // of the eight; watch its own contribution in the output.
+            // --- OiChangeDiff15m: rolling 15-min sum of (CallOiDelta-PutOiDelta), ATM+/-2 -- shared
+            // sliding-window tracker with LiveFeatureEngine.cs's own _coreOiChangeDiffWindow
+            // (2026-09-17 Phase 2 unification). Sign UNRESOLVED per SCORE_CANDIDATES.md -- used
+            // naive (uninverted) here, matching the majority (3 of 4 days) at this specific
+            // 15-min-bucket horizon. Weakest-evidence term of the eight; watch its own contribution
+            // in the output. ---
             var callOiDeltaThisCadence = rows.Where(r => r.OptionType == OptionType.Call && Math.Abs(r.Offset) <= OiDiffBandOffset && r.OpenInterestDeltaRaw is not null)
                 .Sum(r => r.OpenInterestDeltaRaw!.Value);
             var putOiDeltaThisCadence = rows.Where(r => r.OptionType == OptionType.Put && Math.Abs(r.Offset) <= OiDiffBandOffset && r.OpenInterestDeltaRaw is not null)
                 .Sum(r => r.OpenInterestDeltaRaw!.Value);
-            oiDiffWindow.Enqueue((timestamp, callOiDeltaThisCadence, putOiDeltaThisCadence));
-            while (oiDiffWindow.Count > 0 && timestamp - oiDiffWindow.Peek().Timestamp > OiDiffWindow)
-            {
-                oiDiffWindow.Dequeue();
-            }
-            double? oiChangeDiff15mRaw = oiDiffWindow.Sum(w => (double)(w.Call - w.Put));
+            double? oiChangeDiff15mRaw = oiDiffTracker.Observe(timestamp, callOiDeltaThisCadence, putOiDeltaThisCadence);
 
             // Rank against PRIOR observations only (read before add), same self-inclusion-safe
             // ordering already established this session for the DynamicHybrid same-bar fix.
@@ -518,35 +545,38 @@ public static class CoreScoreOptionSimulator
             var itmSkewChangeSigned = RankSigned(itmSkewChange15mRaw, itmSkewChangeRank);
             var gammaExposureChangeSigned = RankSigned(gammaExposureChange5mRaw, gammaExposureChangeRank);
 
-            // Renormalize by the weight of whichever terms are actually present this cadence --
-            // same optional-component pattern CompositeScoreCalculator/RatioScoreCalculator both
-            // already use, rather than silently treating a missing term as zero.
-            var presentWeight = (depthSigned is not null ? weights.DepthImbalanceWeight : 0)
-                + (skewSigned is not null ? weights.ItmSkewWeight : 0)
-                + (cvdSigned is not null ? weights.FutureCvdNet5MinWeight : 0)
-                + (notionalSigned is not null ? weights.NotionalVolumeRatioWeight : 0)
-                + (gammaSigned is not null ? weights.GammaExposureWeight : 0)
-                + (trendSigned is not null ? weights.TrendReversion15mWeight : 0)
-                + (basisSigned is not null ? weights.BasisChangeWeight : 0)
-                + (oiDiffSigned is not null ? weights.OiChangeDiff15mWeight : 0)
-                + (itmSkewChangeSigned is not null ? weights.ItmSkewChange15mWeight : 0)
-                + (gammaExposureChangeSigned is not null ? weights.GammaExposureChange5mWeight : 0);
-
-            double? score = null;
-            if (presentWeight > 0)
-            {
-                var raw = ((depthSigned ?? 0) * weights.DepthImbalanceWeight
-                    + (skewSigned ?? 0) * weights.ItmSkewWeight
-                    + (cvdSigned ?? 0) * weights.FutureCvdNet5MinWeight
-                    + (notionalSigned ?? 0) * weights.NotionalVolumeRatioWeight
-                    + (gammaSigned ?? 0) * weights.GammaExposureWeight
-                    + (trendSigned ?? 0) * weights.TrendReversion15mWeight
-                    + (basisSigned ?? 0) * weights.BasisChangeWeight
-                    + (oiDiffSigned ?? 0) * weights.OiChangeDiff15mWeight
-                    + (itmSkewChangeSigned ?? 0) * weights.ItmSkewChange15mWeight
-                    + (gammaExposureChangeSigned ?? 0) * weights.GammaExposureChange5mWeight) / presentWeight;
-                score = 100.0 * Math.Tanh(raw / weights.K);
-            }
+            // Combine + tanh via the SAME shared calculator NiftySignal.Host/LiveFeatureEngine uses
+            // live (2026-09-17 unification, Phase 1) -- one implementation of the renormalize-by-
+            // present-weight-then-tanh math, not two hand-synced copies. Version is a label only
+            // (stamped onto the returned CoreScore, unused by ScoreCadence below) -- fully qualified
+            // throughout since this file's own CoreScoreWeights (with its "Weight"-suffixed field
+            // names and the backtest-only InvertFutureCvdNet5Min flag) would otherwise collide with
+            // NiftySignal.Scoring.CoreScoreWeights under a blanket `using`.
+            var scoringWeights = new NiftySignal.Scoring.CoreScoreWeights(
+                Version: "backtest-inline",
+                DepthImbalance: weights.DepthImbalanceWeight,
+                ItmSkew: weights.ItmSkewWeight,
+                FutureCvdNet5Min: weights.FutureCvdNet5MinWeight,
+                NotionalVolumeRatio: weights.NotionalVolumeRatioWeight,
+                GammaExposure: weights.GammaExposureWeight,
+                TrendReversion15m: weights.TrendReversion15mWeight,
+                BasisChange: weights.BasisChangeWeight,
+                OiChangeDiff15m: weights.OiChangeDiff15mWeight,
+                ItmSkewChange15m: weights.ItmSkewChange15mWeight,
+                GammaExposureChange5m: weights.GammaExposureChange5mWeight);
+            var scoringInputs = new NiftySignal.Scoring.CoreScoreComponentInputs(
+                DepthImbalance: depthSigned,
+                ItmSkew: skewSigned,
+                FutureCvdNet5Min: cvdSigned,
+                NotionalVolumeRatio: notionalSigned,
+                GammaExposure: gammaSigned,
+                TrendReversion15m: trendSigned,
+                BasisChange: basisSigned,
+                OiChangeDiff15m: oiDiffSigned,
+                ItmSkewChange15m: itmSkewChangeSigned,
+                GammaExposureChange5m: gammaExposureChangeSigned);
+            var coreScoreResult = NiftySignal.Scoring.CoreScoreCalculator.Calculate(scoringInputs, scoringWeights, timestamp, k: weights.K);
+            double? score = coreScoreResult.Score;
 
             cadences.Add(new ScoreCadence(timestamp, localTime, entryWindowOpen, mustForceClose, score, rows,
                 depthImbalanceRaw, depthSigned,
@@ -576,7 +606,7 @@ public static class CoreScoreOptionSimulator
         }
 
         var asOfDate = dayStrikeRows[0].AsOfDate;
-        var (cadences, priceByStrikeAndTime) = BuildScoreCadences(dayStrikeRows, dayCadenceContexts, thisWeekExpiry, options.EffectiveWeights);
+        var (cadences, priceByStrikeAndTime) = BuildScoreCadences(dayStrikeRows, dayCadenceContexts, thisWeekExpiry, options.EffectiveWeights, options.DepthImbalanceSmoothingMinutes);
 
         var trades = new List<CoreScoreTrade>();
         (DateTimeOffset EntryTime, decimal EntryPrice, OptionType Side, decimal StrikePrice, double EntryScore,
@@ -796,7 +826,7 @@ public static class CoreScoreOptionSimulator
         }
 
         var asOfDate = dayStrikeRows[0].AsOfDate;
-        var (cadences, priceByStrikeAndTime) = BuildScoreCadences(dayStrikeRows, dayCadenceContexts, thisWeekExpiry, options.EffectiveWeights);
+        var (cadences, priceByStrikeAndTime) = BuildScoreCadences(dayStrikeRows, dayCadenceContexts, thisWeekExpiry, options.EffectiveWeights, options.DepthImbalanceSmoothingMinutes);
 
         var fastWindowSpan = TimeSpan.FromMinutes(options.FastWindowMinutes);
         var slowWindowSpan = TimeSpan.FromMinutes(options.SlowWindowMinutes);
@@ -929,7 +959,7 @@ public static class CoreScoreOptionSimulator
         }
 
         var asOfDate = dayStrikeRows[0].AsOfDate;
-        var (cadences, priceByStrikeAndTime) = BuildScoreCadences(dayStrikeRows, dayCadenceContexts, thisWeekExpiry, options.EffectiveWeights);
+        var (cadences, priceByStrikeAndTime) = BuildScoreCadences(dayStrikeRows, dayCadenceContexts, thisWeekExpiry, options.EffectiveWeights, options.DepthImbalanceSmoothingMinutes);
 
         var fastWindowSpan = TimeSpan.FromMinutes(options.FastWindowMinutes);
         var slowWindowSpan = TimeSpan.FromMinutes(options.SlowWindowMinutes);
