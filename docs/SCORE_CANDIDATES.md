@@ -437,6 +437,118 @@ depth-imbalance precedent earlier in this file) isn't wrong in general — it ju
 `DepthImbalance` specifically, on this data. `dotnet build`/`dotnet test` clean after the revert
 (569/569).
 
+### Crossover fast/slow window: 5min/15min → 15min/30min (2026-09-17, promising but NOT yet settled)
+
+User's own decision, applied to both live and backtest together: `CoreScoreCrossover`'s
+`FastWindowMinutes`/`SlowWindowMinutes` changed from 5/15 to 15/30 in
+`NiftySignal.Host/appsettings.json` (live config) and in `NiftySignal.MetricTrials/Program.cs`'s own
+defaults (all three call sites — `SimulateDayCrossover`, `SimulateDayCombined`, and the
+`--correlation` diagnostic mode's `BuildDiagnostics` call — so a plain, flagless run of the backtest
+now matches what's actually configured live). `dotnet build`/`dotnet test` clean (569/569); this was
+a parameter change, not a formula change, so no new tests were needed.
+
+**Full 6-day re-run (08–11, 15–16 Sep), same everything else, only the window pair changed:**
+
+| Strategy | 5/15 (old) | 15/30 (new) |
+|---|---|---|
+| Crossover | −101.20 pts, 292 trades, 54.8% win rate | **+253.73 pts, 130 trades, 58.5% win rate** |
+| Combined (either opposite) | +20.28 pts, 136 trades | **+148.95 pts, 83 trades** |
+| Combined (both opposite) | +51.90 pts, 50 trades | **+176.98 pts, 57 trades** |
+| Hysteresis | 63.25 pts (unaffected — doesn't read fast/slow at all) | 63.25 pts |
+
+Trade counts roughly halved across every fast/slow-dependent strategy — the direct, expected
+mechanical effect of wider windows crossing less often.
+
+**Real, broadly-supported part of the result**: 16 Sep (the flat, choppy, near-zero-net-move day
+from the DTE-split entry above) improved under every fast/slow-dependent configuration —
+Crossover's own 16 Sep result went from −55.95 pts on 61 trades to +5.58 pts on 22 trades. Fewer,
+slower crossovers naturally means less whipsaw on a day with real intraday range but no net
+direction — a sensible, mechanistic reason to prefer the wider pair, not an artifact.
+
+**The honest complication — most of the headline swing is one single day, not a broad effect**:
+
+| | Crossover | Combined (either) | Combined (both) |
+|---|---|---|---|
+| 11 Sep's own share of the total gain | +227.98 of +253.73 (**90%**) | +90.85 of +148.95 (61%) | +111.45 of +176.98 (63%) |
+
+11 Sep is the same day already documented at length elsewhere in this project's history as a real,
+exceptional 13:50–14:00 spike. Under 15/30, Crossover caught it cleanly — one single trade on that
+strike netted +93.05 pts (127.03 → 220.08) in 14 minutes. That's genuinely good behavior (riding a
+real move instead of getting shaken out of it by a fast window), but it means the eye-catching total
+is mostly "performed very well on one already-famous outlier day," not broad evidence the wider
+window beats the narrower one under ordinary conditions. Strip 11 Sep out and Crossover's remaining
+5 days net roughly +25.75 — a modest, plausible, unspectacular improvement, not a transformation.
+
+**Verdict: directionally promising, not settled.** Two separable claims, only one of which this
+6-day sample actually supports well: (1) wider windows reduce whipsaw-driven losses on choppy
+days — supported cleanly by 16 Sep, mechanistically sound, low risk of being a fluke; (2) wider
+windows are broadly better across ordinary trending days — not really tested yet, since the entire
+apparent edge on trend days rides on one already-known spike. Same discipline as everywhere else in
+this file: needs more days, ideally both another real trend-spike day and another chop day, before
+15/30 vs. 5/15 is treated as resolved rather than promising.
+
+### Risk-management parity: live's MaxTradesPerDay/MaxDailyLossPct/MaxConsecutiveLosses ported into the backtest (2026-09-17, real P&L improvement, but mostly one incident)
+
+User's own request: both live CoreScore engines (`CoreScoreHysteresisTradingEngine`/
+`CoreScoreCrossoverTradingEngine`) already gate entries on `CoreScoreRiskLimitsConfig`
+(`MaxTradesPerDay`/`MaxDailyLossPct`/`MaxConsecutiveLosses`) — confirmed by reading both directly,
+along with the equally load-bearing negative: neither has a stop-loss, partial-book, or time-stop at
+all (`CoreScoreHysteresisRules.cs`'s own doc comment says so explicitly). `CoreScoreOptionSimulator`
+had none of these three gates wired in before this pass (`StopLossPct`/the pre-existing
+`MaxConsecutiveLosses` flag were opt-in EXPERIMENTS to test adding a stop live doesn't have, not a
+simulation of live behavior — left untouched, still off by default). All three gates now default ON
+at each live engine's own configured value (30 / 20% / 4) for BOTH `SimulateDay` (Hysteresis) and
+`SimulateDayCrossover` — a flagless run now mirrors what's actually gating both live strategies, same
+principle as the 15/30 crossover-window change above. `MaxDailyLossPct` is rupee-denominated,
+translating each trade's points P&L via live's own `CapitalTotal`/`LotSize`/`LotsPerTrade`/
+`BrokeragePerOrder` defaults (50000/65/2/20) — used only for that one check, the headline pts/%
+totals are unchanged. `CoreScoreDayResult` now also carries `BlockedByMaxTradesPerDay`/
+`BlockedByDailyLoss`/`BlockedByMaxConsecutiveLosses` diagnostics so a run shows not just fewer trades
+but which gate fired. `dotnet build`/`dotnet test` clean (569/569); no test previously exercised
+`CoreScoreSimulationOptions`/`CoreScoreCrossoverOptions` directly, so nothing broke on the default
+change.
+
+**Full 6-day re-run (08–11, 15–16 Sep), risk-managed (live parity, default) vs. unmanaged (every gate
+disabled via `--no-max-trades-per-day --no-max-daily-loss --no-max-consecutive-losses`):**
+
+| Strategy | Unmanaged | Risk-managed (live parity) |
+|---|---|---|
+| Hysteresis | +63.25 pts, 56 trades, 76.8% win rate | **+115.83 pts, 51 trades, 76.5% win rate** |
+| Crossover | +253.73 pts, 130 trades, 58.5% win rate | **+285.80 pts, 110 trades, 61.8% win rate** |
+
+**Hysteresis's +83% swing is almost entirely one day, 15 Sep** — the same 0-DTE, −319-point session
+already documented above (DTE split entry) as the stuck-score regime that isn't yet understood.
+Unmanaged: 5 trades, net **−136.28** — the first trade lost −76.63 pts (−58%, the exact stuck-score
+blowup already on record as the incident that originally prompted the `StopLossPct`/
+`MaxConsecutiveLosses` experiments), then re-entered three more times before a second huge
+stuck-score loss (−77.90 pts, −72%) on the session's last trade. Risk-managed: 1 trade, net
+**−76.63** — the same first loss, but 130 qty × −76.63 pts − 2×₹20 brokerage ≈ −₹10,002 crossed the
+₹10,000 (20% of ₹50,000) daily-loss limit almost immediately; `BlockedByDailyLoss=253` that day, and
+every later signal (including the one that would have produced the second −77.90 loss) was refused
+for the rest of the session. This is a real, quantified confirmation of an already-suspected failure
+mode, not new news — the daily-loss breaker did exactly the job the 09-15 live-caught incident
+motivated it for.
+
+**The honest complication — the gate doesn't win every time**: on 16 Sep, `MaxConsecutiveLosses`
+cost a little for Hysteresis. Risk-managed: 4 trades, −18.85. Unmanaged: 5 trades, −11.78 — the
+blocked 5th signal that day would have been a +7.08 winner. A reminder that any gate trades away
+some upside for its downside protection on net, not a pure win on every single day.
+
+**Crossover's +12.6% improvement is smaller and more broadly distributed**: only
+`MaxConsecutiveLosses` ever fired for Crossover in this sample (`MaxDailyLossPct`/`MaxTradesPerDay`
+never tripped — Crossover's per-trade risk is much smaller/faster than Hysteresis's wider hysteresis
+band). 20 blocked signals spread across three separate days (15 on 08 Sep, 2 on 09 Sep, 3 on 16
+Sep), each cutting off a losing streak before it could keep re-entering into a stuck crossover
+signal, rather than one single dominant incident.
+
+**Verdict: real, positive, but same-sample caveat as everywhere else in this file.** Same 6 days
+already used for the 15/30 crossover-window decision and the original stop-loss exploration
+above — not independent confirmation, and one blowup day (15 Sep) does most of the work for
+Hysteresis's headline number. Directionally supports keeping live's risk limits on by default in the
+backtest (which this pass now does); needs more sessions, ideally another 0-DTE stuck-score day and
+a few ordinary days, before treating the magnitude of the improvement as settled rather than
+promising.
+
 ## Normalization and gating — general approach, not yet finalized per-candidate
 
 - Target range for every candidate once scored: **-100 (strong bearish) to +100 (strong

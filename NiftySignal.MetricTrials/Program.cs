@@ -24,11 +24,27 @@ using NiftySignal.MetricTrials;
 // Usage: dotnet run --project NiftySignal.MetricTrials --
 //   [--core-entry-score=N] [--core-entry-price-low=N] [--core-entry-price-high=N]
 //   [--core-score-smoothing-cadences=N] [--crossover-fast-min=N] [--crossover-slow-min=N] [--next-week]
-//   [--stop-loss-pct=N] [--max-consecutive-losses=N] (both Hysteresis only) [--correlation]
-//   [--followups] (requires --correlation) [--date=yyyy-MM-dd] [--drop-itm-skew-and-gamma]
-//   [--use-rolling-changes] [--itm-skew-change-weight=N] [--gamma-exposure-change-weight=N]
-//   (both only meaningful with --use-rolling-changes) [--invert-cvd] [--drop-cvd]
-//   [--depth-imbalance-smoothing-minutes=N] (composable with each other)
+//   [--stop-loss-pct=N] (Hysteresis only, opt-in EXPERIMENT -- live has no stop-loss, see below)
+//   [--correlation] [--followups] (requires --correlation) [--date=yyyy-MM-dd]
+//   [--drop-itm-skew-and-gamma] [--use-rolling-changes] [--itm-skew-change-weight=N]
+//   [--gamma-exposure-change-weight=N] (both only meaningful with --use-rolling-changes)
+//   [--invert-cvd] [--drop-cvd] [--depth-imbalance-smoothing-minutes=N] (composable with each other)
+//
+// Risk-management parity (2026-09-17, both Hysteresis AND Crossover): ON by default at each live
+// engine's own configured value (CoreScoreHysteresisConfigOptions/CoreScoreCrossoverConfigOptions'
+// shared CoreScoreRiskLimitsConfigOptions) -- a flagless run now mirrors what actually gates BOTH
+// live strategies (CoreScoreHysteresisTradingEngine/CoreScoreCrossoverTradingEngine.
+// EvaluateEntryAsync), confirmed by reading both directly. This is deliberately NOT the same thing
+// as --stop-loss-pct above: neither live engine has a stop-loss/partial-book/time-stop at all
+// (CoreScoreHysteresisRules.cs's own doc comment says so explicitly) -- --stop-loss-pct remains a
+// separate, opt-in experiment to test ADDING one, not a simulation of live behavior.
+//   [--max-consecutive-losses=N] (default 4, matches CoreScoreRiskLimitsConfigOptions.MaxConsecutiveLosses)
+//   [--max-trades-per-day=N] (default 30, matches CoreScoreRiskLimitsConfigOptions.MaxTradesPerDay)
+//   [--max-daily-loss-pct=N] (default 20, matches CoreScoreRiskLimitsConfigOptions.MaxDailyLossPct;
+//     rupee-denominated against CapitalTotal=50000/LotSize=65/LotsPerTrade=2/BrokeragePerOrder=20,
+//     RulesetConfigOptions' own live defaults -- the headline pts/% totals are unaffected)
+//   [--no-max-consecutive-losses] [--no-max-trades-per-day] [--no-max-daily-loss] (disable
+//     the corresponding gate entirely, for an unmanaged-vs-managed comparison)
 //
 // Reads every populated day from niftysignal_backtest_analysis (read-only). Entry picks whichever
 // strike is priced near [entryPriceRangeLow, entryPriceRangeHigh] (not ATM) for the signaled side
@@ -98,7 +114,13 @@ void PrintCoreTrade(CoreScoreTrade trade)
 void PrintDayResult(DateOnly asOfDate, DateOnly scoredExpiry, string expiryLabel, CoreScoreDayResult result)
 {
     var dayWinRate = result.Trades.Count > 0 ? 100.0 * result.WinCount / result.Trades.Count : 0;
-    Console.WriteLine($"{asOfDate:yyyy-MM-dd} ({expiryLabel}={scoredExpiry:yyyy-MM-dd}): {result.Trades.Count} trades, {dayWinRate:F1}% win rate, net {result.NetPnlPoints:F2} pts ({result.TotalPnlPercent:F1}%, avgPerTrade={result.AvgPnlPercent:F1}%), avgMFE={result.AvgMfe:F2} avgMAE={result.AvgMae:F2}");
+    // 2026-09-17, risk-management parity pass -- only prints the "blocked by" clause when at least
+    // one gate actually fired this day, so a quiet day's output stays exactly as before.
+    var blocked = result.BlockedByMaxTradesPerDay + result.BlockedByDailyLoss + result.BlockedByMaxConsecutiveLosses;
+    var blockedClause = blocked > 0
+        ? $", BLOCKED {blocked} signal(s) [maxTrades={result.BlockedByMaxTradesPerDay}, dailyLoss={result.BlockedByDailyLoss}, consecutiveLosses={result.BlockedByMaxConsecutiveLosses}]"
+        : "";
+    Console.WriteLine($"{asOfDate:yyyy-MM-dd} ({expiryLabel}={scoredExpiry:yyyy-MM-dd}): {result.Trades.Count} trades, {dayWinRate:F1}% win rate, net {result.NetPnlPoints:F2} pts ({result.TotalPnlPercent:F1}%, avgPerTrade={result.AvgPnlPercent:F1}%), avgMFE={result.AvgMfe:F2} avgMAE={result.AvgMae:F2}{blockedClause}");
     foreach (var trade in result.Trades)
     {
         PrintCoreTrade(trade);
@@ -113,7 +135,14 @@ void PrintOverall(string label, IReadOnlyList<CoreScoreDayResult> dayResults)
     var winRate = allTrades.Count > 0 ? 100.0 * allTrades.Count(t => t.NetPnlPoints > 0) / allTrades.Count : 0;
     var avgMfe = allTrades.Count > 0 ? allTrades.Average(t => t.Mfe) : 0;
     var avgMae = allTrades.Count > 0 ? allTrades.Average(t => t.Mae) : 0;
-    Console.WriteLine($"--- {label} total: {allTrades.Count} trades, {winRate:F1}% win rate, net {totalPnl:F2} pts ({totalPnlPercent:F1}%), avgMFE={avgMfe:F2} avgMAE={avgMae:F2} ---");
+    var totalBlockedMaxTrades = dayResults.Sum(r => r.BlockedByMaxTradesPerDay);
+    var totalBlockedDailyLoss = dayResults.Sum(r => r.BlockedByDailyLoss);
+    var totalBlockedConsecutiveLosses = dayResults.Sum(r => r.BlockedByMaxConsecutiveLosses);
+    var totalBlocked = totalBlockedMaxTrades + totalBlockedDailyLoss + totalBlockedConsecutiveLosses;
+    var blockedClause = totalBlocked > 0
+        ? $", BLOCKED {totalBlocked} signal(s) total [maxTrades={totalBlockedMaxTrades}, dailyLoss={totalBlockedDailyLoss}, consecutiveLosses={totalBlockedConsecutiveLosses}]"
+        : "";
+    Console.WriteLine($"--- {label} total: {allTrades.Count} trades, {winRate:F1}% win rate, net {totalPnl:F2} pts ({totalPnlPercent:F1}%), avgMFE={avgMfe:F2} avgMAE={avgMae:F2}{blockedClause} ---");
     Console.WriteLine();
 }
 
@@ -178,7 +207,7 @@ if (HasFlag("correlation"))
     foreach (var day in dayData)
     {
         var diagnostics = CoreScoreOptionSimulator.BuildDiagnostics(day.StrikeRows, day.CadenceContexts, day.ScoredExpiry,
-            fastWindowMinutes: (int)ParseOverride("--crossover-fast-min=", 5.0), slowWindowMinutes: (int)ParseOverride("--crossover-slow-min=", 15.0));
+            fastWindowMinutes: (int)ParseOverride("--crossover-fast-min=", 15.0), slowWindowMinutes: (int)ParseOverride("--crossover-slow-min=", 30.0));
 
         var contextsByTime = day.CadenceContexts.Where(c => c.FutureChangeForDay is not null).OrderBy(c => c.Timestamp).ToList();
 
@@ -635,10 +664,21 @@ var entryPriceRangeHigh = (decimal)ParseOverride("--core-entry-price-high=", 150
 var scoreSmoothingCadences = (int)ParseOverride("--core-score-smoothing-cadences=", 1.0);
 var stopLossArg = args.FirstOrDefault(a => a.StartsWith("--stop-loss-pct=", StringComparison.OrdinalIgnoreCase));
 var stopLossPct = stopLossArg is not null ? (decimal?)double.Parse(stopLossArg["--stop-loss-pct=".Length..]) : null;
-var maxConsecutiveLossesArg = args.FirstOrDefault(a => a.StartsWith("--max-consecutive-losses=", StringComparison.OrdinalIgnoreCase));
-var maxConsecutiveLosses = maxConsecutiveLossesArg is not null ? (int?)int.Parse(maxConsecutiveLossesArg["--max-consecutive-losses=".Length..]) : null;
 
-Console.WriteLine($"=== Core score option simulation - HYSTERESIS THRESHOLD (entry-score>={entryScoreThreshold}, smoothing={scoreSmoothingCadences} cadence(s), strike price in [{entryPriceRangeLow},{entryPriceRangeHigh}], stop-loss={(stopLossPct is { } sl ? $"{sl}%" : "none")}, max-consecutive-losses={(maxConsecutiveLosses is { } mcl ? mcl.ToString() : "none")}) ===");
+// Risk-management parity (2026-09-17): ON by default at each live engine's own configured value --
+// see this file's own usage-comment block above for the full rationale. --no-* disables the
+// corresponding gate entirely for an unmanaged-vs-managed comparison; the plain =N form overrides
+// the value while keeping the gate on.
+var maxConsecutiveLosses = HasFlag("no-max-consecutive-losses") ? (int?)null : (int)ParseOverride("--max-consecutive-losses=", 4.0);
+var maxTradesPerDay = HasFlag("no-max-trades-per-day") ? (int?)null : (int)ParseOverride("--max-trades-per-day=", 30.0);
+var maxDailyLossPct = HasFlag("no-max-daily-loss") ? (double?)null : ParseOverride("--max-daily-loss-pct=", 20.0);
+
+string RiskLimitsLabel() =>
+    $"max-trades/day={(maxTradesPerDay is { } mt ? mt.ToString() : "none")}, " +
+    $"max-daily-loss={(maxDailyLossPct is { } dl ? $"{dl}%" : "none")}, " +
+    $"max-consecutive-losses={(maxConsecutiveLosses is { } mcl ? mcl.ToString() : "none")}";
+
+Console.WriteLine($"=== Core score option simulation - HYSTERESIS THRESHOLD (entry-score>={entryScoreThreshold}, smoothing={scoreSmoothingCadences} cadence(s), strike price in [{entryPriceRangeLow},{entryPriceRangeHigh}], stop-loss={(stopLossPct is { } sl ? $"{sl}%" : "none, live has none")}, {RiskLimitsLabel()}) ===");
 var hysteresisResults = new List<CoreScoreDayResult>();
 foreach (var day in dayData)
 {
@@ -646,24 +686,30 @@ foreach (var day in dayData)
         new CoreScoreSimulationOptions(EntryScoreThreshold: entryScoreThreshold,
             EntryPriceRangeLow: entryPriceRangeLow, EntryPriceRangeHigh: entryPriceRangeHigh,
             ScoreSmoothingCadences: scoreSmoothingCadences, StopLossPct: stopLossPct, MaxConsecutiveLosses: maxConsecutiveLosses, Weights: weights,
-            DepthImbalanceSmoothingMinutes: depthImbalanceSmoothingMinutes));
+            DepthImbalanceSmoothingMinutes: depthImbalanceSmoothingMinutes,
+            MaxTradesPerDay: maxTradesPerDay, MaxDailyLossPct: maxDailyLossPct));
     hysteresisResults.Add(result);
     PrintDayResult(day.AsOfDate, day.ScoredExpiry, expiryLabel, result);
 }
 PrintOverall("Hysteresis threshold", hysteresisResults);
 
 // --- Strategy 2: fast/slow crossover (experimental) ---
-var crossoverFastMinutes = (int)ParseOverride("--crossover-fast-min=", 5.0);
-var crossoverSlowMinutes = (int)ParseOverride("--crossover-slow-min=", 15.0);
+// 2026-09-17: defaults changed from 5/15 to 15/30 to match the live CoreScoreCrossover config's
+// intended value (user's own decision -- see NiftySignal.Host/appsettings.json's CoreScoreCrossover
+// section, which is being updated to 15/30 in the same change). Override via the flags below if a
+// specific backtest run needs a different pair.
+var crossoverFastMinutes = (int)ParseOverride("--crossover-fast-min=", 15.0);
+var crossoverSlowMinutes = (int)ParseOverride("--crossover-slow-min=", 30.0);
 
-Console.WriteLine($"=== Core score option simulation - FAST/SLOW CROSSOVER EXPERIMENT (fast={crossoverFastMinutes}min, slow={crossoverSlowMinutes}min, strike price in [{entryPriceRangeLow},{entryPriceRangeHigh}]) ===");
+Console.WriteLine($"=== Core score option simulation - FAST/SLOW CROSSOVER EXPERIMENT (fast={crossoverFastMinutes}min, slow={crossoverSlowMinutes}min, strike price in [{entryPriceRangeLow},{entryPriceRangeHigh}], {RiskLimitsLabel()}) ===");
 var crossoverResults = new List<CoreScoreDayResult>();
 foreach (var day in dayData)
 {
     var result = CoreScoreOptionSimulator.SimulateDayCrossover(day.StrikeRows, day.CadenceContexts, day.ScoredExpiry,
         new CoreScoreCrossoverOptions(FastWindowMinutes: crossoverFastMinutes, SlowWindowMinutes: crossoverSlowMinutes,
             EntryPriceRangeLow: entryPriceRangeLow, EntryPriceRangeHigh: entryPriceRangeHigh, Weights: weights,
-            DepthImbalanceSmoothingMinutes: depthImbalanceSmoothingMinutes));
+            DepthImbalanceSmoothingMinutes: depthImbalanceSmoothingMinutes,
+            MaxConsecutiveLosses: maxConsecutiveLosses, MaxTradesPerDay: maxTradesPerDay, MaxDailyLossPct: maxDailyLossPct));
     crossoverResults.Add(result);
     PrintDayResult(day.AsOfDate, day.ScoredExpiry, expiryLabel, result);
 }

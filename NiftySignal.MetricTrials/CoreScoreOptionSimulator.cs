@@ -133,16 +133,20 @@ public sealed record CoreScoreSimulationOptions(
     // amount -- premiums here range from EntryPriceRangeLow to EntryPriceRangeHigh, so a fixed
     // point stop would be a wildly different fraction of risk depending on which strike got picked.
     decimal? StopLossPct = null,
-    // 2026-09-16, added alongside StopLossPct after backtesting showed the stop ALONE makes a
-    // stuck-score session worse, not better: a tight stop on a persistently-miscalibrated score
-    // (09-15's own composite stayed bullish essentially all session while the market fell -- see
-    // the correlation check that found this) just re-enters the SAME losing side over and over,
-    // each loss compounding off a lower base than the last -- literally a bigger cumulative loss
-    // than one long, unstopped ride would have been. Same semantics as the LIVE engine's own
-    // RiskLimits.MaxConsecutiveLosses (CoreScoreHysteresisTradingEngine.EvaluateEntryAsync) --
-    // once this many CLOSED trades in a row lost money, no new entry until a win resets the streak.
-    // null (default) disables it, preserving every existing caller's/test's behavior unchanged.
-    int? MaxConsecutiveLosses = null,
+    // Same semantics as the LIVE engine's own RiskLimits.MaxConsecutiveLosses
+    // (CoreScoreHysteresisTradingEngine.EvaluateEntryAsync) -- once this many CLOSED trades in a
+    // row lost money today, no new entry until a win resets the streak. 2026-09-16: added
+    // alongside StopLossPct as an opt-in experiment (default null) after backtesting showed the
+    // stop ALONE makes a stuck-score session worse, not better -- a tight stop on a persistently-
+    // miscalibrated score (09-15's own composite stayed bullish essentially all session while the
+    // market fell) just re-enters the SAME losing side over and over, each loss compounding off a
+    // lower base than the last. 2026-09-17 (risk-management parity pass, see MaxTradesPerDay/
+    // MaxDailyLossPct below): default flips from null to 4 -- CoreScoreRiskLimitsConfigOptions'
+    // own live default for BOTH CoreScoreHysteresisConfig and CoreScoreCrossoverConfig -- so a
+    // flagless run now actually mirrors what gates both live engines, same principle already
+    // applied to the 15/30 crossover-window change. Pass null explicitly (or the CLI's
+    // --no-max-consecutive-losses) to go back to the old unlimited-streak behavior for comparison.
+    int? MaxConsecutiveLosses = 4,
     // 2026-09-16, experimental (scoping audit finding F-A's own follow-up): 0 (default) means
     // unsmoothed, exactly today's behavior -- DepthImbalanceRaw is BuildScoreCadences' own
     // single-15s-cadence instant read, unchanged. >0 routes that same raw value through a
@@ -152,9 +156,39 @@ public sealed record CoreScoreSimulationOptions(
     // at a 10-minute window versus the raw instant read, unlike PriceMomentum's own smoothing,
     // which made things worse -- this flag exists to confirm whether that correlation gain
     // actually shows up in real trade P&L, not just in the correlation number).
-    int DepthImbalanceSmoothingMinutes = 0)
+    int DepthImbalanceSmoothingMinutes = 0,
+    // 2026-09-17, risk-management parity pass (user's own request: "simulate the live risk
+    // management in the backtest so we can see how it really worked"). Both live CoreScore
+    // engines' actual risk box (CoreScoreHysteresisTradingEngine/CoreScoreCrossoverTradingEngine.
+    // EvaluateEntryAsync) is exactly {MaxTradesPerDay, MaxDailyLossPct, MaxConsecutiveLosses} --
+    // confirmed by reading both engines directly. Neither has a stop-loss, partial-book, or time
+    // stop (CoreScoreHysteresisRules.cs's own doc comment says so explicitly) -- StopLossPct above
+    // remains a separate, opt-in EXPERIMENT to test adding one, not a simulation of live behavior;
+    // don't conflate the two. Defaults below match CoreScoreRiskLimitsConfigOptions'/
+    // CapitalConfigOptions'/CostsConfigOptions' own live values exactly (NiftySignal.Rules/
+    // CoreScoreHysteresisConfigOptions.cs, NiftySignal.Rules/RulesetConfigOptions.cs) -- not
+    // independently chosen.
+    int? MaxTradesPerDay = 30,
+    // Percent of CapitalTotal; a held-open position's own unrealized MFE/MAE never counts here --
+    // matches live's own dailyLossLimit check, which reads only CLOSED trades' NetPnl.
+    double? MaxDailyLossPct = 20.0,
+    // RulesetConfigOptions.CapitalConfigOptions' live defaults -- used ONLY to translate each
+    // trade's points-based NetPnlPoints into the rupee terms MaxDailyLossPct is expressed in; the
+    // headline CoreScoreDayResult totals stay points/percent-of-premium as before, unaffected.
+    decimal CapitalTotal = 50000m,
+    int LotSize = 65,
+    int LotsPerTrade = 2,
+    // RulesetConfigOptions.CostsConfigOptions.BrokeragePerOrder's live default, charged both sides
+    // (entry + exit) same as PaperTradeSimulator.FillEntry/FillExit -- SlippageTicks is NOT applied
+    // here, since this backtest has never modeled tick-level bid/ask fills (entry/exit already use
+    // the raw Mark price, not ask+slippage/bid-slippage); adding that is a separate, larger fidelity
+    // change, not part of this risk-management pass.
+    decimal BrokeragePerOrder = 20m)
 {
     public CoreScoreWeights EffectiveWeights => Weights ?? new CoreScoreWeights();
+
+    /// <summary>Units per position -- matches live's own `config.Capital.LotSize * config.Capital.LotsPerTrade` exactly.</summary>
+    public int Quantity => LotSize * LotsPerTrade;
 }
 
 /// <summary>
@@ -176,9 +210,26 @@ public sealed record CoreScoreCrossoverOptions(
     decimal EntryPriceRangeHigh = 150m,
     CoreScoreWeights? Weights = null,
     // See CoreScoreSimulationOptions' own doc comment on this same field.
-    int DepthImbalanceSmoothingMinutes = 0)
+    int DepthImbalanceSmoothingMinutes = 0,
+    // 2026-09-17, risk-management parity pass -- see CoreScoreSimulationOptions' own doc comments
+    // on these same five fields for the full rationale (live-engine source, defaults' provenance,
+    // why StopLoss/PartialBook/TimeStop are deliberately absent). CoreScoreCrossoverTradingEngine
+    // reads the identical CoreScoreRiskLimitsConfig shape as the Hysteresis engine (same
+    // MaxDailyLossPct/MaxConsecutiveLosses/MaxTradesPerDay defaults), so these five default to the
+    // same live values -- this record previously had NONE of them; SimulateDayCrossover was
+    // "always positioned" with zero risk gating of any kind until this pass.
+    int? MaxConsecutiveLosses = 4,
+    int? MaxTradesPerDay = 30,
+    double? MaxDailyLossPct = 20.0,
+    decimal CapitalTotal = 50000m,
+    int LotSize = 65,
+    int LotsPerTrade = 2,
+    decimal BrokeragePerOrder = 20m)
 {
     public CoreScoreWeights EffectiveWeights => Weights ?? new CoreScoreWeights();
+
+    /// <summary>Units per position -- matches live's own `config.Capital.LotSize * config.Capital.LotsPerTrade` exactly.</summary>
+    public int Quantity => LotSize * LotsPerTrade;
 }
 
 /// <summary>2026-09-15, experimental -- see <see cref="CoreScoreOptionSimulator.SimulateDayCombined"/>'s own doc comment.</summary>
@@ -229,7 +280,16 @@ public sealed record CoreScoreCadenceDiagnostics(
     // remove once the BasisChangeSigned live-vs-backtest divergence is resolved.
     int BasisChangeRankCount = 0, IReadOnlyList<double>? BasisChangeRankValues = null);
 
-public sealed record CoreScoreDayResult(DateOnly AsOfDate, IReadOnlyList<CoreScoreTrade> Trades)
+/// <param name="BlockedByMaxTradesPerDay">
+/// 2026-09-17, risk-management parity pass: count of cadences where a genuine entry signal fired
+/// (score past threshold, or a crossover flip) but <see cref="CoreScoreSimulationOptions.MaxTradesPerDay"/>/
+/// <see cref="CoreScoreCrossoverOptions.MaxTradesPerDay"/> was already at its cap -- diagnostic
+/// only, so "how often did the real live risk gates actually bind" is directly visible in the
+/// output rather than inferred from a lower trade count alone. Default 0 for every pre-existing
+/// caller that doesn't pass it.
+/// </param>
+public sealed record CoreScoreDayResult(DateOnly AsOfDate, IReadOnlyList<CoreScoreTrade> Trades,
+    int BlockedByMaxTradesPerDay = 0, int BlockedByDailyLoss = 0, int BlockedByMaxConsecutiveLosses = 0)
 {
     public decimal NetPnlPoints => Trades.Sum(t => t.NetPnlPoints);
     public int WinCount => Trades.Count(t => t.NetPnlPoints > 0);
@@ -613,6 +673,18 @@ public static class CoreScoreOptionSimulator
             int CadencesHeld, decimal RunningMfe, decimal RunningMae)? open = null;
         var scoreSmoothingWindow = new Queue<double>();
         var consecutiveLosses = 0;
+        // 2026-09-17, risk-management parity pass -- rupee-equivalent running total of today's
+        // CLOSED trades only (matches live's own closedTodayNetPnl query exactly: an open
+        // position's unrealized MFE/MAE never counts against MaxDailyLossPct). Derived from each
+        // trade's own NetPnlPoints * Quantity, brokerage charged both sides -- same arithmetic as
+        // PaperTradeSimulator.ComputeNetPnl, minus the slippage-tick component this backtest has
+        // never modeled at the Mark-price level (see CoreScoreSimulationOptions.BrokeragePerOrder's
+        // own doc comment).
+        var closedTodayNetRupeePnl = 0m;
+        var blockedByMaxTrades = 0;
+        var blockedByDailyLoss = 0;
+        var blockedByConsecutiveLosses = 0;
+        var dailyLossLimit = options.MaxDailyLossPct is { } lossPct ? options.CapitalTotal * (decimal)lossPct / 100m : (decimal?)null;
 
         foreach (var cadence in cadences)
         {
@@ -672,16 +744,35 @@ public static class CoreScoreOptionSimulator
                     // Same rolling-streak semantics as the live engine's own F3 (LiveTradingEngine)/
                     // consecutive-losses check: any non-negative close resets it, a loss extends it.
                     consecutiveLosses = closedTrade.NetPnlPoints < 0 ? consecutiveLosses + 1 : 0;
+                    closedTodayNetRupeePnl += closedTrade.NetPnlPoints * options.Quantity - 2 * options.BrokeragePerOrder;
                 }
             }
-            else if (cadence.EntryWindowOpen && !cadence.MustForceClose && score is { } sc && Math.Abs(sc) >= options.EntryScoreThreshold
-                && (options.MaxConsecutiveLosses is not { } maxLosses || consecutiveLosses < maxLosses))
+            else if (cadence.EntryWindowOpen && !cadence.MustForceClose && score is { } sc && Math.Abs(sc) >= options.EntryScoreThreshold)
             {
-                var side = sc > 0 ? OptionType.Call : OptionType.Put;
-                var picked = PickEntryStrike(rows, side, options.EntryPriceRangeLow, options.EntryPriceRangeHigh);
-                if (picked is { } chosen)
+                // Risk gates checked in the same precedence live's own EvaluateEntryAsync uses
+                // (tradesToday -> dailyLoss -> consecutiveLosses) -- only counted as "blocked" once
+                // a genuine signal (|score| >= threshold) actually existed this cadence, not on
+                // every cadence the gate happens to be tripped.
+                if (options.MaxTradesPerDay is { } maxTrades && trades.Count >= maxTrades)
                 {
-                    open = (timestamp, chosen.Price, side, chosen.Strike, sc, 0, 0m, 0m);
+                    blockedByMaxTrades++;
+                }
+                else if (dailyLossLimit is { } limit && closedTodayNetRupeePnl <= -limit)
+                {
+                    blockedByDailyLoss++;
+                }
+                else if (options.MaxConsecutiveLosses is { } maxLosses && consecutiveLosses >= maxLosses)
+                {
+                    blockedByConsecutiveLosses++;
+                }
+                else
+                {
+                    var side = sc > 0 ? OptionType.Call : OptionType.Put;
+                    var picked = PickEntryStrike(rows, side, options.EntryPriceRangeLow, options.EntryPriceRangeHigh);
+                    if (picked is { } chosen)
+                    {
+                        open = (timestamp, chosen.Price, side, chosen.Strike, sc, 0, 0m, 0m);
+                    }
                 }
             }
         }
@@ -696,7 +787,7 @@ public static class CoreScoreOptionSimulator
                 lastTimestamp, exitPrice, "EndOfData", stillOpen.RunningMfe, stillOpen.RunningMae, stillOpen.EntryScore));
         }
 
-        return new CoreScoreDayResult(asOfDate, trades);
+        return new CoreScoreDayResult(asOfDate, trades, blockedByMaxTrades, blockedByDailyLoss, blockedByConsecutiveLosses);
     }
 
     /// <summary>
@@ -812,10 +903,15 @@ public static class CoreScoreOptionSimulator
     /// composite score over two real-time trailing windows (fast/slow, plain moving average of
     /// every non-null score observed in each window) and trades the crossover: when the fast
     /// average crosses from below to above the slow average, go/flip long (call); crossing from
-    /// above to below, go/flip short (put). Always positioned once the first crossover fires --
-    /// a new cross closes the existing opposite-side position and immediately opens the new one,
-    /// the same cadence. No SL/TP, no score-magnitude threshold at all -- purely directional,
-    /// purely on the crossover event; ForceClose remains the only non-crossover exit.
+    /// above to below, go/flip short (put). No SL/TP, no score-magnitude threshold at all --
+    /// purely directional, purely on the crossover event; ForceClose remains the only
+    /// non-crossover exit. A crossover ALWAYS closes whatever's open (that part is unconditional),
+    /// but 2026-09-17 (risk-management parity pass) it no longer unconditionally reopens the
+    /// opposite side -- the live engine's own MaxTradesPerDay/MaxDailyLossPct/MaxConsecutiveLosses
+    /// gate the re-entry exactly as it does for Hysteresis, so this can now go flat and STAY flat
+    /// for the rest of the session once one of those trips, same as live actually would. Was
+    /// genuinely "always positioned" before this pass; no longer strictly true with the live-parity
+    /// defaults active (still true if every gate is disabled via the CLI's --no-* flags).
     /// </summary>
     public static CoreScoreDayResult SimulateDayCrossover(IReadOnlyList<StrikeCadenceSnapshot> dayStrikeRows,
         IReadOnlyList<CadenceContext> dayCadenceContexts, DateOnly thisWeekExpiry, CoreScoreCrossoverOptions options)
@@ -837,6 +933,14 @@ public static class CoreScoreOptionSimulator
         var trades = new List<CoreScoreTrade>();
         (DateTimeOffset EntryTime, decimal EntryPrice, OptionType Side, decimal StrikePrice, double EntryScore,
             decimal RunningMfe, decimal RunningMae)? open = null;
+        // 2026-09-17, risk-management parity pass -- see SimulateDay's own identical fields for
+        // the full rationale; this strategy had none of this tracking before this pass.
+        var consecutiveLosses = 0;
+        var closedTodayNetRupeePnl = 0m;
+        var blockedByMaxTrades = 0;
+        var blockedByDailyLoss = 0;
+        var blockedByConsecutiveLosses = 0;
+        var dailyLossLimit = options.MaxDailyLossPct is { } lossPct ? options.CapitalTotal * (decimal)lossPct / 100m : (decimal?)null;
 
         void CloseOpen(DateTimeOffset timestamp, string reason)
         {
@@ -848,9 +952,13 @@ public static class CoreScoreOptionSimulator
             var exitPrice = priceByStrikeAndTime.TryGetValue((position.Side, position.StrikePrice), out var series) && series.TryGetValue(timestamp, out var mark) && mark is { } exitMark
                 ? exitMark
                 : position.EntryPrice; // no fresh quote this exact cadence -- fall back to entry, never fabricate a price
-            trades.Add(new CoreScoreTrade(position.EntryTime, position.EntryPrice, position.Side, position.StrikePrice,
-                timestamp, exitPrice, reason, position.RunningMfe, position.RunningMae, position.EntryScore));
+            var closedTrade = new CoreScoreTrade(position.EntryTime, position.EntryPrice, position.Side, position.StrikePrice,
+                timestamp, exitPrice, reason, position.RunningMfe, position.RunningMae, position.EntryScore);
+            trades.Add(closedTrade);
             open = null;
+
+            consecutiveLosses = closedTrade.NetPnlPoints < 0 ? consecutiveLosses + 1 : 0;
+            closedTodayNetRupeePnl += closedTrade.NetPnlPoints * options.Quantity - 2 * options.BrokeragePerOrder;
         }
 
         foreach (var cadence in cadences)
@@ -902,16 +1010,34 @@ public static class CoreScoreOptionSimulator
 
             if (diffSign != previousDiffSign.Value)
             {
-                // A genuine crossover: fast moved from one side of slow to the other.
+                // A genuine crossover: fast moved from one side of slow to the other. Closing
+                // whatever's open is unconditional; re-entering the opposite side is now gated by
+                // the same three live risk limits SimulateDay uses, checked in the same precedence
+                // as live's own EvaluateEntryAsync (tradesToday -> dailyLoss -> consecutiveLosses).
                 CloseOpen(timestamp, "CrossoverFlip");
 
                 if (cadence.EntryWindowOpen)
                 {
-                    var side = diffSign > 0 ? OptionType.Call : OptionType.Put;
-                    var picked = PickEntryStrike(rows, side, options.EntryPriceRangeLow, options.EntryPriceRangeHigh);
-                    if (picked is { } chosen)
+                    if (options.MaxTradesPerDay is { } maxTrades && trades.Count >= maxTrades)
                     {
-                        open = (timestamp, chosen.Price, side, chosen.Strike, fastAvg - slowAvg, 0m, 0m);
+                        blockedByMaxTrades++;
+                    }
+                    else if (dailyLossLimit is { } limit && closedTodayNetRupeePnl <= -limit)
+                    {
+                        blockedByDailyLoss++;
+                    }
+                    else if (options.MaxConsecutiveLosses is { } maxLosses && consecutiveLosses >= maxLosses)
+                    {
+                        blockedByConsecutiveLosses++;
+                    }
+                    else
+                    {
+                        var side = diffSign > 0 ? OptionType.Call : OptionType.Put;
+                        var picked = PickEntryStrike(rows, side, options.EntryPriceRangeLow, options.EntryPriceRangeHigh);
+                        if (picked is { } chosen)
+                        {
+                            open = (timestamp, chosen.Price, side, chosen.Strike, fastAvg - slowAvg, 0m, 0m);
+                        }
                     }
                 }
 
@@ -929,7 +1055,7 @@ public static class CoreScoreOptionSimulator
                 lastTimestamp, exitPrice, "EndOfData", stillOpen.RunningMfe, stillOpen.RunningMae, stillOpen.EntryScore));
         }
 
-        return new CoreScoreDayResult(asOfDate, trades);
+        return new CoreScoreDayResult(asOfDate, trades, blockedByMaxTrades, blockedByDailyLoss, blockedByConsecutiveLosses);
     }
 
     /// <summary>
