@@ -96,112 +96,13 @@ public sealed class InstrumentPriceStateTests
     }
 }
 
-public sealed class FutureFlowAccumulatorTests
-{
-    [Fact]
-    public void FirstTick_ContributesZeroVolumeDelta_NoPriorBaselineToDiffAgainst()
-    {
-        var flow = new FutureFlowAccumulator();
-        flow.ApplyTick(23000m, 5000);
-
-        Assert.Equal(0, flow.CadenceVolumeDelta);
-        Assert.Equal(5000, flow.LatestCumulativeVolume);
-        Assert.Null(flow.Vwap); // zero volume traded so far -> no meaningful VWAP yet
-    }
-
-    [Fact]
-    public void SecondTick_ContributesTheRealVolumeDelta_AndVwapReflectsThatTradedPrice()
-    {
-        var flow = new FutureFlowAccumulator();
-        flow.ApplyTick(23000m, 5000);
-        flow.ApplyTick(23010m, 5100); // +100 volume traded at 23010
-
-        Assert.Equal(100, flow.CadenceVolumeDelta);
-        Assert.Equal(5100, flow.LatestCumulativeVolume);
-        Assert.Equal(23010.0, flow.Vwap);
-    }
-
-    [Fact]
-    public void VolumeGoingBackwards_FloorsTheDeltaAtZero_RatherThanGoingNegative()
-    {
-        var flow = new FutureFlowAccumulator();
-        flow.ApplyTick(23000m, 5000);
-        flow.ApplyTick(23010m, 4000); // a feed reset -- cumulative volume appears to drop
-
-        Assert.Equal(0, flow.CadenceVolumeDelta);
-    }
-
-    [Fact]
-    public void ResetCadence_ClearsOnlyTheCadenceDelta_NotTheDayLongVwapAccumulation()
-    {
-        var flow = new FutureFlowAccumulator();
-        flow.ApplyTick(23000m, 5000);
-        flow.ApplyTick(23010m, 5100);
-        flow.ResetCadence();
-
-        Assert.Equal(0, flow.CadenceVolumeDelta);
-        Assert.Equal(23010.0, flow.Vwap); // VWAP is cumulative for the day -- a cadence reset must not touch it
-
-        flow.ApplyTick(23020m, 5200);
-        // New VWAP = (100*23010 + 100*23020) / 200 = 23015
-        Assert.Equal(23015.0, flow.Vwap);
-    }
-}
-
-public sealed class DepthImbalanceAccumulatorTests
-{
-    static MarketDepth Depth(long bidQty, long askQty) => new(
-        Bid1Price: 100m, Bid1Qty: bidQty, Bid2Price: 0, Bid2Qty: 0, Bid3Price: 0, Bid3Qty: 0, Bid4Price: 0, Bid4Qty: 0, Bid5Price: 0, Bid5Qty: 0,
-        Ask1Price: 101m, Ask1Qty: askQty, Ask2Price: 0, Ask2Qty: 0, Ask3Price: 0, Ask3Qty: 0, Ask4Price: 0, Ask4Qty: 0, Ask5Price: 0, Ask5Qty: 0);
-
-    [Fact]
-    public void NoTicksThisCadence_LeavesImbalanceNull_NotZero()
-    {
-        var accumulator = new DepthImbalanceAccumulator();
-        Assert.Null(accumulator.CadenceImbalance);
-    }
-
-    [Fact]
-    public void SingleTick_ComputesTheRealWorldFormula()
-    {
-        var accumulator = new DepthImbalanceAccumulator();
-        // Matches the worked example already validated against real data: (910-325)/(910+325).
-        accumulator.ApplyTick(Depth(910, 325));
-
-        Assert.Equal((910.0 - 325.0) / (910.0 + 325.0), accumulator.CadenceImbalance);
-        Assert.Equal(910.0, accumulator.AverageBidQty);
-        Assert.Equal(325.0, accumulator.AverageAskQty);
-    }
-
-    [Fact]
-    public void MultipleTicks_AveragesThePerTickRatio_NotTheRatioOfAverages()
-    {
-        var accumulator = new DepthImbalanceAccumulator();
-        accumulator.ApplyTick(Depth(bidQty: 100, askQty: 0));  // ratio = +1
-        accumulator.ApplyTick(Depth(bidQty: 0, askQty: 100));  // ratio = -1
-
-        // Average of the two per-tick ratios is 0 -- not the ratio of the averaged quantities
-        // (which would also happen to be 0 here, but for a different, coincidental reason;
-        // the two-side symmetric case is chosen deliberately to make that distinction visible
-        // rather than hide it behind a number that would pass either way).
-        Assert.Equal(0.0, accumulator.CadenceImbalance);
-    }
-
-    [Fact]
-    public void Reset_ClearsAccumulatedState()
-    {
-        var accumulator = new DepthImbalanceAccumulator();
-        accumulator.ApplyTick(Depth(910, 325));
-        accumulator.Reset();
-
-        Assert.Null(accumulator.CadenceImbalance);
-        Assert.Null(accumulator.AverageBidQty);
-    }
-}
-
 // FutureCvdProxyAccumulatorTests/RollingNetSumWindowTests moved to
 // NiftySignal.Tests/Features/ (2026-09-17, Phase 3 unification) -- the classes themselves moved to
 // NiftySignal.Features, see that project's own FutureCvdProxyAccumulator.cs/RollingNetSumWindow.cs.
+//
+// FutureFlowAccumulatorTests/DepthImbalanceAccumulatorTests moved to NiftySignal.Tests/Features/
+// (2026-09-17, volume-bar cadence work) for the same reason -- see
+// NiftySignal.Features/FutureFlowAccumulator.cs/DepthImbalanceAccumulator.cs.
 
 public sealed class TradingHoursRemainingTests
 {

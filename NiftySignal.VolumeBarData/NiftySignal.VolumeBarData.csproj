@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Builds the volume-cadence backtest dataset (2026-09-17 plan: "participant behaviour,
+         not clock time, should set the pace") from raw historical future ticks into a brand-new,
+         dedicated database, kept fully isolated from NiftySignal.Persistence's live schema and
+         from NiftySignal.BacktestData's own time-cadence dataset. Mirrors
+         NiftySignal.BacktestData's own project shape exactly. -->
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="Microsoft.Extensions.Configuration" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Json" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.EnvironmentVariables" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Persistence, read-only here: the source of historical ticks/instruments
+         (niftysignal_vm_copy). This project never writes to NiftySignalDbContext's tables. -->
+    <ProjectReference Include="..\NiftySignal.Domain\NiftySignal.Domain.csproj" />
+    <ProjectReference Include="..\NiftySignal.Persistence\NiftySignal.Persistence.csproj" />
+    <ProjectReference Include="..\NiftySignal.Features\NiftySignal.Features.csproj" />
+    <!-- 2026-09-18, options phase: ImpliedVolatilitySolver/BlackScholes/SyntheticForward/
+         TimeToExpiry, the same already-validated pricing machinery CadencePopulator's own
+         CONFIRMED IV skew metric uses, reused here rather than reimplemented. -->
+    <ProjectReference Include="..\NiftySignal.Pricing\NiftySignal.Pricing.csproj" />
+    <!-- Read-only here too: BacktestAnalysisDbContext (niftysignal_backtest_analysis, the
+         existing time-cadence dataset) is the parity/sanity-check reference the "analyze" mode
+         compares this project's own volume-bar numbers against. See AnalyzeCommand.cs. -->
+    <ProjectReference Include="..\NiftySignal.BacktestData\NiftySignal.BacktestData.csproj" />
+  </ItemGroup>
+
+</Project>

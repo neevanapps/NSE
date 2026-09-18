@@ -910,97 +910,20 @@ public sealed class InstrumentPriceState
     }
 }
 
-/// <summary>
-/// The tracked future's own cumulative volume/VWAP state, accumulated per real tick (not per
-/// cadence) -- the same "diff cumulative day volume against the previous tick, floored at 0
-/// against a feed reset" pattern LiveFeatureEngine.OnTick already uses for this exact purpose.
-/// One running baseline feeds both the day-long VWAP accumulation and the per-cadence volume
-/// delta, so the two can never silently disagree with each other.
-/// </summary>
-public sealed class FutureFlowAccumulator
-{
-    long? _previousVolume;
-    double _cumulativePriceVolume;
-    double _cumulativeVolume;
-
-    public long? LatestCumulativeVolume { get; private set; }
-
-    public long CadenceVolumeDelta { get; private set; }
-
-    /// <summary>This tick's own volume delta (not the cadence total) -- exposed so a caller (the CVD proxy accumulator) classifies the exact same delta VWAP just weighted, rather than re-deriving its own, potentially disagreeing, volume baseline.</summary>
-    public long LastVolumeDelta { get; private set; }
-
-    public double? Vwap => _cumulativeVolume > 0 ? _cumulativePriceVolume / _cumulativeVolume : null;
-
-    public void ApplyTick(decimal price, long volume)
-    {
-        var delta = _previousVolume is { } previous ? Math.Max(0, volume - previous) : 0;
-        _previousVolume = volume;
-        LatestCumulativeVolume = volume;
-        LastVolumeDelta = delta;
-
-        _cumulativePriceVolume += (double)price * delta;
-        _cumulativeVolume += delta;
-        CadenceVolumeDelta += delta;
-    }
-
-    public void ResetCadence() => CadenceVolumeDelta = 0;
-}
-
-/// <summary>
-/// One instrument's own order-book depth imbalance, averaged over every real tick observed within
-/// one cadence -- built from complete historical tick data, not a 3-second-stride sample (live
-/// production only samples that coarsely because it can't wait around on a real-time feed; this
-/// offline pass has no such constraint, per explicit instruction). Genuinely generic (nothing here
-/// is future-specific) -- named `DepthImbalanceAccumulator` until 2026-09-12, when option-level depth
-/// imbalance needed the exact same computation and this was renamed rather than duplicated.
-/// </summary>
-public sealed class DepthImbalanceAccumulator
-{
-    double _imbalanceSum;
-    int _imbalanceCount;
-    double _bidQtySum;
-    double _askQtySum;
-    int _rawSampleCount;
-
-    public void ApplyTick(MarketDepth depth)
-    {
-        var bid = depth.TotalBidQty;
-        var ask = depth.TotalAskQty;
-
-        if (bid + ask > 0)
-        {
-            _imbalanceSum += (double)(bid - ask) / (bid + ask);
-            _imbalanceCount++;
-        }
-
-        _bidQtySum += bid;
-        _askQtySum += ask;
-        _rawSampleCount++;
-    }
-
-    /// <summary>Average of the per-tick imbalance ratio -- null if no depth-bearing tick arrived this cadence.</summary>
-    public double? CadenceImbalance => _imbalanceCount > 0 ? _imbalanceSum / _imbalanceCount : null;
-
-    public double? AverageBidQty => _rawSampleCount > 0 ? _bidQtySum / _rawSampleCount : null;
-
-    public double? AverageAskQty => _rawSampleCount > 0 ? _askQtySum / _rawSampleCount : null;
-
-    public void Reset()
-    {
-        _imbalanceSum = 0;
-        _imbalanceCount = 0;
-        _bidQtySum = 0;
-        _askQtySum = 0;
-        _rawSampleCount = 0;
-    }
-}
-
 // FutureCvdProxyAccumulator and RollingNetSumWindow moved to NiftySignal.Features (2026-09-17,
 // Phase 3 unification) so NiftySignal.Host/LiveFeatureEngine.cs can reference the SAME classes
 // instead of maintaining its own hand-inlined port of their exact logic -- see
 // NiftySignal.Features/FutureCvdProxyAccumulator.cs and RollingNetSumWindow.cs for the full doc
 // comments (unchanged) and docs/SCORE_CANDIDATES.md's Phase 3 section for the rationale.
+//
+// FutureFlowAccumulator and DepthImbalanceAccumulator moved to NiftySignal.Features (2026-09-17,
+// volume-bar cadence work) for the same reason -- the new NiftySignal.VolumeBarData populator
+// needs the exact same VWAP/volume-delta and depth-imbalance bookkeeping, reset on a volume
+// boundary instead of a 15s cadence boundary, not a hand-copied duplicate. See
+// NiftySignal.Features/FutureFlowAccumulator.cs and DepthImbalanceAccumulator.cs for the full doc
+// comments (unchanged logic). Deliberately does NOT touch NiftySignal.Host/LiveFeatureEngine.cs's
+// own separate CoreDepthImbalanceAccumulator -- unifying that is a live-code change, out of scope
+// per the standing rule not to touch Host/Dashboard until backtesting has found a real edge.
 
 /// <summary>
 /// Aggressor-volume-proxy classifier for one option instrument (2026-09-12; renamed in spirit,

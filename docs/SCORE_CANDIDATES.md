@@ -549,6 +549,82 @@ backtest (which this pass now does); needs more sessions, ideally another 0-DTE 
 a few ordinary days, before treating the magnitude of the improvement as settled rather than
 promising.
 
+### Core score reduced to 4 terms (DepthImbalance/NotionalVolumeRatio/TrendReversion15m/OiChangeDiff15m) — redundancy-trim experiment (2026-09-17, split by strategy shape)
+
+Motivated directly by a new pairwise redundancy check (`--redundancy` flag, `NiftySignal.MetricTrials`, cross-correlates all 8 Core terms' raw values against EACH OTHER, never against price — same method as the already-run ITM/OTM skew redundancy check above): `NotionalVolumeRatio`/`TrendReversion15m`/`OiChangeDiff15m` are mutually correlated (avg r 0.31–0.51, same sign on all 6 days — unusually consistent compared to every other pair in the matrix), together carrying more combined weight (0.34) than `DepthImbalance` alone (0.316 in production). Reads as one underlying flow/momentum factor counted three times, not three independent views.
+
+User's decision: keep only `DepthImbalance`/`NotionalVolumeRatio`/`TrendReversion15m`/`OiChangeDiff15m` (0.25/0.14/0.10/0.10, this file's own weight scale — unchanged relative proportions, not new numbers), zero `ItmSkew`/`FutureCvdNet5Min`/`GammaExposure`/`BasisChange` and both rolling-change experimental terms. New `--four-term-weights` CLI flag (`NiftySignal.MetricTrials/Program.cs`), applies to all 4 strategies via the shared `weights` variable. Deliberately not rescaled to sum 1.0 — `CoreScoreCalculator` renormalizes by whichever weight is actually present each cadence, so scaling every nonzero weight by the same constant is cosmetic only.
+
+**Full 6-day re-run, risk-managed (live-parity MaxTradesPerDay=30/MaxDailyLossPct=20%/MaxConsecutiveLosses=4 from the entry above already active), 8-term vs 4-term:**
+
+| Strategy | 8-term: trades/win%/net | 4-term: trades/win%/net | pts/trade, 8-term → 4-term |
+|---|---|---|---|
+| Hysteresis | 51 / 76.5% / +115.83 | 140 / 73.6% / **+111.75** | 2.27 → **0.80** |
+| Crossover | 110 / 61.8% / +285.80 | 102 / 60.8% / +275.45 | 2.60 → 2.70 |
+| Combined (either) | 83 / 59.0% / +148.95 | 169 / 71.6% / **+259.93** | 1.79 → 1.54 |
+| Combined (both) | 50 / 72.0% / +176.98 | 85 / 64.7% / **+304.55** | 3.54 → 3.58 |
+
+**Hysteresis regresses toward overtrading** — per-trade edge dropped by two-thirds while trade count nearly tripled, hitting `MaxTradesPerDay=30` on 3 of 6 days (08/10/11 Sep) and firing `MaxConsecutiveLosses` 297 times (up from 14). The narrower composite crosses ±30 far more often for this specific threshold-crossing strategy shape — the opposite of what "fewer, higher-conviction trades" (this project's own stated goal) would want. Crossover/Combined kept flat-to-better per-trade edge; their P&L gains are mostly volume, except:
+
+**15 Sep (crash day, −453 pts, the still-unresolved 0-DTE stuck-score regime from the DTE-split entry above) — the one clean, mechanistically sensible result:**
+
+| Strategy | 8-term | 4-term |
+|---|---|---|
+| Hysteresis | −76.63 (1 trade, blocked fast) | **−99.18 (19 trades — worse)** |
+| Crossover | −43.80 | **+132.38** |
+| Combined (either) | −117.00 | **+8.25** |
+| Combined (both) | −146.65 | **−30.55** |
+
+Three of four strategies did dramatically better on the hardest day in the sample — the expected payoff of dropping correlated/conflicting terms (a cleaner directional read exactly when a real move is underway). Hysteresis alone got worse on this exact day, firing 19 trades before its daily-loss breaker finally caught it instead of 1.
+
+**Verdict: split by strategy shape, not a clean win.** Real, mechanistically sensible improvement on the crash day for Crossover/Combined; a real overtrading regression for Hysteresis specifically. Same 6-day, same-sample caveat as everywhere else in this file.
+
+### DepthImbalance smoothing (5min/10min) on top of the 4-term weights (2026-09-17, fixes Hysteresis's overtrading, costs Combined's crash-day resilience)
+
+User's own prediction, tested directly: smoothing `DepthImbalance` (existing `--depth-imbalance-smoothing-minutes=N` flag — already composable with `--four-term-weights`, no code change needed) should bring the four-term score's inflated Hysteresis trade count back down. Full 6-day re-run, risk-managed, same live-parity gates as above, 4-term (no smoothing) vs +5min vs +10min:
+
+**Trade count:**
+
+| Strategy | No smoothing | +5min | +10min |
+|---|---|---|---|
+| Hysteresis | 140 | 62 (−56%) | **53 (−62%)** |
+| Crossover | 102 | 95 (−7%) | 95 (−7%) |
+| Combined (either) | 169 | 82 (−51%) | 75 (−56%) |
+| Combined (both) | 85 | 57 (−33%) | 54 (−36%) |
+
+**Per-trade edge (pts/trade):**
+
+| Strategy | No smoothing | +5min | +10min |
+|---|---|---|---|
+| Hysteresis | 0.80 | 1.54 | **2.44** |
+| Crossover | 2.70 | 3.34 | 3.30 |
+| Combined (either) | 1.54 | 2.77 | 2.66 |
+| Combined (both) | 3.58 | 2.10 | 3.04 |
+
+10-minute smoothing puts Hysteresis's per-trade edge (2.44) back above the original 8-term score's own 2.27, on 53 trades instead of 140 — the overtrading regression from the entry above is fixed, not just masked.
+
+**Net P&L:**
+
+| Strategy | No smoothing | +5min | +10min |
+|---|---|---|---|
+| Hysteresis | +111.75 | +95.45 | **+129.35** |
+| Crossover | +275.45 | **+317.33** | +313.08 |
+| Combined (either) | +259.93 | +226.78 | +199.13 |
+| Combined (both) | +304.55 | **+119.45** | +164.33 |
+
+**15 Sep (crash day) — smoothing helps Hysteresis, hurts Combined:**
+
+| Strategy | No smoothing | +5min | +10min |
+|---|---|---|---|
+| Hysteresis | −99.18 (19 trades) | **−79.13 (1 trade)** | **−81.00 (1 trade)** |
+| Crossover | +132.38 | +84.78 | +63.58 |
+| Combined (either) | +8.25 | −21.20 | −47.28 |
+| Combined (both) | −30.55 | **−105.68** | **−102.50** |
+
+Smoothing restores Hysteresis's fast-block behavior on 15 Sep (1 trade, `BLOCKED ~326 by dailyLoss`) — nearly identical to the original 8-term score's −76.63 on this day, and the main reason its total recovers. But it costs the Combined strategies exactly the crash-day resilience the 4-term change won them in the entry above: Combined (both) goes from −30.55 (unsmoothed 4-term) to −105.68/−102.50 smoothed, more than 3x worse, because a smoother `DepthImbalance` reacts slower to a genuine regime change.
+
+**Verdict: real trade-off, not a strict win.** 10-minute beats 5-minute on 3 of 4 strategies (higher win rate, higher pts/trade) and is the better choice if smoothing is kept at all. But it's a genuine choice between fixing Hysteresis's overtrading and keeping Combined's crash-day resilience, not a change that helps everything at once — needs more sessions (another crash day, more ordinary days) before settling which strategy's behavior to prioritize. Same 6-day caveat as everywhere else.
+
 ## Normalization and gating — general approach, not yet finalized per-candidate
 
 - Target range for every candidate once scored: **-100 (strong bearish) to +100 (strong

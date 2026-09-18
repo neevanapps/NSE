@@ -183,7 +183,20 @@ public sealed record CoreScoreSimulationOptions(
     // here, since this backtest has never modeled tick-level bid/ask fills (entry/exit already use
     // the raw Mark price, not ask+slippage/bid-slippage); adding that is a separate, larger fidelity
     // change, not part of this risk-management pass.
-    decimal BrokeragePerOrder = 20m)
+    decimal BrokeragePerOrder = 20m,
+    // 2026-09-17, risk-rules experiment (user's own request, distinct from the live-parity pass
+    // above -- neither live engine has a target/partial-book either, same "opt-in EXPERIMENT, not
+    // a simulation of live behavior" caveat as StopLossPct). Percent of ENTRY PREMIUM, same
+    // convention as StopLossPct: null (default) disables it entirely. Once excursion crosses +
+    // TargetPct, <see cref="PartialBookFraction"/> of the position closes at whatever mark is
+    // available that cadence (never a synthetic exact-target fill, same "never fabricate a price"
+    // discipline every exit in this file already follows) -- the remainder keeps riding, still
+    // protected by StopLossPct if set, until the normal signal-based exit fires.
+    decimal? TargetPct = null,
+    // Fraction closed at TargetPct -- 0.5 matches ExitConfigOptions.PartialBookFraction's own live
+    // default (the LEGACY engine's, not either CoreScore engine's -- neither has one at all -- but
+    // the closest real precedent for what fraction to default to).
+    decimal PartialBookFraction = 0.5m)
 {
     public CoreScoreWeights EffectiveWeights => Weights ?? new CoreScoreWeights();
 
@@ -224,7 +237,14 @@ public sealed record CoreScoreCrossoverOptions(
     decimal CapitalTotal = 50000m,
     int LotSize = 65,
     int LotsPerTrade = 2,
-    decimal BrokeragePerOrder = 20m)
+    decimal BrokeragePerOrder = 20m,
+    // 2026-09-17, risk-rules experiment (user's own request) -- see CoreScoreSimulationOptions'
+    // own doc comments on these same two fields for the full rationale. This record previously had
+    // no stop-loss at all (unlike Hysteresis, which already had an opt-in StopLossPct experiment);
+    // both are new here.
+    decimal? StopLossPct = null,
+    decimal? TargetPct = null,
+    decimal PartialBookFraction = 0.5m)
 {
     public CoreScoreWeights EffectiveWeights => Weights ?? new CoreScoreWeights();
 
@@ -242,20 +262,65 @@ public sealed record CoreScoreCombinedOptions(
     CoreScoreWeights? Weights = null,
     bool ExitOnEitherOpposite = true,
     // See CoreScoreSimulationOptions' own doc comment on this same field.
-    int DepthImbalanceSmoothingMinutes = 0)
+    int DepthImbalanceSmoothingMinutes = 0,
+    // 2026-09-17, risk-rules experiment (user's own request) -- see CoreScoreSimulationOptions' own
+    // doc comments on these same fields for the full rationale. Combined is a backtest-only
+    // construct (no live StrategyId, unlike Hysteresis/Crossover) -- it was deliberately left OUT
+    // of the earlier live-parity pass (MaxTradesPerDay/MaxConsecutiveLosses stay unadded here, not
+    // being tested this round), so unlike those two records, MaxDailyLossPct here defaults to null
+    // (off) rather than a live-matching value -- there's no live config for this strategy to mirror,
+    // only whatever the current experiment explicitly asks for.
+    decimal? StopLossPct = null,
+    decimal? TargetPct = null,
+    decimal PartialBookFraction = 0.5m,
+    double? MaxDailyLossPct = null,
+    decimal CapitalTotal = 50000m,
+    int LotSize = 65,
+    int LotsPerTrade = 2,
+    decimal BrokeragePerOrder = 20m)
 {
     public CoreScoreWeights EffectiveWeights => Weights ?? new CoreScoreWeights();
+
+    /// <summary>Units per position -- matches live's own `config.Capital.LotSize * config.Capital.LotsPerTrade` exactly.</summary>
+    public int Quantity => LotSize * LotsPerTrade;
 }
 
+/// <param name="HasPartiallyBooked">
+/// 2026-09-17, risk-rules experiment (user's own request: SL 10%, 20% target with a 50% partial
+/// book, remainder rides until the normal signal-based exit) -- true once this position's own
+/// TargetPct fired earlier in its life. Same field shape as the live <see
+/// cref="NiftySignal.Domain.Entities.PaperTrade"/>'s own HasPartiallyBooked/PartialExitTime/
+/// PartialExitPrice trio, not reinvented here.
+/// </param>
+/// <param name="PartialBookFraction">
+/// The fraction of quantity closed at <see cref="PartialExitPrice"/> -- captured from whichever
+/// option record opened this trade, not a global constant, so <see cref="NetPnlPoints"/> stays
+/// correct even if a caller changes the fraction between runs. 0 (default) when never partially
+/// booked; <see cref="NetPnlPoints"/>'s own null-check on <see cref="PartialExitPrice"/> is what
+/// actually gates the blended math, not this field alone.
+/// </param>
 public sealed record CoreScoreTrade(
     DateTimeOffset EntryTime, decimal EntryPrice, OptionType Side, decimal StrikePrice,
     DateTimeOffset ExitTime, decimal ExitPrice, string ExitReason,
-    decimal Mfe, decimal Mae, double EntryScore)
+    decimal Mfe, decimal Mae, double EntryScore,
+    bool HasPartiallyBooked = false, DateTimeOffset? PartialExitTime = null, decimal? PartialExitPrice = null,
+    decimal PartialBookFraction = 0m)
 {
-    /// <summary>Points on the traded option's own price -- no lot size, no transaction costs. Always a LONG position (buying premium, matching how this system actually trades) -- never negated, unlike a long/short future simulator.</summary>
-    public decimal NetPnlPoints => ExitPrice - EntryPrice;
+    /// <summary>
+    /// Points on the traded option's own price -- no lot size, no transaction costs. Always a LONG
+    /// position (buying premium, matching how this system actually trades) -- never negated,
+    /// unlike a long/short future simulator. Blended across both fills when partially booked:
+    /// PartialBookFraction at PartialExitPrice, the remainder at the final ExitPrice -- both legs
+    /// priced off the SAME EntryPrice basis (matching live's own excursion-from-entry convention,
+    /// never re-based off the partial-book price). Reduces to the original single-fill formula
+    /// exactly when HasPartiallyBooked is false (every existing caller's/test's behavior
+    /// unchanged), since PartialExitPrice stays null and this branch is never taken.
+    /// </summary>
+    public decimal NetPnlPoints => HasPartiallyBooked && PartialExitPrice is { } partialPrice
+        ? (PartialBookFraction * (partialPrice - EntryPrice)) + ((1m - PartialBookFraction) * (ExitPrice - EntryPrice))
+        : ExitPrice - EntryPrice;
 
-    /// <summary>Percent return on the entry premium -- (ExitPrice-EntryPrice)/EntryPrice*100. Same long-only, no-lot-size, no-cost caveats as NetPnlPoints; EntryPrice is always > 0 by construction (only priced strikes are ever entered), so no zero-guard needed.</summary>
+    /// <summary>Percent return on the entry premium -- NetPnlPoints/EntryPrice*100. Same long-only, no-lot-size, no-cost caveats as NetPnlPoints; EntryPrice is always > 0 by construction (only priced strikes are ever entered), so no zero-guard needed.</summary>
     public decimal NetPnlPercent => NetPnlPoints / EntryPrice * 100m;
 }
 
@@ -342,6 +407,19 @@ public static class CoreScoreOptionSimulator
         double? OiChangeDiff15mRaw, double? OiChangeDiff15mSigned,
         // TEMPORARY DIAGNOSTIC (2026-09-16) -- see SessionRankTracker.Count's own comment.
         int BasisChangeRankCount = 0, IReadOnlyList<double>? BasisChangeRankValues = null);
+
+    /// <summary>
+    /// 2026-09-17, risk-rules experiment: percent-of-entry-premium excursion check shared by all
+    /// three strategies below -- same "percent of ENTRY PREMIUM, not a fixed point amount" reasoning
+    /// CoreScoreSimulationOptions.StopLossPct's own doc comment already established. Target and stop
+    /// are mutually exclusive by construction (opposite-signed thresholds), so callers never need to
+    /// pick a priority between them for the SAME cadence.
+    /// </summary>
+    static (bool StopLossHit, bool TargetHit) CheckStopAndTarget(decimal excursion, decimal entryPrice, decimal? stopLossPct, decimal? targetPct)
+    {
+        var excursionPct = excursion / entryPrice * 100m;
+        return (stopLossPct is { } sl && excursionPct <= -sl, targetPct is { } tp && excursionPct >= tp);
+    }
 
     /// <summary>
     /// 2026-09-13: entry per explicit instruction picks the strike priced near [low,high], not ATM --
@@ -670,7 +748,8 @@ public static class CoreScoreOptionSimulator
 
         var trades = new List<CoreScoreTrade>();
         (DateTimeOffset EntryTime, decimal EntryPrice, OptionType Side, decimal StrikePrice, double EntryScore,
-            int CadencesHeld, decimal RunningMfe, decimal RunningMae)? open = null;
+            int CadencesHeld, decimal RunningMfe, decimal RunningMae,
+            bool HasPartiallyBooked, DateTimeOffset? PartialExitTime, decimal? PartialExitPrice)? open = null;
         var scoreSmoothingWindow = new Queue<double>();
         var consecutiveLosses = 0;
         // 2026-09-17, risk-management parity pass -- rupee-equivalent running total of today's
@@ -710,12 +789,17 @@ public static class CoreScoreOptionSimulator
                     position = open.Value;
 
                     // Checked off the SAME fresh quote MFE/MAE just used, not a separate lookup --
-                    // a cadence with no quote for this contract can't be stopped out on a stale
-                    // price any more than MFE/MAE can be updated on one.
-                    if (options.StopLossPct is { } stopLossPct)
+                    // a cadence with no quote for this contract can't be stopped out (or partially
+                    // booked) on a stale price any more than MFE/MAE can be updated on one. Target
+                    // fires at most once per position (HasPartiallyBooked guards re-firing); SL
+                    // stays live for the remainder afterward, protecting whatever quantity is still
+                    // open -- 2026-09-17, risk-rules experiment (user's own request).
+                    var (stopHit, targetHit) = CheckStopAndTarget(excursion, position.EntryPrice, options.StopLossPct, options.TargetPct);
+                    stopLossHit = stopHit;
+                    if (targetHit && !position.HasPartiallyBooked)
                     {
-                        var excursionPct = excursion / position.EntryPrice * 100m;
-                        stopLossHit = excursionPct <= -stopLossPct;
+                        open = position with { HasPartiallyBooked = true, PartialExitTime = timestamp, PartialExitPrice = price };
+                        position = open.Value;
                     }
                 }
 
@@ -737,7 +821,8 @@ public static class CoreScoreOptionSimulator
                         : position.EntryPrice; // no fresh quote this exact cadence -- fall back to entry, never fabricate a price
                     var closedTrade = new CoreScoreTrade(position.EntryTime, position.EntryPrice, position.Side, position.StrikePrice,
                         timestamp, exitPrice, cadence.MustForceClose ? "ForceClose" : stopLossHit ? "StopLoss" : "ScoreInvalidated",
-                        position.RunningMfe, position.RunningMae, position.EntryScore);
+                        position.RunningMfe, position.RunningMae, position.EntryScore,
+                        position.HasPartiallyBooked, position.PartialExitTime, position.PartialExitPrice, options.PartialBookFraction);
                     trades.Add(closedTrade);
                     open = null;
 
@@ -771,7 +856,7 @@ public static class CoreScoreOptionSimulator
                     var picked = PickEntryStrike(rows, side, options.EntryPriceRangeLow, options.EntryPriceRangeHigh);
                     if (picked is { } chosen)
                     {
-                        open = (timestamp, chosen.Price, side, chosen.Strike, sc, 0, 0m, 0m);
+                        open = (timestamp, chosen.Price, side, chosen.Strike, sc, 0, 0m, 0m, false, null, null);
                     }
                 }
             }
@@ -784,7 +869,8 @@ public static class CoreScoreOptionSimulator
                 ? exitMark
                 : stillOpen.EntryPrice;
             trades.Add(new CoreScoreTrade(stillOpen.EntryTime, stillOpen.EntryPrice, stillOpen.Side, stillOpen.StrikePrice,
-                lastTimestamp, exitPrice, "EndOfData", stillOpen.RunningMfe, stillOpen.RunningMae, stillOpen.EntryScore));
+                lastTimestamp, exitPrice, "EndOfData", stillOpen.RunningMfe, stillOpen.RunningMae, stillOpen.EntryScore,
+                stillOpen.HasPartiallyBooked, stillOpen.PartialExitTime, stillOpen.PartialExitPrice, options.PartialBookFraction));
         }
 
         return new CoreScoreDayResult(asOfDate, trades, blockedByMaxTrades, blockedByDailyLoss, blockedByConsecutiveLosses);
@@ -932,7 +1018,8 @@ public static class CoreScoreOptionSimulator
 
         var trades = new List<CoreScoreTrade>();
         (DateTimeOffset EntryTime, decimal EntryPrice, OptionType Side, decimal StrikePrice, double EntryScore,
-            decimal RunningMfe, decimal RunningMae)? open = null;
+            decimal RunningMfe, decimal RunningMae,
+            bool HasPartiallyBooked, DateTimeOffset? PartialExitTime, decimal? PartialExitPrice)? open = null;
         // 2026-09-17, risk-management parity pass -- see SimulateDay's own identical fields for
         // the full rationale; this strategy had none of this tracking before this pass.
         var consecutiveLosses = 0;
@@ -953,7 +1040,8 @@ public static class CoreScoreOptionSimulator
                 ? exitMark
                 : position.EntryPrice; // no fresh quote this exact cadence -- fall back to entry, never fabricate a price
             var closedTrade = new CoreScoreTrade(position.EntryTime, position.EntryPrice, position.Side, position.StrikePrice,
-                timestamp, exitPrice, reason, position.RunningMfe, position.RunningMae, position.EntryScore);
+                timestamp, exitPrice, reason, position.RunningMfe, position.RunningMae, position.EntryScore,
+                position.HasPartiallyBooked, position.PartialExitTime, position.PartialExitPrice, options.PartialBookFraction);
             trades.Add(closedTrade);
             open = null;
 
@@ -966,6 +1054,12 @@ public static class CoreScoreOptionSimulator
             var timestamp = cadence.Timestamp;
             var rows = cadence.Rows;
 
+            // 2026-09-17, risk-rules experiment (user's own request) -- Crossover had no per-cadence
+            // stop-loss/target check at all before this pass (unlike Hysteresis's own long-standing
+            // opt-in StopLossPct experiment). Same "checked off the SAME fresh quote MFE/MAE just
+            // used" discipline SimulateDay already follows -- a cadence with no quote for this
+            // contract can't be stopped/targeted on a stale price.
+            var stopLossHit = false;
             if (open is { } position)
             {
                 if (priceByStrikeAndTime.TryGetValue((position.Side, position.StrikePrice), out var series)
@@ -977,7 +1071,21 @@ public static class CoreScoreOptionSimulator
                         RunningMfe = Math.Max(position.RunningMfe, excursion),
                         RunningMae = Math.Min(position.RunningMae, excursion),
                     };
+                    position = open.Value;
+
+                    var (stopHit, targetHit) = CheckStopAndTarget(excursion, position.EntryPrice, options.StopLossPct, options.TargetPct);
+                    stopLossHit = stopHit;
+                    if (targetHit && !position.HasPartiallyBooked)
+                    {
+                        open = position with { HasPartiallyBooked = true, PartialExitTime = timestamp, PartialExitPrice = price };
+                    }
                 }
+            }
+
+            if (stopLossHit)
+            {
+                CloseOpen(timestamp, "StopLoss");
+                continue;
             }
 
             // Extracted into UpdateFastSlow (2026-09-13, Batch 3) so BuildDiagnostics computes
@@ -1036,7 +1144,7 @@ public static class CoreScoreOptionSimulator
                         var picked = PickEntryStrike(rows, side, options.EntryPriceRangeLow, options.EntryPriceRangeHigh);
                         if (picked is { } chosen)
                         {
-                            open = (timestamp, chosen.Price, side, chosen.Strike, fastAvg - slowAvg, 0m, 0m);
+                            open = (timestamp, chosen.Price, side, chosen.Strike, fastAvg - slowAvg, 0m, 0m, false, null, null);
                         }
                     }
                 }
@@ -1052,7 +1160,8 @@ public static class CoreScoreOptionSimulator
                 ? exitMark
                 : stillOpen.EntryPrice;
             trades.Add(new CoreScoreTrade(stillOpen.EntryTime, stillOpen.EntryPrice, stillOpen.Side, stillOpen.StrikePrice,
-                lastTimestamp, exitPrice, "EndOfData", stillOpen.RunningMfe, stillOpen.RunningMae, stillOpen.EntryScore));
+                lastTimestamp, exitPrice, "EndOfData", stillOpen.RunningMfe, stillOpen.RunningMae, stillOpen.EntryScore,
+                stillOpen.HasPartiallyBooked, stillOpen.PartialExitTime, stillOpen.PartialExitPrice, options.PartialBookFraction));
         }
 
         return new CoreScoreDayResult(asOfDate, trades, blockedByMaxTrades, blockedByDailyLoss, blockedByConsecutiveLosses);
@@ -1094,7 +1203,16 @@ public static class CoreScoreOptionSimulator
 
         var trades = new List<CoreScoreTrade>();
         (DateTimeOffset EntryTime, decimal EntryPrice, OptionType Side, decimal StrikePrice, double EntryScore,
-            decimal RunningMfe, decimal RunningMae)? open = null;
+            decimal RunningMfe, decimal RunningMae,
+            bool HasPartiallyBooked, DateTimeOffset? PartialExitTime, decimal? PartialExitPrice)? open = null;
+        // 2026-09-17, risk-rules experiment (user's own request) -- Combined had none of this
+        // tracking before this pass (it was deliberately left out of the earlier live-parity pass,
+        // since it isn't a live StrategyId; see CoreScoreCombinedOptions' own doc comment). Only
+        // MaxDailyLossPct is wired here, not MaxTradesPerDay/MaxConsecutiveLosses -- this round's
+        // request didn't ask for those on this strategy.
+        var closedTodayNetRupeePnl = 0m;
+        var blockedByDailyLoss = 0;
+        var dailyLossLimit = options.MaxDailyLossPct is { } lossPct ? options.CapitalTotal * (decimal)lossPct / 100m : (decimal?)null;
 
         void CloseOpen(DateTimeOffset timestamp, string reason)
         {
@@ -1106,9 +1224,12 @@ public static class CoreScoreOptionSimulator
             var exitPrice = priceByStrikeAndTime.TryGetValue((position.Side, position.StrikePrice), out var series) && series.TryGetValue(timestamp, out var mark) && mark is { } exitMark
                 ? exitMark
                 : position.EntryPrice; // no fresh quote this exact cadence -- fall back to entry, never fabricate a price
-            trades.Add(new CoreScoreTrade(position.EntryTime, position.EntryPrice, position.Side, position.StrikePrice,
-                timestamp, exitPrice, reason, position.RunningMfe, position.RunningMae, position.EntryScore));
+            var closedTrade = new CoreScoreTrade(position.EntryTime, position.EntryPrice, position.Side, position.StrikePrice,
+                timestamp, exitPrice, reason, position.RunningMfe, position.RunningMae, position.EntryScore,
+                position.HasPartiallyBooked, position.PartialExitTime, position.PartialExitPrice, options.PartialBookFraction);
+            trades.Add(closedTrade);
             open = null;
+            closedTodayNetRupeePnl += closedTrade.NetPnlPoints * options.Quantity - 2 * options.BrokeragePerOrder;
         }
 
         foreach (var cadence in cadences)
@@ -1116,6 +1237,9 @@ public static class CoreScoreOptionSimulator
             var timestamp = cadence.Timestamp;
             var rows = cadence.Rows;
 
+            // 2026-09-17, risk-rules experiment (user's own request) -- same stop/target check as
+            // SimulateDayCrossover's own identical block; Combined had neither before this pass.
+            var stopLossHit = false;
             if (open is { } position)
             {
                 if (priceByStrikeAndTime.TryGetValue((position.Side, position.StrikePrice), out var series)
@@ -1127,7 +1251,21 @@ public static class CoreScoreOptionSimulator
                         RunningMfe = Math.Max(position.RunningMfe, excursion),
                         RunningMae = Math.Min(position.RunningMae, excursion),
                     };
+                    position = open.Value;
+
+                    var (stopHit, targetHit) = CheckStopAndTarget(excursion, position.EntryPrice, options.StopLossPct, options.TargetPct);
+                    stopLossHit = stopHit;
+                    if (targetHit && !position.HasPartiallyBooked)
+                    {
+                        open = position with { HasPartiallyBooked = true, PartialExitTime = timestamp, PartialExitPrice = price };
+                    }
                 }
+            }
+
+            if (stopLossHit)
+            {
+                CloseOpen(timestamp, "StopLoss");
+                continue;
             }
 
             var (fast, slow) = UpdateFastSlow(fastWindow, slowWindow, timestamp, cadence.Score, fastWindowSpan, slowWindowSpan);
@@ -1160,7 +1298,10 @@ public static class CoreScoreOptionSimulator
 
             // Not an "else" -- a position closed above this SAME cadence is eligible to reopen
             // immediately if the fresh, still-current A/B reading already qualifies (matching
-            // SimulateDay's own "a closing tick frees the slot" reentry convention).
+            // SimulateDay's own "a closing tick frees the slot" reentry convention). Gated by
+            // MaxDailyLossPct only (2026-09-17) -- only counted as "blocked" once a genuine A+B
+            // agreement actually existed this cadence, same "don't count every gated cadence"
+            // discipline SimulateDay/SimulateDayCrossover's own blocked-counters already follow.
             if (open is null && cadence.EntryWindowOpen && score is { } sc && Math.Abs(sc) >= options.EntryScoreThreshold
                 && bSign is { } bs && bs != 0)
             {
@@ -1168,10 +1309,17 @@ public static class CoreScoreOptionSimulator
                 var bSide = bs > 0 ? OptionType.Call : OptionType.Put;
                 if (aSide == bSide)
                 {
-                    var picked = PickEntryStrike(rows, aSide, options.EntryPriceRangeLow, options.EntryPriceRangeHigh);
-                    if (picked is { } chosen)
+                    if (dailyLossLimit is { } limit && closedTodayNetRupeePnl <= -limit)
                     {
-                        open = (timestamp, chosen.Price, aSide, chosen.Strike, sc, 0m, 0m);
+                        blockedByDailyLoss++;
+                    }
+                    else
+                    {
+                        var picked = PickEntryStrike(rows, aSide, options.EntryPriceRangeLow, options.EntryPriceRangeHigh);
+                        if (picked is { } chosen)
+                        {
+                            open = (timestamp, chosen.Price, aSide, chosen.Strike, sc, 0m, 0m, false, null, null);
+                        }
                     }
                 }
             }
@@ -1184,9 +1332,10 @@ public static class CoreScoreOptionSimulator
                 ? exitMark
                 : stillOpen.EntryPrice;
             trades.Add(new CoreScoreTrade(stillOpen.EntryTime, stillOpen.EntryPrice, stillOpen.Side, stillOpen.StrikePrice,
-                lastTimestamp, exitPrice, "EndOfData", stillOpen.RunningMfe, stillOpen.RunningMae, stillOpen.EntryScore));
+                lastTimestamp, exitPrice, "EndOfData", stillOpen.RunningMfe, stillOpen.RunningMae, stillOpen.EntryScore,
+                stillOpen.HasPartiallyBooked, stillOpen.PartialExitTime, stillOpen.PartialExitPrice, options.PartialBookFraction));
         }
 
-        return new CoreScoreDayResult(asOfDate, trades);
+        return new CoreScoreDayResult(asOfDate, trades, BlockedByDailyLoss: blockedByDailyLoss);
     }
 }
