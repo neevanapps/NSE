@@ -1303,6 +1303,178 @@ own.** Noted for the record, not as a verdict:
 without re-tuning any parameter, so the candidate ranking is eventually judged on data none of it
 was fit to.
 
+### 2026-09-18 (DTE=4, second out-of-sample day — first day that includes the options-phase metrics)
+
+Data validated before running: nearest expiry 2026-09-22 (4 DTE, ordinary non-expiry day, same
+expiry week as 09-16/09-17). Volume bars populated fresh at 650/1300/2600 (757/1249/431 bars
+respectively), all 5 options tables populated clean at all 3 thresholds, no gaps. This is the first
+out-of-sample test of the LOCKED futures score (the session-gated switch, not its individual
+components) and the first out-of-sample test of any options-phase metric at all — every number
+below is on data none of Phase 1's calibration ever saw.
+
+| Metric (locked-in config) | Today | Backtest expectation |
+|---|---|---|
+| Futures: session-gated switch, TOB-confirmed (2600/90) | 12 trades, 41.7% win, **-32.30 pts** | 57.4% win, +177.25 (7-day pooled) |
+| Options 1a: Raw ΔIV (1300/97, DTE-gated) | 4 trades, 75.0% win, **-19.00 pts** | 80.2% win, +77.25 (5-day gated) |
+| Options 1b: Price-signed ΔIV (1300/97, +50% stop) | 2 trades, 50.0% win, +20.65 pts | 57.3% win, +188.95 (7-day, w/ stop) |
+| Options 2: Notional Volume Delta (1300/95, DTE-gated) | 5 trades, **80.0% win**, +13.75 pts | 70.0% win, +130.65 (5-day gated) |
+| Options 3: Notional OI Delta (650/80, DTE-gated) | 7 trades, **42.9% win**, +14.25 pts | 65.1% win, +152.00 (5-day gated) |
+| Options 4: 25-Delta Skew Δ (1300/97, +30% stop) | 5 trades, **80.0% win**, +13.55 pts | 71.7% win, +160.70 (7-day, w/ stop) |
+
+**2-12 trades per metric on a single day — same "too small a sample to confirm or reject anything
+on its own" caveat as 09-17.** Noted for the record, not a verdict:
+
+- **The futures session-gated switch had a losing day** — 41.7% win, well below its 57.4%
+  backtested rate, net negative. Its first real out-of-sample test (09-17) wasn't run against the
+  switch itself (that config was locked afterward), so this is genuinely the switch's FIRST
+  out-of-sample reading, and it's a soft one. Worth more days before reading into it — DepthImbalance
+  itself had a losing day inside the original backtest window too.
+- **Options 2 (Volume Delta) and Options 4 (Skew Δ) both came in with win rates that meet or
+  *exceed* their backtested rate** (80.0% both, vs. 70.0% and 71.7% backtested respectively) — a
+  reassuring first read for the two metrics that also passed their soft-stop test.
+- **Options 3 (OI Delta) is the one real yellow flag**: 42.9% win vs. 65.1% backtested — well below
+  its own expectation, and the only metric here whose win rate came in on the wrong side of 50%.
+  Net still landed positive purely because 2 of the 3 losing trades were small and 2 winners were
+  disproportionately large (+11.45, +12.50) — the kind of "net masks a weak hit rate" pattern the
+  DTE-split check was specifically built to catch on the calibration data, now showing up in a
+  single out-of-sample day. Not enough to reject on one day (same discipline as TobDepthDivergence's
+  first out-of-sample day, which also looked bad early and needed more days to assess), but this is
+  the metric most worth watching as more days arrive — and given Options 3 and Options 2 were found
+  to be the one correlated pair (+0.239) in the robustness check above, a bad day for OI Delta
+  specifically (not Volume Delta) is a useful data point that they're carrying at least partly
+  different information, not just noisier/cleaner copies of the same signal.
+- **Options 1a (Raw ΔIV) had a win rate close to its backtested rate (75.0% vs. 80.2%) but a net
+  loss** — one large loser (-24.30 on the day's last trade, held from 13:14 to 14:59) outweighed
+  three small winners. With only 4 trades this is a concentration observation, not a rejection —
+  worth remembering that this metric has no stop-loss adopted, unlike its price-signed sibling.
+- **Options 1b (Price-signed ΔIV) only fired twice** — too few trades to read anything into today,
+  noted for completeness only.
+
+**Next step**: same as the futures-only log above — keep running every new trading day through both
+the futures and options locked configs, without re-tuning, so both rankings are eventually judged
+on data none of them were fit to. OI Delta in particular should be watched closely on the next
+few days given today's below-50% win rate.
+
+## Crossover experiment: dual-MA crossover on the futures composite score (2026-09-18, user's idea)
+
+A genuinely different trading-rule shape, tried at the user's request: instead of the
+percentile-threshold entry every other metric in this project uses, a classic dual-window
+**moving-average crossover** applied directly to the LOCKED futures composite score
+(`SessionGatedDepthDurationConfirmed`'s own per-bar scaled score, including its TOB open-window
+confirmation gate — the real validated FuturesScore, not a new composite). Fast/slow are simple
+moving averages of the last N per-bar scores on the SAME bar sequence (not two different bar
+thresholds, despite the initial framing) — e.g. "4 fast / 12 slow" means the last 4 bars' average
+vs. the last 12 bars' average. A crossing only fires as a signal once the fast/slow gap at that bar
+is at least a configurable `thresholdPoints` (on the same -100..+100 scale everything else in this
+project uses) — a noise filter, not a percentile (this rule has no percentile concept at all).
+Entry/exit mechanics otherwise match every other metric: real ATM option fills, the standing
+09:30-15:00 entry window / 15:15 force-close, one position at a time, exit on the opposite
+qualifying crossover or end-of-day. New code: `TradeSimulator.SimulateCrossoverDayAsync`, CLI
+commands `crossover` and `crossover-calibrate`.
+
+**First pass, the user's own suggested starting point (4 fast / 12 slow / 2-point threshold, 2600
+bar threshold — matching the locked switch's own bar size)**: badly over-firing. 356 trades across
+8 days (44.5/day, vs. every other metric's 7-20/day target), 51.4% win rate — barely above a coin
+flip. Root cause: at 2600-threshold bars, a 4-bar/12-bar window is short in wall-clock time, so the
+fast/slow gap crosses zero constantly on noise, and a 2-point gap threshold (2% of the full
+-100..+100 range) is far too loose a filter at this bar cadence.
+
+**Calibration sweep** (fast ∈ {3,4,6}, slow ∈ {10,12,16,20}, threshold ∈ {1,2,3,5}, 2600 bars, 48
+combos, all 7 backtest days): **nothing in this grid cleanly clears both the 7-20 trades/day target
+AND a solid win rate at the same time** — trade frequency ranges 16.4-65.9/day across the whole
+grid, mostly still above target, and win rate mostly sits in the low-to-high 40s. The one standout:
+**6 fast / 12 slow / 5-point threshold — 57.9% win rate (the best in the entire 48-row sweep),
+20.7 trades/day (right at the edge of target), +163.50 net over 145 trades, positive on 6 of 7
+days** (09-15 the only real dip, 44.7%). Concentration: top trade 43.5% of net, top 2 = 58.5% —
+higher than every confirmed options survivor, worth flagging as a real weakness even before the
+out-of-sample check below.
+
+**Out-of-sample check on the held-out 09-18 day**: 16 trades, **43.8% win, -15.55 net** — below the
+backtested 57.9% win rate, and the day's trades cluster heavily in the same post-13:30 afternoon
+window that already hurt BarDurationUrgency that day (unsurprising, since the composite score being
+averaged switches to BarDurationUrgency's own formula after 10:00 IST).
+
+**Verdict on the first sweep (fast 3-6, slow 10-20, threshold 1-5): NOT CONFIRMED.** No combo
+satisfies both frequency and quality simultaneously, the one standout (6/12/5) had worse
+concentration than every confirmed options survivor, and it underperformed on the held-out 09-18
+day. Superseded by the wider sweep below.
+
+### Second sweep (2026-09-18), targeting a tighter 5-12 trades/day band per explicit request
+
+Widened the grid to fast ∈ {6,8,10,12}, slow ∈ {20,25,30,40}, threshold ∈ {5,8,10,15,20}, still at
+2600 bars — 80 combos, still all 7 backtest days. **23 combos land in the requested 5-12/day
+band.** Ranked by win-rate quality (project convention: prefer win rate over raw net when picking
+off a sweep), one clear family stands out: **every "8 fast, 5-point threshold" combo, across all
+four slow windows tried, clears 50-53% win rate** — a combo being stable across a whole dimension
+of the grid (here, the slow window) rather than one lucky cell is exactly the kind of robustness
+this project looks for before trusting a pick.
+
+| Fast | Slow | Threshold | Trades/Day | Win Rate | Net (7-day) |
+|---|---|---|---|---|---|
+| 8 | 20 | 5 | 11.7 | 52.4% | +160.05 |
+| 8 | 25 | 5 | 11.7 | 51.2% | +149.95 |
+| 8 | 30 | 5 | 11.6 | 50.6% | +145.90 |
+| **8** | **40** | **5** | **10.6** | **52.7%** | **+241.45** |
+
+**8 fast / 40 slow / 5-point threshold is the best of the family** — highest win rate AND highest
+net of the four, right in the middle of the requested band (10.6 trades/day, 74 trades over 7
+days). Positive on 6 of 7 backtest days (only 09-09 negative, -13.15), win rate above 50% on 6 of
+7 days too. Concentration: top trade 25.9% of net, top 2 = 46.4% — meaningfully better than the
+first sweep's 6/12/5 pick (43.5%/58.5%), though still moderate, comparable to the weaker end of
+the confirmed futures/options survivors, not the cleanest seen in this project.
+
+**Out-of-sample check on 09-18 (held out, same as every other check in this log)** — all 4 members
+of the "8-fast" family tested:
+
+| Combo | Today | Backtest expectation |
+|---|---|---|
+| 8/20/5 | 10 trades, 60.0% win, +13.40 pts | 52.4% win, +160.05 |
+| 8/25/5 | 8 trades, 37.5% win, +17.70 pts | 51.2% win, +149.95 |
+| 8/30/5 | 6 trades, 50.0% win, +7.80 pts | 50.6% win, +145.90 |
+| **8/40/5** | **6 trades, 83.3% win, +35.75 pts** | 52.7% win, +241.45 |
+
+**All 4 came in net-positive on the held-out day, and 8/40/5 (the backtest's best combo) is also
+the out-of-sample standout — win rate well ABOVE its own backtested rate.** This is a genuinely
+encouraging cross-validation: the same combo that led the 7-day sweep on win-rate quality also led
+the one real out-of-sample test, rather than a different cell winning each time (which would be a
+classic overfitting red flag).
+
+**Verdict: PROMISING, still not fully confirmed** — one out-of-sample day (6 trades) is nowhere
+near enough to call this validated by the same standard applied to every other metric in this
+project (DTE split, session-phase split, more out-of-sample days all still needed), but this is a
+meaningfully stronger result than the first sweep produced, and the "8-fast, 5-point threshold"
+region's stability across both the slow-window dimension AND the single out-of-sample day is worth
+taking seriously as a candidate going forward. **Adopted for continued tracking: 8 fast / 40 slow /
+5-point threshold, 2600 bars.** Next new trading day should be run through this combo (and,
+for comparison, the rest of the 8-fast family) the same way every other locked config now gets
+logged in this out-of-sample section.
+
+**Follow-up, same day: the 3 confirmed standalone futures metrics (DepthImbalance, BarDurationUrgency,
+TopOfBookImbalance) run individually against 09-18**, to see whether the switch's bad day was
+uniform or came from one leg specifically:
+
+| Metric (locked config) | Today | Backtest expectation (7-day) |
+|---|---|---|
+| DepthImbalance (650/93, +30% stop) | 19 trades, 63.2% win, +12.60 pts | 56.1% win, +151.50 |
+| **BarDurationUrgency (2600/90)** | 11 trades, **36.4% win, -43.20 pts** | 54.9% win, +119.60 |
+| TopOfBookImbalance (2600/80) | 18 trades, 61.1% win, +36.85 pts | 54.7% win, +124.60 |
+
+**It was not uniform — it was one leg.** Verified directly (trade-by-trade): every one of the
+session-gated switch's post-10:00 trades today is byte-for-byte identical to BarDurationUrgency's
+own standalone trades (same entry/exit times, same prices, same P&L) — the switch's post-10:00 leg
+IS BarDurationUrgency's own score, and today BarDurationUrgency had a genuinely bad day (36.4% win,
+the only one of the three below 50%, and the worst reading of anything in this whole validation
+round). Meanwhile DepthImbalance (the switch's pre-10:00 leg) and TopOfBookImbalance (the
+confirmation filter) both held up well — DepthImbalance's win rate actually exceeded its own
+backtest (63.2% vs 56.1%), and TopOfBookImbalance did too (61.1% vs 54.7%) with the best net of the
+three. **The switch's -32.30 pts today is a BarDurationUrgency problem specifically, not a
+breakdown of the whole session-gated design** — worth remembering before reading too much into the
+switch's own single-day number above. Still one day, still not a verdict on BarDurationUrgency
+either (its time-of-day edge and DTE-robustness were both established on 7 real backtest days,
+not zero), but this is exactly the kind of decomposition the switch's own construction makes
+possible, and it should be repeated on the next few out-of-sample days before trusting either the
+switch's headline number or BarDurationUrgency's bad day too heavily.
+
 ## Summary and next steps
 
 All 8 originally planned future-side candidates have now been through the same evaluation cycle

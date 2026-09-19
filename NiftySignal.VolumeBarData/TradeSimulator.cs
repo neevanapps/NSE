@@ -716,6 +716,160 @@ public static class TradeSimulator
         return trades;
     }
 
+    /// <summary>
+    /// 2026-09-18, user's own experiment: a dual-window moving-average CROSSOVER rule applied to
+    /// the locked futures composite score (<see cref="ComputeSessionGatedScore"/>, the SAME score
+    /// <see cref="VolumeBarMetric.SessionGatedDepthDurationConfirmed"/> trades, including its own
+    /// TOB open-window confirmation gate -- this is deliberately the real validated FuturesScore,
+    /// not a new composite), rather than the percentile-threshold entry every other metric in this
+    /// file uses. Fast/slow are SIMPLE MOVING AVERAGES of the last N per-bar scaled scores (e.g.
+    /// 4 bars vs. 12 bars, on the SAME bar sequence -- not two different bar thresholds), a classic
+    /// dual-MA crossover shape. A crossing only qualifies as a signal once the fast/slow GAP at the
+    /// crossing bar is at least <paramref name="thresholdPoints"/> (on the same -100..+100 scale
+    /// every other score in this file uses) -- a noise filter, not a percentile (this rule has no
+    /// percentile concept at all, unlike everything else here). Entry/exit mechanics (ATM strike
+    /// selection, real option fills, the standing 09:30-15:00 entry window / 15:15 force-close, one
+    /// position at a time, exit only on the opposite qualifying signal or end-of-day) are otherwise
+    /// identical to <see cref="SimulateDayAsync"/> for comparability.
+    /// </summary>
+    public static async Task<List<VolumeBarTrade>> SimulateCrossoverDayAsync(
+        NiftySignalDbContext source, VolumeBarDbContext volumeBarDb, DateOnly asOfDate, long barVolumeThreshold,
+        int fastBars, int slowBars, double thresholdPoints, CancellationToken cancellationToken,
+        Dictionary<(DateOnly, string), OptionPriceSeries>? sharedPriceCache = null)
+    {
+        var bars = await volumeBarDb.VolumeBars
+            .Where(b => b.AsOfDate == asOfDate && b.BarVolumeThreshold == barVolumeThreshold)
+            .OrderBy(b => b.BarIndex)
+            .ToListAsync(cancellationToken);
+
+        if (bars.Count == 0)
+        {
+            return [];
+        }
+
+        var allOptions = await source.Instruments
+            .Where(i => i.AsOfDate == asOfDate && i.InstrumentType == InstrumentType.Option && i.ExpiryDate != null)
+            .ToListAsync(cancellationToken);
+
+        if (allOptions.Count == 0)
+        {
+            return [];
+        }
+
+        var nearestExpiry = allOptions.Select(o => o.ExpiryDate!.Value).Min();
+        var chain = allOptions.Where(o => o.ExpiryDate == nearestExpiry).ToList();
+
+        var dayStart = bars[0].StartTimestamp;
+        var dayEnd = bars[^1].EndTimestamp;
+
+        var priceCache = sharedPriceCache ?? new Dictionary<(DateOnly, string), OptionPriceSeries>();
+        async Task<OptionPriceSeries> GetSeriesAsync(string token)
+        {
+            var key = (asOfDate, token);
+            if (priceCache.TryGetValue(key, out var cached))
+            {
+                return cached;
+            }
+
+            var series = await OptionPriceSeries.LoadAsync(source, token, dayStart, dayEnd, cancellationToken);
+            priceCache[key] = series;
+            return series;
+        }
+
+        Domain.Entities.Instrument? PickAtm(OptionType side, decimal futurePrice) => chain
+            .Where(o => o.OptionType == side)
+            .OrderBy(o => Math.Abs(o.StrikePrice!.Value - futurePrice))
+            .FirstOrDefault();
+
+        var depthRank = new SessionRankTracker();
+        var durationRank = new SessionRankTracker();
+        var tobRank = new SessionRankTracker();
+        var scoreWindow = new List<double>(slowBars);
+        double? previousDiff = null;
+
+        var trades = new List<VolumeBarTrade>();
+        (DateTimeOffset EntryTime, decimal EntryPrice, OptionType Side, decimal StrikePrice, string Token, double EntryScore)? open = null;
+        decimal? previousClose = null;
+
+        for (var i = 0; i < bars.Count; i++)
+        {
+            var bar = bars[i];
+            var isLastBar = i == bars.Count - 1;
+
+            var score = ComputeSessionGatedScore(bar, previousClose, depthRank, durationRank);
+            var tobConfirmScore = SignedRank.Compute(bar.TopOfBookImbalance, tobRank);
+            previousClose = bar.ClosePrice;
+
+            double? fastMa = null;
+            double? slowMa = null;
+            double? diff = null;
+            var crossedUp = false;
+            var crossedDown = false;
+
+            if (score is { } s)
+            {
+                scoreWindow.Add(100.0 * s);
+                if (scoreWindow.Count > slowBars)
+                {
+                    scoreWindow.RemoveAt(0);
+                }
+
+                if (scoreWindow.Count >= slowBars)
+                {
+                    fastMa = scoreWindow.Skip(scoreWindow.Count - fastBars).Average();
+                    slowMa = scoreWindow.Average();
+                    diff = fastMa - slowMa;
+
+                    if (previousDiff is { } prevDiff && diff is { } d)
+                    {
+                        crossedUp = prevDiff <= 0 && d > 0 && Math.Abs(d) >= thresholdPoints;
+                        crossedDown = prevDiff >= 0 && d < 0 && Math.Abs(d) >= thresholdPoints;
+                    }
+
+                    previousDiff = diff;
+                }
+            }
+
+            if (open is { } position)
+            {
+                var series = await GetSeriesAsync(position.Token);
+                var currentPrice = series.PriceAtOrBefore(bar.EndTimestamp) ?? position.EntryPrice;
+
+                var timedOut = IstTimeOfDay(bar.EndTimestamp) >= ForceCloseAt;
+                var reversed = position.Side == OptionType.Call ? crossedDown : crossedUp;
+
+                if (timedOut || reversed || isLastBar)
+                {
+                    var exitReason = timedOut ? "TimeCutoff" : isLastBar ? "EndOfData" : "CrossoverReversed";
+                    trades.Add(new VolumeBarTrade(position.EntryTime, position.EntryPrice, position.Side, position.StrikePrice,
+                        bar.EndTimestamp, currentPrice, exitReason, position.EntryScore));
+                    open = null;
+                }
+            }
+            else if (!isLastBar && (crossedUp || crossedDown)
+                && IstTimeOfDay(bar.EndTimestamp) >= EntryWindowStart && IstTimeOfDay(bar.EndTimestamp) <= EntryWindowEnd
+                // Same TOB open-window confirmation the locked SessionGatedDepthDurationConfirmed
+                // score itself requires -- see PassesConfirmation's own doc comment for why.
+                && (IstTimeOfDay(bar.EndTimestamp) >= SessionGateSwitchTime
+                    || (crossedUp ? tobConfirmScore > 0 : tobConfirmScore < 0)))
+            {
+                var side = crossedUp ? OptionType.Call : OptionType.Put;
+                var candidate = PickAtm(side, bar.ClosePrice);
+                if (candidate is not null)
+                {
+                    var series = await GetSeriesAsync(candidate.Token);
+                    var entryPrice = series.PriceAtOrBefore(bar.EndTimestamp);
+                    if (entryPrice is { } ep && ep > 0)
+                    {
+                        open = (bar.EndTimestamp, ep, side, candidate.StrikePrice!.Value, candidate.Token, diff ?? 0.0);
+                    }
+                }
+            }
+        }
+
+        return trades;
+    }
+
     static double? ComputeScore(VolumeBarMetric metric, VolumeBarRow bar, decimal? previousClose, long? previousOi, VolumeBarTrendReversionTracker trendTracker, SessionRankTracker rankTracker) => metric switch
     {
         VolumeBarMetric.TrendReversion => trendTracker.Observe(previousClose is { } prev ? (double)(bar.ClosePrice - prev) : null),

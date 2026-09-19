@@ -445,6 +445,121 @@ if (args.Length > 0 && string.Equals(args[0], "session-phase", StringComparison.
     return 0;
 }
 
+if (args.Length > 0 && string.Equals(args[0], "crossover", StringComparison.OrdinalIgnoreCase))
+{
+    if (args.Length < 3
+        || !DateOnly.TryParseExact(args[1], "yyyy-MM-dd", out var coFromDate)
+        || !DateOnly.TryParseExact(args[2], "yyyy-MM-dd", out var coToDate))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- crossover <fromDate> <toDate> [fastBars=4] [slowBars=12] [thresholdPoints=2] [barVolumeThreshold=2600]");
+        return 1;
+    }
+
+    var coFastBars = args.Length > 3 ? int.Parse(args[3]) : 4;
+    var coSlowBars = args.Length > 4 ? int.Parse(args[4]) : 12;
+    var coThreshold = args.Length > 5 ? double.Parse(args[5]) : 2.0;
+    var coBarVolumeThreshold = args.Length > 6 ? long.Parse(args[6]) : 2600L;
+
+    Console.WriteLine($"=== Crossover simulation: fast={coFastBars} slow={coSlowBars} thresholdPoints={coThreshold} barThreshold={coBarVolumeThreshold} ===");
+    var coAllTrades = new List<VolumeBarTrade>();
+    for (var date = coFromDate; date <= coToDate; date = date.AddDays(1))
+    {
+        await using var source = new NiftySignalDbContext(tradeSourceOptions);
+        await using var volumeBars = new VolumeBarDbContext(volumeBarOptions);
+        var dayTrades = await TradeSimulator.SimulateCrossoverDayAsync(source, volumeBars, date, coBarVolumeThreshold, coFastBars, coSlowBars, coThreshold, CancellationToken.None, sharedOptionPriceCache);
+        if (dayTrades.Count == 0)
+        {
+            continue;
+        }
+
+        coAllTrades.AddRange(dayTrades);
+        var dayWinRate = 100.0 * dayTrades.Count(t => t.NetPnlPoints > 0) / dayTrades.Count;
+        var dayNet = dayTrades.Sum(t => t.NetPnlPoints);
+        Console.WriteLine($"{date:yyyy-MM-dd}: {dayTrades.Count} trades, {dayWinRate:F1}% win rate, net {dayNet:F2} pts");
+        foreach (var t in dayTrades)
+        {
+            var side = t.Side == OptionType.Call ? "Call" : "Put";
+            Console.WriteLine($"    {FormatIst(t.EntryTime)} Long {side}@{t.StrikePrice} entry={t.EntryPrice:F2} diff={t.EntryScore:F1} -> {FormatIst(t.ExitTime)} exit={t.ExitPrice:F2} ({t.ExitReason}) netPnl={t.NetPnlPoints:F2} ({t.NetPnlPercent:F1}%)");
+        }
+    }
+
+    if (coAllTrades.Count > 0)
+    {
+        var winRate = 100.0 * coAllTrades.Count(t => t.NetPnlPoints > 0) / coAllTrades.Count;
+        var net = coAllTrades.Sum(t => t.NetPnlPoints);
+        Console.WriteLine($"--- Crossover total: {coAllTrades.Count} trades, {winRate:F1}% win rate, net {net:F2} pts ---");
+    }
+    else
+    {
+        Console.WriteLine("No trades fired across the requested range.");
+    }
+
+    return 0;
+}
+
+if (args.Length > 0 && string.Equals(args[0], "crossover-calibrate", StringComparison.OrdinalIgnoreCase))
+{
+    if (args.Length < 3
+        || !DateOnly.TryParseExact(args[1], "yyyy-MM-dd", out var ccFromDate)
+        || !DateOnly.TryParseExact(args[2], "yyyy-MM-dd", out var ccToDate))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- crossover-calibrate <fromDate> <toDate> [barVolumeThreshold=2600] [fastOptions=3,4,6] [slowOptions=10,12,16,20] [thresholdOptions=1,2,3,5] [targetTradesPerDayMin=7] [targetTradesPerDayMax=20]");
+        return 1;
+    }
+
+    var ccBarVolumeThreshold = args.Length > 3 ? long.Parse(args[3]) : 2600L;
+    var fastOptions = args.Length > 4 ? args[4].Split(',').Select(int.Parse).ToArray() : [3, 4, 6];
+    var slowOptions = args.Length > 5 ? args[5].Split(',').Select(int.Parse).ToArray() : [10, 12, 16, 20];
+    var thresholdOptions = args.Length > 6 ? args[6].Split(',').Select(double.Parse).ToArray() : [1, 2, 3, 5];
+    var ccTargetMin = args.Length > 7 ? double.Parse(args[7]) : 7.0;
+    var ccTargetMax = args.Length > 8 ? double.Parse(args[8]) : 20.0;
+
+    Console.WriteLine($"=== Crossover calibration sweep, barThreshold={ccBarVolumeThreshold}, target {ccTargetMin}-{ccTargetMax} trades/day ===");
+    Console.WriteLine($"{"Fast",5} | {"Slow",5} | {"Thresh",6} | {"Trades",7} | {"Trades/Day",10} | {"WinRate",8} | {"NetPts",9} | In target?");
+    foreach (var fast in fastOptions)
+    {
+        foreach (var slow in slowOptions)
+        {
+            if (fast >= slow)
+            {
+                continue;
+            }
+
+            foreach (var threshold in thresholdOptions)
+            {
+                var trades = new List<VolumeBarTrade>();
+                var dayCount = 0;
+                for (var date = ccFromDate; date <= ccToDate; date = date.AddDays(1))
+                {
+                    await using var source = new NiftySignalDbContext(tradeSourceOptions);
+                    await using var volumeBars = new VolumeBarDbContext(volumeBarOptions);
+                    var dayTrades = await TradeSimulator.SimulateCrossoverDayAsync(source, volumeBars, date, ccBarVolumeThreshold, fast, slow, threshold, CancellationToken.None, sharedOptionPriceCache);
+                    if (dayTrades.Count == 0 && !await volumeBars.VolumeBars.AnyAsync(b => b.AsOfDate == date && b.BarVolumeThreshold == ccBarVolumeThreshold))
+                    {
+                        continue;
+                    }
+
+                    dayCount++;
+                    trades.AddRange(dayTrades);
+                }
+
+                if (dayCount == 0)
+                {
+                    continue;
+                }
+
+                var winRate = trades.Count > 0 ? 100.0 * trades.Count(t => t.NetPnlPoints > 0) / trades.Count : 0;
+                var net = trades.Sum(t => t.NetPnlPoints);
+                var tradesPerDay = trades.Count / (double)dayCount;
+                var inTarget = tradesPerDay >= ccTargetMin && tradesPerDay <= ccTargetMax;
+                Console.WriteLine($"{fast,5} | {slow,5} | {threshold,6:F0} | {trades.Count,7} | {tradesPerDay,10:F1} | {winRate,7:F1}% | {net,9:F2} |{(inTarget ? "  <-- TARGET" : "")}");
+            }
+        }
+    }
+
+    return 0;
+}
+
 if (args.Length > 0 && string.Equals(args[0], "sanity-oi-raw", StringComparison.OrdinalIgnoreCase))
 {
     var rawDate = DateOnly.ParseExact(args[1], "yyyy-MM-dd");
