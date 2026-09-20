@@ -22,6 +22,8 @@ public sealed class VolumeBarDbContext(DbContextOptions<VolumeBarDbContext> opti
 
     public DbSet<OptionMaxPainBarRow> OptionMaxPainBars => Set<OptionMaxPainBarRow>();
 
+    public DbSet<OptionDepthBarRow> OptionDepthBars => Set<OptionDepthBarRow>();
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         modelBuilder.Entity<VolumeBarRow>(entity =>
@@ -46,14 +48,16 @@ public sealed class VolumeBarDbContext(DbContextOptions<VolumeBarDbContext> opti
 
         modelBuilder.Entity<OptionBandFlowBarRow>(entity =>
         {
-            entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold });
-            entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold, b.BarIndex }).IsUnique();
+            // BandWidth is part of the identity here (retrofitted 2026-09-20) -- see
+            // OptionBandFlowBarRow's own doc comment for why ATM±1 and ATM±2 need to coexist.
+            entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold, b.BandWidth });
+            entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold, b.BandWidth, b.BarIndex }).IsUnique();
         });
 
         modelBuilder.Entity<OptionOiBarRow>(entity =>
         {
-            entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold });
-            entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold, b.BarIndex }).IsUnique();
+            entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold, b.BandWidth });
+            entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold, b.BandWidth, b.BarIndex }).IsUnique();
         });
 
         modelBuilder.Entity<OptionSkew25DeltaBarRow>(entity =>
@@ -66,6 +70,14 @@ public sealed class VolumeBarDbContext(DbContextOptions<VolumeBarDbContext> opti
         {
             entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold });
             entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold, b.BarIndex }).IsUnique();
+        });
+
+        modelBuilder.Entity<OptionDepthBarRow>(entity =>
+        {
+            // BandWidth is part of the identity here (unlike every other options table) -- see
+            // OptionDepthBarRow's own doc comment for why ATM±1 and ATM±2 need to coexist.
+            entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold, b.BandWidth });
+            entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold, b.BandWidth, b.BarIndex }).IsUnique();
         });
     }
 }

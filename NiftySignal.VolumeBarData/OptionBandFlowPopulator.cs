@@ -21,12 +21,13 @@ public sealed record OptionBandFlowPopulationResult(OptionBandFlowPopulationOutc
 /// </summary>
 public static class OptionBandFlowPopulator
 {
-    const int BandWidth = 3; // ATM +/- 1 strike
+    /// <summary>Default matches the original locked ATM±1 -- pass 5 (ATM±2) explicitly to compare. See <see cref="OptionBandFlowBarRow"/>'s own doc comment.</summary>
+    public const int DefaultBandWidth = 3;
 
     public static async Task<OptionBandFlowPopulationResult> PopulateDayAsync(
-        NiftySignalDbContext source, VolumeBarDbContext destination, DateOnly asOfDate, long barVolumeThreshold, CancellationToken cancellationToken)
+        NiftySignalDbContext source, VolumeBarDbContext destination, DateOnly asOfDate, long barVolumeThreshold, CancellationToken cancellationToken, int bandWidth = DefaultBandWidth)
     {
-        if (await destination.OptionBandFlowBars.AnyAsync(b => b.AsOfDate == asOfDate && b.BarVolumeThreshold == barVolumeThreshold, cancellationToken))
+        if (await destination.OptionBandFlowBars.AnyAsync(b => b.AsOfDate == asOfDate && b.BarVolumeThreshold == barVolumeThreshold && b.BandWidth == bandWidth, cancellationToken))
         {
             return new OptionBandFlowPopulationResult(OptionBandFlowPopulationOutcome.AlreadyPopulated, 0);
         }
@@ -59,7 +60,7 @@ public static class OptionBandFlowPopulator
         // drifts through the day.
         var bandByBarIndex = futureBars.ToDictionary(
             bar => bar.BarIndex,
-            bar => distinctStrikes.OrderBy(s => Math.Abs(s - bar.ClosePrice)).Take(BandWidth).ToHashSet());
+            bar => distinctStrikes.OrderBy(s => Math.Abs(s - bar.ClosePrice)).Take(bandWidth).ToHashSet());
 
         var touchedStrikes = bandByBarIndex.Values.SelectMany(s => s).Distinct().ToList();
 
@@ -93,6 +94,7 @@ public static class OptionBandFlowPopulator
                 AsOfDate = asOfDate,
                 BarIndex = bar.BarIndex,
                 BarVolumeThreshold = barVolumeThreshold,
+                BandWidth = bandWidth,
                 EndTimestamp = bar.EndTimestamp,
                 CallNotionalVolume = callNotional,
                 PutNotionalVolume = putNotional,

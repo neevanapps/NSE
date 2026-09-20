@@ -13,7 +13,11 @@ namespace NiftySignal.VolumeBarData;
 /// price echo.
 ///
 /// Band definition matches <see cref="OptionBandFlowBarRow"/> exactly: ATM = strike nearest the
-/// FUTURE's own close price at this bar, band = ATM ± 1 strike (3 strikes, both sides).
+/// FUTURE's own close price at this bar.
+///
+/// <see cref="BandWidth"/> (2026-09-20, retrofitted alongside <see cref="OptionBandFlowBarRow"/>'s
+/// own retrofit -- was a hardcoded ATM±1 constant, now a real parameter, same coexisting-rows
+/// pattern as <see cref="OptionDepthBarRow"/>).
 /// </summary>
 public sealed class OptionOiBarRow
 {
@@ -24,6 +28,9 @@ public sealed class OptionOiBarRow
     public required int BarIndex { get; set; }
 
     public required long BarVolumeThreshold { get; set; }
+
+    /// <summary>Strikes in the band, e.g. 3 = ATM±1 (the original, still the default), 5 = ATM±2.</summary>
+    public required int BandWidth { get; set; }
 
     public required DateTimeOffset EndTimestamp { get; set; }
 

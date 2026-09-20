@@ -20,12 +20,13 @@ public sealed record OptionOiPopulationResult(OptionOiPopulationOutcome Outcome,
 /// </summary>
 public static class OptionOiPopulator
 {
-    const int BandWidth = 3; // ATM +/- 1 strike, same as OptionBandFlowPopulator.
+    /// <summary>Default matches the original locked ATM±1 -- pass 5 (ATM±2) explicitly to compare.</summary>
+    public const int DefaultBandWidth = 3;
 
     public static async Task<OptionOiPopulationResult> PopulateDayAsync(
-        NiftySignalDbContext source, VolumeBarDbContext destination, DateOnly asOfDate, long barVolumeThreshold, CancellationToken cancellationToken)
+        NiftySignalDbContext source, VolumeBarDbContext destination, DateOnly asOfDate, long barVolumeThreshold, CancellationToken cancellationToken, int bandWidth = DefaultBandWidth)
     {
-        if (await destination.OptionOiBars.AnyAsync(b => b.AsOfDate == asOfDate && b.BarVolumeThreshold == barVolumeThreshold, cancellationToken))
+        if (await destination.OptionOiBars.AnyAsync(b => b.AsOfDate == asOfDate && b.BarVolumeThreshold == barVolumeThreshold && b.BandWidth == bandWidth, cancellationToken))
         {
             return new OptionOiPopulationResult(OptionOiPopulationOutcome.AlreadyPopulated, 0);
         }
@@ -59,7 +60,7 @@ public static class OptionOiPopulator
         // Same per-bar band as OptionBandFlowPopulator: 3 strikes nearest THIS bar's future close.
         var bandByBarIndex = futureBars.ToDictionary(
             bar => bar.BarIndex,
-            bar => distinctStrikes.OrderBy(s => Math.Abs(s - bar.ClosePrice)).Take(BandWidth).ToHashSet());
+            bar => distinctStrikes.OrderBy(s => Math.Abs(s - bar.ClosePrice)).Take(bandWidth).ToHashSet());
 
         var touchedStrikes = bandByBarIndex.Values.SelectMany(s => s).Distinct().ToList();
 
@@ -201,6 +202,7 @@ public static class OptionOiPopulator
                 AsOfDate = asOfDate,
                 BarIndex = bar.BarIndex,
                 BarVolumeThreshold = barVolumeThreshold,
+                BandWidth = bandWidth,
                 EndTimestamp = bar.EndTimestamp,
                 CallOiChangeNotional = callOiChangeNotional,
                 PutOiChangeNotional = putOiChangeNotional,

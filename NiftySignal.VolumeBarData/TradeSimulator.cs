@@ -292,6 +292,258 @@ public enum VolumeBarMetric
     /// payout-minimization calculation. Same untested pinning-sign hypothesis, tested independently.
     /// </summary>
     DistanceToHighestOiStrike,
+
+    /// <summary>
+    /// 2026-09-19, options phase, Phase 2 metric 1 (of 3): the ATM±1 complex's own resting
+    /// order-book depth imbalance -- <c>(ΣBidQty − ΣAskQty)/(ΣBidQty+ΣAskQty)</c>, top-5 levels,
+    /// summed across the band's 6 instruments (both Call and Put). Direct options analog of the
+    /// futures side's own <see cref="DepthImbalance"/>, reusing
+    /// <see cref="NiftySignal.Features.DepthImbalanceAccumulator"/> the same way. Untested sign
+    /// hypothesis: more resting BUY interest than SELL interest across the ATM complex reads
+    /// bullish (mirrors the futures reading) -- tested as-built, flipped only if the sweep rejects
+    /// it, same discipline as every other metric in this track.
+    /// </summary>
+    AtmComplexDepthImbalance,
+
+    /// <summary>
+    /// 2026-09-19, options phase, Phase 2 metric 2: <see cref="AtmComplexDepthImbalance"/> (full
+    /// top-5 book) minus the SAME ATM complex's touch-only (best bid/ask) imbalance -- direct
+    /// options analog of the futures side's own <see cref="TobDepthDivergence"/> (which, on the
+    /// futures side, collapsed once the trading-hours gate was correctly enforced -- see
+    /// `docs/VOLUME_BAR_FINDINGS.md`). Tried again here anyway per the "a metric's verdict on one
+    /// clock/instrument doesn't automatically transfer to another" convention already established
+    /// in this project, not assumed weak. Untested sign hypothesis, same as the futures original:
+    /// a thin touch behind a heavier full book is a "tension zone" whose resolution direction isn't
+    /// obviously derivable from theory -- the sweep settles it, not intuition.
+    /// </summary>
+    AtmComplexTobDepthDivergence,
+
+    /// <summary>
+    /// 2026-09-19, options phase, Phase 2 metric 3: no futures analog -- compares TOTAL resting
+    /// depth (bid+ask, top-5) on the Call side vs. the Put side of the ATM±1 band,
+    /// <c>(CallDepth − PutDepth)/(CallDepth+PutDepth)</c>. A genuinely different question from the
+    /// other two (which side of each order book has more resting interest) -- this asks which
+    /// OPTION SIDE overall is attracting more resting liquidity/participation, independent of
+    /// which direction (buy or sell) that liquidity sits on. Untested sign hypothesis.
+    /// </summary>
+    CallPutDepthImbalance,
+
+    /// <summary>
+    /// 2026-09-20, Phase 4: equal-weight linear blend of the 7 confirmed standalone options
+    /// metrics (Raw ΔIV, Price-signed ΔIV, Volume Delta, OI Delta, Skew Change, ATM Depth
+    /// Imbalance at its own adopted ATM±2, TOB Divergence), each computed with its exact locked
+    /// formula and sign, each session-rank normalized with its OWN independent tracker (same
+    /// isolation every standalone metric run already gets, same pattern <see cref="Composite"/>
+    /// already uses on the futures side). Missing components on a given bar are excluded and the
+    /// average taken over whichever ARE present, not treated as zero. Not percentile-shaped by
+    /// construction (an average of percentile-like values doesn't preserve that property), so it
+    /// gets its own dedicated magnitude-rank tracker for the entry gate, same treatment
+    /// <see cref="Composite"/> and <see cref="TrendReversion"/> already get. Built as the required
+    /// FIRST step (per `docs/METRIC_EVALUATION_PLAYBOOK.md` step 8: "test blend first") before
+    /// considering a session-phase-gated switch -- the session-phase split already found OI Delta
+    /// and ATM Depth Imbalance both peak in the Open while Price-signed ΔIV and Volume Delta are
+    /// Mid-only, the same opposite-bias shape that made a blend underperform on the futures side.
+    /// </summary>
+    OptionsScoreBlend,
+
+    /// <summary>
+    /// 2026-09-20, Phase 4: a hard SWITCH, not a blend -- same shape as the futures side's own
+    /// <see cref="SessionGatedDepthDuration"/>, built after <see cref="OptionsScoreBlend"/> came in
+    /// mid-pack (62.3% win) rather than matching the strongest single input. The session-phase
+    /// split found ATM Depth Imbalance peaks in the Open (7.30 pts/trade, the best of any
+    /// Open-window candidate) while Price-signed ΔIV is Mid-strong and, unlike Volume Delta, stays
+    /// positive in the Close too (Volume Delta goes negative there) -- so ATM Depth Imbalance's own
+    /// score drives bars before <see cref="SessionGateSwitchTime"/> (10:00 IST), Price-signed ΔIV's
+    /// own score drives everything from 10:00 onward. Never an average of both on the same bar.
+    /// Each leg's score is already percentile-shaped by construction (SignedRank), so unlike
+    /// <see cref="OptionsScoreBlend"/> this needs no separate magnitude-rank tracker.
+    /// </summary>
+    OptionsScoreOpenMidSwitch,
+
+    /// <summary>
+    /// 2026-09-20, Phase 5 prep item 3: a 3-way switch, extending
+    /// <see cref="OptionsScoreOpenMidSwitch"/> with a dedicated Close leg instead of letting
+    /// Price-signed ΔIV cover both Mid and Close. The session-phase split found Raw ΔIV was the
+    /// single best Close performer of anything tested (83.3% win) despite a nearly-flat Mid net
+    /// (81% win rate there but ~0 net) -- worth its own dedicated window rather than left unused.
+    /// Open (before 10:00 IST, same validated boundary as the 2-way switch): ATM Depth Imbalance.
+    /// Mid (10:00-13:30 IST, the same boundary the session-phase split itself buckets on):
+    /// Price-signed ΔIV. Close (13:30 IST onward): Raw ΔIV. Never an average of legs on the same
+    /// bar -- pure switch, same discipline as the 2-way version.
+    /// </summary>
+    OptionsScoreThreeWaySwitch,
+
+    /// <summary>
+    /// 2026-09-20, Phase 5 prep item 4: same 3-way design as <see cref="OptionsScoreThreeWaySwitch"/>
+    /// (Mid = Price-signed ΔIV, Close = Raw ΔIV, unchanged), but the Open leg is OI Delta instead
+    /// of ATM Depth Imbalance -- a direct head-to-head rather than trusting the earlier
+    /// per-trade-net pick. OI Delta had the HIGHER win rate in the session-phase split (81.2% vs.
+    /// 71.4%) despite the lower per-trade net (5.27 vs. 7.30) -- worth testing which one actually
+    /// wins inside the real switch, not just in isolation.
+    /// </summary>
+    OptionsScoreThreeWaySwitchOiOpen,
+
+    /// <summary>
+    /// 2026-09-20, Phase 5 prep item 5: same 3-way design as <see cref="OptionsScoreThreeWaySwitch"/>
+    /// (Open = ATM Depth Imbalance, Close = Raw ΔIV, unchanged), but the Mid leg is Volume Delta
+    /// instead of Price-signed ΔIV -- direct head-to-head. The session-phase split showed Volume
+    /// Delta's own Mid performance (76.9% win, +120.70) was actually stronger than Price-signed
+    /// ΔIV's (65.6% win, +160.75) on win rate, though Price-signed ΔIV had the better net -- worth
+    /// testing which one wins inside the real switch.
+    /// </summary>
+    OptionsScoreThreeWaySwitchVolMid,
+
+    /// <summary>
+    /// 2026-09-20, Phase 5 prep item 6: the 3-way switch (item 3's design, unchanged), plus a
+    /// CONFIRMATION GATE, never blended into the score itself -- same role TopOfBookImbalance
+    /// plays on the futures side's own SessionGatedDepthDurationConfirmed. Skew Change is the
+    /// candidate (not TOB Divergence): the session-phase split found it the most session-consistent
+    /// of all 7 confirmed metrics (72.7%/66.1%/72.7% win rate across Open/Mid/Close, no phase where
+    /// it's weak), unlike TOB Divergence which fades in Close (52.2%). Applied all-day (unlike the
+    /// futures side's open-only gate, since Skew Change doesn't have a narrow window where it's
+    /// uniquely strong) -- Skew Change's own score must agree in sign with whichever leg is active
+    /// before a new position opens; it never drives the traded score itself.
+    /// </summary>
+    OptionsScoreThreeWaySwitchConfirmed,
+
+    /// <summary>
+    /// 2026-09-20, Phase 5 prep item 7: the 3-way switch's own scoring unchanged, plus a NEW kind
+    /// of confirmation gate -- a once-per-day directional "early conviction" read, not another
+    /// options metric. <c>EarlyConviction = sign(future close at the first bar ending at/after
+    /// 10:30 IST − the day's own opening price)</c>, computed once (not per bar) since it's
+    /// observing a FIXED historical window, not a running score. Applied ONLY to the Mid and Close
+    /// legs (10:00 IST onward) -- by construction the 10:30 observation window hasn't even closed
+    /// yet during the Open leg's own trading window, so gating the Open leg on this would be
+    /// forward-looking. A new position in either later leg additionally requires its own
+    /// directional call to agree with EarlyConviction's sign.
+    /// </summary>
+    OptionsScoreThreeWaySwitchEarlyConviction,
+
+    /// <summary>
+    /// 2026-09-20, Phase 5 prep item 8: the 3-way switch's own scoring unchanged, plus a
+    /// confirmation gate using Max Pain distance -- the metric explicitly flagged back in Phase 1
+    /// (metric 5a) as a strong confirmation-filter candidate specifically because it was too
+    /// infrequent (real signal, ~2 trades/day) to drive a standalone score, the same role
+    /// TopOfBookImbalance plays on the futures side. As a GATE (needs only sign agreement, not its
+    /// own percentile extremity) its low native frequency doesn't matter -- distance to max pain is
+    /// computable every bar. Applied all day (same as item 6's Skew Change attempt, for a like-for-
+    /// like comparison of confirmation-filter designs).
+    /// </summary>
+    OptionsScoreThreeWaySwitchMaxPainConfirmed,
+
+    /// <summary>
+    /// 2026-09-20, Phase 5 plan item 10: the FIRST-EVER combination of the two independently-locked
+    /// parent scores -- <see cref="SessionGatedDepthDuration"/> (FuturesScore) and
+    /// <see cref="OptionsScoreThreeWaySwitch"/> (OptionsScore, computed at its own adopted
+    /// BandWidth=5 / ATM+/-2), each computed on THE SAME bar from its own already-locked formula and
+    /// dispatch branch (neither touched here). A light DTE-dependent weighted average: on 0-DTE days
+    /// OptionsScore is weighted 0.6/FuturesScore 0.4; on non-0-DTE days the weights flip
+    /// (FuturesScore 0.6/OptionsScore 0.4). Rationale for the split direction, not just its
+    /// existence: docs/VOLUME_BAR_FINDINGS.md's own 0-DTE/non-0-DTE section found FuturesScore's
+    /// (DepthImbalance/BarDurationUrgency) edge is driven largely by 0-DTE gamma variance rather than
+    /// consistent directional skill, while OptionsScore's underlying legs (ATM Depth Imbalance,
+    /// Price-signed/Raw ΔIV) showed no DTE-gate need at all in the 3-way switch's own 09-08/09-15
+    /// check (both 0-DTE days stayed solidly positive) -- i.e. OptionsScore looks like the more
+    /// DTE-robust signal, so it gets the larger weight specifically on 0-DTE days where FuturesScore
+    /// is least trustworthy, and FuturesScore (the stronger switch on ordinary days per its own 7-day
+    /// number) gets the larger weight otherwise. The 0.6/0.4 split itself is a first-pass, deliberately
+    /// mild tilt (not e.g. 0.9/0.1) chosen because neither parent is untrustworthy on either regime,
+    /// only relatively so -- to be evidence-tested and revised, not treated as final. 0-DTE
+    /// classification reuses the day's own nearestExpiry == asOfDate check already computed in
+    /// <see cref="SimulateDayAsync"/> for every day (same dynamic, non-hardcoded convention the
+    /// docs' own DTE analysis used: query the real expiry, don't hardcode a date list). Both parent
+    /// scores are already percentile-shaped SignedRank outputs in [-1,1] by construction, but a
+    /// WEIGHTED AVERAGE of two percentile-shaped values does not itself preserve that shape (same
+    /// reasoning <see cref="Composite"/>/<see cref="OptionsScoreBlend"/> already established) -- so
+    /// this metric gets its own dedicated magnitude-rank tracker for the entry-percentile gate, unlike
+    /// the pure-switch metrics (<see cref="SessionGatedDepthDuration"/>,
+    /// <see cref="OptionsScoreThreeWaySwitch"/>) which don't need one. Null on any bar where either
+    /// parent itself is null (no manufactured signal from a missing leg).
+    /// </summary>
+    FinalScoreDteWeighted,
+
+    /// <summary>
+    /// 2026-09-20, Phase 5 plan item 11: a confirmation-filter combination, not a blend -- the traded
+    /// score IS <see cref="SessionGatedDepthDuration"/> (FuturesScore) unchanged, but a new position
+    /// additionally requires <see cref="OptionsScoreThreeWaySwitch"/> (OptionsScore, BandWidth=5) to
+    /// agree in sign on the SAME bar, or the bar is skipped -- same role TopOfBookImbalance plays for
+    /// <see cref="SessionGatedDepthDurationConfirmed"/> and Skew Change/Max Pain play for
+    /// <see cref="OptionsScoreThreeWaySwitchConfirmed"/>/<see cref="OptionsScoreThreeWaySwitchMaxPainConfirmed"/>,
+    /// except the confirming signal here is the OTHER PARENT's own full score, not a third
+    /// standalone metric. Applied ALL DAY (unlike the futures side's own open-only TOB gate) since
+    /// neither parent has an established narrow window where the other is uniquely noisy. Wired
+    /// through <see cref="PassesConfirmation"/> following the existing pattern. Functionally
+    /// identical to <see cref="FinalScoreFuturesPrimaryOptionsFilter"/> below (both trade
+    /// FuturesScore gated by OptionsScore sign-agreement) -- implemented ONCE
+    /// (FuturesPrimaryOptionsFilter's dispatch branch is reused for both enum values) rather than
+    /// duplicating the logic, per this enum value's own doc-comment note; kept as a separate enum
+    /// value anyway because the "both-must-agree" framing is the plan's own natural entry point and
+    /// distinct from the deliberate futures-primary/options-primary framing of the next two.
+    /// </summary>
+    FinalScoreBothMustAgree,
+
+    /// <summary>
+    /// 2026-09-20, Phase 5 plan item 12 (futures-primary direction): FuturesScore
+    /// (<see cref="SessionGatedDepthDuration"/>) is the traded score, gated by requiring
+    /// OptionsScore (<see cref="OptionsScoreThreeWaySwitch"/>, BandWidth=5) to agree in sign before a
+    /// new position opens, applied all day -- see <see cref="FinalScoreBothMustAgree"/>'s doc comment;
+    /// that value and this one share one dispatch/confirmation implementation since the "both must
+    /// agree, trading futures" design is identical either way it's named. Kept as its own enum value
+    /// (rather than only shipping BothMustAgree) because it is the explicit "which side is primary"
+    /// framing the plan asked for, directly paired with the reverse direction below for a clean
+    /// side-by-side comparison.
+    /// </summary>
+    FinalScoreFuturesPrimaryOptionsFilter,
+
+    /// <summary>
+    /// 2026-09-20, Phase 5 plan item 12 (options-primary direction, the genuinely different reverse
+    /// case): OptionsScore (<see cref="OptionsScoreThreeWaySwitch"/>, BandWidth=5) is the TRADED
+    /// score here, gated by requiring FuturesScore (<see cref="SessionGatedDepthDuration"/>) to agree
+    /// in sign before a new position opens -- the mirror image of
+    /// <see cref="FinalScoreFuturesPrimaryOptionsFilter"/>, genuinely different from it because the
+    /// entry SIDE (Call/Put) and the trade's own EntryScore now come from OptionsScore's magnitude
+    /// and sign instead of FuturesScore's, not merely a relabeling. Applied all day, same as the
+    /// futures-primary direction, for a like-for-like comparison of which parent is the better
+    /// primary driver.
+    /// </summary>
+    FinalScoreOptionsPrimaryFuturesFilter,
+
+    /// <summary>
+    /// 2026-09-20, Phase 5 plan item 13: a session-PHASE-weighted blend of FuturesScore
+    /// (<see cref="SessionGatedDepthDuration"/>) and OptionsScore (<see cref="OptionsScoreThreeWaySwitch"/>,
+    /// BandWidth=5), using the SAME 3-way Open (before 10:00 IST) / Mid (10:00-13:30 IST) / Close
+    /// (13:30 IST onward) boundaries <see cref="OptionsScoreThreeWaySwitch"/> already uses
+    /// (<see cref="MidCloseSwitchTime"/> for the Mid/Close edge, <see cref="SessionGateSwitchTime"/>
+    /// for the Open/Mid edge) -- deliberately reused rather than a new boundary. Weights per phase,
+    /// derived from docs/VOLUME_BAR_FINDINGS.md's own session-phase findings for each parent's
+    /// dominant underlying leg, not guessed: Open -- DepthImbalance (FuturesScore's Open-window
+    /// driver) is documented as the single strongest Open-window candidate found in this whole
+    /// project (78.6% win in the phase split that motivated <see cref="SessionGatedDepthDuration"/>
+    /// itself), so FuturesScore gets 0.7 there vs. OptionsScore 0.3. Mid -- both parents have a real
+    /// Mid leg (BarDurationUrgency for futures, Price-signed ΔIV for options) without one obviously
+    /// dominating the other in the findings doc, so Mid is the one phase left an even 0.5/0.5. Close
+    /// -- Raw ΔIV was documented as the single best Close performer of anything tested in this
+    /// project (83.3% win, the finding that motivated giving <see cref="OptionsScoreThreeWaySwitch"/>
+    /// its own dedicated Close leg in the first place), so OptionsScore gets 0.7 there vs. FuturesScore
+    /// 0.3. These three weight pairs are a first pass tied directly to the strongest documented
+    /// finding in each phase, explicitly flagged (like every other new constant in this batch) as
+    /// something to evidence-test and revise, not a final answer.
+    ///
+    /// 2026-09-20 follow-up: swept via calibrate's --wopen=/--wmid=/--wclose= flags (each phase's
+    /// weight-on-FuturesScore in {0.0,0.3,0.5,0.7,1.0}, 125 combos, BarThreshold=2600, entry
+    /// percentiles 85-97, same 8-day range) looking for a combo that beats
+    /// <see cref="OptionsScoreThreeWaySwitch"/> alone (60.8% win / +446.05 net at 2600/90) on BOTH
+    /// win rate and net. None did within the 7-20 trades/day target band. The nearest candidate
+    /// (0.7/0.3/0.3 at percentile 95: 56 trades, 60.7% win, +446.10 net) is a near-tie on net but
+    /// still short on win rate, AND is a fragile single-percentile-cell peak -- the SAME weights at
+    /// the neighboring 90/93 percentiles collapse to 46.9%/43.7% win, whereas these original
+    /// 0.7/0.5/0.3 weights stay in a tighter 54.0-64.7% band across 90-97. Original weights kept as
+    /// the default for that reason -- see docs/VOLUME_BAR_FINDINGS.md item 13's follow-up
+    /// subsection for the full sweep table. Like
+    /// <see cref="FinalScoreDteWeighted"/>, a weighted AVERAGE of two percentile-shaped scores is not
+    /// itself percentile-shaped, so this gets its own dedicated magnitude-rank tracker too.
+    /// </summary>
+    FinalScoreSessionWeighted,
 }
 
 public sealed record VolumeBarTrade(
@@ -348,6 +600,11 @@ public static class TradeSimulator
     // session-phase checks that motivated this metric (see docs/VOLUME_BAR_FINDINGS.md).
     static readonly TimeSpan SessionGateSwitchTime = new(10, 0, 0);
 
+    // 2026-09-20, only meaningful for OptionsScoreThreeWaySwitch -- the Mid/Close boundary, same
+    // 13:30 IST bucket edge the session-phase split itself already uses throughout this project
+    // (Open 09:30-10:00 / Mid 10:00-13:30 / Close 13:30-15:15), not a new arbitrary choice.
+    static readonly TimeSpan MidCloseSwitchTime = new(13, 30, 0);
+
     static TimeSpan IstTimeOfDay(DateTimeOffset timestamp) => timestamp.ToOffset(TimeSpan.FromHours(5.5)).TimeOfDay;
 
 
@@ -377,8 +634,29 @@ public static class TradeSimulator
         VolumeBarMetric metric, double entryPercentile, int trendWindowBars, CancellationToken cancellationToken,
         IDictionary<(DateOnly Day, string Token), OptionPriceSeries>? sharedPriceCache = null,
         decimal? stopLossPercent = null,
-        long? rollingSubBarThreshold = null)
+        long? rollingSubBarThreshold = null,
+        int bandWidth = OptionDepthPopulator.DefaultBandWidth,
+        TimeSpan? optionsSwitchTime = null,
+        TimeSpan? entryWindowStartOverride = null,
+        (double Open, double Mid, double Close)? sessionWeightsOnFutures = null)
     {
+        // 2026-09-20, item 13 follow-up sweep: lets the 3 FinalScoreSessionWeighted phase weights
+        // (weight-on-FuturesScore per phase; OptionsScore always gets 1 minus it) be swept from the
+        // CLI via calibrate's --wopen=/--wmid=/--wclose= without recompiling. Defaults to the
+        // original 0.7/0.5/0.3 derivation documented on the enum value itself.
+        var effectiveSessionWeights = sessionWeightsOnFutures ?? (Open: 0.7, Mid: 0.5, Close: 0.3);
+        // 2026-09-20, only meaningful for OptionsScoreOpenMidSwitch -- deliberately a SEPARATE
+        // parameter from SessionGateSwitchTime below, not a shared override, so sweeping this
+        // never touches the already-locked futures SessionGatedDepthDuration/Confirmed switch
+        // point. Defaults to the same 10:00 IST boundary those use, purely as a starting point.
+        var effectiveOptionsSwitchTime = optionsSwitchTime ?? SessionGateSwitchTime;
+
+        // 2026-09-20, user's own follow-up question: the standing 09:30 entry-window start was
+        // never itself derived from backtesting (unlike the switch-time boundary above, it was a
+        // standing risk/practicality rule set directly). Real parameter now so it can be tested
+        // the same evidence-based way -- defaults to the existing 09:30 EntryWindowStart constant,
+        // unchanged for every metric unless this is explicitly overridden.
+        var effectiveEntryWindowStart = entryWindowStartOverride ?? EntryWindowStart;
         List<VolumeBarRow> bars;
         if (rollingSubBarThreshold is { } subBarSize)
         {
@@ -413,12 +691,45 @@ public static class TradeSimulator
             return [];
         }
 
+        // 2026-09-20, Phase 5 prep item 7: only meaningful for
+        // OptionsScoreThreeWaySwitchEarlyConviction -- computed ONCE per day (observing a fixed
+        // historical window, not a running score), not per bar. Null if no bar's own end falls at
+        // or after 10:30 IST (shouldn't happen on a real trading day, but never fabricated).
+        int? earlyConvictionSign = null;
+        if (metric == VolumeBarMetric.OptionsScoreThreeWaySwitchEarlyConviction)
+        {
+            var earlyCutoff = new TimeSpan(10, 30, 0);
+            var readingBar = bars.FirstOrDefault(b => IstTimeOfDay(b.EndTimestamp) >= earlyCutoff);
+            if (readingBar is not null)
+            {
+                earlyConvictionSign = Math.Sign(readingBar.ClosePrice - bars[0].OpenPrice);
+            }
+        }
+
         // 2026-09-18, options phase: OptionAtmBarRow lives in the SAME VolumeBarDbContext/database
         // as the future bars (locked "futures bars stay the clock" decision) -- one row per future
         // BarIndex at this threshold, joined by that shared identity. Only loaded for metrics that
         // actually need it (rolling-window mode doesn't have a matching OptionAtmBars threshold to
         // join against, so it's skipped there too -- options-on-rolling-bars is not yet built).
-        var isAtmIvMetric = metric is VolumeBarMetric.AtmIvChangeRaw or VolumeBarMetric.AtmIvChangePriceSigned or VolumeBarMetric.AtmIvAcceleration;
+        var isOptionsScoreBlend = metric == VolumeBarMetric.OptionsScoreBlend;
+        var isOptionsScoreSwitch = metric == VolumeBarMetric.OptionsScoreOpenMidSwitch;
+        // Confirmed reuses the 3-way switch's own scoring logic exactly (Open/Mid/Close legs
+        // unchanged) -- the confirmation gate is applied separately, at the entry check, not by
+        // altering the traded score itself.
+        var isOptionsScore3Way = metric is VolumeBarMetric.OptionsScoreThreeWaySwitch or VolumeBarMetric.OptionsScoreThreeWaySwitchConfirmed or VolumeBarMetric.OptionsScoreThreeWaySwitchEarlyConviction or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmed;
+        var isOptionsScoreConfirmed = metric == VolumeBarMetric.OptionsScoreThreeWaySwitchConfirmed;
+        var isOptionsScoreEarlyConviction = metric == VolumeBarMetric.OptionsScoreThreeWaySwitchEarlyConviction;
+        var isOptionsScoreMaxPainConfirmed = metric == VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmed;
+        var isOptionsScore3WayOiOpen = metric == VolumeBarMetric.OptionsScoreThreeWaySwitchOiOpen;
+        var isOptionsScore3WayVolMid = metric == VolumeBarMetric.OptionsScoreThreeWaySwitchVolMid;
+        // 2026-09-20, Phase 5 plan items 10-13: the first-ever FuturesScore + OptionsScore
+        // combinations. All 5 share this one flag for table-loading purposes; which of the 5 is
+        // actually active is resolved inside the dispatch branch itself.
+        var isFinalScoreCombo = metric is VolumeBarMetric.FinalScoreDteWeighted or VolumeBarMetric.FinalScoreBothMustAgree
+            or VolumeBarMetric.FinalScoreFuturesPrimaryOptionsFilter or VolumeBarMetric.FinalScoreOptionsPrimaryFuturesFilter
+            or VolumeBarMetric.FinalScoreSessionWeighted;
+
+        var isAtmIvMetric = metric is VolumeBarMetric.AtmIvChangeRaw or VolumeBarMetric.AtmIvChangePriceSigned or VolumeBarMetric.AtmIvAcceleration || isOptionsScoreBlend || isOptionsScoreSwitch || isOptionsScore3Way || isOptionsScore3WayOiOpen || isOptionsScore3WayVolMid || isFinalScoreCombo;
         Dictionary<int, OptionAtmBarRow>? optionAtmByBarIndex = null;
         if (isAtmIvMetric && rollingSubBarThreshold is null)
         {
@@ -428,23 +739,23 @@ public static class TradeSimulator
         }
 
         Dictionary<int, OptionBandFlowBarRow>? optionBandFlowByBarIndex = null;
-        if (metric == VolumeBarMetric.NotionalCallPutVolumeDelta && rollingSubBarThreshold is null)
+        if ((metric == VolumeBarMetric.NotionalCallPutVolumeDelta || isOptionsScoreBlend || isOptionsScore3WayVolMid) && rollingSubBarThreshold is null)
         {
             optionBandFlowByBarIndex = await volumeBarDb.OptionBandFlowBars
-                .Where(b => b.AsOfDate == asOfDate && b.BarVolumeThreshold == barVolumeThreshold)
+                .Where(b => b.AsOfDate == asOfDate && b.BarVolumeThreshold == barVolumeThreshold && b.BandWidth == bandWidth)
                 .ToDictionaryAsync(b => b.BarIndex, cancellationToken);
         }
 
-        var isOiMetric = metric is VolumeBarMetric.NotionalOiDelta or VolumeBarMetric.OiBuildupQuadrant;
+        var isOiMetric = metric is VolumeBarMetric.NotionalOiDelta or VolumeBarMetric.OiBuildupQuadrant || isOptionsScoreBlend || isOptionsScore3WayOiOpen;
         Dictionary<int, OptionOiBarRow>? optionOiByBarIndex = null;
         if (isOiMetric && rollingSubBarThreshold is null)
         {
             optionOiByBarIndex = await volumeBarDb.OptionOiBars
-                .Where(b => b.AsOfDate == asOfDate && b.BarVolumeThreshold == barVolumeThreshold)
+                .Where(b => b.AsOfDate == asOfDate && b.BarVolumeThreshold == barVolumeThreshold && b.BandWidth == bandWidth)
                 .ToDictionaryAsync(b => b.BarIndex, cancellationToken);
         }
 
-        var isSkew25DeltaMetric = metric is VolumeBarMetric.Skew25DeltaChangeRaw or VolumeBarMetric.Skew25DeltaChangePriceSigned or VolumeBarMetric.Skew25DeltaLevel;
+        var isSkew25DeltaMetric = metric is VolumeBarMetric.Skew25DeltaChangeRaw or VolumeBarMetric.Skew25DeltaChangePriceSigned or VolumeBarMetric.Skew25DeltaLevel || isOptionsScoreBlend || isOptionsScoreConfirmed;
         Dictionary<int, OptionSkew25DeltaBarRow>? optionSkew25DeltaByBarIndex = null;
         if (isSkew25DeltaMetric && rollingSubBarThreshold is null)
         {
@@ -453,13 +764,35 @@ public static class TradeSimulator
                 .ToDictionaryAsync(b => b.BarIndex, cancellationToken);
         }
 
-        var isMaxPainMetric = metric is VolumeBarMetric.DistanceToMaxPain or VolumeBarMetric.DistanceToHighestOiStrike;
+        var isMaxPainMetric = metric is VolumeBarMetric.DistanceToMaxPain or VolumeBarMetric.DistanceToHighestOiStrike || isOptionsScoreMaxPainConfirmed;
         Dictionary<int, OptionMaxPainBarRow>? optionMaxPainByBarIndex = null;
         if (isMaxPainMetric && rollingSubBarThreshold is null)
         {
             optionMaxPainByBarIndex = await volumeBarDb.OptionMaxPainBars
                 .Where(b => b.AsOfDate == asOfDate && b.BarVolumeThreshold == barVolumeThreshold)
                 .ToDictionaryAsync(b => b.BarIndex, cancellationToken);
+        }
+
+        var isDepthMetric = metric is VolumeBarMetric.AtmComplexDepthImbalance or VolumeBarMetric.AtmComplexTobDepthDivergence or VolumeBarMetric.CallPutDepthImbalance || isOptionsScoreBlend;
+        Dictionary<int, OptionDepthBarRow>? optionDepthByBarIndex = null;
+        if (isDepthMetric && rollingSubBarThreshold is null)
+        {
+            optionDepthByBarIndex = await volumeBarDb.OptionDepthBars
+                .Where(b => b.AsOfDate == asOfDate && b.BarVolumeThreshold == barVolumeThreshold && b.BandWidth == bandWidth)
+                .ToDictionaryAsync(b => b.BarIndex, cancellationToken);
+        }
+
+        // The blend's/switch's Depth Imbalance component uses its own ADOPTED band (ATM±2),
+        // independent of whatever bandWidth is passed for the other band-based components --
+        // TobDivergence stays at bandWidth (its own locked ATM±1) via optionDepthByBarIndex above.
+        Dictionary<int, OptionDepthBarRow>? optionDepthWideByBarIndex = null;
+        if ((isOptionsScoreBlend || isOptionsScoreSwitch || isOptionsScore3Way || isOptionsScore3WayVolMid || isFinalScoreCombo) && rollingSubBarThreshold is null)
+        {
+            optionDepthWideByBarIndex = bandWidth == 5 && optionDepthByBarIndex is not null
+                ? optionDepthByBarIndex
+                : await volumeBarDb.OptionDepthBars
+                    .Where(b => b.AsOfDate == asOfDate && b.BarVolumeThreshold == barVolumeThreshold && b.BandWidth == 5)
+                    .ToDictionaryAsync(b => b.BarIndex, cancellationToken);
         }
 
         var allOptions = await source.Instruments
@@ -473,6 +806,11 @@ public static class TradeSimulator
 
         var nearestExpiry = allOptions.Select(o => o.ExpiryDate!.Value).Min();
         var chain = allOptions.Where(o => o.ExpiryDate == nearestExpiry).ToList();
+
+        // 2026-09-20, only meaningful for FinalScoreDteWeighted -- reuses the same "query the real
+        // expiry, don't hardcode a date list" convention docs/VOLUME_BAR_FINDINGS.md's own DTE split
+        // used, now expressed dynamically off the day's own nearest-expiry chain computed above.
+        var isZeroDte = nearestExpiry == asOfDate;
 
         var dayStart = bars[0].StartTimestamp;
         var dayEnd = bars[^1].EndTimestamp;
@@ -549,6 +887,78 @@ public static class TradeSimulator
         var maxPainRank = new SessionRankTracker();
         var highestOiStrikeRank = new SessionRankTracker();
 
+        // Only meaningful for the 3 Phase-2 depth metrics -- each already a signed level (an
+        // imbalance ratio, or a difference of two), no differencing needed.
+        var atmDepthRank = new SessionRankTracker();
+        var atmTobDivergenceRank = new SessionRankTracker();
+        var callPutDepthRank = new SessionRankTracker();
+
+        // 2026-09-20, Phase 4: only meaningful for OptionsScoreBlend -- 7 independent trackers, one
+        // per confirmed standalone metric, same "own isolation, whichever run" pattern the futures
+        // side's own Composite already uses. previousAtmIv/previousSkewRatio above are reused
+        // as-is (mutually exclusive per call, same convention every other tracker in this file
+        // follows) rather than duplicated.
+        var blendIvRawRank = new SessionRankTracker();
+        var blendIvPriceSignedRank = new SessionRankTracker();
+        var blendVolRank = new SessionRankTracker();
+        var blendOiRank = new SessionRankTracker();
+        var blendSkewRank = new SessionRankTracker();
+        var blendDepthRank = new SessionRankTracker();
+        var blendTobDivRank = new SessionRankTracker();
+        var blendMagnitudeRank = new SessionRankTracker();
+
+        // Only meaningful for OptionsScoreOpenMidSwitch -- both legs fed on EVERY bar (not just
+        // their own active window) so each one's running distribution reflects the whole day, same
+        // convention SessionGatedDepthDuration already uses on the futures side.
+        var switchDepthRank = new SessionRankTracker();
+        var switchIvRank = new SessionRankTracker();
+
+        // Only meaningful for OptionsScoreThreeWaySwitch -- separate trackers from the 2-way
+        // switch's own (mutually exclusive per call, but kept distinct rather than shared for
+        // clarity, same convention as every other metric-specific tracker set in this file).
+        var switch3DepthRank = new SessionRankTracker();
+        var switch3IvMidRank = new SessionRankTracker();
+        var switch3IvCloseRank = new SessionRankTracker();
+
+        // Only meaningful for OptionsScoreThreeWaySwitchOiOpen -- same Mid/Close legs as the
+        // 3-way switch (own trackers, not shared, mutually exclusive per call), OI Delta drives
+        // Open instead of Depth Imbalance.
+        var switch3OiOpenRank = new SessionRankTracker();
+        var switch3OiIvMidRank = new SessionRankTracker();
+        var switch3OiIvCloseRank = new SessionRankTracker();
+
+        // Only meaningful for OptionsScoreThreeWaySwitchVolMid -- Open/Close legs match the 3-way
+        // switch (own trackers), Volume Delta drives Mid instead of Price-signed ΔIV.
+        var switch3VolDepthOpenRank = new SessionRankTracker();
+        var switch3VolMidRank = new SessionRankTracker();
+        var switch3VolIvCloseRank = new SessionRankTracker();
+
+        // Only meaningful for OptionsScoreThreeWaySwitchConfirmed -- Skew Change's OWN score,
+        // computed every bar (not just when a trade might open) so its running distribution
+        // reflects the whole day, same convention every other confirmation-gate tracker in this
+        // file already follows. Deliberately a separate tracker/previous-value from the standalone
+        // Skew25DeltaChangeRaw metric's own -- this is a confirmation gate, not the traded score.
+        var confirmSkewRank = new SessionRankTracker();
+        double? previousSkewRatioForConfirm = null;
+
+        // Only meaningful for OptionsScoreThreeWaySwitchMaxPainConfirmed -- own tracker, same
+        // "confirmation gate, not the traded score" separation as the skew confirmation above.
+        var confirmMaxPainRank = new SessionRankTracker();
+
+        // 2026-09-20, Phase 5 plan items 10-13 -- only meaningful for the 5 FinalScore* combination
+        // metrics. Own dedicated trackers for each leg (mutually exclusive with every other tracker
+        // set in this file per call, same convention), fed every bar so each leg's running
+        // distribution matches what standalone SessionGatedDepthDuration/OptionsScoreThreeWaySwitch
+        // would see. comboMagnitudeRank is only used by FinalScoreDteWeighted/FinalScoreSessionWeighted
+        // (the 2 blended variants) -- see those enum values' own doc comments for why a weighted
+        // average needs a dedicated magnitude-rank tracker the same way Composite/OptionsScoreBlend do.
+        var comboFuturesDepthRank = new SessionRankTracker();
+        var comboFuturesDurationRank = new SessionRankTracker();
+        var comboOptDepthRank = new SessionRankTracker();
+        var comboOptIvMidRank = new SessionRankTracker();
+        var comboOptIvCloseRank = new SessionRankTracker();
+        var comboMagnitudeRank = new SessionRankTracker();
+
         var trades = new List<VolumeBarTrade>();
         (DateTimeOffset EntryTime, decimal EntryPrice, OptionType Side, decimal StrikePrice, string Token, double EntryScore)? open = null;
         decimal? previousClose = null;
@@ -560,10 +970,220 @@ public static class TradeSimulator
             var isLastBar = i == bars.Count - 1;
 
             var isSessionGated = metric is VolumeBarMetric.SessionGatedDepthDuration or VolumeBarMetric.SessionGatedDepthDurationConfirmed;
+            // 2026-09-20, Phase 5 plan items 11-12 -- only meaningful for FinalScoreBothMustAgree/
+            // FinalScoreFuturesPrimaryOptionsFilter/FinalScoreOptionsPrimaryFuturesFilter, set inside
+            // the isFinalScoreCombo branch below, read by PassesConfirmation at the entry check.
+            double? comboOtherLegScore = null;
             double? score;
             if (metric == VolumeBarMetric.Composite)
             {
                 score = ComputeCompositeScore(bar, previousClose, compositeDepthRank, compositeOfiRank, compositeTobRank, compositeDivergenceRank, compositeDurationRank);
+            }
+            else if (isOptionsScoreBlend)
+            {
+                // 2026-09-20, Phase 4: MUST be checked before isAtmIvMetric/isOiMetric/
+                // isSkew25DeltaMetric/isDepthMetric below -- those flags are OR'd with
+                // isOptionsScoreBlend too (so the TABLE-LOADING blocks above fire for the blend),
+                // but their own dispatch branches only handle their OWN metric values and fall
+                // through to null for anything else, silently producing zero trades if this check
+                // were reached after them instead of before.
+                var currentAtmIvB = optionAtmByBarIndex is not null && optionAtmByBarIndex.TryGetValue(bar.BarIndex, out var atmBarB) ? atmBarB.AtmIv : null;
+                double? deltaIvB = previousAtmIv is { } prevIvB && currentAtmIvB is { } curIvB ? curIvB - prevIvB : null;
+                var ivRawScore = deltaIvB is { } divB ? SignedRank.Compute(divB, blendIvRawRank) : null;
+                var ivPriceSignedScore = deltaIvB is { } divB2 && previousClose is { } prevCloseB
+                    ? SignedRank.Compute(-Math.Sign(bar.ClosePrice - prevCloseB) * divB2, blendIvPriceSignedRank)
+                    : null;
+
+                var volScore = optionBandFlowByBarIndex is not null && optionBandFlowByBarIndex.TryGetValue(bar.BarIndex, out var flowBarB)
+                    ? SignedRank.Compute((double)(flowBarB.PutNotionalVolume - flowBarB.CallNotionalVolume), blendVolRank)
+                    : null;
+
+                var oiScore = optionOiByBarIndex is not null && optionOiByBarIndex.TryGetValue(bar.BarIndex, out var oiBarB)
+                    ? SignedRank.Compute((double)(oiBarB.CallOiChangeNotional - oiBarB.PutOiChangeNotional), blendOiRank)
+                    : null;
+
+                var currentSkewRatioB = optionSkew25DeltaByBarIndex is not null && optionSkew25DeltaByBarIndex.TryGetValue(bar.BarIndex, out var skewBarB) ? skewBarB.SkewRatio : null;
+                var skewScore = previousSkewRatio is { } prevRB && currentSkewRatioB is { } curRB
+                    ? SignedRank.Compute(curRB - prevRB, blendSkewRank)
+                    : null;
+
+                var wideDepthBarB = optionDepthWideByBarIndex is not null && optionDepthWideByBarIndex.TryGetValue(bar.BarIndex, out var wdbB) ? wdbB : null;
+                var depthScore = wideDepthBarB is not null
+                    && ComputeImbalanceRatio(wideDepthBarB.CallBidQtyAvg + wideDepthBarB.PutBidQtyAvg, wideDepthBarB.CallAskQtyAvg + wideDepthBarB.PutAskQtyAvg) is { } depthRatioB
+                        ? SignedRank.Compute(-depthRatioB, blendDepthRank) : null;
+
+                var tobDepthBarB = optionDepthByBarIndex is not null && optionDepthByBarIndex.TryGetValue(bar.BarIndex, out var tdbB) ? tdbB : null;
+                var tobDivScore = tobDepthBarB is not null && ComputeTobDivergence(tobDepthBarB) is { } tobDivB
+                    ? SignedRank.Compute(tobDivB, blendTobDivRank)
+                    : null;
+
+                var blendComponents = new[] { ivRawScore, ivPriceSignedScore, volScore, oiScore, skewScore, depthScore, tobDivScore };
+                var blendPresent = blendComponents.Where(c => c is { }).Select(c => c!.Value).ToList();
+                score = blendPresent.Count > 0 ? blendPresent.Average() : null;
+
+                previousAtmIv = currentAtmIvB ?? previousAtmIv;
+                previousSkewRatio = currentSkewRatioB ?? previousSkewRatio;
+            }
+            else if (isOptionsScoreSwitch)
+            {
+                // MUST be checked before isAtmIvMetric below -- same dispatch-order lesson as
+                // OptionsScoreBlend above (that flag is OR'd with isOptionsScoreSwitch too, purely
+                // to trigger table loading, and its own switch statement doesn't know about this
+                // metric).
+                var currentAtmIvS = optionAtmByBarIndex is not null && optionAtmByBarIndex.TryGetValue(bar.BarIndex, out var atmBarS) ? atmBarS.AtmIv : null;
+
+                if (IstTimeOfDay(bar.EndTimestamp) < effectiveOptionsSwitchTime)
+                {
+                    var wideDepthBarS = optionDepthWideByBarIndex is not null && optionDepthWideByBarIndex.TryGetValue(bar.BarIndex, out var wdbS) ? wdbS : null;
+                    score = wideDepthBarS is not null
+                        && ComputeImbalanceRatio(wideDepthBarS.CallBidQtyAvg + wideDepthBarS.PutBidQtyAvg, wideDepthBarS.CallAskQtyAvg + wideDepthBarS.PutAskQtyAvg) is { } depthRatioS
+                            ? SignedRank.Compute(-depthRatioS, switchDepthRank) : null;
+                }
+                else
+                {
+                    score = previousAtmIv is { } prevIvS && currentAtmIvS is { } curIvS && previousClose is { } prevCloseS
+                        ? SignedRank.Compute(-Math.Sign(bar.ClosePrice - prevCloseS) * (curIvS - prevIvS), switchIvRank)
+                        : null;
+                }
+
+                // Keep the IV tracker primed through the Open window too (even though the Open
+                // score comes from Depth Imbalance), so the very first Mid-window bar already has
+                // a real previous-IV reading to diff against instead of starting cold.
+                previousAtmIv = currentAtmIvS ?? previousAtmIv;
+            }
+            else if (isOptionsScore3Way)
+            {
+                // MUST be checked before isAtmIvMetric below -- same dispatch-order lesson as the
+                // blend and 2-way switch above. Logic itself lives in ComputeOptionsThreeWayScore
+                // (factored out 2026-09-20 so SimulateCrossoverDayAsync can reuse it verbatim).
+                score = ComputeOptionsThreeWayScore(bar, previousClose, optionAtmByBarIndex, optionDepthWideByBarIndex,
+                    effectiveOptionsSwitchTime, ref previousAtmIv, switch3DepthRank, switch3IvMidRank, switch3IvCloseRank);
+            }
+            else if (isOptionsScore3WayOiOpen)
+            {
+                // MUST be checked before isAtmIvMetric/isOiMetric below -- same dispatch-order
+                // lesson as every other blend/switch metric above.
+                var currentAtmIv3O = optionAtmByBarIndex is not null && optionAtmByBarIndex.TryGetValue(bar.BarIndex, out var atmBar3O) ? atmBar3O.AtmIv : null;
+                var timeOfDay3O = IstTimeOfDay(bar.EndTimestamp);
+
+                if (timeOfDay3O < effectiveOptionsSwitchTime)
+                {
+                    score = optionOiByBarIndex is not null && optionOiByBarIndex.TryGetValue(bar.BarIndex, out var oiBar3O)
+                        ? SignedRank.Compute((double)(oiBar3O.CallOiChangeNotional - oiBar3O.PutOiChangeNotional), switch3OiOpenRank)
+                        : null;
+                }
+                else if (timeOfDay3O < MidCloseSwitchTime)
+                {
+                    score = previousAtmIv is { } prevIv3OM && currentAtmIv3O is { } curIv3OM && previousClose is { } prevClose3OM
+                        ? SignedRank.Compute(-Math.Sign(bar.ClosePrice - prevClose3OM) * (curIv3OM - prevIv3OM), switch3OiIvMidRank)
+                        : null;
+                }
+                else
+                {
+                    score = previousAtmIv is { } prevIv3OC && currentAtmIv3O is { } curIv3OC
+                        ? SignedRank.Compute(curIv3OC - prevIv3OC, switch3OiIvCloseRank)
+                        : null;
+                }
+
+                previousAtmIv = currentAtmIv3O ?? previousAtmIv;
+            }
+            else if (isOptionsScore3WayVolMid)
+            {
+                // MUST be checked before isAtmIvMetric/etc. below -- same dispatch-order lesson as
+                // every other blend/switch metric above.
+                var currentAtmIv3V = optionAtmByBarIndex is not null && optionAtmByBarIndex.TryGetValue(bar.BarIndex, out var atmBar3V) ? atmBar3V.AtmIv : null;
+                var timeOfDay3V = IstTimeOfDay(bar.EndTimestamp);
+
+                if (timeOfDay3V < effectiveOptionsSwitchTime)
+                {
+                    var wideDepthBar3V = optionDepthWideByBarIndex is not null && optionDepthWideByBarIndex.TryGetValue(bar.BarIndex, out var wdb3V) ? wdb3V : null;
+                    score = wideDepthBar3V is not null
+                        && ComputeImbalanceRatio(wideDepthBar3V.CallBidQtyAvg + wideDepthBar3V.PutBidQtyAvg, wideDepthBar3V.CallAskQtyAvg + wideDepthBar3V.PutAskQtyAvg) is { } depthRatio3V
+                            ? SignedRank.Compute(-depthRatio3V, switch3VolDepthOpenRank) : null;
+                }
+                else if (timeOfDay3V < MidCloseSwitchTime)
+                {
+                    score = optionBandFlowByBarIndex is not null && optionBandFlowByBarIndex.TryGetValue(bar.BarIndex, out var flowBar3V)
+                        ? SignedRank.Compute((double)(flowBar3V.PutNotionalVolume - flowBar3V.CallNotionalVolume), switch3VolMidRank)
+                        : null;
+                }
+                else
+                {
+                    score = previousAtmIv is { } prevIv3VC && currentAtmIv3V is { } curIv3VC
+                        ? SignedRank.Compute(curIv3VC - prevIv3VC, switch3VolIvCloseRank)
+                        : null;
+                }
+
+                previousAtmIv = currentAtmIv3V ?? previousAtmIv;
+            }
+            else if (isFinalScoreCombo)
+            {
+                // MUST be checked before isAtmIvMetric below -- same dispatch-order lesson as every
+                // other switch/blend metric above (isAtmIvMetric is OR'd with isFinalScoreCombo purely
+                // to trigger OptionAtmBars table loading; its own switch statement below doesn't know
+                // about these 5 metrics, so reaching it first would silently null every bar out --
+                // the exact bug that hit OptionsScoreBlend once already).
+                var currentAtmIvF = optionAtmByBarIndex is not null && optionAtmByBarIndex.TryGetValue(bar.BarIndex, out var atmBarF) ? atmBarF.AtmIv : null;
+                var timeOfDayF = IstTimeOfDay(bar.EndTimestamp);
+
+                // FuturesScore leg -- SessionGatedDepthDuration's own locked score, untouched.
+                var futuresLegScore = ComputeSessionGatedScore(bar, previousClose, comboFuturesDepthRank, comboFuturesDurationRank);
+
+                // OptionsScore leg -- OptionsScoreThreeWaySwitch's own locked 3-way logic, untouched,
+                // reproduced here (not modifying that metric's own dispatch branch) at BandWidth=5
+                // (ATM+/-2, its own adopted band) via optionDepthWideByBarIndex.
+                double? optionsLegScore;
+                if (timeOfDayF < effectiveOptionsSwitchTime)
+                {
+                    var wideDepthBarF = optionDepthWideByBarIndex is not null && optionDepthWideByBarIndex.TryGetValue(bar.BarIndex, out var wdbF) ? wdbF : null;
+                    optionsLegScore = wideDepthBarF is not null
+                        && ComputeImbalanceRatio(wideDepthBarF.CallBidQtyAvg + wideDepthBarF.PutBidQtyAvg, wideDepthBarF.CallAskQtyAvg + wideDepthBarF.PutAskQtyAvg) is { } depthRatioF
+                            ? SignedRank.Compute(-depthRatioF, comboOptDepthRank) : null;
+                }
+                else if (timeOfDayF < MidCloseSwitchTime)
+                {
+                    optionsLegScore = previousAtmIv is { } prevIvFM && currentAtmIvF is { } curIvFM && previousClose is { } prevCloseFM
+                        ? SignedRank.Compute(-Math.Sign(bar.ClosePrice - prevCloseFM) * (curIvFM - prevIvFM), comboOptIvMidRank)
+                        : null;
+                }
+                else
+                {
+                    optionsLegScore = previousAtmIv is { } prevIvFC && currentAtmIvF is { } curIvFC
+                        ? SignedRank.Compute(curIvFC - prevIvFC, comboOptIvCloseRank)
+                        : null;
+                }
+
+                previousAtmIv = currentAtmIvF ?? previousAtmIv;
+
+                score = metric switch
+                {
+                    // Item 10: light DTE-dependent weighted average -- see enum doc comment for the
+                    // 0.6/0.4 derivation. Null unless BOTH legs are non-null (never fabricate a
+                    // signal from only one present leg).
+                    VolumeBarMetric.FinalScoreDteWeighted => futuresLegScore is { } fw1 && optionsLegScore is { } ow1
+                        ? (isZeroDte ? 0.4 * fw1 + 0.6 * ow1 : 0.6 * fw1 + 0.4 * ow1)
+                        : null,
+                    // Items 11-12 (futures-primary direction): traded score IS FuturesScore, gated
+                    // separately below via comboOtherLegScore -- see PassesConfirmation.
+                    VolumeBarMetric.FinalScoreBothMustAgree or VolumeBarMetric.FinalScoreFuturesPrimaryOptionsFilter => futuresLegScore,
+                    // Item 12 (options-primary direction): traded score IS OptionsScore instead.
+                    VolumeBarMetric.FinalScoreOptionsPrimaryFuturesFilter => optionsLegScore,
+                    // Item 13: session-phase-weighted blend -- see enum doc comment for the
+                    // 0.7/0.3, 0.5/0.5, 0.3/0.7 per-phase derivation.
+                    VolumeBarMetric.FinalScoreSessionWeighted => futuresLegScore is { } fw2 && optionsLegScore is { } ow2
+                        ? (timeOfDayF < effectiveOptionsSwitchTime ? effectiveSessionWeights.Open * fw2 + (1 - effectiveSessionWeights.Open) * ow2
+                            : timeOfDayF < MidCloseSwitchTime ? effectiveSessionWeights.Mid * fw2 + (1 - effectiveSessionWeights.Mid) * ow2
+                            : effectiveSessionWeights.Close * fw2 + (1 - effectiveSessionWeights.Close) * ow2)
+                        : null,
+                    _ => null,
+                };
+
+                comboOtherLegScore = metric switch
+                {
+                    VolumeBarMetric.FinalScoreBothMustAgree or VolumeBarMetric.FinalScoreFuturesPrimaryOptionsFilter => optionsLegScore,
+                    VolumeBarMetric.FinalScoreOptionsPrimaryFuturesFilter => futuresLegScore,
+                    _ => null,
+                };
             }
             else if (isSessionGated)
             {
@@ -661,6 +1281,33 @@ public static class TradeSimulator
                     ? SignedRank.Compute(-(double)(bar.ClosePrice - hs), highestOiStrikeRank)
                     : null;
             }
+            else if (isDepthMetric)
+            {
+                var depthBar = optionDepthByBarIndex is not null && optionDepthByBarIndex.TryGetValue(bar.BarIndex, out var db) ? db : null;
+                score = metric switch
+                {
+                    // 2026-09-20: built un-negated first (more resting BUY than SELL interest
+                    // reads bullish, mirroring the futures reading) -- win rate stuck below 50%
+                    // at every loose-to-mid percentile, both ATM+/-1 and ATM+/-2 bands, the same
+                    // rejection signature seen repeatedly elsewhere in this project. Flipped here,
+                    // re-verified by re-running rather than inferred.
+                    VolumeBarMetric.AtmComplexDepthImbalance => depthBar is not null
+                        && ComputeImbalanceRatio(depthBar.CallBidQtyAvg + depthBar.PutBidQtyAvg, depthBar.CallAskQtyAvg + depthBar.PutAskQtyAvg) is { } r
+                            ? SignedRank.Compute(-r, atmDepthRank) : null,
+                    VolumeBarMetric.AtmComplexTobDepthDivergence => depthBar is not null && ComputeTobDivergence(depthBar) is { } d
+                        ? SignedRank.Compute(d, atmTobDivergenceRank)
+                        : null,
+                    // 2026-09-20: built un-negated first (more resting depth on the Call side
+                    // reads bullish) -- weak and trade frequency never cleared 4.0/day at any
+                    // setting either sign. Flipped for the empirical-sign check anyway, same
+                    // discipline as every other metric; the frequency problem is structural
+                    // (see this metric's own doc comment) and won't be fixed by a sign flip.
+                    VolumeBarMetric.CallPutDepthImbalance => depthBar is not null
+                        && ComputeImbalanceRatio(depthBar.CallBidQtyAvg + depthBar.CallAskQtyAvg, depthBar.PutBidQtyAvg + depthBar.PutAskQtyAvg) is { } r2
+                            ? SignedRank.Compute(-r2, callPutDepthRank) : null,
+                    _ => null,
+                };
+            }
             else
             {
                 score = ComputeScore(metric, bar, previousClose, previousOi, trendTracker, rankTracker);
@@ -671,10 +1318,29 @@ public static class TradeSimulator
             var tobConfirmScore = metric == VolumeBarMetric.SessionGatedDepthDurationConfirmed
                 ? SignedRank.Compute(bar.TopOfBookImbalance, sessionTobRank)
                 : (double?)null;
+
+            double? skewConfirmScore = null;
+            if (isOptionsScoreConfirmed)
+            {
+                var currentSkewRatioConfirm = optionSkew25DeltaByBarIndex is not null && optionSkew25DeltaByBarIndex.TryGetValue(bar.BarIndex, out var skewBarConfirm) ? skewBarConfirm.SkewRatio : null;
+                skewConfirmScore = previousSkewRatioForConfirm is { } prevRC && currentSkewRatioConfirm is { } curRC
+                    ? SignedRank.Compute(curRC - prevRC, confirmSkewRank)
+                    : null;
+                previousSkewRatioForConfirm = currentSkewRatioConfirm ?? previousSkewRatioForConfirm;
+            }
+
+            double? maxPainConfirmScore = isOptionsScoreMaxPainConfirmed && optionMaxPainByBarIndex is not null
+                && optionMaxPainByBarIndex.TryGetValue(bar.BarIndex, out var mpConfirmBar) && mpConfirmBar.MaxPainStrike is { } mpConfirm
+                    ? SignedRank.Compute(-(double)(bar.ClosePrice - mpConfirm), confirmMaxPainRank)
+                    : null;
+
             previousClose = bar.ClosePrice;
             previousOi = bar.OpenInterestAtClose;
             var scaledScore = score is { } s ? 100.0 * s : (double?)null;
-            var magnitudeRank = metric == VolumeBarMetric.Composite ? compositeMagnitudeRank : trendMagnitudeRank;
+            var magnitudeRank = metric == VolumeBarMetric.Composite ? compositeMagnitudeRank
+                : metric == VolumeBarMetric.OptionsScoreBlend ? blendMagnitudeRank
+                : metric is VolumeBarMetric.FinalScoreDteWeighted or VolumeBarMetric.FinalScoreSessionWeighted ? comboMagnitudeRank
+                : trendMagnitudeRank;
             var percentile = EntryPercentile(metric, scaledScore, magnitudeRank);
 
             if (open is { } position)
@@ -696,8 +1362,8 @@ public static class TradeSimulator
                 }
             }
             else if (!isLastBar && scaledScore is { } sc && percentile is { } p && p >= entryPercentile
-                && IstTimeOfDay(bar.EndTimestamp) >= EntryWindowStart && IstTimeOfDay(bar.EndTimestamp) <= EntryWindowEnd
-                && PassesConfirmation(metric, bar.EndTimestamp, sc, tobConfirmScore))
+                && IstTimeOfDay(bar.EndTimestamp) >= effectiveEntryWindowStart && IstTimeOfDay(bar.EndTimestamp) <= EntryWindowEnd
+                && PassesConfirmation(metric, bar.EndTimestamp, sc, tobConfirmScore, skewConfirmScore, earlyConvictionSign, maxPainConfirmScore, comboOtherLegScore))
             {
                 var side = sc > 0 ? OptionType.Call : OptionType.Put;
                 var candidate = PickAtm(side, bar.ClosePrice);
@@ -732,11 +1398,39 @@ public static class TradeSimulator
     /// position at a time, exit only on the opposite qualifying signal or end-of-day) are otherwise
     /// identical to <see cref="SimulateDayAsync"/> for comparability.
     /// </summary>
+    /// <param name="scoreMetric">
+    /// 2026-09-20: which locked per-bar score to run the crossover on. Defaults to
+    /// <see cref="VolumeBarMetric.SessionGatedDepthDurationConfirmed"/> -- the original, still-locked
+    /// futures crossover behavior, unchanged. Passing
+    /// <see cref="VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmed"/> instead trades the
+    /// OPTIONS side's own locked 3-way-switch score (via <see cref="ComputeOptionsThreeWayScore"/>,
+    /// the exact same computation <see cref="SimulateDayAsync"/> uses for that metric's standard
+    /// percentile-threshold entry -- no duplicated scoring logic), gated on entry by Max Pain sign
+    /// agreement instead of the futures side's TOB gate. No other <see cref="VolumeBarMetric"/>
+    /// value is wired up yet; passing one throws.
+    /// </param>
+    /// <param name="bandWidth">Only meaningful for the options-score path -- the ATM band the Depth
+    /// Imbalance (Open) leg reads from OptionDepthBars. Defaults to 5 (ATM+/-2), the same band
+    /// OptionsScoreThreeWaySwitchMaxPainConfirmed's own locked percentile-threshold runs use.</param>
+    /// <param name="optionsSwitchTime">Only meaningful for the options-score path -- overrides the
+    /// Open/Mid switch boundary (default: the same 10:00 IST <see cref="SessionGateSwitchTime"/>
+    /// every other session-gated metric in this file defaults to).</param>
     public static async Task<List<VolumeBarTrade>> SimulateCrossoverDayAsync(
         NiftySignalDbContext source, VolumeBarDbContext volumeBarDb, DateOnly asOfDate, long barVolumeThreshold,
         int fastBars, int slowBars, double thresholdPoints, CancellationToken cancellationToken,
-        Dictionary<(DateOnly, string), OptionPriceSeries>? sharedPriceCache = null)
+        Dictionary<(DateOnly, string), OptionPriceSeries>? sharedPriceCache = null,
+        VolumeBarMetric scoreMetric = VolumeBarMetric.SessionGatedDepthDurationConfirmed,
+        int bandWidth = 5,
+        TimeSpan? optionsSwitchTime = null)
     {
+        if (scoreMetric is not (VolumeBarMetric.SessionGatedDepthDurationConfirmed or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmed))
+        {
+            throw new ArgumentOutOfRangeException(nameof(scoreMetric), scoreMetric,
+                "SimulateCrossoverDayAsync only supports SessionGatedDepthDurationConfirmed (futures, locked default) and OptionsScoreThreeWaySwitchMaxPainConfirmed (options) so far.");
+        }
+
+        var isOptionsCrossover = scoreMetric == VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmed;
+        var effectiveOptionsSwitchTime = optionsSwitchTime ?? SessionGateSwitchTime;
         var bars = await volumeBarDb.VolumeBars
             .Where(b => b.AsOfDate == asOfDate && b.BarVolumeThreshold == barVolumeThreshold)
             .OrderBy(b => b.BarIndex)
@@ -762,6 +1456,25 @@ public static class TradeSimulator
         var dayStart = bars[0].StartTimestamp;
         var dayEnd = bars[^1].EndTimestamp;
 
+        // Only meaningful for the options-score path -- same tables SimulateDayAsync reads for
+        // OptionsScoreThreeWaySwitchMaxPainConfirmed, loaded here too so ComputeOptionsThreeWayScore
+        // (and the Max Pain confirmation gate below) see identical inputs.
+        Dictionary<int, OptionAtmBarRow>? optionAtmByBarIndex = null;
+        Dictionary<int, OptionDepthBarRow>? optionDepthWideByBarIndex = null;
+        Dictionary<int, OptionMaxPainBarRow>? optionMaxPainByBarIndex = null;
+        if (isOptionsCrossover)
+        {
+            optionAtmByBarIndex = await volumeBarDb.OptionAtmBars
+                .Where(b => b.AsOfDate == asOfDate && b.BarVolumeThreshold == barVolumeThreshold)
+                .ToDictionaryAsync(b => b.BarIndex, cancellationToken);
+            optionDepthWideByBarIndex = await volumeBarDb.OptionDepthBars
+                .Where(b => b.AsOfDate == asOfDate && b.BarVolumeThreshold == barVolumeThreshold && b.BandWidth == bandWidth)
+                .ToDictionaryAsync(b => b.BarIndex, cancellationToken);
+            optionMaxPainByBarIndex = await volumeBarDb.OptionMaxPainBars
+                .Where(b => b.AsOfDate == asOfDate && b.BarVolumeThreshold == barVolumeThreshold)
+                .ToDictionaryAsync(b => b.BarIndex, cancellationToken);
+        }
+
         var priceCache = sharedPriceCache ?? new Dictionary<(DateOnly, string), OptionPriceSeries>();
         async Task<OptionPriceSeries> GetSeriesAsync(string token)
         {
@@ -784,6 +1497,11 @@ public static class TradeSimulator
         var depthRank = new SessionRankTracker();
         var durationRank = new SessionRankTracker();
         var tobRank = new SessionRankTracker();
+        var switch3DepthRank = new SessionRankTracker();
+        var switch3IvMidRank = new SessionRankTracker();
+        var switch3IvCloseRank = new SessionRankTracker();
+        var confirmMaxPainRank = new SessionRankTracker();
+        double? previousAtmIv = null;
         var scoreWindow = new List<double>(slowBars);
         double? previousDiff = null;
 
@@ -796,8 +1514,15 @@ public static class TradeSimulator
             var bar = bars[i];
             var isLastBar = i == bars.Count - 1;
 
-            var score = ComputeSessionGatedScore(bar, previousClose, depthRank, durationRank);
-            var tobConfirmScore = SignedRank.Compute(bar.TopOfBookImbalance, tobRank);
+            var score = isOptionsCrossover
+                ? ComputeOptionsThreeWayScore(bar, previousClose, optionAtmByBarIndex, optionDepthWideByBarIndex,
+                    effectiveOptionsSwitchTime, ref previousAtmIv, switch3DepthRank, switch3IvMidRank, switch3IvCloseRank)
+                : ComputeSessionGatedScore(bar, previousClose, depthRank, durationRank);
+            var tobConfirmScore = isOptionsCrossover ? (double?)null : SignedRank.Compute(bar.TopOfBookImbalance, tobRank);
+            var maxPainConfirmScore = isOptionsCrossover && optionMaxPainByBarIndex is not null
+                && optionMaxPainByBarIndex.TryGetValue(bar.BarIndex, out var mpConfirmBar) && mpConfirmBar.MaxPainStrike is { } mpConfirm
+                    ? SignedRank.Compute(-(double)(bar.ClosePrice - mpConfirm), confirmMaxPainRank)
+                    : (double?)null;
             previousClose = bar.ClosePrice;
 
             double? fastMa = null;
@@ -848,10 +1573,15 @@ public static class TradeSimulator
             }
             else if (!isLastBar && (crossedUp || crossedDown)
                 && IstTimeOfDay(bar.EndTimestamp) >= EntryWindowStart && IstTimeOfDay(bar.EndTimestamp) <= EntryWindowEnd
-                // Same TOB open-window confirmation the locked SessionGatedDepthDurationConfirmed
-                // score itself requires -- see PassesConfirmation's own doc comment for why.
-                && (IstTimeOfDay(bar.EndTimestamp) >= SessionGateSwitchTime
-                    || (crossedUp ? tobConfirmScore > 0 : tobConfirmScore < 0)))
+                && (isOptionsCrossover
+                    // Same Max Pain sign-agreement gate OptionsScoreThreeWaySwitchMaxPainConfirmed's
+                    // own percentile-threshold entry requires (applied every bar, no window
+                    // carve-out -- see PassesConfirmation's own maxPainConfirmScore branch).
+                    ? maxPainConfirmScore is { } mp && (crossedUp ? mp > 0 : mp < 0)
+                    // Same TOB open-window confirmation the locked SessionGatedDepthDurationConfirmed
+                    // score itself requires -- see PassesConfirmation's own doc comment for why.
+                    : IstTimeOfDay(bar.EndTimestamp) >= SessionGateSwitchTime
+                        || (crossedUp ? tobConfirmScore > 0 : tobConfirmScore < 0)))
             {
                 var side = crossedUp ? OptionType.Call : OptionType.Put;
                 var candidate = PickAtm(side, bar.ClosePrice);
@@ -886,6 +1616,25 @@ public static class TradeSimulator
         VolumeBarMetric.PriceImpact => ComputePriceImpactScore(bar, previousClose, rankTracker),
         _ => throw new ArgumentOutOfRangeException(nameof(metric), metric, null),
     };
+
+    /// <summary>`(a-b)/(a+b)`, null-propagating (either side missing means no reading this bar, never fabricated) and null when a+b is exactly 0 (no depth-bearing tick at all -- distinct from a genuine zero imbalance).</summary>
+    static double? ComputeImbalanceRatio(double? a, double? b)
+    {
+        if (a is not { } av || b is not { } bv || av + bv == 0)
+        {
+            return null;
+        }
+
+        return (av - bv) / (av + bv);
+    }
+
+    /// <summary>Full-book ATM-complex imbalance minus touch-only ATM-complex imbalance -- same formula shape as the futures side's own TobDepthDivergence (DepthImbalance − TopOfBookImbalance), just computed from the combined Call+Put band instead of one future.</summary>
+    static double? ComputeTobDivergence(OptionDepthBarRow depthBar)
+    {
+        var fullBook = ComputeImbalanceRatio(depthBar.CallBidQtyAvg + depthBar.PutBidQtyAvg, depthBar.CallAskQtyAvg + depthBar.PutAskQtyAvg);
+        var touchOnly = ComputeImbalanceRatio(depthBar.CallTobBidQtyAvg + depthBar.PutTobBidQtyAvg, depthBar.CallTobAskQtyAvg + depthBar.PutTobAskQtyAvg);
+        return fullBook is { } f && touchOnly is { } t ? f - t : null;
+    }
 
     /// <summary>LongBuildup/ShortCovering read bullish, ShortBuildup/LongUnwinding read bearish, Neutral is 0 -- see <see cref="VolumeBarMetric.FutureOiBuildupQuadrant"/>'s own doc comment.</summary>
     static double? ComputeOiBuildupScore(VolumeBarRow bar, decimal? previousClose, long? previousOi, SessionRankTracker rankTracker)
@@ -1006,14 +1755,98 @@ public static class TradeSimulator
     }
 
     /// <summary>
+    /// 2026-09-20, factored out of <see cref="SimulateDayAsync"/>'s own <c>isOptionsScore3Way</c>
+    /// dispatch branch so <see cref="SimulateCrossoverDayAsync"/> can trade the IDENTICAL per-bar
+    /// score for <see cref="VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmed"/> (and its
+    /// 3-way-switch siblings) instead of duplicating this logic -- see that enum value's own doc
+    /// comment for the Open/Mid/Close leg design (Depth Imbalance / Price-signed ΔIV / raw ΔIV).
+    /// <paramref name="previousAtmIv"/> is threaded through by ref, same "keep primed through the
+    /// Open window" convention the original inline code used.
+    /// </summary>
+    static double? ComputeOptionsThreeWayScore(
+        VolumeBarRow bar, decimal? previousClose,
+        Dictionary<int, OptionAtmBarRow>? optionAtmByBarIndex,
+        Dictionary<int, OptionDepthBarRow>? optionDepthWideByBarIndex,
+        TimeSpan effectiveOptionsSwitchTime,
+        ref double? previousAtmIv,
+        SessionRankTracker depthRank, SessionRankTracker ivMidRank, SessionRankTracker ivCloseRank)
+    {
+        var currentAtmIv3 = optionAtmByBarIndex is not null && optionAtmByBarIndex.TryGetValue(bar.BarIndex, out var atmBar3) ? atmBar3.AtmIv : null;
+        var timeOfDay3 = IstTimeOfDay(bar.EndTimestamp);
+
+        double? score;
+        if (timeOfDay3 < effectiveOptionsSwitchTime)
+        {
+            var wideDepthBar3 = optionDepthWideByBarIndex is not null && optionDepthWideByBarIndex.TryGetValue(bar.BarIndex, out var wdb3) ? wdb3 : null;
+            score = wideDepthBar3 is not null
+                && ComputeImbalanceRatio(wideDepthBar3.CallBidQtyAvg + wideDepthBar3.PutBidQtyAvg, wideDepthBar3.CallAskQtyAvg + wideDepthBar3.PutAskQtyAvg) is { } depthRatio3
+                    ? SignedRank.Compute(-depthRatio3, depthRank) : null;
+        }
+        else if (timeOfDay3 < MidCloseSwitchTime)
+        {
+            score = previousAtmIv is { } prevIv3M && currentAtmIv3 is { } curIv3M && previousClose is { } prevClose3M
+                ? SignedRank.Compute(-Math.Sign(bar.ClosePrice - prevClose3M) * (curIv3M - prevIv3M), ivMidRank)
+                : null;
+        }
+        else
+        {
+            // Close leg: RAW ΔIV, not price-signed -- the session-phase split's own best Close
+            // performer was the raw (un-signed) variant, not the Mid leg's formula.
+            score = previousAtmIv is { } prevIv3C && currentAtmIv3 is { } curIv3C
+                ? SignedRank.Compute(curIv3C - prevIv3C, ivCloseRank)
+                : null;
+        }
+
+        previousAtmIv = currentAtmIv3 ?? previousAtmIv;
+        return score;
+    }
+
+    /// <summary>
     /// Entry-time gate for <see cref="VolumeBarMetric.SessionGatedDepthDurationConfirmed"/> -- a
     /// no-op (always true) for every other metric. During the open (before 10:00 IST) a new
     /// position additionally requires TopOfBookImbalance's own score to agree in sign with the
     /// switched score being traded; outside the open, no confirmation is required (TOB's own edge
     /// there is close to noise -- see the enum value's own doc comment for why).
     /// </summary>
-    static bool PassesConfirmation(VolumeBarMetric metric, DateTimeOffset barEnd, double scaledScore, double? tobConfirmScore)
+    static bool PassesConfirmation(VolumeBarMetric metric, DateTimeOffset barEnd, double scaledScore, double? tobConfirmScore, double? skewConfirmScore = null, int? earlyConvictionSign = null, double? maxPainConfirmScore = null, double? comboOtherLegScore = null)
     {
+        if (metric is VolumeBarMetric.FinalScoreBothMustAgree or VolumeBarMetric.FinalScoreFuturesPrimaryOptionsFilter or VolumeBarMetric.FinalScoreOptionsPrimaryFuturesFilter)
+        {
+            // 2026-09-20, Phase 5 plan items 11-12 -- see these enum values' own doc comments.
+            // Applied all day (no window carve-out) since neither parent has an established narrow
+            // window where the other reads as noise, unlike the futures side's own open-only TOB
+            // gate or the options 3-way's own narrower confirmation experiments.
+            return comboOtherLegScore is { } other && other != 0 && Math.Sign(other) == Math.Sign(scaledScore);
+        }
+
+        if (metric == VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmed)
+        {
+            // 2026-09-20, Phase 5 prep item 8 -- see this enum value's own doc comment. Applied
+            // all day, same as item 6's Skew Change gate, for a like-for-like comparison.
+            return maxPainConfirmScore is { } mp && Math.Sign(mp) == Math.Sign(scaledScore);
+        }
+
+        if (metric == VolumeBarMetric.OptionsScoreThreeWaySwitchConfirmed)
+        {
+            // 2026-09-20, Phase 5 prep item 6 -- see this enum value's own doc comment. Applied
+            // ALL DAY (no time-window carve-out, unlike the futures side's own open-only TOB
+            // gate), since Skew Change doesn't have a narrow window where it's uniquely strong.
+            return skewConfirmScore is { } sk && Math.Sign(sk) == Math.Sign(scaledScore);
+        }
+
+        if (metric == VolumeBarMetric.OptionsScoreThreeWaySwitchEarlyConviction)
+        {
+            // 2026-09-20, Phase 5 prep item 7 -- see this enum value's own doc comment. Only
+            // gates the Mid/Close legs (10:00 IST onward); the Open leg trades ungated since the
+            // 10:30 observation window hasn't closed yet during Open trading.
+            if (IstTimeOfDay(barEnd) < SessionGateSwitchTime)
+            {
+                return true;
+            }
+
+            return earlyConvictionSign is { } ec && ec != 0 && ec == Math.Sign(scaledScore);
+        }
+
         if (metric != VolumeBarMetric.SessionGatedDepthDurationConfirmed || IstTimeOfDay(barEnd) >= SessionGateSwitchTime)
         {
             return true;
@@ -1036,15 +1869,16 @@ public static class TradeSimulator
         }
 
         var magnitude = Math.Abs(value);
-        if (metric != VolumeBarMetric.TrendReversion && metric != VolumeBarMetric.Composite)
+        if (metric != VolumeBarMetric.TrendReversion && metric != VolumeBarMetric.Composite && metric != VolumeBarMetric.OptionsScoreBlend
+            && metric != VolumeBarMetric.FinalScoreDteWeighted && metric != VolumeBarMetric.FinalScoreSessionWeighted)
         {
             // Already a percentile by construction (SignedRank) -- no second rank layer.
             return magnitude;
         }
 
-        // TrendReversion is a raw bounded ratio, Composite is a weighted blend of already-ranked
-        // values -- neither is percentile-shaped by construction, so both get their own dedicated
-        // magnitude tracker (the caller picks which one based on metric).
+        // TrendReversion is a raw bounded ratio, Composite/OptionsScoreBlend are weighted blends
+        // of already-ranked values -- none of the three is percentile-shaped by construction, so
+        // each gets its own dedicated magnitude tracker (the caller picks which one based on metric).
         var rank = magnitudeRank.Rank(magnitude);
         magnitudeRank.Add(magnitude);
         return rank;

@@ -10,6 +10,32 @@ using NiftySignal.VolumeBarData;
 // own requirement) -- same convention NiftySignal.MetricTrials/Program.cs already uses.
 string FormatIst(DateTimeOffset t) => t.ToOffset(TimeSpan.FromHours(5.5)).ToString("HH:mm:ss");
 
+// 2026-09-20: PowerShell (and some other shells) silently drop/collapse empty-string ""
+// placeholder args passed through `dotnet run --`, which shifts every later positional arg left
+// by one -- confirmed the hard way when a stopLossPercent placeholder vanished and "5" (meant for
+// depthBandWidth) landed in stopLossPercent instead, producing a nonsense 5%-stop run that looked
+// like a real result. Fix: trailing optional args on "trade"/"calibrate" are --name=value flags,
+// found anywhere in the arg list, so skipping one never requires a placeholder for the others.
+(string[] Positional, Dictionary<string, string> Named) SplitNamedArgs(string[] rawArgs)
+{
+    var positional = new List<string>();
+    var named = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+    foreach (var a in rawArgs)
+    {
+        if (a.StartsWith("--", StringComparison.Ordinal) && a.Contains('='))
+        {
+            var idx = a.IndexOf('=');
+            named[a[2..idx]] = a[(idx + 1)..];
+        }
+        else
+        {
+            positional.Add(a);
+        }
+    }
+
+    return (positional.ToArray(), named);
+}
+
 // 2026-09-17 volume-cadence plan. Usage:
 //   dotnet run --project NiftySignal.VolumeBarData -- <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [barVolumeThreshold] [sourceDatabaseNameOverride]
 //   dotnet run --project NiftySignal.VolumeBarData -- 2026-09-08 2026-09-16
@@ -119,14 +145,14 @@ var sharedOptionPriceCache = new Dictionary<(DateOnly, string), OptionPriceSerie
 
 // Shared by "trade", "calibrate", and "session-phase" -- runs one (metric, entryPercentile,
 // trendWindowBars, barVolumeThreshold) combination across a date range and returns every trade fired.
-async Task<List<VolumeBarTrade>> RunRangeAsync(DateOnly from, DateOnly to, VolumeBarMetric metric, double entryPercentile, int trendWindowBars, long threshold, decimal? stopLossPercent = null, long? rollingSubBarThreshold = null)
+async Task<List<VolumeBarTrade>> RunRangeAsync(DateOnly from, DateOnly to, VolumeBarMetric metric, double entryPercentile, int trendWindowBars, long threshold, decimal? stopLossPercent = null, long? rollingSubBarThreshold = null, int depthBandWidth = OptionDepthPopulator.DefaultBandWidth, TimeSpan? optionsSwitchTime = null, TimeSpan? entryWindowStartOverride = null, (double Open, double Mid, double Close)? sessionWeightsOnFutures = null)
 {
     var result = new List<VolumeBarTrade>();
     for (var date = from; date <= to; date = date.AddDays(1))
     {
         await using var source = new NiftySignalDbContext(tradeSourceOptions);
         await using var volumeBars = new VolumeBarDbContext(volumeBarOptions);
-        result.AddRange(await TradeSimulator.SimulateDayAsync(source, volumeBars, date, threshold, metric, entryPercentile, trendWindowBars, CancellationToken.None, sharedOptionPriceCache, stopLossPercent, rollingSubBarThreshold));
+        result.AddRange(await TradeSimulator.SimulateDayAsync(source, volumeBars, date, threshold, metric, entryPercentile, trendWindowBars, CancellationToken.None, sharedOptionPriceCache, stopLossPercent, rollingSubBarThreshold, depthBandWidth, optionsSwitchTime, entryWindowStartOverride, sessionWeightsOnFutures));
     }
 
     return result;
@@ -167,18 +193,19 @@ if (args.Length > 0 && string.Equals(args[0], "populate-options-band-flow", Stri
         || !DateOnly.TryParseExact(args[1], "yyyy-MM-dd", out var flowFromDate)
         || !DateOnly.TryParseExact(args[2], "yyyy-MM-dd", out var flowToDate))
     {
-        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- populate-options-band-flow <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [barVolumeThreshold]");
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- populate-options-band-flow <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [barVolumeThreshold] [bandWidth=3, i.e. ATM+/-1; pass 5 for ATM+/-2]");
         return 1;
     }
 
     var flowThreshold = args.Length > 3 ? long.Parse(args[3]) : 1300L;
+    var flowBandWidth = args.Length > 4 ? int.Parse(args[4]) : OptionBandFlowPopulator.DefaultBandWidth;
 
     for (var date = flowFromDate; date <= flowToDate; date = date.AddDays(1))
     {
         await using var source = new NiftySignalDbContext(tradeSourceOptions);
         await using var volumeBars = new VolumeBarDbContext(volumeBarOptions);
-        var result = await OptionBandFlowPopulator.PopulateDayAsync(source, volumeBars, date, flowThreshold, CancellationToken.None);
-        Console.WriteLine($"{date:yyyy-MM-dd} @ {flowThreshold}: {result.Outcome} ({result.RowCount} rows)");
+        var result = await OptionBandFlowPopulator.PopulateDayAsync(source, volumeBars, date, flowThreshold, CancellationToken.None, flowBandWidth);
+        Console.WriteLine($"{date:yyyy-MM-dd} @ {flowThreshold}, band={flowBandWidth}: {result.Outcome} ({result.RowCount} rows)");
     }
 
     return 0;
@@ -190,18 +217,19 @@ if (args.Length > 0 && string.Equals(args[0], "populate-options-oi", StringCompa
         || !DateOnly.TryParseExact(args[1], "yyyy-MM-dd", out var oiFromDate)
         || !DateOnly.TryParseExact(args[2], "yyyy-MM-dd", out var oiToDate))
     {
-        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- populate-options-oi <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [barVolumeThreshold]");
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- populate-options-oi <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [barVolumeThreshold] [bandWidth=3, i.e. ATM+/-1; pass 5 for ATM+/-2]");
         return 1;
     }
 
     var oiThreshold = args.Length > 3 ? long.Parse(args[3]) : 1300L;
+    var oiBandWidth = args.Length > 4 ? int.Parse(args[4]) : OptionOiPopulator.DefaultBandWidth;
 
     for (var date = oiFromDate; date <= oiToDate; date = date.AddDays(1))
     {
         await using var source = new NiftySignalDbContext(tradeSourceOptions);
         await using var volumeBars = new VolumeBarDbContext(volumeBarOptions);
-        var result = await OptionOiPopulator.PopulateDayAsync(source, volumeBars, date, oiThreshold, CancellationToken.None);
-        Console.WriteLine($"{date:yyyy-MM-dd} @ {oiThreshold}: {result.Outcome} ({result.RowCount} rows)");
+        var result = await OptionOiPopulator.PopulateDayAsync(source, volumeBars, date, oiThreshold, CancellationToken.None, oiBandWidth);
+        Console.WriteLine($"{date:yyyy-MM-dd} @ {oiThreshold}, band={oiBandWidth}: {result.Outcome} ({result.RowCount} rows)");
     }
 
     return 0;
@@ -263,14 +291,18 @@ if (args.Length > 0 && string.Equals(args[0], "correlate-options", StringCompari
         return 1;
     }
 
+    // 2026-09-20, Phase 3: extended from the original 4-metric version to all 8 confirmed
+    // standalone/filter candidates, each computed with its OWN exact locked formula (matching
+    // TradeSimulator's own dispatch, not re-derived differently here) -- IV raw and price-signed
+    // are two genuinely different series from the same underlying data, kept separate rather than
+    // assumed redundant. Depth Imbalance uses ATM±2 (its own adopted band); everything else stays
+    // at whatever bandWidth argument is passed (default ATM±1, matching every other locked config).
     var corrThreshold = args.Length > 3 ? long.Parse(args[3]) : 1300L;
+    var corrBandWidth = args.Length > 4 ? int.Parse(args[4]) : OptionDepthPopulator.DefaultBandWidth;
+    const int depthImbalanceBandWidth = 5; // ATM+/-2, its own adopted config -- independent of corrBandWidth.
 
-    // Raw (pre-SignedRank) per-bar values for the 4 confirmed metrics, computed the SAME way
-    // TradeSimulator does -- not re-derived differently here.
-    var ivSeries = new List<double>();
-    var volSeries = new List<double>();
-    var oiSeries = new List<double>();
-    var skewSeries = new List<double>();
+    string[] names = ["IvRaw", "IvPriceSigned", "VolDelta", "OiDelta", "SkewChange", "DepthImbalance", "TobDivergence", "MaxPainDist"];
+    var series = names.ToDictionary(n => n, _ => new List<double>());
     var dayBreak = new List<(DateOnly Date, int Count)>();
 
     for (var date = corrFromDate; date <= corrToDate; date = date.AddDays(1))
@@ -286,9 +318,12 @@ if (args.Length > 0 && string.Equals(args[0], "correlate-options", StringCompari
         }
 
         var atmByBar = await volumeBars.OptionAtmBars.Where(b => b.AsOfDate == date && b.BarVolumeThreshold == corrThreshold).ToDictionaryAsync(b => b.BarIndex);
-        var flowByBar = await volumeBars.OptionBandFlowBars.Where(b => b.AsOfDate == date && b.BarVolumeThreshold == corrThreshold).ToDictionaryAsync(b => b.BarIndex);
-        var oiByBar = await volumeBars.OptionOiBars.Where(b => b.AsOfDate == date && b.BarVolumeThreshold == corrThreshold).ToDictionaryAsync(b => b.BarIndex);
+        var flowByBar = await volumeBars.OptionBandFlowBars.Where(b => b.AsOfDate == date && b.BarVolumeThreshold == corrThreshold && b.BandWidth == corrBandWidth).ToDictionaryAsync(b => b.BarIndex);
+        var oiByBar = await volumeBars.OptionOiBars.Where(b => b.AsOfDate == date && b.BarVolumeThreshold == corrThreshold && b.BandWidth == corrBandWidth).ToDictionaryAsync(b => b.BarIndex);
         var skewByBar = await volumeBars.OptionSkew25DeltaBars.Where(b => b.AsOfDate == date && b.BarVolumeThreshold == corrThreshold).ToDictionaryAsync(b => b.BarIndex);
+        var depthByBar = await volumeBars.OptionDepthBars.Where(b => b.AsOfDate == date && b.BarVolumeThreshold == corrThreshold && b.BandWidth == depthImbalanceBandWidth).ToDictionaryAsync(b => b.BarIndex);
+        var tobDepthByBar = await volumeBars.OptionDepthBars.Where(b => b.AsOfDate == date && b.BarVolumeThreshold == corrThreshold && b.BandWidth == corrBandWidth).ToDictionaryAsync(b => b.BarIndex);
+        var maxPainByBar = await volumeBars.OptionMaxPainBars.Where(b => b.AsOfDate == date && b.BarVolumeThreshold == corrThreshold).ToDictionaryAsync(b => b.BarIndex);
 
         decimal? previousClose = null;
         double? previousAtmIv = null;
@@ -297,12 +332,14 @@ if (args.Length > 0 && string.Equals(args[0], "correlate-options", StringCompari
 
         foreach (var bar in bars)
         {
-            double? ivRaw = null;
-            if (atmByBar.TryGetValue(bar.BarIndex, out var atmBar) && atmBar.AtmIv is { } curIv && previousAtmIv is { } prevIv && previousClose is { } prevClose)
+            double? ivDelta = null;
+            if (atmByBar.TryGetValue(bar.BarIndex, out var atmBar) && atmBar.AtmIv is { } curIv && previousAtmIv is { } prevIv)
             {
-                ivRaw = -Math.Sign(bar.ClosePrice - prevClose) * (curIv - prevIv);
+                ivDelta = curIv - prevIv;
             }
 
+            double? ivRaw = ivDelta;
+            double? ivPriceSigned = ivDelta is { } d0 && previousClose is { } prevClose0 ? -Math.Sign(bar.ClosePrice - prevClose0) * d0 : null;
             double? volRaw = flowByBar.TryGetValue(bar.BarIndex, out var flowBar) ? (double)(flowBar.PutNotionalVolume - flowBar.CallNotionalVolume) : null;
             double? oiRaw = oiByBar.TryGetValue(bar.BarIndex, out var oiBar) ? (double)(oiBar.CallOiChangeNotional - oiBar.PutOiChangeNotional) : null;
 
@@ -312,12 +349,45 @@ if (args.Length > 0 && string.Equals(args[0], "correlate-options", StringCompari
                 skewRaw = curRatio - prevRatio;
             }
 
-            if (ivRaw is { } iv && volRaw is { } vol && oiRaw is { } oi && skewRaw is { } sk)
+            double? depthRaw = null;
+            if (depthByBar.TryGetValue(bar.BarIndex, out var depthBar))
             {
-                ivSeries.Add(iv);
-                volSeries.Add(vol);
-                oiSeries.Add(oi);
-                skewSeries.Add(sk);
+                var bidSum = depthBar.CallBidQtyAvg + depthBar.PutBidQtyAvg;
+                var askSum = depthBar.CallAskQtyAvg + depthBar.PutAskQtyAvg;
+                if (bidSum is { } bs && askSum is { } aSum && bs + aSum != 0)
+                {
+                    depthRaw = -(bs - aSum) / (bs + aSum); // negated -- matches the adopted sign flip
+                }
+            }
+
+            double? tobDivRaw = null;
+            if (tobDepthByBar.TryGetValue(bar.BarIndex, out var tobBar))
+            {
+                var fullBid = tobBar.CallBidQtyAvg + tobBar.PutBidQtyAvg;
+                var fullAsk = tobBar.CallAskQtyAvg + tobBar.PutAskQtyAvg;
+                var touchBid = tobBar.CallTobBidQtyAvg + tobBar.PutTobBidQtyAvg;
+                var touchAsk = tobBar.CallTobAskQtyAvg + tobBar.PutTobAskQtyAvg;
+                if (fullBid is { } fb && fullAsk is { } fa && fb + fa != 0 && touchBid is { } tb && touchAsk is { } ta && tb + ta != 0)
+                {
+                    tobDivRaw = (fb - fa) / (fb + fa) - (tb - ta) / (tb + ta);
+                }
+            }
+
+            double? maxPainRaw = maxPainByBar.TryGetValue(bar.BarIndex, out var mpBar) && mpBar.MaxPainStrike is { } mp
+                ? -(double)(bar.ClosePrice - mp)
+                : null;
+
+            if (ivRaw is { } iv && ivPriceSigned is { } ivps && volRaw is { } vol && oiRaw is { } oi && skewRaw is { } sk
+                && depthRaw is { } dep && tobDivRaw is { } tdv && maxPainRaw is { } mpr)
+            {
+                series["IvRaw"].Add(iv);
+                series["IvPriceSigned"].Add(ivps);
+                series["VolDelta"].Add(vol);
+                series["OiDelta"].Add(oi);
+                series["SkewChange"].Add(sk);
+                series["DepthImbalance"].Add(dep);
+                series["TobDivergence"].Add(tdv);
+                series["MaxPainDist"].Add(mpr);
                 dayCount++;
             }
 
@@ -346,36 +416,29 @@ if (args.Length > 0 && string.Equals(args[0], "correlate-options", StringCompari
             varB += db * db;
         }
 
-        return cov / Math.Sqrt(varA * varB);
+        return varA > 0 && varB > 0 ? cov / Math.Sqrt(varA * varB) : 0.0;
     }
 
-    Console.WriteLine($"=== Correlation, pooled bars with all 4 present: {ivSeries.Count} ===");
+    var totalCount = series[names[0]].Count;
+    Console.WriteLine($"=== Correlation, pooled bars with all 8 present: {totalCount} ===");
     Console.WriteLine($"Per-day usable-bar counts: {string.Join(", ", dayBreak.Select(d => $"{d.Date:yyyy-MM-dd}={d.Count}"))}");
-    Console.WriteLine($"IV(price-signed) vs VolumeDelta:  {Pearson(ivSeries, volSeries):F4}");
-    Console.WriteLine($"IV(price-signed) vs OiDelta:      {Pearson(ivSeries, oiSeries):F4}");
-    Console.WriteLine($"IV(price-signed) vs SkewChange:   {Pearson(ivSeries, skewSeries):F4}");
-    Console.WriteLine($"VolumeDelta vs OiDelta:           {Pearson(volSeries, oiSeries):F4}");
-    Console.WriteLine($"VolumeDelta vs SkewChange:        {Pearson(volSeries, skewSeries):F4}");
-    Console.WriteLine($"OiDelta vs SkewChange:            {Pearson(oiSeries, skewSeries):F4}");
+    Console.WriteLine();
+    Console.Write($"{"",16}");
+    foreach (var n in names)
+    {
+        Console.Write($"{n,15}");
+    }
 
     Console.WriteLine();
-    Console.WriteLine("=== Per-day correlation (IV vs Volume, IV vs OI, IV vs Skew, Vol vs OI, Vol vs Skew, OI vs Skew) ===");
-    var offset = 0;
-    foreach (var (date, count) in dayBreak)
+    foreach (var a in names)
     {
-        if (count < 3)
+        Console.Write($"{a,-16}");
+        foreach (var b in names)
         {
-            Console.WriteLine($"{date:yyyy-MM-dd}: too few bars ({count}) to correlate");
-            offset += count;
-            continue;
+            Console.Write($"{Pearson(series[a], series[b]),15:F3}");
         }
 
-        var ivD = ivSeries.GetRange(offset, count);
-        var volD = volSeries.GetRange(offset, count);
-        var oiD = oiSeries.GetRange(offset, count);
-        var skD = skewSeries.GetRange(offset, count);
-        Console.WriteLine($"{date:yyyy-MM-dd} (n={count}): IV-Vol={Pearson(ivD, volD):F3}, IV-OI={Pearson(ivD, oiD):F3}, IV-Skew={Pearson(ivD, skD):F3}, Vol-OI={Pearson(volD, oiD):F3}, Vol-Skew={Pearson(volD, skD):F3}, OI-Skew={Pearson(oiD, skD):F3}");
-        offset += count;
+        Console.WriteLine();
     }
 
     return 0;
@@ -383,20 +446,23 @@ if (args.Length > 0 && string.Equals(args[0], "correlate-options", StringCompari
 
 if (args.Length > 0 && string.Equals(args[0], "session-phase", StringComparison.OrdinalIgnoreCase))
 {
-    if (args.Length < 6
-        || !DateOnly.TryParseExact(args[1], "yyyy-MM-dd", out var spFromDate)
-        || !DateOnly.TryParseExact(args[2], "yyyy-MM-dd", out var spToDate)
-        || !Enum.TryParse<VolumeBarMetric>(args[3], ignoreCase: true, out var spMetric))
+    var (spPositional, spNamed) = SplitNamedArgs(args);
+    if (spPositional.Length < 6
+        || !DateOnly.TryParseExact(spPositional[1], "yyyy-MM-dd", out var spFromDate)
+        || !DateOnly.TryParseExact(spPositional[2], "yyyy-MM-dd", out var spToDate)
+        || !Enum.TryParse<VolumeBarMetric>(spPositional[3], ignoreCase: true, out var spMetric))
     {
-        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- session-phase <fromDate> <toDate> <metric> <entryPercentile> <barVolumeThreshold> [excludeDates, comma-separated]");
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- session-phase <fromDate> <toDate> <metric> <entryPercentile> <barVolumeThreshold> [--exclude=date,date] [--stop=N] [--band=N]");
         return 1;
     }
 
-    var spPercentile = double.Parse(args[4]);
-    var spThreshold = long.Parse(args[5]);
-    var spExcludeDates = args.Length > 6
-        ? args[6].Split(',').Select(d => DateOnly.ParseExact(d, "yyyy-MM-dd")).ToHashSet()
+    var spPercentile = double.Parse(spPositional[4]);
+    var spThreshold = long.Parse(spPositional[5]);
+    var spExcludeDates = spNamed.TryGetValue("exclude", out var spExcludeStr)
+        ? spExcludeStr.Split(',').Select(d => DateOnly.ParseExact(d, "yyyy-MM-dd")).ToHashSet()
         : [];
+    var spStopLossPercent = spNamed.TryGetValue("stop", out var spStopStr) ? (decimal?)(decimal.Parse(spStopStr) / 100m) : null;
+    var spBandWidth = spNamed.TryGetValue("band", out var spBandStr) ? int.Parse(spBandStr) : OptionDepthPopulator.DefaultBandWidth;
 
     var spTrades = new List<VolumeBarTrade>();
     for (var date = spFromDate; date <= spToDate; date = date.AddDays(1))
@@ -406,7 +472,7 @@ if (args.Length > 0 && string.Equals(args[0], "session-phase", StringComparison.
             continue;
         }
 
-        spTrades.AddRange(await RunRangeAsync(date, date, spMetric, spPercentile, 15, spThreshold));
+        spTrades.AddRange(await RunRangeAsync(date, date, spMetric, spPercentile, 15, spThreshold, spStopLossPercent, rollingSubBarThreshold: null, depthBandWidth: spBandWidth));
     }
 
     static TimeSpan Ist(DateTimeOffset t) => t.ToOffset(TimeSpan.FromHours(5.5)).TimeOfDay;
@@ -445,28 +511,57 @@ if (args.Length > 0 && string.Equals(args[0], "session-phase", StringComparison.
     return 0;
 }
 
-if (args.Length > 0 && string.Equals(args[0], "crossover", StringComparison.OrdinalIgnoreCase))
+if (args.Length > 0 && string.Equals(args[0], "populate-options-depth", StringComparison.OrdinalIgnoreCase))
 {
     if (args.Length < 3
-        || !DateOnly.TryParseExact(args[1], "yyyy-MM-dd", out var coFromDate)
-        || !DateOnly.TryParseExact(args[2], "yyyy-MM-dd", out var coToDate))
+        || !DateOnly.TryParseExact(args[1], "yyyy-MM-dd", out var pdFromDate)
+        || !DateOnly.TryParseExact(args[2], "yyyy-MM-dd", out var pdToDate))
     {
-        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- crossover <fromDate> <toDate> [fastBars=4] [slowBars=12] [thresholdPoints=2] [barVolumeThreshold=2600]");
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- populate-options-depth <fromDate> <toDate> [barVolumeThreshold] [bandWidth=3, i.e. ATM+/-1; pass 5 for ATM+/-2]");
         return 1;
     }
 
-    var coFastBars = args.Length > 3 ? int.Parse(args[3]) : 4;
-    var coSlowBars = args.Length > 4 ? int.Parse(args[4]) : 12;
-    var coThreshold = args.Length > 5 ? double.Parse(args[5]) : 2.0;
-    var coBarVolumeThreshold = args.Length > 6 ? long.Parse(args[6]) : 2600L;
+    var pdThreshold = args.Length > 3 ? long.Parse(args[3]) : 1300L;
+    var pdBandWidth = args.Length > 4 ? int.Parse(args[4]) : OptionDepthPopulator.DefaultBandWidth;
 
-    Console.WriteLine($"=== Crossover simulation: fast={coFastBars} slow={coSlowBars} thresholdPoints={coThreshold} barThreshold={coBarVolumeThreshold} ===");
+    for (var date = pdFromDate; date <= pdToDate; date = date.AddDays(1))
+    {
+        await using var source = new NiftySignalDbContext(tradeSourceOptions);
+        await using var volumeBars = new VolumeBarDbContext(volumeBarOptions);
+        var result = await OptionDepthPopulator.PopulateDayAsync(source, volumeBars, date, pdThreshold, CancellationToken.None, pdBandWidth);
+        Console.WriteLine($"{date:yyyy-MM-dd} @ {pdThreshold}, band={pdBandWidth}: {result.Outcome} ({result.RowCount} rows)");
+    }
+
+    return 0;
+}
+
+if (args.Length > 0 && string.Equals(args[0], "crossover", StringComparison.OrdinalIgnoreCase))
+{
+    var (coPositional, coNamed) = SplitNamedArgs(args);
+    if (coPositional.Length < 3
+        || !DateOnly.TryParseExact(coPositional[1], "yyyy-MM-dd", out var coFromDate)
+        || !DateOnly.TryParseExact(coPositional[2], "yyyy-MM-dd", out var coToDate))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- crossover <fromDate> <toDate> [fastBars=4] [slowBars=12] [thresholdPoints=2] [barVolumeThreshold=2600] [--metric=SessionGatedDepthDurationConfirmed|OptionsScoreThreeWaySwitchMaxPainConfirmed] [--band=5]");
+        return 1;
+    }
+
+    var coFastBars = coPositional.Length > 3 ? int.Parse(coPositional[3]) : 4;
+    var coSlowBars = coPositional.Length > 4 ? int.Parse(coPositional[4]) : 12;
+    var coThreshold = coPositional.Length > 5 ? double.Parse(coPositional[5]) : 2.0;
+    var coBarVolumeThreshold = coPositional.Length > 6 ? long.Parse(coPositional[6]) : 2600L;
+    var coScoreMetric = coNamed.TryGetValue("metric", out var coMetricStr)
+        ? Enum.Parse<VolumeBarMetric>(coMetricStr, ignoreCase: true)
+        : VolumeBarMetric.SessionGatedDepthDurationConfirmed;
+    var coBandWidth = coNamed.TryGetValue("band", out var coBandStr) ? int.Parse(coBandStr) : 5;
+
+    Console.WriteLine($"=== Crossover simulation: metric={coScoreMetric} fast={coFastBars} slow={coSlowBars} thresholdPoints={coThreshold} barThreshold={coBarVolumeThreshold} ===");
     var coAllTrades = new List<VolumeBarTrade>();
     for (var date = coFromDate; date <= coToDate; date = date.AddDays(1))
     {
         await using var source = new NiftySignalDbContext(tradeSourceOptions);
         await using var volumeBars = new VolumeBarDbContext(volumeBarOptions);
-        var dayTrades = await TradeSimulator.SimulateCrossoverDayAsync(source, volumeBars, date, coBarVolumeThreshold, coFastBars, coSlowBars, coThreshold, CancellationToken.None, sharedOptionPriceCache);
+        var dayTrades = await TradeSimulator.SimulateCrossoverDayAsync(source, volumeBars, date, coBarVolumeThreshold, coFastBars, coSlowBars, coThreshold, CancellationToken.None, sharedOptionPriceCache, coScoreMetric, coBandWidth);
         if (dayTrades.Count == 0)
         {
             continue;
@@ -499,22 +594,27 @@ if (args.Length > 0 && string.Equals(args[0], "crossover", StringComparison.Ordi
 
 if (args.Length > 0 && string.Equals(args[0], "crossover-calibrate", StringComparison.OrdinalIgnoreCase))
 {
-    if (args.Length < 3
-        || !DateOnly.TryParseExact(args[1], "yyyy-MM-dd", out var ccFromDate)
-        || !DateOnly.TryParseExact(args[2], "yyyy-MM-dd", out var ccToDate))
+    var (ccPositional, ccNamed) = SplitNamedArgs(args);
+    if (ccPositional.Length < 3
+        || !DateOnly.TryParseExact(ccPositional[1], "yyyy-MM-dd", out var ccFromDate)
+        || !DateOnly.TryParseExact(ccPositional[2], "yyyy-MM-dd", out var ccToDate))
     {
-        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- crossover-calibrate <fromDate> <toDate> [barVolumeThreshold=2600] [fastOptions=3,4,6] [slowOptions=10,12,16,20] [thresholdOptions=1,2,3,5] [targetTradesPerDayMin=7] [targetTradesPerDayMax=20]");
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- crossover-calibrate <fromDate> <toDate> [barVolumeThreshold=2600] [fastOptions=3,4,6] [slowOptions=10,12,16,20] [thresholdOptions=1,2,3,5] [targetTradesPerDayMin=7] [targetTradesPerDayMax=20] [--metric=SessionGatedDepthDurationConfirmed|OptionsScoreThreeWaySwitchMaxPainConfirmed] [--band=5]");
         return 1;
     }
 
-    var ccBarVolumeThreshold = args.Length > 3 ? long.Parse(args[3]) : 2600L;
-    var fastOptions = args.Length > 4 ? args[4].Split(',').Select(int.Parse).ToArray() : [3, 4, 6];
-    var slowOptions = args.Length > 5 ? args[5].Split(',').Select(int.Parse).ToArray() : [10, 12, 16, 20];
-    var thresholdOptions = args.Length > 6 ? args[6].Split(',').Select(double.Parse).ToArray() : [1, 2, 3, 5];
-    var ccTargetMin = args.Length > 7 ? double.Parse(args[7]) : 7.0;
-    var ccTargetMax = args.Length > 8 ? double.Parse(args[8]) : 20.0;
+    var ccBarVolumeThreshold = ccPositional.Length > 3 ? long.Parse(ccPositional[3]) : 2600L;
+    var fastOptions = ccPositional.Length > 4 ? ccPositional[4].Split(',').Select(int.Parse).ToArray() : [3, 4, 6];
+    var slowOptions = ccPositional.Length > 5 ? ccPositional[5].Split(',').Select(int.Parse).ToArray() : [10, 12, 16, 20];
+    var thresholdOptions = ccPositional.Length > 6 ? ccPositional[6].Split(',').Select(double.Parse).ToArray() : [1, 2, 3, 5];
+    var ccTargetMin = ccPositional.Length > 7 ? double.Parse(ccPositional[7]) : 7.0;
+    var ccTargetMax = ccPositional.Length > 8 ? double.Parse(ccPositional[8]) : 20.0;
+    var ccScoreMetric = ccNamed.TryGetValue("metric", out var ccMetricStr)
+        ? Enum.Parse<VolumeBarMetric>(ccMetricStr, ignoreCase: true)
+        : VolumeBarMetric.SessionGatedDepthDurationConfirmed;
+    var ccBandWidth = ccNamed.TryGetValue("band", out var ccBandStr) ? int.Parse(ccBandStr) : 5;
 
-    Console.WriteLine($"=== Crossover calibration sweep, barThreshold={ccBarVolumeThreshold}, target {ccTargetMin}-{ccTargetMax} trades/day ===");
+    Console.WriteLine($"=== Crossover calibration sweep, metric={ccScoreMetric}, barThreshold={ccBarVolumeThreshold}, target {ccTargetMin}-{ccTargetMax} trades/day ===");
     Console.WriteLine($"{"Fast",5} | {"Slow",5} | {"Thresh",6} | {"Trades",7} | {"Trades/Day",10} | {"WinRate",8} | {"NetPts",9} | In target?");
     foreach (var fast in fastOptions)
     {
@@ -533,7 +633,7 @@ if (args.Length > 0 && string.Equals(args[0], "crossover-calibrate", StringCompa
                 {
                     await using var source = new NiftySignalDbContext(tradeSourceOptions);
                     await using var volumeBars = new VolumeBarDbContext(volumeBarOptions);
-                    var dayTrades = await TradeSimulator.SimulateCrossoverDayAsync(source, volumeBars, date, ccBarVolumeThreshold, fast, slow, threshold, CancellationToken.None, sharedOptionPriceCache);
+                    var dayTrades = await TradeSimulator.SimulateCrossoverDayAsync(source, volumeBars, date, ccBarVolumeThreshold, fast, slow, threshold, CancellationToken.None, sharedOptionPriceCache, ccScoreMetric, ccBandWidth);
                     if (dayTrades.Count == 0 && !await volumeBars.VolumeBars.AnyAsync(b => b.AsOfDate == date && b.BarVolumeThreshold == ccBarVolumeThreshold))
                     {
                         continue;
@@ -649,29 +749,35 @@ if (args.Length > 0 && string.Equals(args[0], "sanity-options-oi", StringCompari
 
 if (args.Length > 0 && string.Equals(args[0], "trade", StringComparison.OrdinalIgnoreCase))
 {
-    if (args.Length < 4
-        || !DateOnly.TryParseExact(args[1], "yyyy-MM-dd", out var tradeFromDate)
-        || !DateOnly.TryParseExact(args[2], "yyyy-MM-dd", out var tradeToDate)
-        || !Enum.TryParse<VolumeBarMetric>(args[3], ignoreCase: true, out var metric))
+    var (tradePositional, tradeNamed) = SplitNamedArgs(args);
+    if (tradePositional.Length < 4
+        || !DateOnly.TryParseExact(tradePositional[1], "yyyy-MM-dd", out var tradeFromDate)
+        || !DateOnly.TryParseExact(tradePositional[2], "yyyy-MM-dd", out var tradeToDate)
+        || !Enum.TryParse<VolumeBarMetric>(tradePositional[3], ignoreCase: true, out var metric))
     {
-        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- trade <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> <metric> [entryPercentile] [trendWindowBars] [barVolumeThreshold] [stopLossPercent] [rollingSubBarThreshold]");
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- trade <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> <metric> [entryPercentile] [trendWindowBars] [barVolumeThreshold] [--stop=N] [--rolling=N] [--band=N]");
         Console.Error.WriteLine($"  <metric> is one of: {string.Join(", ", Enum.GetNames<VolumeBarMetric>())}");
-        Console.Error.WriteLine("  [stopLossPercent] e.g. 30 means exit if the option premium falls 30% below entry -- omit for no stop (default, original behavior).");
-        Console.Error.WriteLine("  [rollingSubBarThreshold] e.g. 650 -- when set, barVolumeThreshold is built as a ROLLING window of this many-sized sub-bars (must divide barVolumeThreshold exactly) instead of reading a pre-populated fixed bar; omit for the original fixed-bar behavior.");
+        Console.Error.WriteLine("  --stop=30 means exit if the option premium falls 30% below entry -- omit for no stop (default, original behavior).");
+        Console.Error.WriteLine("  --rolling=650 -- when set, barVolumeThreshold is built as a ROLLING window of this many-sized sub-bars (must divide barVolumeThreshold exactly) instead of reading a pre-populated fixed bar; omit for the original fixed-bar behavior.");
+        Console.Error.WriteLine("  --band=5 only used by the 3 Phase-2 depth metrics -- strikes in the band (3 = ATM+/-1, the default; 5 = ATM+/-2). Must match a value already populated via populate-options-depth.");
+        Console.Error.WriteLine("  These 3 are named flags (can appear anywhere, in any order) rather than positional -- PowerShell silently drops empty-string \"\" placeholder args, which used to corrupt runs that skipped one of these. Named flags avoid that entirely.");
         return 1;
     }
 
-    var entryPercentile = args.Length > 4 ? double.Parse(args[4]) : 90.0;
-    var trendWindowBars = args.Length > 5 ? int.Parse(args[5]) : 15;
-    var tradeThreshold = args.Length > 6 ? long.Parse(args[6]) : 1300L;
-    var stopLossPercent = args.Length > 7 ? (decimal?)(decimal.Parse(args[7]) / 100m) : null;
-    var rollingSubBarThreshold = args.Length > 8 ? (long?)long.Parse(args[8]) : null;
+    var entryPercentile = tradePositional.Length > 4 ? double.Parse(tradePositional[4]) : 90.0;
+    var trendWindowBars = tradePositional.Length > 5 ? int.Parse(tradePositional[5]) : 15;
+    var tradeThreshold = tradePositional.Length > 6 ? long.Parse(tradePositional[6]) : 1300L;
+    var stopLossPercent = tradeNamed.TryGetValue("stop", out var stopStr) ? (decimal?)(decimal.Parse(stopStr) / 100m) : null;
+    var rollingSubBarThreshold = tradeNamed.TryGetValue("rolling", out var rollingStr) ? (long?)long.Parse(rollingStr) : null;
+    var tradeDepthBandWidth = tradeNamed.TryGetValue("band", out var bandStr) ? int.Parse(bandStr) : OptionDepthPopulator.DefaultBandWidth;
+    var tradeSwitchTime = tradeNamed.TryGetValue("switchtime", out var switchStr) ? (TimeSpan?)TimeSpan.Parse(switchStr) : null;
+    var tradeEntryStart = tradeNamed.TryGetValue("entrystart", out var entryStartStr) ? (TimeSpan?)TimeSpan.Parse(entryStartStr) : null;
 
-    Console.WriteLine($"=== Volume-bar trade simulation: metric={metric}, entry-percentile>={entryPercentile}, bar-threshold={tradeThreshold}, stopLoss={(stopLossPercent is { } slp ? $"{slp:P0}" : "none")}, rolling={(rollingSubBarThreshold is { } rsbt ? $"{rsbt}-wide" : "no")} ===");
+    Console.WriteLine($"=== Volume-bar trade simulation: metric={metric}, entry-percentile>={entryPercentile}, bar-threshold={tradeThreshold}, stopLoss={(stopLossPercent is { } slp ? $"{slp:P0}" : "none")}, rolling={(rollingSubBarThreshold is { } rsbt ? $"{rsbt}-wide" : "no")}, depthBandWidth={tradeDepthBandWidth} ===");
     var allTrades = new List<VolumeBarTrade>();
     for (var date = tradeFromDate; date <= tradeToDate; date = date.AddDays(1))
     {
-        var dayTrades = await RunRangeAsync(date, date, metric, entryPercentile, trendWindowBars, tradeThreshold, stopLossPercent, rollingSubBarThreshold);
+        var dayTrades = await RunRangeAsync(date, date, metric, entryPercentile, trendWindowBars, tradeThreshold, stopLossPercent, rollingSubBarThreshold, tradeDepthBandWidth, tradeSwitchTime, tradeEntryStart);
         if (dayTrades.Count == 0)
         {
             continue;
@@ -705,27 +811,42 @@ if (args.Length > 0 && string.Equals(args[0], "trade", StringComparison.OrdinalI
 
 if (args.Length > 0 && string.Equals(args[0], "calibrate", StringComparison.OrdinalIgnoreCase))
 {
-    if (args.Length < 4
-        || !DateOnly.TryParseExact(args[1], "yyyy-MM-dd", out var calFromDate)
-        || !DateOnly.TryParseExact(args[2], "yyyy-MM-dd", out var calToDate)
-        || !Enum.TryParse<VolumeBarMetric>(args[3], ignoreCase: true, out var calMetric))
+    var (calPositional, calNamed) = SplitNamedArgs(args);
+    if (calPositional.Length < 4
+        || !DateOnly.TryParseExact(calPositional[1], "yyyy-MM-dd", out var calFromDate)
+        || !DateOnly.TryParseExact(calPositional[2], "yyyy-MM-dd", out var calToDate)
+        || !Enum.TryParse<VolumeBarMetric>(calPositional[3], ignoreCase: true, out var calMetric))
     {
-        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- calibrate <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> <metric> [barVolumeThresholds, comma-separated] [rollingSubBarThreshold|none] [excludeDates, comma-separated]");
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- calibrate <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> <metric> [barVolumeThresholds, comma-separated] [--rolling=N] [--exclude=date,date] [--band=N]");
         Console.Error.WriteLine($"  <metric> is one of: {string.Join(", ", Enum.GetNames<VolumeBarMetric>())}");
-        Console.Error.WriteLine("  [rollingSubBarThreshold] e.g. 650 -- when set, each barVolumeThreshold is built as a ROLLING window of this many-sized sub-bars (each must divide evenly) instead of a pre-populated fixed bar. Pass 'none' to skip this and still supply [excludeDates].");
-        Console.Error.WriteLine("  [excludeDates] e.g. 2026-09-08,2026-09-15 -- skip these specific days entirely (e.g. to isolate non-0-DTE days that aren't at the edges of the date range).");
+        Console.Error.WriteLine("  --rolling=650 -- when set, each barVolumeThreshold is built as a ROLLING window of this many-sized sub-bars (each must divide evenly) instead of a pre-populated fixed bar.");
+        Console.Error.WriteLine("  --exclude=2026-09-08,2026-09-15 -- skip these specific days entirely (e.g. to isolate non-0-DTE days that aren't at the edges of the date range).");
+        Console.Error.WriteLine("  --band=5 only used by the 3 Phase-2 depth metrics -- strikes in the band (3 = ATM+/-1, the default; 5 = ATM+/-2). Must match a value already populated via populate-options-depth.");
+        Console.Error.WriteLine("  These 3 are named flags (can appear anywhere, in any order) rather than positional -- PowerShell silently drops empty-string \"\" placeholder args, which used to corrupt runs that skipped one of these. Named flags avoid that entirely.");
         return 1;
     }
 
-    var calThresholds = args.Length > 4
-        ? args[4].Split(',').Select(long.Parse).ToArray()
+    var calThresholds = calPositional.Length > 4
+        ? calPositional[4].Split(',').Select(long.Parse).ToArray()
         : [650L, 1300L, 2600L];
-    var calRollingSubBarThreshold = args.Length > 5 && !string.Equals(args[5], "none", StringComparison.OrdinalIgnoreCase)
-        ? (long?)long.Parse(args[5])
+    var calRollingSubBarThreshold = calNamed.TryGetValue("rolling", out var calRollingStr)
+        ? (long?)long.Parse(calRollingStr)
         : null;
-    var calExcludeDates = args.Length > 6
-        ? args[6].Split(',').Select(d => DateOnly.ParseExact(d, "yyyy-MM-dd")).ToHashSet()
+    var calExcludeDates = calNamed.TryGetValue("exclude", out var calExcludeStr)
+        ? calExcludeStr.Split(',').Select(d => DateOnly.ParseExact(d, "yyyy-MM-dd")).ToHashSet()
         : [];
+    var calDepthBandWidth = calNamed.TryGetValue("band", out var calBandStr) ? int.Parse(calBandStr) : OptionDepthPopulator.DefaultBandWidth;
+    var calSwitchTime = calNamed.TryGetValue("switchtime", out var calSwitchStr) ? (TimeSpan?)TimeSpan.Parse(calSwitchStr) : null;
+    var calEntryStart = calNamed.TryGetValue("entrystart", out var calEntryStartStr) ? (TimeSpan?)TimeSpan.Parse(calEntryStartStr) : null;
+    // 2026-09-20, item 13 follow-up: only meaningful for FinalScoreSessionWeighted -- weight-on-FuturesScore
+    // per session phase (OptionsScore always gets 1 minus it), overriding the 0.7/0.5/0.3 default so the
+    // 3 phase weights can be swept via calibrate without recompiling.
+    var calWOpen = calNamed.TryGetValue("wopen", out var calWOpenStr) ? double.Parse(calWOpenStr) : (double?)null;
+    var calWMid = calNamed.TryGetValue("wmid", out var calWMidStr) ? double.Parse(calWMidStr) : (double?)null;
+    var calWClose = calNamed.TryGetValue("wclose", out var calWCloseStr) ? double.Parse(calWCloseStr) : (double?)null;
+    (double Open, double Mid, double Close)? calSessionWeights = calWOpen is not null || calWMid is not null || calWClose is not null
+        ? (calWOpen ?? 0.7, calWMid ?? 0.5, calWClose ?? 0.3)
+        : null;
     double[] percentiles = [75, 80, 85, 90, 93, 95, 97, 99];
 
     Console.WriteLine($"=== Calibration sweep: metric={calMetric}, {calFromDate:yyyy-MM-dd}..{calToDate:yyyy-MM-dd}, target 7-20 trades/day{(calRollingSubBarThreshold is { } crsbt ? $", rolling {crsbt}-wide sub-bars" : "")}{(calExcludeDates.Count > 0 ? $", excluding {string.Join(",", calExcludeDates)}" : "")} ===");
@@ -764,7 +885,7 @@ if (args.Length > 0 && string.Equals(args[0], "calibrate", StringComparison.Ordi
                     continue;
                 }
 
-                trades.AddRange(await RunRangeAsync(date, date, calMetric, percentile, 15, threshold, stopLossPercent: null, rollingSubBarThreshold: calRollingSubBarThreshold));
+                trades.AddRange(await RunRangeAsync(date, date, calMetric, percentile, 15, threshold, stopLossPercent: null, rollingSubBarThreshold: calRollingSubBarThreshold, depthBandWidth: calDepthBandWidth, optionsSwitchTime: calSwitchTime, entryWindowStartOverride: calEntryStart, sessionWeightsOnFutures: calSessionWeights));
             }
 
             var tradesPerDay = trades.Count / (double)tradingDayCountFiltered;

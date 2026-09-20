@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using NiftySignal.VolumeBarData;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace NiftySignal.VolumeBarData.Migrations
 {
     [DbContext(typeof(VolumeBarDbContext))]
-    partial class VolumeBarDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260919023114_AddOptionDepthBars")]
+    partial class AddOptionDepthBars
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -78,9 +81,6 @@ namespace NiftySignal.VolumeBarData.Migrations
                     b.Property<DateOnly>("AsOfDate")
                         .HasColumnType("date");
 
-                    b.Property<int>("BandWidth")
-                        .HasColumnType("integer");
-
                     b.Property<int>("BarIndex")
                         .HasColumnType("integer");
 
@@ -98,9 +98,9 @@ namespace NiftySignal.VolumeBarData.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("AsOfDate", "BarVolumeThreshold", "BandWidth");
+                    b.HasIndex("AsOfDate", "BarVolumeThreshold");
 
-                    b.HasIndex("AsOfDate", "BarVolumeThreshold", "BandWidth", "BarIndex")
+                    b.HasIndex("AsOfDate", "BarVolumeThreshold", "BarIndex")
                         .IsUnique();
 
                     b.ToTable("OptionBandFlowBars");
@@ -116,9 +116,6 @@ namespace NiftySignal.VolumeBarData.Migrations
 
                     b.Property<DateOnly>("AsOfDate")
                         .HasColumnType("date");
-
-                    b.Property<int>("BandWidth")
-                        .HasColumnType("integer");
 
                     b.Property<int>("BarIndex")
                         .HasColumnType("integer");
@@ -155,9 +152,9 @@ namespace NiftySignal.VolumeBarData.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("AsOfDate", "BarVolumeThreshold", "BandWidth");
+                    b.HasIndex("AsOfDate", "BarVolumeThreshold");
 
-                    b.HasIndex("AsOfDate", "BarVolumeThreshold", "BandWidth", "BarIndex")
+                    b.HasIndex("AsOfDate", "BarVolumeThreshold", "BarIndex")
                         .IsUnique();
 
                     b.ToTable("OptionDepthBars");
@@ -210,9 +207,6 @@ namespace NiftySignal.VolumeBarData.Migrations
                     b.Property<DateOnly>("AsOfDate")
                         .HasColumnType("date");
 
-                    b.Property<int>("BandWidth")
-                        .HasColumnType("integer");
-
                     b.Property<int>("BarIndex")
                         .HasColumnType("integer");
 
@@ -233,9 +227,9 @@ namespace NiftySignal.VolumeBarData.Migrations
 
                     b.HasKey("Id");
 
-                    b.HasIndex("AsOfDate", "BarVolumeThreshold", "BandWidth");
+                    b.HasIndex("AsOfDate", "BarVolumeThreshold");
 
-                    b.HasIndex("AsOfDate", "BarVolumeThreshold", "BandWidth", "BarIndex")
+                    b.HasIndex("AsOfDate", "BarVolumeThreshold", "BarIndex")
                         .IsUnique();
 
                     b.ToTable("OptionOiBars");

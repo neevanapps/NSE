@@ -1951,3 +1951,737 @@ without reducing loss frequency. Price-signed IV Δ (50%) and Skew Change (30%) 
 "loose stop clips only real tail risk" pattern the futures side found useful for DepthImbalance.
 **Skew Change + 30% stop is now the strongest single confirmed options metric by both win rate and
 net** of everything tested in Phase 1.
+
+## Phase 2 metric 1: ATM Complex Notional Depth Imbalance (2026-09-19/20)
+
+`(ΣBidQty − ΣAskQty)/(ΣBidQty+ΣAskQty)`, top-5 book, Call+Put combined across the ATM band. New
+`OptionDepthBarRow`/`OptionDepthPopulator`, tick-accumulated per bar via the same
+`DepthImbalanceAccumulator` the futures side's own `DepthImbalance` already uses.
+
+**Built un-negated first** (more resting buy than sell interest reads bullish, mirroring the
+futures reading) — win rate stuck below 50% at every loose-to-mid percentile, both ATM±1 and
+ATM±2, the same rejection signature seen repeatedly elsewhere in this project. **Flipped, re-ran
+the full sweep**: win rate above 50% in nearly every cell, both bands, all three thresholds —
+one of the cleanest patterns found in this whole project.
+
+### Band-width comparison, ATM±1 vs ATM±2 (2026-09-20, user's own question)
+
+Every narrow-band options metric so far (metrics 2/3 in Phase 1, and this one until now) used
+ATM±1 because that's what the Phase 0 plan specified, never because it was tested against a wider
+band. `OptionDepthBarRow.BandWidth` is now a real parameter (not hardcoded) specifically so this
+could be checked. Best combo per band, same 8-day window:
+
+| Band | Combo | Trades/Day | Win Rate | Net | Concentration | Days positive |
+|---|---|---|---|---|---|---|
+| ATM±1 (3) | 1300/90 | 14.2 | 54.4% | +319.15 | 22.8% top / 41.6% top-2 | 8 of 8 |
+| **ATM±2 (5)** | **2600/80** | **13.5** | **60.2%** | +290.65 | **15.4% top / 30.5% top-2** | 7 of 8 |
+
+**Band width genuinely matters here — not a blowout, but a real, measurable difference.** ATM±2
+wins on win-rate quality and concentration (both meaningfully better); ATM±1 wins on raw net and
+day-consistency (positive every single day vs. one losing day for ATM±2, 09-17). Per this
+project's own "prefer win-rate quality over raw net" convention, **ATM±2 (2600/80) is the primary
+pick** — 60.2% win, +290.65 net, 108 trades, positive 7 of 8 days, DTE-robust (both 0-DTE days in
+the window, 09-08 and 09-15, are among the strongest days, no gate needed). ATM±1 (1300/90) stays
+a credible alternative, not discarded.
+
+**Verdict: CONFIRMED, sign-flipped, ATM±2 preferred.** This directly answers the user's question:
+band width was never tested before, and testing it here found a real (if modest) effect —
+worth doing for metrics 2/3 in Phase 1 too as a follow-up, though those stay locked for now per
+the "don't re-litigate confirmed Phase 1 results pre-emptively" decision from when this parameter
+was first added.
+
+**Still pending for this metric**: concentration/DTE/session-phase checks are done; redundancy
+against the other 2 Phase-2 depth metrics and a stop-loss sweep are Phase 3 work per the plan.
+
+## Phase 2 metric 2: TobDepthDivergence on the ATM Complex (2026-09-20)
+
+Full-book ATM-complex imbalance minus touch-only ATM-complex imbalance — direct options analog of
+the futures side's own `TobDepthDivergence` (which collapsed once the trading-hours gate was
+correctly enforced there, but per the "one clock's verdict doesn't transfer automatically"
+convention, tried fresh here rather than assumed dead on arrival).
+
+**Built as-is (no flip needed)** — promising immediately: best combo **1300/95, 55.1% win,
++236.05 net, 78 trades, 9.8 trades/day**, positive on 6 of 8 days. Concentration: top trade 25.9%
+of net, top 2 = 38.6% — moderate, not alarming. DTE split: 0-DTE 54.5% win (+61.05 net) vs.
+non-0-DTE 55.4% win (+175.00) — no meaningful gap, **no DTE gate needed**.
+
+**Band-width check**: ATM±2 gives an almost identical result at the same combo (1300/95: 78
+trades — exactly the same count — 53.8% win, +256.70 net) — band width doesn't move this metric
+much, unlike metric 1. **Kept at ATM±1** for simplicity since the wider band buys nothing here.
+
+**Verdict: CONFIRMED, no gate, no flip needed.** Best combo 1300/95, ATM±1.
+
+## Phase 2 metric 3: Call vs Put Depth Imbalance (2026-09-20)
+
+`(CallDepth − PutDepth)/(CallDepth+PutDepth)` — no futures analog, compares total resting
+liquidity on the Call side vs. Put side of the ATM±1 band.
+
+**Built un-negated first** (more resting depth on the Call side reads bullish) — weak, negative
+net almost everywhere, and trade frequency never cleared 4.0/day at any setting (the band only
+has 6 instruments, and this ratio evidently sits in extreme territory rarely). **Flipped**:
+win rate improved to the upper-40s/50s and net turned consistently positive at every setting
+tested — the flip is directionally correct — but **trade frequency still never reaches the 7-20/day
+target at any combo** (max 4.0/day at 650/75, most settings 1-3/day).
+
+**Verdict: NOT VIABLE AS BUILT** — same "real signal, wrong frequency" tier as Skew25DeltaLevel and
+Distance to Highest-OI Strike from Phase 1. The 6-instrument band may simply be too narrow a
+sample for this specific ratio to move often enough; a wider band (already known configurable via
+`BandWidth`) or a different formulation (e.g. a flow/change version instead of a level) would be
+the natural next thing to try if revisited, not attempted here.
+
+## Phase 2 summary
+
+| Metric | Verdict | Best combo | Win Rate | Net |
+|---|---|---|---|---|
+| 1. ATM Complex Notional Depth Imbalance | CONFIRMED, sign-flipped, ATM±2 preferred | 2600/80, ATM±2 | 60.2% | +290.65 |
+| 2. TobDepthDivergence on ATM Complex | CONFIRMED, no flip, no gate | 1300/95, ATM±1 | 55.1% | +236.05 |
+| 3. Call vs Put Depth Imbalance | NOT VIABLE (frequency) | — | — | — |
+
+**2 of 3 Phase 2 metrics confirmed** — both without needing a DTE gate, unlike most of Phase 1's
+survivors. Combined with Phase 1's 6 confirmed sub-variants (plus 1 confirmation-filter candidate)
+and the crossover experiment (promising, not yet fully confirmed), the options-side candidate
+pool now stands at 8 confirmed standalone scores. Redundancy checks (these 2 against each other,
+and against Phase 1's survivors) and stop-loss sweeps are Phase 3 work, not yet done.
+
+## Band-width retrofit check on Phase 1 metrics 2/3 (2026-09-20, user's own follow-up question)
+
+Having found ATM±2 genuinely better for Phase 2 metric 1, checked whether the same holds for
+Phase 1's own narrow-band metrics (Notional Call-Put Volume Delta, Notional OI Delta) — both used
+a hardcoded ATM±1, never tested wider, same as Phase 2 was before this session. Retrofitted
+`BandWidth` onto `OptionBandFlowBarRow`/`OptionOiBarRow` the same way (real parameter, both widths
+coexist, migration correctly defaulted existing Phase 1 rows to BandWidth=3 rather than EF's own
+auto-generated 0 — checked before applying, would have silently orphaned every existing confirmed
+row otherwise). Re-ran both metrics' full sweeps at ATM±2, same 8-day window (2026-09-08 through
+2026-09-19) as ATM±1 for a fair comparison.
+
+**Result: the opposite conclusion from Phase 2's metric 1 — ATM±1 holds up as well or better for
+both.**
+
+| Metric | Band | Best combo | Win Rate | Net |
+|---|---|---|---|---|
+| Notional Volume Delta | ATM±1 | 650/95 | 63.3% | +84.20 |
+| Notional Volume Delta | ATM±2 | 650/93 | 63.6% | +57.25 |
+| **Notional OI Delta** | **ATM±1** | **2600/75** | **63.5%** | **+192.20** |
+| Notional OI Delta | ATM±2 | 1300/80 (best in-target) | 63.9% | +82.65 |
+
+Volume Delta is essentially a wash between bands (ATM±1 marginally ahead on net). **OI Delta
+clearly favors ATM±1** — nothing in ATM±2's in-target set comes close to ATM±1's 2600/75 combo.
+
+**Conclusion: band width is metric-specific, not a universal "wider is better" (or worse) rule.**
+Phase 2 metric 1 genuinely benefited from ATM±2; Phase 1 metrics 2/3 don't. The original ATM±1
+choice for metrics 2/3 wasn't just an untested assumption that happened to be wrong — tested now,
+it holds up as the right call. **No change to Phase 1's locked configs** (650/95 for Volume Delta,
+650/80 gated for OI Delta remain as documented) — this was a check, not a re-optimization; picking
+2600/75 for OI Delta now would be re-tuning on data that includes 09-18/09-19, which the original
+lock didn't have, and isn't how this project treats already-confirmed results.
+
+## Phase 3: redundancy check across the full confirmed pool (2026-09-20)
+
+Extended the earlier 4-metric correlation tool (`correlate-options`) to all 8 confirmed
+standalone/filter candidates, each computed with its own exact locked formula (raw ΔIV,
+price-signed ΔIV, Volume Delta, OI Delta, Skew Change, Depth Imbalance at its own adopted ATM±2,
+TOB Divergence, Max Pain distance), pooled across all 8 available days, 9,651 bars with all 8
+present.
+
+| | IvRaw | IvPriceSigned | VolDelta | OiDelta | SkewChange | DepthImbalance | TobDivergence | MaxPainDist |
+|---|---|---|---|---|---|---|---|---|
+| **IvRaw** | 1.000 | 0.003 | -0.127 | 0.012 | 0.019 | -0.005 | 0.004 | 0.016 |
+| **IvPriceSigned** | | 1.000 | -0.095 | 0.017 | -0.095 | 0.054 | -0.019 | 0.014 |
+| **VolDelta** | | | 1.000 | **0.249** | -0.008 | **-0.220** | 0.069 | 0.109 |
+| **OiDelta** | | | | 1.000 | -0.027 | -0.060 | 0.013 | 0.101 |
+| **SkewChange** | | | | | 1.000 | -0.037 | 0.015 | -0.005 |
+| **DepthImbalance** | | | | | | 1.000 | -0.086 | 0.114 |
+| **TobDivergence** | | | | | | | 1.000 | -0.038 |
+
+**26 of 28 pairs are fully independent** (|r| < 0.15) — very low double-counting risk for a Phase 4
+combination. Notably, **raw ΔIV and price-signed ΔIV are themselves independent (0.003)** despite
+sharing the same underlying ΔIV data — the price-signing transformation genuinely decorrelates
+them, confirming they're worth keeping as separate candidates, not near-duplicates of each other.
+Phase 2's two depth metrics (DepthImbalance, TobDivergence) are also independent of each other
+(-0.086) despite being derived from the same `OptionDepthBarRow` table — the full-book-vs-touch
+divergence really does carry different information than the level itself.
+
+**Two pairs land in the "related but not redundant, keep both" tier** (same 0.15-0.43
+interpretation scale used throughout this project):
+- **Volume Delta vs. OI Delta: +0.249** — already found in the earlier 4-metric robustness check,
+  reproduced here on the extended 8-day window. Makes sense (both read ATM±1 options activity).
+- **Volume Delta vs. Depth Imbalance: -0.220** (new finding) — moderate negative relationship.
+  Economically plausible: heavy notional volume trading through the book plausibly consumes
+  resting depth on one side, pushing the (flipped-sign) depth imbalance the opposite way. Neither
+  pair is strong enough to drop one metric outright, but both are worth remembering when weighting
+  a Phase 4 combination so they aren't implicitly double-counted.
+
+**Verdict: redundancy check clean.** No pair needs to be dropped; Phase 4 combination work can
+proceed without a forced pruning step.
+
+## Phase 3: stop-loss sweep on the 3 not-yet-tested confirmed metrics (2026-09-20)
+
+Volume Delta and OI Delta were already stop-tested in the earlier 4-metric robustness check (both
+rejected every level — see that section above). Price-signed ΔIV and Skew Change already have
+adopted stops (50% and 30% respectively). Remaining untested: raw ΔIV, and both Phase 2 depth
+metrics. Same rule throughout: adopt only when win rate AND net both improve together.
+
+| Metric | Baseline | 20% | 30% | 40% | 50% | Verdict |
+|---|---|---|---|---|---|---|
+| Raw ΔIV | 67.5% / -30.90 | 66.2% / -12.05 | 65.6% / -39.20 | 66.4% / -52.25 | 66.9% / -27.55 | **No stop** — every level makes win rate worse, none turns net positive |
+| ATM Depth Imbalance (ATM±2) | 60.2% / +290.65 | 57.4% / +273.05 | **60.4% / +299.85** | 60.2% / +290.65 (unchanged, never triggers) | 60.2% / +290.65 (unchanged) | **Adopt 30%** — only level where both improve, modest but real |
+| TOB Divergence | 55.1% / +236.05 | 50.6% / +182.55 | 53.1% / +232.15 | 55.0% / +239.35 | 54.4% / +235.45 | **No stop** — closest candidate (40%) has net up but win rate flat-to-down, doesn't clear the bar |
+
+Note: raw ΔIV's baseline here (67.5% win, -30.90 net, 8-day pooled) looks worse than its own
+locked DTE-gated verdict (80.2% win, +77.25 net, 5-day gated) — expected, since this sweep runs
+the full un-gated 8-day pool including both 0-DTE days and the new 09-18 data, not the DTE-gated
+subset the actual locked config trades on. The stop-loss question itself is unaffected either way:
+no level helps on either framing.
+
+## Phase 3 summary
+
+- **Redundancy**: clean, no pair strong enough to drop (see "Phase 3: redundancy check" above).
+- **Stop-loss**: 2 of 8 confirmed metrics now carry an adopted stop from this round (ATM Depth
+  Imbalance 30%), on top of the 2 already adopted in Phase 1 (Price-signed ΔIV 50%, Skew Change
+  30%) — 4 of 8 total now have a stop; the other 4 (raw ΔIV, Volume Delta, OI Delta, TOB
+  Divergence) trade unprotected by design, tested and rejected at every level.
+- **Phase 3 CLOSED.** Full confirmed pool, locked configs going into Phase 4:
+
+| # | Metric | Combo | Stop | Win Rate | Net (backtest) |
+|---|---|---|---|---|---|
+| 1a | Raw ΔIV | 1300/97, DTE-gated | none | 80.2% | +77.25 (5d) |
+| 1b | Price-signed ΔIV | 1300/97 | 50% | 57.3% | +188.95 |
+| 2 | Volume Delta | 1300/95, DTE-gated | none | 70.0% | +130.65 (5d gated) |
+| 3 | OI Delta | 650/80, DTE-gated | none | 65.1% | +152.00 (5d gated) |
+| 4 | Skew Change (raw) | 1300/97 | 30% | 71.7% | +160.70 |
+| 5* | Max Pain distance | 1300/75 | — | 71.4% | +224.45 (filter candidate, not standalone) |
+| 6 | ATM Depth Imbalance | 2600/80, ATM±2 | 30% | 60.4% | +299.85 |
+| 7 | TOB Divergence | 1300/95 | none | 55.1% | +236.05 |
+
+**Next**: Phase 4 (build OptionsScore) — per the plan's own amendment, check the 7 standalone
+survivors for a regime-bias split (time-of-day, DTE, or option-specific axis) BEFORE defaulting to
+an equal-weight blend, same blend-vs-switch-vs-confirm lesson from the futures side. The session-
+phase splits already done (metrics 1b/2/3/4 in the earlier robustness check) found a real pattern
+worth building on: OI Delta's edge concentrates in the Open, the others in Mid — not yet checked
+for metrics 1a, 6, 7. Max Pain distance is the natural confirmation-filter candidate, same role
+TopOfBookImbalance plays on the futures side.
+
+## Phase 4 prep: session-phase split, remaining 3 metrics (2026-09-20)
+
+Completed the session-phase picture for the full 7-metric confirmed pool (4 already done in the
+earlier robustness check, 3 more here: raw ΔIV, ATM Depth Imbalance, TOB Divergence). Added
+`--stop=`/`--band=` support to the `session-phase` command so these could run against each
+metric's ACTUAL locked config (previously it silently used ATM±1/no-stop regardless).
+
+| Metric | Open (09:30-10:00) | Mid (10:00-13:30) | Close (13:30-15:15) | Pattern |
+|---|---|---|---|---|
+| Raw ΔIV | 7 trades, 57.1% win, +32.05 | 42 trades, 81.0% win, -7.25 | 36 trades, 83.3% win, +34.55 | High win rate everywhere, Mid net flat despite it |
+| Price-signed ΔIV | 7 trades, 42.9% win, -31.85 | 32 trades, 65.6% win, +160.75 | 42 trades, 52.4% win, +24.95 | **Mid-strong only** |
+| Volume Delta | 10 trades, 50.0% win, -19.15 | 26 trades, 76.9% win, +120.70 | 6 trades, 50.0% win, -22.80 | **Mid-strong only**, negative elsewhere |
+| OI Delta | 16 trades, 81.2% win, +84.35 | 35 trades, 54.3% win, +35.00 | 12 trades, 50.0% win, +14.05 | **Open-strong**, fades |
+| Skew Change | 11 trades, 72.7% win, +13.45 | 59 trades, 66.1% win, +92.40 | 33 trades, 72.7% win, +6.40 | Consistent everywhere |
+| ATM Depth Imbalance | 21 trades, 71.4% win, +153.30 | 53 trades, 54.7% win, +75.55 | 37 trades, 62.2% win, +71.00 | **Open-strong**, positive everywhere |
+| TOB Divergence | 18 trades, 61.1% win, +75.30 | 37 trades, 54.1% win, +144.50 | 23 trades, 52.2% win, +16.25 | Open/Mid similar, fades in Close |
+
+**A real, actionable pattern, same shape as the futures-side DepthImbalance/BarDurationUrgency
+split that beat a naive blend there**: OI Delta and ATM Depth Imbalance both peak in the Open;
+Price-signed ΔIV and Volume Delta are Mid-only (negative in Open and Close). Skew Change is the
+session-consistent one. Raw ΔIV is the outlier — strong win rate in every phase but Mid net is
+essentially flat despite an 81% win rate there, worth a closer look (a few outsized Mid losers
+likely offsetting many small wins) before trusting it in a combined design.
+
+**Next**: test a linear blend first (the plan's own required first step, per
+`docs/METRIC_EVALUATION_PLAYBOOK.md` step 8), then check whether an Open/Mid-gated switch (mirroring
+this session-phase split) recovers more than the blend, before deciding Phase 4's combination
+design.
+
+## Phase 4: linear blend, tested and found wanting (2026-09-20)
+
+Built `OptionsScoreBlend` — equal-weight average of all 7 confirmed standalone metrics' own
+SignedRank scores (own independent tracker per component, missing components excluded and the
+average taken over whichever are present, own dedicated magnitude-rank tracker since an average
+of percentile-like values isn't itself percentile-shaped — same pattern as the futures side's own
+`Composite`).
+
+**Caught and fixed a real dispatch bug before trusting any result**: first calibration run showed
+ZERO trades at every single cell. Root cause: the boolean flags gating which tables to load
+(`isAtmIvMetric`, `isOiMetric`, etc.) were extended with `|| isOptionsScoreBlend` so the blend's
+own data would load — but those SAME flags are also used for per-bar dispatch ROUTING, and the
+blend's dispatch branch was placed AFTER them in the if/else-if chain, so `isAtmIvMetric` (now
+true for the blend too) intercepted every blend bar first, fell through its own `switch` to
+`_ => null` (since `OptionsScoreBlend` isn't one of ITS cases), and the blend never got a chance to
+compute anything. Fixed by moving the blend's dispatch check to be the second branch overall
+(right after `Composite`), before any of the shared flags. Re-verified against an already-locked
+metric (`NotionalOiDelta`) to confirm the fix didn't disturb anything else.
+
+**Result — best combo 1300/95: 62.3% win, +221.35 net, 69 trades, 8.6 trades/day.** Solidly
+mid-pack: beats TOB Divergence (55.1%) and ATM Depth Imbalance (60.4%) individually, but doesn't
+approach the strongest single inputs (Skew Change 71.7% with stop, Raw ΔIV's own DTE-gated 80.2%).
+**Same lesson as the futures side's own composite**: averaging metrics with different regime
+biases (the session-phase split already found OI Delta/ATM Depth Imbalance peak in the Open while
+Price-signed ΔIV/Volume Delta are Mid-only) dilutes the best individual edge rather than combining
+it. Confirms the blend alone is not the answer — per the plan's own step 8, next is checking
+whether a session-phase-gated switch (mirroring the futures side's session-gated switch, using
+this project's own session-phase findings) recovers more than either the blend or the best single
+metric.
+
+## Phase 4: session-gated switch — beats the blend (2026-09-20)
+
+Built `OptionsScoreOpenMidSwitch` — a hard switch, not a blend, mirroring the futures side's own
+`SessionGatedDepthDuration` exactly: ATM Depth Imbalance's own score drives bars before 10:00 IST
+(its strongest window, 7.30 pts/trade), Price-signed ΔIV's own score drives everything from 10:00
+onward (Mid-strong, and unlike Volume Delta stays positive through the Close too). Never an
+average of both on the same bar. Same dispatch-order care taken as the blend (checked before the
+shared `isAtmIvMetric` flag in the if/else-if chain).
+
+**Result — best combo 2600/90: 57.1% win, +416.85 net, 156 trades, 19.5 trades/day.** Nearly
+double the blend's net (+221.35) at a comparable win rate, and the highest net of anything found
+in the entire options phase so far. Concentration: top trade 12.4% of net, top 2 = 24.8% — among
+the lowest concentration of any metric in this whole project (comparable to metric 2's 20.0% and
+price-signed ΔIV's 22.4% from Phase 1). Positive on 5 of 8 days; both 0-DTE days (09-08, 09-15)
+are strong, no DTE gate needed.
+
+| | Win Rate | Net | Trades/Day | Concentration |
+|---|---|---|---|---|
+| Blend (equal-weight, 7 metrics) | 62.3% | +221.35 | 8.6 | not checked |
+| **Switch (Depth Imbalance / Price-signed ΔIV)** | 57.1% | **+416.85** | 19.5 | **12.4% / 24.8%** |
+| ATM Depth Imbalance alone | 60.4% | +299.85 | 13.5 | 15.4% / 30.5% |
+| Price-signed ΔIV alone | 57.3% | +188.95 | ~10.6 | ~20% (Phase 1) |
+
+**The switch beats every input that went into it** — higher net than either leg alone, without
+diluting either one's edge the way the blend did. Same lesson as the futures side, confirmed a
+second time on a genuinely different clock/instrument mix: a hard regime switch recovers real
+signal that a naive average cancels out.
+
+**Verdict: OptionsScoreOpenMidSwitch (2600/90) is the leading OptionsScore candidate.** Not yet
+fully locked — same caveats as every "just built" result in this log: needs more out-of-sample
+days, and the plan's own Phase 5 (weighting FuturesScore vs. OptionsScore) is still ahead. But this
+is now the strongest, cleanest composite found in the options phase, and a reasonable point to
+adopt as the working OptionsScore going into Phase 5.
+
+## Phase 5 prep: experiment list, working through in order (2026-09-20)
+
+Before Phase 5, user asked for a complete list of every untested-but-valid technique to check by
+evidence rather than skip by assumption (backtesting is cheap; nothing gets ruled out on a hunch).
+17-item list, working top to bottom. `OptionsScoreOpenMidSwitch`'s switch time is now a real
+parameter (`--switchtime=HH:mm` on `trade`/`calibrate`), separate from the futures side's own
+locked `SessionGateSwitchTime` constant -- sweeping this never touches the already-locked futures
+switch.
+
+### 1. Switch-time sweep — CONFIRMED 10:00 is best
+
+Swept 10:00/10:15/10:30/10:45 at 2600 (the switch's own locked threshold), same 8-day window.
+Best combo each time was 2600/90:
+
+| Switch time | Win Rate | Net |
+|---|---|---|
+| **10:00 (locked)** | **57.1%** | **+416.85** |
+| 10:15 | 55.9% | +356.05 |
+| 10:30 | 56.0% | +383.30 |
+| 10:45 | 52.1% | +307.90 |
+
+Monotonically worse as the boundary moves later (small non-monotonic blip at 10:30, not enough to
+change the conclusion) — later boundaries hand more bars to Depth Imbalance's weaker Mid-window
+performance instead of Price-signed ΔIV's stronger one. **No change — 10:00 stays the switch
+point**, now backed by an actual sweep instead of inherited from the futures side's own boundary.
+
+### 2. Entry window start (09:15 vs. 09:30) — inconclusive, not adopted
+
+Made `EntryWindowStart` a real parameter too (`--entrystart=HH:mm`, default unchanged at 09:30,
+shared code path so every metric could use it, tested here on the current best candidate). At
+2600/90 with `--entrystart=09:15`: 57.3% win, +550.70 net, 164 trades — looks like a ~32%
+improvement over baseline's 416.85.
+
+**Checked before trusting it**: the top trade (124.75 pts) is a Put entered at 09:15:04 on 09-15
+(exit 10:11, +128.9%) — the SAME known high-volatility day already flagged multiple times in this
+project for inflating other metrics' headline numbers (VwapDeviation's own "propped up by 2 lucky
+trades" closure, the crossover experiment's best day, several others). That one trade accounts for
+**93% of the entire improvement** (124.75 of the 133.85-point gain). Excluding it: net is 425.95 —
+essentially a wash against the 09:30 baseline's 416.85. Concentration also gets worse with the
+09:15 window (22.7% top-trade vs. baseline's 12.4%).
+
+**Verdict: inconclusive, NOT adopted.** The headline number looked like a real improvement but
+doesn't survive the same single-trade concentration check that's caught false positives
+repeatedly in this project. Real answer requires more days with activity in the 09:15-09:30
+window before this can be judged either way — keeping the standing 09:30 rule for now, not
+because of the original practical rationale (execution quality in the first 15 minutes), but
+because the backtest itself doesn't show a robust edge once the outlier is set aside.
+
+### 3. 3-way switch (dedicated Close leg) — CONFIRMED improvement, new leading candidate
+
+Built `OptionsScoreThreeWaySwitch`: Open (before 10:00) = ATM Depth Imbalance (unchanged from the
+2-way switch), Mid (10:00-13:30) = Price-signed ΔIV (unchanged), **Close (13:30-15:15) = Raw ΔIV**
+(new dedicated leg, using the session-phase split's own finding that Raw ΔIV was the single best
+Close performer, 83.3% win, of anything tested — previously left unused since the 2-way switch let
+Price-signed ΔIV cover Mid+Close together).
+
+**Result — best combo 2600/90: 60.8% win, +446.05 net, 148 trades, 18.5 trades/day.** Beats the
+2-way switch on every dimension checked:
+
+| | Win Rate | Net | Trades/Day | Concentration | Days positive |
+|---|---|---|---|---|---|
+| 2-way switch (Depth Imbalance / Price-signed ΔIV) | 57.1% | +416.85 | 19.5 | 12.4% / 24.8% | 5 of 8 |
+| **3-way switch (+ Raw ΔIV Close leg)** | **60.8%** | **+446.05** | 18.5 | **11.6% / 23.1%** | **7 of 8** |
+
+Positive on 7 of 8 days (only 09-18 negative), win rate above 50% on every day except that one.
+Both 0-DTE days (09-08: 64.7% win, 09-15: 54.5% win) stay solidly positive — no DTE gate needed,
+consistent with both legs' own individual no-gate findings.
+
+**Verdict: CONFIRMED improvement — OptionsScoreThreeWaySwitch (2600/90) is the new leading
+OptionsScore candidate**, replacing the 2-way switch. Giving Raw ΔIV its own dedicated window
+recovered real signal the 2-way design was leaving on the table, same "don't leave a confirmed
+metric unused just because the initial design didn't have a slot for it" lesson as everything
+else found by testing rather than assuming in this pass.
+
+### 4. OI Delta vs. ATM Depth Imbalance as the Open leg — CONFIRMED Depth Imbalance is better
+
+Built `OptionsScoreThreeWaySwitchOiOpen`: identical to the 3-way switch (item 3) except OI Delta
+drives the Open leg instead of ATM Depth Imbalance. Direct head-to-head at the same combo (2600/90):
+
+| | Win Rate | Net |
+|---|---|---|
+| **Depth Imbalance Open (adopted)** | **60.8%** | **+446.05** |
+| OI Delta Open | 59.7% | +385.10 |
+
+Depth Imbalance wins on both dimensions at the winning combo, and across the broader sweep (best
+in-target OI-open cell tops out at 61.6% win but only +167.90 net at 1300/97 — never both high
+win rate and strong net together the way Depth Imbalance's own 2600/90 does).
+
+**Verdict: CONFIRMED — ATM Depth Imbalance stays the Open-leg driver.** The original pick (made by
+per-trade-net comparison in isolation) holds up under a real in-switch, apples-to-apples test —
+not just an assumption that happened to survive unchallenged.
+
+### 5. Volume Delta vs. Price-signed ΔIV as the Mid leg — CONFIRMED Price-signed ΔIV is better
+
+Built `OptionsScoreThreeWaySwitchVolMid`: identical to the 3-way switch except Volume Delta drives
+Mid instead of Price-signed ΔIV. At the same combo (2600/90): 64.3% win but only **+172.70 net**
+— less than half the adopted design's +446.05. Best cell anywhere in the sweep (650/95: 64.1% win,
++306.85 net) still falls well short of the adopted design's net despite a higher win rate.
+
+**Verdict: CONFIRMED — Price-signed ΔIV stays the Mid-leg driver.** A real trade-off exists (Volume
+Delta trades a meaningfully higher win rate for a much lower net), but the net gap is too large to
+call this a win-rate-quality improvement — the adopted design's net is more than double.
+
+### 6. Skew Change as an all-day confirmation filter — NOT adopted, hurts the switch
+
+Built `OptionsScoreThreeWaySwitchConfirmed`: the 3-way switch's own scoring unchanged, plus a gate
+requiring Skew Change's own score to agree in sign before a new position opens (applied all day,
+no window carve-out, unlike the futures side's open-only TOB gate — Skew Change didn't show a
+narrow window where it's uniquely strong the way TOB does on the futures side).
+
+**Result at the same reference combo (2600/90): 58.2% win, +303.45 net, 110 trades** — both WORSE
+than the unconfirmed 3-way switch (60.8% win, +446.05 net, 148 trades). The gate filtered out 38
+trades, but the remaining ones performed worse on both dimensions, not better — the opposite of
+what a useful confirmation filter should do (remove losers, keep or improve win rate on what's
+left).
+
+**Verdict: NOT adopted.** All-day Skew Change confirmation doesn't help this design. Doesn't rule
+out a confirmation filter entirely — a window-restricted version (matching the futures side's
+own open-only carve-out) or a different confirming metric (TOB Divergence, or Max Pain distance
+per item 8 below) might behave differently, but the specific design tried here is confirmed worse,
+not just untested.
+
+### 7. Early directional conviction (09:15-10:30) as a confirmation filter — NOT adopted
+
+Built `OptionsScoreThreeWaySwitchEarlyConviction`: a genuinely new kind of gate, not another
+options metric. `EarlyConviction = sign(future close at the first bar ending at/after 10:30 IST −
+the day's own opening price)`, computed ONCE per day (a fixed historical observation, not a
+running score). Applied only to the Mid/Close legs (10:00 IST onward) — the Open leg trades
+ungated since the 10:30 window hasn't closed yet during Open trading, so gating it would be
+forward-looking.
+
+**Result at the same reference combo (2600/90): 59.8% win, +370.95 net, 117 trades** — both worse
+than the unfiltered 3-way switch (60.8% win, +446.05 net, 148 trades). Best win rate anywhere in
+the sweep (2600/97: 65.4%) still comes with meaningfully lower net (+179.75) than the unfiltered
+baseline. Same shape as item 6's confirmation filter: trades net for a modest win-rate bump,
+never both together.
+
+**Verdict: NOT adopted.** Two confirmation-filter designs tried now (Skew Change all-day, early
+directional conviction on Mid/Close) — neither beat the unfiltered 3-way switch. Worth noting as a
+real, if modest, pattern: this particular switch design doesn't seem to have "bad trades" that a
+simple sign-agreement filter can cleanly remove — the trades it fires are already reasonably
+well-selected by the percentile gate alone.
+
+## Phase 5 prep progress: 7 of 17 items done, leading candidate unchanged
+
+`OptionsScoreThreeWaySwitch` @ 2600/90 (Depth Imbalance Open / Price-signed ΔIV Mid / Raw ΔIV
+Close, no confirmation filter) remains the leading OptionsScore candidate — it has now survived
+direct head-to-head challenges from 6 different alternatives (switch-time sweep, entry-window
+test, OI-Delta-open variant, Volume-Delta-mid variant, Skew-Change confirmation, early-conviction
+confirmation) without a single one beating it. Items 8-17 remain: Max Pain as confirmation filter,
+DTE-interaction on session-phase, blend concentration check, wider bands, crossover follow-ups,
+then Phase 5's own combination menu (equal weight / DTE weight / both-must-agree / primary-filter,
+FuturesScore + OptionsScore).
+
+### 8. Max Pain distance as a confirmation filter — real trade-off, not a clean answer either way
+
+Built `OptionsScoreThreeWaySwitchMaxPainConfirmed`: same all-day-gate design as item 6, using
+Max Pain distance instead of Skew Change — the metric Phase 1 flagged as the natural confirmation
+candidate specifically because it was too infrequent to drive a standalone score.
+
+**Result at the same reference combo (2600/90): 64.3% win, +426.40 net, 112 trades, 14.0/day** —
+genuinely different shape from items 6/7 (which lost on both dimensions):
+
+| | Win Rate | Net | Concentration | Days ≥50% win |
+|---|---|---|---|---|
+| Unfiltered 3-way switch | 60.8% | **+446.05** | 11.6% / 23.1% | 7 of 8 |
+| **Max Pain confirmed** | **64.3%** | +426.40 (-4.4%) | 12.1% / 24.2% (essentially unchanged) | **8 of 8** |
+
+Win rate up 3.5pp, concentration essentially unchanged, and **every single day stays above 50% win
+rate** (63.6/60.0/63.6/54.2/64.3/69.2/91.7/57.1%) — more consistent than the unfiltered switch,
+which had at least one weaker day. Cost: net is 4.4% lower.
+
+**Verdict: ADOPTED (2026-09-20), overriding the strict "both must improve" rule by explicit
+judgment call.** Reasoning: item 9's DTE-interaction finding (below) shows the unfiltered switch's
+day-to-day robustness is *compensating* rather than uniform — the Mid leg sits below 50% win on
+non-0-DTE days, the Close leg sits at exactly 50%/net-negative on 0-DTE days, masked only by
+pooling. The Max Pain filter's effect lines up directly with that: it is filtering out trades in
+exactly those known-weak legs, which is why it turns 7/8 days into 8/8 and lifts win rate 3.5pp
+rather than being a random trade-off. For a system now running live paper trading, a smoother
+day-to-day equity curve is worth more than a 4.4% net gap on an 8-day sample — that gap is well
+within noise at this sample size, while the 8/8-vs-7/8 consistency is a more durable signal tied
+to a real structural weakness rather than luck.
+
+**`OptionsScoreThreeWaySwitchMaxPainConfirmed` @ 2600/90 is now the leading OptionsScore
+candidate**, replacing the unfiltered `OptionsScoreThreeWaySwitch`. Superseded verdict kept above
+for the record. Next: validate on new out-of-sample days as they accumulate, per the standing
+"backtesting is long-term" discipline — this is not a final word on 8 days of data.
+
+### 9. DTE-interaction on the session-phase split — robustness is compensating, not uniform
+
+Adapted from the original framing (OI Delta's own DTE interaction) since the adopted switch uses
+ATM Depth Imbalance for Open, not OI Delta — tested the actual leading candidate's session-phase
+behavior split by DTE instead, the more relevant question now. Split `OptionsScoreThreeWaySwitch`
+@ 2600/90's trades by 0-DTE (09-08, 09-15) vs. non-0-DTE (the other 6 days), within each session
+phase:
+
+| Phase | 0-DTE | Non-0-DTE |
+|---|---|---|
+| Open (Depth Imbalance) | 2 trades, 100.0% win, +31.03 pts/trade | 12 trades, 75.0% win, +9.20 pts/trade |
+| Mid (Price-signed ΔIV) | 27 trades, 59.3% win, +2.66 pts/trade | **53 trades, 49.1% win** (below 50%), +2.55 pts/trade |
+| Close (Raw ΔIV) | **10 trades, 50.0% win** (net -11.20), -1.12 pts/trade | 44 trades, 72.7% win, +78.10 pts, +1.78 pts/trade |
+
+**The switch's overall DTE-robustness (both buckets net-positive pooled: 0-DTE +122.60, non-0-DTE
++323.45) turns out to be two legs' OPPOSITE DTE weaknesses compensating for each other, not
+either leg being independently robust.** Mid is weaker on non-0-DTE (win rate actually below 50%
+there) but strong on 0-DTE; Close is weak on 0-DTE (exactly 50%, net negative) but strong on
+non-0-DTE. Pooled, the switch looks fine on both DTE buckets — but that's because whichever leg
+is weak on a given DTE regime is offset by another leg being strong there, not because any single
+leg is uniformly good. Open's own split (2 vs. 12 trades) is too small to read into either way.
+
+**Not a rejection — the switch still performs fine pooled, on both DTE buckets, and this is
+exactly the kind of dependency that's cheap to know about now** rather than discover later if one
+leg's pattern drifts on new data. Worth re-checking this specific breakdown as more out-of-sample
+days accumulate, since the current sample (39 and 109 trades split three ways each) is thin for a
+DTE x session-phase cross-tabulation.
+
+### 10. Blend concentration check — clean, confirms dilution was the real story
+
+`OptionsScoreBlend` @ 1300/95 (its own best combo): top trade 32.00/221.35 = **14.5%**, top 2 =
+60.90/221.35 = **27.5%**. Reasonable, close to the leading switch's own 11.6%/23.1% — not a
+concentration red flag. Confirms the blend's weaker net (item 3's comparison) was genuine dilution
+from averaging opposite-biased metrics, not an artifact of a lucky/unlucky trade distribution.
+
+### 11. Wider band test (ATM±3) — confirms ATM±2 is a genuine peak, not an arbitrary stop
+
+Tested `AtmComplexDepthImbalance` at ATM±3 (BandWidth=7), the metric where band width mattered
+most. Best combo 2600/85: 57.1% win, +210.70 net — worse than ATM±2's own best (2600/80: 60.2%
+win, +290.65) on both dimensions, and worse than ATM±1's own best (1300/90: 54.4% win, +319.15)
+on net.
+
+Pattern across all three widths now tested: ATM±1 (54.4%/+319.15) → **ATM±2 (60.2%/+290.65, best
+win rate)** → ATM±3 (57.1%/+210.70, declining again). **Confirms ATM±2 is a genuine local peak for
+this metric, not just where testing happened to stop** — going wider doesn't keep helping.
+
+### 12. Crossover bar-threshold sweep — CONFIRMED 1300 beats locked 2600 config
+Tested the dual-MA crossover (originally tuned only at 2600) against 650 and 1300 bar thresholds, same parameter grid (fast 6-12 / slow 20-40 / threshold 5-20 pts).
+
+| BarThreshold | Fast | Slow | Thresh | Trades | Trades/Day | Win% | Net |
+|---|---|---|---|---|---|---|---|
+| 2600 (locked) | 8 | 40 | 5 | - | - | 52.7% | +241.45 |
+| **1300 (new best)** | **8** | **30** | **8** | 69 | 8.6 | **58.0%** | **+273.20** |
+| 650 | 8 | 30 | 8 | 69 | 8.6 | 58.0% | +273.20 (dup row, see raw sweep) |
+
+1300/8/30/8 beats the locked config on BOTH win rate and net — passes the adopt-only-if-both-improve rule. Trades/day (8.6) sits comfortably in the 5-12 target band. Not yet adopted pending out-of-sample validation (only 1 held-out day available so far, same constraint as the original 2600 config).
+
+## Phase 5 prep progress: 12 of 17 items done (2026-09-20)
+Items 1-12 complete. Note on numbering: items 9-11 as executed correspond to original list items 14-16 (DTE-interaction, blend concentration, wider band) — the equal-weight blend (original item 9) was already done in Phase 4 before this list existed, so items 9-13 proper (DTE-dependent weight, both-must-agree, futures-primary/options-filter, session-weighted multi-metric blend — i.e. the actual FuturesScore+OptionsScore combination methods) have NOT yet been executed and remain open. Flagged to user for confirmation before proceeding.
+
+## Phase 5: FuturesScore + OptionsScore combination (2026-09-20)
+
+The original Phase 5 plan's items 10-13 — the first-ever combination of the two independently-locked
+parent scores, `SessionGatedDepthDuration` (FuturesScore) and `OptionsScoreThreeWaySwitch`
+(OptionsScore, BandWidth=5/ATM±2) — computed on the same bar. Four new `VolumeBarMetric` values
+added to `TradeSimulator.cs`: `FinalScoreDteWeighted`, `FinalScoreBothMustAgree`,
+`FinalScoreFuturesPrimaryOptionsFilter`/`FinalScoreOptionsPrimaryFuturesFilter`, and
+`FinalScoreSessionWeighted`. Neither parent's own internals or dispatch branch was touched — each
+combination re-derives both legs from the parents' own exact locked formulas via dedicated trackers.
+
+**Smoke-tested first** (single-day run before trusting any sweep), then both parents re-verified
+unchanged over the same 8-day range used below, confirming no collateral damage from the new
+dispatch branch (inserted before `isAtmIvMetric`, following the same dispatch-order rule every prior
+combination metric in this file has had to respect):
+
+| Parent | Config | Trades | Win Rate | Net |
+|---|---|---|---|---|
+| FuturesScore (`SessionGatedDepthDuration`) | 2600/90 | 80 | 55.0% | +144.70 |
+| **OptionsScore (`OptionsScoreThreeWaySwitch`)** | **2600/90** | **148** | **60.8%** | **+446.05** |
+
+(These are the 8-day 2026-09-08→2026-09-19 numbers, the same range the 4 new metrics are swept over
+below — not the earlier 7-day locked numbers quoted elsewhere in this file, which cover a shorter
+range. OptionsScore is the stronger of the two parents on this range by both dimensions, so it is
+the bar every new combo must clear on BOTH win rate and net to be adopted, per the project's standing
+discipline.)
+
+Full sweep, thresholds 650/1300/2600, band=5, same 8-day range:
+
+### 10. `FinalScoreDteWeighted` — light DTE-dependent weighted average — NOT adopted
+
+0-DTE days weight OptionsScore 0.6/FuturesScore 0.4; non-0-DTE days flip to FuturesScore
+0.6/OptionsScore 0.4 (0-DTE determined dynamically per day from the day's own nearest-expiry chain,
+not a hardcoded date list). Best in-target cell: **2600/90 — 113 trades, 14.1 trades/day, 45.1% win,
++172.75 net.**
+
+| | Win Rate | Net |
+|---|---|---|
+| FuturesScore alone (2600/90) | 55.0% | +144.70 |
+| **OptionsScore alone (2600/90)** | **60.8%** | **+446.05** |
+| FinalScoreDteWeighted (2600/90) | 45.1% | +172.75 |
+
+**Verdict: NOT adopted.** Worse than both parents on win rate, and far short of OptionsScore's net —
+averaging the two legs dilutes OptionsScore's own strong signal rather than adding anything, the
+same "opposite/uneven-strength legs don't blend well" lesson `Composite`/`OptionsScoreBlend` already
+established on their own sides before switches replaced them.
+
+### 11. `FinalScoreBothMustAgree` — futures traded, options-sign confirmation gate — NOT adopted
+
+Traded score is FuturesScore, gated all-day by requiring OptionsScore to agree in sign. Best
+in-target cell: **2600/90 — 62 trades, 7.8 trades/day, 51.6% win, +129.75 net.**
+
+| | Win Rate | Net |
+|---|---|---|
+| FuturesScore alone (2600/90) | 55.0% | +144.70 |
+| FinalScoreBothMustAgree (2600/90) | 51.6% | +129.75 |
+
+**Verdict: NOT adopted.** The gate does not even improve on FuturesScore alone (both win rate and
+net went DOWN after filtering), the opposite of what a useful confirmation filter should do — same
+failure signature as item 6's all-day Skew Change gate on the options side.
+`FinalScoreFuturesPrimaryOptionsFilter` shares this exact dispatch/confirmation logic (see its own
+doc comment) and was not swept separately since the result is identical by construction.
+
+### 12. `FinalScoreOptionsPrimaryFuturesFilter` — options traded, futures-sign confirmation gate — NOT adopted
+
+Reverse direction: traded score is OptionsScore, gated all-day by requiring FuturesScore to agree in
+sign. Best in-target cell: **2600/85 — 130 trades, 16.2 trades/day, 52.3% win, +308.00 net.**
+
+| | Win Rate | Net |
+|---|---|---|
+| **OptionsScore alone (2600/90)** | **60.8%** | **+446.05** |
+| FinalScoreOptionsPrimaryFuturesFilter (2600/85) | 52.3% | +308.00 |
+
+**Verdict: NOT adopted.** Gating OptionsScore's own strong trades on FuturesScore agreement removes
+more good trades than bad ones — both win rate and net fall well short of trading OptionsScore
+ungated. Combined with item 11, neither direction of "one parent primary, the other as a sign-gate"
+beats trading the stronger parent on its own.
+
+### 13. `FinalScoreSessionWeighted` — session-phase-weighted blend — NOT adopted (closest of the four)
+
+Open (<10:00 IST) 0.7 FuturesScore/0.3 OptionsScore, Mid (10:00-13:30) 0.5/0.5, Close (≥13:30) 0.3
+FuturesScore/0.7 OptionsScore, per-phase weights tied to each phase's strongest documented leg (see
+enum doc comment). Best in-target cell: **2600/93 — 68 trades, 8.5 trades/day, 57.4% win, +379.80
+net.**
+
+| | Win Rate | Net |
+|---|---|---|
+| FuturesScore alone (2600/90) | 55.0% | +144.70 |
+| **OptionsScore alone (2600/90)** | **60.8%** | **+446.05** |
+| FinalScoreSessionWeighted (2600/93) | 57.4% | +379.80 |
+
+**Verdict: NOT adopted, but the closest of the 4 new combos and a genuine open trade-off worth
+revisiting.** It beats FuturesScore alone on both dimensions, and sits between the two parents rather
+than diluting below both the way item 10's DTE-weighted blend did — but per the adopt-only-if-both-
+improve-on-the-BETTER-parent rule, it falls short of OptionsScore alone on both win rate (57.4% vs.
+60.8%) and net (+379.80 vs. +446.05). Unlike items 10-12, this design's weights were never tuned
+(first-pass values straight from the doc-comment derivation) — a real weight sweep (finer per-phase
+grid, or swapping which phase gets the 0.7/0.3 tilt) is the natural next step before writing this
+design off, rather than treating one untuned first-pass result as final.
+
+#### 13a. Follow-up: phase-weight sweep — NOT adopted, kept original 0.7/0.5/0.3
+
+Per item 13's own "worth revisiting" note, the 3 phase weights (Open/Mid/Close weight-on-
+FuturesScore, OptionsScore always 1 minus it) were swept rather than left at their untuned
+first-pass values. `FinalScoreSessionWeighted` gained temporary-turned-permanent `--wopen=`/
+`--wmid=`/`--wclose=` calibrate flags (default 0.7/0.5/0.3, matching the original derivation) so
+the grid could run without recompiling. Swept each phase weight in {0.0, 0.3, 0.5, 0.7, 1.0} (125
+combos), BarThreshold=2600, entry percentiles 85-97 (the standing 7-20 trades/day target band),
+same 2026-09-08→2026-09-19 8-day range.
+
+| Combo (Open/Mid/Close wt-on-Futures) | Percentile | Trades | Win Rate | Net |
+|---|---|---|---|---|
+| Original 0.7/0.5/0.3 | 93 | 68 | 57.4% | +379.80 |
+| Best in-target found: 0.7/0.3/0.3 | 95 | 56 | 60.7% | **+446.10** |
+| **OptionsScore alone (locked)** | 90 | 148 | **60.8%** | +446.05 |
+
+**Verdict: NOT adopted, original 0.7/0.5/0.3 weights kept as the default.** No combo in the grid
+beat OptionsScore alone on both win rate and net within the target trades/day band. The closest,
+0.7/0.3/0.3 at percentile 95, is a near-exact tie on net (+446.10 vs. +446.05) but still loses on
+win rate (60.7% vs. 60.8%) — doesn't clear the adopt-only-if-both-improve bar. It's also a fragile
+single-cell peak, not a robust plateau: the *same* 0.7/0.3/0.3 weights at the neighboring 90 and 93
+percentiles collapse to 46.9% and 43.7% win respectively, while the original 0.7/0.5/0.3 stays in a
+tighter 54.0-64.7% band across percentiles 90-97 in the same sweep. Chasing the single best cell
+here would repeat the mistake item 11 explicitly checked for and ruled out elsewhere (an arbitrary
+stop mistaken for a genuine peak) — so the more stable original weights are kept as the shipped
+default rather than the higher-but-fragile candidate. The `--wopen=`/`--wmid=`/`--wclose=` calibrate
+flags are kept as a permanent addition (documented in `calibrate`'s own usage text) so a future,
+finer or differently-bounded re-sweep doesn't require recompiling again.
+
+**Phase 5 items 10-13 summary: none of the 4 FuturesScore+OptionsScore combinations beat
+`OptionsScoreThreeWaySwitch` alone.** OptionsScore remains the strongest single leading candidate on
+this 8-day range; no combination design tried here recovers additional edge from FuturesScore beyond
+what OptionsScore already captures on its own. Session-weighted blending (item 13) is the one design
+that came reasonably close and is flagged as worth a weight-sweep follow-up; the other three
+(DTE-weighted blend, both-must-agree in either direction) are confirmed weaker, not just untested.
+
+## Options-side crossover experiment (2026-09-20)
+
+The dual-MA crossover mechanism (originally built only for the futures side's own
+`SessionGatedDepthDurationConfirmed` score — see "Crossover experiment" section above) has been
+generalized to run on `OptionsScoreThreeWaySwitchMaxPainConfirmed`'s own per-bar score too.
+`SimulateCrossoverDayAsync` now takes an optional `VolumeBarMetric scoreMetric` parameter (default:
+`SessionGatedDepthDurationConfirmed`, unchanged) plus `bandWidth`/`optionsSwitchTime`; the `crossover`
+and `crossover-calibrate` CLI commands expose this as a new `--metric=` named flag (plus `--band=`),
+following the standing `--name=value` convention — no new required positional args. The options-score
+path reuses `OptionsScoreThreeWaySwitchMaxPainConfirmed`'s exact scoring logic: the Open/Mid/Close
+3-way switch computation was factored out of `SimulateDayAsync` into a new shared static method,
+`ComputeOptionsThreeWayScore`, called from both the standard percentile-threshold path and the new
+crossover path, so the two can never drift out of sync. Entry is gated by Max Pain sign agreement
+(same confirmation `OptionsScoreThreeWaySwitchMaxPainConfirmed` already requires), in place of the
+futures crossover's own TOB open-window gate.
+
+**Sanity check (no regression):** re-ran `crossover-calibrate 2026-09-08 2026-09-19 2600 8 40 5` (the
+locked futures config, `--metric` omitted so it still defaults to `SessionGatedDepthDurationConfirmed`)
+— 80 trades, 55.0% win, +277.20 net. This matches the 8-day-range FuturesScore number already recorded
+elsewhere in this file (see "Phase 5: FuturesScore + OptionsScore combination", which explicitly notes
+the 52.7%/+241.45 figure quoted for this same config was from an earlier, shorter 7-day range — the
+8-day range used throughout Phase 5 is the correct comparison base here, and it is unchanged by this
+change since the futures code path itself was not touched, only gated behind an `if`).
+
+**Options-crossover sweep**, same 8-day range, `--metric=OptionsScoreThreeWaySwitchMaxPainConfirmed
+--band=5`, grid fast∈{6,8,10,12} / slow∈{20,30,40} / threshold∈{5,10,15,20} pts, target 5-20 trades/day:
+
+| BarThreshold | Fast | Slow | Thresh | Trades | Trades/Day | Win% | Net |
+|---|---|---|---|---|---|---|---|
+| 650 | 8 | 40 | 10 | 88 | 11.0 | 62.5% | +152.20 |
+| 1300 | 10 | 30 | 5 | 95 | 11.9 | 60.0% | +136.75 |
+| **2600 (best overall)** | **12** | **30** | **5** | 48 | 6.0 | **62.5%** | **+153.95** |
+| Standing percentile-threshold (2600/90, for comparison) | — | — | — | 112 | 14.0 | **64.3%** | **+426.40** |
+
+**Verdict: NOT ADOPTED.** No options-crossover combo in the swept grid beats the standing
+`OptionsScoreThreeWaySwitchMaxPainConfirmed` percentile-threshold result (64.3% win, +426.40 net) on
+BOTH win rate and net — the best in-target combo found (2600/12/30/5) is close on win rate (62.5% vs
+64.3%) but far behind on net (+153.95 vs +426.40, on roughly half the trade count), so it fails the
+adopt-only-if-both-improve rule outright. Unlike the futures side (where the crossover mechanism found
+a real, still-unconfirmed edge over its own percentile-threshold baseline), the crossover reshaping
+does not help the options score — plausibly because the 3-way switch's Open/Mid/Close legs already
+change formula shape (not just which underlying reading) at each boundary, so a moving-average smooth
+across a leg switch is smoothing over a structural break rather than genuine trend noise the way it
+does for the futures score's single depth/duration switch. Not swept further given this gap; no
+out-of-sample follow-up planned unless a materially different parameter region is proposed.
+
+## Phase 5 combination methods closed out (2026-09-20)
+Items 10-13 (DTE-weighted, both-must-agree, futures/options-primary-filter, session-weighted blend) plus the session-weighted blend's follow-up phase-weight sweep (item 13a) are all complete — none beat the standalone `OptionsScoreThreeWaySwitchMaxPainConfirmed` on both win rate and net. **Combination is closed as a line of investigation for now.** Leading candidate remains the standalone options score with the Max Pain confirmation gate.

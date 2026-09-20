@@ -13,7 +13,13 @@ namespace NiftySignal.VolumeBarData;
 /// Band definition, per the finalized options-phase plan: ATM = strike nearest the FUTURE's own
 /// close price at this bar (not a synthetic forward -- that correction matters for IV solving,
 /// not for picking a coarse 3-strike window, and the plan's own Phase 0 explicitly defines the
-/// band this way). Band = ATM ± 1 strike, i.e. 3 strikes, both Call and Put (6 instruments).
+/// band this way).
+///
+/// <see cref="BandWidth"/> (2026-09-20, retrofitted -- was a hardcoded ATM±1 constant until the
+/// user asked whether Phase 1 ever tested a wider band the way Phase 2's depth metrics later did;
+/// it hadn't) is a real parameter now, matching <see cref="OptionDepthBarRow"/>'s own pattern:
+/// both widths can coexist in this table (part of the identity/unique index) so ATM±1 and ATM±2
+/// can be populated and calibrated side by side without a schema change per width.
 /// </summary>
 public sealed class OptionBandFlowBarRow
 {
@@ -24,6 +30,9 @@ public sealed class OptionBandFlowBarRow
     public required int BarIndex { get; set; }
 
     public required long BarVolumeThreshold { get; set; }
+
+    /// <summary>Strikes in the band, e.g. 3 = ATM±1 (the original, still the default), 5 = ATM±2.</summary>
+    public required int BandWidth { get; set; }
 
     public required DateTimeOffset EndTimestamp { get; set; }
 
