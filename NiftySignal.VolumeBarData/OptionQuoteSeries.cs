@@ -17,19 +17,49 @@ public sealed class OptionQuoteSeries
 {
     readonly List<(DateTimeOffset Timestamp, decimal Mid)> _series;
 
-    OptionQuoteSeries(List<(DateTimeOffset Timestamp, decimal Mid)> series) => _series = series;
+    /// <summary>The last raw tick timestamp already incorporated into <see cref="_series"/> (whether or not that tick itself carried a usable mid) -- see <see cref="OptionOiSeries"/>'s own identically-shaped field for why incremental loading needs this instead of relying on the last USABLE row's own timestamp.</summary>
+    readonly DateTimeOffset _scannedThrough;
 
-    public static async Task<OptionQuoteSeries> LoadAsync(
-        NiftySignalDbContext source, string token, DateTimeOffset dayStart, DateTimeOffset dayEnd, CancellationToken cancellationToken)
+    OptionQuoteSeries(List<(DateTimeOffset Timestamp, decimal Mid)> series, DateTimeOffset scannedThrough)
     {
+        _series = series;
+        _scannedThrough = scannedThrough;
+    }
+
+    /// <summary>Diagnostic only (Phase G perf-check, docs/LIVE_PARITY_PLAN.md) -- how many usable quote rows this load pulled, so the CLI's read-only reload-cost measurement can report real row counts, not just wall-clock time.</summary>
+    public int RowCountForDiagnostics => _series.Count;
+
+    public static Task<OptionQuoteSeries> LoadAsync(
+        NiftySignalDbContext source, string token, DateTimeOffset dayStart, DateTimeOffset dayEnd, CancellationToken cancellationToken) =>
+        LoadAsync(existing: null, source, token, dayStart, dayEnd, cancellationToken);
+
+    /// <summary>
+    /// Phase G perf fix (docs/LIVE_PARITY_PLAN.md): incremental variant used by <see cref="LiveOptionSeriesCache"/>
+    /// -- see <see cref="OptionOiSeries"/>'s own identically-shaped overload for the full rationale and the
+    /// concrete <c>perf-check</c> measurement that motivated it. <paramref name="existing"/> null reproduces
+    /// the original from-scratch <see cref="LoadAsync(NiftySignalDbContext,string,DateTimeOffset,DateTimeOffset,CancellationToken)"/>
+    /// exactly; every existing caller keeps using that overload unchanged.
+    /// </summary>
+    public static async Task<OptionQuoteSeries> LoadAsync(
+        OptionQuoteSeries? existing, NiftySignalDbContext source, string token, DateTimeOffset dayStart, DateTimeOffset dayEnd, CancellationToken cancellationToken)
+    {
+        if (existing is not null && existing._scannedThrough >= dayEnd)
+        {
+            return existing;
+        }
+
+        var queryStart = existing?._scannedThrough ?? dayStart;
+        var strictlyAfter = existing is not null;
+
         var rows = await source.Ticks
             .AsNoTracking()
-            .Where(t => t.Token == token && t.ExchangeTimestamp >= dayStart && t.ExchangeTimestamp <= dayEnd)
+            .Where(t => t.Token == token && (strictlyAfter ? t.ExchangeTimestamp > queryStart : t.ExchangeTimestamp >= queryStart) && t.ExchangeTimestamp <= dayEnd)
             .OrderBy(t => t.ExchangeTimestamp)
             .Select(t => new { t.ExchangeTimestamp, t.LastPrice, t.Depth })
             .ToListAsync(cancellationToken);
 
-        var series = new List<(DateTimeOffset, decimal)>(rows.Count);
+        var series = existing is not null ? new List<(DateTimeOffset, decimal)>(existing._series) : new List<(DateTimeOffset, decimal)>(rows.Count);
+        var scannedThrough = existing?._scannedThrough ?? dayStart;
         foreach (var row in rows)
         {
             var mid = MidPrice(row.LastPrice, row.Depth);
@@ -37,9 +67,16 @@ public sealed class OptionQuoteSeries
             {
                 series.Add((row.ExchangeTimestamp, m));
             }
+
+            scannedThrough = row.ExchangeTimestamp;
         }
 
-        return new OptionQuoteSeries(series);
+        if (rows.Count == 0)
+        {
+            scannedThrough = dayEnd;
+        }
+
+        return new OptionQuoteSeries(series, scannedThrough);
     }
 
     /// <summary>Same convention as `NiftySignal.BacktestData.CadencePopulator`'s own `MidPrice(Tick)` helper -- bid1/ask1 average when both sides are quoted and positive, LastPrice as a fallback, null when neither is usable (never fabricated).</summary>

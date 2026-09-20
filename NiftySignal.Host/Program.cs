@@ -8,6 +8,8 @@ using NiftySignal.Notifications;
 using NiftySignal.Persistence;
 using NiftySignal.Rules;
 using NiftySignal.Scoring;
+using NiftySignal.VolumeBarData;
+using Npgsql;
 using Serilog;
 
 // Windows Services start with their working directory at C:\Windows\System32, not the
@@ -44,6 +46,21 @@ try
 
     builder.Services.AddDbContext<NiftySignalDbContext>(options =>
         options.UseNpgsql(builder.Configuration.GetConnectionString("NiftySignalDb")));
+
+    // Phase A of docs/LIVE_PARITY_PLAN.md: the volume-bar database is a SEPARATE physical
+    // database from NiftySignalDb (see VolumeBarPopulator.VolumeBarDatabaseName's own doc
+    // comment) -- same server/credentials, different Database= override, same convention
+    // NiftySignal.VolumeBarData's own CLI Program.cs already uses to reach it.
+    builder.Services.AddDbContext<VolumeBarDbContext>(options =>
+    {
+        var baseConnectionString = builder.Configuration.GetConnectionString("NiftySignalDb")
+            ?? throw new InvalidOperationException("ConnectionStrings:NiftySignalDb is not set.");
+        var volumeBarConnectionString = new NpgsqlConnectionStringBuilder(baseConnectionString)
+        {
+            Database = VolumeBarPopulator.VolumeBarDatabaseName,
+        }.ConnectionString;
+        options.UseNpgsql(volumeBarConnectionString);
+    });
 
     builder.Services.Configure<TelegramOptions>(builder.Configuration.GetSection(TelegramOptions.SectionName));
     builder.Services.AddHttpClient<TelegramNotifier>();
@@ -103,6 +120,25 @@ try
 
     builder.Services.AddHostedService<MarketDataIngestionWorker>();
 
+    // Phase G of docs/LIVE_PARITY_PLAN.md (perf fix): Singleton, owned exclusively by
+    // LiveVolumeBarWriter's own single-threaded poll loop -- see LiveOptionSeriesCache's own doc
+    // comment for why that's safe without a lock.
+    builder.Services.AddSingleton<LiveOptionSeriesCache>();
+
+    // Phase A of docs/LIVE_PARITY_PLAN.md: writes VolumeBarRow/OptionAtmBarRow/OptionDepthBarRow/
+    // OptionMaxPainBarRow rows live, by polling-and-replaying NiftySignalDbContext.Ticks -- see
+    // LiveVolumeBarWriter's own doc comment for why this is a separate worker rather than hooked
+    // into MarketDataIngestionWorker's own tick loop. Deliberately does NOT compute or persist any
+    // score, nor place any paper trades -- that's Phase C/D, not yet wired.
+    builder.Services.AddHostedService<LiveVolumeBarWriter>();
+
+    // Phase C of docs/LIVE_PARITY_PLAN.md: computes the live OptionsScoreThreeWaySwitchMaxPainConfirmed
+    // score for every bar LiveVolumeBarWriter writes and records entry SIGNALS under the same
+    // percentile/Max-Pain/trading-hours rules the offline backtest uses -- see LiveOptionsScoreEngine's
+    // own doc comment for why this is a separate polling worker rather than literally chained after
+    // LiveVolumeBarWriter. Still no paper trading (no strike selection, no fills) -- that's Phase D.
+    builder.Services.AddHostedService<LiveOptionsScoreEngine>();
+
     var host = builder.Build();
 
     // Self-provisioning: a fresh machine gets its schema on first run.
@@ -110,6 +146,11 @@ try
     {
         var db = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
         db.Database.Migrate();
+
+        // Phase A: same self-provisioning as NiftySignalDb above, for the separate volume-bar
+        // database this Host process now writes to for the first time.
+        var volumeBarDb = scope.ServiceProvider.GetRequiredService<VolumeBarDbContext>();
+        volumeBarDb.Database.Migrate();
 
         // Force eager construction (and therefore eager startup validation -- see
         // ValidatedOptionsMonitor's own doc comment) rather than waiting for the first cadence

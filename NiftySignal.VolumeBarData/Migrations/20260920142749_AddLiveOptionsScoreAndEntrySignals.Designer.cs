@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using NiftySignal.VolumeBarData;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace NiftySignal.VolumeBarData.Migrations
 {
     [DbContext(typeof(VolumeBarDbContext))]
-    partial class VolumeBarDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260920142749_AddLiveOptionsScoreAndEntrySignals")]
+    partial class AddLiveOptionsScoreAndEntrySignals
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -70,38 +73,6 @@ namespace NiftySignal.VolumeBarData.Migrations
                     b.ToTable("LiveEntrySignals");
                 });
 
-            modelBuilder.Entity("NiftySignal.VolumeBarData.LiveKillSwitchState", b =>
-                {
-                    b.Property<int>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("integer");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
-
-                    b.Property<bool>("EntriesEnabled")
-                        .HasColumnType("boolean");
-
-                    b.Property<DateTimeOffset>("UpdatedAt")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<string>("UpdatedBy")
-                        .IsRequired()
-                        .HasColumnType("text");
-
-                    b.HasKey("Id");
-
-                    b.ToTable("LiveKillSwitchStates");
-
-                    b.HasData(
-                        new
-                        {
-                            Id = 1,
-                            EntriesEnabled = true,
-                            UpdatedAt = new DateTimeOffset(new DateTime(2026, 1, 1, 0, 0, 0, 0, DateTimeKind.Unspecified), new TimeSpan(0, 0, 0, 0, 0)),
-                            UpdatedBy = "migration-seed"
-                        });
-                });
-
             modelBuilder.Entity("NiftySignal.VolumeBarData.LiveOptionsScoreRow", b =>
                 {
                     b.Property<long>("Id")
@@ -149,70 +120,6 @@ namespace NiftySignal.VolumeBarData.Migrations
                         .IsUnique();
 
                     b.ToTable("LiveOptionsScoreBars");
-                });
-
-            modelBuilder.Entity("NiftySignal.VolumeBarData.LivePaperTradeRow", b =>
-                {
-                    b.Property<long>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("bigint");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
-
-                    b.Property<DateOnly>("AsOfDate")
-                        .HasColumnType("date");
-
-                    b.Property<long>("BarVolumeThreshold")
-                        .HasColumnType("bigint");
-
-                    b.Property<int>("EntryBarIndex")
-                        .HasColumnType("integer");
-
-                    b.Property<DateTimeOffset>("EntryDecisionTimestamp")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<decimal>("EntryPrice")
-                        .HasColumnType("numeric");
-
-                    b.Property<double>("EntryScore")
-                        .HasColumnType("double precision");
-
-                    b.Property<DateTimeOffset>("EntryTimestamp")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<int?>("ExitBarIndex")
-                        .HasColumnType("integer");
-
-                    b.Property<DateTimeOffset?>("ExitDecisionTimestamp")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<decimal?>("ExitPrice")
-                        .HasColumnType("numeric");
-
-                    b.Property<string>("ExitReason")
-                        .HasColumnType("text");
-
-                    b.Property<DateTimeOffset?>("ExitTimestamp")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<int>("Side")
-                        .HasColumnType("integer");
-
-                    b.Property<decimal>("StrikePrice")
-                        .HasColumnType("numeric");
-
-                    b.Property<string>("Token")
-                        .IsRequired()
-                        .HasColumnType("text");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("AsOfDate", "BarVolumeThreshold");
-
-                    b.HasIndex("AsOfDate", "BarVolumeThreshold", "EntryBarIndex")
-                        .IsUnique();
-
-                    b.ToTable("LivePaperTrades");
                 });
 
             modelBuilder.Entity("NiftySignal.VolumeBarData.OptionAtmBarRow", b =>

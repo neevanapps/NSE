@@ -34,6 +34,11 @@
          existing time-cadence dataset) is the parity/sanity-check reference the "analyze" mode
          compares this project's own volume-bar numbers against. See AnalyzeCommand.cs. -->
     <ProjectReference Include="..\NiftySignal.BacktestData\NiftySignal.BacktestData.csproj" />
+    <!-- 2026-09-20, live/backtest parity plan step 1: the locked OptionsScoreThreeWaySwitchMaxPainConfirmed
+         scoring logic (ComputeOptionsThreeWayScore + PassesConfirmation's Max Pain branch) now lives
+         in this dependency-free, pure-function project instead of a duplicated inline copy here.
+         See docs/LIVE_PARITY_PLAN.md. -->
+    <ProjectReference Include="..\NiftySignal.Scoring\NiftySignal.Scoring.csproj" />
   </ItemGroup>
 
 </Project>

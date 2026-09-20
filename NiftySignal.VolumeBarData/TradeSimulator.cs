@@ -2,6 +2,7 @@ using Microsoft.EntityFrameworkCore;
 using NiftySignal.Domain.Enums;
 using NiftySignal.Features;
 using NiftySignal.Persistence;
+using NiftySignal.Scoring;
 
 namespace NiftySignal.VolumeBarData;
 
@@ -638,7 +639,8 @@ public static class TradeSimulator
         int bandWidth = OptionDepthPopulator.DefaultBandWidth,
         TimeSpan? optionsSwitchTime = null,
         TimeSpan? entryWindowStartOverride = null,
-        (double Open, double Mid, double Close)? sessionWeightsOnFutures = null)
+        (double Open, double Mid, double Close)? sessionWeightsOnFutures = null,
+        Action<VolumeBarRow, double?, double?, double?>? onBarEvaluated = null)
     {
         // 2026-09-20, item 13 follow-up sweep: lets the 3 FinalScoreSessionWeighted phase weights
         // (weight-on-FuturesScore per phase; OptionsScore always gets 1 minus it) be swept from the
@@ -829,10 +831,10 @@ public static class TradeSimulator
             return series;
         }
 
-        Domain.Entities.Instrument? PickAtm(OptionType side, decimal futurePrice) => chain
-            .Where(o => o.OptionType == side)
-            .OrderBy(o => Math.Abs(o.StrikePrice!.Value - futurePrice))
-            .FirstOrDefault();
+        // Phase D of docs/LIVE_PARITY_PLAN.md: delegates to the shared, dependency-free
+        // NiftySignal.Scoring.AtmStrikeSelector -- the live paper-trade path calls the exact same
+        // function, so strike selection has exactly one implementation, not two that could drift.
+        Domain.Entities.Instrument? PickAtm(OptionType side, decimal futurePrice) => AtmStrikeSelector.PickAtm(chain, side, futurePrice);
 
         var trendTracker = new VolumeBarTrendReversionTracker(trendWindowBars);
         var rankTracker = new SessionRankTracker();
@@ -1330,8 +1332,8 @@ public static class TradeSimulator
             }
 
             double? maxPainConfirmScore = isOptionsScoreMaxPainConfirmed && optionMaxPainByBarIndex is not null
-                && optionMaxPainByBarIndex.TryGetValue(bar.BarIndex, out var mpConfirmBar) && mpConfirmBar.MaxPainStrike is { } mpConfirm
-                    ? SignedRank.Compute(-(double)(bar.ClosePrice - mpConfirm), confirmMaxPainRank)
+                && optionMaxPainByBarIndex.TryGetValue(bar.BarIndex, out var mpConfirmBar)
+                    ? MaxPainConfirmationGate.ComputeScore(bar.ClosePrice, mpConfirmBar.MaxPainStrike, confirmMaxPainRank)
                     : null;
 
             previousClose = bar.ClosePrice;
@@ -1342,6 +1344,14 @@ public static class TradeSimulator
                 : metric is VolumeBarMetric.FinalScoreDteWeighted or VolumeBarMetric.FinalScoreSessionWeighted ? comboMagnitudeRank
                 : trendMagnitudeRank;
             var percentile = EntryPercentile(metric, scaledScore, magnitudeRank);
+
+            // Phase C diagnostic hook (docs/LIVE_PARITY_PLAN.md) -- optional, no-op by default (null),
+            // does not affect this method's own dispatch/entry/exit logic in any way. Lets a parity
+            // harness (ReplayLiveScoreCommand) observe the EXACT per-bar scaledScore/percentile/
+            // maxPainConfirmScore this backtest itself computed and traded against, for a true
+            // empirical comparison against the live scoring path rather than an assumption that two
+            // independent call sites into the same NiftySignal.Scoring functions must agree.
+            onBarEvaluated?.Invoke(bar, scaledScore, percentile, maxPainConfirmScore);
 
             if (open is { } position)
             {
@@ -1489,10 +1499,10 @@ public static class TradeSimulator
             return series;
         }
 
-        Domain.Entities.Instrument? PickAtm(OptionType side, decimal futurePrice) => chain
-            .Where(o => o.OptionType == side)
-            .OrderBy(o => Math.Abs(o.StrikePrice!.Value - futurePrice))
-            .FirstOrDefault();
+        // Phase D of docs/LIVE_PARITY_PLAN.md: delegates to the shared, dependency-free
+        // NiftySignal.Scoring.AtmStrikeSelector -- the live paper-trade path calls the exact same
+        // function, so strike selection has exactly one implementation, not two that could drift.
+        Domain.Entities.Instrument? PickAtm(OptionType side, decimal futurePrice) => AtmStrikeSelector.PickAtm(chain, side, futurePrice);
 
         var depthRank = new SessionRankTracker();
         var durationRank = new SessionRankTracker();
@@ -1520,8 +1530,8 @@ public static class TradeSimulator
                 : ComputeSessionGatedScore(bar, previousClose, depthRank, durationRank);
             var tobConfirmScore = isOptionsCrossover ? (double?)null : SignedRank.Compute(bar.TopOfBookImbalance, tobRank);
             var maxPainConfirmScore = isOptionsCrossover && optionMaxPainByBarIndex is not null
-                && optionMaxPainByBarIndex.TryGetValue(bar.BarIndex, out var mpConfirmBar) && mpConfirmBar.MaxPainStrike is { } mpConfirm
-                    ? SignedRank.Compute(-(double)(bar.ClosePrice - mpConfirm), confirmMaxPainRank)
+                && optionMaxPainByBarIndex.TryGetValue(bar.BarIndex, out var mpConfirmBar)
+                    ? MaxPainConfirmationGate.ComputeScore(bar.ClosePrice, mpConfirmBar.MaxPainStrike, confirmMaxPainRank)
                     : (double?)null;
             previousClose = bar.ClosePrice;
 
@@ -1755,13 +1765,15 @@ public static class TradeSimulator
     }
 
     /// <summary>
-    /// 2026-09-20, factored out of <see cref="SimulateDayAsync"/>'s own <c>isOptionsScore3Way</c>
-    /// dispatch branch so <see cref="SimulateCrossoverDayAsync"/> can trade the IDENTICAL per-bar
-    /// score for <see cref="VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmed"/> (and its
-    /// 3-way-switch siblings) instead of duplicating this logic -- see that enum value's own doc
-    /// comment for the Open/Mid/Close leg design (Depth Imbalance / Price-signed ΔIV / raw ΔIV).
-    /// <paramref name="previousAtmIv"/> is threaded through by ref, same "keep primed through the
-    /// Open window" convention the original inline code used.
+    /// 2026-09-20, live/backtest parity plan step 1 (`docs/LIVE_PARITY_PLAN.md`): the actual Open/
+    /// Mid/Close scoring formula now lives in <see cref="NiftySignal.Scoring.OptionsThreeWayScoreCalculator"/>
+    /// (a pure, DB-free function in a project both this backtest and a future live pipeline can
+    /// call) -- this is now a thin adapter that projects the EF row types
+    /// (<see cref="OptionAtmBarRow"/>/<see cref="OptionDepthBarRow"/>) this project has into that
+    /// calculator's plain-typed <see cref="OptionsThreeWayScoreInputs"/>, unchanged call-site
+    /// signature so <see cref="SimulateDayAsync"/>/<see cref="SimulateCrossoverDayAsync"/> needed no
+    /// changes beyond this method body. <paramref name="previousAtmIv"/> is still threaded through
+    /// by ref, same "keep primed through the Open window" convention the original inline code used.
     /// </summary>
     static double? ComputeOptionsThreeWayScore(
         VolumeBarRow bar, decimal? previousClose,
@@ -1772,33 +1784,15 @@ public static class TradeSimulator
         SessionRankTracker depthRank, SessionRankTracker ivMidRank, SessionRankTracker ivCloseRank)
     {
         var currentAtmIv3 = optionAtmByBarIndex is not null && optionAtmByBarIndex.TryGetValue(bar.BarIndex, out var atmBar3) ? atmBar3.AtmIv : null;
-        var timeOfDay3 = IstTimeOfDay(bar.EndTimestamp);
+        var wideDepthBar3 = optionDepthWideByBarIndex is not null && optionDepthWideByBarIndex.TryGetValue(bar.BarIndex, out var wdb3) ? wdb3 : null;
 
-        double? score;
-        if (timeOfDay3 < effectiveOptionsSwitchTime)
-        {
-            var wideDepthBar3 = optionDepthWideByBarIndex is not null && optionDepthWideByBarIndex.TryGetValue(bar.BarIndex, out var wdb3) ? wdb3 : null;
-            score = wideDepthBar3 is not null
-                && ComputeImbalanceRatio(wideDepthBar3.CallBidQtyAvg + wideDepthBar3.PutBidQtyAvg, wideDepthBar3.CallAskQtyAvg + wideDepthBar3.PutAskQtyAvg) is { } depthRatio3
-                    ? SignedRank.Compute(-depthRatio3, depthRank) : null;
-        }
-        else if (timeOfDay3 < MidCloseSwitchTime)
-        {
-            score = previousAtmIv is { } prevIv3M && currentAtmIv3 is { } curIv3M && previousClose is { } prevClose3M
-                ? SignedRank.Compute(-Math.Sign(bar.ClosePrice - prevClose3M) * (curIv3M - prevIv3M), ivMidRank)
-                : null;
-        }
-        else
-        {
-            // Close leg: RAW ΔIV, not price-signed -- the session-phase split's own best Close
-            // performer was the raw (un-signed) variant, not the Mid leg's formula.
-            score = previousAtmIv is { } prevIv3C && currentAtmIv3 is { } curIv3C
-                ? SignedRank.Compute(curIv3C - prevIv3C, ivCloseRank)
-                : null;
-        }
+        var inputs = new OptionsThreeWayScoreInputs(
+            IstTimeOfDay(bar.EndTimestamp), bar.ClosePrice, previousClose, currentAtmIv3,
+            wideDepthBar3?.CallBidQtyAvg, wideDepthBar3?.PutBidQtyAvg, wideDepthBar3?.CallAskQtyAvg, wideDepthBar3?.PutAskQtyAvg);
 
-        previousAtmIv = currentAtmIv3 ?? previousAtmIv;
-        return score;
+        return OptionsThreeWayScoreCalculator.ComputeScore(
+            inputs, ref previousAtmIv, depthRank, ivMidRank, ivCloseRank,
+            effectiveOptionsSwitchTime, MidCloseSwitchTime);
     }
 
     /// <summary>
@@ -1822,8 +1816,10 @@ public static class TradeSimulator
         if (metric == VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmed)
         {
             // 2026-09-20, Phase 5 prep item 8 -- see this enum value's own doc comment. Applied
-            // all day, same as item 6's Skew Change gate, for a like-for-like comparison.
-            return maxPainConfirmScore is { } mp && Math.Sign(mp) == Math.Sign(scaledScore);
+            // all day, same as item 6's Skew Change gate, for a like-for-like comparison. Logic
+            // itself now lives in NiftySignal.Scoring.MaxPainConfirmationGate (live/backtest
+            // parity plan step 1, docs/LIVE_PARITY_PLAN.md) -- relocated, not rewritten.
+            return MaxPainConfirmationGate.Passes(maxPainConfirmScore, scaledScore);
         }
 
         if (metric == VolumeBarMetric.OptionsScoreThreeWaySwitchConfirmed)

@@ -130,8 +130,294 @@ if (args.Length > 0 && string.Equals(args[0], "analyze", StringComparison.Ordina
     return await AnalyzeCommand.RunAsync(analyzeDate, windowBars, analyzeThreshold, volumeBars, timeCadence);
 }
 
+// Phase A (docs/LIVE_PARITY_PLAN.md) debug helper: dumps which (AsOfDate, BarVolumeThreshold)
+// combinations already have rows in each of the 4 Phase-A tables, so a parity-test run can pick a
+// date/threshold that's already offline-populated to compare a live replay against.
+//   dotnet run --project NiftySignal.VolumeBarData -- list-populated [barVolumeThreshold]
+if (args.Length > 0 && string.Equals(args[0], "list-populated", StringComparison.OrdinalIgnoreCase))
+{
+    var lpThreshold = args.Length > 1 ? (long?)long.Parse(args[1]) : null;
+    await using var lpDb = new VolumeBarDbContext(volumeBarOptions);
+
+    async Task DumpAsync<T>(string label, IQueryable<T> query, Func<T, DateOnly> dateSel, Func<T, long> threshSel)
+    {
+        var rows = await query.ToListAsync();
+        var groups = rows.GroupBy(r => (Date: dateSel(r), Threshold: threshSel(r)))
+            .Where(g => lpThreshold is null || g.Key.Threshold == lpThreshold)
+            .OrderBy(g => g.Key.Date).ThenBy(g => g.Key.Threshold);
+        Console.WriteLine($"--- {label} ---");
+        foreach (var g in groups)
+        {
+            Console.WriteLine($"  {g.Key.Date:yyyy-MM-dd} @ {g.Key.Threshold}: {g.Count()} rows");
+        }
+    }
+
+    await DumpAsync("VolumeBars", lpDb.VolumeBars, b => b.AsOfDate, b => b.BarVolumeThreshold);
+    await DumpAsync("OptionAtmBars", lpDb.OptionAtmBars, b => b.AsOfDate, b => b.BarVolumeThreshold);
+    await DumpAsync("OptionDepthBars", lpDb.OptionDepthBars, b => b.AsOfDate, b => b.BarVolumeThreshold);
+    await DumpAsync("OptionMaxPainBars", lpDb.OptionMaxPainBars, b => b.AsOfDate, b => b.BarVolumeThreshold);
+    return 0;
+}
+
+// Phase A (docs/LIVE_PARITY_PLAN.md) verification harness: replays one day's already-recorded
+// ticks through the LIVE incremental writers (LiveVolumeBarPopulator/LiveOptionAtmPopulator/
+// LiveOptionDepthPopulator/LiveOptionMaxPainPopulator) as if they were arriving live -- polling at
+// a simulated cadence, cutting off at each poll's own "now" so no future tick is ever visible early
+// -- into a SEPARATE test database (niftysignal_volume_bars_livetest, never the real
+// niftysignal_volume_bars the offline populators use, so this can be re-run freely without
+// colliding with real data). Then compares the resulting rows, table by table, against the SAME
+// day's rows already produced by the offline populators in the real database.
+//   dotnet run --project NiftySignal.VolumeBarData -- replay-live <date:yyyy-MM-dd> [barVolumeThreshold=2600] [--restart-after=N] [--poll-seconds=10]
+if (args.Length > 0 && string.Equals(args[0], "replay-live", StringComparison.OrdinalIgnoreCase))
+{
+    var (rlPositional, rlNamed) = SplitNamedArgs(args);
+    if (rlPositional.Length < 2 || !DateOnly.TryParseExact(rlPositional[1], "yyyy-MM-dd", out var rlDate))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- replay-live <date:yyyy-MM-dd> [barVolumeThreshold=2600] [--restart-after=N] [--poll-seconds=10]");
+        return 1;
+    }
+
+    var rlThreshold = rlPositional.Length > 2 ? long.Parse(rlPositional[2]) : 2600L;
+    var rlRestartAfter = rlNamed.TryGetValue("restart-after", out var rlRestartStr) ? (int?)int.Parse(rlRestartStr) : null;
+    var rlPollSeconds = rlNamed.TryGetValue("poll-seconds", out var rlPollStr) ? int.Parse(rlPollStr) : 10;
+
+    return await ReplayLiveCommand.RunAsync(baseConnectionString, rlDate, rlThreshold, rlRestartAfter, rlPollSeconds);
+}
+
+// Phase C (docs/LIVE_PARITY_PLAN.md) verification harness: drives TradingDaySession (the exact class
+// NiftySignal.Host.LiveOptionsScoreEngine uses live) over one or more already-populated historical
+// days' bars (read from the OFFICIAL niftysignal_volume_bars database -- Phase A already proved a
+// live replay reproduces those bars row-for-row, so this only re-proves the SCORING/ENTRY side on
+// top of them) and compares its per-bar score + entry-signal output against what
+// TradeSimulator.SimulateDayAsync itself computed for the same day (via that method's own Phase C
+// onBarEvaluated diagnostic hook). Passing 2+ dates also proves day-boundary/no-cross-day-leakage,
+// since each date gets an independently-constructed TradingDaySession.
+//   dotnet run --project NiftySignal.VolumeBarData -- replay-live-score <date1:yyyy-MM-dd> [date2:yyyy-MM-dd ...] [--threshold=2600]
+if (args.Length > 0 && string.Equals(args[0], "replay-live-score", StringComparison.OrdinalIgnoreCase))
+{
+    var (rsPositional, rsNamed) = SplitNamedArgs(args);
+    var rsDates = rsPositional.Skip(1).Select(a => DateOnly.ParseExact(a, "yyyy-MM-dd")).ToList();
+    if (rsDates.Count == 0)
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- replay-live-score <date1:yyyy-MM-dd> [date2:yyyy-MM-dd ...] [--threshold=2600]");
+        return 1;
+    }
+
+    var rsThreshold = rsNamed.TryGetValue("threshold", out var rsThresholdStr) ? long.Parse(rsThresholdStr) : 2600L;
+    if (rsNamed.TryGetValue("restart-after", out var rsRestartStr))
+    {
+        return await ReplayLiveScoreCommand.RunRestartTestAsync(baseConnectionString, rsDates[0], rsThreshold, int.Parse(rsRestartStr), CancellationToken.None);
+    }
+
+    return await ReplayLiveScoreCommand.RunAsync(baseConnectionString, rsDates, rsThreshold, CancellationToken.None);
+}
+
+// Phase D (docs/LIVE_PARITY_PLAN.md) verification harness: drives TradingDaySession (same as
+// replay-live-score) plus LivePaperTradeExecutor (the exact class NiftySignal.Host.LiveOptionsScoreEngine
+// calls live to open/close paper trades) over one or more already-populated historical days, and
+// compares the resulting LivePaperTradeRow rows (entry bar/strike/direction/exit reason -- fill price
+// deltas logged, not compared exactly, per the plan's own fill-price policy) against
+// TradeSimulator.SimulateDayAsync's own trades for the same day/config.
+//   dotnet run --project NiftySignal.VolumeBarData -- replay-live-papertrade <date1:yyyy-MM-dd> [date2:yyyy-MM-dd ...] [--threshold=2600]
+if (args.Length > 0 && string.Equals(args[0], "replay-live-papertrade", StringComparison.OrdinalIgnoreCase))
+{
+    var (rpPositional, rpNamed) = SplitNamedArgs(args);
+    var rpDates = rpPositional.Skip(1).Select(a => DateOnly.ParseExact(a, "yyyy-MM-dd")).ToList();
+    if (rpDates.Count == 0)
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- replay-live-papertrade <date1:yyyy-MM-dd> [date2:yyyy-MM-dd ...] [--threshold=2600]");
+        return 1;
+    }
+
+    var rpThreshold = rpNamed.TryGetValue("threshold", out var rpThresholdStr) ? long.Parse(rpThresholdStr) : 2600L;
+    // 2026-09-20, Phase E: --destination-database= lets this proven harness write into the REAL
+    // niftysignal_volume_bars database instead of its own disposable scratch one -- used once to
+    // produce genuine persisted LivePaperTradeRow rows for verify-parity to read (see
+    // ReplayLivePaperTradeCommand.RunAsync's own doc comment). Omit for the original always-fresh
+    // scratch-database behavior.
+    var rpDestinationDatabase = rpNamed.TryGetValue("destination-database", out var rpDestDb) ? rpDestDb : null;
+    return await ReplayLivePaperTradeCommand.RunAsync(baseConnectionString, rpDates, rpThreshold, CancellationToken.None, rpDestinationDatabase);
+}
+
+// Phase E (docs/LIVE_PARITY_PLAN.md) -- THE MANDATORY NIGHTLY PARITY TOOL ("This tool is mandatory.
+// We will run it every day."). Re-runs the official backtest (TradeSimulator.SimulateDayAsync for
+// OptionsScoreThreeWaySwitchMaxPainConfirmed @ 2600/90) for one finished trading day, reads whatever
+// LivePaperTradeRow rows the REAL live system already persisted for that day, and diffs them
+// trade-by-trade: missing trade, extra trade, and for matched trades -- entry bar/strike/direction/
+// exit reason (must match exactly) and entry/exit fill price (expected to differ per the documented
+// fill-timing policy -- delta reported, only flagged as "out of range" past VerifyParityCommand's own
+// documented threshold, never itself a hard FAIL). See VerifyParityCommand.cs for the full comparison
+// logic and PASS/FAIL rule.
+//   dotnet run --project NiftySignal.VolumeBarData -- verify-parity <date:yyyy-MM-dd> [--threshold=2600] [--live-database=<name>]
+// --live-database overrides which database's LivePaperTradeRow rows are read as "live" (default: the
+// real niftysignal_volume_bars) -- exists ONLY so VerifyParitySelfTestCommand can point it at a
+// scratch copy with a deliberately-corrupted row, proving the tool actually detects a mismatch rather
+// than just printing PASS on already-known-good days. The official backtest re-derivation always
+// reads the real database regardless of this flag -- the source of truth is never swappable.
+if (args.Length > 0 && string.Equals(args[0], "verify-parity", StringComparison.OrdinalIgnoreCase))
+{
+    var (vpPositional, vpNamed) = SplitNamedArgs(args);
+    if (vpPositional.Length < 2 || !DateOnly.TryParseExact(vpPositional[1], "yyyy-MM-dd", out var vpDate))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- verify-parity <date:yyyy-MM-dd> [--threshold=2600] [--live-database=<name>]");
+        return 1;
+    }
+
+    var vpThreshold = vpNamed.TryGetValue("threshold", out var vpThresholdStr) ? long.Parse(vpThresholdStr) : 2600L;
+    var vpLiveDatabase = vpNamed.TryGetValue("live-database", out var vpLiveDb) ? vpLiveDb : null;
+    return await VerifyParityCommand.RunAsync(baseConnectionString, vpDate, vpThreshold, CancellationToken.None, vpLiveDatabase);
+}
+
+// Phase E self-test: proves VerifyParityCommand actually DETECTS a real mismatch, not just that it
+// prints PASS on already-known-good days. Copies one day's real, already-verified LivePaperTradeRow
+// rows into a disposable scratch database (niftysignal_volume_bars_paritytest -- never the real
+// niftysignal_volume_bars), deliberately corrupts ONE row three different ways in turn (wrong strike,
+// wrong direction, missing trade), asserts VerifyParityCommand reports FAIL with the right diagnosis
+// each time, reverts, and asserts PASS again. See VerifyParitySelfTestCommand.cs.
+//   dotnet run --project NiftySignal.VolumeBarData -- verify-parity-selftest <date:yyyy-MM-dd> [--threshold=2600]
+if (args.Length > 0 && string.Equals(args[0], "verify-parity-selftest", StringComparison.OrdinalIgnoreCase))
+{
+    var (vsPositional, vsNamed) = SplitNamedArgs(args);
+    if (vsPositional.Length < 2 || !DateOnly.TryParseExact(vsPositional[1], "yyyy-MM-dd", out var vsDate))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- verify-parity-selftest <date:yyyy-MM-dd> [--threshold=2600]");
+        return 1;
+    }
+
+    var vsThreshold = vsNamed.TryGetValue("threshold", out var vsThresholdStr) ? long.Parse(vsThresholdStr) : 2600L;
+    var vsSourceDatabase = vsNamed.TryGetValue("source-database", out var vsSrcDb) ? vsSrcDb : null;
+    return await VerifyParitySelfTestCommand.RunAsync(baseConnectionString, vsDate, vsThreshold, CancellationToken.None, vsSourceDatabase);
+}
+
 var tradeSourceConnectionString = new NpgsqlConnectionStringBuilder(baseConnectionString) { Database = "niftysignal_vm_copy" }.ConnectionString;
 var tradeSourceOptions = new DbContextOptionsBuilder<NiftySignalDbContext>().UseNpgsql(tradeSourceConnectionString).Options;
+
+// Phase G (docs/LIVE_PARITY_PLAN.md) performance-review helper: measures, READ-ONLY against the
+// real historical source (niftysignal_vm_copy -- never written to), the wall-clock cost of the
+// SINGLE most expensive thing LiveOptionAtmPopulator/LiveOptionMaxPainPopulator do on every poll
+// that has at least one new pending bar: reloading each touched option token's FULL day-so-far
+// quote/OI history (OptionQuoteSeries.LoadAsync / OptionOiSeries.LoadAsync), at the worst point in
+// the day (dayEnd = market close, i.e. the largest possible day-so-far range). This reproduces the
+// exact query shape both live populators already issue -- see their own doc comments in
+// LiveOptionAtmPopulator.cs/LiveOptionMaxPainPopulator.cs for why they reload rather than
+// incrementally update -- without mutating any table.
+//   dotnet run --project NiftySignal.VolumeBarData -- perf-check <date:yyyy-MM-dd> [barVolumeThreshold=2600]
+if (args.Length > 0 && string.Equals(args[0], "perf-check", StringComparison.OrdinalIgnoreCase))
+{
+    if (args.Length < 2 || !DateOnly.TryParseExact(args[1], "yyyy-MM-dd", out var pcDate))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- perf-check <date:yyyy-MM-dd> [barVolumeThreshold=2600]");
+        return 1;
+    }
+
+    var pcThreshold = args.Length > 2 ? long.Parse(args[2]) : 2600L;
+
+    await using var pcSource = new NiftySignalDbContext(tradeSourceOptions);
+    await using var pcVolumeBars = new VolumeBarDbContext(volumeBarOptions);
+
+    var pcFutureBars = await pcVolumeBars.VolumeBars
+        .Where(b => b.AsOfDate == pcDate && b.BarVolumeThreshold == pcThreshold)
+        .OrderBy(b => b.BarIndex)
+        .ToListAsync();
+    if (pcFutureBars.Count == 0)
+    {
+        Console.Error.WriteLine($"No VolumeBars found for {pcDate:yyyy-MM-dd} @ {pcThreshold} in niftysignal_volume_bars -- populate it first (see docs/LIVE_PARITY_PLAN.md Phase A).");
+        return 1;
+    }
+
+    var pcDayStart = pcFutureBars[0].StartTimestamp;
+    var pcDayEnd = pcFutureBars[^1].EndTimestamp;
+
+    var pcAllOptions = await pcSource.Instruments
+        .Where(i => i.AsOfDate == pcDate && i.InstrumentType == NiftySignal.Domain.Enums.InstrumentType.Option && i.ExpiryDate != null)
+        .ToListAsync();
+    var pcNearestExpiry = pcAllOptions.Select(o => o.ExpiryDate!.Value).Min();
+    var pcChain = pcAllOptions.Where(o => o.ExpiryDate == pcNearestExpiry).ToList();
+    var pcDistinctStrikes = pcChain.Select(o => o.StrikePrice!.Value).Distinct().ToList();
+
+    Console.WriteLine($"=== perf-check {pcDate:yyyy-MM-dd} @ {pcThreshold}: {pcDistinctStrikes.Count} distinct strikes, {pcChain.Count} option tokens in nearest-expiry chain, day range {pcDayStart:HH:mm} - {pcDayEnd:HH:mm} IST-equivalent ===");
+
+    // MaxPain's own reload shape: EVERY distinct strike in the chain, both sides -- see
+    // LiveOptionMaxPainPopulator.WriteNewBarsAsync's own foreach (var strike in distinctStrikes) loop.
+    var pcMaxPainTokens = pcChain.Select(o => o.Token).Distinct().ToList();
+    var pcMaxPainSw = System.Diagnostics.Stopwatch.StartNew();
+    var pcMaxPainTotalRows = 0;
+    foreach (var token in pcMaxPainTokens)
+    {
+        var series = await OptionOiSeries.LoadAsync(pcSource, token, pcDayStart, pcDayEnd, CancellationToken.None);
+        pcMaxPainTotalRows += series.RowCountForDiagnostics;
+    }
+
+    pcMaxPainSw.Stop();
+    Console.WriteLine($"MaxPain-shaped reload: {pcMaxPainTokens.Count} tokens, {pcMaxPainTotalRows} total OI-bearing rows read, {pcMaxPainSw.ElapsedMilliseconds}ms wall-clock (full day-so-far range, worst case = last bar of the day).");
+
+    // ATM's own reload shape: only the SyntheticForwardStrikeCount=5 nearest-to-close strikes, both
+    // sides -- see LiveOptionAtmPopulator's own distinctStrikes.OrderBy(...).Take(5) loop. Using the
+    // day's OWN closing future price as the anchor (same "nearest to bar.ClosePrice" ordering, just
+    // evaluated once at the day's last close for this worst-case measurement).
+    var pcLastFuturePrice = pcFutureBars[^1].ClosePrice;
+    var pcAtmTokens = pcDistinctStrikes.OrderBy(s => Math.Abs(s - pcLastFuturePrice)).Take(5)
+        .SelectMany(strike => pcChain.Where(o => o.StrikePrice == strike).Select(o => o.Token))
+        .ToList();
+    var pcAtmSw = System.Diagnostics.Stopwatch.StartNew();
+    var pcAtmTotalRows = 0;
+    foreach (var token in pcAtmTokens)
+    {
+        var series = await OptionQuoteSeries.LoadAsync(pcSource, token, pcDayStart, pcDayEnd, CancellationToken.None);
+        pcAtmTotalRows += series.RowCountForDiagnostics;
+    }
+
+    pcAtmSw.Stop();
+    Console.WriteLine($"ATM-shaped reload: {pcAtmTokens.Count} tokens, {pcAtmTotalRows} total quote-bearing rows read, {pcAtmSw.ElapsedMilliseconds}ms wall-clock (full day-so-far range, worst case = last bar of the day).");
+    Console.WriteLine($"BEFORE (from-scratch every poll): combined worst-case single-poll reload cost = {pcMaxPainSw.ElapsedMilliseconds + pcAtmSw.ElapsedMilliseconds}ms against a 10000ms poll budget.");
+    Console.WriteLine();
+
+    // AFTER: same two reload shapes, but through LiveOptionSeriesCache warmed up to
+    // (dayEnd - 1 poll interval) first -- i.e. simulating "the cache already has everything except
+    // the last ~10s of ticks," the real steady-state shape once the Phase G fix is running live. The
+    // warm-up call's own cost is excluded from the comparison (it corresponds to every EARLIER poll's
+    // own already-amortized cost, not to what THIS poll adds) -- only the final incremental top-up is
+    // timed, since that is what actually runs inside the live 10s poll loop after the cache is warm.
+    var pcCache = new LiveOptionSeriesCache();
+    var pcWarmDayEnd = pcDayEnd.AddSeconds(-10);
+    foreach (var token in pcMaxPainTokens)
+    {
+        await pcCache.GetOiSeriesAsync(pcSource, pcDate, token, pcDayStart, pcWarmDayEnd, CancellationToken.None);
+    }
+
+    foreach (var token in pcAtmTokens)
+    {
+        await pcCache.GetQuoteSeriesAsync(pcSource, pcDate, token, pcDayStart, pcWarmDayEnd, CancellationToken.None);
+    }
+
+    var pcMaxPainAfterSw = System.Diagnostics.Stopwatch.StartNew();
+    var pcMaxPainAfterRows = 0;
+    foreach (var token in pcMaxPainTokens)
+    {
+        var series = await pcCache.GetOiSeriesAsync(pcSource, pcDate, token, pcDayStart, pcDayEnd, CancellationToken.None);
+        pcMaxPainAfterRows += series.RowCountForDiagnostics;
+    }
+
+    pcMaxPainAfterSw.Stop();
+
+    var pcAtmAfterSw = System.Diagnostics.Stopwatch.StartNew();
+    var pcAtmAfterRows = 0;
+    foreach (var token in pcAtmTokens)
+    {
+        var series = await pcCache.GetQuoteSeriesAsync(pcSource, pcDate, token, pcDayStart, pcDayEnd, CancellationToken.None);
+        pcAtmAfterRows += series.RowCountForDiagnostics;
+    }
+
+    pcAtmAfterSw.Stop();
+
+    Console.WriteLine($"AFTER (LiveOptionSeriesCache warm, this poll only adds the last ~10s of ticks):");
+    Console.WriteLine($"  MaxPain-shaped incremental top-up: {pcMaxPainAfterRows} total rows (same series content), {pcMaxPainAfterSw.ElapsedMilliseconds}ms wall-clock.");
+    Console.WriteLine($"  ATM-shaped incremental top-up:     {pcAtmAfterRows} total rows (same series content), {pcAtmAfterSw.ElapsedMilliseconds}ms wall-clock.");
+    Console.WriteLine($"  Combined AFTER cost: {pcMaxPainAfterSw.ElapsedMilliseconds + pcAtmAfterSw.ElapsedMilliseconds}ms against a 10000ms poll budget (was {pcMaxPainSw.ElapsedMilliseconds + pcAtmSw.ElapsedMilliseconds}ms).");
+    Console.WriteLine($"  Row-count parity check: MaxPain {pcMaxPainTotalRows} (before) vs {pcMaxPainAfterRows} (after) -- {(pcMaxPainTotalRows == pcMaxPainAfterRows ? "MATCH" : "MISMATCH")}. ATM {pcAtmTotalRows} (before) vs {pcAtmAfterRows} (after) -- {(pcAtmTotalRows == pcAtmAfterRows ? "MATCH" : "MISMATCH")}.");
+
+    return 0;
+}
 
 // 2026-09-17, perf: lives for the WHOLE process run (not per RunRangeAsync call), so a
 // "calibrate" sweep -- which calls RunRangeAsync dozens of times, once per (threshold,

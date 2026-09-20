@@ -25,5 +25,6 @@
     <ProjectReference Include="..\NiftySignal.Scoring\NiftySignal.Scoring.csproj" />
     <ProjectReference Include="..\NiftySignal.Rules\NiftySignal.Rules.csproj" />
     <ProjectReference Include="..\NiftySignal.Execution\NiftySignal.Execution.csproj" />
+    <ProjectReference Include="..\NiftySignal.VolumeBarData\NiftySignal.VolumeBarData.csproj" />
   </ItemGroup>
 </Project>
