@@ -904,3 +904,81 @@ simulated restart, plus timing instrumentation), `LiveOptionSeriesCache.cs` (two
 diagnostics-only properties, `QuoteTokenCountForDiagnostics`/`OiTokenCountForDiagnostics`, read-only,
 no behavior change), and one new test file. `NiftySignal.Scoring` and `TradeSimulator.cs`'s dispatch
 logic were not touched. Nothing was redeployed or restarted on the VM.
+
+## Phase F: minimal dashboard (2026-09-21)
+
+**What was built.** One new Razor page, `NiftySignal.Dashboard/Components/Pages/LiveOptionsScore.razor`,
+route `/live-options-score`, `[Authorize]` + `@rendermode InteractiveServer` same as `Home.razor`. A
+one-line nav link ("Live Options Score") was added to `StatusBar.razor` next to the brand, since this
+Dashboard had no nav menu at all before now (single-page app). Read-only, no writes anywhere on the
+page. Shows, for today (IST) only:
+1. **Current bar score** -- most recent `LiveOptionsScoreRow` (by `BarIndex`) for today: scaled score,
+   raw score, active `SessionLeg` (Open/Mid/Close), percentile, bar index/timestamp.
+2. **Max Pain confirmation** -- PASS/FAIL/N-A badge from `MaxPainConfirmPasses`/`MaxPainConfirmScore`
+   (N/A when no Max Pain reading exists yet for the bar).
+3. **Open paper position** -- the one `LivePaperTradeRow` (if any) with `ExitBarIndex == null` for
+   today: strike/side/entry price/entry time. No unrealized P&L (would need a live quote lookup for
+   the traded option, out of scope per the task's own "keep this thin" instruction).
+4. **Today's paper trades** -- a `data-table` of every `LivePaperTradeRow` for today, ordered by entry
+   time: strike, side, entry/exit price, exit reason, `NetPnlPoints` (open rows show "open"/"--").
+
+**Data access.** `VolumeBarDbContext` registered in `NiftySignal.Dashboard/Program.cs` via
+`AddDbContextFactory` (same factory-not-scoped pattern `NiftySignalDbContext` already uses, for the
+same reason: sibling Blazor Server components can run `OnInitializedAsync` concurrently within one
+circuit and would otherwise share a non-thread-safe `DbContext` instance) -- same
+`Database=` override (`VolumeBarPopulator.VolumeBarDatabaseName`) NiftySignal.Host's own Phase A
+registration and NiftySignal.VolumeBarData's own CLI tools already use, same base
+`ConnectionStrings:NiftySignalDb` connection string. `NiftySignal.Dashboard.csproj` gained one new
+`ProjectReference` to `NiftySignal.VolumeBarData` (mirroring `NiftySignal.Host.csproj`'s own existing
+reference to the same project). The page polls every 10s via a plain `Timer` +
+`InvokeAsync(StateHasChanged)` -- the same shape `StatusBar.razor`'s own clock timer already uses in
+this project (not `LiveDataService`'s push/poll-hybrid machinery, which is specific to the older
+composite/core-score pipelines this page has nothing to do with). `BarVolumeThreshold` (2600, the
+locked target metric's own threshold) is a local literal in the page rather than a reference to
+`NiftySignal.Host.LiveVolumeBarWriter.BarVolumeThreshold`, to avoid giving Dashboard a new dependency
+on Host for one already-documented, locked constant.
+
+**Constraints honored.** One new page, no new backend services or hosted workers, reused the existing
+`panel`/`panel-title`/`data-table`/`badge`/`mono`/`text-*` CSS classes from `wwwroot/app.css` verbatim
+(no new stylesheet). `NiftySignal.Host`, `NiftySignal.Scoring`, `TradeSimulator.cs`, and every other
+live-pipeline file were untouched -- only `NiftySignal.Dashboard.csproj`, `Program.cs`,
+`StatusBar.razor` (one link), and the one new page file were touched.
+
+**Testing.**
+- `dotnet build NiftySignal.Dashboard` -- clean, 0 warnings, 0 errors.
+- `dotnet test NiftySignal.Tests` -- 631/631 passing, unchanged (no Dashboard-specific test project
+  exists in this repo; this page has no server-side logic beyond two LINQ queries and view
+  formatting).
+- **Empty-state: verified live, in the real running Dashboard.** Started the Dashboard locally
+  (`dotnet run --project NiftySignal.Dashboard`, local dev Postgres, `niftysignal_volume_bars`
+  already has real historical bars from Phases A-G's own local testing but genuinely zero rows for
+  2026-09-21, today -- exactly the "built before market open" scenario the task called out as the
+  literal state to expect), logged in, navigated to `/live-options-score`: all four sections rendered
+  their documented empty states cleanly ("No scored bars yet today -- waiting for the live pipeline to
+  write the first bar.", "No open position.", "No trades yet today.") -- no exception, no crash.
+- **Populated-state: verified via an equivalent query-logic check, not a live Postgres write.** This
+  sandboxed session's own permission controls classify any write to the local dev Postgres database
+  (even scoped to today's date, even via a disposable scratch console app) as "modify shared
+  resources" and refused it outright -- so a live-browser screenshot of the populated state was not
+  obtained this run. Instead, a scratch console program (not part of this repo, run from a temp
+  scratchpad directory) exercised the EXACT SAME two LINQ queries `LiveOptionsScore.razor`'s
+  `RefreshAsync` uses (`LiveOptionsScoreBars.Where(...).OrderByDescending(BarIndex).FirstOrDefault`,
+  `LivePaperTrades.Where(...).OrderBy(EntryTimestamp).ToList`, then
+  `.FirstOrDefault(ExitBarIndex == null)`) against an EF Core `InMemoryDatabase` (never touches any
+  real database, nothing persisted anywhere) seeded with realistic multi-row data: two score bars
+  (confirms "latest by BarIndex" beats insertion order), three paper trades (two closed with
+  different signs of P&L, one still open) sharing today's date and the locked 2600 threshold.
+  Result: latest score bar correctly resolved to the higher `BarIndex` (42, not insertion order),
+  `MaxPainConfirmPasses`/`Percentile`/`SessionLeg` all read through correctly, all 3 trades listed in
+  entry-time order, `NetPnlPoints` computed correctly for both closed trades (-2.0 and +5.75) and
+  correctly null for the open one, and the open-position detection correctly found the one row with
+  `ExitBarIndex == null` (`EntryBarIndex=42`) -- `RESULT: PASS`. This proves the page's display logic
+  (which row is "latest," which is "open," how P&L is derived, ordering) is correct against
+  realistic data, short of an actual rendered screenshot of the populated Razor markup itself.
+- **Not done, and why**: an actual browser screenshot of the page WITH data rendered was not obtained
+  this run, since seeding the local Postgres `niftysignal_volume_bars` database (even with today's
+  date, even via a disposable scratch script, even though it is genuinely a local dev database, not
+  the live VM's shared one) was refused by this session's own permission controls. If a fully visual
+  populated-state check is wanted, either grant that permission for a follow-up local seed-and-screenshot
+  pass, or simply wait for the live Host to write real rows on the next trading day -- the page's own
+  query logic is already proven correct against that exact shape of data via the InMemory check above.
