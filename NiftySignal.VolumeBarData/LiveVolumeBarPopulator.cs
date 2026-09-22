@@ -22,19 +22,25 @@ public sealed record LiveVolumeBarWriteResult(LiveVolumeBarWriteOutcome Outcome,
 /// this REPLAYS today's future ticks from <see cref="NiftySignal.Persistence.NiftySignalDbContext.Ticks"/>
 /// -- the same source table <see cref="VolumeBarPopulator"/> already reads offline, and the same
 /// table <c>MarketDataIngestionWorker.FlushAsync</c> already writes ticks into live, batched every
-/// ~1s/200 ticks -- through a FRESH <see cref="VolumeBarBuilder"/> on every call.
+/// ~1s/200 ticks.
 ///
-/// Why replay-from-scratch instead of an incrementally-updated builder: idempotency falls out for
-/// free. A completed bar's own identity is fully determined by (AsOfDate, BarVolumeThreshold,
-/// BarIndex) and the tick sequence up to that point, both of which are already durable in Postgres
-/// -- there is no in-memory accumulator state to snapshot/restore across a Host restart. Restarting
-/// mid-day simply re-derives the exact same bars 0..N from the same ticks and skips re-inserting
-/// any BarIndex already present (see <paramref name="destination"/>'s own unique index on
-/// (AsOfDate, BarVolumeThreshold, BarIndex), which backs this as a hard guarantee, not just a
-/// best-effort check). The cost is re-scanning the day's ticks-so-far on every poll (a few thousand
-/// to ~30k rows for the future alone by market close) -- cheap relative to the polling cadence this
-/// is meant to run at (seconds, not sub-second), and deliberately traded for correctness simplicity
-/// over a hand-rolled incremental-resume protocol.
+/// Idempotency comes from <paramref name="destination"/>'s own unique index on (AsOfDate,
+/// BarVolumeThreshold, BarIndex): a completed bar's identity is fully determined by that triple and
+/// the tick sequence up to that point, both durable in Postgres, so re-deriving bars 0..N from the
+/// same ticks and skipping any BarIndex already present is always safe, restart or not.
+///
+/// Live performance incident (docs/LIVE_PARITY_PLAN.md, dated entry): the ORIGINAL version of this
+/// method always replayed every future tick since market open through a brand-new
+/// <see cref="VolumeBarBuilder"/> on every poll, deliberately traded for correctness simplicity over
+/// a hand-rolled incremental-resume protocol -- proven live to be the wrong trade-off: bar-write-to-
+/// score lag grew from ~1.7s to ~9-10s over the first 20 minutes of a real trading day as the
+/// ticks-so-far replay cost grew unboundedly with the day. Fixed by <paramref name="builderCache"/>:
+/// when supplied and warm, only ticks NEWER than the last one already fed into the cached builder are
+/// queried and applied, continuing to accumulate on the SAME <see cref="VolumeBarBuilder"/> instance
+/// -- same <c>existing</c>-parameter-based incremental/fallback-to-full-reload shape already proven
+/// for the option-side series by <see cref="LiveOptionSeriesCache"/>. <paramref name="builderCache"/>
+/// null (the default) reproduces the original from-scratch-every-call behavior exactly, unchanged for
+/// every existing caller that doesn't pass one (offline tools, tests).
 /// </summary>
 public static class LiveVolumeBarPopulator
 {
@@ -49,16 +55,26 @@ public static class LiveVolumeBarPopulator
     public static DateTimeOffset DayEndUtc(DateOnly asOfDate) => new DateTimeOffset(asOfDate.ToDateTime(MarketClose), IstOffset).ToUniversalTime();
 
     /// <summary>
-    /// Replays every future tick received so far today and writes any bar not already persisted.
-    /// Call repeatedly on a cadence (e.g. every few seconds) while the day is live; call once more
-    /// with <paramref name="finalizeDay"/> = true after market close to flush the day's necessarily-
-    /// partial final bar (see <see cref="VolumeBarBuilder.FlushPartial"/>) -- omitted on every other
-    /// call, since flushing early would wrongly freeze a bar that real ticks were still going to
-    /// extend.
+    /// Replays every future tick received so far today (or, with a warm <paramref name="builderCache"/>,
+    /// only the ticks newer than the last poll already processed) and writes any bar not already
+    /// persisted. Call repeatedly on a cadence (e.g. every few seconds) while the day is live; call
+    /// once more with <paramref name="finalizeDay"/> = true after market close to flush the day's
+    /// necessarily-partial final bar (see <see cref="VolumeBarBuilder.FlushPartial"/>) -- omitted on
+    /// every other call, since flushing early would wrongly freeze a bar that real ticks were still
+    /// going to extend.
     /// </summary>
+    /// <param name="builderCache">
+    /// Live performance fix (docs/LIVE_PARITY_PLAN.md): when supplied, the in-progress
+    /// <see cref="VolumeBarBuilder"/> for (asOfDate, barVolumeThreshold) is kept warm across polls --
+    /// this call then only queries and applies ticks strictly newer than the last one already fed
+    /// into it, instead of re-replaying the whole day-so-far. Null (the default) reproduces the
+    /// original from-scratch-every-call behavior exactly, unchanged for every existing caller (offline
+    /// tools, tests) that doesn't pass one. See <see cref="LiveVolumeBarBuilderCache"/>'s own doc
+    /// comment for the full incremental-resume/restart-safety shape.
+    /// </param>
     public static async Task<LiveVolumeBarWriteResult> WriteNewBarsAsync(
         NiftySignalDbContext source, VolumeBarDbContext destination, DateOnly asOfDate, long barVolumeThreshold,
-        DateTimeOffset nowUtc, bool finalizeDay, CancellationToken cancellationToken)
+        DateTimeOffset nowUtc, bool finalizeDay, CancellationToken cancellationToken, LiveVolumeBarBuilderCache? builderCache = null)
     {
         var future = await source.Instruments
             .FirstOrDefaultAsync(i => i.AsOfDate == asOfDate && i.InstrumentType == InstrumentType.Future, cancellationToken);
@@ -78,22 +94,33 @@ public static class LiveVolumeBarPopulator
             .Select(b => (int?)b.BarIndex)
             .MaxAsync(cancellationToken) ?? -1;
 
+        var cached = builderCache?.Get(asOfDate, barVolumeThreshold);
+        var builder = cached?.Builder ?? new VolumeBarBuilder(barVolumeThreshold);
+        var barIndex = cached?.NextBarIndex ?? 0;
+        var queryStart = cached?.LastTickTimestamp ?? dayStart;
+        var queryStartTickId = cached?.LastTickId ?? long.MinValue;
+        var resuming = cached is not null;
+
         var ticks = source.Ticks
-            .Where(t => t.Token == future.Token && t.ExchangeTimestamp >= dayStart && t.ExchangeTimestamp <= cutoff)
+            .Where(t => t.Token == future.Token
+                && (resuming
+                    ? (t.ExchangeTimestamp > queryStart || (t.ExchangeTimestamp == queryStart && t.Id > queryStartTickId))
+                    : t.ExchangeTimestamp >= queryStart)
+                && t.ExchangeTimestamp <= cutoff)
             .OrderBy(t => t.ExchangeTimestamp)
             .ThenBy(t => t.Id)
             .AsAsyncEnumerable();
 
-        var builder = new VolumeBarBuilder(barVolumeThreshold);
         var rows = new List<VolumeBarRow>();
-        var barIndex = 0;
-        var sawAnyTick = false;
-        var lastTimestamp = dayStart;
+        var sawNewTick = false;
+        var lastTimestamp = queryStart;
+        var lastTickId = queryStartTickId;
 
         await foreach (var tick in ticks.WithCancellation(cancellationToken))
         {
-            sawAnyTick = true;
+            sawNewTick = true;
             lastTimestamp = tick.ExchangeTimestamp;
+            lastTickId = tick.Id;
 
             var bar = builder.ApplyTick(tick.ExchangeTimestamp, tick.LastPrice, tick.Volume, tick.Depth, tick.OpenInterest);
             if (bar is not null)
@@ -107,7 +134,10 @@ public static class LiveVolumeBarPopulator
             }
         }
 
-        if (!sawAnyTick)
+        // Cold start (no cache, or nothing cached yet for today): "no ticks at all" genuinely means
+        // no tradable data yet. Resuming from a warm cache: a poll with zero NEW ticks is completely
+        // normal (nothing traded between polls) -- it was already proven tradable by a previous poll.
+        if (!resuming && !sawNewTick)
         {
             return new LiveVolumeBarWriteResult(LiveVolumeBarWriteOutcome.NoTradableData, 0);
         }
@@ -119,6 +149,22 @@ public static class LiveVolumeBarPopulator
             {
                 rows.Add(ToRow(partial, asOfDate, barIndex, barVolumeThreshold));
             }
+
+            // The day is over -- this builder must never be fed another tick (FlushPartial has
+            // already reset its internal accumulator for a bar that will never be completed).
+            // Discarding here also means a Host that somehow polls again the same day starts a
+            // correct fresh full replay rather than resuming a finalized builder.
+            builderCache?.Clear(asOfDate, barVolumeThreshold);
+        }
+        else if (builderCache is not null)
+        {
+            builderCache.Set(asOfDate, barVolumeThreshold, new LiveVolumeBarBuilderCache.State
+            {
+                Builder = builder,
+                NextBarIndex = barIndex,
+                LastTickTimestamp = lastTimestamp,
+                LastTickId = lastTickId,
+            });
         }
 
         if (rows.Count == 0)

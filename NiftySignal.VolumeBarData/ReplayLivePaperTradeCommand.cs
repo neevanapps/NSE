@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
+using NiftySignal.Domain.Enums;
 using NiftySignal.Persistence;
 
 namespace NiftySignal.VolumeBarData;
@@ -126,6 +127,7 @@ public static class ReplayLivePaperTradeCommand
                     {
                         AsOfDate = date,
                         BarVolumeThreshold = threshold,
+                        Strategy = LiveVolumeBarStrategyId.Options,
                         Side = opened.Side,
                         EntryBarIndex = opened.EntryBarIndex,
                         EntryTimestamp = opened.EntryTimestamp,

@@ -88,7 +88,13 @@ public static class ReplayLiveCommand
         // happens, not by clearing it (a real process restart doesn't clear an object, it loses it
         // entirely and starts a brand-new one).
         var cache = new LiveOptionSeriesCache();
+        var futureBuilderCache = new LiveVolumeBarBuilderCache();
         var pollTimings = new List<(int Index, long ElapsedMs, bool PostRestart)>();
+        // Live performance incident fix (docs/LIVE_PARITY_PLAN.md, dated entry): the FUTURE write's
+        // own elapsed time, isolated from the option-side ATM/Depth/MaxPain calls (already timed
+        // together above) -- this is the specific number the incident's fix targets, so it gets its
+        // own timeline rather than being folded into the combined per-poll total.
+        var futureWriteTimings = new List<(int Index, long ElapsedMs)>();
 
         async Task RunCheckpointAsync(DateTimeOffset cutoff, bool finalize, bool postRestart = false)
         {
@@ -96,7 +102,10 @@ public static class ReplayLiveCommand
             await using var destination = new VolumeBarDbContext(testOptions);
 
             var sw = System.Diagnostics.Stopwatch.StartNew();
-            var futureResult = await LiveVolumeBarPopulator.WriteNewBarsAsync(source, destination, date, threshold, cutoff, finalize, CancellationToken.None);
+            var futureSw = System.Diagnostics.Stopwatch.StartNew();
+            var futureResult = await LiveVolumeBarPopulator.WriteNewBarsAsync(source, destination, date, threshold, cutoff, finalize, CancellationToken.None, futureBuilderCache);
+            futureSw.Stop();
+            futureWriteTimings.Add((futureWriteTimings.Count, futureSw.ElapsedMilliseconds));
             if (futureResult.Outcome == LiveVolumeBarWriteOutcome.NoTradableData)
             {
                 return;
@@ -126,7 +135,9 @@ public static class ReplayLiveCommand
             midpointVolumeBarCount = await mid.VolumeBars.CountAsync(b => b.AsOfDate == date && b.BarVolumeThreshold == threshold);
             Console.WriteLine($"--- Simulated restart after poll #{restartAfter}: {midpointVolumeBarCount} future bar(s) written so far. Resuming (fresh call, no in-memory state carried over -- exactly what a real process restart would do). ---");
             Console.WriteLine($"    Cache state before restart: {cache.QuoteTokenCountForDiagnostics} quote-series token(s), {cache.OiTokenCountForDiagnostics} OI-series token(s) warm -- discarded now, replaced with a brand-new (cold) LiveOptionSeriesCache, exactly what a real process restart does to this Singleton.");
+            Console.WriteLine($"    Future-side builder cache before restart: warm={futureBuilderCache.HasState(date, threshold)} -- discarded now, replaced with a brand-new (cold) LiveVolumeBarBuilderCache, exactly what a real process restart does to this Singleton.");
             cache = new LiveOptionSeriesCache();
+            futureBuilderCache = new LiveVolumeBarBuilderCache();
 
             // "Resume" is literally just continuing to call the same idempotent writers -- there is
             // no separate resume code path to exercise, which is the whole point (see
@@ -146,6 +157,70 @@ public static class ReplayLiveCommand
 
         // Final poll: flush the day's necessarily-partial last bar.
         await RunCheckpointAsync(dayEnd, finalize: true, postRestart: restartAfter is not null);
+
+        // Live performance incident fix (docs/LIVE_PARITY_PLAN.md, dated entry): THE actual proof
+        // this task is about -- does the future-side write's own per-poll cost stay roughly constant
+        // over the course of the day, instead of growing with the size of the whole day-so-far
+        // replay (the original bug). Report early/quarter/mid/three-quarter/late checkpoints so a
+        // growing trend (the old behavior) is as visible as a flat one (the fix).
+        if (futureWriteTimings.Count >= 5)
+        {
+            var sampleCount = futureWriteTimings.Count;
+            int[] sampleIndexes = [0, sampleCount / 4, sampleCount / 2, 3 * sampleCount / 4, sampleCount - 1];
+            string[] labels = ["earliest", "quarter", "midday", "three-quarter", "latest"];
+            Console.WriteLine("--- Future-side WriteNewBarsAsync per-poll cost across the simulated day (the actual point of this fix) ---");
+            for (var i = 0; i < sampleIndexes.Length; i++)
+            {
+                var t = futureWriteTimings[sampleIndexes[i]];
+                Console.WriteLine($"    [{labels[i],14}] poll #{t.Index + 1}/{sampleCount}: {t.ElapsedMs}ms");
+            }
+
+            var firstQuarter = futureWriteTimings.Take(Math.Max(1, sampleCount / 4)).Select(t => t.ElapsedMs).ToList();
+            var lastQuarter = futureWriteTimings.Skip(Math.Max(0, sampleCount - sampleCount / 4)).Select(t => t.ElapsedMs).ToList();
+            var firstQuarterAvg = firstQuarter.Average();
+            var lastQuarterAvg = lastQuarter.Average();
+            Console.WriteLine($"    First-quarter avg: {firstQuarterAvg:F1}ms. Last-quarter avg: {lastQuarterAvg:F1}ms.");
+            Console.WriteLine(lastQuarterAvg <= firstQuarterAvg * 3 || lastQuarterAvg <= 50
+                ? "PERFORMANCE (future-side incremental fix): PASS -- per-poll cost stayed roughly flat across the day (not growing proportionally to total ticks-so-far)."
+                : $"PERFORMANCE (future-side incremental fix): NOTE -- last-quarter avg ({firstQuarterAvg:F1}ms) is more than 3x first-quarter avg ({firstQuarterAvg:F1}ms); investigate before declaring the fix complete.");
+
+            // Direct BEFORE-vs-AFTER, same code path, same checkpoints: builderCache=null reproduces
+            // the ORIGINAL from-scratch-every-poll behavior exactly (see WriteNewBarsAsync's own doc
+            // comment) -- re-running the identical checkpoint sequence against a disposable scratch DB
+            // with the old (no-cache) call gives a true apples-to-apples per-poll cost comparison,
+            // not just "the new path looks fast in isolation."
+            Console.WriteLine();
+            Console.WriteLine("--- BEFORE-fix comparison: identical checkpoints, builderCache=null (original from-scratch-every-poll replay) ---");
+            var beforeOptions = new DbContextOptionsBuilder<VolumeBarDbContext>()
+                .UseNpgsql(new NpgsqlConnectionStringBuilder(baseConnectionString) { Database = "niftysignal_volume_bars_livetest_beforefix" }.ConnectionString).Options;
+            await using (var wipeBefore = new VolumeBarDbContext(beforeOptions))
+            {
+                await wipeBefore.Database.EnsureDeletedAsync();
+                await wipeBefore.Database.MigrateAsync();
+            }
+
+            var beforeTimings = new List<long>();
+            for (var i = 0; i < checkpoints.Count; i++)
+            {
+                await using var beforeSource = new NiftySignalDbContext(sourceOptions);
+                await using var beforeDestination = new VolumeBarDbContext(beforeOptions);
+                var beforeSw = System.Diagnostics.Stopwatch.StartNew();
+                await LiveVolumeBarPopulator.WriteNewBarsAsync(beforeSource, beforeDestination, date, threshold, checkpoints[i], finalizeDay: false, CancellationToken.None);
+                beforeSw.Stop();
+                beforeTimings.Add(beforeSw.ElapsedMilliseconds);
+            }
+
+            for (var i = 0; i < sampleIndexes.Length; i++)
+            {
+                var idx = Math.Min(sampleIndexes[i], beforeTimings.Count - 1);
+                Console.WriteLine($"    [{labels[i],14}] poll #{idx + 1}/{sampleCount}: BEFORE={beforeTimings[idx]}ms, AFTER={futureWriteTimings[idx].ElapsedMs}ms");
+            }
+
+            var beforeFirstQuarterAvg = beforeTimings.Take(Math.Max(1, sampleCount / 4)).Average();
+            var beforeLastQuarterAvg = beforeTimings.Skip(Math.Max(0, sampleCount - sampleCount / 4)).Average();
+            Console.WriteLine($"    BEFORE first-quarter avg: {beforeFirstQuarterAvg:F1}ms. BEFORE last-quarter avg: {beforeLastQuarterAvg:F1}ms (growth factor: {beforeLastQuarterAvg / Math.Max(0.1, beforeFirstQuarterAvg):F1}x).");
+            Console.WriteLine($"    AFTER  first-quarter avg: {firstQuarterAvg:F1}ms. AFTER  last-quarter avg: {lastQuarterAvg:F1}ms (growth factor: {lastQuarterAvg / Math.Max(0.1, firstQuarterAvg):F1}x).");
+        }
 
         if (restartAfter is not null && pollTimings.Count(t => t.PostRestart) >= 2)
         {

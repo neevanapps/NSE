@@ -130,6 +130,119 @@ if (args.Length > 0 && string.Equals(args[0], "analyze", StringComparison.Ordina
     return await AnalyzeCommand.RunAsync(analyzeDate, windowBars, analyzeThreshold, volumeBars, timeCadence);
 }
 
+// 2026-09-21: parity-investigation diagnostic -- dumps the OFFICIAL (offline-recomputed)
+// per-bar scaledScore/percentile/maxPainConfirmScore for OptionsScoreThreeWaySwitchMaxPainConfirmed,
+// via TradeSimulator.SimulateDayAsync's own onBarEvaluated hook, so it can be compared directly
+// against LiveOptionsScoreBars' own persisted values for the same bar range.
+//   dotnet run --project NiftySignal.VolumeBarData -- dump-scores <date:yyyy-MM-dd> [barVolumeThreshold] [--band=N] [--from=N] [--to=N]
+if (args.Length > 0 && string.Equals(args[0], "dump-scores", StringComparison.OrdinalIgnoreCase))
+{
+    var (dsPositional, dsNamed) = SplitNamedArgs(args);
+    if (dsPositional.Length < 2 || !DateOnly.TryParseExact(dsPositional[1], "yyyy-MM-dd", out var dsDate))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- dump-scores <date:yyyy-MM-dd> [barVolumeThreshold] [--band=N] [--from=N] [--to=N]");
+        return 1;
+    }
+    var dsThreshold = dsPositional.Length > 2 ? long.Parse(dsPositional[2]) : 2600L;
+    var dsBand = dsNamed.TryGetValue("band", out var dsBandStr) ? int.Parse(dsBandStr) : OptionDepthPopulator.DefaultBandWidth;
+    var dsFrom = dsNamed.TryGetValue("from", out var dsFromStr) ? int.Parse(dsFromStr) : 0;
+    var dsTo = dsNamed.TryGetValue("to", out var dsToStr) ? int.Parse(dsToStr) : int.MaxValue;
+
+    Console.WriteLine($"{"Bar",4} {"Time (IST)",10} {"ScaledScore",12} {"Percentile",11} {"MaxPainConfirm",15}");
+    var dsSourceConnectionString = new NpgsqlConnectionStringBuilder(baseConnectionString) { Database = "niftysignal_vm_copy" }.ConnectionString;
+    var dsSourceOptions = new DbContextOptionsBuilder<NiftySignalDbContext>().UseNpgsql(dsSourceConnectionString).Options;
+    await using (var dsSource = new NiftySignalDbContext(dsSourceOptions))
+    await using (var dsVolumeBars = new VolumeBarDbContext(volumeBarOptions))
+    {
+        await TradeSimulator.SimulateDayAsync(dsSource, dsVolumeBars, dsDate, dsThreshold,
+            VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmed, 90.0, 15, CancellationToken.None,
+            sharedPriceCache: null, stopLossPercent: null, rollingSubBarThreshold: null, bandWidth: dsBand,
+            onBarEvaluated: (bar, scaledScore, percentile, maxPainConfirmScore) =>
+            {
+                if (bar.BarIndex < dsFrom || bar.BarIndex > dsTo)
+                {
+                    return;
+                }
+                Console.WriteLine($"{bar.BarIndex,4} {FormatIst(bar.EndTimestamp),10} " +
+                    $"{(scaledScore?.ToString("F4") ?? "--"),12} {(percentile?.ToString("F4") ?? "--"),11} " +
+                    $"{(maxPainConfirmScore?.ToString("F4") ?? "--"),15}");
+            });
+    }
+    return 0;
+}
+
+// 2026-09-21: plain-data diagnostic requested by the user after a live whipsaw concern -- dumps,
+// bar by bar for one day, exactly what the Open-leg ATM depth-imbalance metric sees: the future's
+// own close price alongside the raw Call/Put resting-depth components and the resulting imbalance
+// score, so it can be eyeballed directly rather than inferred from aggregate win-rate numbers.
+// No entry/exit logic here at all -- this is upstream of trading, just the metric's own raw values.
+//   dotnet run --project NiftySignal.VolumeBarData -- depth-report <date:yyyy-MM-dd> [barVolumeThreshold] [--band=N]
+if (args.Length > 0 && string.Equals(args[0], "depth-report", StringComparison.OrdinalIgnoreCase))
+{
+    var (drPositional, drNamed) = SplitNamedArgs(args);
+    if (drPositional.Length < 2 || !DateOnly.TryParseExact(drPositional[1], "yyyy-MM-dd", out var drDate))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- depth-report <date:yyyy-MM-dd> [barVolumeThreshold] [--band=N]");
+        return 1;
+    }
+    var drThreshold = drPositional.Length > 2 ? long.Parse(drPositional[2]) : 650L;
+    var drBand = drNamed.TryGetValue("band", out var drBandStr) ? int.Parse(drBandStr) : OptionDepthPopulator.DefaultBandWidth;
+    var drCsv = drNamed.TryGetValue("csv", out var drCsvPath) ? drCsvPath : null;
+
+    await using var drDb = new VolumeBarDbContext(volumeBarOptions);
+    var drFutureBars = await drDb.VolumeBars
+        .Where(b => b.AsOfDate == drDate && b.BarVolumeThreshold == drThreshold)
+        .OrderBy(b => b.BarIndex)
+        .ToListAsync();
+    var drDepthBars = await drDb.OptionDepthBars
+        .Where(b => b.AsOfDate == drDate && b.BarVolumeThreshold == drThreshold && b.BandWidth == drBand)
+        .ToDictionaryAsync(b => b.BarIndex);
+
+    if (drFutureBars.Count == 0)
+    {
+        Console.Error.WriteLine($"No VolumeBars for {drDate:yyyy-MM-dd} @ {drThreshold}. Populate it first (populate-volume-bars / populate-options-depth --band={drBand}).");
+        return 1;
+    }
+
+    Console.WriteLine($"=== Depth report: {drDate:yyyy-MM-dd}, BarVolumeThreshold={drThreshold}, BandWidth={drBand} (ATM+/-{(drBand - 1) / 2}) ===");
+    Console.WriteLine("Formula: DepthImbalance = (CallBid+PutBid-CallAsk-PutAsk) / (CallBid+PutBid+CallAsk+PutAsk); traded score is the NEGATIVE of this value.");
+    Console.WriteLine();
+
+    using var drWriter = drCsv is not null ? new StreamWriter(drCsv) : null;
+    void WriteRow(string line) { Console.WriteLine(line); drWriter?.WriteLine(line.Replace(" | ", ",")); }
+
+    WriteRow("Bar | TimeIST | IndexPrice | CallDepth | PutDepth | CallBid | CallAsk | PutBid | PutAsk | DepthImbalance");
+
+    foreach (var fb in drFutureBars)
+    {
+        drDepthBars.TryGetValue(fb.BarIndex, out var db);
+        var callDepth = db is not null && db.CallBidQtyAvg is { } cb && db.CallAskQtyAvg is { } ca ? cb + ca : (double?)null;
+        var putDepth = db is not null && db.PutBidQtyAvg is { } pb && db.PutAskQtyAvg is { } pa ? pb + pa : (double?)null;
+        double? imbalance = null;
+        if (db is not null && db.CallBidQtyAvg is { } cbi && db.PutBidQtyAvg is { } pbi && db.CallAskQtyAvg is { } cai && db.PutAskQtyAvg is { } pai)
+        {
+            var bidSum = cbi + pbi;
+            var askSum = cai + pai;
+            var total = bidSum + askSum;
+            imbalance = total != 0 ? (bidSum - askSum) / total : (double?)null;
+        }
+
+        WriteRow($"{fb.BarIndex} | {FormatIst(fb.EndTimestamp)} | {fb.ClosePrice:F2} | " +
+            $"{(callDepth?.ToString("F0") ?? "")} | {(putDepth?.ToString("F0") ?? "")} | " +
+            $"{(db?.CallBidQtyAvg?.ToString("F0") ?? "")} | {(db?.CallAskQtyAvg?.ToString("F0") ?? "")} | " +
+            $"{(db?.PutBidQtyAvg?.ToString("F0") ?? "")} | {(db?.PutAskQtyAvg?.ToString("F0") ?? "")} | " +
+            $"{(imbalance?.ToString("F4") ?? "")}");
+    }
+
+    Console.WriteLine();
+    Console.WriteLine($"Total bars: {drFutureBars.Count}, bars with depth data: {drDepthBars.Count(kv => kv.Value.CallBidQtyAvg is not null)}");
+    if (drCsv is not null)
+    {
+        Console.WriteLine($"CSV written to {drCsv}");
+    }
+    return 0;
+}
+
 // Phase A (docs/LIVE_PARITY_PLAN.md) debug helper: dumps which (AsOfDate, BarVolumeThreshold)
 // combinations already have rows in each of the 4 Phase-A tables, so a parity-test run can pick a
 // date/threshold that's already offline-populated to compare a live replay against.
@@ -289,6 +402,49 @@ if (args.Length > 0 && string.Equals(args[0], "verify-parity-selftest", StringCo
     return await VerifyParitySelfTestCommand.RunAsync(baseConnectionString, vsDate, vsThreshold, CancellationToken.None, vsSourceDatabase);
 }
 
+// Futures-crossover live-wiring task (2026-09-21, docs/LIVE_PARITY_PLAN.md "Futures crossover:
+// wired live" section) -- three harnesses mirroring the options side's own Phase C/D/restart
+// proofs, plus the task's own required no-collision proof (see ReplayLiveFuturesCrossoverCommand's
+// own doc comment for what each one proves).
+//   dotnet run --project NiftySignal.VolumeBarData -- replay-live-futures-crossover <date1:yyyy-MM-dd> [date2 ...] [--threshold=2600] [--fast=8] [--slow=40] [--gapthreshold=5] [--restart-after=N] [--destination-database=<name>]
+//   dotnet run --project NiftySignal.VolumeBarData -- replay-live-futures-crossover-both <date:yyyy-MM-dd> [--threshold=2600]   (no-collision proof, both strategies interleaved)
+if (args.Length > 0 && string.Equals(args[0], "replay-live-futures-crossover", StringComparison.OrdinalIgnoreCase))
+{
+    var (fxPositional, fxNamed) = SplitNamedArgs(args);
+    var fxDates = fxPositional.Skip(1).Select(a => DateOnly.ParseExact(a, "yyyy-MM-dd")).ToList();
+    if (fxDates.Count == 0)
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- replay-live-futures-crossover <date1:yyyy-MM-dd> [date2 ...] [--threshold=2600] [--fast=8] [--slow=40] [--gapthreshold=5] [--restart-after=N] [--destination-database=<name>]");
+        return 1;
+    }
+
+    var fxThreshold = fxNamed.TryGetValue("threshold", out var fxThresholdStr) ? long.Parse(fxThresholdStr) : 2600L;
+    var fxFast = fxNamed.TryGetValue("fast", out var fxFastStr) ? int.Parse(fxFastStr) : LiveFuturesCrossoverSession.FastBars;
+    var fxSlow = fxNamed.TryGetValue("slow", out var fxSlowStr) ? int.Parse(fxSlowStr) : LiveFuturesCrossoverSession.SlowBars;
+    var fxGapThreshold = fxNamed.TryGetValue("gapthreshold", out var fxGapStr) ? double.Parse(fxGapStr) : LiveFuturesCrossoverSession.ThresholdPoints;
+
+    if (fxNamed.TryGetValue("restart-after", out var fxRestartStr))
+    {
+        return await ReplayLiveFuturesCrossoverCommand.RunRestartTestAsync(baseConnectionString, fxDates[0], fxThreshold, int.Parse(fxRestartStr), CancellationToken.None);
+    }
+
+    var fxDestinationDatabase = fxNamed.TryGetValue("destination-database", out var fxDestDb) ? fxDestDb : null;
+    return await ReplayLiveFuturesCrossoverCommand.RunAsync(baseConnectionString, fxDates, fxThreshold, fxFast, fxSlow, fxGapThreshold, CancellationToken.None, fxDestinationDatabase);
+}
+
+if (args.Length > 0 && string.Equals(args[0], "replay-live-futures-crossover-both", StringComparison.OrdinalIgnoreCase))
+{
+    var (fbPositional, fbNamed) = SplitNamedArgs(args);
+    if (fbPositional.Length < 2 || !DateOnly.TryParseExact(fbPositional[1], "yyyy-MM-dd", out var fbDate))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- replay-live-futures-crossover-both <date:yyyy-MM-dd> [--threshold=2600]");
+        return 1;
+    }
+
+    var fbThreshold = fbNamed.TryGetValue("threshold", out var fbThresholdStr) ? long.Parse(fbThresholdStr) : 2600L;
+    return await ReplayLiveFuturesCrossoverCommand.RunBothStrategiesAsync(baseConnectionString, fbDate, fbThreshold, CancellationToken.None);
+}
+
 var tradeSourceConnectionString = new NpgsqlConnectionStringBuilder(baseConnectionString) { Database = "niftysignal_vm_copy" }.ConnectionString;
 var tradeSourceOptions = new DbContextOptionsBuilder<NiftySignalDbContext>().UseNpgsql(tradeSourceConnectionString).Options;
 
@@ -431,14 +587,14 @@ var sharedOptionPriceCache = new Dictionary<(DateOnly, string), OptionPriceSerie
 
 // Shared by "trade", "calibrate", and "session-phase" -- runs one (metric, entryPercentile,
 // trendWindowBars, barVolumeThreshold) combination across a date range and returns every trade fired.
-async Task<List<VolumeBarTrade>> RunRangeAsync(DateOnly from, DateOnly to, VolumeBarMetric metric, double entryPercentile, int trendWindowBars, long threshold, decimal? stopLossPercent = null, long? rollingSubBarThreshold = null, int depthBandWidth = OptionDepthPopulator.DefaultBandWidth, TimeSpan? optionsSwitchTime = null, TimeSpan? entryWindowStartOverride = null, (double Open, double Mid, double Close)? sessionWeightsOnFutures = null)
+async Task<List<VolumeBarTrade>> RunRangeAsync(DateOnly from, DateOnly to, VolumeBarMetric metric, double entryPercentile, int trendWindowBars, long threshold, decimal? stopLossPercent = null, long? rollingSubBarThreshold = null, int depthBandWidth = OptionDepthPopulator.DefaultBandWidth, TimeSpan? optionsSwitchTime = null, TimeSpan? entryWindowStartOverride = null, (double Open, double Mid, double Close)? sessionWeightsOnFutures = null, int? smoothingWindowBars = null, double? minHoldMinutes = null, decimal? minEntryPrice = null, decimal? maxEntryPrice = null, decimal? tp1ProfitPct = null, decimal? tp1Fraction = null, decimal? dailyLossCapPct = null)
 {
     var result = new List<VolumeBarTrade>();
     for (var date = from; date <= to; date = date.AddDays(1))
     {
         await using var source = new NiftySignalDbContext(tradeSourceOptions);
         await using var volumeBars = new VolumeBarDbContext(volumeBarOptions);
-        result.AddRange(await TradeSimulator.SimulateDayAsync(source, volumeBars, date, threshold, metric, entryPercentile, trendWindowBars, CancellationToken.None, sharedOptionPriceCache, stopLossPercent, rollingSubBarThreshold, depthBandWidth, optionsSwitchTime, entryWindowStartOverride, sessionWeightsOnFutures));
+        result.AddRange(await TradeSimulator.SimulateDayAsync(source, volumeBars, date, threshold, metric, entryPercentile, trendWindowBars, CancellationToken.None, sharedOptionPriceCache, stopLossPercent, rollingSubBarThreshold, depthBandWidth, optionsSwitchTime, entryWindowStartOverride, sessionWeightsOnFutures, onBarEvaluated: null, smoothingWindowBars, minHoldMinutes, minEntryPrice, maxEntryPrice, tp1ProfitPct, tp1Fraction, dailyLossCapPct));
     }
 
     return result;
@@ -840,14 +996,23 @@ if (args.Length > 0 && string.Equals(args[0], "crossover", StringComparison.Ordi
         ? Enum.Parse<VolumeBarMetric>(coMetricStr, ignoreCase: true)
         : VolumeBarMetric.SessionGatedDepthDurationConfirmed;
     var coBandWidth = coNamed.TryGetValue("band", out var coBandStr) ? int.Parse(coBandStr) : 5;
+    var coMinEntryPrice = coNamed.TryGetValue("minprice", out var coMinPriceStr) ? (decimal?)decimal.Parse(coMinPriceStr) : null;
+    var coMaxEntryPrice = coNamed.TryGetValue("maxprice", out var coMaxPriceStr) ? (decimal?)decimal.Parse(coMaxPriceStr) : null;
+    // 2026-09-21, same 4 risk-rule flags as "trade" -- see that command's own comment for the
+    // meaning of each. --stop= was previously missing from this command entirely (only "trade"
+    // had it); added here following the exact same pattern/convention.
+    var coStopLossPercent = coNamed.TryGetValue("stop", out var coStopStr) ? (decimal?)(decimal.Parse(coStopStr) / 100m) : null;
+    var coTp1ProfitPct = coNamed.TryGetValue("tp1pct", out var coTp1PctStr) ? (decimal?)(decimal.Parse(coTp1PctStr) / 100m) : null;
+    var coTp1Fraction = coNamed.TryGetValue("tp1frac", out var coTp1FracStr) ? (decimal?)(decimal.Parse(coTp1FracStr) / 100m) : null;
+    var coDailyLossCapPct = coNamed.TryGetValue("dailyloss", out var coDailyLossStr) ? (decimal?)decimal.Parse(coDailyLossStr) : null;
 
-    Console.WriteLine($"=== Crossover simulation: metric={coScoreMetric} fast={coFastBars} slow={coSlowBars} thresholdPoints={coThreshold} barThreshold={coBarVolumeThreshold} ===");
+    Console.WriteLine($"=== Crossover simulation: metric={coScoreMetric} fast={coFastBars} slow={coSlowBars} thresholdPoints={coThreshold} barThreshold={coBarVolumeThreshold}{(coMinEntryPrice is not null || coMaxEntryPrice is not null ? $", entryPriceBand=[{coMinEntryPrice?.ToString() ?? "-inf"},{coMaxEntryPrice?.ToString() ?? "+inf"}]" : "")}{(coStopLossPercent is { } coSlp ? $", stopLoss={coSlp:P0}" : "")}{(coTp1ProfitPct is { } coTp1p ? $", tp1={coTp1p:P0}@{coTp1Fraction:P0}" : "")}{(coDailyLossCapPct is { } coDlc ? $", dailyLossCap={coDlc}%" : "")} ===");
     var coAllTrades = new List<VolumeBarTrade>();
     for (var date = coFromDate; date <= coToDate; date = date.AddDays(1))
     {
         await using var source = new NiftySignalDbContext(tradeSourceOptions);
         await using var volumeBars = new VolumeBarDbContext(volumeBarOptions);
-        var dayTrades = await TradeSimulator.SimulateCrossoverDayAsync(source, volumeBars, date, coBarVolumeThreshold, coFastBars, coSlowBars, coThreshold, CancellationToken.None, sharedOptionPriceCache, coScoreMetric, coBandWidth);
+        var dayTrades = await TradeSimulator.SimulateCrossoverDayAsync(source, volumeBars, date, coBarVolumeThreshold, coFastBars, coSlowBars, coThreshold, CancellationToken.None, sharedOptionPriceCache, coScoreMetric, coBandWidth, optionsSwitchTime: null, coMinEntryPrice, coMaxEntryPrice, coStopLossPercent, coTp1ProfitPct, coTp1Fraction, coDailyLossCapPct);
         if (dayTrades.Count == 0)
         {
             continue;
@@ -1058,12 +1223,32 @@ if (args.Length > 0 && string.Equals(args[0], "trade", StringComparison.OrdinalI
     var tradeDepthBandWidth = tradeNamed.TryGetValue("band", out var bandStr) ? int.Parse(bandStr) : OptionDepthPopulator.DefaultBandWidth;
     var tradeSwitchTime = tradeNamed.TryGetValue("switchtime", out var switchStr) ? (TimeSpan?)TimeSpan.Parse(switchStr) : null;
     var tradeEntryStart = tradeNamed.TryGetValue("entrystart", out var entryStartStr) ? (TimeSpan?)TimeSpan.Parse(entryStartStr) : null;
+    // 2026-09-21, whipsaw-reduction experiment -- only meaningful for
+    // OptionsScoreThreeWaySwitchMaxPainConfirmedSmoothed/...MinHold respectively; no-op for every
+    // other metric.
+    var tradeSmoothBars = tradeNamed.TryGetValue("smoothbars", out var smoothBarsStr) ? (int?)int.Parse(smoothBarsStr) : null;
+    var tradeMinHoldMinutes = tradeNamed.TryGetValue("minhold", out var minHoldStr) ? (double?)double.Parse(minHoldStr) : null;
+    // 2026-09-21, user's own explicit entry-premium band (e.g. --minprice=100 --maxprice=150) --
+    // a bar whose ATM premium falls outside is simply skipped, no trade that bar. Both null by
+    // default (no filter, unchanged locked behavior).
+    var tradeMinEntryPrice = tradeNamed.TryGetValue("minprice", out var minPriceStr) ? (decimal?)decimal.Parse(minPriceStr) : null;
+    var tradeMaxEntryPrice = tradeNamed.TryGetValue("maxprice", out var maxPriceStr) ? (decimal?)decimal.Parse(maxPriceStr) : null;
+    // 2026-09-21, backtest-only risk-rule sweep (old live engine's ExitRuleEvaluator mechanics,
+    // never before tested against either strategy now live) -- all 3 off by default (null), same
+    // named-flag convention as --stop=. --tp1pct=15 --tp1frac=50 means "book 50% of quantity once
+    // premium is up 15% from entry, trail the remaining leg's stop to breakeven" (see
+    // TradeSimulator.RiskRuleState's own doc comment). --dailyloss=20 means "stop taking new
+    // entries once today's realized P&L crosses -20% of the reference capital documented on
+    // RiskRuleState" -- open positions still exit normally.
+    var tradeTp1ProfitPct = tradeNamed.TryGetValue("tp1pct", out var tp1PctStr) ? (decimal?)(decimal.Parse(tp1PctStr) / 100m) : null;
+    var tradeTp1Fraction = tradeNamed.TryGetValue("tp1frac", out var tp1FracStr) ? (decimal?)(decimal.Parse(tp1FracStr) / 100m) : null;
+    var tradeDailyLossCapPct = tradeNamed.TryGetValue("dailyloss", out var dailyLossStr) ? (decimal?)decimal.Parse(dailyLossStr) : null;
 
-    Console.WriteLine($"=== Volume-bar trade simulation: metric={metric}, entry-percentile>={entryPercentile}, bar-threshold={tradeThreshold}, stopLoss={(stopLossPercent is { } slp ? $"{slp:P0}" : "none")}, rolling={(rollingSubBarThreshold is { } rsbt ? $"{rsbt}-wide" : "no")}, depthBandWidth={tradeDepthBandWidth} ===");
+    Console.WriteLine($"=== Volume-bar trade simulation: metric={metric}, entry-percentile>={entryPercentile}, bar-threshold={tradeThreshold}, stopLoss={(stopLossPercent is { } slp ? $"{slp:P0}" : "none")}, rolling={(rollingSubBarThreshold is { } rsbt ? $"{rsbt}-wide" : "no")}, depthBandWidth={tradeDepthBandWidth}{(tradeSmoothBars is { } tsb ? $", smoothingWindowBars={tsb}" : "")}{(tradeMinHoldMinutes is { } tmh ? $", minHoldMinutes={tmh}" : "")}{(tradeMinEntryPrice is not null || tradeMaxEntryPrice is not null ? $", entryPriceBand=[{tradeMinEntryPrice?.ToString() ?? "-inf"},{tradeMaxEntryPrice?.ToString() ?? "+inf"}]" : "")}{(tradeTp1ProfitPct is { } tp1p ? $", tp1={tp1p:P0}@{tradeTp1Fraction:P0}" : "")}{(tradeDailyLossCapPct is { } dlc ? $", dailyLossCap={dlc}%" : "")} ===");
     var allTrades = new List<VolumeBarTrade>();
     for (var date = tradeFromDate; date <= tradeToDate; date = date.AddDays(1))
     {
-        var dayTrades = await RunRangeAsync(date, date, metric, entryPercentile, trendWindowBars, tradeThreshold, stopLossPercent, rollingSubBarThreshold, tradeDepthBandWidth, tradeSwitchTime, tradeEntryStart);
+        var dayTrades = await RunRangeAsync(date, date, metric, entryPercentile, trendWindowBars, tradeThreshold, stopLossPercent, rollingSubBarThreshold, tradeDepthBandWidth, tradeSwitchTime, tradeEntryStart, sessionWeightsOnFutures: null, tradeSmoothBars, tradeMinHoldMinutes, tradeMinEntryPrice, tradeMaxEntryPrice, tradeTp1ProfitPct, tradeTp1Fraction, tradeDailyLossCapPct);
         if (dayTrades.Count == 0)
         {
             continue;
@@ -1090,6 +1275,196 @@ if (args.Length > 0 && string.Equals(args[0], "trade", StringComparison.OrdinalI
     else
     {
         Console.WriteLine("No trades fired across the requested range -- try a lower entryPercentile.");
+    }
+
+    return 0;
+}
+
+// 2026-09-22, MAE/MFE analytics task (docs/VOLUME_BAR_FINDINGS.md's own dated section): reruns
+// either the "trade" or "crossover" simulation to get the exact same trade list those commands
+// would produce (never reimplements trade generation), then for each trade reconstructs its
+// traded instrument's Token (VolumeBarTrade itself has no Token -- see TradeSimulator.cs's own
+// doc comment on why) by re-querying the day's option chain the same way
+// AtmStrikeSelector/PickStrikeInBandAsync already do: AsOfDate + StrikePrice + OptionType
+// uniquely identifies the instrument, since this codebase's convention is one expiry in play per
+// day (verified against SimulateDayAsync/SimulateCrossoverDayAsync's own single `nearestExpiry`
+// chain-build). Loads that instrument's real tick price path for exactly the EntryTime..ExitTime
+// window (OptionPriceSeries.LoadAsync, same Ticks table/ordering convention every other price
+// lookup here uses) and computes MAE/MFE via the separately-tested MaeMfeCalculator.
+//   dotnet run --project NiftySignal.VolumeBarData -- mae-mfe trade <fromDate> <toDate> <metric> [entryPercentile] [trendWindowBars] [barVolumeThreshold] [--band=] [--minprice=] [--maxprice=] ...
+//   dotnet run --project NiftySignal.VolumeBarData -- mae-mfe crossover <fromDate> <toDate> [fastBars] [slowBars] [thresholdPoints] [barVolumeThreshold] [--metric=] [--band=] [--minprice=] [--maxprice=] ...
+if (args.Length > 0 && string.Equals(args[0], "mae-mfe", StringComparison.OrdinalIgnoreCase))
+{
+    var (mmPositional, mmNamed) = SplitNamedArgs(args);
+    if (mmPositional.Length < 2
+        || (!string.Equals(mmPositional[1], "trade", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(mmPositional[1], "crossover", StringComparison.OrdinalIgnoreCase)))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- mae-mfe trade <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> <metric> [entryPercentile] [trendWindowBars] [barVolumeThreshold] [--band=N] [--minprice=] [--maxprice=]");
+        Console.Error.WriteLine("   or: dotnet run --project NiftySignal.VolumeBarData -- mae-mfe crossover <fromDate> <toDate> [fastBars=4] [slowBars=12] [thresholdPoints=2] [barVolumeThreshold=2600] [--metric=] [--band=5] [--minprice=] [--maxprice=]");
+        return 1;
+    }
+
+    var mmMode = mmPositional[1].ToLowerInvariant();
+    var mmSub = mmPositional.Skip(1).ToArray(); // mmSub[0] = "trade"/"crossover" (mirrors that command's own positional[0]), mmSub[1..] = the rest, unchanged.
+
+    List<VolumeBarTrade> mmTrades;
+    if (mmMode == "trade")
+    {
+        if (mmSub.Length < 4
+            || !DateOnly.TryParseExact(mmSub[1], "yyyy-MM-dd", out var mmFromDate)
+            || !DateOnly.TryParseExact(mmSub[2], "yyyy-MM-dd", out var mmToDate)
+            || !Enum.TryParse<VolumeBarMetric>(mmSub[3], ignoreCase: true, out var mmMetric))
+        {
+            Console.Error.WriteLine("Bad mae-mfe trade arguments -- see usage above.");
+            return 1;
+        }
+
+        var mmEntryPercentile = mmSub.Length > 4 ? double.Parse(mmSub[4]) : 90.0;
+        var mmTrendWindowBars = mmSub.Length > 5 ? int.Parse(mmSub[5]) : 15;
+        var mmThreshold = mmSub.Length > 6 ? long.Parse(mmSub[6]) : 1300L;
+        var mmStopLossPercent = mmNamed.TryGetValue("stop", out var mmStopStr) ? (decimal?)(decimal.Parse(mmStopStr) / 100m) : null;
+        var mmRolling = mmNamed.TryGetValue("rolling", out var mmRollingStr) ? (long?)long.Parse(mmRollingStr) : null;
+        var mmBand = mmNamed.TryGetValue("band", out var mmBandStr) ? int.Parse(mmBandStr) : OptionDepthPopulator.DefaultBandWidth;
+        var mmSwitchTime = mmNamed.TryGetValue("switchtime", out var mmSwitchStr) ? (TimeSpan?)TimeSpan.Parse(mmSwitchStr) : null;
+        var mmEntryStart = mmNamed.TryGetValue("entrystart", out var mmEntryStartStr) ? (TimeSpan?)TimeSpan.Parse(mmEntryStartStr) : null;
+        var mmSmoothBars = mmNamed.TryGetValue("smoothbars", out var mmSmoothBarsStr) ? (int?)int.Parse(mmSmoothBarsStr) : null;
+        var mmMinHold = mmNamed.TryGetValue("minhold", out var mmMinHoldStr) ? (double?)double.Parse(mmMinHoldStr) : null;
+        var mmMinPrice = mmNamed.TryGetValue("minprice", out var mmMinPriceStr) ? (decimal?)decimal.Parse(mmMinPriceStr) : null;
+        var mmMaxPrice = mmNamed.TryGetValue("maxprice", out var mmMaxPriceStr) ? (decimal?)decimal.Parse(mmMaxPriceStr) : null;
+        var mmTp1Pct = mmNamed.TryGetValue("tp1pct", out var mmTp1PctStr) ? (decimal?)(decimal.Parse(mmTp1PctStr) / 100m) : null;
+        var mmTp1Frac = mmNamed.TryGetValue("tp1frac", out var mmTp1FracStr) ? (decimal?)decimal.Parse(mmTp1FracStr) / 100m : null;
+        var mmDailyLoss = mmNamed.TryGetValue("dailyloss", out var mmDailyLossStr) ? (decimal?)decimal.Parse(mmDailyLossStr) : null;
+
+        Console.WriteLine($"=== mae-mfe trade: metric={mmMetric}, entry-percentile>={mmEntryPercentile}, bar-threshold={mmThreshold}, band={mmBand}{(mmMinPrice is not null || mmMaxPrice is not null ? $", entryPriceBand=[{mmMinPrice?.ToString() ?? "-inf"},{mmMaxPrice?.ToString() ?? "+inf"}]" : "")} ===");
+        mmTrades = await RunRangeAsync(mmFromDate, mmToDate, mmMetric, mmEntryPercentile, mmTrendWindowBars, mmThreshold, mmStopLossPercent, mmRolling, mmBand, mmSwitchTime, mmEntryStart, sessionWeightsOnFutures: null, mmSmoothBars, mmMinHold, mmMinPrice, mmMaxPrice, mmTp1Pct, mmTp1Frac, mmDailyLoss);
+    }
+    else
+    {
+        if (mmSub.Length < 3
+            || !DateOnly.TryParseExact(mmSub[1], "yyyy-MM-dd", out var mmFromDate)
+            || !DateOnly.TryParseExact(mmSub[2], "yyyy-MM-dd", out var mmToDate))
+        {
+            Console.Error.WriteLine("Bad mae-mfe crossover arguments -- see usage above.");
+            return 1;
+        }
+
+        var mmFastBars = mmSub.Length > 3 ? int.Parse(mmSub[3]) : 4;
+        var mmSlowBars = mmSub.Length > 4 ? int.Parse(mmSub[4]) : 12;
+        var mmThresholdPoints = mmSub.Length > 5 ? double.Parse(mmSub[5]) : 2.0;
+        var mmBarVolumeThreshold = mmSub.Length > 6 ? long.Parse(mmSub[6]) : 2600L;
+        var mmScoreMetric = mmNamed.TryGetValue("metric", out var mmMetricStr) ? Enum.Parse<VolumeBarMetric>(mmMetricStr, ignoreCase: true) : VolumeBarMetric.SessionGatedDepthDurationConfirmed;
+        var mmBandWidth = mmNamed.TryGetValue("band", out var mmBandStr) ? int.Parse(mmBandStr) : 5;
+        var mmMinPrice = mmNamed.TryGetValue("minprice", out var mmMinPriceStr) ? (decimal?)decimal.Parse(mmMinPriceStr) : null;
+        var mmMaxPrice = mmNamed.TryGetValue("maxprice", out var mmMaxPriceStr) ? (decimal?)decimal.Parse(mmMaxPriceStr) : null;
+        var mmStopLossPercent = mmNamed.TryGetValue("stop", out var mmStopStr) ? (decimal?)(decimal.Parse(mmStopStr) / 100m) : null;
+        var mmTp1Pct = mmNamed.TryGetValue("tp1pct", out var mmTp1PctStr) ? (decimal?)(decimal.Parse(mmTp1PctStr) / 100m) : null;
+        var mmTp1Frac = mmNamed.TryGetValue("tp1frac", out var mmTp1FracStr) ? (decimal?)decimal.Parse(mmTp1FracStr) / 100m : null;
+        var mmDailyLoss = mmNamed.TryGetValue("dailyloss", out var mmDailyLossStr) ? (decimal?)decimal.Parse(mmDailyLossStr) : null;
+
+        Console.WriteLine($"=== mae-mfe crossover: metric={mmScoreMetric} fast={mmFastBars} slow={mmSlowBars} thresholdPoints={mmThresholdPoints} barThreshold={mmBarVolumeThreshold}{(mmMinPrice is not null || mmMaxPrice is not null ? $", entryPriceBand=[{mmMinPrice?.ToString() ?? "-inf"},{mmMaxPrice?.ToString() ?? "+inf"}]" : "")} ===");
+        mmTrades = [];
+        for (var date = mmFromDate; date <= mmToDate; date = date.AddDays(1))
+        {
+            await using var mmSource = new NiftySignalDbContext(tradeSourceOptions);
+            await using var mmVolumeBars = new VolumeBarDbContext(volumeBarOptions);
+            mmTrades.AddRange(await TradeSimulator.SimulateCrossoverDayAsync(mmSource, mmVolumeBars, date, mmBarVolumeThreshold, mmFastBars, mmSlowBars, mmThresholdPoints, CancellationToken.None, sharedOptionPriceCache, mmScoreMetric, mmBandWidth, optionsSwitchTime: null, mmMinPrice, mmMaxPrice, mmStopLossPercent, mmTp1Pct, mmTp1Frac, mmDailyLoss));
+        }
+    }
+
+    if (mmTrades.Count == 0)
+    {
+        Console.WriteLine("No trades fired across the requested range -- nothing to analyze.");
+        return 0;
+    }
+
+    var mmWinRate = 100.0 * mmTrades.Count(t => t.NetPnlPoints > 0) / mmTrades.Count;
+    var mmNet = mmTrades.Sum(t => t.NetPnlPoints);
+    Console.WriteLine($"--- {mmMode} total: {mmTrades.Count} trades, {mmWinRate:F1}% win rate, net {mmNet:F2} pts (reproduction check -- compare against the known baseline before trusting the MAE/MFE numbers below) ---");
+    Console.WriteLine();
+
+    // Token reconstruction: cache each day's option chain once (many trades share a day), same
+    // AsOfDate+ExpiryDate!=null query SimulateDayAsync/SimulateCrossoverDayAsync build their own
+    // `chain` from -- a trade's StrikePrice+Side is then unique within that one day's chain.
+    await using var mmAnalysisSource = new NiftySignalDbContext(tradeSourceOptions);
+    var mmChainCache = new Dictionary<DateOnly, List<NiftySignal.Domain.Entities.Instrument>>();
+    async Task<List<NiftySignal.Domain.Entities.Instrument>> GetChainAsync(DateOnly date)
+    {
+        if (mmChainCache.TryGetValue(date, out var cached))
+        {
+            return cached;
+        }
+
+        var options = await mmAnalysisSource.Instruments
+            .Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate != null)
+            .ToListAsync();
+        mmChainCache[date] = options;
+        return options;
+    }
+
+    Console.WriteLine($"{"EntryTime",10} | {"Strike",7} | {"Side",4} | {"Entry",8} | {"Exit",8} | {"NetPnl",8} | {"MAE",8} | {"MFE",8} | {"MAE%",7} | {"MFE%",7}");
+
+    var mmMaePoints = new List<decimal>();
+    var mmMfePoints = new List<decimal>();
+    var mmMaePercents = new List<decimal>();
+    var mmMfePercents = new List<decimal>();
+    var mmRecoveredCount = 0;
+    var mmGaveBackCount = 0;
+    var mmMissingTokenCount = 0;
+
+    foreach (var t in mmTrades)
+    {
+        // Ticks are stored UTC throughout this project (Program.cs's own top-of-file comment) --
+        // EntryTime's UTC date is the same AsOfDate the day's chain was built for.
+        var tradeDate = DateOnly.FromDateTime(t.EntryTime.UtcDateTime);
+        var chain = await GetChainAsync(tradeDate);
+        var instrument = chain.FirstOrDefault(i => i.StrikePrice == t.StrikePrice && i.OptionType == t.Side);
+        if (instrument is null)
+        {
+            mmMissingTokenCount++;
+            Console.WriteLine($"    (no instrument match for {FormatIst(t.EntryTime)} strike={t.StrikePrice} side={t.Side} on {tradeDate:yyyy-MM-dd} -- skipped)");
+            continue;
+        }
+
+        var series = await OptionPriceSeries.LoadAsync(mmAnalysisSource, instrument.Token, t.EntryTime, t.ExitTime, CancellationToken.None);
+        var prices = series.AllPrices.Select(p => p.Price).ToList();
+        var result = MaeMfeCalculator.Compute(t.EntryPrice, prices);
+
+        mmMaePoints.Add(result.MaePoints);
+        mmMfePoints.Add(result.MfePoints);
+        mmMaePercents.Add(result.MaePercent);
+        mmMfePercents.Add(result.MfePercent);
+
+        var finalLossMagnitude = Math.Max(0m, -t.NetPnlPoints);
+        var finalGainMagnitude = Math.Max(0m, t.NetPnlPoints);
+        if (result.MaePoints > finalLossMagnitude)
+        {
+            mmRecoveredCount++;
+        }
+        if (result.MfePoints > finalGainMagnitude)
+        {
+            mmGaveBackCount++;
+        }
+
+        var side = t.Side == OptionType.Call ? "Call" : "Put";
+        Console.WriteLine($"{FormatIst(t.EntryTime),10} | {t.StrikePrice,7} | {side,4} | {t.EntryPrice,8:F2} | {t.ExitPrice,8:F2} | {t.NetPnlPoints,8:F2} | {result.MaePoints,8:F2} | {result.MfePoints,8:F2} | {result.MaePercent,7:F2} | {result.MfePercent,7:F2}");
+    }
+
+    if (mmMaePoints.Count > 0)
+    {
+        var mmMaePointsSorted = mmMaePoints.OrderBy(x => x).ToList();
+        var mmMfePointsSorted = mmMfePoints.OrderBy(x => x).ToList();
+        var mmMaePercentsSorted = mmMaePercents.OrderBy(x => x).ToList();
+        var mmMfePercentsSorted = mmMfePercents.OrderBy(x => x).ToList();
+        Console.WriteLine();
+        Console.WriteLine("--- MAE/MFE summary ---");
+        Console.WriteLine($"Trades analyzed: {mmMaePoints.Count}{(mmMissingTokenCount > 0 ? $" ({mmMissingTokenCount} skipped -- no instrument match)" : "")}");
+        Console.WriteLine($"MAE (points): avg={mmMaePoints.Average():F2}, median={mmMaePointsSorted[mmMaePointsSorted.Count / 2]:F2}, worst={mmMaePointsSorted[^1]:F2}");
+        Console.WriteLine($"MFE (points): avg={mmMfePoints.Average():F2}, median={mmMfePointsSorted[mmMfePointsSorted.Count / 2]:F2}, best={mmMfePointsSorted[^1]:F2}");
+        Console.WriteLine($"MAE (%): avg={mmMaePercents.Average():F2}%, median={mmMaePercentsSorted[mmMaePercentsSorted.Count / 2]:F2}%, worst={mmMaePercentsSorted[^1]:F2}%");
+        Console.WriteLine($"MFE (%): avg={mmMfePercents.Average():F2}%, median={mmMfePercentsSorted[mmMfePercentsSorted.Count / 2]:F2}%, best={mmMfePercentsSorted[^1]:F2}%");
+        Console.WriteLine($"Trades where MAE exceeded the final loss magnitude (recovered from a worse drawdown): {mmRecoveredCount}/{mmMaePoints.Count}");
+        Console.WriteLine($"Trades where MFE exceeded the final gain (gave back profit): {mmGaveBackCount}/{mmMaePoints.Count}");
     }
 
     return 0;
@@ -1133,6 +1508,11 @@ if (args.Length > 0 && string.Equals(args[0], "calibrate", StringComparison.Ordi
     (double Open, double Mid, double Close)? calSessionWeights = calWOpen is not null || calWMid is not null || calWClose is not null
         ? (calWOpen ?? 0.7, calWMid ?? 0.5, calWClose ?? 0.3)
         : null;
+    // 2026-09-21, whipsaw-reduction experiment -- only meaningful for
+    // OptionsScoreThreeWaySwitchMaxPainConfirmedSmoothed/...MinHold respectively; no-op for every
+    // other metric.
+    var calSmoothBars = calNamed.TryGetValue("smoothbars", out var calSmoothBarsStr) ? (int?)int.Parse(calSmoothBarsStr) : null;
+    var calMinHoldMinutes = calNamed.TryGetValue("minhold", out var calMinHoldStr) ? (double?)double.Parse(calMinHoldStr) : null;
     double[] percentiles = [75, 80, 85, 90, 93, 95, 97, 99];
 
     Console.WriteLine($"=== Calibration sweep: metric={calMetric}, {calFromDate:yyyy-MM-dd}..{calToDate:yyyy-MM-dd}, target 7-20 trades/day{(calRollingSubBarThreshold is { } crsbt ? $", rolling {crsbt}-wide sub-bars" : "")}{(calExcludeDates.Count > 0 ? $", excluding {string.Join(",", calExcludeDates)}" : "")} ===");
@@ -1171,7 +1551,7 @@ if (args.Length > 0 && string.Equals(args[0], "calibrate", StringComparison.Ordi
                     continue;
                 }
 
-                trades.AddRange(await RunRangeAsync(date, date, calMetric, percentile, 15, threshold, stopLossPercent: null, rollingSubBarThreshold: calRollingSubBarThreshold, depthBandWidth: calDepthBandWidth, optionsSwitchTime: calSwitchTime, entryWindowStartOverride: calEntryStart, sessionWeightsOnFutures: calSessionWeights));
+                trades.AddRange(await RunRangeAsync(date, date, calMetric, percentile, 15, threshold, stopLossPercent: null, rollingSubBarThreshold: calRollingSubBarThreshold, depthBandWidth: calDepthBandWidth, optionsSwitchTime: calSwitchTime, entryWindowStartOverride: calEntryStart, sessionWeightsOnFutures: calSessionWeights, smoothingWindowBars: calSmoothBars, minHoldMinutes: calMinHoldMinutes));
             }
 
             var tradesPerDay = trades.Count / (double)tradingDayCountFiltered;

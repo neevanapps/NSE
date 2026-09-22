@@ -30,8 +30,11 @@ public sealed class VolumeBarDbContext(DbContextOptions<VolumeBarDbContext> opti
     /// <summary>Phase C of docs/LIVE_PARITY_PLAN.md -- live entry SIGNALS (not paper trades -- see <see cref="LiveEntrySignalRow"/>'s own doc comment) for the locked target metric.</summary>
     public DbSet<LiveEntrySignalRow> LiveEntrySignals => Set<LiveEntrySignalRow>();
 
-    /// <summary>Phase D of docs/LIVE_PARITY_PLAN.md -- live paper trades (real strike/fill/P&amp;L) for the locked target metric, written by <see cref="LivePaperTradeExecutor"/>.</summary>
+    /// <summary>Phase D of docs/LIVE_PARITY_PLAN.md -- live paper trades (real strike/fill/P&amp;L) for the locked target metric, written by <see cref="LivePaperTradeExecutor"/>. Shared across strategies since 2026-09-21 (see <see cref="LivePaperTradeRow.Strategy"/>).</summary>
     public DbSet<LivePaperTradeRow> LivePaperTrades => Set<LivePaperTradeRow>();
+
+    /// <summary>2026-09-21, futures-crossover live-wiring task -- live per-bar FuturesScore/fast-slow-MA diagnostics for the locked crossover strategy, written by <see cref="LiveFuturesCrossoverSession"/>.</summary>
+    public DbSet<LiveFuturesCrossoverScoreRow> LiveFuturesCrossoverScoreBars => Set<LiveFuturesCrossoverScoreRow>();
 
     /// <summary>Phase G of docs/LIVE_PARITY_PLAN.md -- this pipeline's own new-entries-only kill switch, checked by <see cref="LivePaperTradeExecutor.OpenAsync"/> on every entry signal. See <see cref="LiveKillSwitchState"/>'s own doc comment for why this is a separate row from <c>NiftySignal.Domain.Entities.KillSwitchState</c> rather than a shared one.</summary>
     public DbSet<LiveKillSwitchState> LiveKillSwitchStates => Set<LiveKillSwitchState>();
@@ -102,13 +105,17 @@ public sealed class VolumeBarDbContext(DbContextOptions<VolumeBarDbContext> opti
 
         modelBuilder.Entity<LiveEntrySignalRow>(entity =>
         {
-            // NOT unique on BarIndex alone -- EntryBarIndex identifies the signal's own row for the
-            // engine's "find the open one to close" lookup, but a given day can have several signals
-            // over time (one at a time, never overlapping -- enforced by TradingDaySession's own
-            // single _open slot, not by a DB constraint, since "no row with ExitBarIndex IS NULL
-            // other than this one" isn't expressible as a plain unique index).
-            entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold });
-            entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold, b.EntryBarIndex }).IsUnique();
+            // NOT unique on (..., Strategy, BarIndex) alone -- EntryBarIndex identifies the signal's
+            // own row for the engine's "find the open one to close" lookup, but a given day can have
+            // several signals over time per strategy (one at a time per strategy, never overlapping
+            // -- enforced by each strategy's own day-scoped session's single _open slot, not by a DB
+            // constraint, since "no row with ExitBarIndex IS NULL other than this one" isn't
+            // expressible as a plain unique index). Strategy folded into both indexes 2026-09-21
+            // (futures-crossover live-wiring task) -- without it, a futures-crossover signal and an
+            // options signal firing at the same BarIndex on the same day/threshold would collide on
+            // the unique index below (both strategies trade off the SAME BarIndex sequence).
+            entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold, b.Strategy });
+            entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold, b.Strategy, b.EntryBarIndex }).IsUnique();
         });
 
         modelBuilder.Entity<LivePaperTradeRow>(entity =>
@@ -116,8 +123,21 @@ public sealed class VolumeBarDbContext(DbContextOptions<VolumeBarDbContext> opti
             // Same identity shape as LiveEntrySignalRow's own indexes -- one paper trade per
             // originating signal, at most (LivePaperTradeExecutor.OpenAsync may decline to open one
             // at all, e.g. no tradeable strike/price found, but never opens two for the same signal).
+            // Strategy folded in 2026-09-21, same collision-prevention reasoning as LiveEntrySignalRow's
+            // own indexes above.
+            entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold, b.Strategy });
+            entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold, b.Strategy, b.EntryBarIndex }).IsUnique();
+        });
+
+        modelBuilder.Entity<LiveFuturesCrossoverScoreRow>(entity =>
+        {
+            // 2026-09-21, futures-crossover live-wiring task -- same identity shape as
+            // LiveOptionsScoreRow's own indexes (one live score per future bar, by construction --
+            // LiveFuturesCrossoverSession.ProcessBar's own out-of-order/re-score guard). A separate
+            // table from LiveOptionsScoreRow (see this row type's own doc comment), so no Strategy
+            // discriminator is needed here -- there is nothing else that could ever write to it.
             entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold });
-            entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold, b.EntryBarIndex }).IsUnique();
+            entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold, b.BarIndex }).IsUnique();
         });
 
         modelBuilder.Entity<LiveKillSwitchState>(entity =>

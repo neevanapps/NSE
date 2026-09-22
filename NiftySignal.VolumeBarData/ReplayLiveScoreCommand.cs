@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
+using NiftySignal.Domain.Enums;
 using NiftySignal.Persistence;
 
 namespace NiftySignal.VolumeBarData;
@@ -99,6 +100,7 @@ public static class ReplayLiveScoreCommand
                     {
                         AsOfDate = date,
                         BarVolumeThreshold = threshold,
+                        Strategy = LiveVolumeBarStrategyId.Options,
                         Side = opened.Side,
                         EntryBarIndex = opened.EntryBarIndex,
                         EntryTimestamp = opened.EntryTimestamp,
@@ -343,7 +345,7 @@ public static class ReplayLiveScoreCommand
                 {
                     var row = new LiveEntrySignalRow
                     {
-                        AsOfDate = date, BarVolumeThreshold = threshold, Side = opened.Side,
+                        AsOfDate = date, BarVolumeThreshold = threshold, Strategy = LiveVolumeBarStrategyId.Options, Side = opened.Side,
                         EntryBarIndex = opened.EntryBarIndex, EntryTimestamp = opened.EntryTimestamp,
                         EntryScore = opened.EntryScore, EntryPercentile = opened.EntryPercentile,
                     };

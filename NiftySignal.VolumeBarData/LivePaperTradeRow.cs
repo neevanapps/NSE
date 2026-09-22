@@ -34,6 +34,9 @@ public sealed class LivePaperTradeRow
 
     public required long BarVolumeThreshold { get; set; }
 
+    /// <summary>2026-09-21, futures-crossover live-wiring task: see <see cref="LiveEntrySignalRow.Strategy"/>'s own doc comment -- same discriminator, same collision this prevents on this table's own (AsOfDate, BarVolumeThreshold, Strategy, EntryBarIndex) unique index.</summary>
+    public required LiveVolumeBarStrategyId Strategy { get; set; }
+
     /// <summary>Call = long a call, Put = long a put -- same convention <see cref="LiveEntrySignalRow.Side"/>/<see cref="VolumeBarTrade.Side"/> already use.</summary>
     public required OptionType Side { get; set; }
 

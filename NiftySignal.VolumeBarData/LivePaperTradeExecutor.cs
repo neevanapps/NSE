@@ -43,7 +43,13 @@ public static class LivePaperTradeExecutor
     public static async Task<LivePaperTradeRow?> OpenAsync(
         NiftySignalDbContext source, VolumeBarDbContext volumeBarDb,
         DateOnly asOfDate, long barVolumeThreshold, LiveSignalOpened opened, decimal futurePrice,
-        DateTimeOffset decisionTimestamp, Action<string> log, CancellationToken ct)
+        DateTimeOffset decisionTimestamp, Action<string> log, CancellationToken ct,
+        // 2026-09-21, futures-crossover live-wiring task -- defaults to Options (the only strategy
+        // that called this before the discriminator existed) so every pre-existing caller/test
+        // keeps compiling unchanged; NiftySignal.Host.LiveFuturesCrossoverEngine passes
+        // FuturesCrossover explicitly. See LivePaperTradeRow.Strategy's own doc comment for why this
+        // is required at all.
+        LiveVolumeBarStrategyId strategy = LiveVolumeBarStrategyId.Options)
     {
         // Phase G kill switch (docs/LIVE_PARITY_PLAN.md): checked FIRST, before the strike/price
         // lookups below -- disables NEW entries only. The signal itself (LiveEntrySignalRow, already
@@ -58,13 +64,18 @@ public static class LivePaperTradeExecutor
             return null;
         }
 
+        // 2026-09-21, futures-crossover live-wiring task: filtered by Strategy -- each strategy's
+        // own "one position at a time" rule is independent of the other's, so an open OPTIONS
+        // position must never block a FuturesCrossover entry (or vice versa). Without this filter
+        // the no-collision proof (two strategies with simultaneously-open positions on the same
+        // day/threshold) would fail here even though the unique-index collision itself is fixed.
         var alreadyOpen = await volumeBarDb.LivePaperTrades.AnyAsync(
-            t => t.AsOfDate == asOfDate && t.BarVolumeThreshold == barVolumeThreshold && t.ExitBarIndex == null, ct);
+            t => t.AsOfDate == asOfDate && t.BarVolumeThreshold == barVolumeThreshold && t.Strategy == strategy && t.ExitBarIndex == null, ct);
         if (alreadyOpen)
         {
-            // Should not happen -- TradingDaySession never opens a second signal while one is open.
-            // Defensive only, see this class's own doc comment.
-            log($"LivePaperTradeExecutor.OpenAsync: a paper trade is already open for {asOfDate:yyyy-MM-dd} @ {barVolumeThreshold} -- skipping entry signal at BarIndex {opened.EntryBarIndex} (one position at a time).");
+            // Should not happen -- each strategy's own day-scoped session never opens a second
+            // signal while its own is open. Defensive only, see this class's own doc comment.
+            log($"LivePaperTradeExecutor.OpenAsync: a {strategy} paper trade is already open for {asOfDate:yyyy-MM-dd} @ {barVolumeThreshold} -- skipping entry signal at BarIndex {opened.EntryBarIndex} (one position at a time per strategy).");
             return null;
         }
 
@@ -99,6 +110,7 @@ public static class LivePaperTradeExecutor
         {
             AsOfDate = asOfDate,
             BarVolumeThreshold = barVolumeThreshold,
+            Strategy = strategy,
             Side = opened.Side,
             EntryBarIndex = opened.EntryBarIndex,
             EntryTimestamp = opened.EntryTimestamp,
@@ -125,14 +137,15 @@ public static class LivePaperTradeExecutor
     public static async Task CloseAsync(
         VolumeBarDbContext volumeBarDb, NiftySignalDbContext source,
         DateOnly asOfDate, long barVolumeThreshold, LiveSignalClosed closed,
-        DateTimeOffset decisionTimestamp, Action<string> log, CancellationToken ct)
+        DateTimeOffset decisionTimestamp, Action<string> log, CancellationToken ct,
+        LiveVolumeBarStrategyId strategy = LiveVolumeBarStrategyId.Options)
     {
         var tracked = volumeBarDb.ChangeTracker.Entries<LivePaperTradeRow>()
             .Select(e => e.Entity)
-            .FirstOrDefault(r => r.AsOfDate == asOfDate && r.BarVolumeThreshold == barVolumeThreshold && r.EntryBarIndex == closed.EntryBarIndex);
+            .FirstOrDefault(r => r.AsOfDate == asOfDate && r.BarVolumeThreshold == barVolumeThreshold && r.Strategy == strategy && r.EntryBarIndex == closed.EntryBarIndex);
 
         var row = tracked ?? await volumeBarDb.LivePaperTrades.FirstOrDefaultAsync(
-            r => r.AsOfDate == asOfDate && r.BarVolumeThreshold == barVolumeThreshold && r.EntryBarIndex == closed.EntryBarIndex, ct);
+            r => r.AsOfDate == asOfDate && r.BarVolumeThreshold == barVolumeThreshold && r.Strategy == strategy && r.EntryBarIndex == closed.EntryBarIndex, ct);
 
         if (row is null)
         {

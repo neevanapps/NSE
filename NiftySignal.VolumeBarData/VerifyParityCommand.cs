@@ -83,7 +83,17 @@ public static class VerifyParityCommand
             return 1;
         }
 
-        var barIndexByEndTimestamp = bars.ToDictionary(b => b.EndTimestamp, b => b.BarIndex);
+        // 2026-09-21, live-caught: two bars can legitimately share the same EndTimestamp when a
+        // burst of ticks carries an identical ExchangeTimestamp (seen at today's market close,
+        // where the day's normal 2600-volume bar completed and a small trailing partial bar --
+        // VolumeBarBuilder.FlushPartial -- closed at the exact same wall-clock second). A plain
+        // ToDictionary crashes on the duplicate key. Last-bar-wins is safe here: no real trade can
+        // enter after EntryWindowEnd (15:00 IST) or exit after ForceCloseAt (15:15 IST), both
+        // strictly before this collision window, so no genuine trade's bar-index lookup is ever
+        // actually ambiguous -- this only needs to not crash, not resolve a real conflict.
+        var barIndexByEndTimestamp = bars
+            .GroupBy(b => b.EndTimestamp)
+            .ToDictionary(g => g.Key, g => g.Last().BarIndex);
 
         List<VolumeBarTrade> officialTrades;
         await using (var officialSource = new NiftySignalDbContext(sourceOptions))

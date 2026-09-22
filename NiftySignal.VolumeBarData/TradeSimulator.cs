@@ -545,16 +545,163 @@ public enum VolumeBarMetric
     /// itself percentile-shaped, so this gets its own dedicated magnitude-rank tracker too.
     /// </summary>
     FinalScoreSessionWeighted,
+
+    /// <summary>
+    /// 2026-09-21, whipsaw-reduction experiment Candidate A (user-reported live symptom: the score
+    /// swings between extremes and flips position direction after only 1-2 minutes held). Identical
+    /// to <see cref="OptionsScoreThreeWaySwitchMaxPainConfirmed"/> in every respect -- same 3-way
+    /// session-gated switch legs (ATM depth imbalance drives Open, price-signed ΔIV drives Mid, raw
+    /// ΔIV drives Close), same Max Pain confirmation gate, same entry-percentile gate, same
+    /// wide-hysteresis <c>ScoreInvalidated</c> exit shape (a held position only exits once the
+    /// OPPOSITE direction's score itself crosses the full entry percentile, not a naive zero-cross;
+    /// this was already true of the locked baseline -- see docs/VOLUME_BAR_FINDINGS.md's 2026-09-21
+    /// section for why the exit gate itself was ruled out as the whipsaw source) -- EXCEPT each
+    /// leg's raw PRE-RANK value (the depth-imbalance ratio, the price-signed ΔIV term, the raw ΔIV
+    /// term -- the exact same quantities <see cref="OptionsThreeWayScoreCalculator.ComputeScore"/>
+    /// feeds into <c>SignedRank.Compute</c> unchanged) is first passed through a plain N-bar simple
+    /// moving average (<see cref="BarCountRollingMean"/>, this metric's own dedicated instance per
+    /// leg) and the SMOOTHED value is what gets ranked, not the single current bar's raw value.
+    ///
+    /// Hypothesis: the reported whipsaw comes from single-bar noise in the raw leg value repeatedly
+    /// pushing the same-day percentile rank to the opposite ±90th-percentile extreme on a small/
+    /// early sample -- smoothing the input before ranking should damp spurious single-bar swings
+    /// while still letting a genuine sustained directional move reach the percentile extreme (it
+    /// just takes a few more bars to do so). This is a change to the SCORE INPUT only; the
+    /// percentile-threshold entry/exit mechanics themselves are untouched.
+    ///
+    /// SMA (not EMA) chosen for a directly interpretable "N bars" window that matches this
+    /// backtest's own existing bar-count sweep conventions (e.g. <c>trendWindowBars</c>) rather than
+    /// introducing a decay-constant parameter -- not a claim EMA would perform worse, just untested
+    /// and out of scope for this first pass. <see cref="BarCountRollingMean"/> only enqueues/emits
+    /// on bars where the leg's own raw value is actually present (same "don't fabricate a signal
+    /// that isn't there" null-handling convention <see cref="SignedRank"/> and every other tracker
+    /// in this file already follow) -- a bar with no reading contributes nothing and the smoothed
+    /// score is null that bar, exactly like the unsmoothed baseline.
+    ///
+    /// The window length (in bars) is swept via <c>--smoothbars=</c>
+    /// (<see cref="SimulateDayAsync"/>'s <c>smoothingWindowBars</c> parameter) rather than picked by
+    /// eye, per CLAUDE.md's "no hardcoded threshold constants" rule -- see
+    /// docs/VOLUME_BAR_FINDINGS.md's 2026-09-21 section for the full swept grid and verdict. What's
+    /// explicitly NOT changed from the locked baseline: the Max Pain confirmation gate, the Open/Mid/
+    /// Close session boundaries, the entry-percentile gate itself, the exit logic (still the same
+    /// full-opposite-percentile <c>ScoreInvalidated</c> shape, stop-loss, and 15:15 force-close),
+    /// strike selection, and one-position-at-a-time bookkeeping.
+    /// </summary>
+    OptionsScoreThreeWaySwitchMaxPainConfirmedSmoothed,
+
+    /// <summary>
+    /// 2026-09-21, whipsaw-reduction experiment Candidate B (same user-reported symptom as
+    /// <see cref="OptionsScoreThreeWaySwitchMaxPainConfirmedSmoothed"/>'s own doc comment). Identical
+    /// scoring, Max Pain confirmation gate, and entry logic to
+    /// <see cref="OptionsScoreThreeWaySwitchMaxPainConfirmed"/> -- this candidate does not touch the
+    /// score computation at all. The only difference is a MINIMUM DWELL TIME on the exit side: once
+    /// a position opens, a <c>ScoreInvalidated</c> exit (the opposite-direction score crossing the
+    /// full entry percentile) is not allowed to fire until at least
+    /// <see cref="SimulateDayAsync"/>'s own <c>minHoldMinutes</c> parameter's worth of wall-clock
+    /// minutes have elapsed since entry. The stop-loss and the 15:15 <see cref="ForceCloseAt"/>
+    /// force-close are genuine SAFETY exits, not whipsaw-reduction targets, and remain able to close
+    /// the position immediately regardless of dwell time -- this candidate only gates the
+    /// discretionary <c>ScoreInvalidated</c> reason.
+    ///
+    /// Minutes (not bars) chosen for the dwell unit -- matches this file's own existing time-based
+    /// exit conventions (<see cref="ForceCloseAt"/>, <see cref="SessionGateSwitchTime"/>,
+    /// <see cref="MidCloseSwitchTime"/>) rather than a bar count, which would vary in wall-clock
+    /// duration bar to bar (a volume bar's real duration is not fixed). Dwell length is swept via
+    /// <c>--minhold=</c> rather than picked by eye, per CLAUDE.md's "no hardcoded threshold
+    /// constants" rule -- see docs/VOLUME_BAR_FINDINGS.md's 2026-09-21 section for the full swept
+    /// grid and verdict.
+    /// </summary>
+    OptionsScoreThreeWaySwitchMaxPainConfirmedMinHold,
 }
 
+/// <param name="PartialExitTime">
+/// 2026-09-21, backtest-only TP1 partial-booking experiment (see docs/VOLUME_BAR_FINDINGS.md's
+/// 2026-09-21 risk-rule sweep section). Null on every trade that never hit the configured TP1
+/// profit trigger (the default, unchanged, one-exit-per-trade shape). When non-null, this trade
+/// had <see cref="PartialBookedFraction"/> of its quantity closed early at <see cref="
+/// PartialExitPrice"/>/<paramref name="PartialExitTime"/>, and the remaining
+/// (1-<see cref="PartialBookedFraction"/>) closed normally at <see cref="ExitTime"/>/<see
+/// cref="ExitPrice"/> via whatever <see cref="ExitReason"/> eventually fired for the residual
+/// leg (which, per the old live engine's own "trail to breakeven after partial" rule replicated
+/// here -- see <see cref="ExitRuleEvaluator"/>'s own doc comment -- can now ALSO be "StopLoss" at
+/// a tighter, breakeven-only threshold than the original stop, once a partial has booked).
+/// </param>
 public sealed record VolumeBarTrade(
     DateTimeOffset EntryTime, decimal EntryPrice, OptionType Side, decimal StrikePrice,
-    DateTimeOffset ExitTime, decimal ExitPrice, string ExitReason, double EntryScore)
+    DateTimeOffset ExitTime, decimal ExitPrice, string ExitReason, double EntryScore,
+    DateTimeOffset? PartialExitTime = null, decimal? PartialExitPrice = null, decimal? PartialBookedFraction = null)
 {
-    /// <summary>Points on the traded option's own price -- no lot size, no transaction costs, always a LONG position, same convention `NiftySignal.MetricTrials.CoreScoreTrade` already uses.</summary>
-    public decimal NetPnlPoints => ExitPrice - EntryPrice;
+    /// <summary>
+    /// Points on the traded option's own price -- no lot size, no transaction costs, always a LONG
+    /// position, same convention `NiftySignal.MetricTrials.CoreScoreTrade` already uses. With a
+    /// partial book, this is the FRACTION-WEIGHTED BLEND of the two realized legs (partial fraction
+    /// at <see cref="PartialExitPrice"/>, the remaining 1-fraction at <see cref="ExitPrice"/>) --
+    /// the same "blended realized P&amp;L" the old live engine's partial-book mechanic always meant,
+    /// not a new invented definition.
+    /// </summary>
+    public decimal NetPnlPoints => PartialExitTime is not null && PartialExitPrice is { } partialPrice && PartialBookedFraction is { } fraction
+        ? (partialPrice - EntryPrice) * fraction + (ExitPrice - EntryPrice) * (1m - fraction)
+        : ExitPrice - EntryPrice;
 
     public decimal NetPnlPercent => NetPnlPoints / EntryPrice * 100m;
+}
+
+/// <summary>
+/// 2026-09-21, backtest-only risk-rule sweep (docs/VOLUME_BAR_FINDINGS.md's 2026-09-21 section):
+/// per-day running state for the TP1 partial-book and daily-loss-cap mechanics, shared identically
+/// by <see cref="TradeSimulator.SimulateDayAsync"/> and <see cref="TradeSimulator.SimulateCrossoverDayAsync"/>.
+/// Unlike <c>PickStrikeInBandAsync</c> (deliberately duplicated per method because it closes over
+/// each method's own <c>chain</c>/<c>GetSeriesAsync</c>), this class has no such closure and is
+/// real shared logic across both simulators, not a speculative abstraction.
+///
+/// Each of the 2 instance methods is scoped to ONE simulated day (a fresh <see cref="RiskRuleState"/>
+/// per <c>SimulateDayAsync</c>/<c>SimulateCrossoverDayAsync</c> call, both of which already operate
+/// one <paramref name="asOfDate"/> at a time) -- no cross-day state to thread through the CLI's own
+/// range loop.
+///
+/// Daily-loss-cap "% of what": this simulator trades in raw option-premium POINTS with no lot size
+/// or rupee-capital concept of its own (see <see cref="VolumeBarTrade"/>'s own doc comment -- "no
+/// lot size, no transaction costs"). Rather than invent a new arbitrary denominator, the percent is
+/// expressed against <c>NiftySignal.Rules.CapitalConfigOptions</c>'s own real LIVE defaults (Total=
+/// Rs 50,000, LotSize=65, LotsPerTrade=2 -- the actual paper-trading capital box the retired engine
+/// used), converted to a points-of-realized-loss threshold via
+/// <c>(dailyLossCapPct/100 * 50,000) / (65*2)</c>. This is a one-way, backtest-only UNIT CONVERSION
+/// (reading a real number, not writing to or depending on <c>NiftySignal.Rules</c> at runtme) --
+/// documented explicitly here since "% of what" genuinely matters, per CLAUDE.md's sweep-methodology
+/// rule.
+/// </summary>
+public sealed class RiskRuleState
+{
+    const decimal DailyLossCapCapitalTotal = 50_000m;
+    const int DailyLossCapLotSize = 65;
+    const int DailyLossCapLotsPerTrade = 2;
+
+    readonly decimal? _tp1ProfitPct;
+    readonly decimal? _tp1Fraction;
+    readonly decimal? _dailyLossCapPoints;
+    decimal _realizedPnlToday;
+
+    public RiskRuleState(decimal? tp1ProfitPct, decimal? tp1Fraction, decimal? dailyLossCapPct)
+    {
+        _tp1ProfitPct = tp1ProfitPct;
+        _tp1Fraction = tp1Fraction;
+        _dailyLossCapPoints = dailyLossCapPct is { } pct
+            ? pct / 100m * DailyLossCapCapitalTotal / (DailyLossCapLotSize * DailyLossCapLotsPerTrade)
+            : null;
+    }
+
+    /// <summary>True once today's realized P&amp;L (closed trades plus already-booked partial legs)
+    /// has crossed the configured daily-loss threshold -- gates NEW entries only; an already-open
+    /// position keeps exiting through its own rules regardless.</summary>
+    public bool DailyLossCapHit => _dailyLossCapPoints is { } cap && _realizedPnlToday <= -cap;
+
+    public bool ShouldPartialBook(bool alreadyPartiallyBooked, decimal entryPrice, decimal currentPrice) =>
+        _tp1ProfitPct is { } tp1 && _tp1Fraction is not null && !alreadyPartiallyBooked
+        && currentPrice >= entryPrice * (1m + tp1);
+
+    public decimal Tp1Fraction => _tp1Fraction ?? 0m;
+
+    public void RecordRealizedPnl(decimal points) => _realizedPnlToday += points;
 }
 
 /// <summary>
@@ -640,8 +787,37 @@ public static class TradeSimulator
         TimeSpan? optionsSwitchTime = null,
         TimeSpan? entryWindowStartOverride = null,
         (double Open, double Mid, double Close)? sessionWeightsOnFutures = null,
-        Action<VolumeBarRow, double?, double?, double?>? onBarEvaluated = null)
+        Action<VolumeBarRow, double?, double?, double?>? onBarEvaluated = null,
+        // 2026-09-21, whipsaw-reduction experiment Candidate A -- only meaningful for
+        // OptionsScoreThreeWaySwitchMaxPainConfirmedSmoothed. Bars in each leg's own SMA window
+        // (see VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedSmoothed's doc comment and
+        // BarCountRollingMean). Null/no-op for every other metric.
+        int? smoothingWindowBars = null,
+        // 2026-09-21, whipsaw-reduction experiment Candidate B -- only meaningful for
+        // OptionsScoreThreeWaySwitchMaxPainConfirmedMinHold. Minimum wall-clock minutes a position
+        // must be held before a ScoreInvalidated exit (not the stop-loss or force-close) is allowed
+        // to fire. Null/no-op for every other metric.
+        double? minHoldMinutes = null,
+        // 2026-09-21, user's own explicit risk/capital-consistency constraint, not a calibrated
+        // metric threshold -- CLAUDE.md's "no hardcoded thresholds" rule is about magnitudes picked
+        // by eye to flatter a backtest result; this is the opposite direction, an operational band
+        // the user asked for by name (entry premium 100-150) to keep per-lot capital consistent
+        // across trades, independent of which metric/day produced the signal. A bar whose ATM
+        // premium falls outside the band is simply skipped -- no trade that bar, not a different
+        // strike. Both null by default (no filter, the locked baseline's exact behavior unchanged).
+        decimal? minEntryPrice = null,
+        decimal? maxEntryPrice = null,
+        // 2026-09-21, backtest-only risk-rule sweep (docs/VOLUME_BAR_FINDINGS.md's 2026-09-21
+        // section) -- TP1 partial-booking and the daily-loss-cap, evaluating the OLD (retired)
+        // live engine's NiftySignal.Rules/ExitRuleEvaluator.cs risk mechanics against the two
+        // strategies now actually live. All three null by default (off, original one-exit-per-
+        // trade/no-daily-gate behavior byte-identical) -- see RiskRuleState's own doc comment for
+        // the shared mechanics both this method and SimulateCrossoverDayAsync now implement.
+        decimal? tp1ProfitPct = null,
+        decimal? tp1Fraction = null,
+        decimal? dailyLossCapPct = null)
     {
+        var riskState = new RiskRuleState(tp1ProfitPct, tp1Fraction, dailyLossCapPct);
         // 2026-09-20, item 13 follow-up sweep: lets the 3 FinalScoreSessionWeighted phase weights
         // (weight-on-FuturesScore per phase; OptionsScore always gets 1 minus it) be swept from the
         // CLI via calibrate's --wopen=/--wmid=/--wclose= without recompiling. Defaults to the
@@ -718,10 +894,23 @@ public static class TradeSimulator
         // Confirmed reuses the 3-way switch's own scoring logic exactly (Open/Mid/Close legs
         // unchanged) -- the confirmation gate is applied separately, at the entry check, not by
         // altering the traded score itself.
-        var isOptionsScore3Way = metric is VolumeBarMetric.OptionsScoreThreeWaySwitch or VolumeBarMetric.OptionsScoreThreeWaySwitchConfirmed or VolumeBarMetric.OptionsScoreThreeWaySwitchEarlyConviction or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmed;
+        // 2026-09-21, whipsaw-reduction MinHold candidate: its score computation is byte-identical
+        // to OptionsScoreThreeWaySwitchMaxPainConfirmed's own (only the exit side differs, gated
+        // separately below by metric equality), so it deliberately reuses this same flag/branch
+        // rather than getting its own dispatch case. The Smoothed candidate does NOT belong here --
+        // its score computation genuinely differs (smoothed leg inputs, own trackers), so it gets
+        // its own isOptionsScore3WaySmoothed flag and dispatch branch instead.
+        var isOptionsScore3Way = metric is VolumeBarMetric.OptionsScoreThreeWaySwitch or VolumeBarMetric.OptionsScoreThreeWaySwitchConfirmed or VolumeBarMetric.OptionsScoreThreeWaySwitchEarlyConviction or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmed or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedMinHold;
+        var isOptionsScore3WaySmoothed = metric == VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedSmoothed;
         var isOptionsScoreConfirmed = metric == VolumeBarMetric.OptionsScoreThreeWaySwitchConfirmed;
         var isOptionsScoreEarlyConviction = metric == VolumeBarMetric.OptionsScoreThreeWaySwitchEarlyConviction;
-        var isOptionsScoreMaxPainConfirmed = metric == VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmed;
+        // Both whipsaw-reduction candidates keep the exact same Max Pain confirmation gate as the
+        // locked baseline (see each enum value's own doc comment) -- this flag drives both the
+        // OptionMaxPainBars table load (isMaxPainMetric below) and the gate check itself
+        // (PassesConfirmation), so it must cover all 3 metric values, not just the original.
+        var isOptionsScoreMaxPainConfirmed = metric is VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmed
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedSmoothed
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedMinHold;
         var isOptionsScore3WayOiOpen = metric == VolumeBarMetric.OptionsScoreThreeWaySwitchOiOpen;
         var isOptionsScore3WayVolMid = metric == VolumeBarMetric.OptionsScoreThreeWaySwitchVolMid;
         // 2026-09-20, Phase 5 plan items 10-13: the first-ever FuturesScore + OptionsScore
@@ -731,7 +920,7 @@ public static class TradeSimulator
             or VolumeBarMetric.FinalScoreFuturesPrimaryOptionsFilter or VolumeBarMetric.FinalScoreOptionsPrimaryFuturesFilter
             or VolumeBarMetric.FinalScoreSessionWeighted;
 
-        var isAtmIvMetric = metric is VolumeBarMetric.AtmIvChangeRaw or VolumeBarMetric.AtmIvChangePriceSigned or VolumeBarMetric.AtmIvAcceleration || isOptionsScoreBlend || isOptionsScoreSwitch || isOptionsScore3Way || isOptionsScore3WayOiOpen || isOptionsScore3WayVolMid || isFinalScoreCombo;
+        var isAtmIvMetric = metric is VolumeBarMetric.AtmIvChangeRaw or VolumeBarMetric.AtmIvChangePriceSigned or VolumeBarMetric.AtmIvAcceleration || isOptionsScoreBlend || isOptionsScoreSwitch || isOptionsScore3Way || isOptionsScore3WaySmoothed || isOptionsScore3WayOiOpen || isOptionsScore3WayVolMid || isFinalScoreCombo;
         Dictionary<int, OptionAtmBarRow>? optionAtmByBarIndex = null;
         if (isAtmIvMetric && rollingSubBarThreshold is null)
         {
@@ -788,7 +977,7 @@ public static class TradeSimulator
         // independent of whatever bandWidth is passed for the other band-based components --
         // TobDivergence stays at bandWidth (its own locked ATM±1) via optionDepthByBarIndex above.
         Dictionary<int, OptionDepthBarRow>? optionDepthWideByBarIndex = null;
-        if ((isOptionsScoreBlend || isOptionsScoreSwitch || isOptionsScore3Way || isOptionsScore3WayVolMid || isFinalScoreCombo) && rollingSubBarThreshold is null)
+        if ((isOptionsScoreBlend || isOptionsScoreSwitch || isOptionsScore3Way || isOptionsScore3WaySmoothed || isOptionsScore3WayVolMid || isFinalScoreCombo) && rollingSubBarThreshold is null)
         {
             optionDepthWideByBarIndex = bandWidth == 5 && optionDepthByBarIndex is not null
                 ? optionDepthByBarIndex
@@ -835,6 +1024,42 @@ public static class TradeSimulator
         // NiftySignal.Scoring.AtmStrikeSelector -- the live paper-trade path calls the exact same
         // function, so strike selection has exactly one implementation, not two that could drift.
         Domain.Entities.Instrument? PickAtm(OptionType side, decimal futurePrice) => AtmStrikeSelector.PickAtm(chain, side, futurePrice);
+
+        // 2026-09-21, user's own explicit instruction: when minEntryPrice/maxEntryPrice are set,
+        // this does NOT skip the trade if the pure-ATM strike's premium falls outside the band --
+        // it searches the chain, walking strikes outward from ATM by distance (same ordering
+        // AtmStrikeSelector.PickAtm already uses), and takes the FIRST one (closest to ATM) whose
+        // live premium at this bar's timestamp actually falls inside [minEntryPrice, maxEntryPrice].
+        // With no band set, this is byte-identical to PickAtm + a single price lookup (the original,
+        // still-locked behavior) -- verified by re-running the 112/64.3%/+426.40 baseline unchanged.
+        async Task<(Domain.Entities.Instrument Instrument, decimal Price)?> PickStrikeInBandAsync(OptionType side, decimal futurePrice, DateTimeOffset atTime)
+        {
+            if (minEntryPrice is null && maxEntryPrice is null)
+            {
+                var atm = PickAtm(side, futurePrice);
+                if (atm is null)
+                {
+                    return null;
+                }
+                var atmSeries = await GetSeriesAsync(atm.Token);
+                var atmPrice = atmSeries.PriceAtOrBefore(atTime);
+                return atmPrice is { } ap && ap > 0 ? (atm, ap) : null;
+            }
+
+            foreach (var candidate in chain.Where(o => o.OptionType == side).OrderBy(o => Math.Abs(o.StrikePrice!.Value - futurePrice)))
+            {
+                var series = await GetSeriesAsync(candidate.Token);
+                var price = series.PriceAtOrBefore(atTime);
+                if (price is { } p && p > 0
+                    && (minEntryPrice is null || p >= minEntryPrice)
+                    && (maxEntryPrice is null || p <= maxEntryPrice))
+                {
+                    return (candidate, p);
+                }
+            }
+
+            return null;
+        }
 
         var trendTracker = new VolumeBarTrendReversionTracker(trendWindowBars);
         var rankTracker = new SessionRankTracker();
@@ -922,6 +1147,20 @@ public static class TradeSimulator
         var switch3IvMidRank = new SessionRankTracker();
         var switch3IvCloseRank = new SessionRankTracker();
 
+        // 2026-09-21, whipsaw-reduction Candidate A -- only meaningful for
+        // OptionsScoreThreeWaySwitchMaxPainConfirmedSmoothed. Own rank trackers (not shared with the
+        // unsmoothed 3-way switch's own switch3*Rank trackers above, mutually exclusive per call
+        // anyway) plus one BarCountRollingMean per leg to smooth that leg's raw pre-rank value
+        // before it reaches SignedRank.Compute -- see BarCountRollingMean's and the enum value's own
+        // doc comments. Window length defaults to 3 bars when not swept via --smoothbars=.
+        var smoothedDepthRank = new SessionRankTracker();
+        var smoothedIvMidRank = new SessionRankTracker();
+        var smoothedIvCloseRank = new SessionRankTracker();
+        var effectiveSmoothingWindowBars = smoothingWindowBars ?? 3;
+        var depthSmoother = new BarCountRollingMean(effectiveSmoothingWindowBars);
+        var ivMidSmoother = new BarCountRollingMean(effectiveSmoothingWindowBars);
+        var ivCloseSmoother = new BarCountRollingMean(effectiveSmoothingWindowBars);
+
         // Only meaningful for OptionsScoreThreeWaySwitchOiOpen -- same Mid/Close legs as the
         // 3-way switch (own trackers, not shared, mutually exclusive per call), OI Delta drives
         // Open instead of Depth Imbalance.
@@ -962,7 +1201,8 @@ public static class TradeSimulator
         var comboMagnitudeRank = new SessionRankTracker();
 
         var trades = new List<VolumeBarTrade>();
-        (DateTimeOffset EntryTime, decimal EntryPrice, OptionType Side, decimal StrikePrice, string Token, double EntryScore)? open = null;
+        (DateTimeOffset EntryTime, decimal EntryPrice, OptionType Side, decimal StrikePrice, string Token, double EntryScore,
+            bool HasPartiallyBooked, DateTimeOffset? PartialExitTime, decimal? PartialExitPrice, decimal? PartialFraction)? open = null;
         decimal? previousClose = null;
         long? previousOi = null;
 
@@ -1060,6 +1300,17 @@ public static class TradeSimulator
                 // (factored out 2026-09-20 so SimulateCrossoverDayAsync can reuse it verbatim).
                 score = ComputeOptionsThreeWayScore(bar, previousClose, optionAtmByBarIndex, optionDepthWideByBarIndex,
                     effectiveOptionsSwitchTime, ref previousAtmIv, switch3DepthRank, switch3IvMidRank, switch3IvCloseRank);
+            }
+            else if (isOptionsScore3WaySmoothed)
+            {
+                // 2026-09-21, whipsaw-reduction Candidate A -- MUST be checked before isAtmIvMetric
+                // below, same dispatch-order lesson as every other blend/switch metric in this
+                // chain (isOptionsScore3WaySmoothed is OR'd into isAtmIvMetric purely for
+                // OptionAtmBars/OptionDepthBars table loading, and that generic dispatch doesn't
+                // know about this metric).
+                score = ComputeOptionsThreeWayScoreSmoothed(bar, previousClose, optionAtmByBarIndex, optionDepthWideByBarIndex,
+                    effectiveOptionsSwitchTime, ref previousAtmIv, smoothedDepthRank, smoothedIvMidRank, smoothedIvCloseRank,
+                    depthSmoother, ivMidSmoother, ivCloseSmoother);
             }
             else if (isOptionsScore3WayOiOpen)
             {
@@ -1358,33 +1609,62 @@ public static class TradeSimulator
                 var series = await GetSeriesAsync(position.Token);
                 var currentPrice = series.PriceAtOrBefore(bar.EndTimestamp) ?? position.EntryPrice;
 
-                var stoppedOut = stopLossPercent is { } stop && currentPrice <= position.EntryPrice * (1m - stop);
+                // 2026-09-21, TP1 risk-rule sweep: replicates the old live engine's own
+                // "trail to breakeven after partial" rule (ExitRuleEvaluator.Evaluate's
+                // TrailAfterPartialBook branch) -- once a partial has booked, the stop tightens to
+                // 0% (breakeven) rather than staying at the original, wider stopLossPercent.
+                var effectiveStopLossPercent = position.HasPartiallyBooked ? 0m : stopLossPercent;
+                var stoppedOut = effectiveStopLossPercent is { } stop && currentPrice <= position.EntryPrice * (1m - stop);
                 var timedOut = IstTimeOfDay(bar.EndTimestamp) >= ForceCloseAt;
-                var invalidated = scaledScore is { } liveScore && percentile is { } p && p >= entryPercentile
+                // 2026-09-21, whipsaw-reduction Candidate B -- only meaningful for
+                // OptionsScoreThreeWaySwitchMaxPainConfirmedMinHold (a no-op true for every other
+                // metric). Gates ONLY the discretionary ScoreInvalidated reason below -- stoppedOut/
+                // timedOut/isLastBar are safety/session exits and stay unconditional regardless of
+                // dwell time, per the enum value's own doc comment.
+                var dwellSatisfied = metric != VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedMinHold
+                    || minHoldMinutes is not { } minHold
+                    || (bar.EndTimestamp - position.EntryTime).TotalMinutes >= minHold;
+                var invalidated = dwellSatisfied && scaledScore is { } liveScore && percentile is { } p && p >= entryPercentile
                     && (position.Side == OptionType.Call ? liveScore < 0 : liveScore > 0);
 
-                if (stoppedOut || timedOut || invalidated || isLastBar)
+                // 2026-09-21, TP1 partial-book -- priority StopLoss > PartialBook, same as the old
+                // engine (ExitRuleEvaluator checks StopLoss before PartialBook). Also outranked by
+                // the session-absolute timedOut/isLastBar exits (SquareOff-equivalent), which force
+                // a full close regardless of whether TP1 also qualifies on the same bar.
+                if (!stoppedOut && !timedOut && !isLastBar
+                    && riskState.ShouldPartialBook(position.HasPartiallyBooked, position.EntryPrice, currentPrice))
+                {
+                    var fraction = riskState.Tp1Fraction;
+                    riskState.RecordRealizedPnl((currentPrice - position.EntryPrice) * fraction);
+                    open = (position.EntryTime, position.EntryPrice, position.Side, position.StrikePrice, position.Token,
+                        position.EntryScore, true, bar.EndTimestamp, currentPrice, fraction);
+                }
+                else if (stoppedOut || timedOut || invalidated || isLastBar)
                 {
                     var exitReason = stoppedOut ? "StopLoss" : timedOut ? "TimeCutoff" : isLastBar ? "EndOfData" : "ScoreInvalidated";
-                    trades.Add(new VolumeBarTrade(position.EntryTime, position.EntryPrice, position.Side, position.StrikePrice,
-                        bar.EndTimestamp, currentPrice, exitReason, position.EntryScore));
+                    var trade = position.HasPartiallyBooked
+                        ? new VolumeBarTrade(position.EntryTime, position.EntryPrice, position.Side, position.StrikePrice,
+                            bar.EndTimestamp, currentPrice, exitReason, position.EntryScore,
+                            position.PartialExitTime, position.PartialExitPrice, position.PartialFraction)
+                        : new VolumeBarTrade(position.EntryTime, position.EntryPrice, position.Side, position.StrikePrice,
+                            bar.EndTimestamp, currentPrice, exitReason, position.EntryScore);
+                    trades.Add(trade);
+                    riskState.RecordRealizedPnl(position.HasPartiallyBooked
+                        ? (currentPrice - position.EntryPrice) * (1m - position.PartialFraction!.Value)
+                        : currentPrice - position.EntryPrice);
                     open = null;
                 }
             }
-            else if (!isLastBar && scaledScore is { } sc && percentile is { } p && p >= entryPercentile
+            else if (!isLastBar && !riskState.DailyLossCapHit && scaledScore is { } sc && percentile is { } p && p >= entryPercentile
                 && IstTimeOfDay(bar.EndTimestamp) >= effectiveEntryWindowStart && IstTimeOfDay(bar.EndTimestamp) <= EntryWindowEnd
                 && PassesConfirmation(metric, bar.EndTimestamp, sc, tobConfirmScore, skewConfirmScore, earlyConvictionSign, maxPainConfirmScore, comboOtherLegScore))
             {
                 var side = sc > 0 ? OptionType.Call : OptionType.Put;
-                var candidate = PickAtm(side, bar.ClosePrice);
-                if (candidate is not null)
+                var picked = await PickStrikeInBandAsync(side, bar.ClosePrice, bar.EndTimestamp);
+                if (picked is { } pk)
                 {
-                    var series = await GetSeriesAsync(candidate.Token);
-                    var entryPrice = series.PriceAtOrBefore(bar.EndTimestamp);
-                    if (entryPrice is { } ep && ep > 0)
-                    {
-                        open = (bar.EndTimestamp, ep, side, candidate.StrikePrice!.Value, candidate.Token, sc);
-                    }
+                    open = (bar.EndTimestamp, pk.Price, side, pk.Instrument.StrikePrice!.Value, pk.Instrument.Token, sc,
+                        false, null, null, null);
                 }
             }
         }
@@ -1431,8 +1711,24 @@ public static class TradeSimulator
         Dictionary<(DateOnly, string), OptionPriceSeries>? sharedPriceCache = null,
         VolumeBarMetric scoreMetric = VolumeBarMetric.SessionGatedDepthDurationConfirmed,
         int bandWidth = 5,
-        TimeSpan? optionsSwitchTime = null)
+        TimeSpan? optionsSwitchTime = null,
+        // 2026-09-21, same user-specified entry-premium band as SimulateDayAsync's own
+        // minEntryPrice/maxEntryPrice -- see that parameter's doc comment. Null by default (no
+        // filter, locked crossover behavior unchanged).
+        decimal? minEntryPrice = null,
+        decimal? maxEntryPrice = null,
+        // 2026-09-21, risk-overlay experiment -- previously missing from this method entirely
+        // (SimulateDayAsync's own --stop= has existed since 2026-09-17; this crossover path had
+        // no stop-loss wired in at all until now). Same percent-of-entry-premium convention as
+        // SimulateDayAsync's stopLossPercent -- see that parameter's own doc comment.
+        decimal? stopLossPercent = null,
+        // 2026-09-21, backtest-only risk-rule sweep -- see RiskRuleState's own doc comment. Same
+        // 3 parameters as SimulateDayAsync, all null by default (off, original behavior unchanged).
+        decimal? tp1ProfitPct = null,
+        decimal? tp1Fraction = null,
+        decimal? dailyLossCapPct = null)
     {
+        var riskState = new RiskRuleState(tp1ProfitPct, tp1Fraction, dailyLossCapPct);
         if (scoreMetric is not (VolumeBarMetric.SessionGatedDepthDurationConfirmed or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmed))
         {
             throw new ArgumentOutOfRangeException(nameof(scoreMetric), scoreMetric,
@@ -1504,6 +1800,39 @@ public static class TradeSimulator
         // function, so strike selection has exactly one implementation, not two that could drift.
         Domain.Entities.Instrument? PickAtm(OptionType side, decimal futurePrice) => AtmStrikeSelector.PickAtm(chain, side, futurePrice);
 
+        // 2026-09-21, same price-band strike search as SimulateDayAsync's own copy -- see that
+        // method's doc comment on this local function for the full rationale. Duplicated rather
+        // than shared because the two methods' chain/GetSeriesAsync closures aren't factored into
+        // a common object; kept in lockstep deliberately, not accidentally.
+        async Task<(Domain.Entities.Instrument Instrument, decimal Price)?> PickStrikeInBandAsync(OptionType side, decimal futurePrice, DateTimeOffset atTime)
+        {
+            if (minEntryPrice is null && maxEntryPrice is null)
+            {
+                var atm = PickAtm(side, futurePrice);
+                if (atm is null)
+                {
+                    return null;
+                }
+                var atmSeries = await GetSeriesAsync(atm.Token);
+                var atmPrice = atmSeries.PriceAtOrBefore(atTime);
+                return atmPrice is { } ap && ap > 0 ? (atm, ap) : null;
+            }
+
+            foreach (var candidate in chain.Where(o => o.OptionType == side).OrderBy(o => Math.Abs(o.StrikePrice!.Value - futurePrice)))
+            {
+                var series = await GetSeriesAsync(candidate.Token);
+                var price = series.PriceAtOrBefore(atTime);
+                if (price is { } p && p > 0
+                    && (minEntryPrice is null || p >= minEntryPrice)
+                    && (maxEntryPrice is null || p <= maxEntryPrice))
+                {
+                    return (candidate, p);
+                }
+            }
+
+            return null;
+        }
+
         var depthRank = new SessionRankTracker();
         var durationRank = new SessionRankTracker();
         var tobRank = new SessionRankTracker();
@@ -1516,7 +1845,8 @@ public static class TradeSimulator
         double? previousDiff = null;
 
         var trades = new List<VolumeBarTrade>();
-        (DateTimeOffset EntryTime, decimal EntryPrice, OptionType Side, decimal StrikePrice, string Token, double EntryScore)? open = null;
+        (DateTimeOffset EntryTime, decimal EntryPrice, OptionType Side, decimal StrikePrice, string Token, double EntryScore,
+            bool HasPartiallyBooked, DateTimeOffset? PartialExitTime, decimal? PartialExitPrice, decimal? PartialFraction)? open = null;
         decimal? previousClose = null;
 
         for (var i = 0; i < bars.Count; i++)
@@ -1570,18 +1900,41 @@ public static class TradeSimulator
                 var series = await GetSeriesAsync(position.Token);
                 var currentPrice = series.PriceAtOrBefore(bar.EndTimestamp) ?? position.EntryPrice;
 
+                // 2026-09-21, risk-rule sweep -- same stop-loss/trail-to-breakeven/TP1 mechanics as
+                // SimulateDayAsync's own copy (see that method's matching comments for the full
+                // rationale); duplicated rather than shared for the same reason PickStrikeInBandAsync
+                // is duplicated above (closes over this method's own state), kept in lockstep
+                // deliberately.
+                var effectiveStopLossPercent = position.HasPartiallyBooked ? 0m : stopLossPercent;
+                var stoppedOut = effectiveStopLossPercent is { } stop && currentPrice <= position.EntryPrice * (1m - stop);
                 var timedOut = IstTimeOfDay(bar.EndTimestamp) >= ForceCloseAt;
                 var reversed = position.Side == OptionType.Call ? crossedDown : crossedUp;
 
-                if (timedOut || reversed || isLastBar)
+                if (!stoppedOut && !timedOut && !isLastBar
+                    && riskState.ShouldPartialBook(position.HasPartiallyBooked, position.EntryPrice, currentPrice))
                 {
-                    var exitReason = timedOut ? "TimeCutoff" : isLastBar ? "EndOfData" : "CrossoverReversed";
-                    trades.Add(new VolumeBarTrade(position.EntryTime, position.EntryPrice, position.Side, position.StrikePrice,
-                        bar.EndTimestamp, currentPrice, exitReason, position.EntryScore));
+                    var fraction = riskState.Tp1Fraction;
+                    riskState.RecordRealizedPnl((currentPrice - position.EntryPrice) * fraction);
+                    open = (position.EntryTime, position.EntryPrice, position.Side, position.StrikePrice, position.Token,
+                        position.EntryScore, true, bar.EndTimestamp, currentPrice, fraction);
+                }
+                else if (stoppedOut || timedOut || reversed || isLastBar)
+                {
+                    var exitReason = stoppedOut ? "StopLoss" : timedOut ? "TimeCutoff" : isLastBar ? "EndOfData" : "CrossoverReversed";
+                    var trade = position.HasPartiallyBooked
+                        ? new VolumeBarTrade(position.EntryTime, position.EntryPrice, position.Side, position.StrikePrice,
+                            bar.EndTimestamp, currentPrice, exitReason, position.EntryScore,
+                            position.PartialExitTime, position.PartialExitPrice, position.PartialFraction)
+                        : new VolumeBarTrade(position.EntryTime, position.EntryPrice, position.Side, position.StrikePrice,
+                            bar.EndTimestamp, currentPrice, exitReason, position.EntryScore);
+                    trades.Add(trade);
+                    riskState.RecordRealizedPnl(position.HasPartiallyBooked
+                        ? (currentPrice - position.EntryPrice) * (1m - position.PartialFraction!.Value)
+                        : currentPrice - position.EntryPrice);
                     open = null;
                 }
             }
-            else if (!isLastBar && (crossedUp || crossedDown)
+            else if (!isLastBar && !riskState.DailyLossCapHit && (crossedUp || crossedDown)
                 && IstTimeOfDay(bar.EndTimestamp) >= EntryWindowStart && IstTimeOfDay(bar.EndTimestamp) <= EntryWindowEnd
                 && (isOptionsCrossover
                     // Same Max Pain sign-agreement gate OptionsScoreThreeWaySwitchMaxPainConfirmed's
@@ -1594,15 +1947,11 @@ public static class TradeSimulator
                         || (crossedUp ? tobConfirmScore > 0 : tobConfirmScore < 0)))
             {
                 var side = crossedUp ? OptionType.Call : OptionType.Put;
-                var candidate = PickAtm(side, bar.ClosePrice);
-                if (candidate is not null)
+                var picked = await PickStrikeInBandAsync(side, bar.ClosePrice, bar.EndTimestamp);
+                if (picked is { } pk)
                 {
-                    var series = await GetSeriesAsync(candidate.Token);
-                    var entryPrice = series.PriceAtOrBefore(bar.EndTimestamp);
-                    if (entryPrice is { } ep && ep > 0)
-                    {
-                        open = (bar.EndTimestamp, ep, side, candidate.StrikePrice!.Value, candidate.Token, diff ?? 0.0);
-                    }
+                    open = (bar.EndTimestamp, pk.Price, side, pk.Instrument.StrikePrice!.Value, pk.Instrument.Token, diff ?? 0.0,
+                        false, null, null, null);
                 }
             }
         }
@@ -1756,13 +2105,20 @@ public static class TradeSimulator
         return presentWeight > 0 ? weightedSum / presentWeight : null;
     }
 
-    /// <summary>See <see cref="VolumeBarMetric.SessionGatedDepthDuration"/>'s own doc comment. Both trackers are fed every bar regardless of which one is active, so each one's running distribution matches what the standalone metric would see over the same day.</summary>
-    static double? ComputeSessionGatedScore(VolumeBarRow bar, decimal? previousClose, SessionRankTracker depthRank, SessionRankTracker durationRank)
-    {
-        var depth = SignedRank.Compute(bar.FutureDepthImbalance, depthRank);
-        var duration = ComputeBarDurationScore(bar, previousClose, durationRank);
-        return IstTimeOfDay(bar.EndTimestamp) < SessionGateSwitchTime ? depth : duration;
-    }
+    /// <summary>
+    /// See <see cref="VolumeBarMetric.SessionGatedDepthDuration"/>'s own doc comment. 2026-09-21,
+    /// futures-crossover live-wiring plan step 1 (live/backtest parity, same extraction discipline
+    /// <see cref="ComputeOptionsThreeWayScore"/> already established for the options side): now a
+    /// thin adapter projecting this row into <see cref="NiftySignal.Scoring.FuturesSessionGatedScoreCalculator"/>'s
+    /// plain-typed inputs -- formula unchanged, just relocated so the live futures-crossover pipeline
+    /// calls the exact same code. Both trackers are still fed every bar regardless of which leg is
+    /// active, so each one's running distribution matches what the standalone metric would see over
+    /// the same day.
+    /// </summary>
+    static double? ComputeSessionGatedScore(VolumeBarRow bar, decimal? previousClose, SessionRankTracker depthRank, SessionRankTracker durationRank) =>
+        FuturesSessionGatedScoreCalculator.ComputeScore(
+            new FuturesSessionGatedScoreInputs(IstTimeOfDay(bar.EndTimestamp), bar.ClosePrice, previousClose, bar.DurationSeconds, bar.FutureDepthImbalance, bar.TopOfBookImbalance),
+            depthRank, durationRank, SessionGateSwitchTime);
 
     /// <summary>
     /// 2026-09-20, live/backtest parity plan step 1 (`docs/LIVE_PARITY_PLAN.md`): the actual Open/
@@ -1796,6 +2152,60 @@ public static class TradeSimulator
     }
 
     /// <summary>
+    /// 2026-09-21, whipsaw-reduction Candidate A
+    /// (<see cref="VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedSmoothed"/>) -- a
+    /// deliberate FORK of <see cref="ComputeOptionsThreeWayScore"/>'s own 3 leg formulas, NOT a call
+    /// into <see cref="OptionsThreeWayScoreCalculator.ComputeScore"/> (that method is the pure,
+    /// shared function the live pipeline will eventually call too, per this project's
+    /// backtest-only-experimentation rule -- it is not touched here). Each leg's raw pre-rank value
+    /// is computed exactly as that calculator computes it internally, then run through this leg's
+    /// own <see cref="BarCountRollingMean"/> before <c>SignedRank.Compute</c> -- everything else
+    /// (session boundaries, sign conventions, null-propagation) is unchanged from the baseline.
+    /// </summary>
+    static double? ComputeOptionsThreeWayScoreSmoothed(
+        VolumeBarRow bar, decimal? previousClose,
+        Dictionary<int, OptionAtmBarRow>? optionAtmByBarIndex,
+        Dictionary<int, OptionDepthBarRow>? optionDepthWideByBarIndex,
+        TimeSpan effectiveOptionsSwitchTime,
+        ref double? previousAtmIv,
+        SessionRankTracker depthRank, SessionRankTracker ivMidRank, SessionRankTracker ivCloseRank,
+        BarCountRollingMean depthSmoother, BarCountRollingMean ivMidSmoother, BarCountRollingMean ivCloseSmoother)
+    {
+        var currentAtmIv = optionAtmByBarIndex is not null && optionAtmByBarIndex.TryGetValue(bar.BarIndex, out var atmBar) ? atmBar.AtmIv : null;
+        var wideDepthBar = optionDepthWideByBarIndex is not null && optionDepthWideByBarIndex.TryGetValue(bar.BarIndex, out var wdb) ? wdb : null;
+        var timeOfDay = IstTimeOfDay(bar.EndTimestamp);
+
+        double? score;
+        if (timeOfDay < effectiveOptionsSwitchTime)
+        {
+            double? rawDepth = wideDepthBar is not null
+                && ComputeImbalanceRatio(wideDepthBar.CallBidQtyAvg + wideDepthBar.PutBidQtyAvg, wideDepthBar.CallAskQtyAvg + wideDepthBar.PutAskQtyAvg) is { } depthRatio
+                    ? -depthRatio : null;
+            var smoothedDepth = depthSmoother.Observe(rawDepth);
+            score = smoothedDepth is { } sd ? SignedRank.Compute(sd, depthRank) : null;
+        }
+        else if (timeOfDay < MidCloseSwitchTime)
+        {
+            double? rawIvMid = previousAtmIv is { } prevIvMid && currentAtmIv is { } curIvMid && previousClose is { } prevCloseMid
+                ? -Math.Sign(bar.ClosePrice - prevCloseMid) * (curIvMid - prevIvMid) : null;
+            var smoothedIvMid = ivMidSmoother.Observe(rawIvMid);
+            score = smoothedIvMid is { } sm ? SignedRank.Compute(sm, ivMidRank) : null;
+        }
+        else
+        {
+            // Close leg: RAW ΔIV, not price-signed -- same as the unsmoothed baseline's own Close
+            // leg (the session-phase split's own best Close performer was the raw variant).
+            double? rawIvClose = previousAtmIv is { } prevIvClose && currentAtmIv is { } curIvClose
+                ? curIvClose - prevIvClose : null;
+            var smoothedIvClose = ivCloseSmoother.Observe(rawIvClose);
+            score = smoothedIvClose is { } sc ? SignedRank.Compute(sc, ivCloseRank) : null;
+        }
+
+        previousAtmIv = currentAtmIv ?? previousAtmIv;
+        return score;
+    }
+
+    /// <summary>
     /// Entry-time gate for <see cref="VolumeBarMetric.SessionGatedDepthDurationConfirmed"/> -- a
     /// no-op (always true) for every other metric. During the open (before 10:00 IST) a new
     /// position additionally requires TopOfBookImbalance's own score to agree in sign with the
@@ -1813,12 +2223,16 @@ public static class TradeSimulator
             return comboOtherLegScore is { } other && other != 0 && Math.Sign(other) == Math.Sign(scaledScore);
         }
 
-        if (metric == VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmed)
+        if (metric is VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmed
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedSmoothed
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedMinHold)
         {
             // 2026-09-20, Phase 5 prep item 8 -- see this enum value's own doc comment. Applied
             // all day, same as item 6's Skew Change gate, for a like-for-like comparison. Logic
             // itself now lives in NiftySignal.Scoring.MaxPainConfirmationGate (live/backtest
-            // parity plan step 1, docs/LIVE_PARITY_PLAN.md) -- relocated, not rewritten.
+            // parity plan step 1, docs/LIVE_PARITY_PLAN.md) -- relocated, not rewritten. The 2
+            // 2026-09-21 whipsaw-reduction candidates keep this exact same gate (see their own
+            // doc comments), so they share this branch rather than duplicating it.
             return MaxPainConfirmationGate.Passes(maxPainConfirmScore, scaledScore);
         }
 
@@ -1843,12 +2257,14 @@ public static class TradeSimulator
             return earlyConvictionSign is { } ec && ec != 0 && ec == Math.Sign(scaledScore);
         }
 
-        if (metric != VolumeBarMetric.SessionGatedDepthDurationConfirmed || IstTimeOfDay(barEnd) >= SessionGateSwitchTime)
+        if (metric != VolumeBarMetric.SessionGatedDepthDurationConfirmed)
         {
             return true;
         }
 
-        return tobConfirmScore is { } t && Math.Sign(t) == Math.Sign(scaledScore);
+        // 2026-09-21, relocated into NiftySignal.Scoring.FuturesSessionGatedScoreCalculator (same
+        // extraction discipline as ComputeSessionGatedScore above) -- formula unchanged.
+        return FuturesSessionGatedScoreCalculator.PassesTobConfirmation(IstTimeOfDay(barEnd), scaledScore, tobConfirmScore, SessionGateSwitchTime);
     }
 
     /// <summary>
@@ -1878,5 +2294,44 @@ public static class TradeSimulator
         var rank = magnitudeRank.Rank(magnitude);
         magnitudeRank.Add(magnitude);
         return rank;
+    }
+}
+
+/// <summary>
+/// 2026-09-21, whipsaw-reduction experiment Candidate A helper
+/// (<see cref="VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedSmoothed"/>) -- a plain
+/// N-BAR (not time-windowed) simple moving average of a per-bar raw value. Deliberately bar-COUNT
+/// windowed rather than time-windowed like <see cref="NiftySignal.Features.WelfordRollingWindow"/>
+/// or <see cref="NiftySignal.Scoring.CoreScoreRollingMeanTracker"/> -- volume bars vary in
+/// wall-clock duration bar to bar, and the whipsaw-reduction hypothesis under test here is about
+/// damping single-BAR noise, not smoothing over a fixed span of wall-clock time. Backtest-only,
+/// lives in <c>TradeSimulator.cs</c> alongside every other metric-specific tracker in this file --
+/// not a shared/live component.
+///
+/// FIFO queue, same "quiet cadence" null-handling convention every other rolling tracker in this
+/// codebase already follows (<see cref="Observe"/> returns null, and nothing is enqueued, when this
+/// bar's own raw value is itself missing -- the smoothed score goes null that bar exactly like the
+/// unsmoothed baseline would, rather than fabricating a reading by reusing stale history).
+/// </summary>
+sealed class BarCountRollingMean(int windowBars)
+{
+    readonly Queue<double> _values = new();
+    double _sum;
+
+    public double? Observe(double? value)
+    {
+        if (value is not { } v)
+        {
+            return null;
+        }
+
+        _values.Enqueue(v);
+        _sum += v;
+        while (_values.Count > windowBars)
+        {
+            _sum -= _values.Dequeue();
+        }
+
+        return _sum / _values.Count;
     }
 }

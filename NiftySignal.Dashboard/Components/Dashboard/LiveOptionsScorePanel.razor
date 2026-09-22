@@ -1,0 +1,330 @@
+@implements IAsyncDisposable
+@using Microsoft.EntityFrameworkCore
+@using NiftySignal.Domain
+@using NiftySignal.Domain.Enums
+@using NiftySignal.VolumeBarData
+@inject IDbContextFactory<VolumeBarDbContext> DbFactory
+@inject IJSRuntime JS
+
+@* Dashboard reorg (2026-09-21, docs/LIVE_PARITY_PLAN.md): the live-strategy UI built in Phase F
+   (originally the whole of the standalone /live-options-score page) extracted into this
+   reusable component so the SAME query/render logic can be embedded prominently at the top of
+   Home.razor as well as kept on its own page -- one source of truth, no copy-pasted markup to
+   drift out of sync. OptionsScoreThreeWaySwitchMaxPainConfirmed is the locked, currently-live
+   strategy (see docs/LIVE_PARITY_PLAN.md's "Locked target score"); the old CoreScore
+   Hysteresis/Crossover engines were retired from live trading the same day (see
+   MarketDataIngestionWorker's own cutover comment) -- this panel is deliberately what's now
+   primary on the dashboard. *@
+
+<div style="grid-column: span 12;">
+    <div class="panel-title" style="margin-bottom:12px;">
+        <span>Live Options Score <span class="text-faint" style="font-weight:400; text-transform:none; letter-spacing:normal;">OptionsScoreThreeWaySwitchMaxPainConfirmed @@ @BarVolumeThreshold/90 &middot; live strategy</span></span>
+        @if (ShowFullPageLink)
+        {
+            <a href="/live-options-score" class="login-link">Full page &rarr;</a>
+        }
+    </div>
+
+    <div style="display:grid; grid-template-columns: repeat(12, 1fr); gap:16px;">
+        <div class="panel" style="grid-column: span 4;">
+            <div class="panel-title">
+                Current Bar Score
+                <span class="mono text-faint">@_asOfDate.ToString("yyyy-MM-dd")</span>
+            </div>
+
+            @if (_latestScore is null)
+            {
+                <div class="text-faint" style="font-size:13px;">No scored bars yet today &mdash; waiting for the live pipeline to write the first bar.</div>
+            }
+            else
+            {
+                <div class="score-top">
+                    <div class="score-readout">
+                        <div class="score-number @ScoreColorClass">@FormatScore(_latestScore.ScaledScore)</div>
+                        <div class="score-label badge @SessionLegBadgeClass">@(_latestScore.SessionLeg) leg</div>
+                        <div class="mono text-faint">bar @_latestScore.BarIndex &middot; @_latestScore.EndTimestamp.ToIst().ToString("HH:mm:ss")</div>
+                    </div>
+                </div>
+                <div class="components" style="margin-top:8px;">
+                    <div class="component-row">
+                        <span class="component-name text-dim">Raw score [-1,1]</span>
+                        <span class="mono">@FormatRaw(_latestScore.RawScore)</span>
+                    </div>
+                    <div class="component-row">
+                        <span class="component-name text-dim">Entry percentile</span>
+                        <span class="mono">@FormatPercentile(_latestScore.Percentile)</span>
+                    </div>
+                </div>
+            }
+        </div>
+
+        <div class="panel" style="grid-column: span 4;">
+            <div class="panel-title">Max Pain Confirmation</div>
+
+            @if (_latestScore is null)
+            {
+                <div class="text-faint" style="font-size:13px;">No scored bars yet today.</div>
+            }
+            else
+            {
+                <div class="component-row">
+                    <span class="component-name text-dim">Status</span>
+                    <span class="badge @MaxPainBadgeClass">@MaxPainStatusLabel</span>
+                </div>
+                <div class="component-row">
+                    <span class="component-name text-dim">Confirm score</span>
+                    <span class="mono">@FormatRaw(_latestScore.MaxPainConfirmScore)</span>
+                </div>
+            }
+        </div>
+
+        <div class="panel" style="grid-column: span 4;">
+            <div class="panel-title">
+                Open Paper Position
+                <span class="mono text-dim">@(_openTrade is null ? "flat" : "1 open")</span>
+            </div>
+
+            @if (_openTrade is null)
+            {
+                <div class="text-faint" style="font-size:13px;">No open position.</div>
+            }
+            else
+            {
+                <div class="component-row">
+                    <span class="badge @(_openTrade.Side == OptionType.Call ? "badge-bull" : "badge-bear")">@(_openTrade.Side == OptionType.Call ? "CE" : "PE")</span>
+                    <span class="mono strategy-symbol">@_openTrade.StrikePrice.ToString("0")</span>
+                    <span class="mono text-faint">entry @_openTrade.EntryPrice.ToString("0.00")</span>
+                    <span class="text-faint">@_openTrade.EntryTimestamp.ToIst().ToString("HH:mm:ss")</span>
+                </div>
+            }
+        </div>
+
+        <div class="panel" style="grid-column: 1 / -1;">
+            <div class="panel-title">
+                Score / Percentile / Max Pain / Price
+                <span class="text-faint" style="font-weight:400; text-transform:none; letter-spacing:normal;">today, live-updating</span>
+            </div>
+            <div class="score-chart">
+                <canvas id="options-score-history-chart"></canvas>
+            </div>
+        </div>
+
+        <div class="panel" style="grid-column: 1 / -1;">
+            <div class="panel-title">
+                Today's Paper Trades
+                <span class="mono text-dim">@_todaysTrades.Count total</span>
+            </div>
+
+            @if (_todaysTrades.Count == 0)
+            {
+                <div class="text-faint" style="font-size:13px;">No trades yet today.</div>
+            }
+            else
+            {
+                <div class="scroll-x">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Entry time</th>
+                                <th>Strike</th>
+                                <th>Side</th>
+                                <th>Entry price</th>
+                                <th>Exit price</th>
+                                <th>Exit reason</th>
+                                <th>Net P&amp;L</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var t in _todaysTrades)
+                            {
+                                <tr>
+                                    <td>@t.EntryTimestamp.ToIst().ToString("HH:mm:ss")</td>
+                                    <td>@t.StrikePrice.ToString("0")</td>
+                                    <td><span class="badge @(t.Side == OptionType.Call ? "badge-bull" : "badge-bear")">@(t.Side == OptionType.Call ? "CE" : "PE")</span></td>
+                                    <td>@t.EntryPrice.ToString("0.00")</td>
+                                    <td>@(t.ExitPrice is { } ep ? ep.ToString("0.00") : "--")</td>
+                                    <td class="text-faint">@(t.ExitReason ?? (t.ExitBarIndex is null ? "open" : "--"))</td>
+                                    <td class="@(t.NetPnlPoints is { } pnl ? (pnl >= 0 ? "text-bull" : "text-bear") : "")">@(t.NetPnlPoints is { } p ? p.ToString("+0.00;-0.00") : "--")</td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            }
+        </div>
+    </div>
+</div>
+
+@code {
+    // Whether to show the "Full page ->" link to /live-options-score. False when this component
+    // IS /live-options-score's own content (no point linking to itself).
+    [Parameter] public bool ShowFullPageLink { get; set; }
+
+    // Locked target metric's own threshold (docs/LIVE_PARITY_PLAN.md's "Locked target score",
+    // same value NiftySignal.Host.LiveVolumeBarWriter.BarVolumeThreshold uses) -- duplicated as a
+    // literal here rather than referencing NiftySignal.Host from this project, since Dashboard has
+    // no other dependency on Host and this page only ever reads one locked, documented value.
+    const long BarVolumeThreshold = 2600;
+
+    static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(10);
+
+    Timer? _timer;
+    DateOnly _asOfDate;
+    LiveOptionsScoreRow? _latestScore;
+    LivePaperTradeRow? _openTrade;
+    List<LivePaperTradeRow> _todaysTrades = [];
+    List<LiveOptionsScoreRow> _todaysHistory = [];
+    Dictionary<int, decimal> _priceByBarIndex = [];
+    IJSObjectReference? _module;
+    bool _rendered;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await RefreshAsync();
+        _timer = new Timer(_ => InvokeAsync(RefreshAsync), null, PollInterval, PollInterval);
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            _module = await JS.InvokeAsync<IJSObjectReference>("import", "./js/charts.js");
+            await RenderChart();
+            _rendered = true;
+        }
+    }
+
+    async Task RefreshAsync()
+    {
+        try
+        {
+            // Same IST-midnight "today" convention LiveDataService.PollAsync/BuildOptionChainAsync
+            // already use elsewhere in this project.
+            _asOfDate = DateOnly.FromDateTime(DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromHours(5.5)).Date);
+
+            await using var db = await DbFactory.CreateDbContextAsync();
+
+            // Reuse this single poll's history fetch for both the "latest" readout and the chart
+            // -- one query instead of two, same rows either way (last-in-list == latest).
+            _todaysHistory = await db.LiveOptionsScoreBars
+                .Where(s => s.AsOfDate == _asOfDate && s.BarVolumeThreshold == BarVolumeThreshold)
+                .OrderBy(s => s.BarIndex)
+                .ToListAsync();
+            _latestScore = _todaysHistory.Count > 0 ? _todaysHistory[^1] : null;
+
+            // Price rides its own axis on the chart alongside score/percentile/Max-Pain --
+            // VolumeBarRow.ClosePrice, joined by BarIndex since LiveOptionsScoreRow doesn't carry
+            // price itself (same join pattern LiveFuturesCrossoverPanel's own chart already uses).
+            _priceByBarIndex = await db.VolumeBars
+                .Where(b => b.AsOfDate == _asOfDate && b.BarVolumeThreshold == BarVolumeThreshold)
+                .ToDictionaryAsync(b => b.BarIndex, b => b.ClosePrice);
+
+            // 2026-09-21, futures-crossover live-wiring task: LivePaperTrades is now shared across
+            // strategies (see LivePaperTradeRow.Strategy) -- filtered to Options here so this panel
+            // never shows the crossover strategy's own trades under the Options header.
+            _todaysTrades = await db.LivePaperTrades
+                .Where(t => t.AsOfDate == _asOfDate && t.BarVolumeThreshold == BarVolumeThreshold && t.Strategy == LiveVolumeBarStrategyId.Options)
+                .OrderBy(t => t.EntryTimestamp)
+                .ToListAsync();
+
+            _openTrade = _todaysTrades.FirstOrDefault(t => t.ExitBarIndex == null);
+
+            StateHasChanged();
+
+            if (_rendered && _module is not null)
+            {
+                await UpdateChart();
+            }
+        }
+        catch (Exception)
+        {
+            // Same "a background poll must never crash the page" discipline
+            // LiveDataService.PollAsync already documents -- a transient DB hiccup just gets
+            // retried on the next 10s tick rather than tearing down the circuit.
+        }
+    }
+
+    // Max Pain confirm score is [-1,1] -- scaled by 100 to share the score axis, same convention
+    // ScaledScore itself already uses (100 x the raw [-1,1] reading).
+    (string[] Labels, double?[] Scores, double?[] Percentiles, double?[] MaxPain, double?[] Prices) BuildSeries() => (
+        _todaysHistory.Select(h => h.EndTimestamp.ToIst().ToString("HH:mm:ss")).ToArray(),
+        _todaysHistory.Select(h => h.ScaledScore).ToArray(),
+        _todaysHistory.Select(h => h.Percentile).ToArray(),
+        _todaysHistory.Select(h => h.MaxPainConfirmScore * 100.0).ToArray(),
+        _todaysHistory.Select(h => _priceByBarIndex.TryGetValue(h.BarIndex, out var p) ? (double?)p : null).ToArray());
+
+    async Task RenderChart()
+    {
+        if (_module is null)
+        {
+            return;
+        }
+        var (labels, scores, percentiles, maxPain, prices) = BuildSeries();
+        await _module.InvokeVoidAsync("renderOptionsScoreChart", "options-score-history-chart", labels, scores, percentiles, maxPain, prices);
+    }
+
+    async Task UpdateChart()
+    {
+        try
+        {
+            var (labels, scores, percentiles, maxPain, prices) = BuildSeries();
+            await _module!.InvokeVoidAsync("updateOptionsScoreChart", "options-score-history-chart", labels, scores, percentiles, maxPain, prices);
+        }
+        catch (Exception ex) when (ex is JSDisconnectedException or TaskCanceledException or ObjectDisposedException)
+        {
+            // Circuit going away mid-poll (tab closed, phone locked) -- same accepted-noise
+            // discipline the retired ScorePanel's own chart-update path already documents.
+        }
+    }
+
+    string ScoreColorClass => _latestScore?.ScaledScore switch
+    {
+        > 0 => "text-bull",
+        < 0 => "text-bear",
+        _ => "text-dim",
+    };
+
+    string SessionLegBadgeClass => _latestScore?.SessionLeg switch
+    {
+        "Open" => "badge-neutral",
+        "Mid" => "badge-neutral",
+        "Close" => "badge-neutral",
+        _ => "badge-neutral",
+    };
+
+    string MaxPainStatusLabel => _latestScore switch
+    {
+        { MaxPainConfirmScore: null } => "N/A",
+        { MaxPainConfirmPasses: true } => "PASS",
+        _ => "FAIL",
+    };
+
+    string MaxPainBadgeClass => _latestScore switch
+    {
+        { MaxPainConfirmScore: null } => "badge-neutral",
+        { MaxPainConfirmPasses: true } => "badge-bull",
+        _ => "badge-bear",
+    };
+
+    static string FormatScore(double? v) => v is { } value ? value.ToString("+0.0;-0.0") : "--";
+
+    static string FormatRaw(double? v) => v is { } value ? value.ToString("+0.000;-0.000") : "--";
+
+    static string FormatPercentile(double? v) => v is { } value ? value.ToString("0.0") : "--";
+
+    public async ValueTask DisposeAsync()
+    {
+        _timer?.Dispose();
+        if (_module is not null)
+        {
+            try
+            {
+                await _module.DisposeAsync();
+            }
+            catch (Exception ex) when (ex is JSDisconnectedException or TaskCanceledException or ObjectDisposedException)
+            {
+                // Circuit already gone -- nothing to clean up client-side.
+            }
+        }
+    }
+}

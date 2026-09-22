@@ -1,4 +1,6 @@
 using Microsoft.EntityFrameworkCore;
+using NiftySignal.Domain.Enums;
+using NiftySignal.Notifications;
 using NiftySignal.Persistence;
 using NiftySignal.VolumeBarData;
 
@@ -29,6 +31,7 @@ namespace NiftySignal.Host;
 /// </summary>
 public sealed class LiveOptionsScoreEngine(
     IServiceScopeFactory scopeFactory,
+    ITelegramNotifier telegram,
     ILogger<LiveOptionsScoreEngine> logger) : BackgroundService
 {
     static readonly TimeSpan IstOffset = TimeSpan.FromHours(5.5);
@@ -82,16 +85,7 @@ public sealed class LiveOptionsScoreEngine(
             }
 
             var asOfDate = DateOnly.FromDateTime(nowIst.Date);
-            try
-            {
-                await ProcessPendingBarsAsync(asOfDate, stoppingToken);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                // Same "one bad poll must never take down the rest of the day" resilience as
-                // LiveVolumeBarWriter's own loop (and MarketDataIngestionWorker's F34/F49 precedent).
-                logger.LogError(ex, "Live options-score computation failed for {AsOfDate} -- continuing with the next poll", asOfDate);
-            }
+            await PollOnceAsync(asOfDate, stoppingToken);
 
             try
             {
@@ -101,6 +95,41 @@ public sealed class LiveOptionsScoreEngine(
             {
                 break;
             }
+        }
+    }
+
+    /// <summary>
+    /// Runs one poll (<see cref="ProcessPendingBarsAsync"/>), catching and logging + alerting on any
+    /// exception rather than letting it propagate -- extracted from <see cref="ExecuteAsync"/> as its
+    /// own method purely so the catch/Telegram-alert wiring below can be exercised directly by a test
+    /// without depending on real wall-clock market-hours gating. Behavior is unchanged from before
+    /// this extraction: still "log and continue to next poll" (audit findings F34/F49), now also
+    /// alerting on Telegram.
+    /// </summary>
+    public async Task PollOnceAsync(DateOnly asOfDate, CancellationToken ct)
+    {
+        try
+        {
+            await ProcessPendingBarsAsync(asOfDate, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Same "one bad poll must never take down the rest of the day" resilience as
+            // LiveVolumeBarWriter's own loop (and MarketDataIngestionWorker's F34/F49 precedent).
+            // This also catches anything LivePaperTradeExecutor.OpenAsync/CloseAsync throws -- that
+            // class is a stateless static helper with no catch of its own (verified by reading it
+            // directly), so any exception from strike selection, the fill-price lookup, or the
+            // kill-switch/DB reads it does propagates straight up into this same catch, which is why
+            // it's covered here rather than needing its own alert wiring.
+            logger.LogError(ex, "Live options-score computation failed for {AsOfDate} -- continuing with the next poll", asOfDate);
+
+            // 2026-09-21 (docs/LIVE_PARITY_PLAN.md "Exception alerting"): purely additive, see
+            // LiveVolumeBarWriter's own identical comment -- SendAsync never throws, so this cannot
+            // change the "log and continue to next poll" behavior above.
+            await telegram.SendAsync(
+                NotificationCategory.LivePipelineError,
+                $"NiftySignal LiveOptionsScoreEngine: poll failed for {asOfDate:yyyy-MM-dd} -- {ex.GetType().Name}: {ex.Message}",
+                ct);
         }
     }
 
@@ -116,6 +145,15 @@ public sealed class LiveOptionsScoreEngine(
         catch (Exception ex)
         {
             logger.LogError(ex, "Failed to flush end-of-day open signal for {AsOfDate} -- will retry on next day-boundary transition if the session is still held", _session!.AsOfDate);
+
+            // 2026-09-21 (docs/LIVE_PARITY_PLAN.md "Exception alerting"): additive, same reasoning as
+            // the poll-loop catch above -- a failed end-of-day flush means a signal could be left
+            // dangling open past the day boundary, worth a human's attention even though this method
+            // already retries the flush on the next day-boundary transition.
+            await telegram.SendAsync(
+                NotificationCategory.LivePipelineError,
+                $"NiftySignal LiveOptionsScoreEngine: end-of-day flush failed for {_session!.AsOfDate:yyyy-MM-dd} -- {ex.GetType().Name}: {ex.Message}",
+                ct);
             return;
         }
 
@@ -225,6 +263,7 @@ public sealed class LiveOptionsScoreEngine(
                 {
                     AsOfDate = asOfDate,
                     BarVolumeThreshold = LiveVolumeBarWriter.BarVolumeThreshold,
+                    Strategy = LiveVolumeBarStrategyId.Options,
                     Side = opened.Side,
                     EntryBarIndex = opened.EntryBarIndex,
                     EntryTimestamp = opened.EntryTimestamp,
@@ -294,10 +333,10 @@ public sealed class LiveOptionsScoreEngine(
     {
         var tracked = db.ChangeTracker.Entries<LiveEntrySignalRow>()
             .Select(e => e.Entity)
-            .FirstOrDefault(r => r.AsOfDate == asOfDate && r.BarVolumeThreshold == LiveVolumeBarWriter.BarVolumeThreshold && r.EntryBarIndex == closed.EntryBarIndex);
+            .FirstOrDefault(r => r.AsOfDate == asOfDate && r.BarVolumeThreshold == LiveVolumeBarWriter.BarVolumeThreshold && r.Strategy == LiveVolumeBarStrategyId.Options && r.EntryBarIndex == closed.EntryBarIndex);
 
         var row = tracked ?? await db.LiveEntrySignals.FirstOrDefaultAsync(
-            r => r.AsOfDate == asOfDate && r.BarVolumeThreshold == LiveVolumeBarWriter.BarVolumeThreshold && r.EntryBarIndex == closed.EntryBarIndex, ct);
+            r => r.AsOfDate == asOfDate && r.BarVolumeThreshold == LiveVolumeBarWriter.BarVolumeThreshold && r.Strategy == LiveVolumeBarStrategyId.Options && r.EntryBarIndex == closed.EntryBarIndex, ct);
 
         if (row is null)
         {

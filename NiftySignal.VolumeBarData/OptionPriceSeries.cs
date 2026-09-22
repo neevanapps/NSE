@@ -30,6 +30,15 @@ public sealed class OptionPriceSeries
         return new OptionPriceSeries(rows.Select(r => (r.ExchangeTimestamp, r.LastPrice)).ToList());
     }
 
+    /// <summary>
+    /// Every real print this series was loaded with, in timestamp order -- for analytics (MAE/MFE,
+    /// see <c>MaeMfeCalculator</c>) that need the whole intra-window price path, not just a single
+    /// point lookup. <see cref="LoadAsync"/>'s own <c>dayStart</c>/<c>dayEnd</c> bounds determine
+    /// the window this covers -- callers pass the exact analysis window they want (e.g. a single
+    /// trade's EntryTime..ExitTime), not necessarily a full trading day.
+    /// </summary>
+    public IReadOnlyList<(DateTimeOffset Timestamp, decimal Price)> AllPrices => _series;
+
     /// <summary>The most recent real print at or before <paramref name="timestamp"/> -- null if this contract had no priced tick at all before that point (never fabricated).</summary>
     public decimal? PriceAtOrBefore(DateTimeOffset timestamp)
     {

@@ -16,6 +16,13 @@ public sealed class RateLimitedTelegramNotifier(ITelegramNotifier inner, TimePro
     {
         [NotificationCategory.ConnectionFailure] = TimeSpan.FromMinutes(5),
         [NotificationCategory.KillSwitchToggle] = TimeSpan.FromSeconds(30),
+
+        // 2026-09-21: same reasoning as ConnectionFailure's own 5-minute cooldown -- the new live
+        // pipeline's poll loops (LiveVolumeBarWriter/LiveOptionsScoreEngine) retry every 10s, so a
+        // persisting failure (e.g. a DB outage) would otherwise fire a Telegram send on every single
+        // poll. 5 minutes bounds that to a still-timely "this is still broken" reminder without an
+        // alert storm during a bad stretch.
+        [NotificationCategory.LivePipelineError] = TimeSpan.FromMinutes(5),
     };
 
     readonly ConcurrentDictionary<NotificationCategory, DateTimeOffset> _lastSentAt = new();

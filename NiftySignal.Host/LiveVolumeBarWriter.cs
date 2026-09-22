@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using NiftySignal.Notifications;
 using NiftySignal.Persistence;
 using NiftySignal.VolumeBarData;
 
@@ -23,10 +24,17 @@ namespace NiftySignal.Host;
 /// instance passed into the ATM/Max-Pain populators, letting them stop re-scanning each touched
 /// option token's whole day-so-far tick history from scratch on every poll -- see that class's own
 /// doc comment and the plan's Phase G section for the concrete measurement that motivated it.
+///
+/// Live performance incident fix (docs/LIVE_PARITY_PLAN.md, dated entry): also owns the single
+/// <see cref="LiveVolumeBarBuilderCache"/> instance passed into <see cref="LiveVolumeBarPopulator"/>,
+/// the same fix for the FUTURE side's own from-scratch-every-poll replay -- see that class's own doc
+/// comment for the concrete lag measurement that motivated it.
 /// </summary>
 public sealed class LiveVolumeBarWriter(
     IServiceScopeFactory scopeFactory,
     LiveOptionSeriesCache seriesCache,
+    LiveVolumeBarBuilderCache builderCache,
+    ITelegramNotifier telegram,
     ILogger<LiveVolumeBarWriter> logger) : BackgroundService
 {
     /// <summary>The locked target metric's own bar threshold (docs/LIVE_PARITY_PLAN.md's "Locked target score" section) -- not a CLI-configurable default like the offline populator's, since this worker has exactly one live threshold to maintain, not a calibration sweep.</summary>
@@ -61,18 +69,8 @@ public sealed class LiveVolumeBarWriter(
             }
 
             var asOfDate = DateOnly.FromDateTime(nowIst.Date);
-            try
-            {
-                var finalizeDay = nowTime >= new TimeOnly(15, 30);
-                await WritePendingBarsAsync(asOfDate, DateTimeOffset.UtcNow, finalizeDay, stoppingToken);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                // Same "one bad cadence must never take down the rest of the day" resilience as
-                // every loop in MarketDataIngestionWorker (audit findings F34/F49) -- a transient
-                // DB hiccup here must not stop this worker from trying again on the next poll.
-                logger.LogError(ex, "Live volume-bar write failed for {AsOfDate} -- continuing with the next poll", asOfDate);
-            }
+            var finalizeDay = nowTime >= new TimeOnly(15, 30);
+            await PollOnceAsync(asOfDate, DateTimeOffset.UtcNow, finalizeDay, stoppingToken);
 
             try
             {
@@ -82,6 +80,38 @@ public sealed class LiveVolumeBarWriter(
             {
                 break;
             }
+        }
+    }
+
+    /// <summary>
+    /// Runs one poll (<see cref="WritePendingBarsAsync"/>), catching and logging + alerting on any
+    /// exception rather than letting it propagate -- extracted from <see cref="ExecuteAsync"/> as its
+    /// own method purely so the catch/Telegram-alert wiring below can be exercised directly by a test
+    /// without depending on real wall-clock market-hours gating. Behavior is unchanged from before
+    /// this extraction: still "log and continue to next poll" (audit findings F34/F49), now also
+    /// alerting on Telegram.
+    /// </summary>
+    public async Task PollOnceAsync(DateOnly asOfDate, DateTimeOffset nowUtc, bool finalizeDay, CancellationToken ct)
+    {
+        try
+        {
+            await WritePendingBarsAsync(asOfDate, nowUtc, finalizeDay, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Same "one bad cadence must never take down the rest of the day" resilience as every
+            // loop in MarketDataIngestionWorker (audit findings F34/F49) -- a transient DB hiccup
+            // here must not stop this worker from trying again on the next poll.
+            logger.LogError(ex, "Live volume-bar write failed for {AsOfDate} -- continuing with the next poll", asOfDate);
+
+            // 2026-09-21 (docs/LIVE_PARITY_PLAN.md "Exception alerting"): purely additive --
+            // ITelegramNotifier.SendAsync never throws (see TelegramNotifier's own doc comment), so
+            // this cannot itself turn a caught poll failure into an uncaught one, and does not change
+            // the "log and continue to next poll" behavior above.
+            await telegram.SendAsync(
+                NotificationCategory.LivePipelineError,
+                $"NiftySignal LiveVolumeBarWriter: poll failed for {asOfDate:yyyy-MM-dd} -- {ex.GetType().Name}: {ex.Message}",
+                ct);
         }
     }
 
@@ -99,7 +129,7 @@ public sealed class LiveVolumeBarWriter(
         var source = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
         var destination = scope.ServiceProvider.GetRequiredService<VolumeBarDbContext>();
 
-        var futureResult = await LiveVolumeBarPopulator.WriteNewBarsAsync(source, destination, asOfDate, BarVolumeThreshold, nowUtc, finalizeDay, ct);
+        var futureResult = await LiveVolumeBarPopulator.WriteNewBarsAsync(source, destination, asOfDate, BarVolumeThreshold, nowUtc, finalizeDay, ct, builderCache);
         if (futureResult.Outcome == LiveVolumeBarWriteOutcome.Written)
         {
             logger.LogInformation("Live volume bars: wrote {Count} new future bar(s) for {AsOfDate}", futureResult.RowCount, asOfDate);

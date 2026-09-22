@@ -74,6 +74,7 @@ public static class VerifyParitySelfTestCommand
                 {
                     AsOfDate = t.AsOfDate,
                     BarVolumeThreshold = t.BarVolumeThreshold,
+                    Strategy = t.Strategy,
                     Side = t.Side,
                     EntryBarIndex = t.EntryBarIndex,
                     EntryTimestamp = t.EntryTimestamp,

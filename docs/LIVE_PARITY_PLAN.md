@@ -982,3 +982,409 @@ live-pipeline file were untouched -- only `NiftySignal.Dashboard.csproj`, `Progr
   populated-state check is wanted, either grant that permission for a follow-up local seed-and-screenshot
   pass, or simply wait for the live Host to write real rows on the next trading day -- the page's own
   query logic is already proven correct against that exact shape of data via the InMemory check above.
+
+## Exception alerting (2026-09-21)
+
+The new live pipeline (`LiveVolumeBarWriter`, `LiveOptionsScoreEngine`, `LivePaperTradeExecutor`) has
+always logged its per-poll exceptions (`logger.LogError`) and continued to the next poll -- the
+deliberate F34/F49 "one bad poll must never take down the rest of the day" resilience pattern, which
+this change does not touch. What was missing: nothing told a human about a failure other than reading
+logs. Now additive Telegram alerts fire alongside every existing log call, never instead of it:
+
+- `LiveVolumeBarWriter`'s poll-loop catch (now `PollOnceAsync`, extracted from `ExecuteAsync` purely
+  so it's directly unit-testable without real wall-clock market-hours gating).
+- `LiveOptionsScoreEngine`'s poll-loop catch (also extracted into `PollOnceAsync`) -- this single catch
+  already covers anything `LivePaperTradeExecutor.OpenAsync`/`CloseAsync` throws too, since that class
+  is a stateless static helper with no catch of its own (verified by reading it directly); any
+  exception from strike selection, the fill-price lookup, or its kill-switch/DB reads propagates
+  straight up into this same catch, so no separate wiring was needed there.
+- `LiveOptionsScoreEngine.FlushAndDiscardSessionAsync`'s own catch (the end-of-day open-signal flush).
+- `Program.cs`'s top-level `catch (Exception ex)` around `host.Run()` -- a full process crash, the
+  single most important failure to know about. Best-effort and standalone (does not resolve
+  `ITelegramNotifier` from DI, since the container may never have finished building at that point):
+  reads `Telegram:BotToken`/`Telegram:ChatId` directly from `appsettings.json`/`appsettings.Local.json`
+  and POSTs directly to the Telegram API, wrapped in its own try/catch so a failed notification can
+  never prevent `Log.Fatal`/`Log.CloseAndFlush` from completing.
+
+**New category and cooldown.** `NotificationCategory.LivePipelineError`, used by all four sites above.
+Given a 5-minute cooldown in `RateLimitedTelegramNotifier` -- same value and same reasoning as the
+existing `ConnectionFailure` cooldown: these poll loops retry every 10s, so a persisting failure (a DB
+outage, say) would otherwise fire a Telegram send on every single poll; 5 minutes bounds that to a
+still-timely "this is still broken" reminder without an alert storm.
+
+**Message content**: which service (`LiveVolumeBarWriter`/`LiveOptionsScoreEngine`/the flush path),
+the `AsOfDate` (or end-of-day date for the flush case), and the exception's own type name + message --
+not a bare "an error occurred."
+
+**Tests**: `NiftySignal.Tests/Host/ExceptionAlertingTests.cs` (3 new tests) -- a throwing
+`IServiceScopeFactory` forces a real exception inside each `PollOnceAsync`, asserting (1) it never
+propagates (the F34/F49 behavior is unchanged) and (2) the `SpyTelegramNotifier` fake received exactly
+one `LivePipelineError` message naming the failing service/date/exception. A third test proves the new
+cooldown actually suppresses a same-category repeat within 5 minutes and lets one through after.
+`FlushAndDiscardSessionAsync`'s own alert was not separately unit-tested (it requires an already-built
+`TradingDaySession` to reach; out of scope to fabricate one under this task's time pressure) but shares
+the identical try/catch + `SendAsync` shape as the tested poll-loop catch, verifiable by direct code
+read.
+
+**Full suite**: `dotnet test NiftySignal.Tests` -- **634/634 passing** (631 pre-existing + 3 new), 0
+failures. **Build**: `dotnet build NiftySignal.Host` clean, 0 warnings, 0 errors.
+
+**Constraints honored**: no change to the "log and continue to next poll" resilience behavior itself --
+purely additive `telegram.SendAsync` calls alongside existing `logger.LogError` calls.
+`ITelegramNotifier.SendAsync` never throws (its own doc comment), so this cannot make any poll loop
+more likely to crash or stop retrying. `NiftySignal.Scoring`, `TradeSimulator.cs`, and all locked
+metric behavior are untouched. No redeploy, no VM change, no service restart.
+
+## CoreScore engine cutover + dashboard promotion (2026-09-21, pre-market)
+
+**Pre-condition, verified live on the VM dashboard just before this change**: both
+`CoreScoreHysteresisTradingEngine` ("Hysteresis") and `CoreScoreCrossoverTradingEngine`
+("Crossover") showed FLAT, zero open positions, "0/3 MAX open paper positions" -- safe to stop
+both from opening new trades with no wind-down/orphaned-position handling needed.
+
+**Cutover.** `NiftySignal.Host/MarketDataIngestionWorker.cs`'s cadence loop no longer calls
+`hysteresisEngine.EvaluateCadenceAsync`/`crossoverEngine.EvaluateCadenceAsync` (the block right
+after `PersistSnapshotAsync`, dated comment explains the cutover). Same "leave it, just stop
+calling it" pattern already used for `LiveTradingEngine`'s own Batch 5 (2026-09-13) cutover:
+`CoreScoreHysteresisTradingEngine.cs`/`CoreScoreCrossoverTradingEngine.cs` are untouched, both
+stay registered as singletons in `Program.cs`, fully callable again if ever wanted. The
+`CoreScoreSnapshot` itself is still computed and persisted every cadence (`PersistSnapshotAsync`
+unchanged) since the Dashboard's (demoted) Core Directional Score panel and other observers still
+read it -- only the two engines' own trade-decision calls were removed.
+
+**Dashboard reorganization.** `NiftySignal.Dashboard/Components/Pages/Home.razor` now leads with
+the volume-bar pipeline (`OptionsScoreThreeWaySwitchMaxPainConfirmed`) instead of the old
+CoreScore system:
+- Extracted Phase F's `/live-options-score` page content (Current Bar Score/3 legs, Max Pain
+  confirmation, open paper position, today's trades) into a new reusable component,
+  `NiftySignal.Dashboard/Components/Dashboard/LiveOptionsScorePanel.razor`, so the exact same
+  query/render logic backs both places rather than duplicating it.
+- `Home.razor` now renders `<LiveOptionsScorePanel />` immediately below `StatusBar`, above the
+  rest of the existing panel grid -- the most prominent thing on the page.
+- `/live-options-score` (`LiveOptionsScore.razor`) is kept as a thin wrapper around the same
+  component (`ShowFullPageLink="false"`), for a focused/bookmarkable full view; decided to keep it
+  rather than delete it since it costs nothing once the logic is shared and some users may already
+  have it bookmarked.
+- The old feed/connection panels (`FlatTradeLoginPanel`, `LiveQuotePanel`, `OiProfilePanel`,
+  `PositionsPanel`, `OptionChainPanel`, `PerformancePanel`) are kept as-is and in their existing
+  relative order -- they describe the live tick feed/connection health, not which strategy trades,
+  so they're still operationally useful.
+- `ScorePanel` ("Core Directional Score" + "Strategy Positions" for Hysteresis/Crossover) was
+  demoted rather than removed: moved to the bottom of `Home.razor`'s grid, and given a `RETIRED --
+  not trading` badge plus an explanatory line in `ScorePanel.razor` itself (so the badge/note
+  travel with the component regardless of where it's placed). Not deleted since its last-known
+  Core Score/component readout is still a useful reference, but it no longer looks like an
+  equally-live, equally-trading section.
+
+**Testing.**
+- `dotnet build NiftySignal.Host` -- clean, 0 warnings, 0 errors.
+- `dotnet build NiftySignal.Dashboard` -- clean, 0 warnings, 0 errors.
+- `dotnet test` -- **634/634 passing**, unchanged from baseline (this task touched no test-covered
+  logic: Host cadence-loop wiring and Dashboard Razor markup only).
+- **Visual verification, live in the running Dashboard** (`dotnet run --project
+  NiftySignal.Dashboard`, local dev Postgres, same method as Phase F's own empty-state check):
+  loaded `/` and `/live-options-score` today (2026-09-21, genuinely empty -- pre-market, no bars
+  written yet). Both rendered cleanly: `LiveOptionsScorePanel` at the top of Home showing its
+  documented empty states ("No scored bars yet today...", "No open position.", "No trades yet
+  today."), the demoted `Core Directional Score` panel at the bottom correctly labeled `RETIRED --
+  not trading` with `Hysteresis`/`Crossover` both still shown FLAT (last-known-state, as expected),
+  no exception, no crash, no browser console errors. (The local dev `niftysignal_volume_bars`
+  database is missing the `LiveOptionsScoreBars`/`LivePaperTrades` tables entirely in this sandbox
+  -- a pre-existing local-environment gap, not caused by this change; `LiveOptionsScorePanel`'s
+  `RefreshAsync` catches the resulting exception the same way `LiveDataService.PollAsync` already
+  does, so the page still rendered its correct empty state rather than crashing.)
+
+**Constraints honored**: `NiftySignal.Scoring`, `TradeSimulator.cs`, `LiveOptionsScoreEngine`, and
+`LivePaperTradeExecutor` untouched. Neither old engine's class, DI registration, or persisted data
+was deleted. No redeploy, no VM restart -- local build/test only.
+
+## Live performance incident: future-side bar builder was not incremental (2026-09-21)
+
+**Symptom, observed live.** Bar-write-to-score lag grew from ~1.7s at 04:05 UTC to ~9-10s by 04:08
+UTC -- about 20 minutes into the trading day -- with early signs of poll batching ("wrote 3 new
+future bar(s)" in one poll instead of 1, meaning polls were starting to fall behind the bar-creation
+rate itself).
+
+**Root cause, confirmed by reading the code (not assumed).** `LiveVolumeBarPopulator.WriteNewBarsAsync`
+re-read and replayed EVERY future tick since market open, through a brand-new `VolumeBarBuilder`, on
+every single ~10s poll (`LiveVolumeBarWriter`). This was a deliberate Phase A trade-off (the class's
+own original doc comment: "cost is re-scanning the day's ticks-so-far on every poll... cheap relative
+to the polling cadence... deliberately traded for correctness simplicity") whose cost estimate turned
+out wrong under real live load: the replay cost grows with the whole day-so-far tick count, not with
+the (small, roughly constant) number of new ticks per poll -- an unbounded-growth shape, exactly
+matching the observed lag curve. Phase G had already fixed the analogous problem on the OPTION side
+(`LiveOptionSeriesCache`); the future side was the one place still doing this.
+
+**Fix.** `LiveVolumeBarBuilderCache` (new, `NiftySignal.VolumeBarData/LiveVolumeBarBuilderCache.cs`):
+a per-process Singleton, owned exclusively by `LiveVolumeBarWriter`'s own single-threaded poll loop
+(same no-lock-needed reasoning as `LiveOptionSeriesCache`/`TradingDaySession`), holding the one
+in-progress `VolumeBarBuilder` for today's `(AsOfDate, BarVolumeThreshold)` plus the running bar-index
+counter and the (ExchangeTimestamp, Id) boundary of the last tick it has already consumed.
+`VolumeBarBuilder` itself needed no changes -- it already carries its own partial-bar accumulator
+internally, so "resuming" is simply continuing to call `ApplyTick` on the same instance; only the
+external bookkeeping (bar-index counter, last-consumed-tick boundary) needed to move into the new
+cache. `LiveVolumeBarPopulator.WriteNewBarsAsync` gained an optional `builderCache` parameter (default
+null, reproducing the original from-scratch behavior exactly for every existing caller): when the
+cache has a warm builder for today's threshold, only ticks strictly newer than the last-consumed
+(timestamp, id) boundary are queried and fed into the SAME builder instance; when it doesn't (cold
+start, restart, or a new day -- `ResetIfNewDay`, mirroring `TradingDaySession`'s own day-scoped
+lifecycle), it falls back to the original full-day replay, exactly as before. On `finalizeDay=true`
+the cached builder is explicitly cleared (`FlushPartial` has already reset its accumulator for a bar
+that will never be completed) so a stray extra poll the same day correctly falls back to a full
+replay rather than resuming a finalized builder. `existingMaxIndex`-based idempotent write filtering
+is completely unchanged -- this fix only changes how ticks are SOURCED into the builder, never how
+already-written bars are detected or skipped. Wired into `NiftySignal.Host/Program.cs` as a new
+Singleton and passed through `LiveVolumeBarWriter` alongside the existing `LiveOptionSeriesCache`.
+
+**Correctness verification: PASS, byte-identical, on both proven historical days**, via
+`replay-live` (poll-seconds=10, mirroring the real cadence):
+- 2026-09-16 @ 2600: VolumeBars/OptionAtmBars/OptionDepthBars/OptionMaxPainBars all **611/611 rows,
+  0 mismatches** -- identical to the original Phase A proof.
+- 2026-09-11 @ 2600: all four tables **941/941 rows, 0 mismatches** -- identical to the original
+  Phase A proof.
+
+**Restart-safety verification: PASS.** `replay-live 2026-09-16 2600 --restart-after=1100` (cache
+discarded at poll #1100 of 2251, replaced with a brand-new `LiveVolumeBarBuilderCache` -- same
+"a real process restart loses the Singleton entirely" simulation the Phase G addendum established
+for the option-side cache): BarIndex sequence stayed contiguous and gap-free (611 bars, 0..610) and
+the final row set still matched the offline populator exactly (611/611, 0 mismatches). The first
+poll after the simulated restart correctly fell back to a full-day replay (measured cost ~179ms,
+consistent with a cold-cache catch-up) before resuming incrementally. Also proven directly with EF
+Core InMemoryDatabase unit tests (`NiftySignal.Tests/VolumeBarData/LiveVolumeBarPopulatorIncrementalTests.cs`):
+`IncrementalBuilderCache_ProducesByteIdenticalBars_ToColdFullReplay`,
+`SimulatedMidDayRestart_CacheDiscardedAndRebuilt_StillConvergesToTheSameDay`, and
+`FinalizeDay_ClearsCachedBuilder_SoASecondPollTheSameDayFallsBackToFullReplay_NotADoubleFinalize`.
+
+**Performance verification: PASS -- the lag no longer grows over a simulated full trading day.**
+`replay-live` was extended to time `LiveVolumeBarPopulator.WriteNewBarsAsync` in isolation (separate
+from the combined per-poll total, which also includes the already-proven option-side Phase G cache
+calls) at 5 checkpoints spread across the simulated day, and to re-run the IDENTICAL checkpoint
+sequence a second time with `builderCache=null` (the exact original code path) against a disposable
+scratch database, for a true apples-to-apples before/after comparison. Measured on 2026-09-16 @ 2600
+(2251 simulated polls covering the full 09:15-15:30 IST session):
+
+| Checkpoint | poll # | BEFORE (no cache) | AFTER (incremental) |
+|---|---|---|---|
+| earliest | 1/2252 | 35ms | 175ms (one-time cold-start full replay) |
+| quarter | 564/2252 | 69ms | 1ms |
+| midday | 1127/2252 | 163ms | 0ms |
+| three-quarter | 1690/2252 | 222ms | 1ms |
+| latest | 2251/2252 | 374ms | 1ms |
+
+BEFORE: first-quarter avg 49.5ms -> last-quarter avg 300.8ms (**6.1x growth over the day** -- the
+same unbounded-growth shape the live incident showed, just measured end-to-end offline instead of
+truncated to the first 20 minutes). AFTER: first-quarter avg 1.7ms -> last-quarter avg 0.9ms (flat,
+if anything slightly lower late in the day). The one-time cold-start cost at poll #1 (~175ms, a full
+day-so-far replay against an as-yet-nearly-empty day) is expected and matches the restart-safety
+proof's own cold-poll cost -- it is not a regression, it is the same one-time catch-up the option-side
+cache already accepted in Phase G.
+
+**Verification commands run:**
+```
+dotnet build   -- 0 warnings, 0 errors
+dotnet test    -- 637/637 passing (634 baseline + 3 new incremental/restart tests)
+dotnet run --project NiftySignal.VolumeBarData -- replay-live 2026-09-16 2600 --poll-seconds=10
+dotnet run --project NiftySignal.VolumeBarData -- replay-live 2026-09-16 2600 --poll-seconds=10 --restart-after=1100
+dotnet run --project NiftySignal.VolumeBarData -- replay-live 2026-09-11 2600 --poll-seconds=10
+```
+
+**Not yet done / follow-up**: this fix addresses the FUTURE-side replay cost specifically (the
+confirmed root cause of the growing lag). The option-side ATM/MaxPain populators' own Phase G cache
+was already proven to re-warm quickly after a restart, but its one-time cold-restart cost (observed
+here as high as ~8.9s in the combined per-poll total during the restart-safety run above) remains a
+separate, already-known, already-accepted cost from Phase G -- not something this change touches or
+needs to touch. No redeploy or VM restart was performed; deployment is a separate step.
+
+## First real out-of-sample parity check (2026-09-21)
+
+Ran `verify-parity` against today's actual live trading day for the first time (VM was
+reachable). Two real findings, both worth recording:
+
+**Bug found and fixed in the tool itself**: `VerifyParityCommand`'s `barIndexByEndTimestamp`
+dictionary crashed on a duplicate key -- two bars (488, 489) legitimately shared the same
+`EndTimestamp` (a burst of end-of-day ticks at the exact same wall-clock second produced a normal
+2600-volume bar and a small trailing partial bar closing at the identical timestamp). Fixed with
+last-bar-wins grouping; safe because no real trade can enter/exit in that collision window (entry
+window ends 15:00 IST, force-close 15:15 IST, well before the 15:30 close where this occurred).
+
+**Result: 6 of 7 trades matched exactly** (entry bar, strike, direction, exit reason; price deltas
+all within the expected fill-timing range). **Trade 7 diverged**: live opened at BarIndex=333
+(13:59:56 IST), official backtest never fired it and instead opened later at BarIndex=348.
+
+Root cause investigated (new `dump-scores` CLI diagnostic, via `onBarEvaluated`): at bar 333,
+live computed ScaledScore=-90.70/Percentile=90.70 (crosses the 90 gate); the official recompute
+computed ScaledScore=-88.37/Percentile=88.37 (doesn't cross). MaxPainConfirmScore matched exactly
+between both (-0.9879) -- ruling out a confirmation-logic bug. Bars immediately before/after match
+closely in shape, and bar 348 realigns almost exactly. This is a single borderline threshold
+crossing, not a broad breakdown.
+
+**Why this is a new class of finding, not a repeat of an already-proven case**: every prior parity
+proof (Phase A/C/D/E) replayed the SAME already-recorded tick log through both the live and
+offline paths. This was the first time live (VM's own real-time tick stream) was compared against
+an offline recompute sourced from `niftysignal_vm_copy` (a SYNCED COPY of those ticks) -- i.e. the
+first real test of sync fidelity, not just logic parity. The likely cause is a small tick
+ordering/completeness difference between the live feed and the synced copy sometime before bar
+333, not yet pinned down to a specific tick.
+
+**Status**: open investigation, not resolved. One trade out of 7 on one day -- not yet enough to
+change anything, but the root-cause class (sync-copy fidelity vs. logic correctness) is now known
+and should be checked again on future out-of-sample days before being dismissed as a one-off.
+
+## Futures crossover: wired live (not yet deployed) (2026-09-21)
+
+Wired the locked futures SMA-crossover strategy (8-fast/40-slow/5-point-threshold on
+`SessionGatedDepthDurationConfirmed`'s own FuturesScore, `BarVolumeThreshold=2600` -- the config
+actually being tracked for continued out-of-sample validation, per the "Adopted for continued
+out-of-sample tracking" note above, **not** the higher-net-but-unadopted 1300/8/30/8 config found
+in a later sweep) into the live pipeline end to end, alongside (not replacing) the already-live
+`OptionsScoreThreeWaySwitchMaxPainConfirmed` engine. Entirely additive: no existing options-side
+class, no locked backtest dispatch result, and no already-live behavior was changed in a way that
+alters output (see the regression-check results below for direct proof of the one dispatch-chain
+touch this required).
+
+**What was built:**
+
+- **Shared live/backtest scoring function** (`NiftySignal.Scoring/FuturesSessionGatedScoreCalculator.cs`,
+  `FuturesSessionGatedScoreInputs.cs`): the FuturesScore formula (Depth Imbalance before 10:00 IST,
+  Bar Duration Urgency at/after it) and its own Open-window TOB confirmation gate, extracted
+  verbatim out of `TradeSimulator.cs`'s private `ComputeSessionGatedScore`/`ComputeBarDurationScore`/
+  the TOB branch of `PassesConfirmation` -- same "shared pure function, no duplicate
+  implementation" discipline `OptionsThreeWayScoreCalculator` already established for the options
+  side's own 2026-09-20 extraction. `TradeSimulator.cs`'s `ComputeSessionGatedScore` (used by both
+  the `SessionGatedDepthDurationConfirmed` percentile-threshold dispatch AND
+  `SimulateCrossoverDayAsync`'s own futures branch) and the `PassesConfirmation` TOB branch are now
+  thin adapters calling this shared code -- a pure relocation, formula unchanged.
+- **`NiftySignal.VolumeBarData/LiveFuturesCrossoverSession.cs`**: the day-scoped owner of the
+  crossover's own rolling fast/slow-window + rank-tracker state, mirroring `TradingDaySession`'s
+  exact shape (strict BarIndex-order guard, `RebuildAsync` restart-safety, `FlushEndOfDay` day-
+  boundary safety net). Implements the identical entry/exit rules `TradeSimulator
+  .SimulateCrossoverDayAsync`'s futures branch already uses: qualifying crossing (fast/slow gap >=5
+  points at the crossing bar), Open-window TOB confirmation gate, 09:30-15:00 entry window, 15:15
+  IST force-close, exit on `CrossoverReversed` or `TimeCutoff`.
+- **`NiftySignal.VolumeBarData/LiveFuturesCrossoverScoreRow.cs`**: new per-bar diagnostic table
+  (FastMa/SlowMa/Diff/CrossedUp/CrossedDown/TobConfirmScore) -- a separate table from
+  `LiveOptionsScoreRow` since the two strategies' own per-bar shapes genuinely don't overlap (see
+  the row type's own doc comment).
+- **Strategy discriminator** (`NiftySignal.Domain.Enums.LiveVolumeBarStrategyId`: `Options` /
+  `FuturesCrossover`): added to the SHARED `LiveEntrySignalRow`/`LivePaperTradeRow` tables, mirroring
+  the older time-cadence live system's own `StrategyId` discriminator precedent
+  (`NiftySignal.Domain.Enums.StrategyId`, one discriminator column, each strategy independently
+  capped at its own "one position at a time"). Both strategies trade off the SAME BarIndex sequence
+  (one future, one `VolumeBarRow` builder) -- without this column, a futures-crossover entry and an
+  options entry firing at the same BarIndex on the same day/threshold would collide on the unique
+  index `(AsOfDate, BarVolumeThreshold, EntryBarIndex)`. Fixed properly: the unique index is now
+  `(AsOfDate, BarVolumeThreshold, Strategy, EntryBarIndex)`, and `LivePaperTradeExecutor.OpenAsync`/
+  `CloseAsync`'s own "is a position already open" checks are now filtered by `Strategy` too (the
+  pre-existing check queried `ExitBarIndex == null` with no strategy filter, which would have
+  incorrectly blocked one strategy's entry on the other's still-open position). `strategy` is an
+  optional parameter defaulting to `Options` on both methods, so every pre-existing caller/test
+  keeps compiling and behaving unchanged. `LiveEntrySignalRow.EntryPercentile` was also relaxed from
+  `required double` to `double?` -- the crossover strategy has no percentile concept at all (its own
+  gate is a fast/slow crossing plus a fixed point-gap threshold), so it is null on every
+  `FuturesCrossover` row, never fabricated. A new EF migration
+  (`20260921114749_AddFuturesCrossoverLiveTables`) carries all of this; every pre-existing row
+  backfills to `Strategy=Options` (enum value 0), the only strategy that had ever written to these
+  tables.
+- **`NiftySignal.Host/LiveFuturesCrossoverEngine.cs`**: new hosted background service, mirroring
+  `LiveOptionsScoreEngine`'s own polling/day-boundary shape exactly, registered in `Program.cs`
+  alongside it. Simpler than the options engine: FuturesScore reads only `VolumeBarRow`'s own
+  futures-side columns, never the option-side tables (`OptionAtmBarRow`/`OptionDepthBarRow`/
+  `OptionMaxPainBarRow`) the options engine has to wait on, so it never stalls behind Phase A's
+  option-writer sequence. Calls the same `LivePaperTradeExecutor.OpenAsync`/`CloseAsync` the options
+  engine calls, passing `LiveVolumeBarStrategyId.FuturesCrossover` explicitly.
+- **Dashboard**: `NiftySignal.Dashboard/Components/Dashboard/LiveFuturesCrossoverPanel.razor`, same
+  reusable-component shape as `LiveOptionsScorePanel` (fast/slow MA, gap, TOB confirmation status,
+  open position, today's trades), added alongside (not replacing) `LiveOptionsScorePanel` on
+  `Home.razor` -- both strategies visible at once, clearly labeled which is which.
+  `LiveOptionsScorePanel`'s own `LivePaperTrades` query was updated to filter
+  `Strategy == Options` (it is now a shared table).
+
+**Deliberately NOT used**: the 1300/8/30/8 crossover config found promising in a later sweep (see
+this doc's own "Adopted for continued out-of-sample tracking" note) -- this wiring trades the
+config actually being tracked (8/40/5/2600), an explicit, visible decision per the task's own
+instruction, not an oversight.
+
+**Verification (all run locally against the real `niftysignal_volume_bars`/`niftysignal_vm_copy`
+databases via the new `replay-live-futures-crossover`/`replay-live-futures-crossover-both` CLI
+commands, `NiftySignal.VolumeBarData/ReplayLiveFuturesCrossoverCommand.cs`, using 2026-09-16 -- an
+already-used historical day elsewhere in this project):**
+
+1. **Byte-identical replay match**: `replay-live-futures-crossover 2026-09-16 --threshold=2600`
+   drove `LiveFuturesCrossoverSession` bar by bar (the exact class the live Host engine uses) and
+   called the exact same `LivePaperTradeExecutor` the live engine calls, comparing against
+   `TradeSimulator.SimulateCrossoverDayAsync` (8/40/5, `SessionGatedDepthDurationConfirmed`) for the
+   same day. **Result: 5 of 5 trades matched exactly** on entry bar, strike, direction, and exit
+   reason (all 5 exited `CrossoverReversed`). Fill-price deltas were logged, not hidden, per the
+   documented fill-timing policy -- e.g. trade #0: live entry 167.05 vs offline 166.15 (delta
+   +0.90), live exit 180.00 vs offline 183.35 (delta -3.35); deltas ranged roughly -5.30 to +3.40
+   across the 5 trades, consistent with the same decision-timestamp-vs-bar-EndTimestamp gap already
+   documented and accepted for the options side.
+2. **Restart-safety**: `replay-live-futures-crossover 2026-09-16 --threshold=2600 --restart-after=200`
+   scored bars 0-200 directly (ending mid-trade, `HasOpenSignal=True`), discarded the in-memory
+   session, called `LiveFuturesCrossoverSession.RebuildAsync` (exactly what a real process restart
+   does), and finished the day. **Result: PASS** -- the rebuilt session resumed at the correct
+   BarIndex with the correct open-signal state, and the full day's 5 trades matched the
+   uninterrupted replay's own 5 trades exactly (same entry bars/strikes/exit reasons as check #1).
+3. **No collision with the options strategy**: `replay-live-futures-crossover-both 2026-09-16 --threshold=2600`
+   interleaved BOTH strategies bar by bar into the SAME scratch database for the SAME day/threshold.
+   Both strategies had simultaneously-open positions at points during the day -- notably BarIndex
+   165, where the options strategy opened a Call AND the futures-crossover strategy opened a Put on
+   the exact same bar, previously an unhandled unique-index collision. **Result: PASS, no
+   exception** -- the Options strategy's own 13 trades and the FuturesCrossover strategy's own 5
+   trades both persisted independently and matched running each strategy alone (same 13/5 trade
+   sets as the standalone Phase D options replay and check #1 above), proving neither strategy's
+   presence altered the other's own decisions.
+4. **Regression check** (`trade 2026-09-08 2026-09-19 <metric> 90 15 2600`, the same 8-day range and
+   command shape used throughout Phase 5): `OptionsScoreThreeWaySwitchMaxPainConfirmed` @ 2600/90,
+   band=5 reproduced **112 trades, 64.3% win rate, +426.40 net** exactly; `SessionGatedDepthDurationConfirmed`
+   @ 2600/90 reproduced **80 trades, 55.0% win rate, +144.70 net** exactly -- both locked numbers
+   byte-for-byte unchanged after the `FuturesSessionGatedScoreCalculator` extraction touched
+   `TradeSimulator.cs`'s dispatch chain, confirming no dispatch-order regression (the recurring bug
+   pattern this project's own working agreement calls out).
+5. **Full test suite**: 651 tests passing (637 pre-existing baseline + 14 new --
+   `NiftySignal.Tests/Scoring/FuturesSessionGatedScoreCalculatorTests.cs` proving the extracted
+   formula/TOB gate match the pre-extraction inline code, and
+   `NiftySignal.Tests/VolumeBarData/LiveFuturesCrossoverSessionTests.cs` proving the bar-ordering
+   guard, the rolling-window "not yet evaluable" gate, and restart-rebuild equivalence bar-for-bar),
+   0 warnings, `dotnet build` clean across the full solution.
+
+**Not deployed**: `NiftySignal.Host/Program.cs` now registers `LiveFuturesCrossoverEngine` as a
+hosted service, and the migration exists in `NiftySignal.VolumeBarData/Migrations/`, but neither
+`deploy.ps1` nor the VM (`100.105.67.79`) were touched in any way -- no redeploy, no restart, no
+migration applied to the VM's own database. This is local-only, build/test/replay-verified, exactly
+as instructed; deployment is a separate, explicit later step.
+
+## Risk-rule sweep pointer (2026-09-21)
+
+The retired live engine's own risk mechanics (`NiftySignal.Rules/ExitRuleEvaluator.cs` -- per-trade
+stop-loss, TP1 partial-booking with trail-to-breakeven, daily-loss-cap) were evaluated against both
+strategies now live for the first time, entirely as **backtest-only additions to
+`NiftySignal.VolumeBarData`/`TradeSimulator.cs`** (new off-by-default `--stop=`/`--tp1pct=`/
+`--tp1frac=`/`--dailyloss=` CLI flags; `VolumeBarTrade` gained nullable partial-exit fields).
+**Neither `NiftySignal.Host` nor `NiftySignal.Dashboard` were touched** -- nothing here is wired
+into either live paper-trading strategy. Full sweep tables, methodology, and verdict are in
+`docs/VOLUME_BAR_FINDINGS.md`'s "Risk-rule sweep: SL/TP1/daily-loss for both live strategies
+(2026-09-21)" section. Headline: a 20%-of-premium stop-loss is a mild, genuine (if marginal)
+candidate for the options strategy only; TP1 and the daily-loss-cap never beat either strategy's
+no-rules baseline at any setting tried; no DTE-conditioned effect was found. **Recommendation:
+adopt nothing yet** -- one 8-day sample is a data point, not a verdict, pending the user's own
+review.
+
+## Dashboard: live history charts added (2026-09-21)
+
+Both live strategy panels gained a live-updating chart (10s cadence, same poll as the rest of
+each panel), reusing `wwwroot/js/charts.js`'s existing Chart.js interop layer:
+- **Futures crossover panel**: reused `renderCoreScoreChart`/`updateCoreScoreChart` unchanged
+  (already built for the retired Core-score panel, exactly the right shape for a crossover --
+  Score/Fast MA/Slow MA/Price).
+- **Options score panel**: no fast/slow concept exists for a percentile switch, so reusing the
+  Core-score chart's labels would have mislabeled the lines. Added dedicated
+  `renderOptionsScoreChart`/`updateOptionsScoreChart` functions instead: Score / Percentile /
+  Max Pain confirm (x100, shares the score axis) / Price.
+
+Also fixed: both new panels were displaying timestamps via `.ToLocalTime()` (server-timezone-
+dependent) instead of this project's own established `.ToIst()` extension (`NiftySignal.Domain/
+IstTime.cs`) -- same convention the retired ScorePanel already used correctly. Fixed in both.
+
+Build clean, 661/661 tests passing. Not deployed -- local only, per the user's standing
+instruction to hold all Dashboard/Host changes until further items are done.

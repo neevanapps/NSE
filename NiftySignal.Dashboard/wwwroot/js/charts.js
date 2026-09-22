@@ -155,6 +155,108 @@ export function updateCoreScoreChart(canvasId, labels, scoreData, fastData, slow
     chart.update("none");
 }
 
+// OptionsScoreThreeWaySwitchMaxPainConfirmed has no fast/slow MA concept (it's a session-gated
+// percentile switch, not a moving-average crossover) -- reusing renderCoreScoreChart's own
+// "Fast"/"Slow" labels for it would mislabel the lines, so this is its own function with the
+// series that actually apply: the traded ScaledScore, its Percentile (0..100, own axis --
+// deliberately not scaled onto the -100..100 score axis since a percentile above/below 90/10 is
+// what actually gates entry, and squashing it onto the score axis would hide that read), the
+// Max Pain confirmation score (-1..1, scaled by 100 to share the score axis, since it's compared
+// against the same 0-crossing convention the score's own sign uses), and Price.
+export function renderOptionsScoreChart(canvasId, labels, scoreData, percentileData, maxPainData, priceData) {
+    const ctx = document.getElementById(canvasId);
+    if (!ctx) return;
+
+    if (charts[canvasId]) {
+        charts[canvasId].destroy();
+    }
+
+    charts[canvasId] = new Chart(ctx, {
+        type: "line",
+        data: {
+            labels: labels,
+            datasets: [
+                {
+                    label: "Score",
+                    data: scoreData,
+                    borderColor: "#38bdf8",
+                    backgroundColor: "#38bdf822",
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    tension: 0.3,
+                    fill: true,
+                    yAxisID: "score",
+                },
+                {
+                    label: "Max Pain confirm x100",
+                    data: maxPainData,
+                    borderColor: "#f472b6",
+                    borderWidth: 1.5,
+                    pointRadius: 0,
+                    tension: 0.3,
+                    fill: false,
+                    borderDash: [2, 2],
+                    yAxisID: "score",
+                },
+                {
+                    label: "Percentile",
+                    data: percentileData,
+                    borderColor: "#a78bfa",
+                    borderWidth: 1.5,
+                    pointRadius: 0,
+                    tension: 0.3,
+                    fill: false,
+                    borderDash: [7, 3],
+                    yAxisID: "percentile",
+                },
+                {
+                    label: "Price",
+                    data: priceData,
+                    borderColor: "#fbbf24",
+                    borderWidth: 1.5,
+                    pointRadius: 0,
+                    tension: 0.3,
+                    fill: false,
+                    borderDash: [4, 3],
+                    yAxisID: "price",
+                },
+            ],
+        },
+        options: {
+            animation: { duration: 300 },
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: {
+                    display: true,
+                    position: "top",
+                    align: "end",
+                    labels: { color: "rgba(255,255,255,0.55)", boxWidth: 10, boxHeight: 2, font: { size: 10 } },
+                },
+            },
+            scales: {
+                x: { ...timeAxisOptions() },
+                score: { ...baseGridOptions(), position: "left", min: -100, max: 100 },
+                // 0..100, its own axis -- a percentile isn't on the same scale as the -100..100
+                // score, and squashing it in would flatten exactly the 90/10 extremes that matter.
+                percentile: { ...baseGridOptions(), position: "left", min: 0, max: 100, display: false },
+                price: { ...baseGridOptions(), position: "right", grid: { display: false } },
+            },
+        },
+    });
+}
+
+export function updateOptionsScoreChart(canvasId, labels, scoreData, percentileData, maxPainData, priceData) {
+    const chart = charts[canvasId];
+    if (!chart) return;
+    chart.data.labels = labels;
+    chart.data.datasets[0].data = scoreData;
+    chart.data.datasets[1].data = maxPainData;
+    chart.data.datasets[2].data = percentileData;
+    chart.data.datasets[3].data = priceData;
+    chart.update("none");
+}
+
 export function updateLineChart(canvasId, labels, data) {
     const chart = charts[canvasId];
     if (!chart) return;

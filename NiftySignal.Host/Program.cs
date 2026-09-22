@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Options;
 using NiftySignal.Domain.Abstractions;
 using NiftySignal.Domain.Configuration;
@@ -125,6 +126,12 @@ try
     // comment for why that's safe without a lock.
     builder.Services.AddSingleton<LiveOptionSeriesCache>();
 
+    // Live performance incident fix (docs/LIVE_PARITY_PLAN.md, dated entry): same Singleton,
+    // single-writer-owned shape as LiveOptionSeriesCache above, keeping the future-side
+    // VolumeBarBuilder warm across polls instead of re-replaying the whole day-so-far every 10s --
+    // see LiveVolumeBarBuilderCache's own doc comment.
+    builder.Services.AddSingleton<LiveVolumeBarBuilderCache>();
+
     // Phase A of docs/LIVE_PARITY_PLAN.md: writes VolumeBarRow/OptionAtmBarRow/OptionDepthBarRow/
     // OptionMaxPainBarRow rows live, by polling-and-replaying NiftySignalDbContext.Ticks -- see
     // LiveVolumeBarWriter's own doc comment for why this is a separate worker rather than hooked
@@ -138,6 +145,15 @@ try
     // own doc comment for why this is a separate polling worker rather than literally chained after
     // LiveVolumeBarWriter. Still no paper trading (no strike selection, no fills) -- that's Phase D.
     builder.Services.AddHostedService<LiveOptionsScoreEngine>();
+
+    // Futures-crossover live-wiring task (2026-09-21, docs/LIVE_PARITY_PLAN.md "Futures crossover:
+    // wired live" section): the locked 8-fast/40-slow/5-point-threshold SMA crossover on
+    // SessionGatedDepthDurationConfirmed's own FuturesScore -- same polling-worker shape as
+    // LiveOptionsScoreEngine above, entirely independent of it (see LiveFuturesCrossoverEngine's own
+    // doc comment). Purely additive/local: registering this hosted service does not touch
+    // deploy.ps1 or the VM in any way -- it only starts running the next time THIS Host process is
+    // built and actually run.
+    builder.Services.AddHostedService<LiveFuturesCrossoverEngine>();
 
     var host = builder.Build();
 
@@ -174,8 +190,56 @@ catch (OperationCanceledException)
 catch (Exception ex)
 {
     Log.Fatal(ex, "NiftySignal Host terminated unexpectedly");
+
+    // 2026-09-21 (docs/LIVE_PARITY_PLAN.md "Exception alerting"): a full host crash is the single
+    // most important thing to be alerted about -- more than any per-poll error, which already gets
+    // its own Telegram alert via LiveVolumeBarWriter/LiveOptionsScoreEngine. Best-effort only: this
+    // is reached outside the DI container (it may never have finished building, or may have failed
+    // to build at all), so it reads Telegram config directly from the same appsettings files rather
+    // than resolving ITelegramNotifier, and is wrapped so nothing it does can throw a new exception
+    // that would prevent Log.Fatal/CloseAndFlush above/below from running.
+    await TryNotifyFatalCrashAsync(ex);
 }
 finally
 {
     Log.CloseAndFlush();
+}
+
+// Best-effort, standalone (no DI) Telegram send for a full host crash -- deliberately does not
+// reuse TelegramNotifier/ITelegramNotifier (both require a built DI container this code path can't
+// assume exists) and swallows every possible failure (missing/empty config, network error, bad
+// response) so a broken notification path can never mask or block the real crash log above.
+static async Task TryNotifyFatalCrashAsync(Exception ex)
+{
+    try
+    {
+        var config = new ConfigurationBuilder()
+            .SetBasePath(AppContext.BaseDirectory)
+            .AddJsonFile("appsettings.json", optional: true)
+            .AddJsonFile("appsettings.Local.json", optional: true)
+            .Build();
+
+        var botToken = config["Telegram:BotToken"];
+        var chatId = config["Telegram:ChatId"];
+        if (string.IsNullOrWhiteSpace(botToken) || string.IsNullOrWhiteSpace(chatId))
+        {
+            return;
+        }
+
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+        var url = $"https://api.telegram.org/bot{botToken}/sendMessage";
+        var body = System.Text.Json.JsonSerializer.Serialize(new
+        {
+            chat_id = chatId,
+            text = $"NiftySignal Host CRASHED and is terminating: {ex.GetType().Name}: {ex.Message}",
+        });
+        using var content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await http.PostAsync(url, content, cts.Token);
+    }
+    catch
+    {
+        // Best-effort only -- see this method's own doc comment. Never let a failed crash
+        // notification prevent Log.Fatal/CloseAndFlush from completing normally.
+    }
 }

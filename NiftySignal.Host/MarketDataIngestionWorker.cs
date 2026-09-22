@@ -25,7 +25,6 @@ public sealed class MarketDataIngestionWorker(
     IServiceScopeFactory scopeFactory,
     IOptions<FlatTradeOptions> flatTradeOptions,
     ITelegramNotifier telegram,
-    CoreScoreHysteresisTradingEngine hysteresisEngine,
     CoreScoreCrossoverTradingEngine crossoverEngine,
     DashboardPushClient dashboardPush,
     IValidatedOptions<ScoreWeights> scoreWeightsOptions,
@@ -411,20 +410,17 @@ public sealed class MarketDataIngestionWorker(
                         var coreScoreSnapshot = _engine.LastCoreScoreSnapshot;
                         await PersistSnapshotAsync(snapshot, coreScoreSnapshot, _engine.BuildStrikeSnapshots(now), stoppingToken);
 
-                        // Batch 5 cutover (2026-09-13, live-wiring plan A10): the legacy engine's
-                        // own EvaluateCadenceAsync call is REMOVED here, not kept-but-inert -- the
-                        // 14-component composite is retired from live trading (LiveTradingEngine.cs
-                        // itself stays fully intact, just uncalled). Net effect: one call becomes
-                        // two, reading the new CoreScoreSnapshot instead of the old ScoreSnapshot.
-                        // Both engines internally no-op on a not-yet-warmed-up/null CoreScore, same
-                        // as the legacy engine's own snapshot.CompositeScore null-guard, but that
-                        // guard needs a real object to check -- skip entirely on a genuinely null
-                        // snapshot (the Core-score combine step itself failed this cadence).
-                        if (coreScoreSnapshot is not null)
-                        {
-                            await hysteresisEngine.EvaluateCadenceAsync(coreScoreSnapshot, _engine, stoppingToken);
-                            await crossoverEngine.EvaluateCadenceAsync(coreScoreSnapshot, _engine, stoppingToken);
-                        }
+                        // Cutover (2026-09-21): CoreScoreHysteresisTradingEngine and
+                        // CoreScoreCrossoverTradingEngine are retired from live trading now that the
+                        // volume-bar OptionsScoreThreeWaySwitchMaxPainConfirmed pipeline (Phase A-D,
+                        // docs/LIVE_PARITY_PLAN.md) has replaced them as the live strategy. Both
+                        // engines verified FLAT (zero open positions) on the VM dashboard immediately
+                        // before this cutover -- see docs/LIVE_PARITY_PLAN.md's dated note. Same
+                        // pattern as the A10 cutover above LiveTradingEngine: both engines stay fully
+                        // registered/callable (Program.cs) in case ever wanted again, just no longer
+                        // called from this cadence loop. coreScoreSnapshot itself is still computed
+                        // and persisted above (PersistSnapshotAsync) since other things may still
+                        // observe/consume it even though nothing trades off it now.
                     }
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)

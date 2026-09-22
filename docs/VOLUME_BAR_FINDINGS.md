@@ -2685,3 +2685,446 @@ out-of-sample follow-up planned unless a materially different parameter region i
 
 ## Phase 5 combination methods closed out (2026-09-20)
 Items 10-13 (DTE-weighted, both-must-agree, futures/options-primary-filter, session-weighted blend) plus the session-weighted blend's follow-up phase-weight sweep (item 13a) are all complete — none beat the standalone `OptionsScoreThreeWaySwitchMaxPainConfirmed` on both win rate and net. **Combination is closed as a line of investigation for now.** Leading candidate remains the standalone options score with the Max Pain confirmation gate.
+
+## Whipsaw-reduction experiment (2026-09-21)
+
+**Backtest-only. Nothing in this section is live.** The locked, live-trading config
+(`OptionsScoreThreeWaySwitchMaxPainConfirmed`, 2600/90) is unchanged by this section — no deploy,
+no config change, nothing here should be treated as adopted without a separate explicit decision.
+
+**Motivation:** user-reported live symptom — the score swings between extremes and the traded
+position flips direction frequently, with some trades holding only 1-2 minutes before
+`ScoreInvalidated` fires. First checked the exit-trigger logic itself
+(`TradeSimulator.cs` ~line 1478): it already requires the OPPOSITE-direction score to cross the
+FULL entry percentile (not a naive zero-cross), the same wide-hysteresis shape the retired
+`CoreScoreHysteresisRules` used. So the exit gate is not a narrow/missing hysteresis band — the
+whipsaw has to be coming from the RAW per-bar leg values themselves (ATM depth imbalance /
+price-signed ΔIV / raw ΔIV) swinging enough, combined with same-day percentile ranking on a
+small/early sample, to repeatedly cross both ±90th-percentile extremes within a session. Two
+candidate designs were built and evidence-tested against this hypothesis, both strictly
+backtest-only (`NiftySignal.VolumeBarData/TradeSimulator.cs`), both reusing
+`OptionsScoreThreeWaySwitchMaxPainConfirmed`'s exact scoring/confirmation gate otherwise, so the
+comparison isolates just the one change each makes.
+
+**Locked baseline reference** (2026-09-08 to 2026-09-19, 8 trading days, BarThreshold=2600,
+EntryPercentile=90, band=5): **112 trades, 64.3% win rate, +426.40 net points, 14.0 trades/day,
+8/8 days ≥50% win rate, average hold 11.67 minutes** (hold duration newly computed here from the
+same trade log this section's candidates are compared against — not previously recorded).
+
+### Candidate A: smooth the raw leg value before ranking (`...MaxPainConfirmedSmoothed`)
+
+Each leg's raw pre-rank value (depth-imbalance ratio / price-signed ΔIV / raw ΔIV — the exact
+quantities `OptionsThreeWayScoreCalculator.ComputeScore` feeds into `SignedRank.Compute`) is run
+through a plain N-bar simple moving average (`BarCountRollingMean`, new, bar-count windowed not
+time-windowed, since volume bars vary in wall-clock duration) before ranking. SMA chosen over EMA
+for a directly interpretable "N bars" parameter matching this file's own bar-count sweep
+convention (`trendWindowBars`); not a claim EMA is worse, just untested. Window length swept via
+the new `--smoothbars=` flag, same 8-day/2600/90/band=5 config:
+
+| SmoothBars | Trades | Trades/Day | Win% | Net | Days ≥50% win | Avg hold (min) |
+|---|---|---|---|---|---|---|
+| Baseline (unsmoothed) | 112 | 14.0 | 64.3% | +426.40 | 8/8 | 11.67 |
+| 2 | 77 | 9.6 | 64.9% | +266.25 | 6/8 | 18.12 |
+| 3 | 66 | 8.25 | 62.1% | +290.45 | 5/8 | 21.99 |
+| 5 | 50 | 6.25 | 66.0% | +251.30 | 6/8 | 30.86 |
+
+**Verdict: NOT ADOPTED.** Smoothing clearly reduces trade frequency (14.0/day down to 6.25-9.6/day)
+and clearly lengthens average hold (11.67 min up to 18-31 min) — whipsaw is genuinely damped by
+this mechanism. But net drops sharply at every window (426 down to 251-290, a 32-41% cut) and
+day-consistency degrades from 8/8 to 5-6/8 days ≥50% win — one day (09-15) goes as low as 14.3%
+win at SmoothBars=3. Win rate alone stays roughly flat to slightly better (62.1-66.0% vs 64.3%),
+but that's not enough on its own: this fails the "adopt only if both win rate AND net improve" bar
+badly on net, and also fails on the day-consistency character of the locked baseline. Read as: the
+smoothed input is cutting into some of the genuinely fast, genuinely good trades along with the
+noise (the baseline's own quick trades are not uniformly bad — several exit at 1-2 minutes with a
+solid gain, e.g. the 14:37:45 Put on 09-18 nets +1.5% in 13 seconds), so a blanket N-bar smooth on
+the score INPUT is too blunt an instrument here.
+
+### Candidate B: minimum dwell time before an invalidation exit (`...MaxPainConfirmedMinHold`)
+
+Score/confirmation/entry unchanged; once a position opens, a `ScoreInvalidated` exit is blocked
+until at least N minutes have elapsed since entry (minutes, not bars, chosen to match this file's
+own time-based exit conventions — `ForceCloseAt`/`SessionGateSwitchTime` — since a bar's real
+duration varies). The stop-loss and 15:15 force-close are unconditional safety exits, unaffected.
+Swept via the new `--minhold=` flag, same 8-day/2600/90/band=5 config:
+
+| MinHold (min) | Trades | Trades/Day | Win% | Net | Days ≥50% win | Avg hold (min) |
+|---|---|---|---|---|---|---|
+| Baseline (no dwell) | 112 | 14.0 | 64.3% | +426.40 | 8/8 | 11.67 |
+| 2 | 92 | 11.5 | 64.1% | +457.45 | 7/8 | 15.92 |
+| 3 | 85 | 10.6 | 64.7% | +420.65 | **8/8** | 17.50 |
+| 5 | 81 | 10.1 | 63.0% | +409.55 | 7/8 | 19.33 |
+| 10 | 72 | 9.0 | 63.9% | +367.30 | 7/8 | 23.09 |
+
+Collateral-damage check (dispatch-order regression guard, since a new metric's confirmation-gate
+flag was OR'd into the shared `isOptionsScoreMaxPainConfirmed` condition): re-ran
+`SessionGatedDepthDuration` @ 2600/90 after this change — **80 trades, 55.0% win, +144.70 net**,
+byte-identical to its previously recorded locked number. No regression.
+
+**Verdict: OPEN TRADE-OFF, leaning toward adoption of MinHold=3 as the next candidate to carry
+forward for further (multi-session) evidence, not yet formally adopted.** MinHold=3 is the
+standout cell: win rate 64.7% (fractionally *above* the 64.3% baseline), net +420.65 (99.7% of
+baseline net, a 1.3% give-up), **8/8 days ≥50% win — matches the locked baseline's own
+day-consistency exactly** — while cutting trade frequency from 14.0 to 10.6/day (-24%) and
+extending average hold from 11.67 to 17.50 minutes (+50%). That is a real, measurable whipsaw
+reduction (fewer trades, longer holds, same day-consistency) at a cost close to noise-level on the
+two headline metrics. MinHold=2 is arguably even stronger on net alone (+457.45, +7.3% over
+baseline, win rate 64.1% essentially tied) but gives up one day's consistency (09-10 drops to
+44.4%), so it does not cleanly clear the strict "adopt only if both improve, matching baseline
+day-consistency" bar the way MinHold=3 does. Every dwell value tested reduces trade frequency and
+extends hold time monotonically as dwell increases, confirming the mechanism works as intended;
+net and day-consistency both erode gradually past MinHold=3 (5 and 10 both drop a day of
+consistency and give back more net), suggesting 3 minutes is close to a genuine local sweet spot
+on this 8-day sample rather than the edge of a wider plateau — worth re-testing as more days
+accumulate per this project's own "one run is a data point, not a verdict" rule, not adopted into
+the live config off this single 8-day pass.
+
+### Plain-language summary
+
+Both candidates measurably reduce whipsaw (fewer trades, longer average hold) — the underlying
+hypothesis (single-bar noise pushing the same-day percentile rank to false extremes) held up.
+**Candidate A (smoothing the score input) reduces whipsaw the most but at a real, consistent cost
+to net P&L and day-consistency** — not worth it as tested; a blanket N-bar average on the leg
+value throws away some of the genuinely fast, genuinely good trades along with the noise.
+**Candidate B (minimum dwell before an invalidation exit) reduces whipsaw with close to zero cost
+at MinHold=3** (net -1.3%, win rate +0.4pp, day-consistency unchanged at 8/8) — the more promising
+design of the two, and the better mechanism in general for this specific whipsaw symptom, since it
+targets the SYMPTOM (a position closing too fast) directly rather than reshaping the score itself.
+**Recommendation: do not adopt Candidate A. Treat Candidate B (MinHold=3, and MinHold=2 as a
+higher-net/lower-consistency alternative) as a promising open candidate for continued
+multi-session evidence-gathering before any live decision** — consistent with this project's
+"backtesting is a long-term process, one run is a data point" rule. No change to the currently
+deployed live config from this work.
+
+## Risk-rule sweep: SL/TP1/daily-loss for both live strategies (2026-09-21)
+
+Evaluates the retired (pre-volume-bar) live engine's risk-management mechanics
+(`NiftySignal.Rules/ExitRuleEvaluator.cs`, `NiftySignal.Rules/RulesetConfigOptions.cs` — per-trade
+stop-loss, TP1 profit-trigger partial-booking with trail-to-breakeven, daily-loss-cap) against the
+2 strategies now actually live for the first time. These defaults were tuned for the old
+Core/legacy composite score and had never been tested against either
+`OptionsScoreThreeWaySwitchMaxPainConfirmed` or the futures crossover. **Everything in this section
+is backtest-only** — `NiftySignal.VolumeBarData`/CLI-flag additions, nothing wired into
+`NiftySignal.Host`/`NiftySignal.Dashboard`.
+
+**Trade-model change**: `VolumeBarTrade` gained 3 nullable fields (`PartialExitTime`/
+`PartialExitPrice`/`PartialBookedFraction`) rather than a new wrapping type — a TP1 partial-booked
+trade still reports through the same `NetPnlPoints`/`NetPnlPercent` every existing consumer already
+reads, now internally a fraction-weighted blend of the partial leg and the final leg
+(`(partialPrice-entry)*fraction + (exitPrice-entry)*(1-fraction)`) — the exact "blended realized
+P&L" definition the old engine's own TrailAfterPartialBook comment describes, not a new invented
+one. Priority order replicated from `ExitRuleEvaluator.Evaluate`: the absolute session-end exits
+(`TimeCutoff`/`EndOfData`, this simulator's SquareOff-equivalents) outrank everything; then
+StopLoss; then PartialBook; then the metric's own discretionary exit (`ScoreInvalidated`/
+`CrossoverReversed`). After a partial books, the stop tightens to breakeven (0%) for the remaining
+leg, replicating `TrailAfterPartialBook` exactly. New shared `RiskRuleState` class (per-day,
+constructed fresh inside each `SimulateDayAsync`/`SimulateCrossoverDayAsync` call, both of which
+already operate one day at a time) holds the TP1 gate and the running daily-realized-P&L check.
+
+**Daily-loss-cap "% of what"**: this simulator trades raw option-premium points with no lot-size or
+rupee-capital concept of its own. Rather than invent a denominator, `--dailyloss=N` is read as N%
+of `NiftySignal.Rules.CapitalConfigOptions`'s own real live defaults (Total=Rs 50,000, LotSize=65,
+LotsPerTrade=2), converted to a points threshold via `(N/100 * 50,000) / (65*2)` — e.g.
+`--dailyloss=20` is a ~76.9-point cap on a day's realized (closed trades + booked partial legs) P&L.
+This is a one-way, backtest-only unit conversion (reads a real number from `NiftySignal.Rules`,
+never writes to it) — documented explicitly since this project's own sweep discipline requires
+saying what the denominator is, not just the percent.
+
+**New CLI flags** (all off by default, named per the standing `--name=value` convention):
+`--tp1pct=N` (TP1 profit trigger, percent of entry premium), `--tp1frac=N` (fraction of quantity
+booked at TP1, percent), `--dailyloss=N` (daily-loss-cap, percent per the conversion above). `--stop=`
+already existed on `trade`; it was previously **missing entirely** from `crossover`/
+`crossover-calibrate` (no stop-loss parameter, no stopped-out check) — added there now following
+the identical pattern.
+
+**Mandatory regression check (all new flags OFF)**: `trade 2026-09-08 2026-09-19
+OptionsScoreThreeWaySwitchMaxPainConfirmed 90 15 2600 --band=5` reproduced **112 trades, 64.3% win,
++426.40 net** exactly. `crossover 2026-09-08 2026-09-19 8 40 5 2600` reproduced **80 trades, 55.0%
+win, +277.20 net** exactly (re-verified fresh against the current 100-150-strike-search-merged
+`TradeSimulator.cs`, not assumed) — both byte-identical to the locked baselines, confirming no
+dispatch-order regression from threading `RiskRuleState` through both methods' entry/exit chains.
+`dotnet test`: **661/661 passing** (651 pre-existing + 10 new `RiskRuleStateTests`), 0 warnings,
+`dotnet build` clean.
+
+Both strategies actually only produced trades on **8 trading days** in the 2026-09-08→2026-09-19
+range (08, 09, 10, 11, 15, 16, 17, 18 — 09-12/09-13 weekend, and the range's own 09-19 tail had no
+qualifying entries for either strategy that day). 0-DTE days per the existing project convention:
+**08, 15**; non-0-DTE: **09, 10, 11, 16, 17, 18** (6 days).
+
+### Options (`OptionsScoreThreeWaySwitchMaxPainConfirmed` @ 2600/90, band=5) — stop-loss sweep
+
+| Stop | Trades | Win% | Net |
+|---|---|---|---|
+| none (baseline) | 112 | 64.3% | +426.40 |
+| 5% | 130 | 54.6% | +261.45 |
+| 10% | 119 | 62.2% | +364.10 |
+| 15% | 114 | 64.0% | +426.15 |
+| **20%** | 113 | **64.6%** | **+429.15** |
+| 30% | 112 | 64.3% | +426.40 (never binds — identical to baseline) |
+
+A tight stop (5-10%) clearly hurts both metrics — this strategy's real winning trades routinely
+draw down more than 10% intraday before recovering (see the 90-97% avg-hold win rates elsewhere in
+this file), so a tight stop cuts them off early and converts them to losses, also adding MORE
+trades (more StopLoss-triggered re-entries) at a WORSE win rate. 20% is the only value in the grid
+that clears the strict "adopt only if both win rate and net improve" bar, but only marginally
+(+0.3pp win rate, +0.65% net) — well within one-8-day-sample noise, not a confident edge.
+
+### Options — TP1 sweep (profit trigger × booked fraction)
+
+| Trigger\Fraction | 25% | 50% | 75% |
+|---|---|---|---|
+| 10% | 114tr/63.2%/+354.58 | 114tr/64.0%/+316.35 | 114tr/64.0%/+278.13 |
+| 15% | 113tr/**65.5%**/+385.53 | 113tr/65.5%/+354.75 | 113tr/65.5%/+323.98 |
+| 20% | 112tr/64.3%/+398.58 | 112tr/64.3%/+370.75 | 112tr/64.3%/+342.93 |
+| 25% | 112tr/64.3%/+398.16 | 112tr/64.3%/+384.53 | 112tr/64.3%/+370.89 |
+
+**No TP1 setting beats the no-rules baseline on net** (best net is +398.58 at 20%/25%, still below
++426.40) — TP1 consistently trades away upside (locking in a partial early caps the trade's best
+outcome) for a small, consistent win-rate bump (up to +1.2pp at 15%/any fraction). A clean,
+consistent trade-off, not noise: within every trigger row, net strictly decreases as the booked
+fraction rises from 25%→50%→75% (locking in more early = giving up more upside), and win rate is
+flat within a trigger row (the fraction doesn't change whether a trade "wins," only how much).
+Fails the strict adopt bar at every cell tested.
+
+### Options — daily-loss-cap sweep
+
+| Cap | Trades | Win% | Net |
+|---|---|---|---|
+| 1% (~3.8 pts) | 77 | 63.6% | +355.70 |
+| 2% (~7.7 pts) | 85 | 64.7% | +378.80 |
+| 3% (~11.5 pts) | 106 | 64.2% | +413.75 |
+| 5% (~19.2 pts) | 110 | 63.6% | +404.45 |
+| 7% (~26.9 pts) | 112 | 64.3% | +426.40 (baseline) |
+| 10/15/20/30% | 112 | 64.3% | +426.40 (never binds) |
+
+The cap only ever binds below ~7% of the documented reference capital (~27 points/day) on this
+8-day sample — this strategy's worst single-day realized drawdown never got worse than that. Where
+it DOES bind (1-5%), it always cuts both trades and net; only the 2% cell shows a win-rate bump
+(+0.4pp) and even there net drops by $47.60. No cell clears the strict adopt bar; a daily-loss-cap
+in the double-digit-percent range documented here is pure headroom for this strategy on this
+sample, not a real behavioral change — worth re-testing as single-day tail risk shows up in more
+data, per this project's "one run is a data point" rule.
+
+### Options — combos tried (stop + TP1)
+
+Tried combining the single best-in-target lever (stop=20%) with the best-win-rate TP1 cell
+(15%/25%) and a couple of neighbors, since TP1 alone never wins on net but does lift win rate —
+hypothesis was that layering it on top of the one stop value that already clears the bar might
+still hold net roughly flat while adding win-rate. Rejected: every combo tried gives back MORE net
+than stop=20 keeps by adding win rate, same TP1 upside-capping trade-off as the standalone TP1
+sweep, just starting from a slightly higher base:
+
+| Combo | Trades | Win% | Net |
+|---|---|---|---|
+| stop=20 alone (best single lever) | 113 | 64.6% | **+429.15** |
+| stop=20 + tp1=15%/25% | 114 | 65.8% | +388.28 |
+| stop=20 + tp1=25%/25% | 113 | 64.6% | +400.91 |
+| stop=15 + tp1=15%/25% | 114 | 65.8% | +394.03 |
+
+**No combo beats stop=20 alone.** Not pursued further (per the "use judgment, don't
+combinatorially explode" instruction) — TP1's upside-capping cost dominates every combo tried.
+
+### Options — DTE-conditioning check (stop=20%, the one lever that cleared the bar)
+
+| Bucket | Baseline (no stop) trades/win%/net | stop=20% trades/win%/net |
+|---|---|---|
+| 0-DTE (08, 15) | 25 / 64.0% / +157.30 | 25 / 64.0% / +161.45 |
+| Non-0-DTE (09,10,11,16,17,18) | 87 / ~64.4% / +269.10 | 88 / ~64.8% / +267.70 |
+
+**No real DTE-conditioned effect.** stop=20% moves both buckets in roughly the same small
+direction (net essentially flat, win rate up a hair in both) — the tiny overall improvement is not
+concentrated in one day-type, it's spread evenly. A single shared 20% stop performs the same as a
+DTE-conditioned pair would here; splitting it by DTE is not worth the added complexity on this
+evidence.
+
+### Futures crossover (`SessionGatedDepthDurationConfirmed`, 8/40/5pt @ 2600) — stop-loss sweep
+
+| Stop | Trades | Win% | Net |
+|---|---|---|---|
+| none (baseline) | 80 | 55.0% | +277.20 |
+| 5% | 111 | 39.6% | +114.35 |
+| 10% | 93 | 49.5% | +240.55 |
+| 15% | 88 | 52.3% | +275.10 |
+| 20% | 85 | 52.9% | **+285.60** |
+| 30% | 81 | 55.6% | +281.70 |
+
+Same shape as the options side (tight stops clearly hurt), but **no value clears the strict
+adopt-only-if-both-improve bar** here — 20% gives the best net (+3.0% over baseline) but at a real
+win-rate cost (52.9% vs 55.0%, -2.1pp), and 30% recovers win rate (55.6%, +0.6pp) but at lower net
+than baseline-adjacent 15%. This is a genuine trade-off worth recording even though it doesn't
+clear the bar, per this project's "report trade-offs honestly" convention: a tighter stop here
+trades win-rate consistency for a small net edge, unlike the options side where 20% cleanly won on
+both.
+
+### Futures crossover — TP1 sweep
+
+| Trigger\Fraction | 25% | 50% | 75% |
+|---|---|---|---|
+| 10% | 85tr/57.6%/+196.80 | 85tr/57.6%/+174.85 | 85tr/57.6%/+152.90 |
+| 15% | 84tr/57.1%/+213.19 | 84tr/57.1%/+201.58 | 84tr/57.1%/+189.96 |
+| 20% | 83tr/56.6%/+231.65 | 83tr/56.6%/+227.80 | 83tr/56.6%/+223.95 |
+| 25% | 81tr/55.6%/+263.88 | 81tr/55.6%/+263.88 | 81tr/55.6%/+239.43 |
+
+Same pattern as options: TP1 lifts win rate (up to +2.6pp at trigger=10%) but never recovers enough
+net to beat baseline (+277.20) at any cell — the closer the trigger gets to a level the strategy
+rarely reaches (25%), the closer it converges back toward baseline (fewer partials actually fire),
+consistent with the mechanism working as intended rather than a bug.
+
+### Futures crossover — daily-loss-cap sweep
+
+| Cap | Trades | Win% | Net |
+|---|---|---|---|
+| 1% | 41 | 46.3% | +45.35 |
+| 2% | 59 | 52.5% | +203.05 |
+| 3% | 59 | 52.5% | +203.05 |
+| 5% | 77 | 54.5% | +244.05 |
+| 10%+ | 80 | 55.0% | +277.20 (never binds) |
+
+Strictly worse the tighter it's set — this strategy's realized-P&L path apparently has more
+single-day drawdown texture than the options side (the cap starts biting at a looser threshold, 5%
+vs options' ~7%, and every bind cuts both win rate and net, no exception). No adopt case here at
+any setting tested.
+
+### Futures crossover — DTE-conditioning check (stop=20%)
+
+| Bucket | Baseline (no stop) trades/win%/net | stop=20% trades/win%/net |
+|---|---|---|
+| 0-DTE (08, 15) | 20 / 55.0% / +83.35 | 24 / 50.0% / +87.20 |
+| Non-0-DTE (09,10,11,16,17,18) | 60 / 55.0% / +193.85 | 61 / ~54.1% / +198.40 |
+
+**No real DTE-conditioned effect here either** — the win-rate cost of stop=20% shows up in BOTH
+buckets (0-DTE -5.0pp, non-0-DTE -0.9pp — a bit more pronounced on 0-DTE days, but not a clean
+split where one bucket improves and the other doesn't), and net moves up modestly in both. A
+DTE-conditioned rule is not indicated by this evidence.
+
+### Overall verdict and recommendation
+
+**Do not adopt TP1 partial-booking or the daily-loss-cap for either strategy off this evidence** —
+neither ever beats its strategy's own no-rules baseline on net, at any setting tried, on either
+strategy; TP1's cost (capping upside on the exact large winning trades that currently drive most of
+each strategy's net) is a structural, consistent trade-off, not noise, and the daily-loss-cap is
+pure unused headroom in the percent ranges normally considered reasonable (see F42's own note below
+on why this project's `RiskLimitsConfigOptions` defaults are already unusually wide).
+
+**Stop-loss is a mild, genuine candidate for the options strategy specifically** (20%: 64.3%→64.6%
+win, +426.40→+429.15 net — clears the strict bar, but only just, on one 8-day sample) and a
+**flagged, NOT-adopted trade-off for the crossover strategy** (20%: net improves +3.0% but win rate
+drops 2.1pp — a real trade-off, not a win). DTE-conditioning was checked explicitly for stop-loss
+(the only lever showing any real effect) on both strategies and found **no differential effect** —
+the effect, where it exists, is roughly uniform across 0-DTE and non-0-DTE days, so a single shared
+threshold is not worse than a DTE-split pair here.
+
+**Recommendation: adopt nothing yet.** The options-side 20% stop is the single most promising
+number in this sweep, but a 0.3-point win-rate/0.65% net edge on one 8-day sample is well inside
+this project's own "one run is a data point, not a verdict" standard — worth carrying forward into
+the next several backtest sessions as more days accumulate, not worth a live config change today.
+No change to either live strategy's config from this work; all of it stays behind the new,
+off-by-default `--stop=`/`--tp1pct=`/`--tp1frac=`/`--dailyloss=` flags in `NiftySignal.VolumeBarData`.
+
+**Re: audit finding F42** (`NiftySignal.Rules/RulesetConfigOptions.cs`'s own `RiskLimitsConfigOptions`
+comment) — the old engine's `MaxDailyLossPct=20%`/`MaxDailyProfitPct=30%` were flagged as
+deliberately widened for paper-trading observation, "must be tightened before real money." This
+sweep's own finding is consistent with that flag: at the old engine's literal 20% daily-loss value,
+the cap never binds at all for either strategy on this sample (pure headroom), reinforcing that F42's
+concern (these numbers are not a real risk box as configured) transfers cleanly to the new
+strategies too, not just the old composite score this default was originally tuned for.
+
+## MAE/MFE analysis, all 4 strategies (2026-09-22)
+
+New CLI command, purely additive analytics on top of already-existing trade output (no change to
+any strategy's entry/exit/dispatch logic):
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- mae-mfe trade <fromDate> <toDate> <metric> [entryPercentile] [trendWindowBars] [barVolumeThreshold] [--band=] [--minprice=] [--maxprice=] ...
+dotnet run --project NiftySignal.VolumeBarData -- mae-mfe crossover <fromDate> <toDate> [fastBars] [slowBars] [thresholdPoints] [barVolumeThreshold] [--metric=] [--band=] [--minprice=] [--maxprice=] ...
+```
+
+Both accept the exact same parameters as the existing `trade`/`crossover` commands, reuse
+`RunRangeAsync`/`TradeSimulator.SimulateCrossoverDayAsync` verbatim for trade generation, then for
+each closed trade reconstructs the traded instrument's `Token` (not stored on `VolumeBarTrade`) by
+re-querying the day's option chain on `AsOfDate + StrikePrice + OptionType` (unique, since this
+codebase's convention is one expiry in play per day), loads that instrument's real tick price path
+for exactly the `EntryTime..ExitTime` window (`OptionPriceSeries`, extended with a new
+`AllPrices` property alongside its existing point-lookup `PriceAtOrBefore`), and computes MAE/MFE
+via the new, separately-unit-tested `MaeMfeCalculator.Compute` (5 tests in
+`NiftySignal.Tests/VolumeBarData/MaeMfeCalculatorTests.cs`, `dotnet test`: 666 passing, 0 warnings,
+up from the 661 baseline). MAE/MFE are both LONG-premium points/percent relative to `EntryPrice`
+(clamped at 0 — a trade that never moved adversely has MAE 0, not negative), per
+`VolumeBarTrade.NetPnlPoints`'s own doc comment confirming every trade here is a LONG position
+regardless of Call/Put.
+
+All 8 requested trade sets were reproduced first and matched their known-good reference numbers
+exactly before their MAE/MFE numbers were trusted:
+
+| # | Set | Trades | Win% | Net | Reference matched? |
+|---|---|---|---|---|---|
+| 1 | OptionsScore backtest, no strike-search | 112 | 64.3% | +426.40 | Yes |
+| 2 | OptionsScore backtest, --minprice=100 --maxprice=150 | 112 | 64.3% | +452.45 | Yes |
+| 3 | OptionsScore out-of-sample (09-21), no strike-search | 7 | 71.4% | -5.10 | Yes |
+| 4 | OptionsScore out-of-sample (09-21), strike-search | 7 | 71.4% | -5.75 | Yes |
+| 5 | Futures crossover backtest, no strike-search | 80 | 55.0% | +277.20 | Yes (current ground truth, no fixed reference given — reproduced against the plain `crossover` command's own current output) |
+| 6 | Futures crossover backtest, strike-search | 80 | 55.0% | +320.85 | Yes |
+| 7 | Futures crossover out-of-sample (09-21), no strike-search | 10 | 30.0% | -12.50 | Yes |
+| 8 | Futures crossover out-of-sample (09-21), strike-search | 10 | 40.0% | -8.55 | Yes |
+
+### MAE/MFE summary statistics
+
+| # | Avg MAE% | Avg MFE% | Median MAE% | Median MFE% | Worst MAE% | Best MFE% | Recovered¹ | Gave back² |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 4.67% | 7.50% | 3.56% | 3.22% | 31.01% | 71.50% | 105/112 | 101/112 |
+| 2 | 4.26% | 6.58% | 3.54% | 3.19% | 21.87% | 54.71% | 105/112 | 101/112 |
+| 3 | 7.57% | 5.84% | 6.17% | 7.10% | 21.47% | 10.26% | 7/7 | 7/7 |
+| 4 | 5.91% | 5.14% | 5.03% | 6.11% | 16.40% | 8.64% | 7/7 | 7/7 |
+| 5 | 6.82% | 11.21% | 3.76% | 5.54% | 44.39% | 66.69% | 75/80 | 79/80 |
+| 6 | 5.70% | 9.15% | 3.58% | 4.54% | 26.47% | 53.11% | 76/80 | 77/80 |
+| 7 | 7.45% | 8.69% | 4.75% | 2.90% | 34.04% | 58.71% | 10/10 | 9/10 |
+| 8 | 6.19% | 6.38% | 3.94% | 2.85% | 31.11% | 40.50% | 10/10 | 8/10 |
+
+¹ Trades where MAE exceeded the trade's own final loss magnitude (touched a worse drawdown than it
+closed at — includes winners that dipped before recovering). ² Trades where MFE exceeded the
+trade's own final gain (gave back some open profit before exit).
+
+### Notable patterns
+
+- **Almost every trade in every set touches a worse point than its close.** The "recovered"
+  fraction is 90%+ in all 8 sets (lowest is set 5's 75/80 = 93.75%) — essentially every trade,
+  winner or loser, dips below its own final P&L at some point during the hold. This is expected
+  for a strategy holding through noise rather than trailing a tight stop, but it means MAE is a
+  poor predictor of a trade's eventual outcome on its own; it fires on almost everything.
+- **The crossover strategy runs both bigger MFE and bigger MAE than the options-score strategy on
+  the same 8-day backtest window** (set 5: avg MFE% 11.21% vs set 1's 7.50%; avg MAE% 6.82% vs
+  4.67%). Consistent with the crossover strategy's generally longer average hold and larger
+  average move — the single-metric `NiftySignal.MetricTrials` track's own 1-8 minute average trade
+  durations (a lone-metric, no-composite simulation, not this multi-bar crossover approach) sit at
+  the opposite extreme, underlining that a longer hold gives the underlying more time to wander
+  before exit, both ways.
+- **The crossover out-of-sample day (set 7, no strike-search) has the widest MAE spread relative
+  to its win rate of any set**: only 30% win rate, yet every single trade (10/10) touched a worse
+  drawdown than its close, and the worst MAE (34.04%, on a Rs 89.00 Put that fell to Rs 61.35,
+  entry 10:33:49) came within striking distance of being the day's biggest loser outright. This is
+  the "losing trades had deeper MAE than the backtest's typical losing trade" pattern flagged
+  up-front — the same pattern doesn't show up nearly as sharply in the 8-day backtest sets (1, 2,
+  5, 6), where the worst single-trade MAE% (31–44%) is driven by a handful of outliers, not a
+  day-wide pattern.
+- **Two illustrative individual trades** (both from set 1, the plain OptionsScore backtest):
+  - 09:38:49, Long Put@23500, entry 85.60 → exit 137.20, net **+51.60** (a big winner) — but it
+    first drew down **13.00 pts (15.19%)** before rallying to a peak MFE of **61.20 pts (71.50%)**,
+    the best MFE in the whole set. A trader watching the open position mid-trade would have seen a
+    15% loss before it became the day's best winner.
+  - 14:47:09, Long Call@23200, entry 40.95 → exit 28.60, net **-12.35** — its MAE (12.70 pts) is
+    **31.01% of entry**, the worst MAE% in the set, on a cheap (~Rs 41) option that fell almost
+    monotonically (MFE only 3.55 pts / 8.67%, so it barely bounced at all). Cheap premiums produce
+    large percentage swings on comparatively small point moves — a reminder that "avg MAE%"
+    numbers above are pulled around by low-premium trades more than point-based MAE would be.
+- **Strike-search (`--minprice=100 --maxprice=150`) trades toward cheaper, further-OTM strikes
+  having somewhat lower percentage MAE/MFE than the plain-ATM sets** in 3 of 4 matched pairs
+  (sets 1→2, 5→6, 7→8 all show avg MAE%/MFE% decrease with strike-search on), likely because the
+  band search is selecting strikes whose premiums move less violently in percentage terms for the
+  same underlying move — consistent with, though not proof of, the strike-search mechanism
+  behaving as designed (picking a specific premium range rather than pure ATM). Set 3→4 is the one
+  exception (MAE% drops but so does the day's already-small sample of 7 trades' variance
+  generally) — one out-of-sample day is not enough to generalize this observation past "worth
+  watching across more days."
+
+Full per-trade tables for all 8 sets are reproducible on demand via the commands above (not
+reproduced row-by-row here); the exact commands are listed in the reproduction table.
