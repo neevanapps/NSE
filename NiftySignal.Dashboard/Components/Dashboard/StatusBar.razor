@@ -1,5 +1,6 @@
 @implements IDisposable
 @using Microsoft.EntityFrameworkCore
+@using NiftySignal.Domain
 @using NiftySignal.Domain.Entities
 @using NiftySignal.Persistence
 @using NiftySignal.Dashboard.Services
@@ -11,6 +12,15 @@
         <span class="brand-dot"></span>
         NiftySignal
     </div>
+
+    <div class="status-item">
+        <span class="text-faint">IST</span>
+        <span class="mono text-dim">@_nowIst.ToString("HH:mm:ss")</span>
+    </div>
+
+    @* Phase F of docs/LIVE_PARITY_PLAN.md -- the only nav link this single-page dashboard has;
+       the new page links back via its own "Back to dashboard" link. *@
+    <a href="/live-options-score" class="login-link">Live Options Score</a>
 
     <div class="status-item">
         <span class="text-faint">Connection</span>
@@ -54,6 +64,7 @@
     bool _saving;
     Timer? _clockTimer;
     int _secondsSinceTick;
+    DateTimeOffset _nowIst = DateTimeOffset.UtcNow.ToIst();
 
     string ConnectionBadgeClass => Live.Connection switch
     {
@@ -75,6 +86,7 @@
     void RecomputeClock()
     {
         _secondsSinceTick = (int)(DateTimeOffset.Now - Live.LastTickAt).TotalSeconds;
+        _nowIst = DateTimeOffset.UtcNow.ToIst();
         StateHasChanged();
     }
 

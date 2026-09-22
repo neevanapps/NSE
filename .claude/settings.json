@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"D:/Projects/NSE/.claude/hooks/verify-dotnet.sh\"",
+            "shell": "bash",
+            "timeout": 240,
+            "statusMessage": "Verifying dotnet build/test (C#/F# changes detected this turn)..."
+          }
+        ]
+      }
+    ]
+  }
+}

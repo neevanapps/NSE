@@ -22,6 +22,91 @@ namespace NiftySignal.Persistence.Migrations
 
             NpgsqlModelBuilderExtensions.UseIdentityByDefaultColumns(modelBuilder);
 
+            modelBuilder.Entity("NiftySignal.Domain.Entities.CoreScoreSnapshot", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<double?>("BasisChangeRaw")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("BasisChangeSigned")
+                        .HasColumnType("double precision");
+
+                    b.Property<DateTimeOffset>("ComputedAt")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<double?>("CoreScore")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("CoreScoreFast")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("CoreScoreRaw")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("CoreScoreRawInstant")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("CoreScoreSlow")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("DepthImbalanceRaw")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("DepthImbalanceSigned")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("FutureCvdNet5MinRaw")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("FutureCvdNet5MinSigned")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("GammaExposureRaw")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("GammaExposureSigned")
+                        .HasColumnType("double precision");
+
+                    b.Property<bool>("IsWarmedUp")
+                        .HasColumnType("boolean");
+
+                    b.Property<double?>("ItmSkewRaw")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("ItmSkewSigned")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("NotionalVolumeRatioRaw")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("NotionalVolumeRatioSigned")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("OiChangeDiff15mRaw")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("OiChangeDiff15mSigned")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("TrendReversion15mRaw")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("TrendReversion15mSigned")
+                        .HasColumnType("double precision");
+
+                    b.Property<string>("WeightSetVersion")
+                        .HasColumnType("text");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("CoreScoreSnapshots");
+                });
+
             modelBuilder.Entity("NiftySignal.Domain.Entities.DataGap", b =>
                 {
                     b.Property<long>("Id")
@@ -253,6 +338,9 @@ namespace NiftySignal.Persistence.Migrations
                         .HasMaxLength(128)
                         .HasColumnType("character varying(128)");
 
+                    b.Property<int>("StrategyId")
+                        .HasColumnType("integer");
+
                     b.Property<string>("TradingSymbol")
                         .IsRequired()
                         .HasMaxLength(128)
@@ -277,6 +365,9 @@ namespace NiftySignal.Persistence.Migrations
                         .HasColumnType("bigint");
 
                     NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<double?>("AtmIv")
+                        .HasColumnType("double precision");
 
                     b.Property<double?>("CharmExposureRaw")
                         .HasColumnType("double precision");
@@ -314,6 +405,15 @@ namespace NiftySignal.Persistence.Migrations
                     b.Property<double?>("FuturesBasisZ")
                         .HasColumnType("double precision");
 
+                    b.Property<double?>("FuturesVwap")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("FuturesVwapDeviationRaw")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("FuturesVwapDeviationZ")
+                        .HasColumnType("double precision");
+
                     b.Property<double?>("GammaExposureRaw")
                         .HasColumnType("double precision");
 
@@ -329,7 +429,10 @@ namespace NiftySignal.Persistence.Migrations
                     b.Property<double?>("IvRankRaw")
                         .HasColumnType("double precision");
 
-                    b.Property<double?>("IvSkewRaw")
+                    b.Property<int>("IvRankSessionCount")
+                        .HasColumnType("integer");
+
+                    b.Property<double?>("IvSkewOneSigmaRaw")
                         .HasColumnType("double precision");
 
                     b.Property<double?>("IvSkewZ")
@@ -339,6 +442,9 @@ namespace NiftySignal.Persistence.Migrations
                         .HasColumnType("double precision");
 
                     b.Property<double?>("OiBuildupNetZ")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("ParityGapRaw")
                         .HasColumnType("double precision");
 
                     b.Property<double?>("PcrRaw")
@@ -352,6 +458,45 @@ namespace NiftySignal.Persistence.Migrations
 
                     b.Property<double?>("PriceMomentumZ")
                         .HasColumnType("double precision");
+
+                    b.Property<int>("RatioComponentsPresent")
+                        .HasColumnType("integer");
+
+                    b.Property<double?>("RatioCompositeScore")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("RatioCompositeScoreFast")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("RatioCompositeScoreRaw")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("RatioCompositeScoreRawInstant")
+                        .HasColumnType("double precision");
+
+                    b.Property<bool>("RatioIsWarmedUp")
+                        .HasColumnType("boolean");
+
+                    b.Property<double?>("RatioIvSkew25dRaw")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("RatioMomentum")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("RatioNotionalVolumeRaw")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("RatioResidualDifferenceRaw")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("RatioSizedOiFlowRaw")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("RatioSpreadAtmRaw")
+                        .HasColumnType("double precision");
+
+                    b.Property<string>("RatioWeightSetVersion")
+                        .HasColumnType("text");
 
                     b.Property<double?>("SpotPrice")
                         .HasColumnType("double precision");

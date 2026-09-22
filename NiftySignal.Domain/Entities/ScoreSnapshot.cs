@@ -16,7 +16,27 @@ public sealed class ScoreSnapshot
     public double? OiBuildupNetRaw { get; set; }
     public double? PcrRaw { get; set; }
     public double? FuturesBasisRaw { get; set; }
-    public double? IvSkewRaw { get; set; }
+
+    /// <summary>
+    /// Synthetic-forward (put-call parity S) minus spot mid (2026-09-09 external review,
+    /// alongside reverting audit finding F11's original fix). A quote-quality/parity-gap
+    /// diagnostic, not a basis measurement -- <see cref="FuturesBasisRaw"/> above stays the
+    /// honestly-named real future's mid minus spot mid. Typically small and near zero on
+    /// clean data; a wider reading usually means a stale or wide wing-strike quote fed the
+    /// put-call-parity solve, not a real sentiment signal. Weight 0 by construction: no Z
+    /// counterpart, never feeds the composite -- see LiveFeatureEngine.Sample's doc comment.
+    /// </summary>
+    public double? ParityGapRaw { get; set; }
+
+    /// <summary>
+    /// Put/call IV skew, anchored to the expiry's own ~1-sigma expected move (spot x sigma x
+    /// sqrt(t)) rather than a fixed point offset -- see LiveFeatureEngine.ComputeIvSkew (audit
+    /// finding F8). Renamed from IvSkewRaw (2026-09-09 external review) to stay unambiguous
+    /// against the ratio sidecar's RatioIvSkew25dRaw, a materially different (25-delta) skew
+    /// reading -- the two must never be read as the same series.
+    /// </summary>
+    public double? IvSkewOneSigmaRaw { get; set; }
+
     public double? PriceMomentumRaw { get; set; }
     public double? DepthImbalanceRaw { get; set; }
 
@@ -108,6 +128,30 @@ public sealed class ScoreSnapshot
     /// </summary>
     public double? IvRankRaw { get; set; }
 
+    /// <summary>
+    /// The raw ATM reference vol IvRankRaw was ranked against this cadence (2026-09-09
+    /// external review amendment to audit finding F3) -- see LiveFeatureEngine.ComputeIvRank.
+    /// Persisted so today's own observations can be replayed into the cold-start fallback
+    /// distribution on restart (SeedHistory) and so a prior day's session mean can later be
+    /// computed for the next day's 20-session ranking distribution (see
+    /// MarketDataIngestionWorker's prior-session seed query) -- without this column, "rank
+    /// against the last 20 sessions" would have no persisted per-session series to average.
+    /// </summary>
+    public double? AtmIv { get; set; }
+
+    /// <summary>
+    /// How many prior sessions' worth of ATM IV history <see cref="IvRankRaw"/> was actually
+    /// ranked against this cadence (2026-09-09 external review amendment to audit finding F3):
+    /// 0 until at least one prior session's mean is seeded, up to
+    /// LiveFeatureEngine.MaxPriorSessionsForIvRank once mature. Below
+    /// LiveFeatureEngine.MinPriorSessionsForIvRank, IvRankRaw is a same-day-only rank (not
+    /// trustworthy yet -- a genuinely high-vol day would still read as "normal" for its own
+    /// first couple of hours) -- EntryRuleEvaluator's MaxIvRankForEntry gate reads this
+    /// alongside IvRankRaw and skips the gate entirely below that threshold, rather than
+    /// acting on an unreliable same-day rank.
+    /// </summary>
+    public int IvRankSessionCount { get; set; }
+
     public double? OiBuildupNetZ { get; set; }
     public double? PcrZ { get; set; }
     public double? FuturesBasisZ { get; set; }
@@ -160,4 +204,119 @@ public sealed class ScoreSnapshot
     public bool IsWarmedUp { get; set; }
 
     public required string WeightSetVersion { get; set; }
+
+    // --- Ratio-based composite score (weekend build, 2026-09-09) -----------------------------
+    // A second, independent scoring pipeline running alongside the composite above -- not a
+    // replacement. LiveTradingEngine reads none of the columns below (see
+    // LiveTradingEngineTests' trading-safety parity test, which asserts this directly rather
+    // than leaving it as a code-reading claim). See NiftySignal.Scoring.RatioScoreCalculator
+    // and LiveFeatureEngine's ratio-metric methods for how each is computed.
+    //
+    // Audit finding F51 (2026-09-10, user-caught live, then refined by user instruction): all
+    // five Ratio*Raw columns below hold a smoothed value (LiveFeatureEngine.SmoothRatioMetric,
+    // ~RatioCompositeSmoothingCadences / 12 minutes), not the single-cadence instant read --
+    // before this fix, an individual metric's clipped s_i could swing sign entirely between
+    // adjacent 15s cadences even though the combined score shown alongside it
+    // (RatioCompositeScore) was, at the time, additionally smoothed at the combined level too --
+    // which read as contradictory on the dashboard. The instant read still feeds each metric's
+    // own smoothing FIFO every cadence but is no longer persisted anywhere on its own. The
+    // combined score's own separate smoothing layer was retired once this landed (see
+    // RatioCompositeScoreRaw's own doc comment) -- it's stable now because every one of its
+    // inputs already is, not because of an additional smoothing step of its own.
+
+    /// <summary>Call notional / put notional, ATM+/-5, log-ratio-clipped -- see LiveFeatureEngine.ComputeRatioNotionalVolumeRaw. Null when combined notional is below RatioMetricScales.MinNotionalForVolumeRatio (no real signal that bar, not a divide-by-zero guard) AND no sample has ever cleared that floor yet this session (F51: a bar below the floor is simply skipped, not zero-filled, so the smoothed value persists across a quiet bar once at least one real sample exists).</summary>
+    public double? RatioNotionalVolumeRaw { get; set; }
+
+    /// <summary>Sized, spot-classified constructive OI flow ratio, ATM+/-5, log-ratio-clipped -- see LiveFeatureEngine.ComputeRatioSizedOiFlowRaw. Null when combined constructive flow is below RatioMetricScales.MinContractsForOiFlow and no sample has ever cleared that floor yet this session -- see RatioNotionalVolumeRaw's own doc comment (F51) for why a single quiet bar no longer blanks this out.</summary>
+    public double? RatioSizedOiFlowRaw { get; set; }
+
+    /// <summary>ATM call residual minus ATM put residual (rupees), each leg's actual mark change minus its own Delta+Gamma+Theta+Vega-predicted change -- see LiveFeatureEngine.ComputeResidualDifference. A difference, not a ratio (a ratio blows up near zero). Null on an ATM strike roll (same guard as StraddleRichnessRaw) only once every smoothed sample has aged out of the window -- see RatioNotionalVolumeRaw's own doc comment (F51).</summary>
+    public double? RatioResidualDifferenceRaw { get; set; }
+
+    /// <summary>25-delta put IV / 25-delta call IV -- see LiveFeatureEngine.ComputeIvSkewRatio25Delta. A materially different quantity from IvSkewOneSigmaRaw (~16-delta, F8) -- never treat the two as the same series.</summary>
+    public double? RatioIvSkew25dRaw { get; set; }
+
+    /// <summary>OI-weighted put spread% / call spread%, ATM+/-2 -- see LiveFeatureEngine.ComputeRatioSpreadAtmRaw. Reuses the same per-cadence spread samples SpreadRatioRaw does.</summary>
+    public double? RatioSpreadAtmRaw { get; set; }
+
+    /// <summary>The five (smoothed, F51) clipped inputs combined for this cadence -- transparency/future-analysis only, same role as CompositeScoreRawInstant. Already meaningfully stable on its own, since each of its five inputs is itself a ~12-minute average.</summary>
+    public double? RatioCompositeScoreRawInstant { get; set; }
+
+    /// <summary>
+    /// Identical to <see cref="RatioCompositeScoreRawInstant"/> as of audit finding F51
+    /// (2026-09-10, user instruction): this used to be that value smoothed again over its own
+    /// combined-level 12-cadence FIFO, but once every one of the five inputs feeding it was
+    /// already a ~12-minute average in its own right, smoothing the combination a second time
+    /// only added lag with no benefit -- the combined-level FIFO was retired. Kept as its own
+    /// column (rather than removed, which would need a migration and touch every reader) so
+    /// existing call sites reading "the tradable raw, if this pipeline is ever wired into a
+    /// decision" don't need to know which of the two columns to prefer.
+    /// </summary>
+    public double? RatioCompositeScoreRaw { get; set; }
+
+    /// <summary><c>100 * tanh(RatioCompositeScoreRaw / k)</c>, k = RatioScoreCalculator.DefaultK. Null until at least RatioScoreCalculator.MinRequiredComponents of the five Ratio*Raw values above are non-null this cadence.</summary>
+    public double? RatioCompositeScore { get; set; }
+
+    public bool RatioIsWarmedUp { get; set; }
+
+    /// <summary>Nullable unlike the required WeightSetVersion above -- this composite can legitimately fail to warm up (fewer than 3 of 5 metrics present), in which case there's no weight set to attribute the (absent) score to.</summary>
+    public string? RatioWeightSetVersion { get; set; }
+
+    /// <summary>
+    /// Count (0-5) of the five ratio metrics that were non-null this cadence, after the same
+    /// RatioMetricMath clip each goes through before RatioScoreCalculator ever sees it -- so this
+    /// counts the same "present" RatioScoreCalculator.MinRequiredComponents checks, not raw-value
+    /// nullness (a raw value can be non-null yet clip to null, e.g. a non-positive ratio).
+    /// Audit finding F41 -- makes a 3-of-5 bar (e.g. only skew+spread+residual) distinguishable
+    /// from a 5-of-5 bar without re-deriving presence from the five Ratio*Raw columns' nullness.
+    /// </summary>
+    public int RatioComponentsPresent { get; set; }
+
+    /// <summary>
+    /// Audit finding F55 (2026-09-11, live-caught: every ratio-score entry in an 11 Sep backtest
+    /// landed at a local price extreme, after the move that justified it had already run). The
+    /// same five ratio inputs, combined the same way (RatioScoreCalculator, same weights, same
+    /// k), but smoothed over LiveFeatureEngine.RatioFastSmoothingCadences (~2 min) instead of the
+    /// ~12-minute RatioCompositeSmoothingCadences RatioCompositeScore above uses -- structurally
+    /// identical to it, just faster to react. Warms up before RatioCompositeScore does, since its
+    /// window is shorter; not restart-replayed (see LiveFeatureEngine.SeedHistory's own comment)
+    /// since a 2-minute window self-heals from a cold FIFO quickly enough that the replay gap
+    /// that mattered for the 12-minute window doesn't apply here.
+    /// </summary>
+    public double? RatioCompositeScoreFast { get; set; }
+
+    /// <summary>
+    /// <see cref="RatioCompositeScoreFast"/> minus <see cref="RatioCompositeScore"/> (audit
+    /// finding F55) -- positive means the fast read has pulled bullish ahead of the slow read,
+    /// negative bearish. Null unless both are warmed up (the slow one is the binding constraint,
+    /// same as today). Trivially derivable from the two columns above but persisted directly so
+    /// it's queryable without every consumer re-deriving the subtraction.
+    /// </summary>
+    public double? RatioMomentum { get; set; }
+
+    /// <summary>
+    /// The tracked future's own cumulative VWAP, reset once per trading day (audit finding F55's
+    /// price-led dynamic-hybrid mode, 2026-09-11 -- see LiveFeatureEngine.OnTick's accumulation
+    /// and ComputeCadence's own comment for why price, not any option-derived metric, drives
+    /// entry timing). Null until the future has traded any volume yet today.
+    /// </summary>
+    public double? FuturesVwap { get; set; }
+
+    /// <summary>
+    /// The future's last price minus <see cref="FuturesVwap"/>, in price points -- the raw value
+    /// <see cref="FuturesVwapDeviationZ"/> is z-scored from. Persisted separately (not just
+    /// derivable from FuturesVwap and a price column) so LiveFeatureEngine.SeedHistory can replay
+    /// it back into the rolling window on restart, the same way every other z-scored component's
+    /// own Raw column already does.
+    /// </summary>
+    public double? FuturesVwapDeviationRaw { get; set; }
+
+    /// <summary>
+    /// <see cref="FuturesVwapDeviationRaw"/> z-scored against its own rolling window
+    /// (LiveFeatureEngine.FeatureWindowLengths.FuturesVwapDeviation, 30 min) -- self-scaling by
+    /// construction (normalized by the future's own real, current volatility), the primary
+    /// signal BacktestRunner's price-led dynamic-hybrid mode ranks and trades on. Null until the
+    /// window has warmed up.
+    /// </summary>
+    public double? FuturesVwapDeviationZ { get; set; }
 }

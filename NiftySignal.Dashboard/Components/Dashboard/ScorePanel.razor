@@ -1,36 +1,67 @@
 @implements IAsyncDisposable
 @using NiftySignal.Dashboard.Services
 @using NiftySignal.Domain
+@using NiftySignal.Domain.Enums
 @inject LiveDataService Live
 @inject IJSRuntime JS
 
 <div class="panel score-panel">
     <div class="panel-title">
-        Universal Directional Score
-        <span class="text-faint" style="font-weight:400; text-transform:none; letter-spacing:normal;">weights v1 (plan &sect;6)</span>
+        Core Directional Score
+        <span class="badge badge-neutral" style="margin-left:8px;" title="Retired from live trading 2026-09-21 -- see docs/LIVE_PARITY_PLAN.md">RETIRED &mdash; not trading</span>
+        <span class="text-faint" style="font-weight:400; text-transform:none; letter-spacing:normal;">core-score-live-2026-09-13 (docs/replication_plan.md)</span>
+    </div>
+    <div class="text-faint" style="font-size:12px; margin-top:-4px; margin-bottom:8px;">
+        Hysteresis/Crossover engines stopped opening new trades on 2026-09-21 (both verified FLAT
+        beforehand) in favor of the volume-bar pipeline above. Shown below as last-known-state only.
     </div>
 
     <div class="score-top">
         <div class="score-readout">
-            <div class="score-number @ScoreColorClass">@Live.CurrentScore.ToString("+0;-0;0")</div>
+            <div class="score-number @ScoreColorClass">@Live.CurrentCoreScore.ToString("+0;-0;0")</div>
             <div class="score-label badge @ScoreBadgeClass">@ScoreLabel</div>
+            <div class="mono text-faint fast-slow-readout">fast @FormatFastSlow(Live.CurrentCoreScoreFast) / slow @FormatFastSlow(Live.CurrentCoreScoreSlow)</div>
         </div>
-        <div class="score-chart">
-            <canvas id="score-history-chart"></canvas>
-        </div>
+    </div>
+    <div class="score-chart">
+        <canvas id="core-score-history-chart"></canvas>
     </div>
 
     <div class="components">
-        @foreach (var c in Live.ScoreComponents)
+        @foreach (var c in Live.CoreScoreComponents)
         {
             <div class="component-row">
-                <span class="health-dot @(c.IsWarmedUp ? "ok" : "pending")" title="@(c.IsWarmedUp ? "Warmed up" : $"~{FormatWindow(c.Remaining)} left")"></span>
+                <span class="health-dot @(c.IsWarmedUp ? "ok" : "pending")" title="@(c.IsWarmedUp ? "Warmed up" : "Still building today's session rank")"></span>
                 <span class="component-name text-dim">@FormatName(c.Name)</span>
                 <div class="component-bar-track">
-                    <div class="component-bar @(c.ZScore >= 0 ? "bull" : "bear")" style="@BarStyle(c.ZScore)"></div>
+                    <div class="component-bar @((c.SignedValue ?? 0) >= 0 ? "bull" : "bear")" style="@BarStyle(c.SignedValue ?? 0)"></div>
                 </div>
                 <span class="mono text-faint component-weight">w=@c.Weight.ToString("0.00")</span>
-                <span class="mono @(c.ZScore >= 0 ? "text-bull" : "text-bear") component-z">z=@c.ZScore.ToString("+0.00;-0.00")</span>
+                <span class="mono @((c.SignedValue ?? 0) >= 0 ? "text-bull" : "text-bear") component-z">@(c.SignedValue is { } v ? v.ToString("+0.00;-0.00") : "--")</span>
+            </div>
+        }
+    </div>
+
+    <div class="panel-title" style="margin-top:16px;">Strategy Positions</div>
+    <div class="strategy-positions">
+        @foreach (var sp in Live.StrategyPositions)
+        {
+            <div class="strategy-row">
+                <span class="strategy-name text-dim">@StrategyLabel(sp.StrategyId)</span>
+                @if (sp.Position is { } p)
+                {
+                    <span class="badge @(p.Direction == EntryDirection.Bullish ? "badge-bull" : "badge-bear")">@(p.Direction == EntryDirection.Bullish ? "CE" : "PE")</span>
+                    <span class="mono strategy-symbol">@p.TradingSymbol</span>
+                    <span class="mono text-faint">entry @p.EntryPremium.ToString("0.00")</span>
+                    <span class="mono text-faint">ltp @p.CurrentPremium.ToString("0.00")</span>
+                    <span class="mono @(p.UnrealizedPnl >= 0 ? "text-bull" : "text-bear")">@p.UnrealizedPnl.ToString("+0.00;-0.00")</span>
+                    <span class="text-faint">@FormatHeld(p.EntryTime)</span>
+                }
+                else
+                {
+                    <span class="badge badge-neutral">FLAT</span>
+                    <span class="text-faint strategy-symbol">@StrategySignalReading(sp.StrategyId)</span>
+                }
             </div>
         }
     </div>
@@ -43,21 +74,21 @@
     IJSObjectReference? _module;
     bool _rendered;
 
-    string ScoreColorClass => Live.CurrentScore switch
+    string ScoreColorClass => Live.CurrentCoreScore switch
     {
         > 10 => "text-bull",
         < -10 => "text-bear",
         _ => "text-dim",
     };
 
-    string ScoreBadgeClass => Live.CurrentScore switch
+    string ScoreBadgeClass => Live.CurrentCoreScore switch
     {
         > 10 => "badge-bull",
         < -10 => "badge-bear",
         _ => "badge-neutral",
     };
 
-    string ScoreLabel => Live.CurrentScore switch
+    string ScoreLabel => Live.CurrentCoreScore switch
     {
         > 55 => "Strongly Bullish",
         > 10 => "Bullish",
@@ -66,35 +97,53 @@
         _ => "Neutral",
     };
 
+    static string FormatFastSlow(double? v) => v is { } value ? value.ToString("+0.0;-0.0") : "--";
+
+    static string StrategyLabel(StrategyId id) => id switch
+    {
+        StrategyId.CoreScoreHysteresis => "Hysteresis",
+        StrategyId.CoreScoreCrossover => "Crossover",
+        _ => id.ToString(),
+    };
+
+    // Flat-state context reading, one per strategy since each reads a different part of the same
+    // CoreScoreSnapshot: Hysteresis watches the instant score against its +-30 entry threshold;
+    // Crossover watches fast-vs-slow, which the instant score alone doesn't show.
+    string StrategySignalReading(StrategyId id) => id switch
+    {
+        StrategyId.CoreScoreHysteresis => $"score {Live.CurrentCoreScore.ToString("+0.0;-0.0")} (enters at |score| >= 30)",
+        StrategyId.CoreScoreCrossover => $"fast {FormatFastSlow(Live.CurrentCoreScoreFast)} / slow {FormatFastSlow(Live.CurrentCoreScoreSlow)}",
+        _ => "",
+    };
+
     static string FormatName(string name) => name switch
     {
-        "OiBuildupNet" => "OI Buildup Net",
-        "Pcr" => "Aggregate PCR",
-        "FuturesBasis" => "Futures Basis",
-        "IvSkew" => "IV Skew",
-        "PriceMomentum" => "Price Momentum",
         "DepthImbalance" => "Depth Imbalance",
-        "VixChange" => "VIX Change",
+        "ItmSkew" => "ITM Skew",
+        "FutureCvdNet5Min" => "Future CVD (5m net)",
+        "NotionalVolumeRatio" => "Notional Volume Ratio",
         "GammaExposure" => "Gamma Exposure",
-        "VolumePcr" => "Volume PCR (notional)",
-        "SpreadRatio" => "Spread Ratio (put/call)",
-        "VannaExposure" => "Vanna Exposure",
-        "CharmExposure" => "Charm Exposure",
-        "CvdProxy" => "CVD Proxy (quote-rule)",
-        "StraddleRichness" => "Straddle Richness",
+        "TrendReversion15m" => "Trend Reversion (15m)",
+        "BasisChange" => "Basis Change",
+        "OiChangeDiff15m" => "OI Change Diff (15m)",
         _ => name,
     };
 
-    static string BarStyle(double z)
+    // Core-score components are already session-rank-normalized to [-1,1] (see
+    // CoreScoreSnapshot's own doc comment), unlike the old composite's unbounded z-scores -- the
+    // bar fills its full half-track at |v|=1 rather than needing the old /3 scaling.
+    static string BarStyle(double v)
     {
-        var pct = Math.Min(100, Math.Abs(z) / 3 * 100);
-        var side = z >= 0 ? "left" : "right";
+        var pct = Math.Min(100, Math.Abs(v) * 100);
+        var side = v >= 0 ? "left" : "right";
         return $"width:{pct.ToString("0")}%; {side}: 50%;";
     }
 
-    static string FormatWindow(TimeSpan t) => t.TotalMinutes >= 60
-        ? $"{t.TotalHours:0.#}h"
-        : $"{t.TotalMinutes:0}m";
+    static string FormatHeld(DateTimeOffset entryTime)
+    {
+        var held = DateTimeOffset.Now - entryTime;
+        return held.TotalMinutes >= 60 ? $"{held.TotalHours:0.0}h" : $"{held.TotalMinutes:0}m";
+    }
 
     protected override void OnInitialized() => Live.Updated += OnDemoUpdated;
 
@@ -108,24 +157,27 @@
         }
     }
 
-    // Spot rides on the same time axis as the score so the two can be read against each other
-    // -- "did the score turn before price did?" is the whole question this panel exists to
-    // answer. Nulls (snapshots predating the SpotPrice column) pass through as gaps rather
-    // than being coerced to zero, which would drag the price axis to the floor.
-    (string[] Labels, double[] Scores, double?[] Prices) BuildSeries()
+    // Fast/slow ride the same time axis as the instant score (2026-09-15) -- exactly the two
+    // trailing reads the Crossover strategy trades on, so their crossover is visible on the same
+    // plot as the Hysteresis strategy's own +-30 threshold read. Spot rides alongside on its own
+    // axis, joined here against CoreScoreSnapshot's cadence timestamps (see LiveDataService.
+    // PollAsync's own join).
+    (string[] Labels, double[] Scores, double?[] Fast, double?[] Slow, double?[] Prices) BuildSeries()
     {
-        var history = Live.ScoreHistory;
+        var history = Live.CoreScoreHistory;
         return (
             history.Select(h => h.Timestamp.ToIst().ToString("HH:mm:ss")).ToArray(),
             history.Select(h => Math.Round(h.Score, 1)).ToArray(),
+            history.Select(h => h.Fast).ToArray(),
+            history.Select(h => h.Slow).ToArray(),
             history.Select(h => h.SpotPrice).ToArray());
     }
 
     async Task RenderChart()
     {
         if (_module is null) return;
-        var (labels, scores, prices) = BuildSeries();
-        await _module.InvokeVoidAsync("renderScoreWithPriceChart", "score-history-chart", labels, scores, prices, "#38bdf8", "#fbbf24");
+        var (labels, scores, fast, slow, prices) = BuildSeries();
+        await _module.InvokeVoidAsync("renderCoreScoreChart", "core-score-history-chart", labels, scores, fast, slow, prices);
     }
 
     // async void is required here -- Live.Updated is a plain event Action?, and it fires for
@@ -145,8 +197,8 @@
                 StateHasChanged();
                 if (_rendered && _module is not null)
                 {
-                    var (labels, scores, prices) = BuildSeries();
-                    await _module.InvokeVoidAsync("updateScoreWithPriceChart", "score-history-chart", labels, scores, prices);
+                    var (labels, scores, fast, slow, prices) = BuildSeries();
+                    await _module.InvokeVoidAsync("updateCoreScoreChart", "core-score-history-chart", labels, scores, fast, slow, prices);
                 }
             });
         }

@@ -101,14 +101,41 @@ public class LiveFeatureEngineTests
     }
 
     [Fact]
-    public void ComputeCadence_ComputesFuturesBasis_AsSyntheticForwardMinusSpot_IndependentOfTheTrackedFuture()
+    public void ComputeCadence_ComputesFuturesBasis_AsFutureMidMinusSpot()
     {
-        // Audit finding F11 (2026-09-08): basis must be measured against the option-derived
-        // synthetic forward (this weekly expiry), not the tracked monthly future -- a monthly
-        // future's own time-decay drift isn't sentiment, and it isn't even the contract these
-        // options expire with. Proven here the opposite way from before the fix: the tracked
-        // future's price now has ZERO effect on basis once a real synthetic forward can be
-        // solved from the option chain, because the future is no longer read at all.
+        // Basis is the real monthly future's own mid minus spot mid (2026-09-09 external
+        // review, reverting audit finding F11's original fix -- see the ParityGapRaw test
+        // below for the synthetic-forward-based diagnostic that replaced the reverted
+        // version). Two engines differing only in the future's price must produce genuinely
+        // different basis readings -- the opposite assertion from before this revert.
+        var engineA = new LiveFeatureEngine(BaseUniverse());
+        engineA.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engineA.OnTick(MakeTick(FutureToken, 24028.35m, Start));
+        engineA.OnTick(MakeTick(CallToken, 100m, Start, depth: Depth(bidQty: 10, askQty: 10, bid: 99.5m, ask: 100.5m)));
+        engineA.OnTick(MakeTick(PutToken, 80m, Start, depth: Depth(bidQty: 10, askQty: 10, bid: 79.5m, ask: 80.5m)));
+
+        var engineB = new LiveFeatureEngine(BaseUniverse());
+        engineB.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engineB.OnTick(MakeTick(FutureToken, 23200m, Start)); // wildly different future price
+        engineB.OnTick(MakeTick(CallToken, 100m, Start, depth: Depth(bidQty: 10, askQty: 10, bid: 99.5m, ask: 100.5m)));
+        engineB.OnTick(MakeTick(PutToken, 80m, Start, depth: Depth(bidQty: 10, askQty: 10, bid: 79.5m, ask: 80.5m)));
+
+        var snapshotA = engineA.ComputeCadence(Start);
+        var snapshotB = engineB.ComputeCadence(Start);
+
+        Assert.NotNull(snapshotA);
+        Assert.NotNull(snapshotB);
+        Assert.Equal(24028.35 - 23950, snapshotA!.FuturesBasisRaw!.Value, precision: 6);
+        Assert.Equal(23200 - 23950, snapshotB!.FuturesBasisRaw!.Value, precision: 6);
+    }
+
+    [Fact]
+    public void ComputeCadence_ComputesParityGap_AsSyntheticForwardMinusSpot_IndependentOfTheTrackedFuture()
+    {
+        // ParityGapRaw (2026-09-09 review, new alongside the F11 revert above): synthetic
+        // forward via put-call parity minus spot -- a quote-quality diagnostic, deliberately
+        // independent of the tracked future's own price (unlike FuturesBasisRaw above). This
+        // is exactly the assertion FuturesBasisRaw itself carried before the revert.
         var engineA = new LiveFeatureEngine(BaseUniverse());
         engineA.OnTick(MakeTick(SpotToken, 23950m, Start));
         engineA.OnTick(MakeTick(FutureToken, 24028.35m, Start)); // deliberately far from spot
@@ -126,8 +153,8 @@ public class LiveFeatureEngineTests
 
         Assert.NotNull(snapshotA);
         Assert.NotNull(snapshotB);
-        Assert.NotEqual(0, snapshotA!.FuturesBasisRaw!.Value, 6);
-        Assert.Equal(snapshotA.FuturesBasisRaw!.Value, snapshotB!.FuturesBasisRaw!.Value, precision: 6);
+        Assert.NotEqual(0, snapshotA!.ParityGapRaw!.Value, 6);
+        Assert.Equal(snapshotA.ParityGapRaw!.Value, snapshotB!.ParityGapRaw!.Value, precision: 6);
     }
 
     [Fact]
@@ -361,6 +388,36 @@ public class LiveFeatureEngineTests
         // or the new max -- rank must land exactly at 0 or 100, not somewhere in between.
         Assert.NotNull(snapshot!.IvRankRaw);
         Assert.True(snapshot.IvRankRaw is 0.0 or 100.0);
+        Assert.Equal(0, snapshot.IvRankSessionCount);
+    }
+
+    [Fact]
+    public void IvRankSessionCount_IsZero_BeforeAnyPriorSessionHistoryIsSeeded()
+    {
+        var engine = new LiveFeatureEngine(BaseUniverse());
+
+        Assert.Equal(0, engine.IvRankSessionCount);
+    }
+
+    [Fact]
+    public void ComputeCadence_IvRank_UsesPriorSessionDistribution_OnceFiveSessionsAreSeeded()
+    {
+        // 2026-09-09 review amendment to F3: once >= 5 prior sessions are seeded, IvRankRaw
+        // ranks against that fixed distribution starting from the very first cadence of the
+        // day -- no longer gated behind accumulating 2 same-day observations first (contrast
+        // with the unseeded cold-start test above, which is null on its first cadence).
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.SeedPriorSessionIvHistory([0.10, 0.12, 0.14, 0.16, 0.18]);
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, oi: 100_000, depth: Depth(bidQty: 500, askQty: 400, bid: 99.5m, ask: 100.5m)));
+        engine.OnTick(MakeTick(PutToken, 80m, Start, oi: 100_000, depth: Depth(bidQty: 300, askQty: 600, bid: 79.5m, ask: 80.5m)));
+
+        var snapshot = engine.ComputeCadence(Start);
+
+        Assert.Equal(5, engine.IvRankSessionCount);
+        Assert.Equal(5, snapshot!.IvRankSessionCount);
+        Assert.NotNull(snapshot.IvRankRaw);
     }
 
     [Fact]
@@ -633,18 +690,38 @@ public class LiveFeatureEngineTests
         // a 200-contract strike counted as loud as a 500,000-contract one, on the component
         // carrying the single largest weight in the composite. Weighted by |OI change|, the
         // far larger put buildup correctly dominates instead.
+        //
+        // Spans FeatureWindowLengths.OiComparisonWindow, not just one 15s cadence (audit
+        // finding F50, 2026-09-10): ComputeOiBuildupNet now compares OI against ~that long ago,
+        // not the previous cadence, matching how NSE/the broker actually refresh OI (~3
+        // minutes, not every 15s) -- see OiLookbackWindow. Ticks every 15s throughout (real
+        // cadence spacing, not one big jump) with OI held flat -- ComputeOiBuildupNet's own
+        // MaxCadenceGapForOiBuildup guard rejects a single >20s gap as looking like a feed
+        // outage, same as production calling ComputeCadence every 15s while the exchange's own
+        // OI print just lags behind underneath.
         var engine = new LiveFeatureEngine(BaseUniverse());
-        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
-        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
-        engine.OnTick(MakeTick(CallToken, 100m, Start, oi: 100_000));
-        engine.OnTick(MakeTick(PutToken, 80m, Start, oi: 100_000));
-        engine.ComputeCadence(Start);
+        var at = Start;
+        engine.OnTick(MakeTick(SpotToken, 23950m, at));
+        engine.OnTick(MakeTick(FutureToken, 24000m, at));
+        engine.OnTick(MakeTick(CallToken, 100m, at, oi: 100_000));
+        engine.OnTick(MakeTick(PutToken, 80m, at, oi: 100_000));
+        engine.ComputeCadence(at);
+
+        for (var elapsed = TimeSpan.FromSeconds(15); elapsed <= FeatureWindowLengths.OiComparisonWindow + TimeSpan.FromSeconds(15); elapsed += TimeSpan.FromSeconds(15))
+        {
+            at = Start + elapsed;
+            engine.OnTick(MakeTick(SpotToken, 23950m, at));
+            engine.OnTick(MakeTick(FutureToken, 24000m, at));
+            engine.OnTick(MakeTick(CallToken, 100m, at, oi: 100_000));
+            engine.OnTick(MakeTick(PutToken, 80m, at, oi: 100_000));
+            engine.ComputeCadence(at);
+        }
 
         // Spot up (classification is spot-driven since F17, not each leg's own price -- see
         // ComputeOiBuildupNet). Call: OI up by a small 1,000 -- LongBuildup, bullish, +1 sign,
         // small size. Put: OI up by a large 50,000 -- LongBuildup, bearish for a put, -1 sign,
         // large size. Old formula: (+1) + (-1) = 0. New formula: (+1,000) + (-50,000) = -49,000.
-        var next = Start.AddSeconds(15);
+        var next = at + TimeSpan.FromSeconds(15);
         engine.OnTick(MakeTick(SpotToken, 23960m, next));
         engine.OnTick(MakeTick(FutureToken, 24000m, next));
         engine.OnTick(MakeTick(CallToken, 105m, next, oi: 101_000));
@@ -779,7 +856,78 @@ public class LiveFeatureEngineTests
         // pre-spike baseline is robust to whatever ambient value that baseline happens to be.
         var smoothedMove = Math.Abs(spiked.CompositeScoreRaw!.Value - preSpikeSmoothed);
         var instantMove = Math.Abs(spiked.CompositeScoreRawInstant!.Value - preSpikeSmoothed);
-        Assert.True(smoothedMove < instantMove / 2);
+        // <= not < (audit finding F46, 2026-09-10): fixing the z-score self-inclusion bug
+        // removed a pre-existing dampening bias from the instant reading itself, which moved
+        // this specific deterministic scenario's ratio to exactly 0.5 -- still strong smoothing
+        // (only ~1/12 FIFO leak-through, as expected for CompositeSmoothingCadences=12), just
+        // sitting exactly on the old strict boundary rather than under it.
+        Assert.True(smoothedMove <= instantMove / 2);
+    }
+
+    [Fact]
+    public void ComputeCadence_FuturesBasisZ_ExcludesCurrentObservationFromItsOwnWindow()
+    {
+        // Audit finding F46 (2026-09-10): the current cadence's raw value must be scored
+        // against the window's state as it stood BEFORE this observation, never after --
+        // otherwise an outlier inflates its own comparison stddev and understates its own
+        // extremity. FuturesBasis is used here (rather than the more heavily-weighted
+        // OiBuildupNet) because its raw value is a simple, fully test-controlled
+        // futureMark-spot subtraction with no option-chain machinery involved.
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        var shadowWindow = new WelfordRollingWindow(FeatureWindowLengths.FuturesBasis);
+
+        var at = Start;
+        ScoreSnapshot? snapshot = null;
+        // Oscillate basis between two close values for a bit over the 30-minute window so
+        // FuturesBasisZ warms up with a real (non-zero) spread to divide by.
+        for (var elapsed = TimeSpan.Zero; elapsed <= FeatureWindowLengths.FuturesBasis + TimeSpan.FromMinutes(2); elapsed += TimeSpan.FromSeconds(15))
+        {
+            at = Start + elapsed;
+            var cadenceIndex = elapsed.Ticks / TimeSpan.FromSeconds(15).Ticks;
+            var basis = cadenceIndex % 2 == 0 ? 100m : 102m;
+            engine.OnTick(MakeTick(SpotToken, 23900m, at));
+            engine.OnTick(MakeTick(FutureToken, 23900m + basis, at));
+            snapshot = engine.ComputeCadence(at);
+
+            // Mirrors the engine's own basis window exactly -- same values, same timestamps,
+            // fed from the same public FuturesBasisRaw the engine computed internally -- so
+            // this shadow window's state is identical to the engine's private _basisWindow
+            // without needing to reach into it.
+            if (snapshot?.FuturesBasisRaw is { } raw)
+            {
+                shadowWindow.Add(at, raw);
+            }
+        }
+
+        Assert.NotNull(snapshot);
+        Assert.NotNull(snapshot!.FuturesBasisZ);
+
+        // A moderate outlier relative to the 100/102 oscillation (mean ~101) -- deliberately
+        // NOT extreme: an outlier large enough to saturate the +/-3 clamp under both orderings
+        // would make them indistinguishable after clamping, hiding the very divergence this
+        // test exists to catch.
+        var spikeAt = at + TimeSpan.FromSeconds(15);
+        engine.OnTick(MakeTick(SpotToken, 23900m, spikeAt));
+        engine.OnTick(MakeTick(FutureToken, 23900m + 103m, spikeAt));
+        var spiked = engine.ComputeCadence(spikeAt);
+
+        Assert.NotNull(spiked);
+        Assert.NotNull(spiked!.FuturesBasisRaw);
+        Assert.NotNull(spiked.FuturesBasisZ);
+
+        // Correct (fixed) behavior: z computed against the shadow window's state as it stood
+        // before the spike -- must match the engine's actual FuturesBasisZ exactly.
+        var correctZ = shadowWindow.ComputeZScore(spiked.FuturesBasisRaw!.Value);
+        Assert.Equal(correctZ, spiked.FuturesBasisZ);
+
+        // The bug this guards against: had the engine (wrongly) added the spike to the window
+        // before scoring it, the spike would inflate its own comparison stddev and understate
+        // its own extremity. Confirm the two orderings actually diverge for this scenario
+        // (otherwise this test wouldn't be discriminating at all), and that the engine's real
+        // answer is not the buggy one.
+        shadowWindow.Add(spikeAt, spiked.FuturesBasisRaw!.Value);
+        var buggyZ = shadowWindow.ComputeZScore(spiked.FuturesBasisRaw!.Value);
+        Assert.NotEqual(buggyZ, spiked.FuturesBasisZ);
     }
 
     [Fact]
@@ -1254,6 +1402,21 @@ public class LiveFeatureEngineTests
     }
 
     [Fact]
+    public void BuildStrikeCandidates_ReportsCumulativeDayVolume_NotAHardcodedZero()
+    {
+        // Audit finding F19: Volume used to be hardcoded 0, making StrikeSelector's own
+        // volume tie-break a permanent no-op (always 0 vs 0).
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        engine.OnTick(MakeTick(CallToken, 100m, Start, oi: 1_000_000, depth: Depth(500, 400, bid: 99.9m, ask: 100.1m), volume: 42_000));
+
+        var candidate = Assert.Single(engine.BuildStrikeCandidates(OptionType.Call, Start));
+
+        Assert.Equal(42_000, candidate.Volume);
+    }
+
+    [Fact]
     public void BuildStrikeCandidates_PricesIvAgainstSpot_NotTheMismatchedTrackedFuture()
     {
         // Regression test for the 2026-09-04 live-caught bug ("all put IVs read >10, call
@@ -1314,8 +1477,8 @@ public class LiveFeatureEngineTests
         var snapshot = engine.ComputeCadence(Start);
 
         Assert.NotNull(snapshot);
-        Assert.NotNull(snapshot!.IvSkewRaw);
-        Assert.Equal(0.0, snapshot.IvSkewRaw!.Value, 1e-3);
+        Assert.NotNull(snapshot!.IvSkewOneSigmaRaw);
+        Assert.Equal(0.0, snapshot.IvSkewOneSigmaRaw!.Value, 1e-3);
     }
 
     [Fact]
@@ -1373,8 +1536,8 @@ public class LiveFeatureEngineTests
 
             var snapshot = engine.ComputeCadence(Start);
             Assert.NotNull(snapshot);
-            Assert.NotNull(snapshot!.IvSkewRaw);
-            return snapshot.IvSkewRaw!.Value;
+            Assert.NotNull(snapshot!.IvSkewOneSigmaRaw);
+            return snapshot.IvSkewOneSigmaRaw!.Value;
         }
 
         var lowVolSkew = SkewAtAtmVol(0.12);
@@ -1493,7 +1656,7 @@ public class LiveFeatureEngineTests
                 OiBuildupNetRaw = Wave(1.0, i),
                 PcrRaw = 0.8 + Wave(0.1, i),
                 FuturesBasisRaw = 100 + Wave(20, i),
-                IvSkewRaw = Wave(0.05, i),
+                IvSkewOneSigmaRaw = Wave(0.05, i),
                 PriceMomentumRaw = Wave(10, i),
                 DepthImbalanceRaw = Wave(0.3, i),
                 WeightSetVersion = "v1",
@@ -1525,5 +1688,662 @@ public class LiveFeatureEngineTests
         // arrived yet) -- SeedHistory should skip it, not feed a fabricated 0 into the window.
         var exception = Record.Exception(() => engine.SeedHistory(history));
         Assert.Null(exception);
+    }
+
+    // --- Ratio-based composite score (weekend build, 2026-09-09) ---------------------------
+
+    /// <summary>ATM+/-5 strikes at 50-point spacing, offset 0 == the 23950 ATM strike used everywhere else in this file -- BaseUniverse's single pair is insufficient for the ratio composite's wider bands (metrics 1/2's ATM+/-5).</summary>
+    static string WideCallToken(int offsetFromAtm) => $"7{offsetFromAtm + 5:00}";
+    static string WidePutToken(int offsetFromAtm) => $"8{offsetFromAtm + 5:00}";
+
+    static List<Instrument> WideRatioUniverse()
+    {
+        var universe = new List<Instrument> { Spot(), Future() };
+        for (var offset = -5; offset <= 5; offset++)
+        {
+            var strike = 23950m + (offset * 50m);
+            universe.Add(Option(WideCallToken(offset), OptionType.Call, strike));
+            universe.Add(Option(WidePutToken(offset), OptionType.Put, strike));
+        }
+
+        return universe;
+    }
+
+    /// <summary>
+    /// Ticks every strike in <see cref="WideRatioUniverse"/> with real Black-Scholes-consistent
+    /// two-way quotes (priced from <paramref name="underlying"/>/<paramref name="vol"/> at each
+    /// strike) rather than an arbitrary linear price ladder -- a hand-rolled price scheme
+    /// produces strike/price combinations the IV solver can't reliably round-trip (or that
+    /// don't bracket a real 25-delta strike for metric 4's selection), where a real BS price at
+    /// a known vol always converges cleanly. Shared setup for the tests below.
+    /// </summary>
+    static void TickWideRatioUniverse(LiveFeatureEngine engine, DateTimeOffset at, decimal underlying = 23950m, double vol = 0.40, long oi = 100_000, long volume = 1_000)
+    {
+        var t = TimeToExpiry.YearsUntilExpiry(NearestExpiry, at);
+        for (var offset = -5; offset <= 5; offset++)
+        {
+            var strike = 23950m + (offset * 50m);
+            var callPrice = Math.Max(0.5m, (decimal)BlackScholes.Calculate(OptionType.Call, (double)underlying, (double)strike, t, 0.065, vol).Price);
+            var putPrice = Math.Max(0.5m, (decimal)BlackScholes.Calculate(OptionType.Put, (double)underlying, (double)strike, t, 0.065, vol).Price);
+            engine.OnTick(MakeTick(WideCallToken(offset), callPrice, at, oi: oi, depth: Depth(500, 400, bid: callPrice - 0.5m, ask: callPrice + 0.5m), volume: volume));
+            engine.OnTick(MakeTick(WidePutToken(offset), putPrice, at, oi: oi, depth: Depth(500, 400, bid: putPrice - 0.5m, ask: putPrice + 0.5m), volume: volume));
+        }
+    }
+
+    [Fact]
+    public void FuturesVwapDeviationZ_IsNull_BeforeTheThirtyMinuteWindowWarmsUp()
+    {
+        // Audit finding F55's price-led dynamic-hybrid mode: FeatureWindowLengths.FuturesVwapDeviation
+        // is 30 minutes of real elapsed time (WelfordRollingWindow.IsWarmedUp), not a cadence
+        // count -- a single early cadence must not report a z-score.
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start, volume: 1_000));
+
+        var snapshot = engine.ComputeCadence(Start);
+
+        Assert.NotNull(snapshot);
+        Assert.Null(snapshot!.FuturesVwapDeviationZ);
+        // FuturesVwap itself is also null on this very first cadence -- the first tick for any
+        // token always contributes a zero volume delta (no prior baseline to diff against yet,
+        // same "no prior observation" convention every other VolumeDelta-based metric in this
+        // class already follows), so cumulative volume is still 0 here.
+        Assert.Null(snapshot.FuturesVwap);
+
+        // A second tick with real volume gives the future a real delta to accumulate -- VWAP
+        // becomes available (even though the z-score still isn't, real elapsed time is nowhere
+        // near 30 minutes yet).
+        var next = Start.AddSeconds(15);
+        engine.OnTick(MakeTick(FutureToken, 24010m, next, volume: 2_000));
+        var snapshot2 = engine.ComputeCadence(next);
+
+        Assert.NotNull(snapshot2);
+        Assert.Null(snapshot2!.FuturesVwapDeviationZ);
+        Assert.NotNull(snapshot2.FuturesVwap);
+    }
+
+    [Fact]
+    public void FuturesVwapDeviationZ_GoesPositive_WhenPriceJumpsAwayFromAnAlreadyWarmFlatBaseline()
+    {
+        // Audit finding F55's price-led dynamic-hybrid mode (2026-09-11, user's own diagnosis:
+        // every ratio metric is built from option chain data that *reacts* to price, so none of
+        // it can lead -- entries need something that moves *with* price instead). The future's
+        // own price relative to its own volume-weighted average price is the most direct,
+        // zero-lag signal available.
+        //
+        // Warm the 30-minute window on a long, FLAT baseline first (so its recent-history mean
+        // and stddev are small and stable), then check right after a fresh jump -- not at the end
+        // of a long climb. A first version of this test checked *after* a 100-cadence climb and
+        // got a *negative* z-score: VWAP is a cumulative, never-evicting average, so across a long
+        // climb it keeps catching up to the new price, meaning deviation itself decays over the
+        // climb -- by the end, current deviation can legitimately sit *below* the rolling window's
+        // own recent (still climb-dominated, still-elevated) mean, even though the raw deviation
+        // is still positive. That's the metric correctly measuring "still rising or already
+        // settling," not a bug -- but it means the right moment to see a clean positive spike is
+        // right as the jump happens, before VWAP has had time to react to it.
+        var engine = new LiveFeatureEngine(BaseUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+
+        var at = Start;
+        ScoreSnapshot? snapshot = null;
+
+        // Flat baseline, 130 cadences (32.5 min -- comfortably past the 30-minute warm-up mark),
+        // constant per-tick volume delta (Tick.Volume is cumulative day volume, so this must keep
+        // growing -- 1_000*(i+1) gives an exact 1_000 delta every tick, i.e. equal VWAP weighting
+        // per tick, not "no new volume" the way a literal constant Volume value would).
+        for (var i = 0; i < 130; i++)
+        {
+            engine.OnTick(MakeTick(FutureToken, 24000m + (i % 2), at, volume: 1_000 * (i + 1)));
+            snapshot = engine.ComputeCadence(at);
+            at = at.AddSeconds(15);
+        }
+
+        // A sharp jump to 24200, one cadence in: 130 flat ticks already anchor VWAP near 24000,
+        // so a single new tick barely moves it -- deviation jumps to roughly +200 while the
+        // window's recent mean/stddev are still small (dominated by the flat baseline), which is
+        // exactly the "fresh, sharp move" case this metric exists to catch fast.
+        engine.OnTick(MakeTick(FutureToken, 24200m, at, volume: 1_000 * 131));
+        var jumpSnapshot = engine.ComputeCadence(at);
+
+        Assert.NotNull(jumpSnapshot);
+        Assert.NotNull(jumpSnapshot!.FuturesVwapDeviationZ);
+        Assert.True(jumpSnapshot.FuturesVwapDeviationRaw > 0, $"Raw deviation ({jumpSnapshot.FuturesVwapDeviationRaw:F2}) should be positive right after the jump.");
+        Assert.True(jumpSnapshot.FuturesVwapDeviationZ!.Value > 0, $"FuturesVwapDeviationZ ({jumpSnapshot.FuturesVwapDeviationZ.Value:F2}) should be positive right after a fresh jump above an already-warm flat baseline.");
+    }
+
+    // ==================== Core score (2026-09-13, live-wiring plan Batch 2) ====================
+
+    /// <summary>ATM+/-10 strikes at 50-point spacing -- WideRatioUniverse's own ATM+/-5 span is too narrow for GammaExposure's ATM+/-CoreGammaBandOffset(10) band. Distinct token prefixes from WideRatioUniverse so both can coexist in the same test if ever needed.</summary>
+    static string WideCoreCallToken(int offsetFromAtm) => $"9{offsetFromAtm + 10:00}";
+    static string WideCorePutToken(int offsetFromAtm) => $"6{offsetFromAtm + 10:00}";
+
+    static List<Instrument> WideCoreUniverse()
+    {
+        var universe = new List<Instrument> { Spot(), Future() };
+        for (var offset = -10; offset <= 10; offset++)
+        {
+            var strike = 23950m + (offset * 50m);
+            universe.Add(Option(WideCoreCallToken(offset), OptionType.Call, strike));
+            universe.Add(Option(WideCorePutToken(offset), OptionType.Put, strike));
+        }
+
+        return universe;
+    }
+
+    /// <summary>Same real-Black-Scholes-quote approach as TickWideRatioUniverse, extended to the full ATM+/-10 span.</summary>
+    static void TickWideCoreUniverse(LiveFeatureEngine engine, DateTimeOffset at, decimal underlying = 23950m, double vol = 0.20, long oi = 100_000, long volume = 1_000)
+    {
+        var t = TimeToExpiry.YearsUntilExpiry(NearestExpiry, at);
+        for (var offset = -10; offset <= 10; offset++)
+        {
+            var strike = 23950m + (offset * 50m);
+            var callPrice = Math.Max(0.5m, (decimal)BlackScholes.Calculate(OptionType.Call, (double)underlying, (double)strike, t, 0.065, vol).Price);
+            var putPrice = Math.Max(0.5m, (decimal)BlackScholes.Calculate(OptionType.Put, (double)underlying, (double)strike, t, 0.065, vol).Price);
+            engine.OnTick(MakeTick(WideCoreCallToken(offset), callPrice, at, oi: oi, depth: Depth(500, 400, bid: callPrice - 0.5m, ask: callPrice + 0.5m), volume: volume));
+            engine.OnTick(MakeTick(WideCorePutToken(offset), putPrice, at, oi: oi, depth: Depth(500, 400, bid: putPrice - 0.5m, ask: putPrice + 0.5m), volume: volume));
+        }
+    }
+
+    [Fact]
+    public void ComputeCadence_CoreScorePointInTimeMetrics_AreNotNull_OnTheVeryFirstCadence()
+    {
+        // DepthImbalance/ItmSkew/GammaExposure need no prior cadence -- unlike the flow metrics
+        // below, they should populate immediately once real quotes/OI exist.
+        var engine = new LiveFeatureEngine(WideCoreUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        TickWideCoreUniverse(engine, Start);
+
+        var snapshot = engine.ComputeCadence(Start);
+        var coreSnapshot = engine.LastCoreScoreSnapshot;
+
+        Assert.NotNull(snapshot);
+        Assert.NotNull(coreSnapshot);
+        Assert.NotNull(coreSnapshot!.DepthImbalanceRaw);
+        Assert.NotNull(coreSnapshot.ItmSkewRaw);
+        Assert.NotNull(coreSnapshot.GammaExposureRaw);
+    }
+
+    [Fact]
+    public void ComputeCadence_CoreScoreFlowMetrics_AreNullOrZero_OnTheVeryFirstCadence_WithNoPriorStateToDeltaAgainst()
+    {
+        var engine = new LiveFeatureEngine(WideCoreUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start, depth: Depth(bidQty: 10, askQty: 10, bid: 23999.5m, ask: 24000.5m)));
+        TickWideCoreUniverse(engine, Start);
+
+        engine.ComputeCadence(Start);
+        var coreSnapshot = engine.LastCoreScoreSnapshot;
+
+        Assert.NotNull(coreSnapshot);
+        // NotionalVolumeRatio needs a prior volume baseline to compute a delta -- null on the
+        // very first cadence, same as OiBuildupNetRaw's own well-established behavior.
+        Assert.Null(coreSnapshot!.NotionalVolumeRatioRaw);
+        // TrendReversion15m/BasisChange (Batch 3 fix) use THIS cadence's own future/spot LTP
+        // open-to-close, not a prior-cadence price -- with exactly one future/spot tick this
+        // cadence, CadenceOpen == CadenceClose, so both changes are a real 0, not null.
+        // TrendReversion15m itself stays null: its window holds one 0-valued observation, giving
+        // a zero path length that can't be normalized (net/pathLength), matching
+        // CoreScoreOptionSimulator's own path>0 guard.
+        Assert.Null(coreSnapshot.TrendReversion15mRaw);
+        Assert.Equal(0, coreSnapshot.BasisChangeRaw);
+        // OiChangeDiff15m needs _previousCadence, which doesn't exist yet -- null, not zero.
+        Assert.Null(coreSnapshot.OiChangeDiff15mRaw);
+        // FutureCvdNet5Min (Batch 3 fix, second pass): the 5-minute rolling SUM needs a full 5
+        // real minutes elapsed since its own first cadence contribution before it's trusted --
+        // matching RollingNetSumWindow.IsWarmedUp exactly (`latestTimestamp - firstSeenAt >=
+        // window`) -- so it's null on the very first cadence (0 elapsed), not a real 0, even
+        // though the per-tick volume delta itself is genuinely 0 this cadence (no prior volume to
+        // diff against).
+        Assert.Null(coreSnapshot.FutureCvdNet5MinRaw);
+    }
+
+    [Fact]
+    public void ComputeCoreDepthImbalance_ExcludesStrikesOutsideItm2Atm1Band()
+    {
+        // Itm2Atm1: calls {-2,-1,0}, puts {0,+1,+2} by signed offset. Construct a universe where
+        // the two furthest-in-band strikes (call offset -2, put offset +2) have a strongly
+        // bullish depth reading, and everything OUTSIDE the band (offset +/-3 and beyond) has an
+        // equally strong BEARISH reading -- if the band filter leaks, the result flips sign.
+        var engine = new LiveFeatureEngine(WideCoreUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        TickWideCoreUniverse(engine, Start);
+        // Flush TickWideCoreUniverse's own neutral depth (500/400 on every strike) into a
+        // completed cadence before sending the skewed depth this test actually asserts on --
+        // DepthImbalance now averages every tick THIS cadence per strike (Batch 3 fix, matching
+        // CadencePopulator's own DepthImbalanceAccumulator), so without this flush the neutral
+        // baseline tick would blend into the skewed reading below instead of being superseded by
+        // it (the old "last tick wins" semantics this test was originally written against).
+        engine.ComputeCadence(Start);
+
+        // Overwrite depth on every strike: heavily bid-skewed (bullish) inside Itm2Atm1, heavily
+        // ask-skewed (bearish) outside it, on BOTH sides -- a leaking band would pull the result
+        // toward 0 or flip its sign; a correct band keeps it strongly positive (call-bid-heavy
+        // minus put-bid-heavy, matching CoreScoreOptionSimulator's own "positive = bullish" sign).
+        var next = Start.AddSeconds(15);
+        for (var offset = -10; offset <= 10; offset++)
+        {
+            var strike = 23950m + (offset * 50m);
+            var callPrice = Math.Max(0.5m, (decimal)BlackScholes.Calculate(OptionType.Call, 23950, (double)strike, TimeToExpiry.YearsUntilExpiry(NearestExpiry, next), 0.065, 0.20).Price);
+            var putPrice = Math.Max(0.5m, (decimal)BlackScholes.Calculate(OptionType.Put, 23950, (double)strike, TimeToExpiry.YearsUntilExpiry(NearestExpiry, next), 0.065, 0.20).Price);
+
+            var callInItm2Atm1 = offset is >= -2 and <= 0;
+            var putInItm2Atm1 = offset is >= 0 and <= 2;
+            var callDepth = callInItm2Atm1 ? Depth(bidQty: 900, askQty: 100, bid: callPrice - 0.5m, ask: callPrice + 0.5m) : Depth(bidQty: 100, askQty: 900, bid: callPrice - 0.5m, ask: callPrice + 0.5m);
+            var putDepth = putInItm2Atm1 ? Depth(bidQty: 100, askQty: 900, bid: putPrice - 0.5m, ask: putPrice + 0.5m) : Depth(bidQty: 900, askQty: 100, bid: putPrice - 0.5m, ask: putPrice + 0.5m);
+
+            engine.OnTick(MakeTick(WideCoreCallToken(offset), callPrice, next, oi: 100_000, depth: callDepth, volume: 1_000));
+            engine.OnTick(MakeTick(WideCorePutToken(offset), putPrice, next, oi: 100_000, depth: putDepth, volume: 1_000));
+        }
+
+        engine.ComputeCadence(next);
+        var coreSnapshot = engine.LastCoreScoreSnapshot;
+
+        Assert.NotNull(coreSnapshot);
+        Assert.NotNull(coreSnapshot!.DepthImbalanceRaw);
+        // Bid-heavy calls (bullish) minus ask-heavy... wait, put side is ask-heavy within the
+        // band per the setup above (putInItm2Atm1 => bidQty:100, askQty:900) -- a call imbalance
+        // near +0.8 minus a put imbalance near -0.8 should land close to +1.6, strongly positive.
+        Assert.True(coreSnapshot.DepthImbalanceRaw!.Value > 1.0, $"Expected a strongly positive band-restricted DepthImbalance, got {coreSnapshot.DepthImbalanceRaw.Value:F3} -- the Itm2Atm1 band may be leaking strikes it shouldn't.");
+    }
+
+    [Fact]
+    public void ComputeCoreItmSkew_IsNull_OnA0DteExpiryDay()
+    {
+        // NearestExpiry is fixed at 2026-09-08 by this file's own Option()/Future() helpers --
+        // pass a cadence timestamp whose IST date equals that expiry to trigger the 0-DTE check,
+        // regardless of AsOfDate.
+        var expiryDayNow = new DateTimeOffset(2026, 9, 8, 10, 0, 0, TimeSpan.FromHours(5.5));
+        var engine = new LiveFeatureEngine(WideCoreUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, expiryDayNow));
+        engine.OnTick(MakeTick(FutureToken, 24000m, expiryDayNow));
+        TickWideCoreUniverse(engine, expiryDayNow);
+
+        engine.ComputeCadence(expiryDayNow);
+        var coreSnapshot = engine.LastCoreScoreSnapshot;
+
+        Assert.NotNull(coreSnapshot);
+        Assert.Null(coreSnapshot!.ItmSkewRaw);
+        // Renormalize-by-present-weight (CoreScoreCalculator) must still publish a score from the
+        // other 7 terms -- ItmSkew being null must not withhold the whole Core score.
+        Assert.NotNull(coreSnapshot.CoreScore);
+    }
+
+    [Fact]
+    public void ComputeCoreItmSkew_IsNotNull_OnANonExpiryDay_WithTheSameUniverse()
+    {
+        // Same universe/quotes as the 0-DTE test above, different day -- isolates the 0-DTE
+        // check itself as the cause of the null, not some other missing precondition.
+        var engine = new LiveFeatureEngine(WideCoreUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        TickWideCoreUniverse(engine, Start);
+
+        engine.ComputeCadence(Start);
+
+        Assert.NotNull(engine.LastCoreScoreSnapshot!.ItmSkewRaw);
+    }
+
+    [Fact]
+    public void ComputeCoreGammaExposure_ExcludesStrikesOutsideAtmPlusMinusTen()
+    {
+        // Set OI to 0 (excluded from the sum, per ComputeCoreGammaExposureRaw's own OI>0 guard)
+        // on every strike EXCEPT one just inside the band (offset +10) and one just outside it
+        // (offset +11 -- add one more ring to WideCoreUniverse's own +/-10 span for this one
+        // strike) -- if the band leaks, the outside strike's nonzero OI would change the result.
+        var universe = WideCoreUniverse();
+        const int outsideOffset = 11;
+        var outsideStrike = 23950m + (outsideOffset * 50m);
+        universe.Add(Option("outside_call", OptionType.Call, outsideStrike));
+        var engine = new LiveFeatureEngine(universe);
+
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        var t = TimeToExpiry.YearsUntilExpiry(NearestExpiry, Start);
+
+        // Every strike in the +/-10 band: zero OI (contributes nothing).
+        for (var offset = -10; offset <= 10; offset++)
+        {
+            var strike = 23950m + (offset * 50m);
+            var callPrice = Math.Max(0.5m, (decimal)BlackScholes.Calculate(OptionType.Call, 23950, (double)strike, t, 0.065, 0.20).Price);
+            var putPrice = Math.Max(0.5m, (decimal)BlackScholes.Calculate(OptionType.Put, 23950, (double)strike, t, 0.065, 0.20).Price);
+            engine.OnTick(MakeTick(WideCoreCallToken(offset), callPrice, Start, oi: 0, depth: Depth(500, 400, bid: callPrice - 0.5m, ask: callPrice + 0.5m)));
+            engine.OnTick(MakeTick(WideCorePutToken(offset), putPrice, Start, oi: 0, depth: Depth(500, 400, bid: putPrice - 0.5m, ask: putPrice + 0.5m)));
+        }
+
+        // The one strike outside the band: large OI. If it leaked into the sum, GammaExposureRaw
+        // would be strongly nonzero; if the band correctly excludes it, the result is null (no
+        // strike inside the band had any OI at all).
+        var outsidePrice = Math.Max(0.5m, (decimal)BlackScholes.Calculate(OptionType.Call, 23950, (double)outsideStrike, t, 0.065, 0.20).Price);
+        engine.OnTick(MakeTick("outside_call", outsidePrice, Start, oi: 1_000_000, depth: Depth(500, 400, bid: outsidePrice - 0.5m, ask: outsidePrice + 0.5m)));
+
+        engine.ComputeCadence(Start);
+
+        Assert.Null(engine.LastCoreScoreSnapshot!.GammaExposureRaw);
+    }
+
+    [Fact]
+    public void ComputeCoreNotionalVolumeRatio_ExcludesStrikesOutsideAtmPlusMinusFive()
+    {
+        // WideRatioUniverse spans exactly ATM+/-5 -- if NotionalVolumeRatio's own band leaked
+        // beyond it, this test wouldn't catch that (no wider strikes exist). Instead: prove the
+        // computed ratio only reflects the two ATM+/-5-inclusive edge strikes' own notional by
+        // comparing against a hand-computed expectation using ALL eleven strikes on each side
+        // (the whole WideRatioUniverse IS the ATM+/-5 band, so this doubles as the "matches a
+        // manual computation" test for this metric).
+        var engine = new LiveFeatureEngine(WideRatioUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        TickWideRatioUniverse(engine, Start, volume: 0); // volume=0 baseline: first real deltas come next cadence
+        engine.ComputeCadence(Start);
+
+        var at = Start.AddSeconds(15);
+        double expectedCallNotional = 0, expectedPutNotional = 0;
+        var t = TimeToExpiry.YearsUntilExpiry(NearestExpiry, at);
+        for (var offset = -5; offset <= 5; offset++)
+        {
+            var strike = 23950m + (offset * 50m);
+            var callPrice = Math.Max(0.5m, (decimal)BlackScholes.Calculate(OptionType.Call, 23950, (double)strike, t, 0.065, 0.40).Price);
+            var putPrice = Math.Max(0.5m, (decimal)BlackScholes.Calculate(OptionType.Put, 23950, (double)strike, t, 0.065, 0.40).Price);
+            engine.OnTick(MakeTick(WideCallToken(offset), callPrice, at, oi: 100_000, depth: Depth(500, 400, bid: callPrice - 0.5m, ask: callPrice + 0.5m), volume: 1_000));
+            engine.OnTick(MakeTick(WidePutToken(offset), putPrice, at, oi: 100_000, depth: Depth(500, 400, bid: putPrice - 0.5m, ask: putPrice + 0.5m), volume: 1_000));
+            expectedCallNotional += 1_000 * (double)callPrice;
+            expectedPutNotional += 1_000 * (double)putPrice;
+        }
+
+        engine.ComputeCadence(at);
+        var coreSnapshot = engine.LastCoreScoreSnapshot;
+
+        Assert.NotNull(coreSnapshot);
+        Assert.NotNull(coreSnapshot!.NotionalVolumeRatioRaw);
+        var expected = Math.Log(expectedPutNotional / expectedCallNotional);
+        Assert.Equal(expected, coreSnapshot.NotionalVolumeRatioRaw!.Value, precision: 3);
+    }
+
+    [Fact]
+    public void ComputeCoreTrendReversionAndBasisChange_UseWithinCadenceLtpOpenToCloseChange()
+    {
+        // Batch 3 fix: TrendReversion15m/BasisChange read THIS cadence's own future/spot LTP
+        // open-to-close (CadenceContext.FutureChangeFromLastCadence/SpotChangeFromLastCadence's
+        // actual definition, despite the "FromLastCadence" name -- see ComputeCoreTrendAndBasis's
+        // own doc comment), not a cross-cadence previous-mid-to-current-mid diff.
+        var engine = new LiveFeatureEngine(WideCoreUniverse());
+
+        // First cadence: exactly one future/spot tick each -- CadenceOpen == CadenceClose, so
+        // futureChange/spotChange are a real 0 (not null), matching InstrumentPriceState's own
+        // CadenceClose-CadenceOpen with a single tick. BasisChange is therefore a real 0 (0-0),
+        // but TrendReversion15m stays null: its window holds one 0-valued observation, giving a
+        // zero path length that can't be normalized (net/pathLength), matching
+        // CoreScoreOptionSimulator's own path>0 guard.
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start, depth: null));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start, depth: Depth(bidQty: 10, askQty: 10, bid: 23999m, ask: 24001m)));
+        TickWideCoreUniverse(engine, Start);
+        engine.ComputeCadence(Start);
+
+        Assert.Null(engine.LastCoreScoreSnapshot!.TrendReversion15mRaw);
+        Assert.Equal(0, engine.LastCoreScoreSnapshot!.BasisChangeRaw);
+
+        // Second cadence: future prints 24000 then 24020 WITHIN this cadence (open=24000,
+        // close=24020, futureChange=+20); spot prints 23950 then 23960 within the same cadence
+        // (spotChange=+10). TrendReversion15m = -1 * (net/pathLength); with a single observation
+        // in the window, net == pathLength == 20, so TrendReversion15m == -1.0 exactly (full
+        // saturation, a single clean move). BasisChange = futureChange - spotChange = 20 - 10 = 10.
+        var at = Start.AddSeconds(15);
+        engine.OnTick(MakeTick(SpotToken, 23950m, at, depth: null));
+        engine.OnTick(MakeTick(FutureToken, 24000m, at, depth: Depth(bidQty: 10, askQty: 10, bid: 23999m, ask: 24001m)));
+        engine.OnTick(MakeTick(SpotToken, 23960m, at, depth: null));
+        engine.OnTick(MakeTick(FutureToken, 24020m, at, depth: Depth(bidQty: 10, askQty: 10, bid: 24019m, ask: 24021m)));
+        TickWideCoreUniverse(engine, at);
+        engine.ComputeCadence(at);
+
+        var coreSnapshot = engine.LastCoreScoreSnapshot;
+        Assert.NotNull(coreSnapshot);
+        Assert.Equal(-1.0, coreSnapshot!.TrendReversion15mRaw!.Value, precision: 6);
+        Assert.Equal(10.0, coreSnapshot.BasisChangeRaw!.Value, precision: 6);
+    }
+
+    [Fact]
+    public void ComputeCoreOiChangeDiff_ExcludesStrikesOutsideAtmPlusMinusTwo_AndAccumulatesOverTheRollingWindow()
+    {
+        var engine = new LiveFeatureEngine(WideCoreUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start));
+        TickWideCoreUniverse(engine, Start, oi: 100_000);
+        engine.ComputeCadence(Start);
+
+        Assert.Null(engine.LastCoreScoreSnapshot!.OiChangeDiff15mRaw);
+
+        // Second cadence: bump OI by +5,000 on every call strike, +1,000 on every put strike,
+        // both inside AND outside ATM+/-2 -- if the band leaks, the sum grows far beyond what the
+        // 5 in-band strikes (offsets -2..2) alone would produce.
+        var at = Start.AddSeconds(15);
+        var t = TimeToExpiry.YearsUntilExpiry(NearestExpiry, at);
+        for (var offset = -10; offset <= 10; offset++)
+        {
+            var strike = 23950m + (offset * 50m);
+            var callPrice = Math.Max(0.5m, (decimal)BlackScholes.Calculate(OptionType.Call, 23950, (double)strike, t, 0.065, 0.20).Price);
+            var putPrice = Math.Max(0.5m, (decimal)BlackScholes.Calculate(OptionType.Put, 23950, (double)strike, t, 0.065, 0.20).Price);
+            engine.OnTick(MakeTick(WideCoreCallToken(offset), callPrice, at, oi: 105_000, depth: Depth(500, 400, bid: callPrice - 0.5m, ask: callPrice + 0.5m)));
+            engine.OnTick(MakeTick(WideCorePutToken(offset), putPrice, at, oi: 101_000, depth: Depth(500, 400, bid: putPrice - 0.5m, ask: putPrice + 0.5m)));
+        }
+
+        engine.ComputeCadence(at);
+        var coreSnapshot = engine.LastCoreScoreSnapshot;
+
+        Assert.NotNull(coreSnapshot);
+        // Exactly 5 strikes in ATM+/-2 (offsets -2..2): callDelta = 5*5,000=25,000, putDelta =
+        // 5*1,000=5,000 -- CallOiDelta-PutOiDelta = 20,000. A leaking band (all 21 strikes) would
+        // give 21*5,000 - 21*1,000 = 84,000 instead.
+        Assert.Equal(20_000.0, coreSnapshot!.OiChangeDiff15mRaw!.Value, precision: 6);
+    }
+
+    [Fact]
+    public void ComputeCoreFutureCvdNet5Min_ClassifiesByQuoteRule_SignsBuyLeaningTicksPositive()
+    {
+        var engine = new LiveFeatureEngine(WideCoreUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        // First future tick just establishes the volume baseline (no prior volume -> delta 0,
+        // contributes nothing) -- matches FutureCvdProxyAccumulator's own "skip if volumeDelta<=0" rule.
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start, depth: Depth(bidQty: 10, askQty: 10, bid: 23999m, ask: 24001m), volume: 1_000));
+        TickWideCoreUniverse(engine, Start);
+        engine.ComputeCadence(Start);
+
+        // Second cadence: LastPrice (24002) sits ABOVE the midpoint (24000.5) -- buy-leaning,
+        // whole volume delta (500) signed positive. This is this metric's own "first seen"
+        // cadence for warm-up purposes (Batch 3 fix, third pass): CadencePopulator's own
+        // "skip a null cadence, never zero-fill it" rule means the window/warm-up timestamps only
+        // advance on a cadence with a REAL contribution, not simply the first cadence overall --
+        // see _coreFutureCvdFirstSeenAt's own doc comment.
+        var second = Start.AddSeconds(15);
+        engine.OnTick(MakeTick(FutureToken, 24002m, second, depth: Depth(bidQty: 10, askQty: 10, bid: 24000m, ask: 24001m), volume: 1_500));
+        TickWideCoreUniverse(engine, second);
+        engine.ComputeCadence(second);
+        Assert.Null(engine.LastCoreScoreSnapshot!.FutureCvdNet5MinRaw);
+
+        // Third cadence, exactly 5 real minutes after the SECOND (the first real contribution,
+        // not the first cadence overall) -- warm-up needs another real contribution at or after
+        // that mark, since the warm-up clock itself only advances on Add. LastPrice (24020) sits
+        // AT the new midpoint (24020) -- a tie, which the quote rule's own >= counts as
+        // buy-leaning, so this tick's whole volume delta (500) also signs positive. The window
+        // still holds the second cadence's +500 (exactly 5min old, not yet evicted -- eviction is
+        // a strict >, not >=), so the sum is 500 (second) + 500 (third) = 1000.
+        var third = second.AddMinutes(5);
+        engine.OnTick(MakeTick(FutureToken, 24020m, third, depth: Depth(bidQty: 10, askQty: 10, bid: 24019m, ask: 24021m), volume: 2_000));
+        TickWideCoreUniverse(engine, third);
+        engine.ComputeCadence(third);
+
+        var coreSnapshot = engine.LastCoreScoreSnapshot;
+        Assert.NotNull(coreSnapshot);
+        Assert.Equal(1000.0, coreSnapshot!.FutureCvdNet5MinRaw!.Value, precision: 6);
+    }
+
+    [Fact]
+    public void CoreScoreCalculator_PublishesAScore_ThroughLiveFeatureEngine_WithRealisticQuotes()
+    {
+        // End-to-end smoke test: a fully-quoted, realistic cadence should warm up and produce a
+        // real CoreScore, not just individual raw values.
+        var engine = new LiveFeatureEngine(WideCoreUniverse());
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start, depth: Depth(bidQty: 10, askQty: 10, bid: 23999m, ask: 24001m)));
+        TickWideCoreUniverse(engine, Start);
+        engine.ComputeCadence(Start);
+
+        var at = Start.AddSeconds(15);
+        engine.OnTick(MakeTick(FutureToken, 24010m, at, depth: Depth(bidQty: 10, askQty: 10, bid: 24009m, ask: 24011m)));
+        TickWideCoreUniverse(engine, at);
+        engine.ComputeCadence(at);
+
+        var coreSnapshot = engine.LastCoreScoreSnapshot;
+        Assert.NotNull(coreSnapshot);
+        Assert.True(coreSnapshot!.IsWarmedUp);
+        Assert.NotNull(coreSnapshot.CoreScore);
+        Assert.InRange(coreSnapshot.CoreScore!.Value, -100.0, 100.0);
+        // CoreScoreFast/Slow should also have started warming up (at least one observation each).
+        Assert.NotNull(coreSnapshot.CoreScoreFast);
+        Assert.NotNull(coreSnapshot.CoreScoreSlow);
+    }
+
+    [Fact]
+    public void SeedCoreScoreHistory_DoesNotThrow_OnNullRawValues()
+    {
+        var history = new List<CoreScoreSnapshot>
+        {
+            new() { ComputedAt = Start, DepthImbalanceRaw = null },
+        };
+
+        var engine = new LiveFeatureEngine(WideCoreUniverse());
+
+        var exception = Record.Exception(() => engine.SeedCoreScoreHistory(history));
+        Assert.Null(exception);
+    }
+
+    [Fact]
+    public void SeedCoreScoreHistory_ReplaysCoreScoreIntoFastAndSlowWindows_SoTheyAreImmediatelyWarm()
+    {
+        // The whole point of A5's restart-replay fix: post-replay, CoreScoreFast/Slow must be
+        // immediately non-null on the very next cadence, not need a fresh 10/30-minute warm-up.
+        var history = new List<CoreScoreSnapshot>
+        {
+            new() { ComputedAt = Start, CoreScore = 42.0 },
+            new() { ComputedAt = Start.AddSeconds(15), CoreScore = 44.0 },
+        };
+
+        var engine = new LiveFeatureEngine(WideCoreUniverse());
+        engine.SeedCoreScoreHistory(history);
+
+        engine.OnTick(MakeTick(SpotToken, 23950m, Start.AddSeconds(30)));
+        engine.OnTick(MakeTick(FutureToken, 24000m, Start.AddSeconds(30), depth: Depth(bidQty: 10, askQty: 10, bid: 23999m, ask: 24001m)));
+        TickWideCoreUniverse(engine, Start.AddSeconds(30));
+        engine.ComputeCadence(Start.AddSeconds(30));
+
+        var coreSnapshot = engine.LastCoreScoreSnapshot;
+        Assert.NotNull(coreSnapshot);
+        Assert.NotNull(coreSnapshot!.CoreScoreFast);
+        Assert.NotNull(coreSnapshot.CoreScoreSlow);
+    }
+
+    // Audit finding F61 (2026-09-22): regression coverage for the Underlying-ambiguity bug found
+    // while scoping the Sensex/Bank Nifty tick-collection task. Before the fix, _spot/_future/
+    // _nearestExpiry were picked via plain First(...)/Min(...) over the WHOLE instruments list with
+    // no Underlying filter -- harmless only because every real caller's list was 100% NIFTY. These
+    // tests build a fixture with a second underlying's rows mixed in (deliberately placed FIRST in
+    // the list, and with an earlier expiry than NIFTY's own, so an unfiltered First()/Min() would
+    // pick the wrong one) and assert the engine still resolves to NIFTY's own instruments only.
+    const string OtherUnderlyingSpotToken = "99000";
+    const string OtherUnderlyingFutureToken = "99001";
+    const string OtherUnderlyingOptionToken = "99002";
+    static readonly DateOnly OtherUnderlyingEarlierExpiry = NearestExpiry.AddDays(-3);
+
+    static List<Instrument> MixedUnderlyingUniverse() =>
+    [
+        // Other underlying's rows first, and with an earlier expiry -- if the constructor's
+        // First()/Min() calls were ever unfiltered again, these would win.
+        new()
+        {
+            Token = OtherUnderlyingSpotToken,
+            Exchange = Exchange.Bse,
+            TradingSymbol = "SENSEX",
+            InstrumentType = InstrumentType.Index,
+            Underlying = "SENSEX",
+            LotSize = 1,
+            TickSize = 0.05m,
+            AsOfDate = AsOfDate,
+        },
+        new()
+        {
+            Token = OtherUnderlyingFutureToken,
+            Exchange = Exchange.Bfo,
+            TradingSymbol = "SENSEX-FUT",
+            InstrumentType = InstrumentType.Future,
+            ExpiryDate = OtherUnderlyingEarlierExpiry,
+            Underlying = "SENSEX",
+            LotSize = 10,
+            TickSize = 0.05m,
+            AsOfDate = AsOfDate,
+        },
+        new()
+        {
+            Token = OtherUnderlyingOptionToken,
+            Exchange = Exchange.Bfo,
+            TradingSymbol = "SENSEX-OPT",
+            InstrumentType = InstrumentType.Option,
+            OptionType = OptionType.Call,
+            StrikePrice = 80000m,
+            ExpiryDate = OtherUnderlyingEarlierExpiry,
+            Underlying = "SENSEX",
+            LotSize = 10,
+            TickSize = 0.05m,
+            AsOfDate = AsOfDate,
+        },
+        .. BaseUniverse(),
+    ];
+
+    [Fact]
+    public void Constructor_WithMixedUnderlyingInstruments_OnlyResolvesNiftyOwnInstruments()
+    {
+        var engine = new LiveFeatureEngine(MixedUnderlyingUniverse());
+
+        Assert.NotNull(engine.FindInstrument(SpotToken));
+        Assert.NotNull(engine.FindInstrument(FutureToken));
+        Assert.NotNull(engine.FindInstrument(CallToken));
+
+        Assert.Null(engine.FindInstrument(OtherUnderlyingSpotToken));
+        Assert.Null(engine.FindInstrument(OtherUnderlyingFutureToken));
+        Assert.Null(engine.FindInstrument(OtherUnderlyingOptionToken));
+    }
+
+    [Fact]
+    public void Constructor_WithMixedUnderlyingInstruments_ComputesCadenceIdenticallyToNiftyOnlyUniverse()
+    {
+        // Same tick sequence fed to two engines -- one built from a NIFTY-only universe (today's
+        // real-world shape), one from the mixed universe above (the shape once Sensex/Bank Nifty
+        // rows exist in the same table) -- asserting byte-identical composite scores proves the
+        // extra rows are inert, not just that FindInstrument happens to filter them.
+        var niftyOnlyEngine = new LiveFeatureEngine(BaseUniverse());
+        var mixedEngine = new LiveFeatureEngine(MixedUnderlyingUniverse());
+
+        void Feed(LiveFeatureEngine engine)
+        {
+            engine.OnTick(MakeTick(SpotToken, 23950m, Start.AddSeconds(30)));
+            engine.OnTick(MakeTick(FutureToken, 24000m, Start.AddSeconds(30), depth: Depth(bidQty: 10, askQty: 10, bid: 23999m, ask: 24001m)));
+            engine.OnTick(MakeTick(CallToken, 120m, Start.AddSeconds(30), depth: Depth(bidQty: 10, askQty: 10, bid: 119m, ask: 121m)));
+            engine.OnTick(MakeTick(PutToken, 110m, Start.AddSeconds(30), depth: Depth(bidQty: 10, askQty: 10, bid: 109m, ask: 111m)));
+            engine.Sample(Start.AddSeconds(30));
+        }
+
+        Feed(niftyOnlyEngine);
+        Feed(mixedEngine);
+
+        // The other underlying's own ticks (dead weight for a real feed sharing one WebSocket) must
+        // not perturb anything either.
+        mixedEngine.OnTick(MakeTick(OtherUnderlyingSpotToken, 81000m, Start.AddSeconds(31)));
+        mixedEngine.OnTick(MakeTick(OtherUnderlyingFutureToken, 81050m, Start.AddSeconds(31)));
+
+        var niftyOnlySnapshot = niftyOnlyEngine.ComputeCadence(Start.AddSeconds(45));
+        var mixedSnapshot = mixedEngine.ComputeCadence(Start.AddSeconds(45));
+
+        Assert.Equal(niftyOnlySnapshot?.CompositeScore, mixedSnapshot?.CompositeScore);
+        Assert.Equal(niftyOnlySnapshot?.IsWarmedUp, mixedSnapshot?.IsWarmedUp);
     }
 }

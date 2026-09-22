@@ -31,7 +31,15 @@ public sealed record EntryContext(
     // nullable and simply skips its gate when null (not enough IV history yet to rank against
     // -- see LiveFeatureEngine.ComputeIvRank) rather than blocking on an unknown.
     double? CurrentIvRank = null,
-    int ConsecutiveLossesToday = 0);
+    int ConsecutiveLossesToday = 0,
+    // 2026-09-09 external review amendment to F3: CurrentIvRank alone isn't enough to know
+    // whether the gate should act -- LiveFeatureEngine.ComputeIvRank falls back to a same-day-
+    // only rank (IvRankSessionCount below MinIvRankSessionsForGate) whenever fewer than 5
+    // prior sessions of history exist yet, and that same-day rank isn't trustworthy (a
+    // genuinely high-vol day would still read "normal" for its own first couple of hours).
+    // Zero by default so a caller that hasn't been updated to pass this yet gets the safe
+    // (gate-off) behavior rather than an accidentally-live gate.
+    int IvRankSessionCount = 0);
 
 /// <summary>Every failed check is included, not just the first -- plan section 7.3: "the rejection data matters as much as the acceptance data."</summary>
 public sealed record EntryDecision(bool ShouldEnter, EntryDirection Direction, IReadOnlyList<string> FailedConditions);
@@ -48,6 +56,12 @@ public sealed record EntryDecision(bool ShouldEnter, EntryDirection Direction, I
 public static class EntryRuleEvaluator
 {
     public static readonly TimeOnly MarketOpen = new(9, 15);
+
+    // 2026-09-09 external review amendment to F3 -- must match LiveFeatureEngine's
+    // MinPriorSessionsForIvRank exactly (that's the threshold IvRankSessionCount is measured
+    // against); duplicated as a literal here rather than shared, same as every other config
+    // duplicate already in this codebase (see RulesetConfigOptions' own doc comment).
+    const int MinIvRankSessionsForGate = 5;
 
     // NSE trading hours are always IST regardless of where this process runs or what offset
     // context.Now happens to carry (UtcNow throughout this codebase, per Npgsql's timestamptz
@@ -101,8 +115,15 @@ public static class EntryRuleEvaluator
 
         // Audit finding F3 (2026-09-08): buying premium when IV is already rich relative to its
         // own recent range is how a directionally-correct trade still loses to a vol crush.
-        // Skipped, not blocked, while there isn't yet enough IV history to rank against.
-        if (context.CurrentIvRank is { } ivRank && ivRank > config.Entry.MaxIvRankForEntry)
+        // Skipped, not blocked, while there isn't yet enough IV history to rank against --
+        // amended 2026-09-09 (external review): "enough history" means IvRankSessionCount has
+        // reached MinIvRankSessionsForGate, not merely CurrentIvRank being non-null.
+        // LiveFeatureEngine.ComputeIvRank can and does return a non-null same-day-only rank
+        // well before 5 sessions exist; acting on that rank here would be gating on a value
+        // that hasn't earned trust yet (a genuinely high-vol day still reads "normal" for its
+        // own first couple of hours under a same-day-only rank).
+        if (context.IvRankSessionCount >= MinIvRankSessionsForGate
+            && context.CurrentIvRank is { } ivRank && ivRank > config.Entry.MaxIvRankForEntry)
         {
             failures.Add($"IV rank ({ivRank:F1}) above MaxIvRankForEntry ({config.Entry.MaxIvRankForEntry})");
         }

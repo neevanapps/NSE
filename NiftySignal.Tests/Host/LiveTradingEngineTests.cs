@@ -8,6 +8,8 @@ using NiftySignal.Domain.ValueObjects;
 using NiftySignal.Host;
 using NiftySignal.Notifications;
 using NiftySignal.Persistence;
+using NiftySignal.Rules;
+using NiftySignal.Tests.Rules;
 
 namespace NiftySignal.Tests.Host;
 
@@ -35,6 +37,12 @@ public class LiveTradingEngineTests
             Sent.Add((category, message));
             return Task.CompletedTask;
         }
+    }
+
+    /// <summary>Fixed, never-reloading stand-in for the real hot-reloaded config -- these tests assert against TestRulesetConfigs' known values, not whatever's live.</summary>
+    sealed class FixedOptions<T>(T value) : IValidatedOptions<T>
+    {
+        public T Current { get; } = value;
     }
 
     sealed class Fixture : IAsyncDisposable
@@ -67,6 +75,7 @@ public class LiveTradingEngineTests
                 _provider.GetRequiredService<IServiceScopeFactory>(),
                 Telegram,
                 _dashboardPush,
+                new FixedOptions<RulesetConfig>(TestRulesetConfigs.Default()),
                 NullLogger<LiveTradingEngine>.Instance);
         }
 
@@ -209,6 +218,46 @@ public class LiveTradingEngineTests
         Assert.Contains(fixture.Telegram.Sent, s => s.Category == NotificationCategory.TradeEntry);
     }
 
+    static ScoreSnapshot WarmedSnapshotWithOpposingRatioScore(double score, DateTimeOffset at) => new()
+    {
+        ComputedAt = at,
+        CompositeScore = score,
+        IsWarmedUp = true,
+        WeightSetVersion = "test-weights-1",
+        // Strongly bearish and warmed up -- the opposite direction and sign from `score`
+        // above, and clearly past any threshold that would matter if this were ever read.
+        RatioCompositeScore = -99,
+        RatioIsWarmedUp = true,
+        RatioWeightSetVersion = "ratio-test-1",
+    };
+
+    [Fact]
+    public async Task EvaluateCadenceAsync_IgnoresRatioCompositeScore_EvenWhenStronglyOppositeToCompositeScore()
+    {
+        // Structural-safety proof (weekend build, 2026-09-09): LiveTradingEngine reads only
+        // ScoreSnapshot.CompositeScore to decide entries -- a RatioCompositeScore strongly
+        // opposite in sign must have zero effect. Same four-cadence sustain sequence as
+        // EvaluateCadenceAsync_EntersTrade_WhenScoreSustainedAndStrikeCandidateValid above,
+        // and must produce the identical outcome despite the added opposing ratio score.
+        await using var fixture = new Fixture();
+        var t0 = new DateTimeOffset(2026, 9, 4, 10, 0, 0, Ist);
+        var featureEngine = WarmedFeatureEngineWithAtmCall(t0);
+
+        await fixture.Engine.EvaluateCadenceAsync(WarmedSnapshotWithOpposingRatioScore(70, t0), featureEngine, CancellationToken.None);
+        await fixture.Engine.EvaluateCadenceAsync(WarmedSnapshotWithOpposingRatioScore(70, t0.AddSeconds(15)), featureEngine, CancellationToken.None);
+        await fixture.Engine.EvaluateCadenceAsync(WarmedSnapshotWithOpposingRatioScore(70, t0.AddSeconds(30)), featureEngine, CancellationToken.None);
+        await fixture.Engine.EvaluateCadenceAsync(WarmedSnapshotWithOpposingRatioScore(70, t0.AddSeconds(45)), featureEngine, CancellationToken.None);
+
+        await fixture.WithDbAsync(async db =>
+        {
+            var trade = Assert.Single(await db.PaperTrades.ToListAsync());
+            Assert.Equal(AtmCallToken, trade.InstrumentToken);
+            Assert.Equal(EntryDirection.Bullish, trade.Direction);
+            Assert.Equal(70, trade.EntryScore);
+            Assert.Equal(125.34m, trade.EntryPrice);
+        });
+    }
+
     [Fact]
     public async Task EvaluateCadenceAsync_SquareOff_ClosesOpenPosition()
     {
@@ -220,7 +269,7 @@ public class LiveTradingEngineTests
         {
             db.PaperTrades.Add(new PaperTrade
             {
-                InstrumentToken = AtmCallToken, TradingSymbol = "NIFTY08SEP26C24000", Direction = EntryDirection.Bullish,
+                InstrumentToken = AtmCallToken, TradingSymbol = "NIFTY08SEP26C24000", StrategyId = StrategyId.LegacyComposite, Direction = EntryDirection.Bullish,
                 EntryTime = entryTime, EntryPrice = 164.34m, Quantity = 130, EntryScore = 70,
                 RulesetVersion = "live-v1-2026-09-04", ScoreWeightsVersion = "test-weights-1",
             });
@@ -249,7 +298,7 @@ public class LiveTradingEngineTests
         {
             db.PaperTrades.Add(new PaperTrade
             {
-                InstrumentToken = AtmCallToken, TradingSymbol = "NIFTY08SEP26C24000", Direction = EntryDirection.Bullish,
+                InstrumentToken = AtmCallToken, TradingSymbol = "NIFTY08SEP26C24000", StrategyId = StrategyId.LegacyComposite, Direction = EntryDirection.Bullish,
                 EntryTime = entryTime, EntryPrice = 100m, Quantity = 65, EntryScore = 70,
                 RulesetVersion = "live-v1-2026-09-04", ScoreWeightsVersion = "test-weights-1",
             });
@@ -310,7 +359,7 @@ public class LiveTradingEngineTests
         {
             db.PaperTrades.Add(new PaperTrade
             {
-                InstrumentToken = AtmCallToken, TradingSymbol = "NIFTY08SEP26C24000", Direction = EntryDirection.Bullish,
+                InstrumentToken = AtmCallToken, TradingSymbol = "NIFTY08SEP26C24000", StrategyId = StrategyId.LegacyComposite, Direction = EntryDirection.Bullish,
                 EntryTime = entryTime, EntryPrice = 100m, Quantity = 130, EntryScore = 70,
                 RulesetVersion = "live-v1-2026-09-04", ScoreWeightsVersion = "test-weights-1",
             });
@@ -355,7 +404,7 @@ public class LiveTradingEngineTests
         {
             db.PaperTrades.Add(new PaperTrade
             {
-                InstrumentToken = AtmCallToken, TradingSymbol = "NIFTY08SEP26C24000", Direction = EntryDirection.Bullish,
+                InstrumentToken = AtmCallToken, TradingSymbol = "NIFTY08SEP26C24000", StrategyId = StrategyId.LegacyComposite, Direction = EntryDirection.Bullish,
                 EntryTime = t0.AddHours(-1), EntryPrice = 100m, Quantity = 130, EntryScore = 70,
                 ExitTime = t0.AddMinutes(-30), ExitPrice = 150m, ExitReason = ExitReason.PartialBook,
                 GrossPnl = 15_250m, NetPnl = 15_100m,
@@ -377,6 +426,51 @@ public class LiveTradingEngineTests
             var trades = await db.PaperTrades.ToListAsync();
             Assert.Single(trades);
             Assert.NotNull(trades[0].ExitTime);
+        });
+        Assert.DoesNotContain(fixture.Telegram.Sent, s => s.Category == NotificationCategory.TradeEntry);
+    }
+
+    [Fact]
+    public async Task EvaluateCadenceAsync_NoEntry_WhenCommittedCapitalWouldExceedTotal_EvenUnderMaxConcurrentPositions()
+    {
+        // Audit finding F48 (2026-09-10): two open positions at a high entry price (150 each,
+        // qty 130 -> Rs 19,500 apiece, Rs 39,000 committed) leave MaxConcurrentPositions (3)
+        // unbroken -- only 2 of 3 slots used, so the position-COUNT gate alone would let a
+        // third entry through. But a third position at this test's own ~125.34 fill x 130 qty
+        // (~Rs 16,294) would bring total committed capital to ~Rs 55,294, over Capital.Total
+        // (Rs 50,000) -- proving the capital-SUM gate is the one actually doing the rejecting
+        // here, not MaxConcurrentPositions (which this scenario deliberately never trips).
+        await using var fixture = new Fixture();
+        var t0 = new DateTimeOffset(2026, 9, 4, 10, 0, 0, Ist);
+
+        await fixture.WithDbAsync(async db =>
+        {
+            for (var i = 0; i < 2; i++)
+            {
+                db.PaperTrades.Add(new PaperTrade
+                {
+                    InstrumentToken = $"OPEN-{i}", TradingSymbol = $"NIFTY08SEP26C2{i}000", StrategyId = StrategyId.LegacyComposite, Direction = EntryDirection.Bullish,
+                    EntryTime = t0.AddHours(-1), EntryPrice = 150m, Quantity = 130, EntryScore = 70,
+                    RulesetVersion = "live-v1-2026-09-04", ScoreWeightsVersion = "test-weights-1",
+                });
+            }
+
+            await db.SaveChangesAsync();
+        });
+
+        var featureEngine = WarmedFeatureEngineWithAtmCall(t0);
+
+        await fixture.Engine.EvaluateCadenceAsync(WarmedSnapshot(70, t0), featureEngine, CancellationToken.None);
+        await fixture.Engine.EvaluateCadenceAsync(WarmedSnapshot(70, t0.AddSeconds(15)), featureEngine, CancellationToken.None);
+        await fixture.Engine.EvaluateCadenceAsync(WarmedSnapshot(70, t0.AddSeconds(30)), featureEngine, CancellationToken.None);
+        await fixture.Engine.EvaluateCadenceAsync(WarmedSnapshot(70, t0.AddSeconds(45)), featureEngine, CancellationToken.None);
+
+        await fixture.WithDbAsync(async db =>
+        {
+            // Still just the two pre-existing open positions -- the third was rejected.
+            var trades = await db.PaperTrades.ToListAsync();
+            Assert.Equal(2, trades.Count);
+            Assert.All(trades, t => Assert.Null(t.ExitTime));
         });
         Assert.DoesNotContain(fixture.Telegram.Sent, s => s.Category == NotificationCategory.TradeEntry);
     }

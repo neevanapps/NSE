@@ -12,6 +12,18 @@ namespace NiftySignal.Dashboard.Services;
 public sealed record ScoreHistoryPoint(DateTimeOffset Timestamp, double Score, double? SpotPrice);
 
 /// <summary>
+/// One Core-score history point, alongside <see cref="ScoreHistoryPoint"/> rather than reusing it
+/// (Batch 7 follow-up, 2026-09-15) -- the old composite has no fast/slow smoothing concept at all,
+/// so bolting those fields onto the shared record would leave them permanently unused on that
+/// path. <see cref="Fast"/>/<see cref="Slow"/> are the same 10-min/30-min trailing reads the
+/// Crossover strategy itself trades on (<see cref="NiftySignal.Domain.Entities.CoreScoreSnapshot.CoreScoreFast"/>/
+/// <c>CoreScoreSlow</c>), carried per-point so the chart can plot them on the same time axis as
+/// the instant score -- seeing whether fast/slow have crossed, and whether the instant score is
+/// approaching the +-30 hysteresis threshold, together is the point.
+/// </summary>
+public sealed record CoreScoreHistoryPoint(DateTimeOffset Timestamp, double Score, double? Fast, double? Slow, double? SpotPrice);
+
+/// <summary>
 /// One score component's weight/z-score/contribution plus its own warm-up status
 /// (2026-09-04, folded in from the former standalone Data Health panel -- see
 /// LiveDataService.BuildComponentRows) so ScorePanel doesn't need to correlate two
@@ -97,6 +109,30 @@ public sealed record ClosedTradeRow(
     DateTimeOffset ExitTime,
     decimal NetPnl,
     ExitReason ExitReason);
+
+/// <summary>
+/// One Core-score term's weight/signed-value/contribution plus its own warm-up status (Batch 7,
+/// 2026-09-14) -- deliberately its own type rather than reusing <see cref="ScoreComponentRow"/>:
+/// that record's <c>Window</c>/<c>Remaining</c> fields are a fixed-duration Welford warm-up
+/// countdown, which doesn't apply here -- a Core-score term warms up once its
+/// <c>SessionRankTracker</c> has seen enough of TODAY's own observations, not once a fixed
+/// wall-clock window has elapsed, so there's no "time remaining" to show, only warmed/not yet.
+/// </summary>
+public sealed record CoreScoreComponentRow(
+    string Name,
+    double Weight,
+    double? SignedValue,
+    double WeightedContribution,
+    bool IsWarmedUp);
+
+/// <summary>
+/// One of the two new Core-score strategies' current open position, if any (Batch 7, 2026-09-14)
+/// -- <see cref="Position"/> is null when that strategy is flat. Reuses <see cref="PositionRow"/>
+/// as-is rather than a bespoke shape: an open Hysteresis/Crossover position and an open legacy
+/// position display identically (symbol, direction, entry/current premium, P&amp;L, held time) --
+/// the only new thing here is which <see cref="StrategyId"/> it belongs to.
+/// </summary>
+public sealed record StrategyPositionRow(StrategyId StrategyId, PositionRow? Position);
 
 /// <summary>
 /// The Live Quote panel's fast (1s) refresh -- deliberately a small subset of

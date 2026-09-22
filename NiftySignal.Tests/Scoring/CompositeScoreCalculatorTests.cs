@@ -63,15 +63,18 @@ public class CompositeScoreCalculatorTests
         Assert.Null(result.Score);
     }
 
+    // PriceMomentum deliberately excluded from this theory (audit finding F47, 2026-09-10):
+    // its default weight is 0.0 (cut by F4), so it's now optional -- see the dedicated
+    // Calculate_StillWarmsUp_WhenPriceMomentumZIsNull test below instead of asserting the
+    // opposite of what F47 fixed.
     [Theory]
-    [InlineData(true, false, false, false, false, false)]
-    [InlineData(false, true, false, false, false, false)]
-    [InlineData(false, false, true, false, false, false)]
-    [InlineData(false, false, false, true, false, false)]
-    [InlineData(false, false, false, false, true, false)]
-    [InlineData(false, false, false, false, false, true)]
-    public void Calculate_ReturnsNullScore_WhenAnySingleComponentIsNotWarmedUp(
-        bool missingOi, bool missingPcr, bool missingBasis, bool missingSkew, bool missingMomentum, bool missingDepth)
+    [InlineData(true, false, false, false, false)]
+    [InlineData(false, true, false, false, false)]
+    [InlineData(false, false, true, false, false)]
+    [InlineData(false, false, false, true, false)]
+    [InlineData(false, false, false, false, true)]
+    public void Calculate_ReturnsNullScore_WhenAnySingleNonzeroWeightComponentIsNotWarmedUp(
+        bool missingOi, bool missingPcr, bool missingBasis, bool missingSkew, bool missingDepth)
     {
         var inputs = FullyWarmInputs with
         {
@@ -79,7 +82,6 @@ public class CompositeScoreCalculatorTests
             PcrZ = missingPcr ? null : FullyWarmInputs.PcrZ,
             FuturesBasisZ = missingBasis ? null : FullyWarmInputs.FuturesBasisZ,
             IvSkewZ = missingSkew ? null : FullyWarmInputs.IvSkewZ,
-            PriceMomentumZ = missingMomentum ? null : FullyWarmInputs.PriceMomentumZ,
             DepthImbalanceZ = missingDepth ? null : FullyWarmInputs.DepthImbalanceZ,
         };
 
@@ -87,6 +89,53 @@ public class CompositeScoreCalculatorTests
 
         Assert.False(result.IsWarmedUp);
         Assert.Null(result.Score);
+    }
+
+    [Fact]
+    public void Calculate_StillWarmsUp_WhenPriceMomentumZIsNull_BecauseItsWeightIsZero()
+    {
+        // Audit finding F47 (2026-09-10): PriceMomentum's weight was cut to 0.0 by F4, but it
+        // stayed on the hardcoded required-six list -- a missing PriceMomentumZ could stall the
+        // whole composite for a component that contributes exactly 0 to the score even when
+        // present. Fixed: a component is now required iff its weight is nonzero (or it's
+        // VixChange, which has its own separate name-based exception).
+        var inputs = FullyWarmInputs with { PriceMomentumZ = null };
+
+        var result = CompositeScoreCalculator.Calculate(inputs, ScoreWeights.Default, ComputedAt);
+
+        Assert.True(result.IsWarmedUp);
+        Assert.NotNull(result.Score);
+
+        var momentumComponent = result.Components.Single(c => c.Name == "PriceMomentum");
+        Assert.Null(momentumComponent.ZScore);
+        Assert.Null(momentumComponent.WeightedContribution);
+    }
+
+    [Fact]
+    public void DescribeMissingRequiredComponents_ExcludesPriceMomentum_EvenWhenItIsNull()
+    {
+        // Live-caught 2026-09-10 while validating this same day's F47 deploy:
+        // MarketDataIngestionWorker's warm-up-blocked diagnostic log used a hardcoded six-name
+        // list that kept blaming PriceMomentumZ for blocking warm-up even after F47 made it
+        // optional -- actively misleading. Fixed by having that log call this shared method
+        // instead of duplicating the required/optional rule. Both DepthImbalance (real,
+        // nonzero weight -- genuinely still required) and PriceMomentum (weight 0.0 -- no
+        // longer required) missing at once, to prove the method reports the former and not the
+        // latter, not just "reports something."
+        var inputs = FullyWarmInputs with { PriceMomentumZ = null, DepthImbalanceZ = null };
+
+        var missing = CompositeScoreCalculator.DescribeMissingRequiredComponents(inputs, ScoreWeights.Default);
+
+        Assert.Contains("DepthImbalance", missing);
+        Assert.DoesNotContain("PriceMomentum", missing);
+    }
+
+    [Fact]
+    public void DescribeMissingRequiredComponents_IsEmpty_WhenFullyWarm()
+    {
+        var missing = CompositeScoreCalculator.DescribeMissingRequiredComponents(FullyWarmInputs, ScoreWeights.Default);
+
+        Assert.Empty(missing);
     }
 
     [Fact]
@@ -344,16 +393,17 @@ public class CompositeScoreCalculatorTests
     {
         // Plan section 6's 25/20/15/15/15/10, each x0.95, plus a conservative 0.05 for the
         // VixChange component (2026-09-04), then PriceMomentum cut 0.1425 -> 0.07 with the
-        // freed 0.0725 moved to OiBuildupNet/DepthImbalance (2026-09-07) -- see
-        // ScoreWeights.Default's own doc comment.
+        // freed 0.0725 moved to OiBuildupNet/DepthImbalance (2026-09-07), then PriceMomentum
+        // cut again to 0.0 with the freed 0.07 split the same way (2026-09-09, F4, external
+        // review) -- see ScoreWeights.Default's own doc comments.
         var weights = ScoreWeights.Default;
 
-        Assert.Equal(0.2775, weights.OiBuildupNet, 1e-9);
+        Assert.Equal(0.3125, weights.OiBuildupNet, 1e-9);
         Assert.Equal(0.19, weights.Pcr, 1e-9);
         Assert.Equal(0.1425, weights.FuturesBasis, 1e-9);
         Assert.Equal(0.1425, weights.IvSkew, 1e-9);
-        Assert.Equal(0.07, weights.PriceMomentum, 1e-9);
-        Assert.Equal(0.1275, weights.DepthImbalance, 1e-9);
+        Assert.Equal(0.0, weights.PriceMomentum, 1e-9);
+        Assert.Equal(0.1625, weights.DepthImbalance, 1e-9);
         Assert.Equal(0.05, weights.VixChange, 1e-9);
         Assert.Equal(0.0, weights.GammaExposure, 1e-9);
         Assert.Equal(0.0, weights.VolumePcr, 1e-9);

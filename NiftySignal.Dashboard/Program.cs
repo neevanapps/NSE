@@ -7,8 +7,11 @@ using Microsoft.Extensions.Options;
 using NiftySignal.Dashboard.Components;
 using NiftySignal.Dashboard.Hubs;
 using NiftySignal.Dashboard.Services;
+using NiftySignal.Domain.Configuration;
 using NiftySignal.Ingestion.FlatTrade;
 using NiftySignal.Persistence;
+using NiftySignal.VolumeBarData;
+using Npgsql;
 
 // Windows Services start with their working directory at C:\Windows\System32, not the
 // exe's own folder -- any future relative path (log files, etc.) would silently land there
@@ -37,7 +40,25 @@ builder.Services.AddSignalR();
 builder.Services.AddDbContextFactory<NiftySignalDbContext>(options =>
     options.UseNpgsql(builder.Configuration.GetConnectionString("NiftySignalDb")));
 
+// Phase F of docs/LIVE_PARITY_PLAN.md: same separate-database override NiftySignal.Host's own
+// VolumeBarDbContext registration already uses (see NiftySignal.Host/Program.cs) -- same
+// server/credentials as NiftySignalDb, different Database= override
+// (VolumeBarPopulator.VolumeBarDatabaseName). Read-only from this Dashboard's side: the
+// /live-options-score page never writes to it. Factory, not AddDbContext, for the same
+// concurrent-sibling-component reason NiftySignalDbContext above already documents.
+builder.Services.AddDbContextFactory<VolumeBarDbContext>(options =>
+{
+    var baseConnectionString = builder.Configuration.GetConnectionString("NiftySignalDb")
+        ?? throw new InvalidOperationException("ConnectionStrings:NiftySignalDb is not set.");
+    var volumeBarConnectionString = new NpgsqlConnectionStringBuilder(baseConnectionString)
+    {
+        Database = VolumeBarPopulator.VolumeBarDatabaseName,
+    }.ConnectionString;
+    options.UseNpgsql(volumeBarConnectionString);
+});
+
 builder.Services.Configure<FlatTradeOptions>(builder.Configuration.GetSection(FlatTradeOptions.SectionName));
+builder.Services.Configure<PricingOptions>(builder.Configuration.GetSection(PricingOptions.SectionName));
 builder.Services.AddHttpClient<FlatTradeAuthClient>();
 
 builder.Services.AddSingleton<LiveDataService>();

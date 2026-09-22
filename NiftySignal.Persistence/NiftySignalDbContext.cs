@@ -25,6 +25,8 @@ public sealed class NiftySignalDbContext(DbContextOptions<NiftySignalDbContext> 
 
     public DbSet<ScoreSnapshot> ScoreSnapshots => Set<ScoreSnapshot>();
 
+    public DbSet<CoreScoreSnapshot> CoreScoreSnapshots => Set<CoreScoreSnapshot>();
+
     public DbSet<StrikeSnapshot> StrikeSnapshots => Set<StrikeSnapshot>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)

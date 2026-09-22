@@ -1,5 +1,7 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 using NiftySignal.Domain;
+using NiftySignal.Domain.Configuration;
 using NiftySignal.Domain.Entities;
 using NiftySignal.Domain.Enums;
 using NiftySignal.Features;
@@ -53,8 +55,13 @@ public sealed class LiveDataService : IDisposable
 
     double _currentScore;
     List<ScoreHistoryPoint> _scoreHistory = [];
+    double _currentCoreScore;
+    double? _currentCoreScoreFast;
+    double? _currentCoreScoreSlow;
+    List<CoreScoreHistoryPoint> _coreScoreHistory = [];
     List<OptionChainRow> _optionChain = [];
     List<PositionRow> _positions = [];
+    List<StrategyPositionRow> _strategyPositions = [];
     List<ClosedTradeRow> _closedTrades = [];
     Dictionary<(decimal Strike, OptionType Type), QuickQuote> _quickQuotes = [];
     Dictionary<string, TokenInfo> _tokenRoles = [];
@@ -89,6 +96,30 @@ public sealed class LiveDataService : IDisposable
     public IReadOnlyList<ScoreHistoryPoint> ScoreHistory { get { lock (_lock) return _scoreHistory; } }
 
     public IReadOnlyList<ScoreComponentRow> ScoreComponents { get; private set; } = BuildDefaultComponentRows();
+
+    // --- Core score (Batch 7, 2026-09-14) -- the two new strategies' own scoring pipeline,
+    // independent of the 14-component composite above. Same "read fresh every poll" shape.
+
+    public double CurrentCoreScore { get { lock (_lock) return _currentCoreScore; } }
+
+    public double? CurrentCoreScoreFast { get { lock (_lock) return _currentCoreScoreFast; } }
+
+    public double? CurrentCoreScoreSlow { get { lock (_lock) return _currentCoreScoreSlow; } }
+
+    public IReadOnlyList<CoreScoreHistoryPoint> CoreScoreHistory { get { lock (_lock) return _coreScoreHistory; } }
+
+    public IReadOnlyList<CoreScoreComponentRow> CoreScoreComponents { get; private set; } = BuildDefaultCoreScoreComponentRows();
+
+    /// <summary>
+    /// Always exactly 2 entries (Hysteresis, Crossover), in that order -- a strategy with no open
+    /// position still gets a row, with a null <see cref="StrategyPositionRow.Position"/>, so the
+    /// panel can render a stable "flat" state rather than the row disappearing. Refreshed on the
+    /// 5s poll only, unlike <see cref="Positions"/> -- deliberately not wired into
+    /// <see cref="ApplyPushedTick"/>'s tick-fast path; this is an at-a-glance summary on the score
+    /// panel, not the primary position-tracking table (that's <see cref="Positions"/>/
+    /// PositionsPanel, which does get the fast path).
+    /// </summary>
+    public IReadOnlyList<StrategyPositionRow> StrategyPositions { get { lock (_lock) return [.. _strategyPositions]; } }
 
     public IReadOnlyList<OptionChainRow> OptionChain { get { lock (_lock) return _optionChain; } }
 
@@ -138,10 +169,15 @@ public sealed class LiveDataService : IDisposable
     /// </summary>
     public double? GammaFlipLevel { get; private set; }
 
-    public LiveDataService(IDbContextFactory<NiftySignalDbContext> dbFactory, FlatTradeAuthClient authClient, ILogger<LiveDataService> logger)
+    public LiveDataService(
+        IDbContextFactory<NiftySignalDbContext> dbFactory,
+        FlatTradeAuthClient authClient,
+        IOptionsMonitor<PricingOptions> pricingOptions,
+        ILogger<LiveDataService> logger)
     {
         _dbFactory = dbFactory;
         _authClient = authClient;
+        _pricingOptions = pricingOptions;
         _logger = logger;
         _timer = new Timer(_ => Poll(), null, TimeSpan.Zero, PollInterval);
     }
@@ -380,6 +416,40 @@ public sealed class LiveDataService : IDisposable
                 GammaFlipLevel = latest.GammaFlipLevel;
             }
 
+            // Same today-only floor, same Take(120)/reverse shape as the composite score above --
+            // a second, independent scoring pipeline (Batch 7, 2026-09-14) with its own history.
+            var coreSnapshots = await db.CoreScoreSnapshots
+                .Where(s => s.ComputedAt >= todayIstMidnightUtc)
+                .OrderByDescending(s => s.ComputedAt)
+                .Take(120)
+                .ToListAsync();
+            coreSnapshots.Reverse();
+
+            if (coreSnapshots.Count > 0)
+            {
+                var latestCore = coreSnapshots[^1];
+
+                // CoreScoreSnapshot carries no SpotPrice of its own (it's a leaner, purpose-built
+                // table -- see that entity's own doc comment); joined here by exact cadence
+                // timestamp against ScoreSnapshot instead, since both tables are populated from
+                // the SAME cadence tick in MarketDataIngestionWorker and therefore share exact
+                // ComputedAt values -- not an approximate/nearest-match join.
+                var coreTimestamps = coreSnapshots.Select(s => s.ComputedAt).ToArray();
+                var spotByTimestamp = await db.ScoreSnapshots
+                    .Where(s => coreTimestamps.Contains(s.ComputedAt))
+                    .ToDictionaryAsync(s => s.ComputedAt, s => s.SpotPrice);
+
+                lock (_lock)
+                {
+                    _currentCoreScore = latestCore.CoreScore ?? _currentCoreScore;
+                    _currentCoreScoreFast = latestCore.CoreScoreFast;
+                    _currentCoreScoreSlow = latestCore.CoreScoreSlow;
+                    _coreScoreHistory = [.. coreSnapshots.Select(s => new CoreScoreHistoryPoint(s.ComputedAt, s.CoreScore ?? 0, s.CoreScoreFast, s.CoreScoreSlow, spotByTimestamp.GetValueOrDefault(s.ComputedAt)))];
+                }
+
+                CoreScoreComponents = BuildCoreScoreComponentRows(latestCore);
+            }
+
             var chain = await BuildOptionChainAsync(db);
             lock (_lock)
             {
@@ -387,10 +457,12 @@ public sealed class LiveDataService : IDisposable
             }
 
             var positions = await BuildPositionsAsync(db);
+            var strategyPositions = await BuildStrategyPositionsAsync(db);
             var closedTrades = await BuildClosedTradesAsync(db);
             lock (_lock)
             {
                 _positions = positions;
+                _strategyPositions = strategyPositions;
                 _closedTrades = closedTrades;
             }
 
@@ -543,6 +615,31 @@ public sealed class LiveDataService : IDisposable
         new("StraddleRichness", ScoreWeights.Default.StraddleRichness, 0, 0, false, FeatureWindowLengths.StraddleRichness, FeatureWindowLengths.StraddleRichness),
     ];
 
+    /// <summary>Batch 7 (2026-09-14) -- the Core score's own 8 terms, same weights <see cref="CoreScoreWeights.Default"/> the live engine actually trades on.</summary>
+    static List<CoreScoreComponentRow> BuildCoreScoreComponentRows(CoreScoreSnapshot s) =>
+    [
+        new("DepthImbalance", CoreScoreWeights.Default.DepthImbalance, s.DepthImbalanceSigned, (s.DepthImbalanceSigned ?? 0) * CoreScoreWeights.Default.DepthImbalance, s.DepthImbalanceSigned is not null),
+        new("ItmSkew", CoreScoreWeights.Default.ItmSkew, s.ItmSkewSigned, (s.ItmSkewSigned ?? 0) * CoreScoreWeights.Default.ItmSkew, s.ItmSkewSigned is not null),
+        new("FutureCvdNet5Min", CoreScoreWeights.Default.FutureCvdNet5Min, s.FutureCvdNet5MinSigned, (s.FutureCvdNet5MinSigned ?? 0) * CoreScoreWeights.Default.FutureCvdNet5Min, s.FutureCvdNet5MinSigned is not null),
+        new("NotionalVolumeRatio", CoreScoreWeights.Default.NotionalVolumeRatio, s.NotionalVolumeRatioSigned, (s.NotionalVolumeRatioSigned ?? 0) * CoreScoreWeights.Default.NotionalVolumeRatio, s.NotionalVolumeRatioSigned is not null),
+        new("GammaExposure", CoreScoreWeights.Default.GammaExposure, s.GammaExposureSigned, (s.GammaExposureSigned ?? 0) * CoreScoreWeights.Default.GammaExposure, s.GammaExposureSigned is not null),
+        new("TrendReversion15m", CoreScoreWeights.Default.TrendReversion15m, s.TrendReversion15mSigned, (s.TrendReversion15mSigned ?? 0) * CoreScoreWeights.Default.TrendReversion15m, s.TrendReversion15mSigned is not null),
+        new("BasisChange", CoreScoreWeights.Default.BasisChange, s.BasisChangeSigned, (s.BasisChangeSigned ?? 0) * CoreScoreWeights.Default.BasisChange, s.BasisChangeSigned is not null),
+        new("OiChangeDiff15m", CoreScoreWeights.Default.OiChangeDiff15m, s.OiChangeDiff15mSigned, (s.OiChangeDiff15mSigned ?? 0) * CoreScoreWeights.Default.OiChangeDiff15m, s.OiChangeDiff15mSigned is not null),
+    ];
+
+    static List<CoreScoreComponentRow> BuildDefaultCoreScoreComponentRows() =>
+    [
+        new("DepthImbalance", CoreScoreWeights.Default.DepthImbalance, null, 0, false),
+        new("ItmSkew", CoreScoreWeights.Default.ItmSkew, null, 0, false),
+        new("FutureCvdNet5Min", CoreScoreWeights.Default.FutureCvdNet5Min, null, 0, false),
+        new("NotionalVolumeRatio", CoreScoreWeights.Default.NotionalVolumeRatio, null, 0, false),
+        new("GammaExposure", CoreScoreWeights.Default.GammaExposure, null, 0, false),
+        new("TrendReversion15m", CoreScoreWeights.Default.TrendReversion15m, null, 0, false),
+        new("BasisChange", CoreScoreWeights.Default.BasisChange, null, 0, false),
+        new("OiChangeDiff15m", CoreScoreWeights.Default.OiChangeDiff15m, null, 0, false),
+    ];
+
     async Task<List<OptionChainRow>> BuildOptionChainAsync(NiftySignalDbContext db)
     {
         var today = DateOnly.FromDateTime(DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromHours(5.5)).Date);
@@ -637,7 +734,7 @@ public sealed class LiveDataService : IDisposable
         // NiftySignal.Pricing.SyntheticForward's doc comment and
         // LiveFeatureEngine.ComputeUnderlyingPrice (same fix, same day, same root cause).
         var forwardByExpiry = spotLtp is { } spotForForward
-            ? BuildSyntheticForwardByExpiry(instruments, latestByToken, spotForForward, yearsToExpiry)
+            ? BuildSyntheticForwardByExpiry(instruments, latestByToken, spotForForward, yearsToExpiry, RiskFreeRate)
             : [];
 
         // Reference vol for theoretical pricing (2026-09-05), solved per expiry at the ATM
@@ -647,7 +744,7 @@ public sealed class LiveDataService : IDisposable
         // premium in rupee terms, i.e. how much more (or less) the market is paying for this
         // strike than the at-the-money baseline implies. Above theoretical reads as demand
         // bidding premium up; below reads as supply/writing pressure.
-        var atmVolByExpiry = BuildAtmReferenceVol(instruments, latestByToken, forwardByExpiry, atmStrike, yearsToExpiry);
+        var atmVolByExpiry = BuildAtmReferenceVol(instruments, latestByToken, forwardByExpiry, atmStrike, yearsToExpiry, RiskFreeRate);
 
         var rows = new List<OptionChainRow>();
         foreach (var instrument in instruments.OrderBy(i => i.ExpiryDate).ThenBy(i => i.StrikePrice))
@@ -723,20 +820,20 @@ public sealed class LiveDataService : IDisposable
     /// if the call's solve fails. Expiries with no usable ATM quote are simply absent from the
     /// result, and their rows get no theoretical price rather than one built on a guess.
     ///
-    /// DEFERRED (audit finding F33, 2026-09-08 third-party review -- see fix plan): structurally
-    /// parallel to, but not shared with, LiveFeatureEngine.SolveAtmReferenceVol -- a
-    /// maintainability risk, not a correctness bug today (the two currently agree), but the next
-    /// fix to one has to be remembered and manually re-applied to the other or the dashboard will
-    /// quietly start showing different numbers than what's actually driving trades. Extract the
-    /// shared logic into NiftySignal.Pricing/NiftySignal.Features (which Dashboard could
-    /// reference) so there's exactly one implementation.
+    /// Audit finding F33 fixed (2026-09-09): the fallback/solve step (call preferred, put as
+    /// fallback) is now shared with LiveFeatureEngine.SolveAtmReferenceVol via
+    /// AtmReferenceVolSolver (NiftySignal.Pricing) -- only this method's own multi-expiry
+    /// iteration and LTP-based mark price stay local, since those are legitimate, pre-existing
+    /// differences from the live engine's single-expiry/mid-price read (this is a display value,
+    /// not a live scoring input), not something that needed sharing.
     /// </summary>
     static Dictionary<DateOnly, double> BuildAtmReferenceVol(
         List<Instrument> instruments,
         Dictionary<string, Tick> latestByToken,
         Dictionary<DateOnly, decimal> forwardByExpiry,
         decimal atmStrike,
-        Dictionary<DateOnly, double> yearsToExpiry)
+        Dictionary<DateOnly, double> yearsToExpiry,
+        double riskFreeRate)
     {
         var result = new Dictionary<DateOnly, double>();
 
@@ -749,23 +846,16 @@ public sealed class LiveDataService : IDisposable
 
             var atmLegs = instruments
                 .Where(i => i.ExpiryDate == expiry && i.StrikePrice == atmStrike)
-                .OrderBy(i => i.OptionType == OptionType.Call ? 0 : 1);
+                .OrderBy(i => i.OptionType == OptionType.Call ? 0 : 1)
+                .Select(i => latestByToken.TryGetValue(i.Token, out var tick)
+                    ? new AtmReferenceVolSolver.Leg(i.OptionType, tick.LastPrice)
+                    : (AtmReferenceVolSolver.Leg?)null)
+                .Where(leg => leg is not null)
+                .Select(leg => leg!.Value);
 
-            foreach (var leg in atmLegs)
+            if (AtmReferenceVolSolver.Solve(atmLegs, atmStrike, underlying, yearsToExpiry[expiry], riskFreeRate) is { } vol)
             {
-                if (!latestByToken.TryGetValue(leg.Token, out var tick) || tick.LastPrice <= 0)
-                {
-                    continue;
-                }
-
-                var solved = ImpliedVolatilitySolver.Solve(
-                    leg.OptionType, (double)tick.LastPrice, (double)underlying, (double)atmStrike, yearsToExpiry[expiry], RiskFreeRate);
-
-                if (solved is { } vol)
-                {
-                    result[expiry] = vol;
-                    break;
-                }
+                result[expiry] = vol;
             }
         }
 
@@ -786,7 +876,8 @@ public sealed class LiveDataService : IDisposable
         List<Instrument> instruments,
         Dictionary<string, Tick> latestByToken,
         decimal spotLtp,
-        Dictionary<DateOnly, double> yearsToExpiry)
+        Dictionary<DateOnly, double> yearsToExpiry,
+        double riskFreeRate)
     {
         var result = new Dictionary<DateOnly, decimal>();
 
@@ -809,7 +900,7 @@ public sealed class LiveDataService : IDisposable
                 pairs.Add(((double)strike, (double)callMid, (double)putMid));
             }
 
-            result[expiry] = SyntheticForward.Compute(pairs, t, RiskFreeRate) is { } forward ? (decimal)forward : spotLtp;
+            result[expiry] = SyntheticForward.Compute(pairs, t, riskFreeRate) is { } forward ? (decimal)forward : spotLtp;
         }
 
         return result;
@@ -844,24 +935,52 @@ public sealed class LiveDataService : IDisposable
             return [];
         }
 
-        var tokens = open.Select(t => t.InstrumentToken).Distinct().ToArray();
+        var latestPriceByToken = await LatestPriceByTokenAsync(db, open.Select(t => t.InstrumentToken));
+        return open.Select(t => ToPositionRow(t, latestPriceByToken)).ToList();
+    }
 
-        var latestTicks = await LatestTicksAsync(db, tokens);
-        var latestPriceByToken = latestTicks.ToDictionary(t => t.Token, t => t.LastPrice);
+    /// <summary>
+    /// Batch 7 (2026-09-14) -- the two new strategies' own open position, if any, for the
+    /// repurposed ScorePanel. Always returns exactly one row per <see cref="StrategyId"/> (null
+    /// <see cref="StrategyPositionRow.Position"/> when flat) rather than omitting flat strategies,
+    /// so the panel renders a stable two-row layout instead of the row count itself changing.
+    /// </summary>
+    async Task<List<StrategyPositionRow>> BuildStrategyPositionsAsync(NiftySignalDbContext db)
+    {
+        var open = await db.PaperTrades
+            .Where(t => t.ExitTime == null && (t.StrategyId == StrategyId.CoreScoreHysteresis || t.StrategyId == StrategyId.CoreScoreCrossover))
+            .ToListAsync();
 
-        return open.Select(t => new PositionRow(
-            InstrumentToken: t.InstrumentToken,
-            TradingSymbol: t.TradingSymbol,
-            Direction: t.Direction,
-            EntryPremium: t.EntryPrice,
-            // Falls back to entry price (0 unrealized) if no tick has landed yet for this
-            // token this session -- same "nothing live yet" tolerance as everywhere else,
-            // not a crash or a fabricated number.
-            CurrentPremium: latestPriceByToken.TryGetValue(t.InstrumentToken, out var ltp) ? ltp : t.EntryPrice,
-            Quantity: t.HasPartiallyBooked ? t.Quantity - (t.PartialExitQuantity ?? 0) : t.Quantity,
-            EntryTime: t.EntryTime,
-            HasPartiallyBooked: t.HasPartiallyBooked))
-            .ToList();
+        var latestPriceByToken = await LatestPriceByTokenAsync(db, open.Select(t => t.InstrumentToken));
+
+        PositionRow? RowFor(StrategyId strategyId) =>
+            open.FirstOrDefault(t => t.StrategyId == strategyId) is { } trade ? ToPositionRow(trade, latestPriceByToken) : null;
+
+        return
+        [
+            new StrategyPositionRow(StrategyId.CoreScoreHysteresis, RowFor(StrategyId.CoreScoreHysteresis)),
+            new StrategyPositionRow(StrategyId.CoreScoreCrossover, RowFor(StrategyId.CoreScoreCrossover)),
+        ];
+    }
+
+    static PositionRow ToPositionRow(PaperTrade t, IReadOnlyDictionary<string, decimal> latestPriceByToken) => new(
+        InstrumentToken: t.InstrumentToken,
+        TradingSymbol: t.TradingSymbol,
+        Direction: t.Direction,
+        EntryPremium: t.EntryPrice,
+        // Falls back to entry price (0 unrealized) if no tick has landed yet for this
+        // token this session -- same "nothing live yet" tolerance as everywhere else,
+        // not a crash or a fabricated number.
+        CurrentPremium: latestPriceByToken.TryGetValue(t.InstrumentToken, out var ltp) ? ltp : t.EntryPrice,
+        Quantity: t.HasPartiallyBooked ? t.Quantity - (t.PartialExitQuantity ?? 0) : t.Quantity,
+        EntryTime: t.EntryTime,
+        HasPartiallyBooked: t.HasPartiallyBooked);
+
+    static async Task<Dictionary<string, decimal>> LatestPriceByTokenAsync(NiftySignalDbContext db, IEnumerable<string> tokens)
+    {
+        var distinctTokens = tokens.Distinct().ToArray();
+        var latestTicks = await LatestTicksAsync(db, distinctTokens);
+        return latestTicks.ToDictionary(t => t.Token, t => t.LastPrice);
     }
 
     /// <summary>
@@ -965,10 +1084,13 @@ public sealed class LiveDataService : IDisposable
         new DateTimeOffset(DateTimeOffset.UtcNow.ToIst().Date, IstTime.Offset).ToUniversalTime();
 
     // 91-day T-bill proxy -- same starting value as LiveFeatureEngine (plan 4.1).
-    // PENDING (audit finding F21, 2026-09-08 lead review -- see fix plan Batch 6): duplicated
-    // identically in NiftySignal.Host/LiveFeatureEngine.cs. Move both to config so a rate change
-    // can't land in one copy and not the other.
-    const double RiskFreeRate = 0.065;
+    // Audit finding F21 fixed (2026-09-09): was a hardcoded const duplicated identically in
+    // NiftySignal.Host/LiveFeatureEngine.cs; both now read the same-shaped "Pricing" config
+    // section (PricingOptions, NiftySignal.Domain.Configuration) from their own appsettings.json
+    // instead -- see PricingOptions' own doc comment for why this is two config entries kept in
+    // sync by hand, not one shared source.
+    readonly IOptionsMonitor<PricingOptions> _pricingOptions;
+    double RiskFreeRate => _pricingOptions.CurrentValue.RiskFreeRate;
 
     public void Dispose() => _timer.Dispose();
 }

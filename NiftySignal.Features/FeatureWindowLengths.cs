@@ -33,6 +33,21 @@ public static class FeatureWindowLengths
     /// <summary>OI updates are not tick-frequency.</summary>
     public static readonly TimeSpan OiBuildupNet = TimeSpan.FromMinutes(30);
 
+    /// <summary>
+    /// How far back <c>OiLookbackWindow</c> compares raw OI against, for both
+    /// <c>LiveFeatureEngine.ComputeOiBuildupNet</c> and <c>ComputeRatioSizedOiFlowRaw</c> --
+    /// distinct from <see cref="OiBuildupNet"/> above, which governs how the resulting *raw*
+    /// value gets z-scored, not how it's computed. Audit finding F50 (2026-09-10, user-caught
+    /// live): NSE/the broker only refresh OI every ~3 minutes -- comparing against the previous
+    /// 15s cadence was structurally almost always a no-op, the exact same root cause the
+    /// Dashboard's own "OI Change %" panel was already fixed for once (see
+    /// LiveDataService.cs's own comment on the same underlying reality). Comfortably longer
+    /// than the confirmed ~3 minutes so the comparison reliably spans at least one real
+    /// update -- a provisional constant like every other assumed-but-unvalidated number in this
+    /// class, not yet derived from measuring the real print-to-print gap in live data.
+    /// </summary>
+    public static readonly TimeSpan OiComparisonWindow = TimeSpan.FromMinutes(4);
+
     /// <summary>Slow structural signal.</summary>
     public static readonly TimeSpan IvSkew = TimeSpan.FromMinutes(15);
 
@@ -114,11 +129,14 @@ public static class FeatureWindowLengths
     public static readonly TimeSpan StraddleRichness = TimeSpan.FromMinutes(15);
 
     /// <summary>
-    /// ATM IV rank lookback (2026-09-08, audit finding F3 -- "the single biggest omission for
-    /// a strategy that buys premium"). No multi-day IV history exists yet, so this ranks
-    /// today's ATM IV against itself over a rolling window rather than a true 52-week rank --
-    /// same "calm and active regimes both represented" reasoning as VixChangeZScoreWindow,
-    /// long enough that one flat stretch can't dominate the observed min/max range.
+    /// How far back the tracked future's own price-vs-VWAP deviation is z-scored (audit finding
+    /// F55's price-led dynamic-hybrid mode, 2026-09-11). Deliberately a rolling window, not a
+    /// full-session one -- short enough to warm up in the first half hour (matching every other
+    /// window in this class) and to stay reactive to the *current* regime rather than averaging
+    /// across the whole day including calmer or more volatile earlier stretches, which is
+    /// actually the more F59-aligned choice here (a fixed full-session window would get
+    /// progressively less sensitive as the day went on, the same trap the DynamicHybrid rank
+    /// cutoff fell into against a growing distribution).
     /// </summary>
-    public static readonly TimeSpan IvRank = TimeSpan.FromHours(2);
+    public static readonly TimeSpan FuturesVwapDeviation = TimeSpan.FromMinutes(30);
 }

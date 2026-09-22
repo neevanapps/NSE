@@ -18,15 +18,16 @@ namespace NiftySignal.Backtest;
 /// strikes simultaneously -- narrowing to one instrument would misrepresent how the live
 /// feed actually interleaves.
 ///
-/// PENDING (audit finding F32, 2026-09-08 third-party review -- see fix plan): this class and
-/// PerformanceReportBuilder are both real and tested, but nothing wires them together yet --
-/// no BacktestRunner drives this source's replayed ticks through LiveFeatureEngine.OnTick/
-/// Sample/ComputeCadence on a clock keyed off tick timestamps (not DateTimeOffset.UtcNow, which
-/// MarketDataIngestionWorker/LiveTradingEngine currently hardcode), then through the
-/// entry/exit evaluation LiveTradingEngine performs live, into PaperTradeSimulator, into
-/// PerformanceReportBuilder. Right now there is genuinely no way to backtest anything -- this is
-/// the single biggest gap relative to the project's own "validate before trusting" plan, and the
-/// prerequisite for validating every sign/weight question already tracked elsewhere (F23-F28).
+/// Audit finding F32 (2026-09-11): now wired up by <see cref="BacktestRunner"/>, which drives
+/// this source's replayed ticks through LiveFeatureEngine.OnTick/Sample/ComputeCadence on a
+/// clock keyed off tick timestamps, then through LiveTradingEngine.EvaluateCadenceAsync (the
+/// same entry/exit evaluation used live), into PaperTradeSimulator, into
+/// PerformanceReportBuilder. Correction to this comment's earlier claim (2026-09-08 draft): a
+/// full read of LiveTradingEngine.cs found it does NOT hardcode DateTimeOffset.UtcNow anywhere
+/// -- EvaluateCadenceAsync derives `now` entirely from snapshot.ComputedAt and threads that one
+/// value through every downstream call, so it was already look-ahead-safe before BacktestRunner
+/// existed. Only MarketDataIngestionWorker (the live-only orchestration loop, not replayed here)
+/// uses UtcNow.
 /// </summary>
 public sealed class BacktestTickSource(
     NiftySignalDbContext db,

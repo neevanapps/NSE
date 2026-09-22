@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Exploratory trade simulation for testing whether a single candidate metric from
+         CadenceContexts (NiftySignal.BacktestData) has real directional edge, future-direct
+         (long/short the tracked future itself), not options, until the child (strike-level)
+         table exists for realistic option-premium fills. This is deliberately NOT
+         NiftySignal.Backtest, which drives the real live pipeline (LiveFeatureEngine/
+         LiveTradingEngine/PaperTradeSimulator) against real option positions; this one is a much
+         simpler, standalone tool for the "does this metric have edge" question specifically,
+         per the standing per-metric evaluation cycle in docs/REVIEW_FINDINGS.md. -->
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NiftySignal.BacktestData\NiftySignal.BacktestData.csproj" />
+    <ProjectReference Include="..\NiftySignal.Features\NiftySignal.Features.csproj" />
+    <ProjectReference Include="..\NiftySignal.Scoring\NiftySignal.Scoring.csproj" />
+  </ItemGroup>
+
+</Project>

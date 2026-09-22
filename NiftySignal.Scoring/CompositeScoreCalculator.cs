@@ -16,15 +16,20 @@ public static class CompositeScoreCalculator
     public const double DefaultK = 1.0;
 
     /// <summary>
-    /// The components that don't gate warm-up -- see ScoreComponentInputs' VixChangeZ and
-    /// GammaExposureZ doc comments for why. Excluded by name rather than restructuring the
-    /// six required ones into their own type, since these are deliberate, individually-named
-    /// exceptions, not a general "optional components" mechanism.
+    /// Components that don't gate warm-up for a reason *other than* being weight-0 -- see
+    /// ScoreComponentInputs' VixChangeZ doc comment: VIX tracking can be legitimately absent
+    /// for a day's whole instrument universe even though it carries a real (0.05) weight, so
+    /// it needs its own name-based exception. GammaExposure/VolumePcr/SpreadRatio/
+    /// VannaExposure/CharmExposure/CvdProxy/StraddleRichness are listed here too for backward
+    /// documentation clarity, but as of the F47 fix below they'd be optional regardless (all
+    /// currently weight 0.0) -- this list only still matters for VixChange.
     ///
     /// PENDING (audit finding F14, 2026-09-08 lead review -- see fix plan Batch 6): DepthImbalance
-    /// stays one of the required six below, so a missing depth book blocks OiBuildupNet/Pcr/
-    /// FuturesBasis/IvSkew/PriceMomentum even when those are otherwise ready. Should join this
-    /// list (contributing 0 when null, same as the other eight) once implemented.
+    /// carries a real, nonzero weight (0.1625) and is untouched by the F47 fix below, so it
+    /// still gates warm-up for OiBuildupNet/Pcr/FuturesBasis/IvSkew/PriceMomentum too. F14 asks
+    /// whether a missing depth book should instead silently contribute 0 like VixChange does --
+    /// that's a real risk-behavior decision (the composite could warm up and trade having never
+    /// seen a depth book at all), not a mechanical fix, and stays open pending that decision.
     /// </summary>
     const string VixComponentName = "VixChange";
     const string GammaExposureComponentName = "GammaExposure";
@@ -34,11 +39,11 @@ public static class CompositeScoreCalculator
     const string CharmExposureComponentName = "CharmExposure";
     const string CvdProxyComponentName = "CvdProxy";
     const string StraddleRichnessComponentName = "StraddleRichness";
-    static readonly string[] OptionalComponentNames =
-    [
-        VixComponentName, GammaExposureComponentName, VolumePcrComponentName, SpreadRatioComponentName,
-        VannaExposureComponentName, CharmExposureComponentName, CvdProxyComponentName, StraddleRichnessComponentName,
-    ];
+    // Just VixChange -- the other seven are all weight-0.0 today (see ScoreWeights.Default) and
+    // are therefore already optional via IsOptional's weight check below without needing to be
+    // named here too. Kept as a single-entry array rather than a plain string comparison so a
+    // future second name-based exception (like VixChange's) has an obvious place to go.
+    static readonly string[] OptionalComponentNames = [VixComponentName];
 
     /// <summary>
     /// The pre-tanh weighted z-sum on its own (2026-09-04), for callers that need to build a
@@ -77,26 +82,43 @@ public static class CompositeScoreCalculator
 
     /// <summary>
     /// True (with the weighted-z-sum in <paramref name="raw"/>) once every *required*
-    /// component (everything except <see cref="OptionalComponentNames"/>) has a z-score. An
-    /// optional component's own contribution is added when available and silently treated as
-    /// 0 when not -- neither one blocks the composite, or prevents the required six from
-    /// producing one.
+    /// component has a z-score. A component is optional -- contributes when available,
+    /// silently treated as 0 when not, never blocks the composite -- if it's named in
+    /// <see cref="OptionalComponentNames"/> (VixChange's own separate-warm-up-clock reason) or
+    /// if its weight is 0 (audit finding F47, 2026-09-10: a component contributing nothing to
+    /// the score has no business being able to block every other component's warm-up just
+    /// because it happened to be one of the original six -- e.g. PriceMomentum, cut to weight
+    /// 0 by F4 but left on the required list, meaning a missing PriceMomentumZ could stall the
+    /// whole composite for a component that would add exactly 0 even if present).
     /// </summary>
     static bool TryComputeRaw(List<ScoreComponentBreakdown> components, out double raw)
     {
-        var required = components.Where(c => !OptionalComponentNames.Contains(c.Name)).ToList();
+        var required = components.Where(c => !IsOptional(c)).ToList();
         if (!required.All(c => c.ZScore is not null))
         {
             raw = 0;
             return false;
         }
 
-        var optionalContribution = components
-            .Where(c => OptionalComponentNames.Contains(c.Name))
-            .Sum(c => c.WeightedContribution ?? 0.0);
+        var optionalContribution = components.Where(IsOptional).Sum(c => c.WeightedContribution ?? 0.0);
         raw = required.Sum(c => c.WeightedContribution!.Value) + optionalContribution;
         return true;
     }
+
+    static bool IsOptional(ScoreComponentBreakdown c) => OptionalComponentNames.Contains(c.Name) || c.Weight == 0.0;
+
+    /// <summary>
+    /// Names of the required components currently missing a z-score -- i.e. the ones actually
+    /// responsible for <see cref="Calculate"/> returning a null score this cadence. Exists so a
+    /// caller wanting to log *why* warm-up is blocked (audit finding F10) reads this class's own
+    /// required/optional rule directly instead of hand-maintaining a second, parallel list that
+    /// can silently drift out of sync with it -- which is exactly what happened to
+    /// MarketDataIngestionWorker's old hardcoded six-name list once F47 made PriceMomentum
+    /// optional: the log kept blaming PriceMomentumZ for blocking warm-up long after it no
+    /// longer could.
+    /// </summary>
+    public static IReadOnlyList<string> DescribeMissingRequiredComponents(ScoreComponentInputs inputs, ScoreWeights weights) =>
+        BuildComponents(inputs, weights).Where(c => !IsOptional(c) && c.ZScore is null).Select(c => c.Name).ToList();
 
     static List<ScoreComponentBreakdown> BuildComponents(ScoreComponentInputs inputs, ScoreWeights weights) =>
     [

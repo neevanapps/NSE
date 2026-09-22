@@ -6,6 +6,10 @@
     <ProjectReference Include="..\NiftySignal.Execution\NiftySignal.Execution.csproj" />
     <ProjectReference Include="..\NiftySignal.Rules\NiftySignal.Rules.csproj" />
     <ProjectReference Include="..\NiftySignal.Ingestion\NiftySignal.Ingestion.csproj" />
+    <!-- Phase F of docs/LIVE_PARITY_PLAN.md: read-only access to VolumeBarDbContext's live
+         tables (LiveOptionsScoreRow/LiveEntrySignalRow/LivePaperTradeRow) for the new
+         /live-options-score page. This project never writes to any VolumeBarDbContext table. -->
+    <ProjectReference Include="..\NiftySignal.VolumeBarData\NiftySignal.VolumeBarData.csproj" />
   </ItemGroup>
 
   <ItemGroup>

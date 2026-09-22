@@ -1,0 +1,23 @@
+@page "/live-options-score"
+@attribute [Authorize]
+@rendermode InteractiveServer
+@using NiftySignal.Dashboard.Components.Dashboard
+
+@* Dashboard reorg (2026-09-21, docs/LIVE_PARITY_PLAN.md): this page's own content (Current Bar
+   Score / Max Pain / Open Position / Today's Trades) was extracted into LiveOptionsScorePanel so
+   it could ALSO be embedded at the top of Home.razor, now the primary place this data is seen.
+   This standalone page is kept for a focused, full-detail view (and for anyone with it
+   bookmarked) -- it's now a thin wrapper around the shared component, not a separate
+   implementation. *@
+
+<PageTitle>Live Options Score</PageTitle>
+
+<div class="dashboard-shell">
+    <div style="padding: 4px 0 12px;">
+        <a href="/" class="login-link">&larr; Back to dashboard</a>
+    </div>
+
+    <div style="display:grid; grid-template-columns: repeat(12, 1fr); gap:16px;">
+        <LiveOptionsScorePanel ShowFullPageLink="false" />
+    </div>
+</div>

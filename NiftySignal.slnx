@@ -3,6 +3,7 @@
     <Project Path="spikes/FlatTradeSpike/FlatTradeSpike.csproj" />
   </Folder>
   <Project Path="NiftySignal.Backtest/NiftySignal.Backtest.csproj" />
+  <Project Path="NiftySignal.CoreScoreReplayDiff/NiftySignal.CoreScoreReplayDiff.csproj" />
   <Project Path="NiftySignal.Dashboard/NiftySignal.Dashboard.csproj" />
   <Project Path="NiftySignal.Domain/NiftySignal.Domain.csproj" />
   <Project Path="NiftySignal.Execution/NiftySignal.Execution.csproj" />
@@ -13,6 +14,7 @@
   <Project Path="NiftySignal.Persistence/NiftySignal.Persistence.csproj" />
   <Project Path="NiftySignal.Pricing/NiftySignal.Pricing.csproj" />
   <Project Path="NiftySignal.Rules/NiftySignal.Rules.csproj" />
+  <Project Path="NiftySignal.ScoreReplay/NiftySignal.ScoreReplay.csproj" />
   <Project Path="NiftySignal.Scoring/NiftySignal.Scoring.csproj" />
   <Project Path="NiftySignal.Tests/NiftySignal.Tests.csproj" />
 </Solution>

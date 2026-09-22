@@ -1,5 +1,84 @@
 # Nifty 50 Options — Directional Signal & Paper Trading System
 
+## As-Built Status (2026-09-09)
+
+**This document is the original pre-build plan, finalized 2026-09-03. It is kept as the
+historical record of intent — it is not current, and a growing amount of what follows no
+longer matches what actually runs.** Anyone auditing this project against this file alone will
+be auditing against a plan the live system has since moved past in real, documented ways. The
+authoritative sources for current behavior are the source code itself (every material
+deviation from this plan is doc-commented at its point of change, cross-referenced to an audit
+finding number) and [`ARCHITECTURE.md`](../ARCHITECTURE.md) for the actual module map. This
+section exists so that cross-reference doesn't have to be reverse-engineered from scratch.
+
+**Material deviations from this plan's locked decisions, as of 2026-09-09:**
+
+- **§1.2 risk sizing** — planned `MaxTradesPerDay: 7`; live is **30** (raised 2026-09-08 after
+  the 7-cap was spent by 10:48 one session, before a later well-sustained move could even be
+  evaluated — deliberately loose to observe unconstrained behavior, not a considered steady
+  state). Planned `MaxConcurrentPositions: 2-3`; live is **3**, matches.
+- **§6 Universal Score** — planned as 6 fixed-weight components (25/20/15/15/15/10) with a
+  *dynamic* `k`. Live is materially different on both axes: `k` is now a **fixed constant**
+  (the dynamic version was found to be self-defeating — see `CompositeScoreCalculator.
+  DefaultK`'s doc comment, audit finding F1), there are now **14** tracked components (6
+  directional + VixChange + 7 diagnostic-only components carrying weight 0, added and
+  evaluated incrementally against live data rather than designed up front — see
+  `ScoreWeights.cs`'s own revision history), and the weights themselves have been revised
+  multiple times against live findings (`PriceMomentum` cut from 0.15 to 0 entirely, its
+  weight redistributed to `OiBuildupNet`/`DepthImbalance`; see F4).
+- **§4.1 time-to-expiry** — planned as calendar-days/365 floored at 1 hour; live now floors at
+  **2 minutes** (F20, tightened after finding the 1-hour floor kept Greeks/IV frozen through
+  the entire final hour before expiry — the highest-gamma stretch). A same-day detour tried
+  trading-day (weekday) counting instead of calendar days (F6) and was reverted after external
+  review — index options price on calendar time; that detour is gone, but is a real example of
+  why this file can't be trusted as a live description.
+- **§5.3 IV skew** — planned as a fixed delta or fixed strike offset; live anchors the compared
+  strikes to the expiry's own expected move (`spot × σ × √t`, F8) instead, so the same
+  *relative* strikes are compared regardless of vol regime. Window shortened from the planned
+  60 minutes to 15 (2026-09-04, so it warms up same-session).
+- **§7.1/7.2 rule engine — partially closed, largest remaining gap is the rest.** Planned as
+  JSON-configured, NCalc-evaluated expressions, hot-reloaded via `IOptionsMonitor` + file
+  watcher with a validate-before-swap gate. Entry/exit *logic* is still hardcoded C#
+  (`EntryRuleEvaluator`, `ExitRuleEvaluator`) — no NCalc, no JSON rule expressions, no dashboard
+  rules editor (§11); that rewrite is a separate, much larger undertaking and remains
+  undone. But the config *values* half of this gap closed 2026-09-09: `RulesetConfig`/
+  `ScoreWeights` now bind from appsettings (`RulesetConfigOptions`/`ScoreWeightsOptions`, see
+  their own doc comments for why they're separate bindable DTOs rather than binding the domain
+  records directly) via `IOptionsMonitor`, hot-reload on file change, and validate before swap
+  (`RulesetConfigValidator`/`ScoreWeightsValidator` plus `ValidatedOptionsMonitor<TOptions,
+  TDomain>` — a bad reload is rejected and logged, the running system keeps serving the last
+  value that passed, and a bad value at startup fails fast rather than running on an unvalidated
+  fallback). §7.2's example numbers themselves have drifted too:
+  `MinAbsScore` 55 → **64** (F13, derived from a live-data replay, not guessed), premium band
+  ₹150-200 → **₹100-150** (2026-09-07), `MaxDailyLossPct` 3.0% → **20.0%** (deliberately widened
+  for paper-trading observation — see the risk-limits note below), and `RiskLimitsConfig`
+  gained a `MaxDailyProfitPct` field the plan never specified.
+- **§10 Backtesting** — planned as "same code path as live, only the tick source differs."
+  `BacktestTickSource`/`PerformanceReportBuilder` exist and are tested, but nothing wired them
+  together end-to-end (audit finding F32, still deferred — needs `LiveTradingEngine`/
+  `PaperTradeSimulator` in the loop for real P&L replay, not just scoring). A narrower tool,
+  `NiftySignal.ScoreReplay`, drives ticks through the scoring path alone (not entry/exit/P&L)
+  to validate raw-value distributions against live data without waiting for a fresh session —
+  see its own doc comment for the exact scope line against F32.
+- **Risk limits are observation-mode, not the plan's risk box — flagged explicitly, not fixed
+  here.** `MaxDailyLossPct: 20.0` / `MaxTradesPerDay: 30` (`LiveRulesetConfig.cs`) were
+  deliberately widened for paper-trading exploration, on the explicit reasoning that no real
+  capital is at risk while observing a fuller range of daily outcomes. **These must be tightened
+  back toward this plan's own risk box (§1.2/§7.2: single-digit `MaxTradesPerDay`, low-single-
+  digit `MaxDailyLossPct`) before this system is ever pointed at real money.** Left wide
+  deliberately for now — do not read this note as permission to tighten mid-observation without
+  cause, and do not read it as permission to skip tightening before real capital either.
+- **Diagnostic (weight-0) components** — `GammaExposure`/`VolumePcr`/`SpreadRatio`/
+  `VannaExposure`/`CharmExposure`/`CvdProxy`/`StraddleRichness` all launched at weight 0,
+  explicitly pending correlation evidence (`scripts/batch5-component-correlation.sql`, audit
+  finding F9/Batch 5). **None should move off weight 0 until that script has run against
+  several clean (non-VM-restart-interrupted) live sessions on the current, corrected formulas**
+  — one session's correlation is not evidence, and running it against still-buggy components
+  (which several of these were, earlier) would just encode those bugs more precisely. This is a
+  standing constraint, not a one-time check.
+
+---
+
 ## Project Plan v1.1 (Finalized)
 
 **Scope:** Paper trading only. Directional (option buying) strategy only. Option selling deferred to a later phase.
