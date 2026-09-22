@@ -3185,3 +3185,60 @@ external review's "OiBuildupNet has never been tested" finding. Complete tally f
 confirmed/strong candidates, 3 watch candidates, 9 closed. See `docs/SCORE_CANDIDATES.md` for the
 full list with evidence; the user-facing summary was delivered directly in conversation rather than
 duplicated here in full.
+
+---
+
+## 2026-09-22 — F61: `Instruments` table Underlying-ambiguity, found while scoping the Sensex/Bank Nifty tick-collection task — fixed same session
+
+**Found while investigating, not reported by an outside review.** The task was to start persisting
+raw Sensex/Bank Nifty ticks into the same `NiftySignalDbContext.Instruments`/`Ticks` tables NIFTY's
+own live pipeline already uses (for future backtesting only — no scoring/trading on the new
+indices). Before writing any resolver code, checked every consumer of `Instruments` for a hidden
+single-underlying assumption, since that table has only ever held NIFTY rows in production.
+
+**Confirmed real:** several call sites picked "the" future/spot/nearest-expiry-option-chain via a
+bare `FirstOrDefaultAsync`/`First`/`Min` over `Instruments` filtered only by `AsOfDate` (or nothing
+at all), with no `Underlying` filter and, for the `FirstOrDefault` sites, no deterministic
+`OrderBy` either:
+
+- `NiftySignal.Host/LiveFeatureEngine.cs` constructor — `_spot`/`_future`/`_nearestExpiry`/
+  `_nearestExpiryOptions`, the engine that computes every live (paper) trade decision.
+- `NiftySignal.VolumeBarData/LiveVolumeBarPopulator.cs` (`WriteNewBarsAsync`'s future lookup) and
+  `NiftySignal.VolumeBarData/ReplayLiveCommand.cs` (same pattern, the `replay-live` parity harness).
+- `NiftySignal.VolumeBarData/LiveOptionAtmPopulator.cs`, `LiveOptionMaxPainPopulator.cs`,
+  `LiveOptionDepthPopulator.cs` — nearest-expiry option chain selection.
+- `NiftySignal.Backtest/BacktestRunner.cs`, `NiftySignal.ScoreReplay/Program.cs`,
+  `NiftySignal.CoreScoreReplayDiff/Program.cs` (two call sites) — all hand their loaded
+  `Instruments` rows straight into `new LiveFeatureEngine(...)`.
+
+Once Sensex/Bank Nifty rows exist in `Instruments` for the same `AsOfDate`, any of these would have
+silently resolved to the wrong underlying's future/spot/option chain — no exception, no log line,
+just quietly wrong scores/bars. Checked and ruled out as *not* needing a fix: `NiftySignal.DataSync/
+Program.cs`'s Instruments max-id watermark query (`OrderByDescending(i => i.Id).FirstOrDefaultAsync()`)
+— deterministic and deliberately underlying-agnostic, since it's a generic full-table replicator, not
+a single-instrument selector.
+
+**Fix:** added an explicit `Underlying == "NIFTY"` (`LiveFeatureEngine.NiftyUnderlying`) filter at
+every site above, plus explicit `OrderBy(ExpiryDate)` wherever a `FirstOrDefault` had no ordering.
+`LiveFeatureEngine`'s own constructor now filters to NIFTY once, internally, and stores only the
+filtered list — so every downstream consumer that hands it a (possibly mixed) instrument list is
+protected regardless of whether that caller also filters. The Backtest/ScoreReplay/CoreScoreReplayDiff
+call sites additionally filter at intake, belt-and-suspenders.
+
+**Verification (Stage 1 of the Sensex/Bank Nifty task, before any new-index code was written):**
+- Behaviorally a no-op today, proven: full `dotnet test` suite (666 pre-existing tests) passes
+  byte-identical after the fix, since the `Instruments` table holds only NIFTY rows in every
+  existing fixture and in production as of this date.
+- Two new regression tests added specifically to catch the bug this fix closes (would have failed
+  against the pre-fix code): `LiveFeatureEngineTests.Constructor_WithMixedUnderlyingInstruments_*`
+  (two tests) and `LiveVolumeBarPopulatorUnderlyingFilterTests.WriteNewBarsAsync_WithTwoUnderlyingsInInstrumentsTable_UsesNiftyFutureOnly`
+  — each builds a fixture with a second underlying's rows deliberately inserted first and with an
+  earlier expiry (the exact ordering an unfiltered query is most likely to get wrong), and asserts
+  the NIFTY-only result.
+- Full suite after the fix + new tests: 669/669 passing, 0 warnings.
+- No live/VM verification performed or required — this is a local-code fix with no behavior change
+  to the currently-deployed system (Instruments table on the VM also holds NIFTY rows only, so the
+  filter is a no-op there too until Stage 2 ships).
+
+**Numbering note:** this file's own text above (2026-09-11) said F61 was next-free; that note is now
+stale as of this entry — **F62 is next-free** going forward.

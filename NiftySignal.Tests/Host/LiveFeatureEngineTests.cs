@@ -2242,4 +2242,108 @@ public class LiveFeatureEngineTests
         Assert.NotNull(coreSnapshot!.CoreScoreFast);
         Assert.NotNull(coreSnapshot.CoreScoreSlow);
     }
+
+    // Audit finding F61 (2026-09-22): regression coverage for the Underlying-ambiguity bug found
+    // while scoping the Sensex/Bank Nifty tick-collection task. Before the fix, _spot/_future/
+    // _nearestExpiry were picked via plain First(...)/Min(...) over the WHOLE instruments list with
+    // no Underlying filter -- harmless only because every real caller's list was 100% NIFTY. These
+    // tests build a fixture with a second underlying's rows mixed in (deliberately placed FIRST in
+    // the list, and with an earlier expiry than NIFTY's own, so an unfiltered First()/Min() would
+    // pick the wrong one) and assert the engine still resolves to NIFTY's own instruments only.
+    const string OtherUnderlyingSpotToken = "99000";
+    const string OtherUnderlyingFutureToken = "99001";
+    const string OtherUnderlyingOptionToken = "99002";
+    static readonly DateOnly OtherUnderlyingEarlierExpiry = NearestExpiry.AddDays(-3);
+
+    static List<Instrument> MixedUnderlyingUniverse() =>
+    [
+        // Other underlying's rows first, and with an earlier expiry -- if the constructor's
+        // First()/Min() calls were ever unfiltered again, these would win.
+        new()
+        {
+            Token = OtherUnderlyingSpotToken,
+            Exchange = Exchange.Bse,
+            TradingSymbol = "SENSEX",
+            InstrumentType = InstrumentType.Index,
+            Underlying = "SENSEX",
+            LotSize = 1,
+            TickSize = 0.05m,
+            AsOfDate = AsOfDate,
+        },
+        new()
+        {
+            Token = OtherUnderlyingFutureToken,
+            Exchange = Exchange.Bfo,
+            TradingSymbol = "SENSEX-FUT",
+            InstrumentType = InstrumentType.Future,
+            ExpiryDate = OtherUnderlyingEarlierExpiry,
+            Underlying = "SENSEX",
+            LotSize = 10,
+            TickSize = 0.05m,
+            AsOfDate = AsOfDate,
+        },
+        new()
+        {
+            Token = OtherUnderlyingOptionToken,
+            Exchange = Exchange.Bfo,
+            TradingSymbol = "SENSEX-OPT",
+            InstrumentType = InstrumentType.Option,
+            OptionType = OptionType.Call,
+            StrikePrice = 80000m,
+            ExpiryDate = OtherUnderlyingEarlierExpiry,
+            Underlying = "SENSEX",
+            LotSize = 10,
+            TickSize = 0.05m,
+            AsOfDate = AsOfDate,
+        },
+        .. BaseUniverse(),
+    ];
+
+    [Fact]
+    public void Constructor_WithMixedUnderlyingInstruments_OnlyResolvesNiftyOwnInstruments()
+    {
+        var engine = new LiveFeatureEngine(MixedUnderlyingUniverse());
+
+        Assert.NotNull(engine.FindInstrument(SpotToken));
+        Assert.NotNull(engine.FindInstrument(FutureToken));
+        Assert.NotNull(engine.FindInstrument(CallToken));
+
+        Assert.Null(engine.FindInstrument(OtherUnderlyingSpotToken));
+        Assert.Null(engine.FindInstrument(OtherUnderlyingFutureToken));
+        Assert.Null(engine.FindInstrument(OtherUnderlyingOptionToken));
+    }
+
+    [Fact]
+    public void Constructor_WithMixedUnderlyingInstruments_ComputesCadenceIdenticallyToNiftyOnlyUniverse()
+    {
+        // Same tick sequence fed to two engines -- one built from a NIFTY-only universe (today's
+        // real-world shape), one from the mixed universe above (the shape once Sensex/Bank Nifty
+        // rows exist in the same table) -- asserting byte-identical composite scores proves the
+        // extra rows are inert, not just that FindInstrument happens to filter them.
+        var niftyOnlyEngine = new LiveFeatureEngine(BaseUniverse());
+        var mixedEngine = new LiveFeatureEngine(MixedUnderlyingUniverse());
+
+        void Feed(LiveFeatureEngine engine)
+        {
+            engine.OnTick(MakeTick(SpotToken, 23950m, Start.AddSeconds(30)));
+            engine.OnTick(MakeTick(FutureToken, 24000m, Start.AddSeconds(30), depth: Depth(bidQty: 10, askQty: 10, bid: 23999m, ask: 24001m)));
+            engine.OnTick(MakeTick(CallToken, 120m, Start.AddSeconds(30), depth: Depth(bidQty: 10, askQty: 10, bid: 119m, ask: 121m)));
+            engine.OnTick(MakeTick(PutToken, 110m, Start.AddSeconds(30), depth: Depth(bidQty: 10, askQty: 10, bid: 109m, ask: 111m)));
+            engine.Sample(Start.AddSeconds(30));
+        }
+
+        Feed(niftyOnlyEngine);
+        Feed(mixedEngine);
+
+        // The other underlying's own ticks (dead weight for a real feed sharing one WebSocket) must
+        // not perturb anything either.
+        mixedEngine.OnTick(MakeTick(OtherUnderlyingSpotToken, 81000m, Start.AddSeconds(31)));
+        mixedEngine.OnTick(MakeTick(OtherUnderlyingFutureToken, 81050m, Start.AddSeconds(31)));
+
+        var niftyOnlySnapshot = niftyOnlyEngine.ComputeCadence(Start.AddSeconds(45));
+        var mixedSnapshot = mixedEngine.ComputeCadence(Start.AddSeconds(45));
+
+        Assert.Equal(niftyOnlySnapshot?.CompositeScore, mixedSnapshot?.CompositeScore);
+        Assert.Equal(niftyOnlySnapshot?.IsWarmedUp, mixedSnapshot?.IsWarmedUp);
+    }
 }

@@ -156,7 +156,9 @@ foreach (var asOfDate in asOfDates)
 {
     Console.WriteLine($"=== {asOfDate:yyyy-MM-dd} ===");
 
-    var instruments = await liveDb.Instruments.Where(i => i.AsOfDate == asOfDate).ToListAsync();
+    // Audit finding F61 (2026-09-22): explicit NIFTY filter at the intake, in addition to
+    // LiveFeatureEngine's own internal filter -- see that class's NiftyUnderlying doc comment.
+    var instruments = await liveDb.Instruments.Where(i => i.AsOfDate == asOfDate && i.Underlying == LiveFeatureEngine.NiftyUnderlying).ToListAsync();
     if (instruments.Count == 0)
     {
         Console.WriteLine($"  SKIPPED: no resolved instruments in '{sourceDatabaseNameOverride}' for this date.");
@@ -453,7 +455,9 @@ async Task<int> RunShadowSimulationAsync(string[] shadowArgs)
     Console.WriteLine($"=== SHADOW SIMULATION -- {asOfDate:yyyy-MM-dd}, simulated Host restart at {restartTime:HH:mm} IST ===");
     Console.WriteLine($"  RulesetVersion={rulesetConfig.RulesetVersion}  Hysteresis.EntryScoreThreshold={hysteresisConfig.EntryScoreThreshold}  Crossover.Fast/Slow={crossoverConfig.FastWindowMinutes}/{crossoverConfig.SlowWindowMinutes}min  (both ShadowMode={hysteresisConfig.ShadowMode}/{crossoverConfig.ShadowMode})");
 
-    var instruments = await liveDbLocal.Instruments.Where(i => i.AsOfDate == asOfDate).ToListAsync();
+    // Audit finding F61 (2026-09-22): explicit NIFTY filter at the intake, in addition to
+    // LiveFeatureEngine's own internal filter -- see that class's NiftyUnderlying doc comment.
+    var instruments = await liveDbLocal.Instruments.Where(i => i.AsOfDate == asOfDate && i.Underlying == LiveFeatureEngine.NiftyUnderlying).ToListAsync();
     if (instruments.Count == 0)
     {
         Console.Error.WriteLine($"No resolved instruments in '{sourceDb}' for {asOfDate:yyyy-MM-dd}.");

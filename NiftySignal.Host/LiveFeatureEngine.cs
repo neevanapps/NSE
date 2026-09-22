@@ -150,6 +150,26 @@ public sealed class LiveFeatureEngine
     double RiskFreeRate => _pricingOptions?.CurrentValue.RiskFreeRate ?? DefaultRiskFreeRate;
 
     /// <summary>
+    /// Audit finding F61 (2026-09-22, found while scoping the Sensex/Bank Nifty tick-collection
+    /// task): this class is Nifty's own live/backtest/replay scoring engine -- <see cref="_spot"/>/
+    /// <see cref="_future"/>/<see cref="_nearestExpiry"/> were previously picked via plain
+    /// <c>instruments.First(...)</c>/<c>.Min(...)</c> with no <see cref="Instrument.Underlying"/>
+    /// filter, which was silently correct only because every caller's own <c>instruments</c> list
+    /// (from <c>MarketDataIngestionWorker</c>, <c>NiftySignal.Backtest.BacktestRunner</c>,
+    /// <c>NiftySignal.ScoreReplay</c>, <c>NiftySignal.CoreScoreReplayDiff</c>) has only ever
+    /// contained NIFTY rows. Once the shared <c>Instruments</c> table starts also holding Sensex/
+    /// Bank Nifty rows for the same AsOfDate (the tick-collection task this finding was found
+    /// under), an unfiltered <c>First</c>/<c>Min</c> would have silently picked a non-Nifty spot/
+    /// future/expiry depending on row order -- corrupting every score this engine computes with no
+    /// exception and no log line. Fixed by filtering to <see cref="NiftyUnderlying"/> once, here,
+    /// rather than trusting every call site to filter before constructing this engine -- every
+    /// existing caller's instruments list is 100% NIFTY today, so this is a behavioral no-op right
+    /// now (see LiveFeatureEngineUnderlyingFilterTests for the regression test that proves the
+    /// filter actually discriminates, using a fixture with two underlyings' rows in one list).
+    /// </summary>
+    public const string NiftyUnderlying = "NIFTY";
+
+    /// <summary>
     /// Strikes each side of ATM whose per-cadence analytics get persisted (2026-09-05) --
     /// so ATM +/- 2, i.e. 5 strikes x 2 sides = ~10 rows a cadence. The full tracked chain is
     /// ATM +/- 10; persisting Greeks for all of it every 15s would be ~600k values a day,
@@ -503,18 +523,23 @@ public sealed class LiveFeatureEngine
         IOptionsMonitor<PricingOptions>? pricingOptions = null,
         ILogger? logger = null)
     {
-        _instruments = instruments;
+        // F61: filter to this engine's own underlying before any First/Min pick -- see
+        // NiftyUnderlying's own doc comment for why this can no longer be assumed implicitly.
+        // Everything below (fields, OnTick's token dispatch, FindInstrument) reads _instruments,
+        // never the raw constructor argument, so a caller that (today, mistakenly, or in the
+        // future) hands this engine a multi-underlying list still only ever sees NIFTY rows.
+        _instruments = [.. instruments.Where(i => i.Underlying == NiftyUnderlying)];
         _scoreWeightsOptions = scoreWeightsOptions;
         _pricingOptions = pricingOptions;
         _logger = logger;
-        _spot = instruments.First(i => i.InstrumentType == InstrumentType.Index);
-        _future = instruments.First(i => i.InstrumentType == InstrumentType.Future);
-        _vix = instruments.FirstOrDefault(i => i.InstrumentType == InstrumentType.Vix);
-        _nearestExpiry = instruments
+        _spot = _instruments.First(i => i.InstrumentType == InstrumentType.Index);
+        _future = _instruments.OrderBy(i => i.ExpiryDate).First(i => i.InstrumentType == InstrumentType.Future);
+        _vix = _instruments.FirstOrDefault(i => i.InstrumentType == InstrumentType.Vix);
+        _nearestExpiry = _instruments
             .Where(i => i.InstrumentType == InstrumentType.Option && i.ExpiryDate is not null)
             .Select(i => i.ExpiryDate!.Value)
             .Min();
-        _nearestExpiryOptions = [.. instruments.Where(i => i.InstrumentType == InstrumentType.Option && i.ExpiryDate == _nearestExpiry)];
+        _nearestExpiryOptions = [.. _instruments.Where(i => i.InstrumentType == InstrumentType.Option && i.ExpiryDate == _nearestExpiry)];
 
         // Core score DepthImbalance/ItmSkew (Batch 3 fix) -- one accumulator/mid-price slot per
         // nearest-expiry option token, for the whole lifetime of this engine instance (the

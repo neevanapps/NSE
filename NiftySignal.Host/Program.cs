@@ -76,6 +76,13 @@ try
     builder.Services.AddScoped<IDataGapRecorder, EfDataGapRecorder>();
     builder.Services.AddScoped<InstrumentUniverseResolver>();
 
+    // Sensex/Bank Nifty raw-tick-collection resolver (write-only/archive, future backtesting
+    // only) -- registered as its own concrete types, not bound to IInstrumentMasterProvider
+    // above, so Nifty's own resolution (InstrumentUniverseResolver -> IInstrumentMasterProvider
+    // -> FlatTradeInstrumentMasterProvider) is provably untouched by this addition.
+    builder.Services.AddHttpClient<SensexBankNiftyInstrumentMasterProvider>();
+    builder.Services.AddScoped<SensexBankNiftyInstrumentUniverseResolver>();
+
     // Hot-reloaded, validate-before-swap config (2026-09-09, external review -- see
     // ValidatedOptionsMonitor's own doc comment for why plain IOptionsMonitor +
     // IValidateOptions doesn't actually give "keep the last-known-good value on a bad reload").

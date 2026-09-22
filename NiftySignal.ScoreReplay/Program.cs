@@ -50,7 +50,9 @@ var connectionString = connectionStringBuilder.ConnectionString;
 var options = new DbContextOptionsBuilder<NiftySignalDbContext>().UseNpgsql(connectionString).Options;
 await using var db = new NiftySignalDbContext(options);
 
-var instruments = await db.Instruments.Where(i => i.AsOfDate == asOfDate).ToListAsync();
+// Audit finding F61 (2026-09-22): explicit NIFTY filter at the intake, in addition to
+// LiveFeatureEngine's own internal filter -- see that class's NiftyUnderlying doc comment.
+var instruments = await db.Instruments.Where(i => i.AsOfDate == asOfDate && i.Underlying == LiveFeatureEngine.NiftyUnderlying).ToListAsync();
 if (instruments.Count == 0)
 {
     Console.Error.WriteLine($"No resolved instruments found for {asOfDate:yyyy-MM-dd}.");

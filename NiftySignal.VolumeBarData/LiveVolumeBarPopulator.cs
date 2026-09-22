@@ -76,8 +76,16 @@ public static class LiveVolumeBarPopulator
         NiftySignalDbContext source, VolumeBarDbContext destination, DateOnly asOfDate, long barVolumeThreshold,
         DateTimeOffset nowUtc, bool finalizeDay, CancellationToken cancellationToken, LiveVolumeBarBuilderCache? builderCache = null)
     {
+        // Audit finding F61 (2026-09-22): NIFTY-filtered and explicitly ordered -- see
+        // NiftySignal.Host.LiveFeatureEngine.NiftyUnderlying's own doc comment for the ambiguity
+        // this closes now that the Instruments table can also hold Sensex/Bank Nifty rows for the
+        // same AsOfDate. A bare FirstOrDefaultAsync with no filter/order (the previous code here)
+        // would otherwise silently pick whichever underlying's future Postgres happened to return
+        // first, corrupting this exact live-parity future-bar pipeline with no error.
         var future = await source.Instruments
-            .FirstOrDefaultAsync(i => i.AsOfDate == asOfDate && i.InstrumentType == InstrumentType.Future, cancellationToken);
+            .Where(i => i.AsOfDate == asOfDate && i.InstrumentType == InstrumentType.Future && i.Underlying == "NIFTY")
+            .OrderBy(i => i.ExpiryDate)
+            .FirstOrDefaultAsync(cancellationToken);
         if (future is null)
         {
             return new LiveVolumeBarWriteResult(LiveVolumeBarWriteOutcome.NoTradableData, 0);

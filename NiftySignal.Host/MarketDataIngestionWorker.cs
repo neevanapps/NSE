@@ -35,6 +35,12 @@ public sealed class MarketDataIngestionWorker(
     const int FlushBatchSize = 200;
     static readonly TimeSpan FlushInterval = TimeSpan.FromSeconds(1);
 
+    // Sensex/Bank Nifty tick-collection monitoring (2026-09-22): ticks/sec per underlying, flush
+    // duration, and Ticks-table disk growth, logged at this cadence -- not spammed per-flush (which
+    // happens every ~1s/200 ticks). A plain log line, per the task spec's own "not a new dashboard
+    // panel or database table" instruction.
+    static readonly TimeSpan MonitoringInterval = TimeSpan.FromMinutes(1);
+
     // Live feed/cadence activity is only meaningful inside this window (2026-09-07, live-caught:
     // with no gating at all, the cadence loop kept computing on frozen post-close prices until
     // scores went to NULL around 16:10). MarketPreOpen matches the "08:45-equivalent job"
@@ -63,6 +69,27 @@ public sealed class MarketDataIngestionWorker(
     // (unbounded) rather than being lost while a cadence tick briefly holds it.
     readonly SemaphoreSlim _engineSync = new(1, 1);
     LiveFeatureEngine? _engine;
+
+    /// <summary>
+    /// Token -> Underlying for today's whole resolved universe (NIFTY + SENSEX + BANKNIFTY),
+    /// rebuilt fresh each trading session in <see cref="RunTradingSessionAsync"/> -- used only by
+    /// <see cref="RunMonitoringLoopAsync"/> to attribute ticks/sec per underlying; nothing
+    /// decision-making reads this (see docs/SENSEX_BANKNIFTY_TICK_COLLECTION.md's no-downstream-
+    /// leakage proof for why monitoring is the only new thing that looks at all three underlyings
+    /// together). A token subscribed later via <see cref="RunPendingSubscriptionLoopAsync"/> (an
+    /// on-demand Dashboard watch request) won't be in this snapshot -- its ticks are counted under
+    /// "UNKNOWN" in the monitoring log rather than causing an error; acceptable since this is a
+    /// diagnostic aid, not a correctness-sensitive path.
+    /// </summary>
+    IReadOnlyDictionary<string, string> _tokenToUnderlying = new Dictionary<string, string>();
+
+    /// <summary>Ticks received since the last monitoring report, per underlying -- reset to empty at the start of each trading session and drained (not just read) by <see cref="RunMonitoringLoopAsync"/> every <see cref="MonitoringInterval"/>.</summary>
+    readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _tickCountByUnderlyingSinceReport = new();
+
+    /// <summary>Flush-duration accumulator since the last monitoring report -- (count, totalMs), read/reset together under <see cref="_flushStatsSync"/> since <see cref="FlushAsync"/> (single writer, the tick loop) and <see cref="RunMonitoringLoopAsync"/> (reader/resetter) run on different loops.</summary>
+    readonly Lock _flushStatsSync = new();
+    int _flushCountSinceReport;
+    double _flushDurationMsTotalSinceReport;
 
     /// <summary>
     /// Edge-triggered guard for the F10 warm-up-blocker log below -- true while the current
@@ -170,6 +197,20 @@ public sealed class MarketDataIngestionWorker(
         var instruments = await ResolveInstrumentsAsync(session.Token, asOfDate, stoppingToken);
         var subscriptions = instruments.Select(i => (i.Exchange, i.Token)).ToList();
 
+        // Monitoring-only snapshot (see _tokenToUnderlying's own doc comment) -- built from the
+        // SAME `instruments` list passed to LiveFeatureEngine below, which is safe to include
+        // SENSEX/BANKNIFTY rows because LiveFeatureEngine's own constructor (audit finding F61)
+        // filters to NIFTY internally; this dictionary is purely descriptive and drives no
+        // decision. Fresh per session -- a restart mid-day rebuilds it rather than carrying over
+        // a prior session's stale counts.
+        _tokenToUnderlying = instruments.ToDictionary(i => i.Token, i => i.Underlying);
+        _tickCountByUnderlyingSinceReport.Clear();
+        lock (_flushStatsSync)
+        {
+            _flushCountSinceReport = 0;
+            _flushDurationMsTotalSinceReport = 0;
+        }
+
         _engine = new LiveFeatureEngine(instruments, scoreWeightsOptions, pricingOptions, logger);
         await SeedEngineHistoryAsync(_engine, asOfDate, stoppingToken);
         await SeedPriorSessionIvHistoryAsync(_engine, asOfDate, stoppingToken);
@@ -206,10 +247,12 @@ public sealed class MarketDataIngestionWorker(
         var cadenceLoop = RunScoreCadenceLoopAsync(feedCts.Token);
         var sampleLoop = RunSampleLoopAsync(feedCts.Token);
         var pendingSubscriptionLoop = RunPendingSubscriptionLoopAsync(tickSource, asOfDate, feedCts.Token);
+        var monitoringLoop = RunMonitoringLoopAsync(asOfDate, feedCts.Token);
         await RunTickLoopAsync(tickSource, feedCts.Token);
         await cadenceLoop;
         await sampleLoop;
         await pendingSubscriptionLoop;
+        await monitoringLoop;
         await closeWatchdog;
         return true;
     }
@@ -285,6 +328,13 @@ public sealed class MarketDataIngestionWorker(
                     }
 
                     await dashboardPush.PushTickAsync(tick, stoppingToken);
+
+                    // Monitoring only (see _tokenToUnderlying's own doc comment) -- never gates or
+                    // filters anything; a token this session's universe doesn't recognize (e.g. a
+                    // just-requested Dashboard watch not yet in the snapshot) still gets buffered/
+                    // flushed normally below, just counted under "UNKNOWN" here.
+                    var underlying = _tokenToUnderlying.GetValueOrDefault(tick.Token, "UNKNOWN");
+                    _tickCountByUnderlyingSinceReport.AddOrUpdate(underlying, 1, static (_, count) => count + 1);
 
                     buffer.Add(tick);
                     if (buffer.Count >= FlushBatchSize || DateTimeOffset.UtcNow - lastFlush >= FlushInterval)
@@ -676,23 +726,75 @@ public sealed class MarketDataIngestionWorker(
         return await db.FlatTradeSessions.FindAsync([FlatTradeSession.SingletonId], ct);
     }
 
-    /// <summary>Reuses today's instruments if the 08:45-equivalent job already ran (e.g. a service restart) instead of re-hitting FlatTrade's API.</summary>
+    /// <summary>
+    /// Reuses today's instruments if the 08:45-equivalent job already ran (e.g. a service restart)
+    /// instead of re-hitting FlatTrade's API -- now checked and resolved PER underlying-group
+    /// (NIFTY vs. SENSEX/BANKNIFTY) rather than as one all-or-nothing set (2026-09-22, Sensex/Bank
+    /// Nifty tick-collection task), so a restart that finds NIFTY's own rows already resolved but
+    /// not yet SENSEX/BANKNIFTY's (or vice versa) still fills in whichever is missing rather than
+    /// silently reusing an incomplete day. NIFTY's own resolution (<see cref="InstrumentUniverseResolver"/>)
+    /// runs first and is entirely unchanged from before this task -- for a day where NIFTY rows
+    /// already exist, this method calls the resolver exactly as often as it did before (zero
+    /// times), returns exactly the same NIFTY rows, in the same way.
+    /// </summary>
     async Task<IReadOnlyList<Instrument>> ResolveInstrumentsAsync(string sessionToken, DateOnly asOfDate, CancellationToken ct)
     {
         await using var scope = scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
 
         var existing = await db.Instruments.Where(i => i.AsOfDate == asOfDate).ToListAsync(ct);
-        if (existing.Count > 0)
+        var resolved = new List<Instrument>(existing);
+        var wroteAnything = false;
+
+        if (existing.Any(i => i.Underlying == LiveFeatureEngine.NiftyUnderlying))
         {
-            logger.LogInformation("Reusing {Count} previously-resolved instruments for {AsOfDate}", existing.Count, asOfDate);
-            return existing;
+            logger.LogInformation(
+                "Reusing {Count} previously-resolved NIFTY instruments for {AsOfDate}",
+                existing.Count(i => i.Underlying == LiveFeatureEngine.NiftyUnderlying), asOfDate);
+        }
+        else
+        {
+            var resolver = scope.ServiceProvider.GetRequiredService<InstrumentUniverseResolver>();
+            var niftyInstruments = await resolver.ResolveAsync(sessionToken, asOfDate, ct);
+            db.Instruments.AddRange(niftyInstruments);
+            resolved.AddRange(niftyInstruments);
+            wroteAnything = true;
         }
 
-        var resolver = scope.ServiceProvider.GetRequiredService<InstrumentUniverseResolver>();
-        var resolved = await resolver.ResolveAsync(sessionToken, asOfDate, ct);
-        db.Instruments.AddRange(resolved);
-        await db.SaveChangesAsync(ct);
+        // Write-only/archive, future-backtesting-only addition (2026-09-22) -- deliberately
+        // best-effort and fully independent of NIFTY's own resolution above: a failure here must
+        // never stop or delay NIFTY's own live (paper) trading from starting. See
+        // docs/SENSEX_BANKNIFTY_TICK_COLLECTION.md for the full design/verification.
+        if (existing.Any(i => i.Underlying is SensexBankNiftyInstrumentMasterProvider.SensexUnderlying or SensexBankNiftyInstrumentMasterProvider.BankNiftyUnderlying))
+        {
+            logger.LogInformation(
+                "Reusing {Count} previously-resolved SENSEX/BANKNIFTY instruments for {AsOfDate}",
+                existing.Count(i => i.Underlying is SensexBankNiftyInstrumentMasterProvider.SensexUnderlying or SensexBankNiftyInstrumentMasterProvider.BankNiftyUnderlying),
+                asOfDate);
+        }
+        else
+        {
+            try
+            {
+                var otherResolver = scope.ServiceProvider.GetRequiredService<SensexBankNiftyInstrumentUniverseResolver>();
+                var otherInstruments = await otherResolver.ResolveAsync(sessionToken, asOfDate, ct);
+                db.Instruments.AddRange(otherInstruments);
+                resolved.AddRange(otherInstruments);
+                wroteAnything = wroteAnything || otherInstruments.Count > 0;
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex,
+                    "SENSEX/BANKNIFTY instrument resolution failed for {AsOfDate} -- continuing without them for today; NIFTY's own resolution/subscription/trading is unaffected.",
+                    asOfDate);
+            }
+        }
+
+        if (wroteAnything)
+        {
+            await db.SaveChangesAsync(ct);
+        }
+
         return resolved;
     }
 
@@ -809,7 +911,97 @@ public sealed class MarketDataIngestionWorker(
         await using var scope = scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
         db.Ticks.AddRange(buffer);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
         await db.SaveChangesAsync(ct);
-        logger.LogDebug("Flushed {Count} ticks", buffer.Count);
+        sw.Stop();
+
+        lock (_flushStatsSync)
+        {
+            _flushCountSinceReport++;
+            _flushDurationMsTotalSinceReport += sw.Elapsed.TotalMilliseconds;
+        }
+
+        logger.LogDebug("Flushed {Count} ticks in {ElapsedMs}ms", buffer.Count, sw.Elapsed.TotalMilliseconds);
+    }
+
+    /// <summary>
+    /// Sensex/Bank Nifty tick-collection monitoring (2026-09-22 task): ticks/sec per underlying,
+    /// average flush duration, and the Ticks table's current disk size (a proxy for "disk growth
+    /// per day" -- delta since this session started, logged alongside the running total), all as
+    /// a single INFO line every <see cref="MonitoringInterval"/>. Read-only, best-effort -- a
+    /// failure here (e.g. the disk-size query) must never affect ingestion itself, same "one bad
+    /// loop must not take down the rest of the day" discipline every other loop in this class
+    /// already follows (audit finding F34).
+    /// </summary>
+    async Task RunMonitoringLoopAsync(DateOnly asOfDate, CancellationToken stoppingToken)
+    {
+        using var timer = new PeriodicTimer(MonitoringInterval);
+        long? tableSizeAtSessionStartBytes = null;
+
+        try
+        {
+            while (await timer.WaitForNextTickAsync(stoppingToken))
+            {
+                try
+                {
+                    var perUnderlyingRates = new Dictionary<string, double>();
+                    foreach (var key in _tickCountByUnderlyingSinceReport.Keys.ToList())
+                    {
+                        if (_tickCountByUnderlyingSinceReport.TryRemove(key, out var count))
+                        {
+                            perUnderlyingRates[key] = count / MonitoringInterval.TotalSeconds;
+                        }
+                    }
+
+                    int flushCount;
+                    double flushDurationTotalMs;
+                    lock (_flushStatsSync)
+                    {
+                        flushCount = _flushCountSinceReport;
+                        flushDurationTotalMs = _flushDurationMsTotalSinceReport;
+                        _flushCountSinceReport = 0;
+                        _flushDurationMsTotalSinceReport = 0;
+                    }
+                    var avgFlushMs = flushCount > 0 ? flushDurationTotalMs / flushCount : 0;
+
+                    long? tableSizeBytes = null;
+                    try
+                    {
+                        await using var scope = scopeFactory.CreateAsyncScope();
+                        var db = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
+                        tableSizeBytes = await db.Database
+                            .SqlQuery<long>($"""SELECT pg_total_relation_size('"Ticks"') AS "Value" """)
+                            .SingleAsync(stoppingToken);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogDebug(ex, "Monitoring: could not read Ticks table size this cycle");
+                    }
+                    tableSizeAtSessionStartBytes ??= tableSizeBytes;
+
+                    var ticksPerSecDescription = perUnderlyingRates.Count == 0
+                        ? "no ticks"
+                        : string.Join(", ", perUnderlyingRates.OrderByDescending(kv => kv.Value).Select(kv => $"{kv.Key}={kv.Value:0.0}/s"));
+                    var growthSinceSessionStartMb = tableSizeBytes is { } sizeNow && tableSizeAtSessionStartBytes is { } sizeStart
+                        ? (sizeNow - sizeStart) / (1024.0 * 1024.0)
+                        : (double?)null;
+
+                    logger.LogInformation(
+                        "Ingestion monitoring ({AsOfDate}): ticks/sec [{TicksPerSec}], flushes={FlushCount} avgFlushMs={AvgFlushMs:0.0}, Ticks table size={TableSizeMb:0.0}MB (+{GrowthMb:0.00}MB since session start)",
+                        asOfDate, ticksPerSecDescription, flushCount, avgFlushMs,
+                        tableSizeBytes.HasValue ? tableSizeBytes.Value / (1024.0 * 1024.0) : (double?)null,
+                        growthSinceSessionStartMb);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    // Audit finding F34 discipline -- same as every other loop in this class.
+                    logger.LogError(ex, "Ingestion monitoring cycle failed -- continuing with the next one");
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
     }
 }

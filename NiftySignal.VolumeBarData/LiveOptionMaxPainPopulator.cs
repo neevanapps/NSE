@@ -58,8 +58,10 @@ public static class LiveOptionMaxPainPopulator
             return new LiveOptionMaxPainWriteResult(LiveOptionMaxPainWriteOutcome.NoNewBars, 0);
         }
 
+        // Audit finding F61 (2026-09-22) -- NIFTY-filtered; see LiveOptionAtmPopulator's identical fix
+        // and NiftySignal.Host.LiveFeatureEngine.NiftyUnderlying's own doc comment.
         var allOptions = await source.Instruments
-            .Where(i => i.AsOfDate == asOfDate && i.InstrumentType == InstrumentType.Option && i.ExpiryDate != null)
+            .Where(i => i.AsOfDate == asOfDate && i.InstrumentType == InstrumentType.Option && i.ExpiryDate != null && i.Underlying == "NIFTY")
             .ToListAsync(cancellationToken);
         if (allOptions.Count == 0)
         {

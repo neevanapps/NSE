@@ -47,7 +47,12 @@ public static class ReplayLiveCommand
         List<DateTimeOffset> checkpoints;
         await using (var source = new NiftySignalDbContext(sourceOptions))
         {
-            var future = await source.Instruments.FirstOrDefaultAsync(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Future);
+            // Audit finding F61 (2026-09-22) -- same NIFTY filter/deterministic order as
+            // LiveVolumeBarPopulator.WriteNewBarsAsync; see that fix's own comment.
+            var future = await source.Instruments
+                .Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Future && i.Underlying == "NIFTY")
+                .OrderBy(i => i.ExpiryDate)
+                .FirstOrDefaultAsync();
             if (future is null)
             {
                 Console.WriteLine("No future instrument for this date -- nothing to replay.");

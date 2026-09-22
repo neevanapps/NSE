@@ -94,7 +94,12 @@ public sealed class BacktestRunner(
         var dayStartUtc = new DateTimeOffset(day.ToDateTime(TimeOnly.MinValue), IstOffset).ToUniversalTime();
         var dayEndUtc = dayStartUtc.AddDays(1);
 
-        var instruments = await realTicksDb.Instruments.Where(i => i.AsOfDate == day).ToListAsync(ct);
+        // Audit finding F61 (2026-09-22): explicit NIFTY filter at the intake, in addition to
+        // LiveFeatureEngine's own internal filter (belt-and-suspenders -- see that class's
+        // NiftyUnderlying doc comment) -- this backtest runner drives the exact live-decision
+        // pipeline, so its own instrument set should never silently include another underlying's
+        // rows even if the engine's internal guard were ever weakened.
+        var instruments = await realTicksDb.Instruments.Where(i => i.AsOfDate == day && i.Underlying == LiveFeatureEngine.NiftyUnderlying).ToListAsync(ct);
         if (instruments.Count == 0)
         {
             logger?.LogInformation("Backtest: no resolved instruments for {Day} -- skipping (weekend/holiday/no data).", day);
