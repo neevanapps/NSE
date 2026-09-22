@@ -612,6 +612,80 @@ public enum VolumeBarMetric
     /// grid and verdict.
     /// </summary>
     OptionsScoreThreeWaySwitchMaxPainConfirmedMinHold,
+
+    /// <summary>
+    /// 2026-09-22, Part A score-smoothing task (research only, see docs/VOLUME_BAR_FINDINGS.md's
+    /// "Part A: score smoothing on the locked OptionsScore" section). Distinct from the earlier
+    /// 2026-09-21 Candidate A (<see cref="OptionsScoreThreeWaySwitchMaxPainConfirmedSmoothed"/>),
+    /// which smoothed each leg's RAW PRE-RANK value before <c>SignedRank.Compute</c> (rejected --
+    /// net dropped 32-41%). This candidate instead leaves <see cref="ComputeOptionsThreeWayScore"/>
+    /// (score computation itself, the Max Pain gate, session boundaries, sign conventions) COMPLETELY
+    /// UNCHANGED, and smooths the ALREADY-COMPUTED, ALREADY-PERCENTILE-SHAPED scaled score (the
+    /// <c>100 * s</c> value <see cref="SimulateDayAsync"/> derives every bar) with a plain N-bar
+    /// simple moving average (<see cref="BarCountRollingMean"/>, reused verbatim -- same bar-count
+    /// windowing rationale as the rejected candidate's own doc comment).
+    ///
+    /// Design decision (documented per the task's own instruction that this is a real design choice,
+    /// not fully pinned down by spec): because a SignedRank output is percentile-shaped by
+    /// construction, but an AVERAGE of percentile-shaped values does NOT itself preserve that shape
+    /// (same reasoning <see cref="VolumeBarMetric.Composite"/>/<see cref="OptionsScoreBlend"/>/
+    /// <see cref="TrendReversion"/> already establish for their own magnitude-rank trackers), the
+    /// SMOOTHED value is re-ranked through its OWN dedicated <c>SessionRankTracker</c>
+    /// (<c>scoreSmoothMagnitudeRank</c>) rather than reusing the raw score's already-percentile
+    /// property directly. Concretely: entry/exit gate on <c>Percentile(|SMA(scaledScore, N)|)</c>,
+    /// not <c>|SMA(scaledScore, N)|</c> itself and not a magnitude threshold -- this keeps the SAME
+    /// dynamic, self-calibrating percentile-threshold mechanism the whole file already uses (per
+    /// CLAUDE.md's "no hardcoded thresholds" rule) rather than inventing a new fixed-magnitude gate.
+    /// The smoothed value ALSO drives the exit's own opposite-extreme <c>ScoreInvalidated</c> check,
+    /// the traded side (Call/Put sign), the Max Pain confirmation gate's sign-agreement check, and
+    /// <see cref="VolumeBarTrade.EntryScore"/> -- i.e. every downstream consumer of "today's score"
+    /// sees the smoothed series, not the raw one, satisfying the task's own instruction that "entry
+    /// rules must use the smoothed value... not the raw single-bar percentile."
+    ///
+    /// Window length N (bars) is swept via the existing <c>--smoothbars=</c> flag (same parameter
+    /// <see cref="OptionsScoreThreeWaySwitchMaxPainConfirmedSmoothed"/> already uses -- reused rather
+    /// than adding a second flag, since the two metrics are mutually exclusive per call and both
+    /// want "an N-bar window" in the same units), defaulting to 3 bars when omitted. See
+    /// docs/VOLUME_BAR_FINDINGS.md's 2026-09-22 section for the full swept grid (N in 3/4/5/6) and
+    /// verdict. Research only, off by default, nothing here changes the locked baseline's own
+    /// byte-identical reproduction.
+    /// </summary>
+    OptionsScoreThreeWaySwitchMaxPainConfirmedScoreSma,
+
+    /// <summary>
+    /// 2026-09-22, Part A score-smoothing task -- EMA sibling of
+    /// <see cref="OptionsScoreThreeWaySwitchMaxPainConfirmedScoreSma"/>. Identical design (smooths
+    /// the already-computed, already-percentile-shaped scaled score, re-ranks the smoothed value
+    /// through its own dedicated magnitude tracker, feeds every downstream consumer the smoothed
+    /// series), differing only in HOW the smoothing itself is computed: a standard exponential
+    /// moving average with smoothing constant <c>alpha = 2 / (N + 1)</c> (the conventional
+    /// "N-period EMA" convention, chosen so the same <c>--smoothbars=N</c> parameter/flag means a
+    /// directly comparable "N" between the SMA and EMA variants -- N=3 EMA gives recent bars more
+    /// weight than N=3 SMA but both describe "a 3-bar-ish window"), implemented in the new
+    /// <see cref="ExponentialMean"/> (first observed value seeds the EMA directly, same
+    /// null-passthrough convention as every other smoother in this file -- a bar with no reading
+    /// leaves the EMA state untouched and yields a null smoothed score that bar). See
+    /// docs/VOLUME_BAR_FINDINGS.md's 2026-09-22 section for the full swept grid (N in 3/4/5/6) and
+    /// verdict. Research only, off by default.
+    /// </summary>
+    OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma,
+
+    /// <summary>
+    /// 2026-09-22, Part A follow-up: combines the best-performing Part A smoother
+    /// (<see cref="OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma"/>, EMA N=3, per
+    /// docs/VOLUME_BAR_FINDINGS.md's own Part A sweep verdict) with the already-promising
+    /// 2026-09-21 whipsaw-reduction Candidate B minimum-dwell exit
+    /// (<see cref="OptionsScoreThreeWaySwitchMaxPainConfirmedMinHold"/>) -- entry-side smoothing and
+    /// exit-side dwell time are independent mechanisms (one damps the score the entry/exit gate
+    /// reads, the other blocks an early discretionary exit regardless of what the score reads), so
+    /// this checks whether they compound or interfere when stacked, per the task's own explicit
+    /// single combination ask. Reuses the SAME <c>--smoothbars=</c> (EMA length) and
+    /// <c>--minhold=</c> (dwell minutes) parameters both parent metrics already use -- both
+    /// mechanisms are ALWAYS ON for this metric (not independently toggleable), since it exists
+    /// specifically to answer "what does the one promising smoother plus the one promising dwell
+    /// value do together," not to sweep a 2D grid of the two.
+    /// </summary>
+    OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold,
 }
 
 /// <param name="PartialExitTime">
@@ -900,7 +974,10 @@ public static class TradeSimulator
         // rather than getting its own dispatch case. The Smoothed candidate does NOT belong here --
         // its score computation genuinely differs (smoothed leg inputs, own trackers), so it gets
         // its own isOptionsScore3WaySmoothed flag and dispatch branch instead.
-        var isOptionsScore3Way = metric is VolumeBarMetric.OptionsScoreThreeWaySwitch or VolumeBarMetric.OptionsScoreThreeWaySwitchConfirmed or VolumeBarMetric.OptionsScoreThreeWaySwitchEarlyConviction or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmed or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedMinHold;
+        // 2026-09-22, Part A score-smoothing candidates (ScoreSma/ScoreEma) reuse
+        // ComputeOptionsThreeWayScore completely unchanged -- only the entry/exit gate downstream
+        // (post-percentile) differs -- so they belong in this same set, same reasoning as MinHold.
+        var isOptionsScore3Way = metric is VolumeBarMetric.OptionsScoreThreeWaySwitch or VolumeBarMetric.OptionsScoreThreeWaySwitchConfirmed or VolumeBarMetric.OptionsScoreThreeWaySwitchEarlyConviction or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmed or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedMinHold or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreSma or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold;
         var isOptionsScore3WaySmoothed = metric == VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedSmoothed;
         var isOptionsScoreConfirmed = metric == VolumeBarMetric.OptionsScoreThreeWaySwitchConfirmed;
         var isOptionsScoreEarlyConviction = metric == VolumeBarMetric.OptionsScoreThreeWaySwitchEarlyConviction;
@@ -910,7 +987,10 @@ public static class TradeSimulator
         // (PassesConfirmation), so it must cover all 3 metric values, not just the original.
         var isOptionsScoreMaxPainConfirmed = metric is VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmed
             or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedSmoothed
-            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedMinHold;
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedMinHold
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreSma
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold;
         var isOptionsScore3WayOiOpen = metric == VolumeBarMetric.OptionsScoreThreeWaySwitchOiOpen;
         var isOptionsScore3WayVolMid = metric == VolumeBarMetric.OptionsScoreThreeWaySwitchVolMid;
         // 2026-09-20, Phase 5 plan items 10-13: the first-ever FuturesScore + OptionsScore
@@ -1160,6 +1240,19 @@ public static class TradeSimulator
         var depthSmoother = new BarCountRollingMean(effectiveSmoothingWindowBars);
         var ivMidSmoother = new BarCountRollingMean(effectiveSmoothingWindowBars);
         var ivCloseSmoother = new BarCountRollingMean(effectiveSmoothingWindowBars);
+
+        // 2026-09-22, Part A score-smoothing candidates -- only meaningful for
+        // OptionsScoreThreeWaySwitchMaxPainConfirmedScoreSma/...ScoreEma. Unlike the leg-level
+        // smoothers above, these smooth the already-computed, already-percentile-shaped SCALED
+        // SCORE itself (see each enum value's own doc comment for the design rationale), so they
+        // get their own dedicated magnitude-rank tracker (re-ranking a smoothed percentile-shaped
+        // value does not preserve its percentile-ness, same reasoning as Composite/OptionsScoreBlend/
+        // TrendReversion's own dedicated trackers). Reuses the SAME --smoothbars= window parameter
+        // as the (mutually exclusive) leg-level Smoothed candidate -- both variants want "an N-bar
+        // window," and only one of the three smoothing metrics is ever active per call.
+        var scoreSmoothMagnitudeRank = new SessionRankTracker();
+        var scoreSmaSmoother = new BarCountRollingMean(effectiveSmoothingWindowBars);
+        var scoreEmaSmoother = new ExponentialMean(effectiveSmoothingWindowBars);
 
         // Only meaningful for OptionsScoreThreeWaySwitchOiOpen -- same Mid/Close legs as the
         // 3-way switch (own trackers, not shared, mutually exclusive per call), OI Delta drives
@@ -1590,9 +1683,32 @@ public static class TradeSimulator
             previousClose = bar.ClosePrice;
             previousOi = bar.OpenInterestAtClose;
             var scaledScore = score is { } s ? 100.0 * s : (double?)null;
+
+            // 2026-09-22, Part A score-smoothing candidates -- overwrite the just-computed raw
+            // scaledScore with its own smoothed value HERE, before anything downstream reads it.
+            // Every later use of `scaledScore` in this loop iteration (percentile, onBarEvaluated,
+            // the exit's opposite-extreme check, the entry side/sign, the Max Pain confirmation
+            // gate, and VolumeBarTrade.EntryScore) therefore automatically operates on the smoothed
+            // series rather than the single-bar raw value, satisfying "entry rules must use the
+            // smoothed value" without needing to thread a second variable through the rest of the
+            // method. No-op (scaledScore left exactly as computed) for every other metric.
+            if (metric == VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreSma)
+            {
+                scaledScore = scoreSmaSmoother.Observe(scaledScore);
+            }
+            else if (metric is VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold)
+            {
+                // 2026-09-22, best-smoother + MinHold=3 combination: the EmaMinHold metric shares
+                // this same EMA smoother instance/branch as the standalone ScoreEma metric (only the
+                // dwell-gated exit below differs) -- mutually exclusive per call, same convention as
+                // every other shared-branch pairing in this method.
+                scaledScore = scoreEmaSmoother.Observe(scaledScore);
+            }
+
             var magnitudeRank = metric == VolumeBarMetric.Composite ? compositeMagnitudeRank
                 : metric == VolumeBarMetric.OptionsScoreBlend ? blendMagnitudeRank
                 : metric is VolumeBarMetric.FinalScoreDteWeighted or VolumeBarMetric.FinalScoreSessionWeighted ? comboMagnitudeRank
+                : metric is VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreSma or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold ? scoreSmoothMagnitudeRank
                 : trendMagnitudeRank;
             var percentile = EntryPercentile(metric, scaledScore, magnitudeRank);
 
@@ -1621,7 +1737,7 @@ public static class TradeSimulator
                 // metric). Gates ONLY the discretionary ScoreInvalidated reason below -- stoppedOut/
                 // timedOut/isLastBar are safety/session exits and stay unconditional regardless of
                 // dwell time, per the enum value's own doc comment.
-                var dwellSatisfied = metric != VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedMinHold
+                var dwellSatisfied = metric is not (VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedMinHold or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold)
                     || minHoldMinutes is not { } minHold
                     || (bar.EndTimestamp - position.EntryTime).TotalMinutes >= minHold;
                 var invalidated = dwellSatisfied && scaledScore is { } liveScore && percentile is { } p && p >= entryPercentile
@@ -2225,14 +2341,21 @@ public static class TradeSimulator
 
         if (metric is VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmed
             or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedSmoothed
-            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedMinHold)
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedMinHold
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreSma
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold)
         {
             // 2026-09-20, Phase 5 prep item 8 -- see this enum value's own doc comment. Applied
             // all day, same as item 6's Skew Change gate, for a like-for-like comparison. Logic
             // itself now lives in NiftySignal.Scoring.MaxPainConfirmationGate (live/backtest
-            // parity plan step 1, docs/LIVE_PARITY_PLAN.md) -- relocated, not rewritten. The 2
-            // 2026-09-21 whipsaw-reduction candidates keep this exact same gate (see their own
-            // doc comments), so they share this branch rather than duplicating it.
+            // parity plan step 1, docs/LIVE_PARITY_PLAN.md) -- relocated, not rewritten. The
+            // 2026-09-21 whipsaw-reduction candidates and the 2026-09-22 Part A score-smoothing
+            // candidates all keep this exact same gate (see their own doc comments), so they share
+            // this branch rather than duplicating it. `scaledScore` here is already the SMOOTHED
+            // value for the two ScoreSma/ScoreEma metrics (overwritten in-place by the caller
+            // before this method is invoked), so the gate checks sign agreement against what's
+            // actually traded, not the raw single-bar value.
             return MaxPainConfirmationGate.Passes(maxPainConfirmScore, scaledScore);
         }
 
@@ -2282,15 +2405,19 @@ public static class TradeSimulator
 
         var magnitude = Math.Abs(value);
         if (metric != VolumeBarMetric.TrendReversion && metric != VolumeBarMetric.Composite && metric != VolumeBarMetric.OptionsScoreBlend
-            && metric != VolumeBarMetric.FinalScoreDteWeighted && metric != VolumeBarMetric.FinalScoreSessionWeighted)
+            && metric != VolumeBarMetric.FinalScoreDteWeighted && metric != VolumeBarMetric.FinalScoreSessionWeighted
+            && metric != VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreSma && metric != VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma
+            && metric != VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold)
         {
             // Already a percentile by construction (SignedRank) -- no second rank layer.
             return magnitude;
         }
 
         // TrendReversion is a raw bounded ratio, Composite/OptionsScoreBlend are weighted blends
-        // of already-ranked values -- none of the three is percentile-shaped by construction, so
-        // each gets its own dedicated magnitude tracker (the caller picks which one based on metric).
+        // of already-ranked values, and the 2026-09-22 ScoreSma/ScoreEma candidates smooth an
+        // already-percentile-shaped value (which breaks that shape) -- none of these is
+        // percentile-shaped by construction, so each gets its own dedicated magnitude tracker (the
+        // caller picks which one based on metric).
         var rank = magnitudeRank.Rank(magnitude);
         magnitudeRank.Add(magnitude);
         return rank;
@@ -2313,7 +2440,7 @@ public static class TradeSimulator
 /// bar's own raw value is itself missing -- the smoothed score goes null that bar exactly like the
 /// unsmoothed baseline would, rather than fabricating a reading by reusing stale history).
 /// </summary>
-sealed class BarCountRollingMean(int windowBars)
+public sealed class BarCountRollingMean(int windowBars)
 {
     readonly Queue<double> _values = new();
     double _sum;
@@ -2333,5 +2460,35 @@ sealed class BarCountRollingMean(int windowBars)
         }
 
         return _sum / _values.Count;
+    }
+}
+
+/// <summary>
+/// 2026-09-22, Part A score-smoothing task helper
+/// (<see cref="VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma"/>) -- a standard
+/// exponential moving average with smoothing constant <c>alpha = 2 / (length + 1)</c> (the
+/// conventional "N-period EMA" formula, chosen so <c>length</c> reads as directly comparable to
+/// <see cref="BarCountRollingMean"/>'s own bar-count window for the sibling SMA candidate). The
+/// first observed value seeds the EMA directly (no synthetic warm-up period) -- a common, simple
+/// convention for a short EMA where a longer warm-up would just delay when the metric starts
+/// trading at all. Same null-passthrough convention as every other smoother in this file:
+/// <see cref="Observe"/> returns null and leaves the running EMA state untouched when this bar's
+/// own raw value is itself missing, rather than fabricating a reading from stale history.
+/// Backtest-only, lives in <c>TradeSimulator.cs</c> alongside every other metric-specific tracker.
+/// </summary>
+public sealed class ExponentialMean(int length)
+{
+    readonly double _alpha = 2.0 / (length + 1);
+    double? _current;
+
+    public double? Observe(double? value)
+    {
+        if (value is not { } v)
+        {
+            return null;
+        }
+
+        _current = _current is { } prev ? _alpha * v + (1 - _alpha) * prev : v;
+        return _current;
     }
 }

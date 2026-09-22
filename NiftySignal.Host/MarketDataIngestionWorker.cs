@@ -970,8 +970,16 @@ public sealed class MarketDataIngestionWorker(
                     {
                         await using var scope = scopeFactory.CreateAsyncScope();
                         var db = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
+                        // 2026-09-22, live-caught: this database's actual physical table is
+                        // lowercase `ticks`, not `"Ticks"` -- EF's own LINQ-generated SQL for
+                        // `db.Ticks` resolves correctly because Npgsql emits the identifier
+                        // UNQUOTED, which Postgres then case-folds to lowercase, matching the
+                        // real table. A quoted `"Ticks"` (capital T) preserves case instead and
+                        // fails with "relation does not exist" -- confirmed live, this query was
+                        // erroring every monitoring cycle (harmless to ingestion, but noisy [ERR]
+                        // spam). Fixed to the real lowercase name.
                         tableSizeBytes = await db.Database
-                            .SqlQuery<long>($"""SELECT pg_total_relation_size('"Ticks"') AS "Value" """)
+                            .SqlQuery<long>($"""SELECT pg_total_relation_size('ticks') AS "Value" """)
                             .SingleAsync(stoppingToken);
                     }
                     catch (Exception ex)

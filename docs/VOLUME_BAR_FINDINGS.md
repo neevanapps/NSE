@@ -3128,3 +3128,330 @@ trade's own final gain (gave back some open profit before exit).
 
 Full per-trade tables for all 8 sets are reproducible on demand via the commands above (not
 reproduced row-by-row here); the exact commands are listed in the reproduction table.
+
+## Part A: score smoothing on the locked OptionsScore (2026-09-22)
+
+**Research only, provisional, not adopted.** Everything in this section is backtest-only
+(`NiftySignal.VolumeBarData`), off by default, additive to `TradeSimulator.cs`. The locked
+live-trading config (`OptionsScoreThreeWaySwitchMaxPainConfirmed` @ 2600/90, band=5) and its own
+score computation (`ComputeOptionsThreeWayScore`/`OptionsThreeWayScoreCalculator`, the Max Pain
+gate) are byte-for-byte unchanged -- reverified below. No `NiftySignal.Host`/`NiftySignal.Dashboard`
+file was touched, and nothing was deployed or redeployed.
+
+### Design decision: what gets smoothed, and how entry is gated
+
+Distinct from the already-rejected 2026-09-21 Candidate A
+(`OptionsScoreThreeWaySwitchMaxPainConfirmedSmoothed`), which smoothed each leg's RAW PRE-RANK
+value (the quantity fed into `SignedRank.Compute`) -- this task smooths the ALREADY-COMPUTED,
+ALREADY-PERCENTILE-SHAPED scaled score (`100 * ComputeOptionsThreeWayScore(...)`, the exact value
+`SimulateDayAsync` derives every bar and currently gates entry on directly). Two new
+`VolumeBarMetric` values were added, both reusing `ComputeOptionsThreeWayScore`/the Max Pain
+confirmation gate completely unchanged:
+
+- `OptionsScoreThreeWaySwitchMaxPainConfirmedScoreSma` -- the scaled score run through
+  `BarCountRollingMean` (reused verbatim from the 2026-09-21 Candidate A helper), a plain N-bar
+  simple moving average.
+- `OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma` -- the scaled score run through the new
+  `ExponentialMean` (`NiftySignal.VolumeBarData/TradeSimulator.cs`), a standard EMA with smoothing
+  constant `alpha = 2 / (N + 1)` (the conventional "N-period EMA" formula), first observation
+  seeding the EMA directly (no synthetic warm-up).
+
+**Why re-rank the smoothed value instead of thresholding it directly.** A `SignedRank` output is
+percentile-shaped by construction, but an AVERAGE of percentile-shaped values does not itself
+preserve that shape -- the same reasoning this file's own `Composite`/`OptionsScoreBlend`/
+`TrendReversion` metrics already establish for their own dedicated magnitude-rank trackers (see
+each enum value's own doc comment). So the smoothed value is re-ranked through its own dedicated
+`SessionRankTracker` (`scoreSmoothMagnitudeRank`), and entry/exit still gate on
+`Percentile(|Smoothed(scaledScore, N)|) >= entryPercentile` -- the SAME dynamic, self-calibrating
+percentile-threshold mechanism every other metric in this file uses, per CLAUDE.md's "no hardcoded
+thresholds" rule, rather than inventing a fixed-magnitude gate.
+
+**Implementation mechanism.** `TradeSimulator.SimulateDayAsync` overwrites the local `scaledScore`
+variable with its smoothed value immediately after computing it (right after
+`var scaledScore = score is { } s ? 100.0 * s : null;`), before anything else in that bar's
+iteration reads it. Every downstream consumer -- the percentile calc, the exit's opposite-extreme
+`ScoreInvalidated` check, the entry side/sign (Call vs. Put), the Max Pain confirmation gate's
+sign-agreement check, `onBarEvaluated`, and `VolumeBarTrade.EntryScore` -- therefore automatically
+operates on the smoothed series, not the raw single-bar value, satisfying the task's own
+instruction that "entry rules must use the smoothed value... not the raw single-bar percentile"
+without threading a second variable through the rest of the method. Both new metrics reuse the
+EXISTING `--smoothbars=N` CLI flag (already wired through `trade`/`mae-mfe trade`/`calibrate`) for
+the window/EMA-length parameter, rather than adding a second flag -- the three smoothing metrics
+(leg-level `Smoothed`, `ScoreSma`, `ScoreEma`) are mutually exclusive per call and all want "an
+N-bar window" in the same units. Defaults to 3 bars when omitted (same default as the 2026-09-21
+candidate).
+
+**Variant 3 (dual-MA crossover): already built, reused directly, no new code.** Checked per the
+task's own instruction -- `SimulateCrossoverDayAsync`'s existing `scoreMetric` parameter already
+supports `OptionsScoreThreeWaySwitchMaxPainConfirmed` (added 2026-09-20 for a different purpose,
+Max-Pain-sign-gated futures/options comparability), which runs fast/slow simple moving averages of
+this exact scaled-score series with a `thresholdPoints` crossing-gap filter -- this IS variant 3
+as specified. No new code was written for it; only the sweep below is new.
+
+Mandatory regression check (all new metrics unused, baseline unchanged): `trade 2026-09-08
+2026-09-19 OptionsScoreThreeWaySwitchMaxPainConfirmed 90 15 2600 --band=5` reproduced **112 trades,
+64.3% win, +426.40 net** exactly. `trade ... OptionsScoreThreeWaySwitchMaxPainConfirmedMinHold ...
+--minhold=3` reproduced **85 trades, 64.7% win, +420.65 net** exactly. `trade ...
+SessionGatedDepthDuration ...` (collateral-damage check, unrelated dispatch branch) reproduced
+**80 trades, 55.0% win, +144.70 net** exactly. `dotnet test`: **680/680 passing** (673 pre-existing
++ 7 new `ExponentialMeanTests`, which also cover `BarCountRollingMean`'s null-handling
+convention), 0 warnings, `dotnet build` clean.
+
+### Variant 3 (crossover) threshold note
+
+`SimulateCrossoverDayAsync` requires a `thresholdPoints` crossing-gap filter with no percentile
+concept at all (unlike variants 1-2). A quick calibration at the default fast=4/slow=12 combo found
+thresholds below ~15 fire 16-39 trades/day (far above CLAUDE.md's 5-10/day target band) and
+thresholds at/above ~25 collapse to under 2 trades/day; **thresholdPoints=15** was fixed for the
+entire fast/slow grid below (lands the default fast=4/slow=12 combo at 8.75 trades/day, inside the
+target band) -- the task's own combo grid is fast x slow only, so threshold itself was not swept
+further.
+
+### Full sweep: variant 1 (SMA) and variant 2 (EMA), N in {3,4,5,6}
+
+8-day backtest (2026-09-08 to 2026-09-19) and out-of-sample day (2026-09-21), both @ 2600/90,
+band=5:
+
+| Variant | N | Backtest trades | Backtest win% | Backtest net | Days >=50% win | OOS trades | OOS win% | OOS net |
+|---|---|---|---|---|---|---|---|---|
+| Baseline (unsmoothed) | - | 112 | 64.3% | +426.40 | 8/8 | 7 | 71.4% | -5.10 |
+| SMA | 3 | 42 | 61.9% | +295.40 | 6/8 | 7 | 42.9% | +12.85 |
+| SMA | 4 | 33 | 63.6% | +280.80 | 6/8 | 5 | 60.0% | +3.60 |
+| SMA | 5 | 27 | 59.3% | +328.55 | 7/8 | 2 | 50.0% | -12.95 |
+| SMA | 6 | 19 | 68.4% | +221.85 | 7/8 | 3 | 66.7% | -3.80 |
+| EMA | 3 | 35 | 68.6% | +274.55 | **8/8** | 6 | 50.0% | +9.10 |
+| EMA | 4 | 29 | 65.5% | +202.30 | 6/8 | 6 | 50.0% | +8.90 |
+| EMA | 5 | 26 | 61.5% | +191.40 | 5/8 | 5 | 60.0% | +11.85 |
+| EMA | 6 | 23 | 65.2% | +206.05 | 6/8 | 4 | 75.0% | +16.15 |
+
+Days>=50% win, per SMA/EMA cell (derived from the per-day breakdown, not re-tabulated row by row):
+SMA3 fails on 09-11/09-15; SMA4 fails on 09-11/09-18; SMA5/SMA6 fail only on 09-18; EMA3 fails on
+none (matches baseline's own 8/8); EMA4 fails on 09-11/09-18; EMA5 fails on 09-11/09-15/09-18;
+EMA6 fails on 09-11/09-18.
+
+**No SMA or EMA cell clears the strict "adopt only if both win rate and net improve" bar** -- every
+cell trades far fewer signals than baseline (19-42 vs. 112, since smoothing suppresses many
+borderline single-bar percentile crossings that used to qualify), and net drops 23-55% at every
+cell even where win rate improves. This mirrors the 2026-09-21 leg-level Candidate A's own
+rejection shape (net down 32-41% there) -- smoothing at the score level is not meaningfully less
+costly than smoothing at the leg level on this sample.
+
+**EMA N=3 is the standout candidate among the 8 SMA/EMA cells**, on day-consistency specifically:
+it is the ONLY cell matching baseline's 8/8 days >=50% win rate, and it has the best win-rate lift
+of any SMA/EMA cell on the OOS-adjacent metric (68.6% vs. baseline 64.3%, +4.3pp) at real net cost
+(+274.55 vs +426.40, -35.6%). SMA N=5 has the best raw net among the smoothed cells (+328.55, only
+-23.0% vs baseline) but gives up a day of consistency (09-18 drops below 50%) and trades far less
+often (3.4/day, well below the 5-10/day band). Neither is a clean win; both are real trade-offs
+recorded honestly, per this project's own "report trade-offs, don't force a winner" convention.
+
+### Full sweep: variant 3 (dual-MA crossover), fast in {3,4,5} x slow in {8,9,10,11,12}, threshold=15
+
+8-day backtest:
+
+| Fast | Slow | Trades | Win% | Net |
+|---|---|---|---|---|
+| 3 | 8 | 131 | 53.4% | +177.00 |
+| 3 | 9 | 132 | 50.0% | +3.50 |
+| 3 | 10 | 138 | 48.6% | -52.50 |
+| 3 | 11 | 145 | 51.0% | +69.75 |
+| 3 | 12 | 135 | 46.7% | +8.30 |
+| 4 | 8 | 70 | 47.1% | +49.05 |
+| 4 | 9 | 74 | 60.8% | +137.20 |
+| 4 | 10 | 71 | 46.5% | +8.25 |
+| 4 | 11 | 74 | 51.4% | +94.10 |
+| 4 | 12 | 70 | 45.7% | +69.95 |
+| 5 | 8 | 54 | **61.1%** | **+200.20** |
+| 5 | 9 | 44 | 56.8% | +83.05 |
+| 5 | 10 | 46 | 50.0% | -28.05 |
+| 5 | 11 | 35 | 48.6% | +16.80 |
+| 5 | 12 | 41 | 41.5% | -30.80 |
+
+Out-of-sample day (2026-09-21), same 15 combos:
+
+| Fast | Slow | Trades | Win% | Net |
+|---|---|---|---|---|
+| 3 | 8 | 11 | 36.4% | -28.80 |
+| 3 | 9 | 11 | 72.7% | -7.80 |
+| 3 | 10 | 13 | 30.8% | -22.20 |
+| 3 | 11 | 11 | 63.6% | -10.90 |
+| 3 | 12 | 15 | 40.0% | -37.85 |
+| 4 | 8 | 8 | 12.5% | -32.65 |
+| 4 | 9 | 7 | 28.6% | -36.60 |
+| 4 | 10 | 8 | 37.5% | -26.05 |
+| 4 | 11 | 8 | 50.0% | +0.95 |
+| 4 | 12 | 7 | 71.4% | -6.95 |
+| 5 | 8 | 2 | 50.0% | -19.90 |
+| 5 | 9 | 4 | 25.0% | -9.90 |
+| 5 | 10 | 4 | 0.0% | -46.90 |
+| 5 | 11 | 4 | 25.0% | -13.00 |
+| 5 | 12 | 2 | 0.0% | -9.90 |
+
+**Verdict: crossover (variant 3) is clearly the weakest of the three variants.** No backtest cell
+gets remotely close to baseline's net (+426.40) or win rate (64.3%) -- the best cell (fast=5/
+slow=8: 54 trades, 61.1% win, +200.20, -53.0% net vs baseline) is still a large give-up. Every
+single one of the 15 combos is NET NEGATIVE on the out-of-sample day, with several posting
+catastrophic single-day losses (-46.90 on 5/10) -- a much worse out-of-sample picture than either
+SMA/EMA (which stayed positive on OOS in most cells) or MinHold=3 (-9.25, small). This is
+consistent with the dual-MA mechanism requiring several consecutive bars of sustained directional
+score movement to cross, which this metric's already-fast-moving percentile-threshold entries
+don't naturally provide -- the crossover shape fits the futures side's own `SessionGatedDepthDuration`
+score (its original design target) better than a metric already built around single-bar percentile
+extremes. Not carried forward.
+
+### MinHold=3 comparison (re-run for apples-to-apples MAE/MFE, DTE, and session-phase splits)
+
+The 2026-09-21 whipsaw-reduction finding (85 trades, 64.7% win, +420.65 net, 8/8 days) is
+reconfirmed byte-identical (see regression check above). New splits computed here for the first
+time:
+
+| Split | Trades | Win% | Net |
+|---|---|---|---|
+| 0-DTE (09-08, 09-15) | 22 | 63.6% | +158.45 |
+| Non-0-DTE (09-09/10/11/16/17/18) | 63 | 65.1% | +262.20 |
+| Session: Open (<10:00) | 10 | 60.0% | +121.95 |
+| Session: Mid (10:00-13:30) | 45 | 64.4% | +275.05 |
+| Session: Close (>=13:30) | 30 | 66.7% | +23.65 |
+
+Robust across both DTE regimes and all three session phases (positive everywhere, no single-segment
+dependency) -- matches the baseline's own broad-based character, not a surprise since MinHold only
+gates the exit side.
+
+### MAE/MFE comparison: baseline vs. MinHold=3 vs. best smoothing candidate (EMA N=3)
+
+Reused the existing `mae-mfe trade` command unchanged:
+
+| Set | Trades | Avg MAE% | Avg MFE% | Median MAE% | Median MFE% |
+|---|---|---|---|---|---|
+| Baseline (unsmoothed) | 112 | 4.67% | 7.50% | 3.56% | 3.22% |
+| MinHold=3 | 85 | 6.32% | 10.07% | 4.85% | 6.05% |
+| ScoreEma N=3 | 35 | 9.88% | 13.57% | 5.98% | 11.94% |
+| ScoreEma3 + MinHold=3 (combo, see below) | 33 | 10.36% | 14.25% | 6.12% | 12.21% |
+
+**Finding, stated plainly: smoothing/dwell do NOT make trades calmer -- they make the SURVIVING
+trades' own excursions LARGER, not smaller.** This is the opposite of what "reduce whipsaw" might
+suggest about individual-trade volatility, and worth reporting exactly because it's a real,
+measured result rather than the hoped-for outcome. The mechanism is straightforward once measured:
+both smoothing and dwell suppress the FAST, LOW-EXCURSION trades that used to exit within a few
+minutes of entry (the baseline's own quick, small-MAE/MFE trades) while leaving the SLOWER, HIGHER-
+EXCURSION trades intact and, on average, held even longer -- so the surviving trade population's
+average intra-trade wander goes UP, not down, even though trade FREQUENCY goes down. Trade-count
+reduction and average-hold-time extension are real (already established 2026-09-21 for MinHold);
+per-trade calmness is not.
+
+### Day-by-day stability (>=50% win rate, matching the "8/8" bar)
+
+| Config | Days >=50% win |
+|---|---|
+| Baseline | 8/8 |
+| MinHold=3 | 8/8 |
+| SMA N=3/4 | 6/8 |
+| SMA N=5/6 | 7/8 |
+| EMA N=3 | **8/8** |
+| EMA N=4/6 | 6/8 |
+| EMA N=5 | 5/8 |
+| Crossover (best cell, 5/8) | not tracked per-day (single aggregate; day-level detail not pulled for the weakest variant, per "use judgment on what's worth the detail" instruction) |
+| ScoreEma3 + MinHold=3 (combo) | **8/8** |
+
+### Concentration (top trade / top 2 trades as % of net)
+
+| Config | Net | Top 1 trade | Top 1 % | Top 2 sum | Top 2 % |
+|---|---|---|---|---|---|
+| Baseline | +426.40 | +51.60 | 12.1% | +103.20 | 24.2% |
+| MinHold=3 | +420.65 | +51.60 | 12.3% | +103.20 | 24.5% |
+| SMA N=5 | +328.55 | +68.40 | 20.8% | +111.95 | 34.1% |
+| EMA N=3 | +274.55 | +48.30 | 17.6% | +81.30 | 29.6% |
+| ScoreEma3 + MinHold=3 (combo) | +276.45 | +48.30 | 17.5% | +82.45 | 29.8% |
+
+MinHold=3's top 2 trades are the EXACT SAME two trades as the baseline's (same +103.20 sum) --
+dwell-gating never touched either of the two biggest winners. The smoothing candidates run
+somewhat MORE concentrated than baseline (17.5-20.8% vs 12.1-12.3% for the single top trade), the
+mirror image of trading away small quick winners: fewer total trades means each surviving trade,
+including the big ones, is a larger share of a smaller pie.
+
+### Best-smoother + MinHold=3 combination (`OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold`)
+
+Per the task's own instruction, ran exactly one additional combination: the single best smoother
+found (ScoreEma N=3, the only SMA/EMA cell matching baseline's day-consistency) stacked with the
+already-promising MinHold=3 exit-side dwell. New metric
+`OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold` (both mechanisms always on together,
+not independently toggleable -- it exists to answer this one question, not to sweep a 2D grid),
+reusing the same `--smoothbars=3 --minhold=3` flags:
+
+| Metric | Trades | Win% | Net | Days >=50% |
+|---|---|---|---|---|
+| ScoreEma N=3 alone | 35 | 68.6% | +274.55 | 8/8 |
+| MinHold=3 alone | 85 | 64.7% | +420.65 | 8/8 |
+| **ScoreEma3 + MinHold=3 (combo)** | 33 | **72.7%** | +276.45 | 8/8 |
+| Combo, out-of-sample (09-21) | 5 | 40.0% | +6.75 | n/a (1 day) |
+
+**Verdict: the two mechanisms barely compound, and mostly don't interfere either -- MinHold=3 adds
+almost nothing on top of ScoreEma3 alone** (33 trades vs. 35, net +276.45 vs. +274.55, essentially
+flat) but DOES lift win rate further (72.7% vs. 68.6%, +4.1pp over ScoreEma3 alone and +8.4pp over
+the unsmoothed baseline -- the best win rate of anything tested in this whole Part A task). The
+reason the combination barely changes trade count: ScoreEma smoothing already suppresses most of
+the fast, early `ScoreInvalidated` exits MinHold=3 would otherwise have blocked, so by the time
+MinHold=3's 3-minute dwell is checked, there's little left for it to gate -- the two mechanisms
+target an overlapping subset of the same whipsaw symptom rather than compounding on independent
+dimensions. On the out-of-sample day, the combo stays net POSITIVE (+6.75) where ScoreEma3 alone
+was also positive (+9.10) and MinHold=3 alone was slightly negative (-9.25) -- a small, single-day
+data point, not a pattern to lean on.
+
+### Frozen smoothing spec for Part B
+
+**Nothing beat the baseline cleanly on the strict "adopt only if both win rate and net improve"
+bar** -- consistent with the 2026-09-21 leg-level smoothing finding, and an honest result, not
+forced. If Part B needs a starting point for further score-smoothing exploration (more days,
+different thresholds, or as an ingredient in a future multi-metric composite rather than a
+standalone entry gate), freeze on:
+
+- **Method: EMA (not SMA)** -- `ExponentialMean`, `alpha = 2 / (N + 1)`.
+- **Length: N = 3** (same units as `--smoothbars=3`).
+- **Metric name: `OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma`** (standalone) or
+  `OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold` (stacked with MinHold=3) if the exit-
+  side dwell mechanism is also wanted -- the combo's +8.4pp win-rate lift over baseline, at 8/8
+  day-consistency and roughly flat net vs. ScoreEma3 alone, is the single most win-rate-favorable
+  result in this entire task.
+- **Why EMA over SMA**: EMA N=3 was the only SMA/EMA cell matching baseline's own 8/8
+  day-consistency bar; SMA's best net cell (N=5) gave up a day of consistency and traded at barely
+  a third of the target 5-10/day band.
+- **Why NOT the crossover (variant 3)**: clearly weakest of the three variants -- large net
+  give-up in-sample and net-negative on EVERY combo tested out-of-sample.
+- **Real, measured cost of adopting this spec**: net drops 35.6% (ScoreEma3 alone) to 35.2%
+  (combo) versus the unsmoothed baseline, trade frequency drops from 14.0/day to ~4.1-4.4/day (well
+  below CLAUDE.md's 5-10/day target band -- a real, explicit flag per that document's own
+  instruction to surface frequency drift, not tune past it silently), and MAE/MFE INCREASE rather
+  than decrease (the calming hypothesis did not hold). This is not a call to adopt -- it is the
+  exact, reproducible starting point Part B would need if score-smoothing is revisited with more
+  data, so that work doesn't have to re-derive the SMA-vs-EMA/N-value/re-rank-vs-threshold design
+  decisions from scratch.
+
+### Reproduction commands
+
+```
+# Baseline (unchanged)
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-19 OptionsScoreThreeWaySwitchMaxPainConfirmed 90 15 2600 --band=5
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-21 2026-09-21 OptionsScoreThreeWaySwitchMaxPainConfirmed 90 15 2600 --band=5
+
+# Variant 1 (SMA) / Variant 2 (EMA), N in {3,4,5,6}
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-19 OptionsScoreThreeWaySwitchMaxPainConfirmedScoreSma 90 15 2600 --band=5 --smoothbars=<N>
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-19 OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma 90 15 2600 --band=5 --smoothbars=<N>
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-21 2026-09-21 OptionsScoreThreeWaySwitchMaxPainConfirmedScoreSma 90 15 2600 --band=5 --smoothbars=<N>
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-21 2026-09-21 OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma 90 15 2600 --band=5 --smoothbars=<N>
+
+# Variant 3 (crossover), already-existing mechanism, fast/slow grid at threshold=15
+dotnet run --project NiftySignal.VolumeBarData -- crossover 2026-09-08 2026-09-19 <fast> <slow> 15 2600 --metric=OptionsScoreThreeWaySwitchMaxPainConfirmed --band=5
+dotnet run --project NiftySignal.VolumeBarData -- crossover 2026-09-21 2026-09-21 <fast> <slow> 15 2600 --metric=OptionsScoreThreeWaySwitchMaxPainConfirmed --band=5
+
+# MinHold=3 re-run
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-19 OptionsScoreThreeWaySwitchMaxPainConfirmedMinHold 90 15 2600 --band=5 --minhold=3
+dotnet run --project NiftySignal.VolumeBarData -- mae-mfe trade 2026-09-08 2026-09-19 OptionsScoreThreeWaySwitchMaxPainConfirmedMinHold 90 15 2600 --band=5 --minhold=3
+
+# MAE/MFE for baseline and ScoreEma N=3
+dotnet run --project NiftySignal.VolumeBarData -- mae-mfe trade 2026-09-08 2026-09-19 OptionsScoreThreeWaySwitchMaxPainConfirmed 90 15 2600 --band=5
+dotnet run --project NiftySignal.VolumeBarData -- mae-mfe trade 2026-09-08 2026-09-19 OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma 90 15 2600 --band=5 --smoothbars=3
+
+# Best-smoother + MinHold=3 combination
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-19 OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold 90 15 2600 --band=5 --smoothbars=3 --minhold=3
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-21 2026-09-21 OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold 90 15 2600 --band=5 --smoothbars=3 --minhold=3
+dotnet run --project NiftySignal.VolumeBarData -- mae-mfe trade 2026-09-08 2026-09-19 OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold 90 15 2600 --band=5 --smoothbars=3 --minhold=3
+```
