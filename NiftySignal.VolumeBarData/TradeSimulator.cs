@@ -686,6 +686,134 @@ public enum VolumeBarMetric
     /// value do together," not to sweep a 2D grid of the two.
     /// </summary>
     OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold,
+
+    /// <summary>
+    /// 2026-09-22, bounded-transform research task (user's own idea: "replace percentile with a
+    /// bounded transform, e.g. tanh or clipped z-score of the raw metric, then smooth" --
+    /// docs/VOLUME_BAR_FINDINGS.md's dated "Bounded-transform score" section). Replaces
+    /// <see cref="SignedRank.Compute"/>'s session-rank percentile with a session-scoped z-score
+    /// (mean/std of THIS metric's own raw readings so far today, via <see cref="RunningMeanStd"/> --
+    /// Welford's online algorithm, so the scale is derived from real data seen so far, never a fixed
+    /// magnitude picked by eye, per CLAUDE.md's own rule) squashed through <c>tanh</c> -- removes the
+    /// "rank against every other value seen today" percentile effect the user's note calls out, while
+    /// staying session-scoped (still resets each day) and requiring no cross-day warm-up data. Same 3
+    /// leg formulas as the locked baseline (Open: depth imbalance; Mid: price-signed ΔIV; Close: raw
+    /// ΔIV), same Max Pain confirmation gate, same 09:30-15:00 entry window -- ONLY the per-leg
+    /// normalization step changes (<see cref="ComputeOptionsThreeWayScoreBoundedTransform"/>, a fork
+    /// of <see cref="ComputeOptionsThreeWayScoreSmoothed"/>'s own structure, not a call into the
+    /// live/shared <see cref="OptionsThreeWayScoreCalculator"/>, same backtest-only-experimentation
+    /// discipline every other Part A/B candidate in this file follows).
+    ///
+    /// Entry-threshold redesign: the raw tanh output is naturally bounded to (-1,1) but is NOT
+    /// percentile-shaped (a tanh value near 0.9 does not mean "90th percentile of today's readings"
+    /// the way a SignedRank output does) -- so, exactly like
+    /// <see cref="OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma"/>'s own re-rank-not-threshold
+    /// decision, this metric's own bounded value is re-ranked through its own dedicated
+    /// <c>scoreSmoothMagnitudeRank</c> tracker (shared with the ScoreSma/ScoreEma family --
+    /// mutually exclusive per call) and entry/exit still gate on
+    /// <c>Percentile(|boundedScore|) >= entryPercentile</c>, the SAME dynamic self-calibrating
+    /// threshold mechanism every metric in this file uses, per CLAUDE.md's "no hardcoded thresholds"
+    /// rule -- not a fixed tanh cutoff like 0.8, which would be exactly the kind of eyeballed magnitude
+    /// constant that rule warns against.
+    /// </summary>
+    OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransform,
+
+    /// <summary>
+    /// 2026-09-22, EMA sibling of <see cref="OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransform"/>
+    /// -- reuses the EXACT SAME EMA machinery (<see cref="ExponentialMean"/>, alpha=2/(N+1), the
+    /// <c>scoreEmaSmoother</c>/<c>scoreSmoothMagnitudeRank</c> instances already built for
+    /// <see cref="OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma"/>) applied on top of the
+    /// bounded-transform score instead of the percentile score -- Part A's frozen EMA N=3 spec,
+    /// unmodified, just fed a different upstream series. <c>--smoothbars=N</c> (default 3) controls
+    /// the EMA length, same flag every other smoothing candidate in this file already uses.
+    /// </summary>
+    OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransformScoreEma,
+
+    // ===================================================================================
+    // 2026-09-22, Part B: CallScore/PutScore pure single-side metric isolation (research
+    // only, provisional -- see docs/VOLUME_BAR_FINDINGS.md's dated "Part B" section). Every
+    // metric below is computed STRICTLY on one option side's own fields (Call-only or
+    // Put-only), never a pooled Call+Put sum -- the whole point of this batch is testing
+    // whether separating the two sides reveals something the existing pooled metrics
+    // (AtmComplexDepthImbalance, AtmComplexTobDepthDivergence, CallPutDepthImbalance,
+    // NotionalOiDelta, AtmIvChangeRaw/PriceSigned, Skew25Delta*) hide. Same clock (future
+    // volume bars), same SignedRank/SessionRankTracker percentile machinery as every metric
+    // above. Notional (price-weighted) depth data does not exist in OptionDepthBarRow --
+    // only raw resting quantity (CallBidQtyAvg etc.) -- so the two depth-family metrics
+    // below use raw quantity, documented here rather than silently assumed notional.
+    // ===================================================================================
+
+    /// <summary>Part B, depth family, Call-only: (CallBidQtyAvg-CallAskQtyAvg)/(CallBidQtyAvg+CallAskQtyAvg), full top-5-level book, mirrors AtmComplexDepthImbalance's formula shape but never pools in the Put side. Untested sign hypothesis, same discipline as every other candidate in this file.</summary>
+    CallDepthImbalance,
+
+    /// <summary>Part B, depth family, Put-only mirror of <see cref="CallDepthImbalance"/>: (PutBidQtyAvg-PutAskQtyAvg)/(PutBidQtyAvg+PutAskQtyAvg).</summary>
+    PutDepthImbalance,
+
+    /// <summary>Part B, TOB family, Call-only: touch-level (CallTobBidQtyAvg/CallTobAskQtyAvg) imbalance, mirrors TopOfBookImbalance's futures-side formula shape applied to the Call side alone.</summary>
+    CallTobImbalance,
+
+    /// <summary>Part B, TOB family, Put-only mirror of <see cref="CallTobImbalance"/>.</summary>
+    PutTobImbalance,
+
+    /// <summary>Part B, divergence family, Call-only: <see cref="CallDepthImbalance"/> minus <see cref="CallTobImbalance"/> (full book vs. touch, Call side only) -- single-sided analog of AtmComplexTobDepthDivergence/the futures TobDepthDivergence. Untested sign hypothesis.</summary>
+    CallTobDepthDivergence,
+
+    /// <summary>Part B, divergence family, Put-only mirror of <see cref="CallTobDepthDivergence"/>.</summary>
+    PutTobDepthDivergence,
+
+    /// <summary>Part B, OI family, Call-only: <see cref="OptionOiBarRow.CallOiChangeNotional"/> directly (already a flow, no differencing), session-rank normalized -- the Call leg of NotionalOiDelta's own two terms, traded standalone instead of as a Call-minus-Put difference.</summary>
+    CallOiDeltaOnly,
+
+    /// <summary>Part B, OI family, Put-only mirror of <see cref="CallOiDeltaOnly"/> using <see cref="OptionOiBarRow.PutOiChangeNotional"/>.</summary>
+    PutOiDeltaOnly,
+
+    /// <summary>Part B, ATM IV family, Call-only: bar-over-bar change in <see cref="OptionAtmBarRow.AtmCallIv"/> alone (never averaged with the Put leg the way AtmIvChangeRaw's underlying AtmIv is). Untested sign hypothesis.</summary>
+    CallIvChangeRaw,
+
+    /// <summary>Part B, ATM IV family, Put-only mirror of <see cref="CallIvChangeRaw"/> using <see cref="OptionAtmBarRow.AtmPutIv"/>.</summary>
+    PutIvChangeRaw,
+
+    /// <summary>Part B, ATM IV family, Call-only price-signed variant: sign(future ΔPrice) x ΔAtmCallIv, single-side analog of AtmIvChangePriceSigned.</summary>
+    CallIvChangePriceSigned,
+
+    /// <summary>Part B, ATM IV family, Put-only mirror of <see cref="CallIvChangePriceSigned"/> using ΔAtmPutIv.</summary>
+    PutIvChangePriceSigned,
+
+    /// <summary>Part B, 25-delta wing family, Call-only: bar-over-bar change in <see cref="OptionSkew25DeltaBarRow.Call25DeltaIv"/> alone -- that wing's own IV level, not the Put/Call skew ratio Skew25DeltaChangeRaw already tests. Untested sign hypothesis.</summary>
+    CallWingIvChangeRaw,
+
+    /// <summary>Part B, 25-delta wing family, Put-only mirror of <see cref="CallWingIvChangeRaw"/> using <see cref="OptionSkew25DeltaBarRow.Put25DeltaIv"/>.</summary>
+    PutWingIvChangeRaw,
+
+    /// <summary>
+    /// Part B, CallScore: a session-gated SWITCH among whichever Call-side metrics above survive
+    /// their own individual evaluation cycle (see docs/VOLUME_BAR_FINDINGS.md) -- only ever enters
+    /// Call options (long Call on a positive signal, flat/no-trade on a negative one; this metric
+    /// never goes short/Put). Exact switch legs and boundary are documented on
+    /// <see cref="TradeSimulator.ComputeCallScore"/> and in the findings doc, not re-derived here.
+    /// </summary>
+    CallScoreStandalone,
+
+    /// <summary>Part B, PutScore: Put-side mirror of <see cref="CallScoreStandalone"/> -- only ever enters Puts. See <see cref="TradeSimulator.ComputePutScore"/>.</summary>
+    PutScoreStandalone,
+
+    /// <summary>Part B combination (a): CallScore and PutScore must AGREE in sign (both bullish or both bearish) before a bar counts as a signal; the trade direction and side follow the agreed sign (Call on agreed-bullish, Put on agreed-bearish) -- this is the only Part B combination metric that can trade EITHER side.</summary>
+    CallPutScoreAgreement,
+
+    /// <summary>Part B combination (b): CallScore minus PutScore, traded as its own signed score (Call on positive spread, Put on negative) -- a genuinely new derived signal, not a gate on an existing one.</summary>
+    CallPutScoreSpread,
+
+    /// <summary>
+    /// Part B combination (c): the already-locked <see cref="OptionsScoreThreeWaySwitchMaxPainConfirmed"/>
+    /// production score (identical formula and Max Pain confirmation gate, UNCHANGED) with one extra
+    /// confirmation requirement: the
+    /// Call/Put side-score agreement check (same sign test as <see cref="CallPutScoreAgreement"/>) must
+    /// also pass before the locked switch's own signal is allowed to trade. Mirrors the existing
+    /// Max-Pain-as-confirmation-gate pattern (<see cref="OptionsScoreThreeWaySwitchMaxPainConfirmed"/>
+    /// itself) -- an additional gate on top of the locked score, never a replacement for it, and the
+    /// locked score's own dispatch/formula is not touched by this metric's existence.
+    /// </summary>
+    OptionsScoreThreeWaySwitchMaxPainConfirmedCallPutAgreementConfirmed,
 }
 
 /// <param name="PartialExitTime">
@@ -860,6 +988,13 @@ public static class TradeSimulator
         int bandWidth = OptionDepthPopulator.DefaultBandWidth,
         TimeSpan? optionsSwitchTime = null,
         TimeSpan? entryWindowStartOverride = null,
+        // 2026-09-22, Open-phase Put edge deep dive (docs/VOLUME_BAR_FINDINGS.md) -- the counterpart
+        // to entryWindowStartOverride above, added for the same reason (an evidence-based override
+        // point rather than a new mechanism) so a metric can be gated to an Open-only window
+        // (e.g. --entrystart=09:30 --entryend=10:00) without touching the standing 09:30-15:00
+        // EntryWindowStart/End constants used everywhere else. Null (default) means unchanged
+        // behavior -- every existing caller/metric keeps trading through the full EntryWindowEnd.
+        TimeSpan? entryWindowEndOverride = null,
         (double Open, double Mid, double Close)? sessionWeightsOnFutures = null,
         Action<VolumeBarRow, double?, double?, double?>? onBarEvaluated = null,
         // 2026-09-21, whipsaw-reduction experiment Candidate A -- only meaningful for
@@ -909,6 +1044,7 @@ public static class TradeSimulator
         // the same evidence-based way -- defaults to the existing 09:30 EntryWindowStart constant,
         // unchanged for every metric unless this is explicitly overridden.
         var effectiveEntryWindowStart = entryWindowStartOverride ?? EntryWindowStart;
+        var effectiveEntryWindowEnd = entryWindowEndOverride ?? EntryWindowEnd;
         List<VolumeBarRow> bars;
         if (rollingSubBarThreshold is { } subBarSize)
         {
@@ -979,6 +1115,10 @@ public static class TradeSimulator
         // (post-percentile) differs -- so they belong in this same set, same reasoning as MinHold.
         var isOptionsScore3Way = metric is VolumeBarMetric.OptionsScoreThreeWaySwitch or VolumeBarMetric.OptionsScoreThreeWaySwitchConfirmed or VolumeBarMetric.OptionsScoreThreeWaySwitchEarlyConviction or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmed or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedMinHold or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreSma or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold;
         var isOptionsScore3WaySmoothed = metric == VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedSmoothed;
+        // 2026-09-22, bounded-transform research task -- own dispatch branch, same "does not belong
+        // in isOptionsScore3Way" reasoning as isOptionsScore3WaySmoothed above (its own score
+        // computation genuinely differs: tanh(session z-score) instead of SignedRank percentile).
+        var isOptionsScore3WayBoundedTransform = metric is VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransform or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransformScoreEma;
         var isOptionsScoreConfirmed = metric == VolumeBarMetric.OptionsScoreThreeWaySwitchConfirmed;
         var isOptionsScoreEarlyConviction = metric == VolumeBarMetric.OptionsScoreThreeWaySwitchEarlyConviction;
         // Both whipsaw-reduction candidates keep the exact same Max Pain confirmation gate as the
@@ -990,7 +1130,10 @@ public static class TradeSimulator
             or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedMinHold
             or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreSma
             or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma
-            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold;
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedCallPutAgreementConfirmed
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransform
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransformScoreEma;
         var isOptionsScore3WayOiOpen = metric == VolumeBarMetric.OptionsScoreThreeWaySwitchOiOpen;
         var isOptionsScore3WayVolMid = metric == VolumeBarMetric.OptionsScoreThreeWaySwitchVolMid;
         // 2026-09-20, Phase 5 plan items 10-13: the first-ever FuturesScore + OptionsScore
@@ -1000,7 +1143,24 @@ public static class TradeSimulator
             or VolumeBarMetric.FinalScoreFuturesPrimaryOptionsFilter or VolumeBarMetric.FinalScoreOptionsPrimaryFuturesFilter
             or VolumeBarMetric.FinalScoreSessionWeighted;
 
-        var isAtmIvMetric = metric is VolumeBarMetric.AtmIvChangeRaw or VolumeBarMetric.AtmIvChangePriceSigned or VolumeBarMetric.AtmIvAcceleration || isOptionsScoreBlend || isOptionsScoreSwitch || isOptionsScore3Way || isOptionsScore3WaySmoothed || isOptionsScore3WayOiOpen || isOptionsScore3WayVolMid || isFinalScoreCombo;
+        // 2026-09-22, Part B: the 5 CallScore/PutScore combination metrics each need every
+        // single-side table loaded (they switch among whichever survivors apply), same
+        // "load everything a combo might touch" convention OptionsScoreBlend already uses.
+        var isPartBCombo = metric is VolumeBarMetric.CallScoreStandalone or VolumeBarMetric.PutScoreStandalone
+            or VolumeBarMetric.CallPutScoreAgreement or VolumeBarMetric.CallPutScoreSpread
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedCallPutAgreementConfirmed;
+        // 2026-09-22, Part B: these 6 metrics each get their OWN dedicated top-level dispatch
+        // block (below, after the shared isAtmIvMetric/isSkew25DeltaMetric branches) rather than
+        // being folded into those branches' own switch statements -- kept OUT of the shared
+        // branches' entry conditions (isAtmIvMetric && !isPartBIvMetric, etc.) specifically to
+        // avoid this project's own recurring dispatch-order bug (CLAUDE.md: a new metric's flag
+        // OR'd into an earlier metric's condition gets intercepted if its own branch isn't placed
+        // correctly) -- still included in the flags below purely for TABLE LOADING.
+        var isPartBIvMetric = metric is VolumeBarMetric.CallIvChangeRaw or VolumeBarMetric.PutIvChangeRaw or VolumeBarMetric.CallIvChangePriceSigned or VolumeBarMetric.PutIvChangePriceSigned;
+        var isPartBWingMetric = metric is VolumeBarMetric.CallWingIvChangeRaw or VolumeBarMetric.PutWingIvChangeRaw;
+        var isAtmIvMetric = metric is VolumeBarMetric.AtmIvChangeRaw or VolumeBarMetric.AtmIvChangePriceSigned or VolumeBarMetric.AtmIvAcceleration
+            or VolumeBarMetric.CallIvChangeRaw or VolumeBarMetric.PutIvChangeRaw or VolumeBarMetric.CallIvChangePriceSigned or VolumeBarMetric.PutIvChangePriceSigned
+            || isOptionsScoreBlend || isOptionsScoreSwitch || isOptionsScore3Way || isOptionsScore3WaySmoothed || isOptionsScore3WayBoundedTransform || isOptionsScore3WayOiOpen || isOptionsScore3WayVolMid || isFinalScoreCombo || isPartBCombo;
         Dictionary<int, OptionAtmBarRow>? optionAtmByBarIndex = null;
         if (isAtmIvMetric && rollingSubBarThreshold is null)
         {
@@ -1017,7 +1177,9 @@ public static class TradeSimulator
                 .ToDictionaryAsync(b => b.BarIndex, cancellationToken);
         }
 
-        var isOiMetric = metric is VolumeBarMetric.NotionalOiDelta or VolumeBarMetric.OiBuildupQuadrant || isOptionsScoreBlend || isOptionsScore3WayOiOpen;
+        var isOiMetric = metric is VolumeBarMetric.NotionalOiDelta or VolumeBarMetric.OiBuildupQuadrant
+            or VolumeBarMetric.CallOiDeltaOnly or VolumeBarMetric.PutOiDeltaOnly
+            || isOptionsScoreBlend || isOptionsScore3WayOiOpen || isPartBCombo;
         Dictionary<int, OptionOiBarRow>? optionOiByBarIndex = null;
         if (isOiMetric && rollingSubBarThreshold is null)
         {
@@ -1026,7 +1188,9 @@ public static class TradeSimulator
                 .ToDictionaryAsync(b => b.BarIndex, cancellationToken);
         }
 
-        var isSkew25DeltaMetric = metric is VolumeBarMetric.Skew25DeltaChangeRaw or VolumeBarMetric.Skew25DeltaChangePriceSigned or VolumeBarMetric.Skew25DeltaLevel || isOptionsScoreBlend || isOptionsScoreConfirmed;
+        var isSkew25DeltaMetric = metric is VolumeBarMetric.Skew25DeltaChangeRaw or VolumeBarMetric.Skew25DeltaChangePriceSigned or VolumeBarMetric.Skew25DeltaLevel
+            or VolumeBarMetric.CallWingIvChangeRaw or VolumeBarMetric.PutWingIvChangeRaw
+            || isOptionsScoreBlend || isOptionsScoreConfirmed || isPartBCombo;
         Dictionary<int, OptionSkew25DeltaBarRow>? optionSkew25DeltaByBarIndex = null;
         if (isSkew25DeltaMetric && rollingSubBarThreshold is null)
         {
@@ -1035,7 +1199,8 @@ public static class TradeSimulator
                 .ToDictionaryAsync(b => b.BarIndex, cancellationToken);
         }
 
-        var isMaxPainMetric = metric is VolumeBarMetric.DistanceToMaxPain or VolumeBarMetric.DistanceToHighestOiStrike || isOptionsScoreMaxPainConfirmed;
+        var isMaxPainMetric = metric is VolumeBarMetric.DistanceToMaxPain or VolumeBarMetric.DistanceToHighestOiStrike || isOptionsScoreMaxPainConfirmed
+            || metric == VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedCallPutAgreementConfirmed;
         Dictionary<int, OptionMaxPainBarRow>? optionMaxPainByBarIndex = null;
         if (isMaxPainMetric && rollingSubBarThreshold is null)
         {
@@ -1044,7 +1209,10 @@ public static class TradeSimulator
                 .ToDictionaryAsync(b => b.BarIndex, cancellationToken);
         }
 
-        var isDepthMetric = metric is VolumeBarMetric.AtmComplexDepthImbalance or VolumeBarMetric.AtmComplexTobDepthDivergence or VolumeBarMetric.CallPutDepthImbalance || isOptionsScoreBlend;
+        var isDepthMetric = metric is VolumeBarMetric.AtmComplexDepthImbalance or VolumeBarMetric.AtmComplexTobDepthDivergence or VolumeBarMetric.CallPutDepthImbalance
+            or VolumeBarMetric.CallDepthImbalance or VolumeBarMetric.PutDepthImbalance or VolumeBarMetric.CallTobImbalance or VolumeBarMetric.PutTobImbalance
+            or VolumeBarMetric.CallTobDepthDivergence or VolumeBarMetric.PutTobDepthDivergence
+            || isOptionsScoreBlend || isPartBCombo;
         Dictionary<int, OptionDepthBarRow>? optionDepthByBarIndex = null;
         if (isDepthMetric && rollingSubBarThreshold is null)
         {
@@ -1057,7 +1225,7 @@ public static class TradeSimulator
         // independent of whatever bandWidth is passed for the other band-based components --
         // TobDivergence stays at bandWidth (its own locked ATM±1) via optionDepthByBarIndex above.
         Dictionary<int, OptionDepthBarRow>? optionDepthWideByBarIndex = null;
-        if ((isOptionsScoreBlend || isOptionsScoreSwitch || isOptionsScore3Way || isOptionsScore3WaySmoothed || isOptionsScore3WayVolMid || isFinalScoreCombo) && rollingSubBarThreshold is null)
+        if ((isOptionsScoreBlend || isOptionsScoreSwitch || isOptionsScore3Way || isOptionsScore3WaySmoothed || isOptionsScore3WayBoundedTransform || isOptionsScore3WayVolMid || isFinalScoreCombo) && rollingSubBarThreshold is null)
         {
             optionDepthWideByBarIndex = bandWidth == 5 && optionDepthByBarIndex is not null
                 ? optionDepthByBarIndex
@@ -1200,6 +1368,34 @@ public static class TradeSimulator
         var atmTobDivergenceRank = new SessionRankTracker();
         var callPutDepthRank = new SessionRankTracker();
 
+        // 2026-09-22, Part B: pure single-side metric trackers, own isolation per metric same as
+        // everything else in this file. See docs/VOLUME_BAR_FINDINGS.md's Part B section.
+        var callDepthRank = new SessionRankTracker();
+        var putDepthRank = new SessionRankTracker();
+        var callTobRank = new SessionRankTracker();
+        var putTobRank = new SessionRankTracker();
+        var callTobDivergenceRank = new SessionRankTracker();
+        var putTobDivergenceRank = new SessionRankTracker();
+        var callOiDeltaRank = new SessionRankTracker();
+        var putOiDeltaRank = new SessionRankTracker();
+        var callIvChangeRank = new SessionRankTracker();
+        var putIvChangeRank = new SessionRankTracker();
+        var callWingIvChangeRank = new SessionRankTracker();
+        var putWingIvChangeRank = new SessionRankTracker();
+        double? previousAtmCallIv = null;
+        double? previousAtmPutIv = null;
+        double? previousCall25DeltaIv = null;
+        double? previousPut25DeltaIv = null;
+        // Part B combination metrics -- own dedicated trackers for the locked-score leg (kept
+        // separate from switch3*Rank above, mutually exclusive per call anyway, same "own
+        // isolation" convention as isOptionsScore3WaySmoothed's own trackers).
+        var comboLockedDepthRank = new SessionRankTracker();
+        var comboLockedIvMidRank = new SessionRankTracker();
+        var comboLockedIvCloseRank = new SessionRankTracker();
+        double? previousAtmIvForCombo = null;
+        var comboMagnitudeRankPartB = new SessionRankTracker();
+        var spreadSignedRank = new SessionRankTracker();
+
         // 2026-09-20, Phase 4: only meaningful for OptionsScoreBlend -- 7 independent trackers, one
         // per confirmed standalone metric, same "own isolation, whichever run" pattern the futures
         // side's own Composite already uses. previousAtmIv/previousSkewRatio above are reused
@@ -1253,6 +1449,17 @@ public static class TradeSimulator
         var scoreSmoothMagnitudeRank = new SessionRankTracker();
         var scoreSmaSmoother = new BarCountRollingMean(effectiveSmoothingWindowBars);
         var scoreEmaSmoother = new ExponentialMean(effectiveSmoothingWindowBars);
+
+        // 2026-09-22, bounded-transform research task -- only meaningful for
+        // OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransform/...BoundedTransformScoreEma.
+        // Own RunningMeanStd (Welford) per leg, session-scoped (fresh per day, same lifecycle as
+        // every SessionRankTracker in this method) -- the data-derived scale tanh squashes against,
+        // never a fixed magnitude. The EMA sibling reuses scoreEmaSmoother/scoreSmoothMagnitudeRank
+        // above (mutually exclusive per call with the ScoreSma/ScoreEma family, same sharing
+        // convention already established there).
+        var boundedDepthStats = new RunningMeanStd();
+        var boundedIvMidStats = new RunningMeanStd();
+        var boundedIvCloseStats = new RunningMeanStd();
 
         // Only meaningful for OptionsScoreThreeWaySwitchOiOpen -- same Mid/Close legs as the
         // 3-way switch (own trackers, not shared, mutually exclusive per call), OI Delta drives
@@ -1405,6 +1612,13 @@ public static class TradeSimulator
                     effectiveOptionsSwitchTime, ref previousAtmIv, smoothedDepthRank, smoothedIvMidRank, smoothedIvCloseRank,
                     depthSmoother, ivMidSmoother, ivCloseSmoother);
             }
+            else if (isOptionsScore3WayBoundedTransform)
+            {
+                // 2026-09-22, bounded-transform research task -- MUST be checked before isAtmIvMetric
+                // below, same dispatch-order lesson as every other blend/switch metric in this chain.
+                score = ComputeOptionsThreeWayScoreBoundedTransform(bar, previousClose, optionAtmByBarIndex, optionDepthWideByBarIndex,
+                    effectiveOptionsSwitchTime, ref previousAtmIv, boundedDepthStats, boundedIvMidStats, boundedIvCloseStats);
+            }
             else if (isOptionsScore3WayOiOpen)
             {
                 // MUST be checked before isAtmIvMetric/isOiMetric below -- same dispatch-order
@@ -1535,7 +1749,7 @@ public static class TradeSimulator
             {
                 score = ComputeSessionGatedScore(bar, previousClose, sessionDepthRank, sessionDurationRank);
             }
-            else if (isAtmIvMetric)
+            else if (isAtmIvMetric && !isPartBCombo && !isPartBIvMetric)
             {
                 var currentAtmIv = optionAtmByBarIndex is not null && optionAtmByBarIndex.TryGetValue(bar.BarIndex, out var optionBar) ? optionBar.AtmIv : null;
                 double? deltaIv = previousAtmIv is { } prevIv && currentAtmIv is { } curIv ? curIv - prevIv : null;
@@ -1582,7 +1796,7 @@ public static class TradeSimulator
                     ? SignedRank.Compute(-bn, oiBuildupRank)
                     : null;
             }
-            else if (isSkew25DeltaMetric)
+            else if (isSkew25DeltaMetric && !isPartBCombo && !isPartBWingMetric)
             {
                 var currentRatio = optionSkew25DeltaByBarIndex is not null && optionSkew25DeltaByBarIndex.TryGetValue(bar.BarIndex, out var skewBar) ? skewBar.SkewRatio : null;
                 double? deltaRatio = previousSkewRatio is { } prevR && currentRatio is { } curR ? curR - prevR : null;
@@ -1627,7 +1841,7 @@ public static class TradeSimulator
                     ? SignedRank.Compute(-(double)(bar.ClosePrice - hs), highestOiStrikeRank)
                     : null;
             }
-            else if (isDepthMetric)
+            else if (isDepthMetric && !isPartBCombo)
             {
                 var depthBar = optionDepthByBarIndex is not null && optionDepthByBarIndex.TryGetValue(bar.BarIndex, out var db) ? db : null;
                 score = metric switch
@@ -1651,8 +1865,145 @@ public static class TradeSimulator
                     VolumeBarMetric.CallPutDepthImbalance => depthBar is not null
                         && ComputeImbalanceRatio(depthBar.CallBidQtyAvg + depthBar.CallAskQtyAvg, depthBar.PutBidQtyAvg + depthBar.PutAskQtyAvg) is { } r2
                             ? SignedRank.Compute(-r2, callPutDepthRank) : null,
+                    // 2026-09-22, Part B, depth family. CallDepthImbalance tested as-built (untested
+                    // sign hypothesis, not pre-negated) -- weak/inconsistent, not a clean flip
+                    // signature, see docs/VOLUME_BAR_FINDINGS.md. PutDepthImbalance built un-negated
+                    // first -- win rate degraded as the gate tightened (32.8% down to 28.6% across
+                    // the 650 target band, same pattern at every threshold), the classic wrong-sign
+                    // signature this project has flagged repeatedly elsewhere. Flipped here,
+                    // re-verified by re-running the full sweep rather than inferred.
+                    VolumeBarMetric.CallDepthImbalance => depthBar is not null
+                        && ComputeImbalanceRatio(depthBar.CallBidQtyAvg, depthBar.CallAskQtyAvg) is { } cdr
+                            ? SignedRank.Compute(cdr, callDepthRank) : null,
+                    VolumeBarMetric.PutDepthImbalance => depthBar is not null
+                        && ComputeImbalanceRatio(depthBar.PutBidQtyAvg, depthBar.PutAskQtyAvg) is { } pdr
+                            ? SignedRank.Compute(-pdr, putDepthRank) : null,
+                    VolumeBarMetric.CallTobImbalance => depthBar is not null
+                        && ComputeImbalanceRatio(depthBar.CallTobBidQtyAvg, depthBar.CallTobAskQtyAvg) is { } ctr
+                            ? SignedRank.Compute(ctr, callTobRank) : null,
+                    // 2026-09-22: built un-negated first -- same wrong-sign degradation signature as
+                    // PutDepthImbalance (win rate falling from 39.8% to 33.8% as the 650 gate
+                    // tightened, consistently negative net at every threshold). Flipped, re-verified.
+                    VolumeBarMetric.PutTobImbalance => depthBar is not null
+                        && ComputeImbalanceRatio(depthBar.PutTobBidQtyAvg, depthBar.PutTobAskQtyAvg) is { } ptr2
+                            ? SignedRank.Compute(-ptr2, putTobRank) : null,
+                    VolumeBarMetric.CallTobDepthDivergence => depthBar is not null && ComputeSideTobDivergence(depthBar, side: true) is { } ctd
+                        ? SignedRank.Compute(ctd, callTobDivergenceRank) : null,
+                    VolumeBarMetric.PutTobDepthDivergence => depthBar is not null && ComputeSideTobDivergence(depthBar, side: false) is { } ptd
+                        ? SignedRank.Compute(ptd, putTobDivergenceRank) : null,
                     _ => null,
                 };
+            }
+            else if (metric == VolumeBarMetric.CallOiDeltaOnly)
+            {
+                // 2026-09-22, Part B, OI family -- the Call leg of NotionalOiDelta's own two terms,
+                // traded standalone. Untested sign hypothesis, tested as-built.
+                score = optionOiByBarIndex is not null && optionOiByBarIndex.TryGetValue(bar.BarIndex, out var callOiBar)
+                    ? SignedRank.Compute((double)callOiBar.CallOiChangeNotional, callOiDeltaRank)
+                    : null;
+            }
+            else if (metric == VolumeBarMetric.PutOiDeltaOnly)
+            {
+                score = optionOiByBarIndex is not null && optionOiByBarIndex.TryGetValue(bar.BarIndex, out var putOiBar)
+                    ? SignedRank.Compute((double)putOiBar.PutOiChangeNotional, putOiDeltaRank)
+                    : null;
+            }
+            else if (metric is VolumeBarMetric.CallIvChangeRaw or VolumeBarMetric.CallIvChangePriceSigned)
+            {
+                var currentCallIv = optionAtmByBarIndex is not null && optionAtmByBarIndex.TryGetValue(bar.BarIndex, out var callIvBar) ? callIvBar.AtmCallIv : null;
+                double? deltaCallIv = previousAtmCallIv is { } prevCIv && currentCallIv is { } curCIv ? curCIv - prevCIv : null;
+                score = metric switch
+                {
+                    VolumeBarMetric.CallIvChangeRaw => deltaCallIv is { } d ? SignedRank.Compute(d, callIvChangeRank) : null,
+                    // 2026-09-22: built un-negated first -- win rate stuck at 40-47% (never above
+                    // 50%) across every threshold/percentile, uniformly negative net, the classic
+                    // wrong-sign signature. Flipped here, re-verified by re-running the full sweep.
+                    VolumeBarMetric.CallIvChangePriceSigned => deltaCallIv is { } d && previousClose is { } prevCloseCiv
+                        ? SignedRank.Compute(-Math.Sign(bar.ClosePrice - prevCloseCiv) * d, callIvChangeRank)
+                        : null,
+                    _ => null,
+                };
+                previousAtmCallIv = currentCallIv ?? previousAtmCallIv;
+            }
+            else if (metric is VolumeBarMetric.PutIvChangeRaw or VolumeBarMetric.PutIvChangePriceSigned)
+            {
+                var currentPutIv = optionAtmByBarIndex is not null && optionAtmByBarIndex.TryGetValue(bar.BarIndex, out var putIvBar) ? putIvBar.AtmPutIv : null;
+                double? deltaPutIv = previousAtmPutIv is { } prevPIv && currentPutIv is { } curPIv ? curPIv - prevPIv : null;
+                score = metric switch
+                {
+                    VolumeBarMetric.PutIvChangeRaw => deltaPutIv is { } d ? SignedRank.Compute(d, putIvChangeRank) : null,
+                    // 2026-09-22: built un-negated first -- win rate stuck below 50% (38-50%) at
+                    // every threshold/percentile, mostly negative net, same wrong-sign signature as
+                    // CallIvChangePriceSigned. Flipped here, re-verified by re-running the sweep.
+                    VolumeBarMetric.PutIvChangePriceSigned => deltaPutIv is { } d && previousClose is { } prevClosePiv
+                        ? SignedRank.Compute(-Math.Sign(bar.ClosePrice - prevClosePiv) * d, putIvChangeRank)
+                        : null,
+                    _ => null,
+                };
+                previousAtmPutIv = currentPutIv ?? previousAtmPutIv;
+            }
+            else if (metric == VolumeBarMetric.CallWingIvChangeRaw)
+            {
+                var currentCall25Iv = optionSkew25DeltaByBarIndex is not null && optionSkew25DeltaByBarIndex.TryGetValue(bar.BarIndex, out var call25Bar) ? call25Bar.Call25DeltaIv : null;
+                double? deltaCall25Iv = previousCall25DeltaIv is { } prevC25 && currentCall25Iv is { } curC25 ? curC25 - prevC25 : null;
+                score = deltaCall25Iv is { } d ? SignedRank.Compute(d, callWingIvChangeRank) : null;
+                previousCall25DeltaIv = currentCall25Iv ?? previousCall25DeltaIv;
+            }
+            else if (metric == VolumeBarMetric.PutWingIvChangeRaw)
+            {
+                var currentPut25Iv = optionSkew25DeltaByBarIndex is not null && optionSkew25DeltaByBarIndex.TryGetValue(bar.BarIndex, out var put25Bar) ? put25Bar.Put25DeltaIv : null;
+                double? deltaPut25Iv = previousPut25DeltaIv is { } prevP25 && currentPut25Iv is { } curP25 ? curP25 - prevP25 : null;
+                score = deltaPut25Iv is { } d ? SignedRank.Compute(d, putWingIvChangeRank) : null;
+                previousPut25DeltaIv = currentPut25Iv ?? previousPut25DeltaIv;
+            }
+            else if (metric is VolumeBarMetric.CallScoreStandalone or VolumeBarMetric.PutScoreStandalone
+                or VolumeBarMetric.CallPutScoreAgreement or VolumeBarMetric.CallPutScoreSpread)
+            {
+                var callScore = ComputeCallScore(bar, optionDepthByBarIndex, optionOiByBarIndex);
+                var putScore = ComputePutScore(bar, optionDepthByBarIndex, optionOiByBarIndex);
+                // 2026-09-22 fix: CallScoreStandalone/PutScoreStandalone must carry their FULL
+                // signed score through every bar (not null out the "wrong" sign) so the standard
+                // hysteresis exit (score crossing to the opposite extreme) can still fire on an
+                // already-open position -- nulling the score when it disagreed with the traded side
+                // was found to silently defeat that exit (every position rode to TimeCutoff/EndOfDay
+                // regardless of entryPercentile, exactly 1 trade/day at every setting tested -- see
+                // docs/VOLUME_BAR_FINDINGS.md). The "only ever buys Calls/Puts" requirement is
+                // enforced at ENTRY instead, via PassesConfirmation (see its own extended cases),
+                // which only gates new entries and never touches an already-open position's exit.
+                score = metric switch
+                {
+                    VolumeBarMetric.CallScoreStandalone => callScore,
+                    VolumeBarMetric.PutScoreStandalone => putScore,
+                    VolumeBarMetric.CallPutScoreAgreement => callScore is { } cs2 && putScore is { } ps2 && Math.Sign(cs2) == Math.Sign(ps2) && Math.Sign(cs2) != 0
+                        ? (cs2 + ps2) / 2.0
+                        : null,
+                    VolumeBarMetric.CallPutScoreSpread => callScore is { } cs3 && putScore is { } ps3 ? cs3 - ps3 : null,
+                    _ => null,
+                };
+                if (metric == VolumeBarMetric.CallPutScoreSpread && score is { } spreadRaw)
+                {
+                    score = SignedRank.Compute(spreadRaw, spreadSignedRank);
+                }
+            }
+            else if (metric == VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedCallPutAgreementConfirmed)
+            {
+                // Part B combination (c) -- IDENTICAL locked-score computation to
+                // OptionsScoreThreeWaySwitchMaxPainConfirmed (own dedicated trackers, never shares
+                // mutable state with that metric's own switch3*Rank set), plus an extra Call/Put
+                // agreement confirmation applied at the entry gate (PassesConfirmation), not here.
+                score = ComputeOptionsThreeWayScore(bar, previousClose, optionAtmByBarIndex, optionDepthWideByBarIndex,
+                    effectiveOptionsSwitchTime, ref previousAtmIvForCombo, comboLockedDepthRank, comboLockedIvMidRank, comboLockedIvCloseRank);
+
+                // Reuses the shared comboOtherLegScore plumbing (already threaded to
+                // PassesConfirmation for the FinalScore* combos) to carry the Call/Put agreement
+                // sign through to the entry gate -- see PassesConfirmation's own extended MaxPain
+                // branch below. Raw CallScore/PutScore here (ATM±1 band, not the locked score's own
+                // ATM±2), same components ComputeCallScore/ComputePutScore already use elsewhere.
+                var comboCallScore = ComputeCallScore(bar, optionDepthByBarIndex, optionOiByBarIndex);
+                var comboPutScore = ComputePutScore(bar, optionDepthByBarIndex, optionOiByBarIndex);
+                comboOtherLegScore = comboCallScore is { } ccs && comboPutScore is { } cps && Math.Sign(ccs) == Math.Sign(cps) && Math.Sign(ccs) != 0
+                    ? Math.Sign(ccs)
+                    : 0.0;
             }
             else
             {
@@ -1696,19 +2047,25 @@ public static class TradeSimulator
             {
                 scaledScore = scoreSmaSmoother.Observe(scaledScore);
             }
-            else if (metric is VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold)
+            else if (metric is VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold
+                or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransformScoreEma)
             {
                 // 2026-09-22, best-smoother + MinHold=3 combination: the EmaMinHold metric shares
                 // this same EMA smoother instance/branch as the standalone ScoreEma metric (only the
                 // dwell-gated exit below differs) -- mutually exclusive per call, same convention as
-                // every other shared-branch pairing in this method.
+                // every other shared-branch pairing in this method. The bounded-transform EMA sibling
+                // also shares this same smoother instance, applied on top of its own tanh-based
+                // scaledScore instead of the percentile score -- same Part A EMA N=3 spec, different
+                // upstream series.
                 scaledScore = scoreEmaSmoother.Observe(scaledScore);
             }
 
             var magnitudeRank = metric == VolumeBarMetric.Composite ? compositeMagnitudeRank
                 : metric == VolumeBarMetric.OptionsScoreBlend ? blendMagnitudeRank
                 : metric is VolumeBarMetric.FinalScoreDteWeighted or VolumeBarMetric.FinalScoreSessionWeighted ? comboMagnitudeRank
-                : metric is VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreSma or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold ? scoreSmoothMagnitudeRank
+                : metric is VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreSma or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold
+                    or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransform or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransformScoreEma ? scoreSmoothMagnitudeRank
+                : metric is VolumeBarMetric.CallScoreStandalone or VolumeBarMetric.PutScoreStandalone or VolumeBarMetric.CallPutScoreAgreement ? comboMagnitudeRankPartB
                 : trendMagnitudeRank;
             var percentile = EntryPercentile(metric, scaledScore, magnitudeRank);
 
@@ -1772,7 +2129,7 @@ public static class TradeSimulator
                 }
             }
             else if (!isLastBar && !riskState.DailyLossCapHit && scaledScore is { } sc && percentile is { } p && p >= entryPercentile
-                && IstTimeOfDay(bar.EndTimestamp) >= effectiveEntryWindowStart && IstTimeOfDay(bar.EndTimestamp) <= EntryWindowEnd
+                && IstTimeOfDay(bar.EndTimestamp) >= effectiveEntryWindowStart && IstTimeOfDay(bar.EndTimestamp) <= effectiveEntryWindowEnd
                 && PassesConfirmation(metric, bar.EndTimestamp, sc, tobConfirmScore, skewConfirmScore, earlyConvictionSign, maxPainConfirmScore, comboOtherLegScore))
             {
                 var side = sc > 0 ? OptionType.Call : OptionType.Put;
@@ -2111,6 +2468,76 @@ public static class TradeSimulator
         return fullBook is { } f && touchOnly is { } t ? f - t : null;
     }
 
+    /// <summary>Part B, single-side analog of <see cref="ComputeTobDivergence"/>: full-book imbalance minus touch-only imbalance, computed on ONE option side alone (never pools Call+Put). <paramref name="side"/> true = Call, false = Put.</summary>
+    internal static double? ComputeSideTobDivergence(OptionDepthBarRow depthBar, bool side)
+    {
+        var fullBook = side
+            ? ComputeImbalanceRatio(depthBar.CallBidQtyAvg, depthBar.CallAskQtyAvg)
+            : ComputeImbalanceRatio(depthBar.PutBidQtyAvg, depthBar.PutAskQtyAvg);
+        var touchOnly = side
+            ? ComputeImbalanceRatio(depthBar.CallTobBidQtyAvg, depthBar.CallTobAskQtyAvg)
+            : ComputeImbalanceRatio(depthBar.PutTobBidQtyAvg, depthBar.PutTobAskQtyAvg);
+        return fullBook is { } f && touchOnly is { } t ? f - t : null;
+    }
+
+    /// <summary>
+    /// Part B, CallScore -- DATA-DRIVEN, built AFTER the individual-metric evaluation cycle (see
+    /// docs/VOLUME_BAR_FINDINGS.md's Part B section for the full per-metric sweep results this is
+    /// based on). Of the 7 Call-side families tested (depth, TOB, TOB-divergence, OI, raw ΔIV,
+    /// price-signed ΔIV, 25-delta wing ΔIV), only 2 cleared the kill criteria: CallTobImbalance
+    /// (strong, clean, 650/95: 63.2% win, +74.40 net, 106 trades, 7/8 days positive) and
+    /// CallIvChangePriceSigned (moderate, flipped-sign, 2600/90: 56.2% win, +172.75 net). Per the
+    /// task's own "check switch/dominant-metric vs blend, don't assume blending is right" guidance:
+    /// with CallTobImbalance clearly the stronger, more broadly-consistent of the two survivors,
+    /// this uses a DOMINANT-METRIC design (CallTobImbalance alone), not an equal-weight blend --
+    /// diluting a clean signal with a much weaker second one repeats the mistake this project's own
+    /// Composite (blend) vs. SessionGatedDepthDuration (switch) history already taught on the
+    /// futures side. CallIvChangePriceSigned is not thrown away -- it remains independently tradeable
+    /// via its own enum value and is a candidate for a future revision of this score, documented as
+    /// a real, considered-and-declined option, not an oversight.
+    /// </summary>
+    internal static double? ComputeCallScore(VolumeBarRow bar, Dictionary<int, OptionDepthBarRow>? optionDepthByBarIndex, Dictionary<int, OptionOiBarRow>? optionOiByBarIndex)
+    {
+        var depthBar = optionDepthByBarIndex is not null && optionDepthByBarIndex.TryGetValue(bar.BarIndex, out var db) ? db : null;
+        return depthBar is not null ? ComputeImbalanceRatio(depthBar.CallTobBidQtyAvg, depthBar.CallTobAskQtyAvg) : null;
+    }
+
+    /// <summary>
+    /// Part B, PutScore -- DATA-DRIVEN, built AFTER the individual-metric evaluation cycle. Of the
+    /// 7 Put-side families, 5 cleared the kill criteria, 2 of them clearly the strongest and most
+    /// broadly consistent: PutDepthImbalance (flipped, 2600/85: 65.5% win, +386.50 net, 113 trades,
+    /// 7/8 days positive) and PutTobImbalance (flipped, 1300/95: 66.2% win, +362.15 net, 80 trades,
+    /// 7/8 days positive) -- near-identical strength to each other, unlike CallScore's own clear
+    /// single winner. The other 3 survivors (PutTobDepthDivergence, PutIvChangePriceSigned,
+    /// PutWingIvChangeRaw) are meaningfully weaker (56-68% win but noticeably smaller/less consistent
+    /// net). Per the same "don't over-optimize weights on a small sample" instruction, this uses a
+    /// SIMPLE EQUAL-WEIGHT average of the 2 strongest survivors only (not a fitted weight vector, and
+    /// not all 5 -- diluting 2 clean signals with 3 much weaker ones repeats the same mistake
+    /// CallScore's own dominant-metric choice avoids). Both components are already bounded [-1,1]
+    /// imbalance ratios, so a plain average preserves that bound.
+    /// </summary>
+    internal static double? ComputePutScore(VolumeBarRow bar, Dictionary<int, OptionDepthBarRow>? optionDepthByBarIndex, Dictionary<int, OptionOiBarRow>? optionOiByBarIndex)
+    {
+        var depthBar = optionDepthByBarIndex is not null && optionDepthByBarIndex.TryGetValue(bar.BarIndex, out var db) ? db : null;
+        if (depthBar is null)
+        {
+            return null;
+        }
+
+        // Both flipped from their un-negated build per the empirical-sign discipline already
+        // applied and re-verified in each standalone metric's own dispatch case above.
+        var depthComponent = ComputeImbalanceRatio(depthBar.PutBidQtyAvg, depthBar.PutAskQtyAvg) is { } d ? -d : (double?)null;
+        var tobComponent = ComputeImbalanceRatio(depthBar.PutTobBidQtyAvg, depthBar.PutTobAskQtyAvg) is { } t ? -t : (double?)null;
+
+        return (depthComponent, tobComponent) switch
+        {
+            ({ } dd, { } tt) => (dd + tt) / 2.0,
+            ({ } dd, null) => dd,
+            (null, { } tt) => tt,
+            _ => null,
+        };
+    }
+
     /// <summary>LongBuildup/ShortCovering read bullish, ShortBuildup/LongUnwinding read bearish, Neutral is 0 -- see <see cref="VolumeBarMetric.FutureOiBuildupQuadrant"/>'s own doc comment.</summary>
     static double? ComputeOiBuildupScore(VolumeBarRow bar, decimal? previousClose, long? previousOi, SessionRankTracker rankTracker)
     {
@@ -2322,6 +2749,64 @@ public static class TradeSimulator
     }
 
     /// <summary>
+    /// 2026-09-22, bounded-transform research task
+    /// (<see cref="VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransform"/>) --
+    /// a deliberate FORK of <see cref="ComputeOptionsThreeWayScoreSmoothed"/>'s own structure (same
+    /// reason that one is a fork rather than a call into the shared
+    /// <see cref="OptionsThreeWayScoreCalculator"/>: backtest-only experimentation must not touch the
+    /// live pipeline's pure functions). Each leg's raw pre-normalization value is computed exactly as
+    /// <see cref="OptionsThreeWayScoreCalculator.ComputeScore"/> computes it internally (session
+    /// boundaries, sign conventions, null-propagation all unchanged from the baseline) -- only the
+    /// final normalization step differs: instead of <see cref="SignedRank.Compute"/> (percentile rank
+    /// against today's own distribution of |raw| via <see cref="SessionRankTracker"/>), this runs the
+    /// raw value through <see cref="BoundedTransform.Compute"/> (session z-score against this leg's
+    /// own running mean/std, via <see cref="RunningMeanStd"/>, squashed through <c>tanh</c>).
+    /// </summary>
+    static double? ComputeOptionsThreeWayScoreBoundedTransform(
+        VolumeBarRow bar, decimal? previousClose,
+        Dictionary<int, OptionAtmBarRow>? optionAtmByBarIndex,
+        Dictionary<int, OptionDepthBarRow>? optionDepthWideByBarIndex,
+        TimeSpan effectiveOptionsSwitchTime,
+        ref double? previousAtmIv,
+        RunningMeanStd depthStats, RunningMeanStd ivMidStats, RunningMeanStd ivCloseStats)
+    {
+        var currentAtmIv = optionAtmByBarIndex is not null && optionAtmByBarIndex.TryGetValue(bar.BarIndex, out var atmBar) ? atmBar.AtmIv : null;
+        var wideDepthBar = optionDepthWideByBarIndex is not null && optionDepthWideByBarIndex.TryGetValue(bar.BarIndex, out var wdb) ? wdb : null;
+        var timeOfDay = IstTimeOfDay(bar.EndTimestamp);
+
+        double? score;
+        if (timeOfDay < effectiveOptionsSwitchTime)
+        {
+            // Open leg: depth imbalance is already naturally bounded to [-1,1] by construction
+            // ((bid-ask)/(bid+ask)) -- the bounded transform is applied for consistency across all
+            // three legs (same code path, same entry-threshold mechanism downstream), but is a much
+            // smaller behavioral change here than for Mid/Close (see the enum value's own doc
+            // comment and docs/VOLUME_BAR_FINDINGS.md's design-decision section for why).
+            double? rawDepth = wideDepthBar is not null
+                && ComputeImbalanceRatio(wideDepthBar.CallBidQtyAvg + wideDepthBar.PutBidQtyAvg, wideDepthBar.CallAskQtyAvg + wideDepthBar.PutAskQtyAvg) is { } depthRatio
+                    ? -depthRatio : null;
+            score = BoundedTransform.Compute(rawDepth, depthStats);
+        }
+        else if (timeOfDay < MidCloseSwitchTime)
+        {
+            double? rawIvMid = previousAtmIv is { } prevIvMid && currentAtmIv is { } curIvMid && previousClose is { } prevCloseMid
+                ? -Math.Sign(bar.ClosePrice - prevCloseMid) * (curIvMid - prevIvMid) : null;
+            score = BoundedTransform.Compute(rawIvMid, ivMidStats);
+        }
+        else
+        {
+            // Close leg: RAW ΔIV, not price-signed -- same as the unsmoothed baseline's own Close
+            // leg (the session-phase split's own best Close performer was the raw variant).
+            double? rawIvClose = previousAtmIv is { } prevIvClose && currentAtmIv is { } curIvClose
+                ? curIvClose - prevIvClose : null;
+            score = BoundedTransform.Compute(rawIvClose, ivCloseStats);
+        }
+
+        previousAtmIv = currentAtmIv ?? previousAtmIv;
+        return score;
+    }
+
+    /// <summary>
     /// Entry-time gate for <see cref="VolumeBarMetric.SessionGatedDepthDurationConfirmed"/> -- a
     /// no-op (always true) for every other metric. During the open (before 10:00 IST) a new
     /// position additionally requires TopOfBookImbalance's own score to agree in sign with the
@@ -2344,7 +2829,9 @@ public static class TradeSimulator
             or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedMinHold
             or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreSma
             or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma
-            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold)
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransform
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransformScoreEma)
         {
             // 2026-09-20, Phase 5 prep item 8 -- see this enum value's own doc comment. Applied
             // all day, same as item 6's Skew Change gate, for a like-for-like comparison. Logic
@@ -2357,6 +2844,30 @@ public static class TradeSimulator
             // before this method is invoked), so the gate checks sign agreement against what's
             // actually traded, not the raw single-bar value.
             return MaxPainConfirmationGate.Passes(maxPainConfirmScore, scaledScore);
+        }
+
+        if (metric == VolumeBarMetric.CallScoreStandalone)
+        {
+            // Only ever buys Calls -- a new entry requires the traded score to be positive (it can
+            // still be negative on a bar with no open position; that bar simply never qualifies as
+            // an entry). Does not affect exits -- an already-open position's own hysteresis exit
+            // (score crossing to the opposite extreme) is untouched by this gate.
+            return scaledScore > 0;
+        }
+
+        if (metric == VolumeBarMetric.PutScoreStandalone)
+        {
+            return scaledScore < 0;
+        }
+
+        if (metric == VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedCallPutAgreementConfirmed)
+        {
+            // Part B combination (c) -- SAME Max Pain gate as the locked baseline PLUS the
+            // Call/Put side-score agreement gate (comboOtherLegScore, set to +/-1 when
+            // CallScore/PutScore agree in sign, 0 otherwise -- see the dispatch site's own comment).
+            // Both must pass; neither alone is sufficient.
+            return MaxPainConfirmationGate.Passes(maxPainConfirmScore, scaledScore)
+                && comboOtherLegScore is { } agreementSign && agreementSign != 0 && Math.Sign(agreementSign) == Math.Sign(scaledScore);
         }
 
         if (metric == VolumeBarMetric.OptionsScoreThreeWaySwitchConfirmed)
@@ -2407,7 +2918,9 @@ public static class TradeSimulator
         if (metric != VolumeBarMetric.TrendReversion && metric != VolumeBarMetric.Composite && metric != VolumeBarMetric.OptionsScoreBlend
             && metric != VolumeBarMetric.FinalScoreDteWeighted && metric != VolumeBarMetric.FinalScoreSessionWeighted
             && metric != VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreSma && metric != VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma
-            && metric != VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold)
+            && metric != VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold
+            && metric != VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransform && metric != VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransformScoreEma
+            && metric != VolumeBarMetric.CallScoreStandalone && metric != VolumeBarMetric.PutScoreStandalone && metric != VolumeBarMetric.CallPutScoreAgreement)
         {
             // Already a percentile by construction (SignedRank) -- no second rank layer.
             return magnitude;
@@ -2490,5 +3003,81 @@ public sealed class ExponentialMean(int length)
 
         _current = _current is { } prev ? _alpha * v + (1 - _alpha) * prev : v;
         return _current;
+    }
+}
+
+/// <summary>
+/// 2026-09-22, bounded-transform research task
+/// (<see cref="VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransform"/>) --
+/// session-scoped running mean/standard-deviation of one metric's own raw readings, via Welford's
+/// online algorithm (numerically stable, single-pass, no stored history needed unlike
+/// <see cref="SessionRankTracker"/>'s own growing list). This is the DATA-DERIVED scale
+/// <see cref="BoundedTransform"/> squashes a z-score against -- per CLAUDE.md's "no hardcoded
+/// thresholds/scale constants" rule, the standard deviation used to normalize each bar's raw value
+/// is always computed from real readings seen so far today, never a fixed magnitude picked by eye.
+/// Fresh instance per day/per leg, same lifecycle every <see cref="SessionRankTracker"/> in this
+/// file already follows -- resets each trading day, so early-session estimates are based on few
+/// samples (same accepted "cold start" limitation <see cref="SessionRankTracker"/>'s own doc comment
+/// already documents for percentile ranking).
+/// </summary>
+public sealed class RunningMeanStd
+{
+    int _count;
+    double _mean;
+    double _m2;
+
+    public int Count => _count;
+    public double Mean => _mean;
+
+    /// <summary>Sample standard deviation (Bessel-corrected, n-1 denominator) -- 0 until at least 2 values have been observed.</summary>
+    public double StdDev => _count >= 2 ? Math.Sqrt(_m2 / (_count - 1)) : 0.0;
+
+    public void Add(double value)
+    {
+        _count++;
+        var delta = value - _mean;
+        _mean += delta / _count;
+        var delta2 = value - _mean;
+        _m2 += delta * delta2;
+    }
+}
+
+/// <summary>
+/// 2026-09-22, bounded-transform research task -- the user's own proposed replacement for
+/// <see cref="SignedRank.Compute"/>'s session-rank percentile: "replace percentile with a bounded
+/// transform, e.g. tanh or clipped z-score of the raw metric, then smooth." Computes a session
+/// z-score of <paramref name="raw"/> against <paramref name="tracker"/>'s own running mean/std (see
+/// <see cref="RunningMeanStd"/> for why that scale is data-derived, not a fixed constant) and
+/// squashes it through <c>tanh</c>, bounding the output to (-1,1) by construction -- removes the
+/// "ranked against every other value seen today" percentile effect while staying session-scoped.
+///
+/// Reads the mean/std BEFORE adding the current value (self-inclusion-safe, no same-bar leakage),
+/// the exact same convention <see cref="SignedRank.Compute"/> already follows. Requires at least 2
+/// prior observations to compute a meaningful standard deviation (mirrors the fact that a single
+/// data point has no variance) -- returns null (no reading yet, same null-passthrough convention
+/// every other smoother/normalizer in this file follows) until the tracker has warmed up, rather
+/// than fabricating a z-score against an undefined spread. When the running std is numerically zero
+/// (every prior reading identical -- possible but rare this early), the z-score is defined as 0
+/// (tanh(0)=0, a neutral reading) rather than dividing by zero.
+/// </summary>
+public static class BoundedTransform
+{
+    public static double? Compute(double? raw, RunningMeanStd tracker)
+    {
+        if (raw is not { } value)
+        {
+            return null;
+        }
+
+        if (tracker.Count < 2)
+        {
+            tracker.Add(value);
+            return null;
+        }
+
+        var std = tracker.StdDev;
+        var z = std > 1e-9 ? (value - tracker.Mean) / std : 0.0;
+        tracker.Add(value);
+        return Math.Tanh(z);
     }
 }

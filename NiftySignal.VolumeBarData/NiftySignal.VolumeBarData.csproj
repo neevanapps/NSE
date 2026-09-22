@@ -10,6 +10,15 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- 2026-09-22, Part B: lets NiftySignal.Tests exercise TradeSimulator's pure single-side
+         formula helpers (ComputeSideTobDivergence/ComputeCallScore/ComputePutScore, now internal
+         rather than private) directly, without a DB fixture, same "new behavior gets a test" rule
+         as everywhere else in this project, without changing these helpers' real visibility to
+         any other caller (still inaccessible outside this project plus its test assembly). -->
+    <InternalsVisibleTo Include="NiftySignal.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Design">
       <PrivateAssets>all</PrivateAssets>

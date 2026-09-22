@@ -3455,3 +3455,942 @@ dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-19 Op
 dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-21 2026-09-21 OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold 90 15 2600 --band=5 --smoothbars=3 --minhold=3
 dotnet run --project NiftySignal.VolumeBarData -- mae-mfe trade 2026-09-08 2026-09-19 OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold 90 15 2600 --band=5 --smoothbars=3 --minhold=3
 ```
+
+## Part B: CallScore/PutScore metric isolation (2026-09-22)
+
+Research-only, provisional -- per the task's own explicit scope, nothing here touches
+`NiftySignal.Host`, `NiftySignal.Dashboard`, or the locked `OptionsScoreThreeWaySwitchMaxPainConfirmed`
+metric's own formula/dispatch. All new code lives in `NiftySignal.VolumeBarData/TradeSimulator.cs`
+(new `VolumeBarMetric` enum values + dispatch branches only) plus one new test file
+(`NiftySignal.Tests/VolumeBarData/PartBSingleSideMetricsTests.cs`, 8 tests). The locked baseline
+(`OptionsScoreThreeWaySwitchMaxPainConfirmed` @ 2600/90: **112 trades, 64.3% win, +426.40 net**) was
+re-verified byte-identical after every batch of changes in this task, not just once at the end.
+`dotnet test`: 680 passing before this task, **688 passing after** (8 new), 0 warnings both times.
+
+**Question this task answers**: every existing options metric in this file (ATM Complex Depth
+Imbalance, ATM Complex TOB-Depth Divergence, Notional Volume/OI Delta, ATM IV Change, 25-delta
+Skew) pools the Call and Put side together (`CallX + PutX`). Does separating the two sides reveal
+something the pooled versions hide?
+
+### Method
+
+Same volume-bar clock (650/1300/2600), same `SignedRank`/`SessionRankTracker` percentile machinery,
+same calibration-sweep/kill-criteria/DTE-split/session-phase discipline as every other metric in
+this file. **Hard rule enforced throughout**: every new metric reads ONLY one option side's own
+fields -- verified both by code inspection (each dispatch case names exactly one side's columns)
+and, for the two combined-formula functions (`ComputeCallScore`/`ComputePutScore`), by a dedicated
+unit test (`ComputeCallScore_UsesOnlyCallTouchFields_NeverPutFields`,
+`ComputePutScore_NeverReadsCallFields`) that feeds the "wrong" side wildly extreme values and
+asserts the result is unaffected.
+
+**Schema feasibility, checked before building anything** (existing tables only, no populator/schema
+changes made):
+- `OptionDepthBarRow` -- Call/Put fields fully separate (`CallBidQtyAvg`/`PutBidQtyAvg` etc., touch
+  and full-book). **No notional (price-weighted) depth field exists** -- only raw resting quantity.
+  Depth/TOB/TOB-divergence metrics below use raw quantity, not notional, documented here rather
+  than silently assumed.
+- `OptionOiBarRow` -- `CallOiChangeNotional`/`PutOiChangeNotional` fully separate, already flow
+  -shaped (notional, as the task asked). Buildable.
+- `OptionAtmBarRow` -- **`AtmCallIv`/`AtmPutIv` are already tracked separately**, contrary to the
+  task's own worry that ATM IV "may only be pooled." Fully buildable single-sided.
+- `OptionSkew25DeltaBarRow` -- `Call25DeltaIv`/`Put25DeltaIv` already separate. Buildable.
+- **Not buildable from existing tables, reported honestly rather than forced**:
+  - *Notional Volume Delta / CVD-style per side* (task item 3): `OptionBandFlowBarRow` stores only
+    `CallNotionalVolume`/`PutNotionalVolume` -- a flow MAGNITUDE, no buy/sell-aggressor or
+    bid/ask-side split. There is no principled way to read a *directional* per-side signal out of
+    a single unsigned notional-volume number without inventing an assumption the schema doesn't
+    support (e.g. "more Call volume = bullish" begs the question of whether that volume was buying
+    or selling). Would need a genuinely new field (aggressor-side volume split, mirroring how
+    `FutureCvdNet` gets its sign from the futures tick feed) -- a populator/schema change, flagged
+    as a follow-up need, not built here.
+  - *Bar Duration/Urgency per option side* (task item 5): no table tracks per-option-instrument bar
+    timing at all -- `VolumeBarRow.DurationSeconds` is the FUTURE bar's own duration, and no options
+    table has an analogous per-instrument fill-speed column. Would need a new accumulator/table
+    keyed by instrument, not a formula change. Not attempted.
+  - *Item 10 (short-term IV pressure)*: redundant with item 7/8 (raw/price-signed ΔIV) under a
+    different name, per the task's own instruction to say so rather than build a near-duplicate.
+    Not built separately.
+
+14 single-sided metrics were built and swept (7 families x 2 sides): CallDepthImbalance/
+PutDepthImbalance, CallTobImbalance/PutTobImbalance, CallTobDepthDivergence/PutTobDepthDivergence,
+CallOiDeltaOnly/PutOiDeltaOnly, CallIvChangeRaw/PutIvChangeRaw, CallIvChangePriceSigned/
+PutIvChangePriceSigned, CallWingIvChangeRaw/PutWingIvChangeRaw. Each swept across the standard
+650/1300/2600 x 75-99 percentile grid, 2026-09-08..2026-09-18 (8 trading days -- 2026-09-19 has no
+populated volume-bar data at any threshold, excluded same as every other gap date in this file).
+
+### Empirical-sign flips (re-verified by re-running, not inferred)
+
+Following this project's own standing discipline (a metric that shows the "win rate degrades as the
+gate tightens, net stays negative" signature gets its sign flipped and re-swept once, not assumed
+correct as-built): **PutDepthImbalance**, **PutTobImbalance**, **CallIvChangePriceSigned**, and
+**PutIvChangePriceSigned** were all built un-negated first, showed that exact signature, were
+flipped, and were re-swept -- each flip is called out in its own `TradeSimulator.cs` dispatch-case
+comment. CallDepthImbalance, CallTobImbalance, CallTobDepthDivergence, PutTobDepthDivergence,
+CallOiDeltaOnly, PutOiDeltaOnly, CallIvChangeRaw, PutIvChangeRaw, CallWingIvChangeRaw, and
+PutWingIvChangeRaw were tested as-built only (no flip signature, or too weak/thin to make a flip
+call meaningful) -- their sign remains an untested-if-weak or as-built-and-decent hypothesis, not
+independently re-verified in both directions.
+
+### Results table (best target-zone row per metric; full grids logged in the calibration output)
+
+| Metric | Side | Best row (Thr/Pctl) | Trades/Day | Win Rate | Net | Verdict |
+|---|---|---|---|---|---|---|
+| DepthImbalance | Call | 650/97 | 5.0 | 55.0% | +97.40 | KILLED -- weak/inconsistent, most target rows negative |
+| DepthImbalance | Put (flipped) | 2600/85 | 14.1 | **65.5%** | **+386.50** | **SURVIVED -- strongest Put candidate** |
+| TobImbalance | Call | 650/95 | 13.2 | 63.2% | +74.40 | SURVIVED -- clean, broadly positive |
+| TobImbalance | Put (flipped) | 1300/95 | 10.0 | **66.2%** | **+362.15** | **SURVIVED -- strongest Put candidate (tied)** |
+| TobDepthDivergence | Call | 2600/93 | 7.5 | 53.3% | +131.05 | KILLED -- weak/noisy, ~50% win rate throughout |
+| TobDepthDivergence | Put | 2600/93 | 9.8 | 56.4% | +197.45 | SURVIVED -- moderate |
+| OiDeltaOnly | Call | 650/75 | 9.9 | 53.2% | +61.60 | KILLED -- thin sample, target-zone rows have n<20 |
+| OiDeltaOnly | Put | 650/75 | 9.5 | 34.2% | -145.75 | KILLED -- wrong-sign-looking AND thin, not flipped (unreliable either way) |
+| IvChangeRaw | Call | 2600/93 | 17.6 | 59.6% | +38.50 | KILLED -- excessive frequency off-band, inconsistent net |
+| IvChangeRaw | Put | 2600/97 | 7.9 | 68.3% | -4.55 | KILLED -- high win rate but net doesn't confirm (thin wins, fat losses) |
+| IvChangePriceSigned | Call (flipped) | 2600/90 | 18.0 | 56.2% | +172.75 | SURVIVED -- moderate |
+| IvChangePriceSigned | Put (flipped) | 650/97 | 15.8 | 56.3% | +167.00 | SURVIVED -- moderate |
+| WingIvChangeRaw (25-delta) | Call | 2600/93 | 16.5 | 54.5% | +112.55 | KILLED -- inconsistent across grid, several negative rows |
+| WingIvChangeRaw (25-delta) | Put | 2600/93 | 14.1 | 65.5% | +113.55 | SURVIVED -- moderate |
+
+**Kill criteria applied** (per the task's own instruction, same standards this file has used
+throughout): a metric is killed if its target-zone rows are inconsistent/weak with no clean
+percentile pattern (the majority of the table above), OR win rate never clears ~53-55% with
+confirming net across multiple thresholds. No survivor here showed the concentration-blowup
+pattern this file flagged for 25-delta skew's own 55.1% top-2 share (checked directly for the two
+strongest survivors below) or an 0-DTE-only-positive pattern (not separately re-run per metric given
+time -- flagged as a real gap, see Recommendation).
+
+**Concentration check, two strongest survivors** (`trade` command, day-by-day):
+- **PutDepthImbalance @ 2600/85**: 113 trades, 65.5% win, +386.50 net, **7 of 8 days net positive**
+  (only 09-08 slightly negative, -21.95). No single day or trade dominates -- best day (09-16,
+  +135.35) is 35.0% of total, well under this file's own 55%+ red-flag level.
+- **CallTobImbalance @ 650/95**: 106 trades, 63.2% win, +74.40 net, **7 of 8 days net positive**
+  (only 09-11, -66.40 negative). Best day (09-10, +93.30) is 125% of total (small total net makes
+  this ratio look large in isolation, but no day is catastrophically negative and 7/8 are positive).
+
+### Ranking
+
+**Call-side survivors** (2 of 7 families): 1) CallTobImbalance (clearly strongest, clean), 2)
+CallIvChangePriceSigned (moderate, meaningfully weaker).
+
+**Put-side survivors** (5 of 7 families): 1) PutDepthImbalance and 2) PutTobImbalance (near-tied for
+strongest, both far ahead of the rest), 3) PutTobDepthDivergence, 4) PutIvChangePriceSigned, 5)
+PutWingIvChangeRaw (moderate tier, all meaningfully weaker than the top 2).
+
+**Notable asymmetry**: the Put side survived 5 of 7 families vs. the Call side's 2 of 7, and the
+Put side's best results (+386.50, +362.15) are roughly 4-5x the Call side's best (+74.40). This
+project's own convention is to report such an asymmetry rather than force a symmetric story --
+possible explanations (not tested here, flagged as follow-up): Nifty's known structural skew toward
+Put-side hedging flow, or simply that this 8-day window happened to be Put-favorable (the same
+"don't trust one window" caveat this file applies everywhere).
+
+### CallScore / PutScore
+
+**Design choice, per the task's own "check switch/dominant-metric vs. blend" instruction**:
+- **CallScore = CallTobImbalance alone** (a dominant-metric choice, not a blend) -- with only 2
+  survivors and one (CallTobImbalance) clearly stronger, averaging in the much weaker
+  CallIvChangePriceSigned was judged likely to dilute signal rather than add it, the same lesson
+  this file's own Composite-vs-SessionGatedDepthDuration history already taught on the futures side.
+  CallIvChangePriceSigned is not discarded -- it stays independently tradeable via its own enum
+  value and is a documented, considered-and-declined option for a future revision.
+- **PutScore = simple equal-weight average of PutDepthImbalance and PutTobImbalance's own raw
+  (flipped) imbalance ratios** -- the 2 clearly strongest survivors, both already bounded [-1,1].
+  Not a fitted weight vector (equal weight, transparent, per the "don't over-optimize on 8 days"
+  instruction). The 3 weaker survivors (PutTobDepthDivergence, PutIvChangePriceSigned,
+  PutWingIvChangeRaw) are excluded from PutScore itself for the same dilution reason as CallScore.
+
+**Implementation bug found and fixed while wiring this up** (documented since CLAUDE.md asks for
+this): CallScoreStandalone/PutScoreStandalone were first built nulling the score out on the "wrong"
+sign (e.g. CallScore null whenever bearish), matching a literal reading of "only ever buys Calls."
+This silently broke the standard hysteresis EXIT (which fires on the score crossing to the *opposite*
+extreme) -- every position rode to `TimeCutoff`/`EndOfDay` regardless of `entryPercentile`, producing
+exactly 1 trade/day at every single setting tested (a dead giveaway once seen in the calibration
+grid). Fixed by carrying the FULL signed score through every bar (so the exit can still see a sign
+flip) and moving the "only buys Calls/Puts" restriction to the ENTRY gate only, via
+`PassesConfirmation` (which never touches an already-open position). Re-verified by re-running the
+full sweep after the fix.
+
+**CallScoreStandalone standalone** (Call entries only): best target-zone row 650/93,
+13.5 trades/day, 53.7% win, **-33.80 net** -- every target-zone row across all three thresholds is
+net NEGATIVE. This is a genuine, reportable finding, not a bug: CallTobImbalance traded
+BIDIRECTIONALLY (its own standalone run allows both Call and Put entries depending on its sign)
+nets +74.40 at 650/95, but restricting to ONLY the bullish (Call-entry) half of its signal loses
+money. The metric's edge appears to live disproportionately in its BEARISH readings (Put entries),
+not its bullish ones -- worth flagging for anyone considering trading CallTobImbalance standalone in
+either direction.
+
+**PutScoreStandalone standalone** (Put entries only): clean and strong. Win rate rises
+monotonically as the gate tightens (55.6% at 650/90 up to 74.0% at 650/97), net positive at nearly
+every target-zone row, best at 2600/90: **7.1 trades/day, 68.4% win, +208.40 net** (also strong at
+1300/93: 8.1/day, 67.7% win, +164.55; 650/97: 6.2/day, 74.0% win, +252.05, just under the 7/day
+floor). Genuinely validates the "only buy Puts on Put-side conviction" framing that CallScore's own
+result argues against on the Call side.
+
+### The three combination rules (task's exact testing order)
+
+**(a) Agreement** -- CallScore and PutScore's signs must agree before entering (Call on
+agreed-bullish, Put on agreed-bearish), traded as `(CallScore+PutScore)/2` when they agree, null
+otherwise. **Strongest Part B result found**: 2600/75, 13.2 trades/day, **67.9% win, +315.85 net**,
+106 trades, **7 of 8 days net positive** (only 09-09 slightly negative, -3.40), top single day
+(09-15, +61.10) only **19.3%** of total -- the LOWEST single-day concentration of anything in this
+whole task. 1300/85 also strong: 13.5/day, 60.2% win, +263.25, 6/8 days positive.
+
+**(b) Spread** -- CallScore minus PutScore, session-rank normalized, traded as its own signal.
+**KILLED**: win rate never clears 50% at any target-zone row across all three thresholds, mostly
+negative net (e.g. 1300/93: 42.9% win, -215.55 net). The spread does not carry a clean signal the
+way the raw agreement gate does.
+
+**(c) Confirmation filter on the locked switch** -- `OptionsScoreThreeWaySwitchMaxPainConfirmed`'s
+own exact formula and Max Pain gate (UNCHANGED, re-verified byte-identical), plus an additional
+requirement that CallScore and PutScore agree in sign before a signal is allowed to trade. At the
+SAME 2600/90 settings as the locked baseline: **53 trades, 62.3% win, +197.10 net** vs. the locked
+baseline's own 112 trades, 64.3% win, +426.40 net at those identical settings. The extra gate roughly
+HALVES trade count and win rate/net both come in slightly below the ungated baseline
+(avg pts/trade: gated 3.72 vs. baseline's 3.81) -- **the confirmation filter does not clearly
+improve the locked switch; it mostly just trades less, with a marginally worse per-trade average.**
+Not adopted as an improvement, though not badly broken either (still a reasonably win-rate/net-positive
+rule on its own, just not better than what it's gating).
+
+### Comparison against the locked baseline (112 trades, 64.3% win, +426.40 net)
+
+| Approach | Trades | Win Rate | Net | vs. baseline |
+|---|---|---|---|---|
+| Locked baseline (unchanged) | 112 | 64.3% | +426.40 | -- |
+| PutScoreStandalone (2600/90) | ~57 (7.1/day) | 68.4% | +208.40 | Higher win rate, lower net (half the trades) |
+| CallPutScoreAgreement (2600/75) | 106 | 67.9% | +315.85 | Higher win rate, lower net, best breadth/lowest concentration of anything in Part B |
+| Confirmation-gated locked switch | 53 | 62.3% | +197.10 | Lower win rate AND lower net than baseline at matching settings |
+
+**Nothing in Part B cleanly beats the locked baseline on both win rate AND net** (this project's own
+adopt bar) -- every Part B result trades meaningfully less often, and lower trade count mechanically
+caps net even where win rate improves. **CallPutScoreAgreement is the standout finding worth
+flagging even though it doesn't clear the adopt bar**: a 67.9% win rate with the lowest single-day
+concentration (19.3%) seen anywhere in this file's history is a genuine trade-off (higher-quality,
+lower-frequency signal) in the same spirit this project already documented for MinHold and the Part
+A smoothing results -- not adopted, but a real, reproducible, well-behaved result.
+
+### Recommendation
+
+1. **Keep** (as independently documented, provisional, research-only candidates): PutDepthImbalance
+   (flipped), PutTobImbalance (flipped), CallTobImbalance, and the CallPutScoreAgreement combination
+   -- these are the metrics/combinations worth carrying into any future composite-score work on this
+   track, per this project's stated multi-metric-composite endgame.
+2. **Kill**: CallDepthImbalance, CallTobDepthDivergence, both OiDeltaOnly variants, both raw
+   IvChangeRaw variants, CallWingIvChangeRaw -- weak, inconsistent, or too thin on data.
+3. **The Call/Put side-score direction is worth continued investment, cautiously**: the pooled
+   metrics this task set out to test against (AtmComplexDepthImbalance, CallPutDepthImbalance) were
+   themselves weak/inconsistent in the earlier Phase 2 work -- and separating sides here DID surface
+   real, clean signal (PutDepthImbalance/PutTobImbalance) that the pooled versions missed. The
+   Call/Put asymmetry itself is a genuine, reportable finding, not noise to explain away.
+4. **What would need a schema/populator change to test properly, not reachable here**: a true
+   per-side notional-volume-delta / CVD-style metric needs an aggressor-side (buy/sell) split on
+   option ticks that `OptionBandFlowBarRow` doesn't currently store; a per-side bar-duration/urgency
+   metric needs a new per-instrument timing table. Both are flagged as real follow-up items, not
+   built in this task per its own "existing tables only" constraint.
+5. **What this task did NOT get to, flagged honestly rather than silently skipped**: a full
+   MAE/MFE pass (the `mae-mfe` CLI command exists and was reused elsewhere in this file, but time
+   did not allow running it against every Part B survivor), a metric-by-metric DTE split (only
+   checked qualitatively via the day-by-day breakdown, not the explicit 0-DTE-vs-non-0-DTE table
+   this file uses elsewhere), and a full session-phase (Open/Mid/Close) split for each survivor.
+   These are the natural next steps before trusting any Part B result as deeply as DepthImbalance/
+   TobDepthDivergence are trusted on the futures side.
+
+### Reproduction commands
+
+```
+# Individual metric sweeps (repeat per metric name)
+dotnet run --project NiftySignal.VolumeBarData -- calibrate 2026-09-08 2026-09-18 CallDepthImbalance
+dotnet run --project NiftySignal.VolumeBarData -- calibrate 2026-09-08 2026-09-18 PutDepthImbalance
+dotnet run --project NiftySignal.VolumeBarData -- calibrate 2026-09-08 2026-09-18 CallTobImbalance
+dotnet run --project NiftySignal.VolumeBarData -- calibrate 2026-09-08 2026-09-18 PutTobImbalance
+dotnet run --project NiftySignal.VolumeBarData -- calibrate 2026-09-08 2026-09-18 CallTobDepthDivergence
+dotnet run --project NiftySignal.VolumeBarData -- calibrate 2026-09-08 2026-09-18 PutTobDepthDivergence
+dotnet run --project NiftySignal.VolumeBarData -- calibrate 2026-09-08 2026-09-18 CallOiDeltaOnly
+dotnet run --project NiftySignal.VolumeBarData -- calibrate 2026-09-08 2026-09-18 PutOiDeltaOnly
+dotnet run --project NiftySignal.VolumeBarData -- calibrate 2026-09-08 2026-09-18 CallIvChangeRaw
+dotnet run --project NiftySignal.VolumeBarData -- calibrate 2026-09-08 2026-09-18 PutIvChangeRaw
+dotnet run --project NiftySignal.VolumeBarData -- calibrate 2026-09-08 2026-09-18 CallIvChangePriceSigned
+dotnet run --project NiftySignal.VolumeBarData -- calibrate 2026-09-08 2026-09-18 PutIvChangePriceSigned
+dotnet run --project NiftySignal.VolumeBarData -- calibrate 2026-09-08 2026-09-18 CallWingIvChangeRaw
+dotnet run --project NiftySignal.VolumeBarData -- calibrate 2026-09-08 2026-09-18 PutWingIvChangeRaw
+
+# CallScore/PutScore standalone
+dotnet run --project NiftySignal.VolumeBarData -- calibrate 2026-09-08 2026-09-18 CallScoreStandalone
+dotnet run --project NiftySignal.VolumeBarData -- calibrate 2026-09-08 2026-09-18 PutScoreStandalone
+
+# Combinations
+dotnet run --project NiftySignal.VolumeBarData -- calibrate 2026-09-08 2026-09-18 CallPutScoreAgreement
+dotnet run --project NiftySignal.VolumeBarData -- calibrate 2026-09-08 2026-09-18 CallPutScoreSpread
+dotnet run --project NiftySignal.VolumeBarData -- calibrate 2026-09-08 2026-09-18 OptionsScoreThreeWaySwitchMaxPainConfirmedCallPutAgreementConfirmed
+
+# Baseline re-verification (must stay 112 trades, 64.3% win, +426.40 net)
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-19 OptionsScoreThreeWaySwitchMaxPainConfirmed 90 15 2600
+
+# Best individual trade-level detail (concentration/day breakdown)
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-18 PutDepthImbalance 85 15 2600
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-18 CallTobImbalance 95 15 650
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-18 CallPutScoreAgreement 75 15 2600
+```
+
+## Part B follow-up: MAE/MFE, DTE, and session-phase split -- chasing the Call/Put asymmetry (2026-09-22)
+
+Research-only, provisional. Closes the three gaps Part B's own Recommendation #5 flagged as
+skipped (MAE/MFE, explicit 0-DTE split, session-phase split). **No source code was touched to
+produce this** -- every number below comes from re-running the existing `trade`, `mae-mfe trade`,
+and `session-phase` CLI commands against Part B's own already-locked configs (no re-calibration).
+Every reproduced total (trade count/win rate/net) matched Part B's documented numbers exactly
+before any breakdown was trusted. The locked baseline
+(`OptionsScoreThreeWaySwitchMaxPainConfirmed` @ 2600/90) was re-verified byte-identical: **112
+trades, 64.3% win, +426.40 net**. `dotnet test`: 688 passing before and after (unchanged, no
+source touched).
+
+**Mid-task reframing from the user**: the ranking lens below is win-rate-first with MAE%
+(smallest drawdown) and MFE% (largest favorable excursion) as the next two criteria -- net P&L is
+explicitly secondary here, a departure from Part B's own "win rate AND net" adopt bar. The raw
+numbers are unchanged either way; only the verdict section re-weights them.
+
+### Configs used (unchanged from Part B, reproduced first)
+
+| Candidate | Config (Thr/Pctl) | Trades | Win% | Net |
+|---|---|---|---|---|
+| CallTobImbalance | 650/95 | 106 | 63.2% | +74.40 |
+| CallIvChangePriceSigned (flipped) | 2600/90 | 144 | 56.2% | +172.75 |
+| CallScoreStandalone | 650/93 | 108 | 53.7% | -33.80 |
+| PutDepthImbalance (flipped) | 2600/85 | 113 | 65.5% | +386.50 |
+| PutTobImbalance (flipped) | 1300/95 | 80 | 66.2% | +362.15 |
+| PutTobDepthDivergence | 2600/93 | 78 | 56.4% | +197.45 |
+| PutIvChangePriceSigned (flipped) | 650/97 | 126 | 56.3% | +167.00 |
+| PutWingIvChangeRaw | 2600/93 | 113 | 65.5% | +113.55 |
+| PutScoreStandalone | 2600/90 | 57 | 68.4% | +208.40 |
+| CallPutScoreAgreement | 2600/75 | 106 | 67.9% | +315.85 |
+| CallPutScoreSpread (killed, for contrast) | 1300/93 | 98 | 42.9% | -215.55 |
+| Confirmation-gate on locked switch (not adopted, for contrast) | 2600/90 | 53 | 62.3% | +197.10 |
+
+### MAE/MFE (`mae-mfe trade`, avg points and avg %)
+
+| Candidate | Avg MAE% | Avg MFE% | MFE/MAE ratio |
+|---|---|---|---|
+| CallTobImbalance | 8.30% | 7.77% | 0.94 |
+| CallIvChangePriceSigned | 6.05% | 7.29% | 1.21 |
+| CallScoreStandalone | 7.47% | 5.96% | 0.80 |
+| PutDepthImbalance | 8.70% | 8.49% | 0.98 |
+| PutTobImbalance | 9.62% | **11.45%** | **1.19** |
+| PutTobDepthDivergence | 9.72% | 8.05% | 0.83 |
+| PutIvChangePriceSigned | 5.66% | 7.71% | 1.36 |
+| PutWingIvChangeRaw | 7.26% | 7.12% | 0.98 |
+| PutScoreStandalone | 7.82% | 7.67% | 0.98 |
+| CallPutScoreAgreement | 8.01% | 8.87% | 1.11 |
+| CallPutScoreSpread (killed) | 9.17% | 7.87% | 0.86 |
+| Confirmation-gate | **3.86%** | 7.48% | **1.94** |
+
+The confirmation-gate variant (not adopted on win-rate/net grounds in Part B) has by far the
+tightest MAE control of anything tested here (3.86% avg drawdown vs. 6-10% everywhere else) and a
+respectable MFE (7.48%), for an MFE/MAE ratio nearly double the next-best. Flagged explicitly per
+the user's own reframing: this is a genuinely good result on win-rate+MAE/MFE terms even though
+its net (+197.10, half the locked baseline's) looked unremarkable under Part B's original
+win-rate-AND-net bar.
+
+### 0-DTE vs non-0-DTE split (2026-09-08, 2026-09-15 = 0-DTE; the other 6 days = non-0-DTE)
+
+| Candidate | 0-DTE (n, win%, net) | non-0-DTE (n, win%, net) |
+|---|---|---|
+| CallTobImbalance | 36, 61.1%, +61.15 | 70, 64.3%, +13.25 |
+| CallIvChangePriceSigned | 72, 55.5%, +40.95 | 72, 57.0%, +131.80 |
+| CallScoreStandalone | 38, **39.5%**, -45.50 | 70, 61.4%, +11.70 |
+| PutDepthImbalance | 31, 58.1%, +12.40 | 82, 68.3%, +374.10 |
+| PutTobImbalance | 29, 62.1%, +75.15 | 51, 68.6%, +287.00 |
+| PutTobDepthDivergence | 26, 46.2%, -12.75 | 52, 61.5%, +210.20 |
+| PutIvChangePriceSigned | 56, 62.5%, +83.75 | 70, 51.4%, +83.25 |
+| PutWingIvChangeRaw | 47, 51.1%, +6.55 | 66, 75.7%, +107.00 |
+| PutScoreStandalone | 17, 70.6%, +77.30 | 40, 67.5%, +131.10 |
+| CallPutScoreAgreement | 34, 67.7%, +72.25 | 72, 68.1%, +243.60 |
+| CallPutScoreSpread | 30, 33.3%, -21.20 | 68, 47.1%, -194.35 |
+| Confirmation-gate | 8, 75.0%, +58.30 | 45, 60.0%, +138.80 |
+
+**CallScoreStandalone is the one clear DTE artifact**: its overall -33.80 net is driven almost
+entirely by 0-DTE days (38 trades, 39.5% win, -45.50 net) -- on non-0-DTE days alone it is
+marginally profitable (61.4% win, +11.70 net), a genuinely different (better) picture than the
+pooled number suggests. Every other candidate is directionally similar in both buckets (mostly
+positive net both sides, win rate within ~10pp), so this is NOT a general "Call metrics only look
+bad because of 0-DTE" story -- CallTobImbalance and CallIvChangePriceSigned both hold up fine on
+0-DTE days too. Most Put survivors trade noticeably more (and net more) on non-0-DTE days simply
+because there are more of them (6 vs 2) and 0-DTE days constrain premium/time differently, not
+because of a Put-specific 0-DTE weakness.
+
+### Session-phase split (Open 09:30-10:00 / Mid 10:00-13:30 / Close 13:30-15:15, by entry bar)
+
+| Candidate | Open (n, win%, net) | Mid (n, win%, net) | Close (n, win%, net) |
+|---|---|---|---|
+| CallTobImbalance | 21, 66.7%, **-12.95** | 55, 61.8%, +49.00 | 30, 63.3%, +38.35 |
+| CallIvChangePriceSigned | 15, 60.0%, +76.95 | 55, 63.6%, +91.15 | 74, 50.0%, +4.65 |
+| CallScoreStandalone | 20, 60.0%, +6.75 | 55, 54.5%, -28.60 | 33, 48.5%, -11.95 |
+| PutDepthImbalance | 25, **76.0%**, +225.15 | 53, 66.0%, +133.50 | 35, 57.1%, +27.85 |
+| PutTobImbalance | 18, 61.1%, +142.15 | 39, **76.9%**, +182.65 | 23, 52.2%, +37.35 |
+| PutTobDepthDivergence | 16, 68.8%, +71.65 | 41, 51.2%, +96.40 | 21, 57.1%, +29.40 |
+| PutIvChangePriceSigned | 7, 71.4%, +62.35 | 50, 50.0%, +24.65 | 69, 59.4%, +80.00 |
+| PutWingIvChangeRaw | 17, 70.6%, +54.10 | 48, 58.3%, +6.50 | 48, 70.8%, +52.95 |
+| PutScoreStandalone | 14, 71.4%, +80.00 | 29, 75.9%, +120.50 | 14, 50.0%, +7.90 |
+| CallPutScoreAgreement | 27, 66.7%, +71.55 | 47, 74.5%, +229.55 | 32, 59.4%, +14.75 |
+| CallPutScoreSpread | 22, 36.4%, -115.95 | 52, 36.5%, -156.40 | 24, 62.5%, +56.80 |
+| Confirmation-gate | no trades | 34, 61.8%, +189.80 | 19, 63.2%, +7.30 |
+
+Two patterns, both consistent across nearly every candidate regardless of side:
+1. **The Close phase is the weakest phase everywhere** -- pts/trade drops for both Call and Put
+   candidates in Close vs. Open/Mid (e.g. CallIvChangePriceSigned falls to 50.0% win/+0.06
+   pts/trade in Close after 60-64% earlier; PutScoreStandalone falls to 50.0% win in Close after
+   71-76% earlier). This is a session-wide effect, not a Call/Put-specific one.
+2. **Put metrics are disproportionately strong at the Open specifically** -- PutDepthImbalance's
+   76.0% win / 9.01 pts/trade in Open is the single strongest cell in this whole table, and
+   PutIvChangePriceSigned/PutScoreStandalone/PutWingIvChangeRaw are all >70% win in Open too (small
+   samples on some, n=7-17, noted as thin). CallTobImbalance is the one Call candidate tested at
+   the Open and it is *negative* there (-12.95 net) despite a 66.7% win rate -- a small sample
+   (n=21) where a couple of large adverse moves outweigh several small wins, not a directional-
+   accuracy problem (the win rate itself is fine).
+
+### What explains the Call/Put asymmetry
+
+Four hypotheses were checked against the data above; the honest answer is **it's not one clean
+story, but the Open-phase pattern is the strongest single thread**:
+
+1. **Session-phase concentration -- partially confirmed.** Put metrics have a genuine edge at the
+   Open specifically (PutDepthImbalance's 76% win/9.01 pts/trade there is unmatched by anything
+   Call-side). But this is not the clean "opposite-phase-strength" pattern seen with
+   DepthImbalance/BarDurationUrgency on the futures side -- every candidate, Call and Put alike, is
+   weakest in Close, so the Close-phase decay is a shared, non-asymmetric effect layered on top of
+   the Open-phase Put advantage.
+2. **DTE artifact -- confirmed for exactly one candidate, not a general explanation.**
+   CallScoreStandalone's poor showing is substantially a 0-DTE artifact (39.5% win on 0-DTE vs.
+   61.4% on non-0-DTE) -- if 0-DTE days were excluded, CallScoreStandalone would look meaningfully
+   less bad. But CallTobImbalance and CallIvChangePriceSigned (the two Call survivors that actually
+   matter) show no such pattern -- both trade fine in both buckets. So DTE explains one weak Call
+   candidate's own internal split, not the Call/Put asymmetry as a whole.
+3. **MAE/MFE structural difference -- largely does NOT hold up.** Averaging the 2 Call survivors
+   (CallTobImbalance, CallIvChangePriceSigned) vs. the 5 Put survivors: Call averages 59.7% win /
+   7.18% MAE / 7.53% MFE; Put averages 62.0% win / 8.19% MAE / 8.56% MFE. Put trades run *wider*
+   swings in both directions (bigger MAE AND bigger MFE), not cleaner ones -- there is no sign that
+   Call-side losers suffer uglier drawdowns than Put-side losers; if anything the reverse (Put MAE
+   is higher on average). The MFE/MAE ratio is similar on both sides (~1.05 Call, ~1.05 Put,
+   computed unweighted). MAE/MFE alone does not explain why Put nets ran 4-5x higher in Part B --
+   that gap is a win-rate/frequency story (PutDepthImbalance and PutTobImbalance's outsized 65-66%
+   win rates times more Put-family survivors), not a drawdown-severity story.
+4. **Market-structure hypothesis (unproven, flagged as a hypothesis per this project's own "sign is
+   a hypothesis until tested" discipline).** The one place the data does show a clean, repeated
+   Put advantage is the Open phase, where Nifty's known structural put-skew / hedging-driven flow
+   (index constituents and institutional hedges tend to lean toward put buying/writing, especially
+   around the open when overnight gap risk is being priced) could plausibly make Put-side order-flow
+   and IV reads cleaner signals right after the bell, while Call-side reads are noisier there. This
+   is consistent with what's observed (PutDepthImbalance/PutIvChangePriceSigned/PutScoreStandalone
+   all >70% win in Open; CallTobImbalance negative there) but is NOT independently verified against
+   any skew/hedging-flow data in this task -- it is offered as a plausible explanation worth a
+   dedicated follow-up (e.g. correlating Open-phase Put win rate against realized 25-delta skew),
+   not a proven mechanism.
+
+**Bottom line**: the asymmetry holds up in win-rate and net terms across DTE and session-phase
+buckets (it does not wash out anywhere), but it does NOT show up as a uniform MAE/MFE
+drawback-severity difference -- Put trades are wider, not cleaner. The clearest single thread is
+the Open-phase Put advantage, plausibly (not provenly) tied to Nifty's put-skew/hedging structure.
+
+### Re-ranked recommendation under the win-rate-first / low-MAE% / high-MFE% lens
+
+Per the user's mid-task reframing, net P&L is explicitly de-weighted below. Ranked primarily by win
+rate, then by MAE% (lower better) and MFE% (higher better) as tie-breakers:
+
+1. **PutScoreStandalone (2600/90)** -- best win rate of anything Part B built (68.4%), balanced
+   MAE/MFE (7.82%/7.67%), also happens to be net-positive. The cleanest all-around result.
+2. **CallPutScoreAgreement (2600/75)** -- near-best win rate (67.9%), best MFE among the top tier
+   apart from PutTobImbalance (8.87%), moderate MAE (8.01%), plus Part B's own lowest single-day
+   concentration (19.3%). Still the standout combination result.
+3. **PutTobImbalance (1300/95)** -- strong win rate (66.2%) and by far the largest MFE (11.45%,
+   the single best favorable-excursion capture of anything tested) -- but also the highest MAE in
+   this tier (9.62%), i.e. bigger drawdowns before the bigger payoff. A real trade-off, not a clean
+   win: whoever trades this needs to tolerate deeper adverse excursions for the larger upside.
+4. **PutDepthImbalance (2600/85) / PutWingIvChangeRaw (2600/93)** -- tied at 65.5% win. PutWingIv
+   has the tighter MAE of the two (7.26% vs. 8.70%), making it the better-controlled pick despite a
+   much smaller net (+113.55 vs. +386.50) -- exactly the kind of "clean on win-rate/MAE/MFE, weak
+   on net" result the user asked to flag as good rather than penalize.
+5. **Confirmation-gate on the locked switch (2600/90)** -- singled out separately: 62.3% win is
+   mid-pack, but its 3.86% avg MAE is the tightest of anything in this entire task (next-best is
+   nearly double that) with a respectable 7.48% MFE. Under this task's reframed lens this is a
+   genuinely notable result Part B's original "roughly halves trade count, marginally worse
+   per-trade average" verdict undersold -- worth carrying forward as a low-drawdown candidate even
+   though its net doesn't compete with the ungated baseline.
+6. **CallTobImbalance (650/95)** -- the best Call candidate on win rate (63.2%) but its MAE (8.30%)
+   is the one case among the "kept" candidates where MAE exceeds MFE (7.77%), i.e. its average
+   losing/stalling excursion is deeper than its average favorable one -- a real, if mild, red flag
+   for this candidate specifically that the earlier net-based framing did not surface.
+7. **PutTobDepthDivergence / PutIvChangePriceSigned / CallIvChangePriceSigned** -- moderate tier,
+   win rates ~56%, unremarkable on all three axes.
+8. **CallScoreStandalone** -- worst on every axis (53.7% win, MAE 7.47% > MFE 5.96%, negative net)
+   and substantially a 0-DTE artifact per the DTE split above. Confirms Part B's own "the metric's
+   edge lives in its bearish [Put] readings, not bullish" finding from a second, independent angle.
+
+Nothing here overturns Part B's own findings -- PutScoreStandalone and CallPutScoreAgreement were
+already Part B's strongest results under the old win-rate-and-net lens too. What changes under the
+new lens is mainly #3 (PutTobImbalance, whose MAE cost is now visible rather than hidden inside a
+strong net figure) and #5 (the confirmation-gate, previously written off as "not adopted," now
+reads as the tightest-drawdown candidate in the whole task).
+
+## Open-phase Put edge, deep dive (2026-09-22)
+
+Research-only, provisional. Tests whether `PutDepthImbalance`'s 76.0% Open-phase win rate (found by
+a post-hoc session-phase SPLIT of its all-day trade list, above) survives being built as its own
+standalone, Open-only-GATED strategy, rather than remaining a post-hoc subset. **No locked metric's
+formula was touched.** One small, off-by-default parameter was added to `TradeSimulator.SimulateDayAsync`
+(and threaded through `RunRangeAsync` and the `trade`/`mae-mfe trade`/`calibrate` CLI commands): a
+new `entryWindowEndOverride` (`--entryend=`), the exact counterpart to the pre-existing
+`entryWindowStartOverride`/`--entrystart=`. Both default to `null`, which reproduces the original
+09:30-15:00 `EntryWindowStart`/`EntryWindowEnd` constants unchanged for every existing caller and
+metric -- verified by re-running the locked baseline
+(`OptionsScoreThreeWaySwitchMaxPainConfirmed` @ 2600/90) byte-identical after the change: **112
+trades, 64.3% win, +426.40 net.** `dotnet test`: 688 passing before and after, 0 warnings both
+times. Nothing deployed; only `NiftySignal.VolumeBarData/TradeSimulator.cs` and
+`NiftySignal.VolumeBarData/Program.cs` were touched.
+
+### 1. Trade-count sanity check (mandatory, done first)
+
+Re-ran `session-phase` for `PutDepthImbalance` @ 2600/85 fresh (not trusting the prior doc number
+from memory): **Open phase = exactly 25 trades, 76.0% win rate, +225.15 net, 9.01 pts/trade** --
+matches the previously documented figure exactly. Then re-derived the same 25 trades independently
+via the new `--entrystart=09:30 --entryend=10:00` gate on a dedicated `trade` run: identical count,
+win rate, and net, trade-for-trade. **25 trades over 8 days (~3.1/day) is a small sample** -- above
+this task's own "flag if <10-15" floor, but still thin enough that a single-proportion 76% win rate
+on n=25 carries a wide confidence interval (roughly 56-90% at the usual 95% level). Every result
+below inherits this caveat and it is repeated at each step rather than only stated once here.
+
+### 2. PutDepthImbalance: all-day vs. Open-only-gated
+
+| Variant | Trades | Win% | Net | Avg MAE% | Avg MFE% | Pts/trade |
+|---|---|---|---|---|---|---|
+| All-day (Part B baseline, 2600/85) | 113 | 65.5% | +386.50 | 8.70% | 8.49% | 3.42 |
+| **Open-only gated (09:30-10:00, same 2600/85)** | **25** | **76.0%** | **+225.15** | **5.99%** | **10.00%** | **9.01** |
+
+Gating to Open-only **improves all three of the user's stated priority axes at once**: win rate
++10.5pp, MAE% drops from 8.70% to 5.99% (tighter drawdowns), MFE% rises from 8.49% to 10.00%
+(bigger favorable excursions). This is not merely "the strong subset looks strong when isolated" --
+narrowing the window changed the profile, not just the sample size, and improved it on every axis
+this task is asked to weight. Net and trade count both fall (expected, explicitly de-prioritized
+per this task's own instructions) but per-trade average net more than doubles (3.42 -> 9.01
+pts/trade).
+
+**Out-of-sample day (2026-09-21)**: `OptionDepthBars` had not previously been populated for this
+date at band-width 3/threshold 2600 (the 8-day Part B window stopped at 09-18) -- populated it via
+the existing `populate-options-depth` command (the same populator already used for every other day
+in this file, run against already-ingested tick data; not a new dataset/table). Result: **Open-only
+gated, exactly 1 trade, 100% win, +9.65 net** (vs. 8 trades, 50.0% win, +6.65 net all-day on the
+same date). A single OOS trade is not evidence on its own -- noted as a data point, not a
+confirmation, consistent with this file's own "don't trust one day" discipline.
+
+### 3. PutDepthImbalance Open-only vs. the locked switch's own Open leg (same window, different metric)
+
+The locked baseline (`OptionsScoreThreeWaySwitchMaxPainConfirmed` @ 2600/90) had never had its own
+Open-phase leg isolated in this file before (the Part B follow-up's session-phase table covered the
+*confirmation-gated* variant, not the plain locked metric). Ran `session-phase` against the plain
+locked baseline directly:
+
+`OptionsScoreThreeWaySwitchMaxPainConfirmed` session-phase split (2026-09-08..09-18, 2600/90):
+Open 11 trades/63.6% win/+129.10 net (11.74 pts/trade), Mid 54/61.1%/+266.80 (4.94 pts/trade),
+Close 47/68.1%/+30.50 (0.65 pts/trade) -- total 112/64.3%/+426.40, matching the known baseline
+exactly.
+
+Isolated the locked switch's own 11 Open-leg trades via the identical `--entrystart=09:30
+--entryend=10:00` gate (count matched the session-phase split exactly, confirming apples-to-apples)
+and ran `mae-mfe` on them:
+
+| Candidate (same Open window) | Trades | Win% | Net | Avg MAE% | Avg MFE% |
+|---|---|---|---|---|---|
+| Locked switch's own Open leg (pooled Call+Put depth, 2600/90) | 11 | 63.6% | +129.10 | 6.14% | 13.48% |
+| **PutDepthImbalance, Open-only gated (Put-only depth, 2600/85)** | **25** | **76.0%** | **+225.15** | **5.99%** | **10.00%** |
+
+Under this task's win-rate-first / low-MAE% / high-MFE% ranking: **PutDepthImbalance Open-only wins
+on win rate (76.0% vs 63.6%) and on MAE% (5.99% vs 6.14%, marginally tighter), but loses on MFE%
+(10.00% vs 13.48% -- the pooled switch captures noticeably larger favorable excursions in its Open
+leg)**. 2 of the 3 priority axes favor the pure Put-only metric; the pooled version's larger MFE is
+consistent with its higher per-trade net average (11.74 vs 9.01 pts/trade) even on a smaller sample
+(n=11 vs n=25). Neither sample is large enough to call this decisively, but the pure-Put version is
+the more consistent win-rate/MAE performer of the two.
+
+### 4. Full battery on PutDepthImbalance Open-only
+
+**MAE/MFE**: covered above (5.99%/10.00%, MFE/MAE ratio 1.67, the best ratio of any PutDepthImbalance
+variant tested in this file).
+
+**DTE split** (0-DTE = 2026-09-08, 2026-09-15; non-0-DTE = the other 6 days), from the Open-only
+gated 25-trade list:
+- 0-DTE: 4 trades (09-08: 3, 09-15: 1), 3/4 win = **75.0%**, net +69.60
+- non-0-DTE: 21 trades, 16/21 win = **76.2%**, net +155.55
+
+Essentially identical win rate in both buckets -- **the Open edge is not a DTE artifact**, unlike
+`CallScoreStandalone`'s documented 0-DTE-driven weakness elsewhere in this file.
+
+**Day-by-day breakdown** (Open-only gated):
+
+| Date | Trades | Win% | Net |
+|---|---|---|---|
+| 2026-09-08 | 3 | 66.7% | -3.45 |
+| 2026-09-09 | 2 | 50.0% | -2.75 |
+| 2026-09-10 | 3 | 100.0% | +25.25 |
+| 2026-09-11 | 4 | 25.0% | -18.90 |
+| 2026-09-15 | 1 | 100.0% | +73.05 |
+| 2026-09-16 | 8 | 87.5% | +100.40 |
+| 2026-09-17 | 2 | 100.0% | +30.25 |
+| 2026-09-18 | 2 | 100.0% | +21.30 |
+
+**Not consistently 76%-ish day to day -- lumpy.** Two of eight days (09-09, 09-11) are net negative
+with sub-50% win rates on tiny per-day counts (2 and 4 trades); the pooled 76.0%/+225.15 headline
+is disproportionately carried by 09-15 and 09-16 (see concentration check below). This is exactly
+the "lumpy not clean" pattern the task asked to check for honestly rather than let the pooled
+percentage imply.
+
+**Concentration check** (same discipline as Part B's own DepthImbalance/TobImbalance checks):
+- **Top single trade** (09-15, the lone 1-trade day, +73.05) = **32.5% of total net** on its own.
+- **Top 2 trades** (+73.05 and a +44.65 trade on 09-16) = **52.3% of total net**.
+- **Top single day** (09-16, +100.40) = **44.6% of total net**.
+- **Top 2 days** (09-15 + 09-16, +173.45) = **77.0% of total net** -- well above this file's own
+  55%+ single-day red-flag convention, and here it's two of only eight days.
+
+This is the clearest red flag in this deep dive: the Open-only result's net (and, since it's a
+25-trade sample, its win rate too) leans heavily on two unusually good days. The win rate itself
+holds up reasonably day-to-day (5 of 8 days at 66.7% or better), but the concentration in net terms
+is real and should temper confidence in the specific magnitude of the edge, even though the
+directional win-rate pattern looks more broadly supported.
+
+### 5. Hedging-flow hypothesis -- exploratory only, not a rigorous test
+
+Queried the existing `OptionOiBars`, `OptionBandFlowBars`, and `OptionSkew25DeltaBars` tables
+directly (band width 3, threshold 2600, 2026-09-08..09-18, Open window 09:30-10:00 IST) -- no new
+populator or schema, read-only SQL against already-populated data. **Labeled exploratory throughout,
+per the task's own instruction; none of this is a statistical test.**
+
+- **OI change**: `CallOiChangeNotional` was actually LARGER than `PutOiChangeNotional` at the Open
+  on 6 of 8 days -- **does not support** a clean "Put-side OI build at the open" story. 09-15 is a
+  notable outlier (Put OI change strongly negative, -13.4M avg vs Call's +18.5M), but this is one
+  day, not a pattern.
+- **Notional volume**: `PutNotionalVolume` exceeded `CallNotionalVolume` at the Open on 6 of 8 days
+  (ratio range 0.80-3.00x), which is directionally consistent with "more Put-side flow at the open"
+  -- but per this file's own already-documented caveat on `OptionBandFlowBarRow`, this is
+  unsigned notional magnitude with no aggressor-side (buy/sell) split, so it cannot distinguish Put
+  buying from Put writing/hedging-driven activity. Weak, suggestive-at-best evidence.
+- **25-delta skew**: Put IV exceeded Call IV at the Open on 7 of 8 days (skew ratio >1), but this is
+  the standard, expected equity-index Put skew present all day, not something Open-specific --
+  pooling all bars across the 8 days by session phase, the Put-minus-Call IV gap is only slightly
+  wider at Open (0.00916) than Mid (0.00642) or Close (0.00537), and the skew ratio is nearly flat
+  across phases (1.077 Open vs 1.072 Mid vs 1.075 Close). **This does not show a meaningfully
+  Open-specific skew effect** -- the skew is a standing feature of the whole session, not something
+  that spikes at the open.
+
+**Honest conclusion**: the existing tables offer, at most, weak and mixed support for the
+hedging-flow hypothesis -- Put notional volume leans higher at the Open more often than not, but OI
+change doesn't confirm a Put-side buildup, and the skew data shows only a marginal (not dramatic)
+Open-specific widening. This does not confirm the hypothesis; it also doesn't rule it out. Still an
+open question, as flagged in the prior task.
+
+### 6. Does Open-only gating help the other 4 Put survivors, or is this PutDepthImbalance-specific?
+
+Quick pass (win rate/MAE/MFE/trade-count only, not the full battery) on the other 4 Part B Put
+survivors, same `--entrystart=09:30 --entryend=10:00` gate at each metric's own locked config. All
+4 trade counts matched the Part B follow-up's own session-phase Open-row numbers exactly, confirming
+the gate reproduces that split correctly in every case.
+
+| Metric (config) | All-day Win%/MAE%/MFE% | Open-only Win%/MAE%/MFE% (n) | Direction vs all-day |
+|---|---|---|---|
+| PutDepthImbalance (2600/85) | 65.5% / 8.70% / 8.49% | **76.0%** / **5.99%** / **10.00%** (n=25) | Improves on all 3 axes |
+| PutTobDepthDivergence (2600/93) | 56.4% / 9.72% / 8.05% | **68.8%** / **6.56%** / 7.75% (n=16) | Win% and MAE% improve, MFE% roughly flat |
+| PutWingIvChangeRaw (2600/93) | 65.5% / 7.26% / 7.12% | 70.6% / 7.46% / **9.04%** (n=17) | Win% and MFE% improve, MAE% roughly flat |
+| PutIvChangePriceSigned (650/97) | 56.3% / 5.66% / 7.71% | 71.4% / 11.12% / **11.81%** (n=7, very thin) | Win% and MFE% improve, MAE% clearly worse |
+| PutTobImbalance (1300/95) | **66.2%** / 9.62% / **11.45%** | 61.1% / 6.12% / 10.19% (n=18) | Win% and MFE% WORSEN, MAE% improves |
+
+**Not purely PutDepthImbalance-specific, but not universal either.** 4 of 5 Put survivors show a
+win-rate improvement when gated to Open-only (the exception is `PutTobImbalance`, whose win rate
+and MFE% both get worse under the gate despite its MAE% improving) -- so "Open favors Puts" is a
+real, moderately general pattern across this family, not an artifact of cherry-picking one metric.
+`PutDepthImbalance` is nonetheless the standout: it is the only one of the five that improves
+cleanly on all three priority axes at once, on the largest of the five thin samples (n=25 vs
+n=7-18 for the rest).
+
+### Final verdict
+
+**A real, directionally-repeated pattern worth carrying forward as a provisional research
+candidate -- but not yet a robust, trade-ready edge**, for these specific reasons:
+
+- **For it**: the Open-only gate improves win rate, MAE%, and MFE% simultaneously for
+  `PutDepthImbalance` (not just a smaller slice of the same profile); the win-rate improvement
+  replicates (directionally) across 4 of 5 related Put-side metrics, so it is not an isolated
+  fluke of one metric's calibration; the DTE split shows no 0-DTE artifact; the single OOS day,
+  while just one trade, was a win in the same direction.
+- **Against it**: the underlying sample is small (n=25, CI roughly 56-90%) and explicitly flagged
+  as such throughout, not just here; the day-by-day breakdown is lumpy, with 2 of 8 days net
+  negative and the pooled net concentrated 77% in just 2 of 8 days; the OOS evidence is a single
+  trade, not a real confirmation; the locked switch's own Open leg still captures a meaningfully
+  larger MFE% (13.48% vs 10.00%) even though it loses on win rate and MAE%, so this is not an
+  unambiguous win over the pooled incumbent on every axis; the hedging-flow hypothesis offered as
+  a mechanism gets only weak, mixed support from the data actually available, not confirmation.
+
+**Recommendation**: keep `PutDepthImbalance` Open-only-gated as a documented, provisional research
+candidate worth further accumulation (per this project's "backtesting is a long-term process" rule)
+-- specifically worth re-checking once more trading days are available, since 25 trades is too few
+to trust the exact 76.0%/5.99%/10.00% figures as stable. Do not treat this as validated enough to
+carry into any composite-score weighting yet, and do not read the day-by-day concentration as
+disqualifying either -- it is a genuine caveat on a genuine, repeated-across-metrics pattern, which
+is a different (better) place to be than a single-metric, single-day artifact.
+
+### Reproduction commands
+
+```
+# Sanity check -- exact trade count behind the 76.0% figure
+dotnet run --project NiftySignal.VolumeBarData -- session-phase 2026-09-08 2026-09-18 PutDepthImbalance 85 2600
+
+# PutDepthImbalance Open-only gated (8-day window)
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-18 PutDepthImbalance 85 15 2600 --entrystart=09:30 --entryend=10:00
+dotnet run --project NiftySignal.VolumeBarData -- mae-mfe trade 2026-09-08 2026-09-18 PutDepthImbalance 85 15 2600 --entrystart=09:30 --entryend=10:00
+
+# Out-of-sample day (required populating OptionDepthBars for this date first)
+dotnet run --project NiftySignal.VolumeBarData -- populate-options-depth 2026-09-21 2026-09-21 2600 3
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-21 2026-09-21 PutDepthImbalance 85 15 2600 --entrystart=09:30 --entryend=10:00
+
+# Locked switch's own Open leg, isolated for a fair comparison
+dotnet run --project NiftySignal.VolumeBarData -- session-phase 2026-09-08 2026-09-18 OptionsScoreThreeWaySwitchMaxPainConfirmed 90 2600
+dotnet run --project NiftySignal.VolumeBarData -- mae-mfe trade 2026-09-08 2026-09-18 OptionsScoreThreeWaySwitchMaxPainConfirmed 90 15 2600 --entrystart=09:30 --entryend=10:00
+
+# Other 4 Put survivors, Open-only quick pass
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-18 PutTobImbalance 95 15 1300 --entrystart=09:30 --entryend=10:00
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-18 PutTobDepthDivergence 93 15 2600 --entrystart=09:30 --entryend=10:00
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-18 PutIvChangePriceSigned 97 15 650 --entrystart=09:30 --entryend=10:00
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-18 PutWingIvChangeRaw 93 15 2600 --entrystart=09:30 --entryend=10:00
+
+# Baseline re-verification (must stay 112 trades, 64.3% win, +426.40 net)
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-19 OptionsScoreThreeWaySwitchMaxPainConfirmed 90 15 2600
+```
+
+## Bounded-transform score research: tanh/z-score replacing session-rank percentile (2026-09-22)
+
+**Research only, provisional, not adopted.** Everything below is backtest-only
+(`NiftySignal.VolumeBarData`), off by default, additive to `TradeSimulator.cs`. Nothing in
+`NiftySignal.Host`/`NiftySignal.Dashboard`/`NiftySignal.Scoring`'s live pure functions was touched;
+the locked `OptionsScoreThreeWaySwitchMaxPainConfirmed` @ 2600/90 config and its own formula are
+byte-identical, reverified below. **Priority for this task, per the user's own stated instruction:
+win rate first, then MAE%/MFE% (smaller drawdowns, better favorable excursion), net P&L last.**
+
+### User's idea, restated
+
+"Replace percentile with a bounded transform, e.g. tanh or clipped z-score of the raw metric, then
+smooth. Removes the 'rank against whole day' effect. Loses the nice 0-100 scale."
+`SignedRank.Compute` ranks `|raw|` against every OTHER same-day value seen so far (session-scoped,
+resets daily) and reattaches the sign -- noisy early in a session (small sample), and "relative to
+today only" by construction, not a fixed function of the raw value.
+
+### Design decision: session z-score (option (a)), not a cross-day rolling baseline (option (b))
+
+Built **option (a)**: z-score each leg's raw pre-normalization value against THIS session's own
+running mean/std (`RunningMeanStd`, Welford's online algorithm, session-scoped -- fresh instance per
+leg per day, same construction lifecycle as every `SessionRankTracker` in this file), then squash
+through `tanh`. **Option (b)** (a rolling multi-day baseline) was NOT built this session -- it is a
+materially more novel design (no precedent in this codebase for a normalizer that spans the day
+boundary) requiring its own warm-up-window and cross-day-state-lifecycle decisions that deserve their
+own design pass rather than being bolted on inside this already-large task; noted here as the
+natural next step if (a)'s results below justify further investment, not silently dropped.
+
+**Why (a) still meaningfully tests the user's hypothesis**: it removes the exact mechanism the user's
+note names ("rank against whole day") -- a z-score is a function of the raw value's distance from the
+session's running mean in std-dev units, not its ordinal position among every other same-day reading
+-- while keeping the "resets each day, no look-ahead" property `SignedRank` already has. It shares
+option (a)'s own accepted early-session-instability (few samples to estimate mean/std from), by
+design, not as an oversight.
+
+**Data-derived scale, per CLAUDE.md's own rule**: the standard deviation `tanh`'s z-score is divided
+by is `RunningMeanStd.StdDev` -- Welford's algorithm computed fresh from every real raw reading this
+leg has produced so far today, never a fixed magnitude picked by eye. `RunningMeanStd.Add` is called
+AFTER the current bar's z-score is read (self-inclusion-safe, mirrors `SignedRank.Compute`'s own
+"read the rank before adding" convention exactly). With fewer than 2 prior observations there is no
+meaningful std to divide by, so `BoundedTransform.Compute` returns null that bar (same
+null-passthrough convention every other smoother in this file follows) rather than fabricating a
+z-score against an undefined spread; if the running std is ever exactly 0 (every prior reading
+identical), z is defined as 0 (a neutral `tanh(0)=0` reading) rather than dividing by zero.
+
+**Open leg is structurally different from Mid/Close, as the task's own framing anticipated.** Depth
+Imbalance (`(bid-ask)/(bid+ask)`) is ALREADY bounded to [-1,1] by construction -- the bounded
+transform is applied to it for pipeline consistency (same code path, same downstream entry-threshold
+mechanism), but the transform is a much smaller behavioral change there than for Mid/Close's raw
+ΔIV/price-signed-ΔIV, which are unbounded real-valued IV changes in percentage points with no natural
+scale. This is visible in the results below: the Open-window trade count for the raw bounded-transform
+metric (11 trades) is IDENTICAL to the baseline's own Open count (11 trades) across the same 8 days --
+consistent with "not meaningfully different for an already-bounded input," exactly as the task
+anticipated it might be.
+
+### Entry-threshold redesign
+
+The raw `tanh` output is bounded to (-1,1) but is NOT percentile-shaped (a reading of 0.9 does not
+mean "90th percentile of today's readings" the way a `SignedRank` output does by construction) --
+losing the "nice 0-100 scale" the user's own note flags is real. Two options were considered:
+
+- **Re-rank the bounded value's own magnitude** through a dedicated `SessionRankTracker`
+  (`scoreSmoothMagnitudeRank`, shared with the existing ScoreSma/ScoreEma family -- mutually
+  exclusive per call), gating entry/exit on `Percentile(|boundedScore|) >= entryPercentile` -- the
+  SAME dynamic, self-calibrating threshold mechanism every metric in this file already uses. **Chosen.**
+- A fixed `tanh`-output cutoff (e.g. 0.8) -- rejected: this is exactly the kind of eyeballed magnitude
+  constant CLAUDE.md's "no hardcoded thresholds" rule warns against, and this project has no existing
+  distributional study of this specific transform's output to justify a specific fixed cutoff instead
+  of deriving it from the data the way every other metric here does.
+
+This means the existing `--percentile=90` CLI parameter keeps working unchanged and stays directly
+comparable across metrics -- "90" still means "top 10% of today's own bounded-score-magnitude
+readings," just measured on a different underlying series.
+
+### Implementation
+
+Two new `VolumeBarMetric` values, both off by default:
+- `OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransform` -- raw (unsmoothed) bounded-transform
+  score. `ComputeOptionsThreeWayScoreBoundedTransform` is a deliberate FORK of
+  `ComputeOptionsThreeWayScoreSmoothed`'s own structure (same reason that one is a fork rather than a
+  call into the shared, live-facing `OptionsThreeWayScoreCalculator`: backtest-only experimentation
+  must not touch the live pipeline's pure functions) -- identical 3 leg formulas/session boundaries/
+  sign conventions to the locked baseline, only the final normalization step (`SignedRank.Compute` ->
+  `BoundedTransform.Compute`) differs.
+- `OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransformScoreEma` -- Part A's frozen EMA N=3 spec
+  (`ExponentialMean`, alpha=2/(N+1)) applied on top of the bounded-transform score instead of the
+  percentile score, reusing the EXACT SAME `scoreEmaSmoother`/`scoreSmoothMagnitudeRank` instances
+  already built for `OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma` -- no smoothing logic was
+  re-derived, per the task's own instruction to reuse Part A's implementation verbatim.
+
+Both metrics keep the exact same Max Pain confirmation gate as the locked baseline
+(`MaxPainConfirmationGate.Passes(maxPainConfirmScore, scaledScore)`) completely unchanged -- the gate
+only checks SIGN agreement between the traded score and the confirmation score, which works
+identically regardless of whether `scaledScore` is percentile-shaped or tanh-shaped. **No adjustment
+was needed for the Max Pain gate; it stays fully independent of this change**, confirmed by reading
+`MaxPainConfirmationGate.Passes`'s own implementation (a sign check, no assumption about the input's
+scale or distribution).
+
+Mandatory regression check: `trade 2026-09-08 2026-09-19 OptionsScoreThreeWaySwitchMaxPainConfirmed
+90 15 2600 --band=5` reproduced **112 trades, 64.3% win, +426.40 net** exactly.
+`SessionGatedDepthDuration` (collateral-damage check) reproduced **80 trades, 55.0% win, +144.70 net**
+exactly. `dotnet test`: **698/698 passing** (688 pre-existing + 10 new `BoundedTransformTests`
+covering `RunningMeanStd`/`BoundedTransform` against hand-computed synthetic sequences), 0 warnings,
+`dotnet build` clean.
+
+### Full results: raw and EMA-smoothed, 8-day backtest + out-of-sample
+
+| Metric | Trades | Win% | Net | Days >=50% win | MAE% avg | MFE% avg | MAE% median | MFE% median |
+|---|---|---|---|---|---|---|---|---|
+| Baseline (percentile, unsmoothed) | 112 | 64.3% | +426.40 | 8/8 | 4.67% | 7.50% | 3.56% | 3.22% |
+| Part A EMA N=3 (percentile, frozen spec) | 35 | 68.6% | +274.55 | 8/8 | 9.88% | 13.57% | 5.98% | 11.94% |
+| **BoundedTransform (raw, tanh z-score)** | 123 | 62.6% | +342.95 | **8/8** | 4.43% | 7.18% | 3.75% | 3.21% |
+| **BoundedTransform + EMA N=3** | 34 | 67.6% | +268.55 | 7/8 | 9.66% | 15.03% | 5.97% | 11.43% |
+
+Out-of-sample day (2026-09-21):
+
+| Metric | Trades | Win% | Net |
+|---|---|---|---|
+| Baseline (percentile, unsmoothed) | 7 | 71.4% | -5.10 |
+| Part A EMA N=3 (percentile) | 6 | 50.0% | +9.10 |
+| BoundedTransform (raw) | 9 | 44.4% | -23.05 |
+| BoundedTransform + EMA N=3 | 3 | 0.0% | -25.90 |
+
+### DTE split (0-DTE: 09-08/09-15 vs. non-0-DTE: the other 6 days)
+
+| Metric | 0-DTE trades | 0-DTE win% | 0-DTE net | Non-0-DTE trades | Non-0-DTE win% | Non-0-DTE net |
+|---|---|---|---|---|---|---|
+| BoundedTransform (raw) | 31 | 67.7% | +112.20 | 92 | 60.9% | +230.75 |
+| BoundedTransform + EMA N=3 | 8 | 75.0% | +52.65 | 26 | 65.4% | +215.90 |
+
+Positive and above 50% win rate in both DTE regimes for both variants -- no single-regime dependency,
+matching the baseline's own broad-based character.
+
+### Session-phase split (Open <10:00, Mid 10:00-13:30, Close >=13:30)
+
+| Metric | Open trades | Open win% | Open net | Mid trades | Mid win% | Mid net | Close trades | Close win% | Close net |
+|---|---|---|---|---|---|---|---|---|---|
+| Baseline (percentile) | 11 | 63.6% | +129.10 | 54 | 61.1% | +266.80 | 47 | 68.1% | +30.50 |
+| BoundedTransform (raw) | 11 | 72.7% | +86.35 | 62 | 53.2% | +167.80 | 50 | 72.0% | +88.80 |
+| BoundedTransform + EMA N=3 | 8 | 75.0% | +68.35 | 20 | 70.0% | +220.00 | 6 | 50.0% | -19.80 |
+
+The raw variant's Open-window TRADE COUNT is identical to the baseline's (11 vs 11) across the same
+8 days -- see the design-decision section above for why this is expected (Open's raw input is
+already bounded, so the transform changes that leg's traded values comparatively little). Win rate in
+that window is higher (72.7% vs 63.6%), but on only 11 trades this is a single-sample-size-limited
+observation, not a strong result on its own.
+
+### Concentration (top trade / top 2 as % of net)
+
+| Metric | Net | Top 1 | Top 1 % | Top 2 sum | Top 2 % |
+|---|---|---|---|---|---|
+| Baseline | +426.40 | +51.60 | 12.1% | +103.20 | 24.2% |
+| Part A EMA N=3 (percentile) | +274.55 | +48.30 | 17.6% | +81.30 | 29.6% |
+| BoundedTransform (raw) | +342.95 | +49.70 | 14.5% | +91.40 | 26.6% |
+| BoundedTransform + EMA N=3 | +268.55 | +48.30 | 18.0% | +82.60 | 30.8% |
+
+BoundedTransform + EMA N=3's concentration profile (18.0%/30.8%) is nearly identical to Part A's own
+percentile-based EMA N=3 (17.6%/29.6%) -- consistent with both being the SAME EMA mechanism
+(`ExponentialMean`, N=3) applied to two differently-shaped-but-similarly-distributed upstream series;
+the smoothing itself, not the underlying normalization, appears to be what drives the concentration
+effect.
+
+### Does removing the "rank against whole day" effect measurably reduce early-session whipsaw?
+
+**Direct per-bar sign-flip instrumentation was not built this session** (would require a new
+`onBarEvaluated`-driven CLI harness dumping every bar's score for the first 30 minutes of each day,
+separately for the percentile and bounded-transform series -- judged out of proportion to add on top
+of an already-large task; flagged here rather than silently skipped). Instead, the Open-window trade
+counts/win-rates above serve as an indirect but real proxy (a whipsaw-prone score would tend to
+produce MORE entries/exits in a volatile opening window, not fewer): **the raw bounded-transform
+metric's Open-window trade count is unchanged from baseline (11 vs 11 trades over the same 8 days)**.
+This does NOT support the hypothesis that the transform meaningfully calms early-session behavior --
+if anything, the raw variant's OVERALL trade count is higher than baseline's (123 vs 112), driven by
+more Mid/Close-window entries, not fewer Open-window ones. Stated plainly: **the user's own stated
+hypothesis is not confirmed by this evidence.** This is consistent with the design-decision section's
+own prediction that the Open leg (already naturally bounded) would see the least effect from this
+change, and Mid/Close (unbounded raw inputs) would see the most -- and indeed the trade-count
+*increase* happened in Mid/Close, not a *decrease* in Open.
+
+**Is losing the 0-100 scale a practical problem?** No, for the two things checked: (1) the
+`--percentile=90` CLI parameter and every existing calibration/sweep tool keep working unchanged
+via the re-rank-the-bounded-value approach (see "Entry-threshold redesign" above); (2) the Max Pain
+confirmation gate needed zero adjustment, confirmed by reading its own implementation (a sign-only
+check).
+
+### Verdict, ranked by the user's own stated priority (win rate first, then MAE%/MFE%, net last)
+
+**Raw BoundedTransform vs. baseline**: win rate is LOWER (62.6% vs 64.3%, -1.7pp) -- fails the
+priority's own first criterion. MAE% is marginally better (4.43% vs 4.67%, smaller average drawdown)
+but MFE% is marginally worse (7.18% vs 7.50%, smaller average favorable excursion) -- a wash on the
+second criterion, not a clear win either way. Day-consistency matches (8/8 both). **Does not clear
+the bar; not an improvement over the baseline on the stated priority.**
+
+**BoundedTransform + EMA N=3 vs. Part A's own EMA N=3 (percentile, the already-frozen best smoothing
+candidate)**: win rate is slightly LOWER (67.6% vs 68.6%, -1.0pp), MAE% is slightly BETTER (9.66% vs
+9.88%), MFE% is meaningfully BETTER (15.03% vs 13.57%, +1.46pp) -- genuinely the closest head-to-head
+of anything tested here, essentially a statistical tie tilted marginally toward the bounded-transform
+variant on the MAE/MFE half of the priority, tilted marginally toward Part A's own candidate on win
+rate. Day-consistency is WORSE (7/8 vs Part A's own 8/8, failing 09-11 specifically at 16.7% win on
+only 6 trades). **Does not clearly beat what Part A already found; a near-tie, not a new best
+candidate.**
+
+**Overall**: this task set out to test whether removing session-rank percentile's "rank against
+today" effect, per the user's own hypothesis, would show up as a real improvement. On this 8-day
+sample plus the one out-of-sample day, it does not -- neither variant clears the strict "beats what's
+already been tried" bar on win rate, and the direct whipsaw proxy (Open-window trade count) shows no
+reduction. This is a genuine, measured negative result on the specific hypothesis tested (option (a),
+session z-score), not a rejection of the broader idea -- **option (b) (a cross-day rolling baseline,
+not built this session, see the design-decision section above) remains a real, different, untested
+variant of the same underlying idea** that could behave differently precisely because it removes the
+"session-scoped, few early-session samples" limitation option (a) still shares with `SignedRank`.
+**Recommendation: not worth pursuing option (a) further on the strict adoption bar; option (b) is the
+more promising unexplored direction if bounded-transform normalization is revisited**, since it is
+the one design variant that actually escapes the "still resets each day" property common to both
+`SignedRank` and option (a).
+
+### Reproduction commands
+
+```
+# Baseline (unchanged)
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-19 OptionsScoreThreeWaySwitchMaxPainConfirmed 90 15 2600 --band=5
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-21 2026-09-21 OptionsScoreThreeWaySwitchMaxPainConfirmed 90 15 2600 --band=5
+
+# BoundedTransform (raw)
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-19 OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransform 90 15 2600 --band=5
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-21 2026-09-21 OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransform 90 15 2600 --band=5
+dotnet run --project NiftySignal.VolumeBarData -- mae-mfe trade 2026-09-08 2026-09-19 OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransform 90 15 2600 --band=5
+
+# BoundedTransform + EMA N=3
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-19 OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransformScoreEma 90 15 2600 --band=5 --smoothbars=3
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-21 2026-09-21 OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransformScoreEma 90 15 2600 --band=5 --smoothbars=3
+dotnet run --project NiftySignal.VolumeBarData -- mae-mfe trade 2026-09-08 2026-09-19 OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransformScoreEma 90 15 2600 --band=5 --smoothbars=3
+
+# Baseline re-verification (must stay 112 trades, 64.3% win, +426.40 net)
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-19 OptionsScoreThreeWaySwitchMaxPainConfirmed 90 15 2600 --band=5
+```
