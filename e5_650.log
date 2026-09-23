@@ -1,0 +1,77 @@
+=== Experiment 5, bar=650 range=2026-09-04..2026-09-22 ===
+Days with data: 11
+Locked threshold (Experiment 3, unchanged): TickVelocityMedian=2.0000 PriceEfficiencyMedian=0.113576
+Qualifying bars: total=7087 pos(NetMove>0,->Put)=3490 neg(NetMove<0,->Call)=3597
+--- Underlying (Nifty) forward outcomes: positive-NetMove cell (ALL days) ---
+  H |     n | MeanFwd% | AbsFwd% |  P(Up)% | MeanMFE% | MeanMAE% | BarsToMFE | BarsToMAE | RevProb% |  FavEx% |  AdvEx%
+  1 |  3489 |   -0.009 |   0.016 |    30.9 |    0.006 |   -0.020 |      1.00 |      1.00 |     59.8 |   0.020 |   0.006
+  2 |  3487 |   -0.009 |   0.018 |    33.8 |    0.009 |   -0.025 |      1.35 |      1.41 |     60.1 |   0.025 |   0.009
+  5 |  3478 |   -0.008 |   0.023 |    36.5 |    0.016 |   -0.032 |      2.60 |      2.75 |     59.9 |   0.032 |   0.016
+ 10 |  3464 |   -0.009 |   0.030 |    38.9 |    0.023 |   -0.039 |      4.88 |      5.17 |     59.1 |   0.039 |   0.023
+ 20 |  3441 |   -0.009 |   0.038 |    40.7 |    0.032 |   -0.049 |      9.45 |      9.90 |     57.8 |   0.049 |   0.032
+--- Underlying (Nifty) forward outcomes: negative-NetMove cell (ALL days) ---
+  H |     n | MeanFwd% | AbsFwd% |  P(Up)% | MeanMFE% | MeanMAE% | BarsToMFE | BarsToMAE | RevProb% |  FavEx% |  AdvEx%
+  1 |  3596 |    0.008 |   0.015 |    57.8 |    0.020 |   -0.006 |      1.00 |      1.00 |     57.8 |   0.020 |   0.006
+  2 |  3593 |    0.008 |   0.017 |    58.9 |    0.025 |   -0.009 |      1.40 |      1.37 |     58.9 |   0.025 |   0.009
+  5 |  3589 |    0.007 |   0.023 |    58.0 |    0.032 |   -0.016 |      2.71 |      2.75 |     58.0 |   0.032 |   0.016
+ 10 |  3579 |    0.007 |   0.029 |    57.3 |    0.039 |   -0.023 |      4.86 |      5.15 |     57.3 |   0.039 |   0.023
+ 20 |  3554 |    0.006 |   0.038 |    54.6 |    0.048 |   -0.033 |      9.37 |     10.20 |     54.6 |   0.048 |   0.033
+Option trades built: 28853 (skipped, no tradable instrument/price: 6582)
+--- Option tradeability by horizon (ALL qualifying bars, both directions pooled) ---
+Horizon=1 [GROSS]: n=5795 win%=48.1 avgWin=123.5 avgLoss=-137.8 medWin=84.5 medLoss=-91.0 PF=0.88 expect=-8.1 net=-47047.0 maxDD=53930.5 MFE%=0.97 MAE%=1.15 medMFE%=0.45 medMAE%=0.48 avgHoldMin=0.1 medHoldMin=0.1 top1%=-3.5 top3%=-7.5 top5%=-11.4
+Horizon=1 [NET]: n=5795 win%=27.8 avgWin=122.9 avgLoss=-150.1 medWin=77.0 medLoss=-105.0 PF=0.32 expect=-74.1 net=-429452.0 maxDD=429452.0 MFE%=0.97 MAE%=1.15 medMFE%=0.45 medMAE%=0.48 avgHoldMin=0.1 medHoldMin=0.1 top1%=-0.4 top3%=-0.8 top5%=-1.2
+Horizon=2 [GROSS]: n=5790 win%=49.5 avgWin=183.1 avgLoss=-190.6 medWin=130.0 medLoss=-130.0 PF=0.98 expect=-1.7 net=-9841.0 maxDD=34859.5 MFE%=1.52 MAE%=1.66 medMFE%=0.78 medMAE%=0.78 avgHoldMin=0.3 medHoldMin=0.2 top1%=-34.0 top3%=-84.1 top5%=-119.2
+Horizon=2 [NET]: n=5790 win%=34.8 avgWin=179.9 avgLoss=-200.0 medWin=116.0 medLoss=-144.0 PF=0.48 expect=-67.7 net=-391929.0 maxDD=392128.5 MFE%=1.52 MAE%=1.66 medMFE%=0.78 medMAE%=0.78 avgHoldMin=0.3 medHoldMin=0.2 top1%=-0.8 top3%=-2.1 top5%=-2.9
+Horizon=5 [GROSS]: n=5779 win%=49.9 avgWin=286.3 avgLoss=-296.4 medWin=201.5 medLoss=-214.5 PF=0.98 expect=-2.8 net=-15918.5 maxDD=44271.5 MFE%=2.64 MAE%=2.73 medMFE%=1.44 medMAE%=1.42 avgHoldMin=0.7 medHoldMin=0.5 top1%=-38.6 top3%=-82.8 top5%=-120.7
+Horizon=5 [NET]: n=5779 win%=41.0 avgWin=274.4 avgLoss=-307.5 medWin=187.5 medLoss=-222.0 PF=0.62 expect=-68.7 net=-397280.5 maxDD=397889.0 MFE%=2.64 MAE%=2.73 medMFE%=1.44 medMAE%=1.42 avgHoldMin=0.7 medHoldMin=0.5 top1%=-1.5 top3%=-3.3 top5%=-4.8
+Horizon=10 [GROSS]: n=5763 win%=49.8 avgWin=409.3 avgLoss=-413.4 medWin=286.0 medLoss=-299.0 PF=1.00 expect=-0.7 net=-3802.5 maxDD=38792.0 MFE%=3.86 MAE%=3.89 medMFE%=2.11 medMAE%=2.13 avgHoldMin=1.4 medHoldMin=1.0 top1%=-192.5 top3%=-460.9 top5%=-707.2
+Horizon=10 [NET]: n=5763 win%=43.6 avgWin=396.1 avgLoss=-425.0 medWin=272.0 medLoss=-319.5 PF=0.72 expect=-66.7 net=-384115.0 maxDD=384715.5 MFE%=3.86 MAE%=3.89 medMFE%=2.11 medMAE%=2.13 avgHoldMin=1.4 medHoldMin=1.0 top1%=-1.9 top3%=-4.5 top5%=-6.9
+Horizon=20 [GROSS]: n=5726 win%=49.4 avgWin=556.5 avgLoss=-559.6 medWin=383.5 medLoss=-409.5 PF=0.98 expect=-6.0 net=-34391.5 maxDD=67502.5 MFE%=5.67 MAE%=5.41 medMFE%=3.04 medMAE%=3.14 avgHoldMin=2.8 medHoldMin=2.2 top1%=-25.7 top3%=-69.9 top5%=-103.6
+Horizon=20 [NET]: n=5726 win%=44.1 avgWin=552.0 avgLoss=-565.2 medWin=376.0 medLoss=-417.0 PF=0.77 expect=-72.0 net=-412262.0 maxDD=412714.0 MFE%=5.67 MAE%=5.41 medMFE%=3.04 medMAE%=3.14 avgHoldMin=2.8 medHoldMin=2.2 top1%=-2.1 top3%=-5.8 top5%=-8.6
+--- Case A/B/C breakdown, horizon=10 (Nifty-reversed x option-P&L-sign) ---
+Case A: n=2408 (41.8% of horizon=10 trades)
+Case B: n=928 (16.1% of horizon=10 trades)
+Case C: n=1965 (34.1% of horizon=10 trades)
+Case Other (Nifty didn't reverse, option still won): n=462 (8.0% of horizon=10 trades)
+Case B (n=928, 926 with entry+exit ATM IV available): mean ATM IV change (exit-entry) = -0.0020 -- investigative only, not a proven cause (see doc discussion)
+--- 0-DTE vs non-0-DTE (all horizons) ---
+H=1 DTE=0 [NET]: n=1770 win%=25.4 avgWin=114.3 avgLoss=-149.5 medWin=70.5 medLoss=-101.8 PF=0.26 expect=-82.4 net=-145849.0 maxDD=145849.0 MFE%=1.77 MAE%=2.30 medMFE%=0.78 medMAE%=0.79 avgHoldMin=0.1 medHoldMin=0.1 top1%=-1.1 top3%=-2.3 top5%=-3.2
+H=1 DTE>0 [NET]: n=4025 win%=28.9 avgWin=126.2 avgLoss=-150.4 medWin=83.5 medLoss=-111.5 PF=0.34 expect=-70.5 net=-283603.0 maxDD=284633.0 MFE%=0.62 MAE%=0.65 medMFE%=0.38 medMAE%=0.40 avgHoldMin=0.1 medHoldMin=0.1 top1%=-0.3 top3%=-0.9 top5%=-1.5
+H=2 DTE=0 [NET]: n=1768 win%=34.3 avgWin=166.5 avgLoss=-195.1 medWin=109.5 medLoss=-127.8 PF=0.44 expect=-71.2 net=-125840.0 maxDD=125840.0 MFE%=2.79 MAE%=3.26 medMFE%=1.36 medMAE%=1.32 avgHoldMin=0.2 medHoldMin=0.2 top1%=-2.6 top3%=-6.1 top5%=-8.5
+H=2 DTE>0 [NET]: n=4022 win%=35.1 avgWin=185.7 avgLoss=-202.2 medWin=122.5 medLoss=-150.5 PF=0.50 expect=-66.2 net=-266089.0 maxDD=267071.5 MFE%=0.96 MAE%=0.96 medMFE%=0.64 medMAE%=0.65 avgHoldMin=0.3 medHoldMin=0.2 top1%=-0.8 top3%=-1.9 top5%=-2.7
+H=5 DTE=0 [NET]: n=1764 win%=39.6 avgWin=260.3 avgLoss=-285.6 medWin=161.5 medLoss=-189.5 PF=0.60 expect=-69.3 net=-122235.0 maxDD=122291.5 MFE%=4.95 MAE%=5.21 medMFE%=2.48 medMAE%=2.44 avgHoldMin=0.6 medHoldMin=0.5 top1%=-5.0 top3%=-9.5 top5%=-12.5
+H=5 DTE>0 [NET]: n=4015 win%=41.6 avgWin=280.3 avgLoss=-317.4 medWin=194.0 medLoss=-241.5 PF=0.63 expect=-68.5 net=-275045.5 maxDD=277025.0 MFE%=1.63 MAE%=1.63 medMFE%=1.18 medMAE%=1.17 avgHoldMin=0.7 medHoldMin=0.5 top1%=-1.2 top3%=-3.3 top5%=-5.0
+H=10 DTE=0 [NET]: n=1758 win%=42.7 avgWin=381.4 avgLoss=-395.2 medWin=239.5 medLoss=-287.0 PF=0.72 expect=-63.4 net=-111536.5 maxDD=111536.5 MFE%=7.19 MAE%=7.30 medMFE%=3.74 medMAE%=3.64 avgHoldMin=1.3 medHoldMin=1.0 top1%=-6.5 top3%=-15.5 top5%=-21.3
+H=10 DTE>0 [NET]: n=4005 win%=44.0 avgWin=402.4 avgLoss=-438.4 medWin=285.0 medLoss=-332.5 PF=0.72 expect=-68.1 net=-272578.5 maxDD=274604.5 MFE%=2.39 MAE%=2.40 medMFE%=1.72 medMAE%=1.78 avgHoldMin=1.4 medHoldMin=1.1 top1%=-1.7 top3%=-5.0 top5%=-8.1
+H=20 DTE=0 [NET]: n=1747 win%=43.3 avgWin=530.8 avgLoss=-545.2 medWin=330.5 medLoss=-371.5 PF=0.74 expect=-79.6 net=-139040.0 maxDD=139422.5 MFE%=10.81 MAE%=9.98 medMFE%=5.36 medMAE%=5.53 avgHoldMin=2.6 medHoldMin=2.0 top1%=-6.3 top3%=-17.1 top5%=-25.4
+H=20 DTE>0 [NET]: n=3979 win%=44.5 avgWin=561.0 avgLoss=-574.2 medWin=389.0 medLoss=-443.0 PF=0.78 expect=-68.7 net=-273222.0 maxDD=273947.5 MFE%=3.42 MAE%=3.40 medMFE%=2.52 medMAE%=2.67 avgHoldMin=2.9 medHoldMin=2.3 top1%=-1.6 top3%=-4.6 top5%=-7.6
+--- Session breakdown, horizon=10 ---
+Open(<10:00) [NET]: n=1893 win%=42.5 avgWin=425.6 avgLoss=-457.6 medWin=278.5 medLoss=-326.0 PF=0.69 expect=-82.5 net=-156131.5 maxDD=157686.5 MFE%=2.91 MAE%=2.93 medMFE%=1.93 medMAE%=2.08 avgHoldMin=0.9 medHoldMin=0.8 top1%=-3.0 top3%=-8.7 top5%=-14.1
+Mid(10:00-13:30) [NET]: n=2007 win%=43.9 avgWin=359.6 avgLoss=-397.9 medWin=278.5 medLoss=-326.0 PF=0.71 expect=-65.4 net=-131201.0 maxDD=131201.0 MFE%=2.86 MAE%=2.87 medMFE%=1.95 medMAE%=1.97 avgHoldMin=1.8 medHoldMin=1.4 top1%=-1.6 top3%=-4.5 top5%=-7.2
+Close(>13:30) [NET]: n=1863 win%=44.6 avgWin=406.2 avgLoss=-420.1 medWin=259.0 medLoss=-300.0 PF=0.78 expect=-51.9 net=-96782.5 maxDD=98632.0 MFE%=5.90 MAE%=5.98 medMFE%=2.56 medMAE%=2.42 avgHoldMin=1.4 medHoldMin=1.1 top1%=-7.5 top3%=-17.9 top5%=-24.6
+--- Cost sensitivity summary, horizon=10 (gross vs net, CostsConfig BrokeragePerOrder=20/SlippageTicks=2) ---
+ALL [GROSS]: n=5763 win%=49.8 avgWin=409.3 avgLoss=-413.4 medWin=286.0 medLoss=-299.0 PF=1.00 expect=-0.7 net=-3802.5 maxDD=38792.0 MFE%=3.86 MAE%=3.89 medMFE%=2.11 medMAE%=2.13 avgHoldMin=1.4 medHoldMin=1.0 top1%=-192.5 top3%=-460.9 top5%=-707.2
+ALL [NET]: n=5763 win%=43.6 avgWin=396.1 avgLoss=-425.0 medWin=272.0 medLoss=-319.5 PF=0.72 expect=-66.7 net=-384115.0 maxDD=384715.5 MFE%=3.86 MAE%=3.89 medMFE%=2.11 medMAE%=2.13 avgHoldMin=1.4 medHoldMin=1.0 top1%=-1.9 top3%=-4.5 top5%=-6.9
+--- Day-level breakdown, horizon=10 (net) ---
+2026-09-08 [NET]: n=621 win%=39.9 avgWin=336.1 avgLoss=-342.1 medWin=190.8 medLoss=-215.5 PF=0.65 expect=-71.3 net=-44268.5 maxDD=47873.5 MFE%=8.21 MAE%=7.66 medMFE%=3.41 medMAE%=3.48 avgHoldMin=1.5 medHoldMin=1.1 top1%=-12.0 top3%=-26.6 top5%=-36.7
+2026-09-09 [NET]: n=993 win%=42.4 avgWin=265.3 avgLoss=-325.9 medWin=194.0 medLoss=-267.5 PF=0.60 expect=-75.3 net=-74742.0 maxDD=76235.5 MFE%=1.65 MAE%=1.75 medMFE%=1.31 medMAE%=1.28 avgHoldMin=1.1 medHoldMin=0.9 top1%=-2.8 top3%=-7.4 top5%=-11.0
+2026-09-10 [NET]: n=485 win%=44.1 avgWin=476.8 avgLoss=-493.3 medWin=356.5 medLoss=-397.5 PF=0.76 expect=-65.3 net=-31665.5 maxDD=42142.0 MFE%=2.87 MAE%=2.85 medMFE%=2.18 medMAE%=2.10 avgHoldMin=1.7 medHoldMin=1.2 top1%=-14.7 top3%=-34.2 top5%=-43.4
+2026-09-11 [NET]: n=1094 win%=42.7 avgWin=370.7 avgLoss=-371.9 medWin=259.0 medLoss=-306.5 PF=0.74 expect=-54.9 net=-60023.0 maxDD=64716.0 MFE%=2.42 MAE%=2.37 medMFE%=1.64 medMAE%=1.80 avgHoldMin=1.2 medHoldMin=0.9 top1%=-4.5 top3%=-11.9 top5%=-18.6
+2026-09-15 [NET]: n=1137 win%=44.2 avgWin=403.7 avgLoss=-426.4 medWin=272.0 medLoss=-319.5 PF=0.75 expect=-59.2 net=-67268.0 maxDD=68391.5 MFE%=6.63 MAE%=7.10 medMFE%=3.87 medMAE%=3.83 avgHoldMin=1.1 medHoldMin=0.9 top1%=-10.8 top3%=-21.2 top5%=-26.5
+2026-09-16 [NET]: n=647 win%=46.4 avgWin=526.4 avgLoss=-614.7 medWin=431.3 medLoss=-553.5 PF=0.74 expect=-85.6 net=-55396.5 maxDD=55396.5 MFE%=2.38 MAE%=2.54 medMFE%=1.81 medMAE%=2.07 avgHoldMin=1.4 medHoldMin=0.9 top1%=-3.7 top3%=-10.4 top5%=-16.0
+2026-09-17 [NET]: n=505 win%=45.5 avgWin=508.0 avgLoss=-570.1 medWin=353.3 medLoss=-430.0 PF=0.75 expect=-79.1 net=-39927.5 maxDD=49436.0 MFE%=3.00 MAE%=2.94 medMFE%=2.38 medMAE%=2.36 avgHoldMin=1.8 medHoldMin=1.7 top1%=-11.0 top3%=-32.0 top5%=-42.8
+2026-09-18 [NET]: n=281 win%=47.0 avgWin=365.0 avgLoss=-396.0 medWin=272.0 medLoss=-319.5 PF=0.82 expect=-38.5 net=-10824.0 maxDD=11643.5 MFE%=3.02 MAE%=2.70 medMFE%=2.49 medMAE%=2.03 avgHoldMin=1.9 medHoldMin=1.6 top1%=-21.1 top3%=-48.3 top5%=-70.2
+Best day by net P&L: 2026-09-18 (-10824.0)
+Excl-2026-09-18 [NET]: n=5482 win%=43.5 avgWin=397.8 avgLoss=-426.4 medWin=272.0 medLoss=-319.5 PF=0.72 expect=-68.1 net=-373291.0 maxDD=373775.0 MFE%=3.90 MAE%=3.95 medMFE%=2.09 medMAE%=2.14 avgHoldMin=1.3 medHoldMin=1.0 top1%=-1.9 top3%=-4.6 top5%=-7.1
+Excl-top1-trade(s) [NET]: n=5762 win%=43.6 avgWin=393.4 avgLoss=-425.0 medWin=272.0 medLoss=-319.5 PF=0.72 expect=-67.9 net=-391368.0 maxDD=391968.5 MFE%=3.83 MAE%=3.88 medMFE%=2.11 medMAE%=2.13 avgHoldMin=1.4 medHoldMin=1.0 top1%=-1.4 top3%=-3.8 top5%=-6.1
+Excl-top3-trade(s) [NET]: n=5760 win%=43.6 avgWin=389.7 avgLoss=-425.0 medWin=272.0 medLoss=-319.5 PF=0.71 expect=-69.7 net=-401441.0 maxDD=402041.5 MFE%=3.75 MAE%=3.88 medMFE%=2.11 medMAE%=2.13 avgHoldMin=1.4 medHoldMin=1.0 top1%=-1.2 top3%=-3.4 top5%=-5.5
+Excl-top5-trade(s) [NET]: n=5758 win%=43.6 avgWin=386.3 avgLoss=-425.0 medWin=272.0 medLoss=-319.5 PF=0.70 expect=-71.3 net=-410675.5 maxDD=411276.0 MFE%=3.74 MAE%=3.88 medMFE%=2.10 medMAE%=2.13 avgHoldMin=1.4 medHoldMin=1.0 top1%=-1.1 top3%=-3.1 top5%=-4.7
+--- Activity x Efficiency interaction check, horizon=10 (net, both directions pooled) ---
+D: High+High (real signal) [NET]: n=5763 win%=43.6 avgWin=396.1 avgLoss=-425.0 medWin=272.0 medLoss=-319.5 PF=0.72 expect=-66.7 net=-384115.0 maxDD=384715.5 MFE%=3.86 MAE%=3.89 medMFE%=2.11 medMAE%=2.13 avgHoldMin=1.4 medHoldMin=1.0 top1%=-1.9 top3%=-4.5 top5%=-6.9
+C: High+Low [NET]: n=2866 win%=41.8 avgWin=367.0 avgLoss=-370.8 medWin=233.0 medLoss=-274.0 PF=0.71 expect=-62.2 net=-178164.5 maxDD=179262.5 MFE%=3.56 MAE%=3.69 medMFE%=1.99 medMAE%=2.08 avgHoldMin=1.5 medHoldMin=1.1 top1%=-7.1 top3%=-12.9 top5%=-17.7
+B: Low+High [NET]: n=2276 win%=43.5 avgWin=427.7 avgLoss=-451.2 medWin=324.0 medLoss=-365.0 PF=0.73 expect=-69.3 net=-157723.5 maxDD=158725.0 MFE%=3.86 MAE%=3.76 medMFE%=2.46 medMAE%=2.62 avgHoldMin=2.6 medHoldMin=2.3 top1%=-8.7 top3%=-13.0 top5%=-16.3
+A: Low+Low [NET]: n=2700 win%=43.6 avgWin=441.7 avgLoss=-440.8 medWin=330.5 medLoss=-361.8 PF=0.78 expect=-55.7 net=-150477.5 maxDD=161708.5 MFE%=3.97 MAE%=3.63 medMFE%=2.66 medMAE%=2.76 avgHoldMin=3.2 medHoldMin=2.9 top1%=-4.9 top3%=-12.1 top5%=-15.2
+--- Random-entry baseline, horizon=10 (net, matched count per day, deterministic stride sample) ---
+RANDOM baseline [NET]: n=5772 win%=42.2 avgWin=398.7 avgLoss=-418.2 medWin=272.0 medLoss=-319.5 PF=0.70 expect=-73.7 net=-425496.5 maxDD=425916.0 MFE%=3.79 MAE%=3.80 medMFE%=2.15 medMAE%=2.31 avgHoldMin=1.9 medHoldMin=1.4 top1%=-3.0 top3%=-5.3 top5%=-7.5
+REAL signal (for comparison) [NET]: n=5763 win%=43.6 avgWin=396.1 avgLoss=-425.0 medWin=272.0 medLoss=-319.5 PF=0.72 expect=-66.7 net=-384115.0 maxDD=384715.5 MFE%=3.86 MAE%=3.89 medMFE%=2.11 medMAE%=2.13 avgHoldMin=1.4 medHoldMin=1.0 top1%=-1.9 top3%=-4.5 top5%=-6.9
+

@@ -67,4 +67,7 @@ public sealed class VolumeBarRow
 
     /// <summary>This bar's own touch-only depth imbalance (<see cref="NiftySignal.Features.TopOfBookImbalanceAccumulator"/>) -- same resting-book SNAPSHOT-average shape as <see cref="FutureDepthImbalance"/>, but Bid1Qty/Ask1Qty only, not the summed 5-level totals. New 2026-09-17, 9th future-side candidate. Null if no depth-bearing tick arrived this bar.</summary>
     public double? TopOfBookImbalance { get; set; }
+
+    /// <summary>Count of raw <see cref="NiftySignal.Domain.Entities.Tick"/> rows (feed messages) observed while this bar was open -- NOT a count of discrete trades, since a Tick row is broker-agnostic and undiscriminated (trade/touchline/depth-only updates all produce one). See <see cref="NiftySignal.Features.VolumeBar.TickCount"/>'s own doc comment for the full semantics caveat. New 2026-09-22, tick-activity research task.</summary>
+    public int TickCount { get; set; }
 }

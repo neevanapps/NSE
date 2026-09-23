@@ -79,8 +79,11 @@ public static class LivePaperTradeExecutor
             return null;
         }
 
+        // Audit finding F62 (2026-09-22) -- NIFTY-filtered, offline follow-up to F61 (this file's
+        // name starts with "Live" but was not in F61's fix list -- confirmed via grep/blame it was
+        // missed). See NiftySignal.Host.LiveFeatureEngine.NiftyUnderlying's own doc comment.
         var chain = await source.Instruments
-            .Where(i => i.AsOfDate == asOfDate && i.InstrumentType == InstrumentType.Option && i.ExpiryDate != null)
+            .Where(i => i.AsOfDate == asOfDate && i.InstrumentType == InstrumentType.Option && i.ExpiryDate != null && i.Underlying == "NIFTY")
             .ToListAsync(ct);
         if (chain.Count == 0)
         {

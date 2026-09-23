@@ -137,6 +137,19 @@ coordinator's explicit request to confirm the Underlying filter is *sufficient o
 downstream change was needed for Stage 2. This was re-verified with Stage 2's actual resolver/
 worker changes in the tree, not assumed to still hold from Stage 1 alone.
 
+## Offline backtest tooling gap (F62, closed 2026-09-22, before any sync pulled mixed-underlying data)
+
+Stage 1 (F61) scoped its fix to the **live** path only. A follow-up pass found the exact same
+unfiltered `Instruments` query pattern throughout the **offline** backtest tooling in
+`NiftySignal.VolumeBarData` (`VolumeBarPopulator.cs`, every `Option*Populator.cs`, `TradeSimulator.cs`,
+`LivePaperTradeExecutor.cs`, the `*TrialSimulator.cs` files, and three ad hoc `Program.cs` CLI
+commands) -- none of it was in scope for F61 since no multi-underlying data existed at the time. Now
+fixed with the same `Underlying == "NIFTY"` template; see `docs/REVIEW_FINDINGS.md`'s F62 entry for
+the full file list and verification. **Practical effect:** `scripts/sync-vm-data-incremental.ps1`
+(or a full `sync-vm-database.ps1`) can now safely pull a day that mixes all three underlyings in
+`Instruments`/`Ticks` without corrupting any offline populator's chain/future resolution -- this was
+not true before this fix.
+
 ## Nifty-regression evidence (Stage 2)
 
 - `dotnet build`: 0 warnings, 0 errors.

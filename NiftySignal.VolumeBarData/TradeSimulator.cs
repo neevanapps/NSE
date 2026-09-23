@@ -729,6 +729,47 @@ public enum VolumeBarMetric
     /// </summary>
     OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransformScoreEma,
 
+    /// <summary>
+    /// 2026-09-22, cross-session rolling-baseline research task
+    /// (docs/VOLUME_BAR_FINDINGS.md's dated "Cross-session rolling-baseline bounded-transform"
+    /// section) -- option (b) flagged, but not built, by the session-z-score task above. Reuses
+    /// <see cref="ComputeOptionsThreeWayScoreBoundedTransform"/> and <see cref="BoundedTransform"/>
+    /// COMPLETELY UNCHANGED (same tanh(z-score) mechanics, same 3 leg formulas, same Max Pain gate,
+    /// same re-rank-through-<c>scoreSmoothMagnitudeRank</c> entry-threshold design) -- the ONLY
+    /// difference from <see cref="OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransform"/> is
+    /// WHAT each leg's <see cref="RunningMeanStd"/> tracker is SEEDED with before the day's own bar
+    /// loop starts: instead of an empty tracker (session-scoped, cold at bar 1), each leg's tracker
+    /// is seeded with that SAME leg's own raw (pre-transform) readings from the last
+    /// <c>rollingWindowDays</c> (default 3, see <c>--rollingdays=</c>) PRIOR POPULATED trading
+    /// days, phase-matched (a prior day's Open-window depth-imbalance readings seed today's Open
+    /// tracker; Mid seeds Mid; Close seeds Close -- never cross-leg). "Prior populated days" means
+    /// the actual distinct <c>AsOfDate</c>s present in <c>VolumeBars</c> before <c>asOfDate</c> at
+    /// this bar threshold, not a fixed calendar lookback -- so a weekend/holiday gap in the real
+    /// data never silently shrinks the effective window. After seeding, today's own bars keep
+    /// accumulating into the SAME tracker exactly as <see cref="BoundedTransform.Compute"/> already
+    /// does (no code change there) -- the baseline is a blend that STARTS from the rolling
+    /// cross-day history and organically grows more session-specific as the day progresses, rather
+    /// than a static, day-long-fixed baseline. Warm-up: a day with fewer than
+    /// <c>rollingWindowDays</c> prior populated days available produces NO trades at all (returns
+    /// an empty list) -- skipped entirely rather than trading against a partially-seeded baseline
+    /// built from fewer days than the chosen window calls for (see the doc's own warm-up-handling
+    /// discussion for why this was chosen over a session-scoped fallback). Off by default, research
+    /// only.
+    /// </summary>
+    OptionsScoreThreeWaySwitchMaxPainConfirmedRollingBoundedTransform,
+
+    /// <summary>
+    /// 2026-09-22, EMA sibling of
+    /// <see cref="OptionsScoreThreeWaySwitchMaxPainConfirmedRollingBoundedTransform"/> -- reuses the
+    /// exact same Part A frozen EMA N=3 machinery (<see cref="ExponentialMean"/>, the
+    /// <c>scoreEmaSmoother</c>/<c>scoreSmoothMagnitudeRank</c> instances shared with every other
+    /// ScoreEma-family candidate) applied on top of the rolling-baseline bounded-transform score
+    /// instead of the session-scoped one. <c>--smoothbars=N</c> (default 3) controls the EMA
+    /// length, <c>--rollingdays=N</c> (default 3) controls the rolling warm-up window -- both
+    /// independently tunable, same convention every other swept parameter in this file follows.
+    /// </summary>
+    OptionsScoreThreeWaySwitchMaxPainConfirmedRollingBoundedTransformScoreEma,
+
     // ===================================================================================
     // 2026-09-22, Part B: CallScore/PutScore pure single-side metric isolation (research
     // only, provisional -- see docs/VOLUME_BAR_FINDINGS.md's dated "Part B" section). Every
@@ -1024,7 +1065,16 @@ public static class TradeSimulator
         // the shared mechanics both this method and SimulateCrossoverDayAsync now implement.
         decimal? tp1ProfitPct = null,
         decimal? tp1Fraction = null,
-        decimal? dailyLossCapPct = null)
+        decimal? dailyLossCapPct = null,
+        // 2026-09-22, cross-session rolling-baseline research task -- only meaningful for
+        // OptionsScoreThreeWaySwitchMaxPainConfirmedRollingBoundedTransform/
+        // ...RollingBoundedTransformScoreEma. How many PRIOR POPULATED trading days' worth of
+        // phase-matched raw readings seed each leg's RunningMeanStd before today's own bar loop
+        // starts (see that enum value's own doc comment). Defaults to 3 -- a structural
+        // window-length constant (CLAUDE.md's "no hardcoded thresholds" rule explicitly carves out
+        // window lengths, same as smoothingWindowBars' own default below), not a decision
+        // threshold. Null/no-op for every other metric.
+        int? rollingWindowDays = null)
     {
         var riskState = new RiskRuleState(tp1ProfitPct, tp1Fraction, dailyLossCapPct);
         // 2026-09-20, item 13 follow-up sweep: lets the 3 FinalScoreSessionWeighted phase weights
@@ -1119,6 +1169,11 @@ public static class TradeSimulator
         // in isOptionsScore3Way" reasoning as isOptionsScore3WaySmoothed above (its own score
         // computation genuinely differs: tanh(session z-score) instead of SignedRank percentile).
         var isOptionsScore3WayBoundedTransform = metric is VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransform or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransformScoreEma;
+        // 2026-09-22, cross-session rolling-baseline research task -- own dispatch branch, same
+        // "does not belong in isOptionsScore3WayBoundedTransform" reasoning (its own trackers are
+        // pre-seeded from prior days before the loop starts; the per-bar formula/tanh mechanics
+        // are otherwise byte-identical, reused via the same ComputeOptionsThreeWayScoreBoundedTransform call).
+        var isOptionsScore3WayRollingBoundedTransform = metric is VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedRollingBoundedTransform or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedRollingBoundedTransformScoreEma;
         var isOptionsScoreConfirmed = metric == VolumeBarMetric.OptionsScoreThreeWaySwitchConfirmed;
         var isOptionsScoreEarlyConviction = metric == VolumeBarMetric.OptionsScoreThreeWaySwitchEarlyConviction;
         // Both whipsaw-reduction candidates keep the exact same Max Pain confirmation gate as the
@@ -1133,7 +1188,9 @@ public static class TradeSimulator
             or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold
             or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedCallPutAgreementConfirmed
             or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransform
-            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransformScoreEma;
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransformScoreEma
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedRollingBoundedTransform
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedRollingBoundedTransformScoreEma;
         var isOptionsScore3WayOiOpen = metric == VolumeBarMetric.OptionsScoreThreeWaySwitchOiOpen;
         var isOptionsScore3WayVolMid = metric == VolumeBarMetric.OptionsScoreThreeWaySwitchVolMid;
         // 2026-09-20, Phase 5 plan items 10-13: the first-ever FuturesScore + OptionsScore
@@ -1160,7 +1217,7 @@ public static class TradeSimulator
         var isPartBWingMetric = metric is VolumeBarMetric.CallWingIvChangeRaw or VolumeBarMetric.PutWingIvChangeRaw;
         var isAtmIvMetric = metric is VolumeBarMetric.AtmIvChangeRaw or VolumeBarMetric.AtmIvChangePriceSigned or VolumeBarMetric.AtmIvAcceleration
             or VolumeBarMetric.CallIvChangeRaw or VolumeBarMetric.PutIvChangeRaw or VolumeBarMetric.CallIvChangePriceSigned or VolumeBarMetric.PutIvChangePriceSigned
-            || isOptionsScoreBlend || isOptionsScoreSwitch || isOptionsScore3Way || isOptionsScore3WaySmoothed || isOptionsScore3WayBoundedTransform || isOptionsScore3WayOiOpen || isOptionsScore3WayVolMid || isFinalScoreCombo || isPartBCombo;
+            || isOptionsScoreBlend || isOptionsScoreSwitch || isOptionsScore3Way || isOptionsScore3WaySmoothed || isOptionsScore3WayBoundedTransform || isOptionsScore3WayRollingBoundedTransform || isOptionsScore3WayOiOpen || isOptionsScore3WayVolMid || isFinalScoreCombo || isPartBCombo;
         Dictionary<int, OptionAtmBarRow>? optionAtmByBarIndex = null;
         if (isAtmIvMetric && rollingSubBarThreshold is null)
         {
@@ -1225,7 +1282,7 @@ public static class TradeSimulator
         // independent of whatever bandWidth is passed for the other band-based components --
         // TobDivergence stays at bandWidth (its own locked ATM±1) via optionDepthByBarIndex above.
         Dictionary<int, OptionDepthBarRow>? optionDepthWideByBarIndex = null;
-        if ((isOptionsScoreBlend || isOptionsScoreSwitch || isOptionsScore3Way || isOptionsScore3WaySmoothed || isOptionsScore3WayBoundedTransform || isOptionsScore3WayVolMid || isFinalScoreCombo) && rollingSubBarThreshold is null)
+        if ((isOptionsScoreBlend || isOptionsScoreSwitch || isOptionsScore3Way || isOptionsScore3WaySmoothed || isOptionsScore3WayBoundedTransform || isOptionsScore3WayRollingBoundedTransform || isOptionsScore3WayVolMid || isFinalScoreCombo) && rollingSubBarThreshold is null)
         {
             optionDepthWideByBarIndex = bandWidth == 5 && optionDepthByBarIndex is not null
                 ? optionDepthByBarIndex
@@ -1234,8 +1291,10 @@ public static class TradeSimulator
                     .ToDictionaryAsync(b => b.BarIndex, cancellationToken);
         }
 
+        // Audit finding F62 (2026-09-22) -- NIFTY-filtered, offline follow-up to F61. See
+        // NiftySignal.Host.LiveFeatureEngine.NiftyUnderlying's own doc comment.
         var allOptions = await source.Instruments
-            .Where(i => i.AsOfDate == asOfDate && i.InstrumentType == InstrumentType.Option && i.ExpiryDate != null)
+            .Where(i => i.AsOfDate == asOfDate && i.InstrumentType == InstrumentType.Option && i.ExpiryDate != null && i.Underlying == "NIFTY")
             .ToListAsync(cancellationToken);
 
         if (allOptions.Count == 0)
@@ -1461,6 +1520,86 @@ public static class TradeSimulator
         var boundedIvMidStats = new RunningMeanStd();
         var boundedIvCloseStats = new RunningMeanStd();
 
+        // 2026-09-22, cross-session rolling-baseline research task -- only meaningful for
+        // OptionsScoreThreeWaySwitchMaxPainConfirmedRollingBoundedTransform/
+        // ...RollingBoundedTransformScoreEma. Own RunningMeanStd per leg (separate instances from
+        // boundedDepthStats/etc above -- mutually exclusive per call, same isolation convention
+        // every other tracker set in this file follows), SEEDED below (before the main bar loop)
+        // with phase-matched raw readings from the last effectiveRollingWindowDays prior POPULATED
+        // trading days, then left to keep accumulating today's own bars on top exactly like
+        // BoundedTransform.Compute already does -- see the enum value's own doc comment for the
+        // full design rationale (why seeding rather than a wholesale new mechanism; why "prior
+        // populated days" rather than a fixed calendar lookback; why a blend rather than a
+        // static-for-the-day baseline).
+        var boundedRollingDepthStats = new RunningMeanStd();
+        var boundedRollingIvMidStats = new RunningMeanStd();
+        var boundedRollingIvCloseStats = new RunningMeanStd();
+        if (isOptionsScore3WayRollingBoundedTransform)
+        {
+            var effectiveRollingWindowDays = rollingWindowDays ?? 3;
+            // 2026-09-22 fix: "prior populated days" must mean days with the OPTIONS tables
+            // (OptionAtmBars) actually populated, not merely VolumeBars -- the futures table has
+            // at least one earlier date (2026-09-04) with no matching options data, which would
+            // otherwise silently count as a warm-up day while contributing zero real readings to
+            // any leg, making the effective window thinner than the warm-up check believes it is.
+            var priorPopulatedDays = await volumeBarDb.OptionAtmBars
+                .Where(b => b.AsOfDate < asOfDate && b.BarVolumeThreshold == barVolumeThreshold)
+                .Select(b => b.AsOfDate)
+                .Distinct()
+                .OrderByDescending(d => d)
+                .Take(effectiveRollingWindowDays)
+                .ToListAsync(cancellationToken);
+
+            if (priorPopulatedDays.Count < effectiveRollingWindowDays)
+            {
+                // Warm-up handling (documented on the enum value and in
+                // docs/VOLUME_BAR_FINDINGS.md's dated "Cross-session rolling-baseline
+                // bounded-transform" section): fewer prior populated days available than the
+                // chosen window calls for -- this day is skipped ENTIRELY (no trades at all)
+                // rather than trading against a partially-seeded baseline built from fewer days
+                // than the design calls for.
+                return [];
+            }
+
+            foreach (var priorDay in priorPopulatedDays)
+            {
+                var priorBars = await volumeBarDb.VolumeBars
+                    .Where(b => b.AsOfDate == priorDay && b.BarVolumeThreshold == barVolumeThreshold)
+                    .OrderBy(b => b.BarIndex)
+                    .ToListAsync(cancellationToken);
+                if (priorBars.Count == 0)
+                {
+                    continue;
+                }
+
+                var priorAtmByBarIndex = await volumeBarDb.OptionAtmBars
+                    .Where(b => b.AsOfDate == priorDay && b.BarVolumeThreshold == barVolumeThreshold)
+                    .ToDictionaryAsync(b => b.BarIndex, cancellationToken);
+                // Always band=5 (matches this task's own reproduction commands, which fix
+                // --band=5 for every options-3-way run) -- the historical seed must use the same
+                // band the locked baseline/every sibling bounded-transform metric trades against.
+                var priorDepthWideByBarIndex = await volumeBarDb.OptionDepthBars
+                    .Where(b => b.AsOfDate == priorDay && b.BarVolumeThreshold == barVolumeThreshold && b.BandWidth == 5)
+                    .ToDictionaryAsync(b => b.BarIndex, cancellationToken);
+
+                var priorLegs = CollectThreeWayRawLegReadings(priorBars, priorAtmByBarIndex, priorDepthWideByBarIndex, effectiveOptionsSwitchTime);
+                foreach (var v in priorLegs.Open)
+                {
+                    boundedRollingDepthStats.Add(v);
+                }
+
+                foreach (var v in priorLegs.Mid)
+                {
+                    boundedRollingIvMidStats.Add(v);
+                }
+
+                foreach (var v in priorLegs.Close)
+                {
+                    boundedRollingIvCloseStats.Add(v);
+                }
+            }
+        }
+
         // Only meaningful for OptionsScoreThreeWaySwitchOiOpen -- same Mid/Close legs as the
         // 3-way switch (own trackers, not shared, mutually exclusive per call), OI Delta drives
         // Open instead of Depth Imbalance.
@@ -1618,6 +1757,18 @@ public static class TradeSimulator
                 // below, same dispatch-order lesson as every other blend/switch metric in this chain.
                 score = ComputeOptionsThreeWayScoreBoundedTransform(bar, previousClose, optionAtmByBarIndex, optionDepthWideByBarIndex,
                     effectiveOptionsSwitchTime, ref previousAtmIv, boundedDepthStats, boundedIvMidStats, boundedIvCloseStats);
+            }
+            else if (isOptionsScore3WayRollingBoundedTransform)
+            {
+                // 2026-09-22, cross-session rolling-baseline research task -- MUST be checked
+                // before isAtmIvMetric below, same dispatch-order lesson as every other blend/
+                // switch metric in this chain. Reuses ComputeOptionsThreeWayScoreBoundedTransform
+                // COMPLETELY UNCHANGED -- the only difference from the isOptionsScore3WayBoundedTransform
+                // branch above is which RunningMeanStd instances are passed in: these were
+                // pre-seeded with prior-day rolling history before the loop started (see that
+                // seeding block, above the tracker declarations).
+                score = ComputeOptionsThreeWayScoreBoundedTransform(bar, previousClose, optionAtmByBarIndex, optionDepthWideByBarIndex,
+                    effectiveOptionsSwitchTime, ref previousAtmIv, boundedRollingDepthStats, boundedRollingIvMidStats, boundedRollingIvCloseStats);
             }
             else if (isOptionsScore3WayOiOpen)
             {
@@ -2048,7 +2199,8 @@ public static class TradeSimulator
                 scaledScore = scoreSmaSmoother.Observe(scaledScore);
             }
             else if (metric is VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold
-                or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransformScoreEma)
+                or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransformScoreEma
+                or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedRollingBoundedTransformScoreEma)
             {
                 // 2026-09-22, best-smoother + MinHold=3 combination: the EmaMinHold metric shares
                 // this same EMA smoother instance/branch as the standalone ScoreEma metric (only the
@@ -2064,7 +2216,8 @@ public static class TradeSimulator
                 : metric == VolumeBarMetric.OptionsScoreBlend ? blendMagnitudeRank
                 : metric is VolumeBarMetric.FinalScoreDteWeighted or VolumeBarMetric.FinalScoreSessionWeighted ? comboMagnitudeRank
                 : metric is VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreSma or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold
-                    or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransform or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransformScoreEma ? scoreSmoothMagnitudeRank
+                    or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransform or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransformScoreEma
+                    or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedRollingBoundedTransform or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedRollingBoundedTransformScoreEma ? scoreSmoothMagnitudeRank
                 : metric is VolumeBarMetric.CallScoreStandalone or VolumeBarMetric.PutScoreStandalone or VolumeBarMetric.CallPutScoreAgreement ? comboMagnitudeRankPartB
                 : trendMagnitudeRank;
             var percentile = EntryPercentile(metric, scaledScore, magnitudeRank);
@@ -2220,8 +2373,10 @@ public static class TradeSimulator
             return [];
         }
 
+        // Audit finding F62 (2026-09-22) -- NIFTY-filtered, offline follow-up to F61. See
+        // NiftySignal.Host.LiveFeatureEngine.NiftyUnderlying's own doc comment.
         var allOptions = await source.Instruments
-            .Where(i => i.AsOfDate == asOfDate && i.InstrumentType == InstrumentType.Option && i.ExpiryDate != null)
+            .Where(i => i.AsOfDate == asOfDate && i.InstrumentType == InstrumentType.Option && i.ExpiryDate != null && i.Underlying == "NIFTY")
             .ToListAsync(cancellationToken);
 
         if (allOptions.Count == 0)
@@ -2807,6 +2962,67 @@ public static class TradeSimulator
     }
 
     /// <summary>
+    /// 2026-09-22, cross-session rolling-baseline research task -- pure, DB-free replay of the SAME
+    /// 3 raw (pre-transform) leg formulas <see cref="ComputeOptionsThreeWayScoreBoundedTransform"/>
+    /// computes per bar (Open: negated depth-imbalance ratio; Mid: price-signed ΔIV; Close: raw
+    /// ΔIV), phase-matched into 3 separate lists by the bar's own IST time-of-day, in the exact
+    /// same self-inclusion-safe/no-look-ahead order (previousAtmIv/previousClose only ever reflect
+    /// bars strictly earlier than the one being read). Used to collect a PRIOR trading day's own
+    /// raw readings so they can seed that leg's <see cref="RunningMeanStd"/> for a LATER day's
+    /// rolling baseline -- deliberately factored out as its own testable, side-effect-free function
+    /// (no RunningMeanStd/tanh here at all) rather than duplicating the formulas inline at both call
+    /// sites, so a synthetic multi-bar/multi-day test can verify the phase-matching and ordering
+    /// without touching a database.
+    /// </summary>
+    internal static (List<double> Open, List<double> Mid, List<double> Close) CollectThreeWayRawLegReadings(
+        IReadOnlyList<VolumeBarRow> bars,
+        Dictionary<int, OptionAtmBarRow>? optionAtmByBarIndex,
+        Dictionary<int, OptionDepthBarRow>? optionDepthWideByBarIndex,
+        TimeSpan effectiveOptionsSwitchTime)
+    {
+        var openReadings = new List<double>();
+        var midReadings = new List<double>();
+        var closeReadings = new List<double>();
+        double? previousAtmIv = null;
+        decimal? previousClose = null;
+
+        foreach (var bar in bars)
+        {
+            var currentAtmIv = optionAtmByBarIndex is not null && optionAtmByBarIndex.TryGetValue(bar.BarIndex, out var atmBar) ? atmBar.AtmIv : null;
+            var wideDepthBar = optionDepthWideByBarIndex is not null && optionDepthWideByBarIndex.TryGetValue(bar.BarIndex, out var wdb) ? wdb : null;
+            var timeOfDay = IstTimeOfDay(bar.EndTimestamp);
+
+            if (timeOfDay < effectiveOptionsSwitchTime)
+            {
+                if (wideDepthBar is not null
+                    && ComputeImbalanceRatio(wideDepthBar.CallBidQtyAvg + wideDepthBar.PutBidQtyAvg, wideDepthBar.CallAskQtyAvg + wideDepthBar.PutAskQtyAvg) is { } depthRatio)
+                {
+                    openReadings.Add(-depthRatio);
+                }
+            }
+            else if (timeOfDay < MidCloseSwitchTime)
+            {
+                if (previousAtmIv is { } prevIvMid && currentAtmIv is { } curIvMid && previousClose is { } prevCloseMid)
+                {
+                    midReadings.Add(-Math.Sign(bar.ClosePrice - prevCloseMid) * (curIvMid - prevIvMid));
+                }
+            }
+            else
+            {
+                if (previousAtmIv is { } prevIvClose && currentAtmIv is { } curIvClose)
+                {
+                    closeReadings.Add(curIvClose - prevIvClose);
+                }
+            }
+
+            previousAtmIv = currentAtmIv ?? previousAtmIv;
+            previousClose = bar.ClosePrice;
+        }
+
+        return (openReadings, midReadings, closeReadings);
+    }
+
+    /// <summary>
     /// Entry-time gate for <see cref="VolumeBarMetric.SessionGatedDepthDurationConfirmed"/> -- a
     /// no-op (always true) for every other metric. During the open (before 10:00 IST) a new
     /// position additionally requires TopOfBookImbalance's own score to agree in sign with the
@@ -2831,7 +3047,9 @@ public static class TradeSimulator
             or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma
             or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold
             or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransform
-            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransformScoreEma)
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransformScoreEma
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedRollingBoundedTransform
+            or VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedRollingBoundedTransformScoreEma)
         {
             // 2026-09-20, Phase 5 prep item 8 -- see this enum value's own doc comment. Applied
             // all day, same as item 6's Skew Change gate, for a like-for-like comparison. Logic
@@ -2920,6 +3138,7 @@ public static class TradeSimulator
             && metric != VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreSma && metric != VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEma
             && metric != VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedScoreEmaMinHold
             && metric != VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransform && metric != VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedBoundedTransformScoreEma
+            && metric != VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedRollingBoundedTransform && metric != VolumeBarMetric.OptionsScoreThreeWaySwitchMaxPainConfirmedRollingBoundedTransformScoreEma
             && metric != VolumeBarMetric.CallScoreStandalone && metric != VolumeBarMetric.PutScoreStandalone && metric != VolumeBarMetric.CallPutScoreAgreement)
         {
             // Already a percentile by construction (SignedRank) -- no second rank layer.
@@ -2935,6 +3154,232 @@ public static class TradeSimulator
         magnitudeRank.Add(magnitude);
         return rank;
     }
+
+    /// <summary>
+    /// 2026-09-22, option-price moving-average-crossover research task (docs/VOLUME_BAR_FINDINGS.md's
+    /// dated section) -- crosses the ATM (or band-averaged) option's own RAW PREMIUM, not any
+    /// derived score, unlike <see cref="SimulateCrossoverDayAsync"/>. A wholly separate method
+    /// (not a new branch in that method or in <see cref="ComputeScore"/>'s dispatch chain) so this
+    /// research work carries zero risk of the recurring dispatch-order bug this project has hit
+    /// before -- the locked score-crossover path is untouched.
+    ///
+    /// <paramref name="side"/> selects which standalone signal to trade:
+    /// <see cref="PriceCrossoverSide.Call"/> tracks only the Call premium's own fast/slow SMA and
+    /// trades only Calls (enter on a crossed-up i.e. rising-momentum bar, exit on a crossed-down
+    /// reversal -- a falling Call premium is a reason to get flat, not a reason to buy a Put, since
+    /// this is a single-instrument momentum read, not a paired directional score);
+    /// <see cref="PriceCrossoverSide.Put"/> mirrors this for the Put premium/Put side; and
+    /// <see cref="PriceCrossoverSide.DualAgreement"/> requires BOTH conditions on the SAME bar --
+    /// Call fast crosses above Call slow (bullish call-side momentum) AND Put fast crosses below Put
+    /// slow (bearish put-side momentum, i.e. put premium deflating) -- before entering a Call
+    /// (the direction both sides agree on), exiting on whichever side's reversal condition fires
+    /// first. <paramref name="putFastBars"/>/<paramref name="putSlowBars"/> let the dual mode use a
+    /// different window pair for the Put leg than <paramref name="fastBars"/>/<paramref name="slowBars"/>
+    /// (the Call leg) when the two sides' independently-best windows differ -- null means "same as
+    /// the Call leg's windows," the common case.
+    ///
+    /// <paramref name="bandWidth"/> null means single-ATM-strike price (the base case); a value
+    /// (3 = ATM+/-1, 5 = ATM+/-2, same convention as <see cref="OptionDepthPopulator"/>) averages
+    /// that many strikes' own real prices at each bar instead.
+    /// </summary>
+    public static async Task<List<VolumeBarTrade>> SimulatePriceCrossoverDayAsync(
+        NiftySignalDbContext source, VolumeBarDbContext volumeBarDb, DateOnly asOfDate, long barVolumeThreshold,
+        PriceCrossoverSide side, int fastBars, int slowBars, double thresholdFraction, CancellationToken cancellationToken,
+        Dictionary<(DateOnly, string), OptionPriceSeries>? sharedPriceCache = null,
+        int? bandWidth = null, int? putFastBars = null, int? putSlowBars = null)
+    {
+        var bars = await volumeBarDb.VolumeBars
+            .Where(b => b.AsOfDate == asOfDate && b.BarVolumeThreshold == barVolumeThreshold)
+            .OrderBy(b => b.BarIndex)
+            .ToListAsync(cancellationToken);
+
+        if (bars.Count == 0)
+        {
+            return [];
+        }
+
+        // Audit finding F62 (2026-09-22) -- NIFTY-filtered, deterministic ordering, same follow-up
+        // discipline every other query against Instruments in this file now applies.
+        var allOptions = await source.Instruments
+            .Where(i => i.AsOfDate == asOfDate && i.InstrumentType == InstrumentType.Option && i.ExpiryDate != null && i.Underlying == "NIFTY")
+            .OrderBy(i => i.StrikePrice).ThenBy(i => i.OptionType)
+            .ToListAsync(cancellationToken);
+
+        if (allOptions.Count == 0)
+        {
+            return [];
+        }
+
+        var nearestExpiry = allOptions.Select(o => o.ExpiryDate!.Value).Min();
+        var chain = allOptions.Where(o => o.ExpiryDate == nearestExpiry).ToList();
+        var callStrikesSorted = chain.Where(o => o.OptionType == OptionType.Call).Select(o => o.StrikePrice!.Value).Distinct().OrderBy(s => s).ToList();
+        var putStrikesSorted = chain.Where(o => o.OptionType == OptionType.Put).Select(o => o.StrikePrice!.Value).Distinct().OrderBy(s => s).ToList();
+
+        var dayStart = bars[0].StartTimestamp;
+        var dayEnd = bars[^1].EndTimestamp;
+
+        var priceCache = sharedPriceCache ?? new Dictionary<(DateOnly, string), OptionPriceSeries>();
+        async Task<OptionPriceSeries> GetSeriesAsync(string token)
+        {
+            var key = (asOfDate, token);
+            if (priceCache.TryGetValue(key, out var cached))
+            {
+                return cached;
+            }
+
+            var series = await OptionPriceSeries.LoadAsync(source, token, dayStart, dayEnd, cancellationToken);
+            priceCache[key] = series;
+            return series;
+        }
+
+        Domain.Entities.Instrument? PickAtm(OptionType optSide, decimal futurePrice) => AtmStrikeSelector.PickAtm(chain, optSide, futurePrice);
+
+        // Band-averaged price (2026-09-22, "if possible" band-width variant) -- same ATM+/-N strike
+        // count as OptionDepthPopulator's own BandWidth convention (3 = ATM+/-1 = 3 strikes,
+        // 5 = ATM+/-2 = 5 strikes), but averaging each strike's own REAL last-traded premium at this
+        // bar's timestamp (there is no existing "average price across a band" field anywhere in this
+        // project -- OptionDepthBarRow only aggregates resting QUANTITY, never price -- so this is
+        // computed fresh here from the ATM strike's ordinal position in the sorted strike list).
+        async Task<double?> GetPriceAsync(OptionType optSide, decimal futurePrice, DateTimeOffset atTime)
+        {
+            var atm = PickAtm(optSide, futurePrice);
+            if (atm is null)
+            {
+                return null;
+            }
+
+            if (bandWidth is not { } bw)
+            {
+                var atmSeries = await GetSeriesAsync(atm.Token);
+                var atmPrice = atmSeries.PriceAtOrBefore(atTime);
+                return atmPrice is { } ap && ap > 0 ? (double)ap : null;
+            }
+
+            var strikesSorted = optSide == OptionType.Call ? callStrikesSorted : putStrikesSorted;
+            var atmIndex = strikesSorted.IndexOf(atm.StrikePrice!.Value);
+            if (atmIndex < 0)
+            {
+                return null;
+            }
+
+            var half = (bw - 1) / 2;
+            var loIndex = Math.Max(0, atmIndex - half);
+            var hiIndex = Math.Min(strikesSorted.Count - 1, atmIndex + half);
+            var prices = new List<double>();
+            for (var idx = loIndex; idx <= hiIndex; idx++)
+            {
+                var strike = strikesSorted[idx];
+                var instrument = chain.First(o => o.OptionType == optSide && o.StrikePrice == strike);
+                var series = await GetSeriesAsync(instrument.Token);
+                var price = series.PriceAtOrBefore(atTime);
+                if (price is { } pr && pr > 0)
+                {
+                    prices.Add((double)pr);
+                }
+            }
+
+            return prices.Count > 0 ? prices.Average() : null;
+        }
+
+        var callEngine = new PriceCrossoverEngine(fastBars, slowBars);
+        var putEngine = side == PriceCrossoverSide.Call
+            ? null
+            : new PriceCrossoverEngine(putFastBars ?? fastBars, putSlowBars ?? slowBars);
+
+        var trades = new List<VolumeBarTrade>();
+        (DateTimeOffset EntryTime, decimal EntryPrice, OptionType Side, decimal StrikePrice, string Token, double EntryScore)? open = null;
+
+        for (var i = 0; i < bars.Count; i++)
+        {
+            var bar = bars[i];
+            var isLastBar = i == bars.Count - 1;
+
+            PriceCrossoverEngine.Step? callStep = side != PriceCrossoverSide.Put
+                ? callEngine.Observe(await GetPriceAsync(OptionType.Call, bar.ClosePrice, bar.EndTimestamp), thresholdFraction)
+                : null;
+            PriceCrossoverEngine.Step? putStep = side != PriceCrossoverSide.Call
+                ? putEngine!.Observe(await GetPriceAsync(OptionType.Put, bar.ClosePrice, bar.EndTimestamp), thresholdFraction)
+                : null;
+
+            var entrySignal = false;
+            var exitSignal = false;
+            var entryDiagnostic = 0.0;
+            switch (side)
+            {
+                case PriceCrossoverSide.Call:
+                    entrySignal = callStep is { CrossedUp: true };
+                    exitSignal = callStep is { CrossedDown: true };
+                    entryDiagnostic = callStep?.DiffFraction * 100.0 ?? 0.0;
+                    break;
+                case PriceCrossoverSide.Put:
+                    entrySignal = putStep is { CrossedUp: true };
+                    exitSignal = putStep is { CrossedDown: true };
+                    entryDiagnostic = putStep?.DiffFraction * 100.0 ?? 0.0;
+                    break;
+                case PriceCrossoverSide.DualAgreement:
+                    // Looser/faster exit (2026-09-22 "four sets" task, set 4): EITHER leg reversing
+                    // is enough to exit -- this is the pre-existing DualAgreement behavior, unchanged.
+                    entrySignal = callStep is { CrossedUp: true } && putStep is { CrossedDown: true };
+                    exitSignal = callStep is { CrossedDown: true } || putStep is { CrossedUp: true };
+                    entryDiagnostic = (callStep?.DiffFraction * 100.0 ?? 0.0) - (putStep?.DiffFraction * 100.0 ?? 0.0);
+                    break;
+                case PriceCrossoverSide.DualAgreementBothExit:
+                    // Stricter/symmetric exit (2026-09-22 "four sets" task, set 3): same entry gate as
+                    // DualAgreement, but BOTH legs must reverse (call crosses down AND put crosses up)
+                    // before exiting -- a lone leg's reversal is tolerated as noise as long as the
+                    // other leg still agrees. New variant, not a change to DualAgreement's own
+                    // pre-existing semantics.
+                    entrySignal = callStep is { CrossedUp: true } && putStep is { CrossedDown: true };
+                    exitSignal = callStep is { CrossedDown: true } && putStep is { CrossedUp: true };
+                    entryDiagnostic = (callStep?.DiffFraction * 100.0 ?? 0.0) - (putStep?.DiffFraction * 100.0 ?? 0.0);
+                    break;
+            }
+
+            if (open is { } position)
+            {
+                var series = await GetSeriesAsync(position.Token);
+                var currentPrice = series.PriceAtOrBefore(bar.EndTimestamp) ?? position.EntryPrice;
+                var timedOut = IstTimeOfDay(bar.EndTimestamp) >= ForceCloseAt;
+
+                if (exitSignal || timedOut || isLastBar)
+                {
+                    var exitReason = timedOut ? "TimeCutoff" : isLastBar ? "EndOfData" : "CrossoverReversed";
+                    trades.Add(new VolumeBarTrade(position.EntryTime, position.EntryPrice, position.Side, position.StrikePrice,
+                        bar.EndTimestamp, currentPrice, exitReason, position.EntryScore));
+                    open = null;
+                }
+            }
+            else if (!isLastBar && entrySignal
+                && IstTimeOfDay(bar.EndTimestamp) >= EntryWindowStart && IstTimeOfDay(bar.EndTimestamp) <= EntryWindowEnd)
+            {
+                // Dual-agreement always trades the Call side (the direction both legs agree on --
+                // see this method's own doc comment); standalone Call/Put trade their own side.
+                var tradeSide = side == PriceCrossoverSide.Put ? OptionType.Put : OptionType.Call;
+                var atm = PickAtm(tradeSide, bar.ClosePrice);
+                if (atm is not null)
+                {
+                    var atmSeries = await GetSeriesAsync(atm.Token);
+                    var entryPrice = atmSeries.PriceAtOrBefore(bar.EndTimestamp);
+                    if (entryPrice is { } ep && ep > 0)
+                    {
+                        open = (bar.EndTimestamp, ep, tradeSide, atm.StrikePrice!.Value, atm.Token, entryDiagnostic);
+                    }
+                }
+            }
+        }
+
+        return trades;
+    }
+}
+
+/// <summary>Which standalone/combined option-price crossover signal <see cref="TradeSimulator.SimulatePriceCrossoverDayAsync"/> trades -- see that method's own doc comment.</summary>
+public enum PriceCrossoverSide
+{
+    Call,
+    Put,
+    DualAgreement,
+    /// <summary>2026-09-22 "four sets" task, set 3 -- same entry gate as <see cref="DualAgreement"/>, but BOTH legs must reverse to exit (stricter/symmetric).</summary>
+    DualAgreementBothExit,
 }
 
 /// <summary>

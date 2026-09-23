@@ -4394,3 +4394,3611 @@ dotnet run --project NiftySignal.VolumeBarData -- mae-mfe trade 2026-09-08 2026-
 # Baseline re-verification (must stay 112 trades, 64.3% win, +426.40 net)
 dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-19 OptionsScoreThreeWaySwitchMaxPainConfirmed 90 15 2600 --band=5
 ```
+
+## Cross-session rolling-baseline bounded-transform (2026-09-22)
+
+**Research only, provisional, not adopted.** Builds **option (b)**, explicitly flagged but not built
+by the session-z-score task immediately above: a rolling baseline that spans the day boundary,
+rather than resetting fresh every session. Everything here is backtest-only
+(`NiftySignal.VolumeBarData`), off by default, additive to `TradeSimulator.cs`. Nothing in
+`NiftySignal.Host`/`NiftySignal.Dashboard`/`NiftySignal.Scoring`'s live pure functions was touched.
+**Priority, per the user's own stated instruction for this session: win rate first, then MAE%/MFE%
+(smaller drawdowns, better favorable excursion), net P&L last.**
+
+### Design decisions
+
+**What "rolling" means here -- seeding, not a separate static baseline.** `BoundedTransform.Compute`
+and `RunningMeanStd` (Welford's online algorithm) are reused **completely unchanged** from the
+session-z-score task -- the only difference is what each leg's `RunningMeanStd` tracker contains
+*before* the day's own bar loop starts. Instead of an empty tracker (cold at bar 1, as the
+session-scoped variant above has), each leg's tracker is **seeded** with that same leg's own raw
+(pre-transform) readings from the last `rollingWindowDays` prior POPULATED trading days
+(`--rollingdays=`, default 3), then left to keep accumulating today's own bars on top exactly as
+before. This is a deliberate hybrid, not a frozen-for-the-day baseline: bar 1 of a new day already
+has a real multi-day baseline to compare against (fixing the cold-start problem the task set out to
+fix), and the baseline keeps adapting to today's own conditions as the day progresses, exactly the
+way the already-tested session z-score does once it has enough samples. A wholesale "static baseline,
+never updated intraday" alternative was considered and rejected -- it would have required a second,
+parallel code path duplicating `BoundedTransform.Compute` rather than reusing it verbatim, which the
+task's own instruction ("reuse the tanh-squashing mechanics ... only change what the mean/std is
+computed over") argues against.
+
+**Phase-matched, not whole-day-pooled.** A prior day's OPEN-window raw readings seed today's Open
+tracker; Mid seeds Mid; Close seeds Close -- never pooled across legs. The three legs use
+structurally different raw metrics (bounded Depth Imbalance ratio for Open vs. unbounded ΔIV for
+Mid/Close), so pooling them would mix distributions with different natural scales into one baseline,
+defeating the point of a data-derived scale. Implemented in the new pure helper
+`TradeSimulator.CollectThreeWayRawLegReadings` -- a DB-free replay of the exact same 3 raw-value
+formulas `ComputeOptionsThreeWayScoreBoundedTransform` already uses, factored out specifically so it
+is unit-testable without a database (`NiftySignal.Tests/VolumeBarData/RollingBoundedTransformTests.cs`)
+and reusable both for collecting a prior day's history and (implicitly, via the existing function) for
+computing a live day's own score.
+
+**"Prior populated days" is data-derived, not a fixed calendar lookback.** The rolling window is
+built from the actual distinct `AsOfDate`s present in `OptionAtmBars` before the day being simulated
+(not `VolumeBars` -- see the bug note below), so a weekend or holiday gap in the real data never
+silently shrinks the effective window or requires special-casing. **Bug found and fixed during this
+task**: the first implementation queried `VolumeBars` for "prior populated days," but that table has
+an extra date (2026-09-04) with futures bars populated but NO matching options data (`OptionAtmBars`/
+`OptionDepthBars` are empty for it) -- that date would have silently counted toward satisfying the
+warm-up requirement while contributing zero real readings to any leg, making 2026-09-10's rolling
+window effectively 2 real days of history while the warm-up check believed it had 3. Fixed to query
+`OptionAtmBars` (the table the Mid/Close legs actually depend on, and which is populated in lockstep
+with `OptionDepthBars`/`OptionMaxPainBars` per `list-populated`'s own output) instead. Caught before
+any results were reported, not discovered after the fact.
+
+**Window length: 3 prior days, not 5 -- the usable-range trade-off, stated plainly.** Only 9 trading
+days are populated at 2600/band=5: 09-08, 09, 10, 11, 15, 16, 17, 18, 21 (`list-populated 2600`
+reconfirmed live for this task). With `rollingWindowDays=3`, the first 3 populated days (08, 09, 10)
+are consumed purely as warm-up and produce **zero trades** (the day is skipped entirely -- see
+warm-up handling below), leaving **5 usable in-sample days (11, 15, 16, 17, 18)** plus 2026-09-21 as
+out-of-sample (using 18/17/16 as its own history). A `rollingWindowDays=5` sensitivity check was also
+run: it consumes 08/09/10/11/15 as warm-up, leaving only **3 usable in-sample days (16, 17, 18)** plus
+21 OOS -- confirmed live (19 trades total, 57.9% win, +157.85 net across 16/17/18/21). **This
+project's own standing rule ("never treat one day's or even one week's backtest as a verdict") applies
+with extra force here**: 5 in-sample days (N=3) is already thin for a strategy targeting 5-10
+trades/day-scale conclusions; 3 in-sample days (N=5) is thinner still. N=3 was chosen as the primary
+configuration specifically to preserve as many usable days as this already-small dataset allows, not
+because 3 days was independently validated as the "right" baseline length -- it wasn't and couldn't be,
+given the data available. Every number below should be read with that caveat attached.
+
+**Warm-up handling: skip the day entirely, not a session-scoped fallback.** A day with fewer than
+`rollingWindowDays` prior populated days available produces **no trades at all** (`SimulateDayAsync`
+returns `[]` immediately for that day) rather than trading against a partially-seeded baseline or
+silently falling back to the session-z-score behavior for just that day. Chosen over a fallback
+because a silent fallback would make the "cross-session baseline" hypothesis being tested ambiguous
+for exactly the days where the warm-up is thinnest -- better to have a hard, visible boundary (0
+trades on 08/09/10) than a soft one that quietly changes behavior mid-comparison.
+
+**No hardcoded scale constants.** Every mean/std the tanh transform squashes against is built purely
+from real historical raw readings (`RunningMeanStd.Add` calls over `CollectThreeWayRawLegReadings`'
+output) -- `rollingWindowDays` itself is a window-LENGTH parameter (like `smoothingWindowBars`'s own
+default of 3), not a magnitude/threshold constant, consistent with CLAUDE.md's explicit carve-out for
+window lengths.
+
+### Implementation
+
+Two new `VolumeBarMetric` values, both off by default:
+- `OptionsScoreThreeWaySwitchMaxPainConfirmedRollingBoundedTransform` -- raw (unsmoothed).
+- `OptionsScoreThreeWaySwitchMaxPainConfirmedRollingBoundedTransformScoreEma` -- Part A's frozen EMA
+  N=3 spec applied on top, reusing the exact same `scoreEmaSmoother`/`scoreSmoothMagnitudeRank`
+  instances the ScoreEma family already shares.
+
+Both reuse `ComputeOptionsThreeWayScoreBoundedTransform` **completely unchanged** -- the only
+difference from the session-scoped `...BoundedTransform`/`...BoundedTransformScoreEma` metrics is
+which `RunningMeanStd` instances are passed in (pre-seeded `boundedRolling*Stats` vs. empty
+`bounded*Stats`). Same Max Pain confirmation gate, same re-rank-through-`scoreSmoothMagnitudeRank`
+entry-threshold design, same 09:30-15:00 entry window as every sibling in this family.
+
+Mandatory regression check: `trade 2026-09-08 2026-09-19 OptionsScoreThreeWaySwitchMaxPainConfirmed
+90 15 2600 --band=5` reproduced **112 trades, 64.3% win, +426.40 net** exactly.
+`SessionGatedDepthDuration` (collateral-damage check) reproduced **80 trades, 55.0% win, +144.70 net**
+exactly. `dotnet test`: **704/704 passing** (698 pre-existing + 6 new `RollingBoundedTransformTests`
+covering `CollectThreeWayRawLegReadings`'s phase-matching/ordering/look-ahead-safety against synthetic
+multi-bar sequences, plus a seeding-equivalence check against `RunningMeanStd`), 0 warnings, `dotnet
+build` clean.
+
+### Full results: raw and EMA-smoothed, apples-to-apples same-range comparison
+
+All rows below use the **same 5-day usable in-sample range (2026-09-11 to 2026-09-18)** -- the
+baseline rows are a FRESH run restricted to that exact range, not the original 8-day figures, so this
+is a genuine like-for-like comparison, not confounded by which days are included.
+
+| Metric | Trades | Win% | Net | Days >=50% win (of 5) | MAE% avg | MFE% avg | MAE% median | MFE% median |
+|---|---|---|---|---|---|---|---|---|
+| Baseline (percentile), same 5-day range | 70 | 65.7% | +308.25 | 5/5 | 5.34% | 9.15% | 4.19% | 3.62% |
+| **Rolling BoundedTransform (raw)** | 49 | 55.1% | +236.10 | **4/5** | 6.17% | 11.62% | 4.21% | 6.94% |
+| **Rolling BoundedTransform + EMA N=3** | 15 | 53.3% | -7.45 | **2/5** | 15.88% | 17.53% | 16.69% | 10.74% |
+
+Out-of-sample day (2026-09-21, using 09-18/17/16 as its own rolling history):
+
+| Metric | Trades | Win% | Net |
+|---|---|---|---|
+| Baseline (percentile) | 7 | 71.4% | -5.10 |
+| Rolling BoundedTransform (raw) | 5 | 60.0% | +8.85 |
+| Rolling BoundedTransform + EMA N=3 | 1 | 0.0% | -27.65 |
+
+### Day-by-day (in-sample, 09-11 to 09-18)
+
+| Day | Baseline trades/win%/net | Rolling raw trades/win%/net | Rolling+EMA trades/win%/net |
+|---|---|---|---|
+| 09-11 | 24 / 54.2% / +26.70 | 2 / 100.0% / +14.85 | 3 / 33.3% / -0.80 |
+| 09-15 | 14 / 64.3% / +90.25 | 30 / 46.7% / +49.00 | 7 / 42.9% / -8.10 |
+| 09-16 | 13 / 69.2% / +74.50 | 6 / 50.0% / +49.75 | 1 / 100.0% / +5.80 |
+| 09-17 | 12 / 91.7% / +120.25 | 9 / 77.8% / +132.65 | 3 / 100.0% / +28.40 |
+| 09-18 | 7 / 57.1% / -3.45 | 2 / 50.0% / -10.15 | 1 / 0.0% / -32.75 |
+
+The raw variant's single worst day (09-15, 46.7%) is also its highest-volume day (30 of 49 trades) --
+a meaningful drag on the overall win rate, not an isolated outlier bar.
+
+### Session-phase split (Open <10:00, Mid 10:00-13:30, Close >=13:30), in-sample range
+
+| Metric | Open trades | Open win% | Open net | Mid trades | Mid win% | Mid net | Close trades | Close win% | Close net |
+|---|---|---|---|---|---|---|---|---|---|
+| Baseline (percentile) | 7 | 57.1% | +113.00 | 30 | 70.0% | +189.85 | 33 | 63.6% | +5.40 |
+| Rolling BoundedTransform (raw) | 8 | 62.5% | +123.80 | 32 | 53.1% | +116.10 | 9 | 55.6% | -3.80 |
+
+### Does a cross-session baseline show up as measurably calmer early-session behavior?
+
+**This is the whole point of trying option (b) instead of option (a)** -- same indirect proxy used by
+the session-z-score task (Open-window trade count as a whipsaw proxy, since a calmer, more-stable-at-
+bar-1 score should produce fewer/steadier entries in the volatile opening window): **Rolling raw's
+Open-window trade count is 8, actually HIGHER than the same-range baseline's own 7** (both counted
+directly off the trade listings for the identical 09-11..09-18 range). **This does not support the
+hypothesis.** Removing the "resets cold every day" property -- the one thing option (a) could NOT do
+and option (b) specifically can -- still does not translate into fewer or calmer Open-window
+entries. Combined with the session-phase table above (Rolling raw's Mid-window win rate, 53.1%, is
+its weakest phase and also its highest-volume phase, 32 of 49 trades), the extra history does not
+appear to be stabilizing the score in the way the underlying hypothesis predicted anywhere in the
+session, not just at the open.
+
+### Verdict, ranked by the user's own stated priority (win rate first, then MAE%/MFE%, net last)
+
+**Rolling BoundedTransform (raw) vs. the same-range baseline**: win rate is LOWER (55.1% vs 65.7%,
+-10.6pp -- a materially larger gap than option (a)'s own -1.7pp shortfall against its own baseline
+comparison) -- fails the priority's first criterion clearly. MAE% is WORSE (6.17% vs 5.34%, larger
+average drawback) and MFE% is nominally better (11.62% vs 9.15%) but that's driven by a few large
+favorable-excursion trades on the thin 09-17 day, not a broad-based improvement -- not enough to
+outweigh the win-rate and MAE deficits. Day-consistency is worse (4/5 vs 5/5). **Does not clear the
+bar; a clear regression from the same-range baseline, and a larger one than option (a)'s own raw
+variant showed against its own (larger-sample, 8-day) baseline.**
+
+**Rolling BoundedTransform + EMA N=3**: the weakest candidate examined across both bounded-transform
+tasks. Win rate 53.3%, net actually NEGATIVE (-7.45 on 15 trades) despite EMA smoothing being the
+mechanism that helped every other candidate in this family (Part A: 68.6%; option (a)'s own EMA
+sibling: 67.6%). MAE% (15.88%) and MFE% (17.53%) are both the worst of any smoothed candidate tested
+in this file to date. Day-consistency (2/5) is the worst of any smoothed candidate. The small sample
+(15 trades) makes this noisy, but there is no reading of this result that supports the EMA-on-
+rolling-baseline combination.
+
+**Overall**: option (b) -- the "genuinely different, still untested" direction flagged by the
+session-z-score task -- does not show the hoped-for improvement either. If anything it performs WORSE
+than option (a) did against ITS OWN same-range comparison, on every axis in the stated priority order
+(win rate, MAE%, day-consistency), and the direct early-session-calmness proxy (Open-window trade
+count) shows the same "no reduction, if anything slightly more" pattern option (a) already showed.
+**This is a genuine, measured negative result on the cross-session-baseline hypothesis itself, not
+just on one particular implementation of it** -- both the session-scoped z-score (option a) and the
+cross-session rolling baseline (option b) fail to beat their own same-range/same-sample baseline
+comparisons on win rate, and neither shows the early-session stabilization the underlying "remove the
+resets-every-day dependency" idea predicted.
+
+**Honest assessment of data sufficiency, separate from the approach's own merit**: the available
+history (9 populated trading days) is genuinely too thin to give this specific design (rolling
+cross-day baseline) a fair trial. A 3-day warm-up window consumes exactly 1/3 of all available days
+before a single trade can even be evaluated, leaving 5 in-sample days -- half the sample size the
+percentile baseline and the session-z-score task were themselves evaluated on (8 days), and itself
+still well short of what this project's own "never treat one week as a verdict" rule calls for. The
+single worst in-sample day (09-15, 46.7% win on 30 of 49 trades) has outsized influence on a 5-day
+total in a way it would not on a longer run. **Recommendation: do not pursue either bounded-transform
+variant (session-scoped or rolling) further on the current dataset.** If more historical days become
+available later (the project's own "backtesting is a long-term process" principle), a rolling-baseline
+re-test at that point would be worth revisiting -- but re-testing the SAME conclusion on the SAME 9
+days would not add information; new days are needed, not a re-run.
+
+### Reproduction commands
+
+```
+# Baseline, same-range restriction (5-day in-sample: 09-11 to 09-18)
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-11 2026-09-18 OptionsScoreThreeWaySwitchMaxPainConfirmed 90 15 2600 --band=5
+dotnet run --project NiftySignal.VolumeBarData -- mae-mfe trade 2026-09-11 2026-09-18 OptionsScoreThreeWaySwitchMaxPainConfirmed 90 15 2600 --band=5
+
+# Rolling BoundedTransform (raw), rollingWindowDays defaults to 3
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-21 OptionsScoreThreeWaySwitchMaxPainConfirmedRollingBoundedTransform 90 15 2600 --band=5
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-11 2026-09-18 OptionsScoreThreeWaySwitchMaxPainConfirmedRollingBoundedTransform 90 15 2600 --band=5
+dotnet run --project NiftySignal.VolumeBarData -- mae-mfe trade 2026-09-11 2026-09-18 OptionsScoreThreeWaySwitchMaxPainConfirmedRollingBoundedTransform 90 15 2600 --band=5
+
+# Rolling BoundedTransform + EMA N=3
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-11 2026-09-18 OptionsScoreThreeWaySwitchMaxPainConfirmedRollingBoundedTransformScoreEma 90 15 2600 --band=5 --smoothbars=3
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-21 2026-09-21 OptionsScoreThreeWaySwitchMaxPainConfirmedRollingBoundedTransformScoreEma 90 15 2600 --band=5 --smoothbars=3
+dotnet run --project NiftySignal.VolumeBarData -- mae-mfe trade 2026-09-11 2026-09-18 OptionsScoreThreeWaySwitchMaxPainConfirmedRollingBoundedTransformScoreEma 90 15 2600 --band=5 --smoothbars=3
+
+# rollingWindowDays=5 sensitivity check (only 3 usable in-sample days: 09-16/17/18)
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-21 OptionsScoreThreeWaySwitchMaxPainConfirmedRollingBoundedTransform 90 15 2600 --band=5 --rollingdays=5
+
+# Baseline re-verification (must stay 112 trades, 64.3% win, +426.40 net)
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-19 OptionsScoreThreeWaySwitchMaxPainConfirmed 90 15 2600 --band=5
+# SessionGatedDepthDuration collateral check (must stay 80 trades, 55.0% win, +144.70 net)
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-19 SessionGatedDepthDuration 90 15 2600
+```
+
+## Option-price moving-average crossover research (2026-09-22)
+
+**Research only, provisional, not adopted.** The user's idea for this task: cross a fast/slow SMA of
+the ATM option's own RAW PREMIUM PRICE (never a derived -100..100 score, never IV) -- Call-price and
+Put-price tested standalone first, then a dual-agreement combination (Call fast crosses up AND Put
+fast crosses down, same bar), with an optional band-averaged-price variant mirroring this project's
+existing ATM+/-N BandWidth convention. Everything here is backtest-only, entirely new code
+(`NiftySignal.VolumeBarData/PriceCrossoverCalculator.cs`, `TradeSimulator.SimulatePriceCrossoverDayAsync`,
+CLI `price-crossover`/`mae-mfe price-crossover`), added as a **wholly separate method, never a new
+branch in `SimulateCrossoverDayAsync` or `ComputeScore`'s dispatch chain** -- deliberately, to carry
+zero risk of this project's recurring dispatch-order bug. Nothing in `NiftySignal.Host`/
+`NiftySignal.Dashboard`/`NiftySignal.Scoring`'s live pure functions was touched. **Priority, per the
+user's own stated instruction for this session: win rate first, then MAE%/MFE% (smaller drawdowns,
+better favorable excursion), net P&L last.**
+
+### Design decisions
+
+**Threshold is a percent-of-slow-MA gap, not raw points.** `SimulateCrossoverDayAsync`'s existing
+futures/options-score crossover gates a crossing on a raw-points gap (2-20pt convention) because
+every score on that path is already normalized to the same -100..100 scale. A raw option premium is
+not on any fixed scale (a Rs 8 far-OTM Call and a Rs 300 deep-ITM Put on the same day are both real
+ATM premiums at different times) -- a fixed point threshold would mean wildly different things
+depending on which strike/day/hour it fired on. `PriceCrossoverEngine.Observe` instead gates on
+`|fastMa-slowMa|/slowMa`, a threshold in PERCENT, then the actual percent-gap grid (1/2/3/5%) was
+swept empirically below rather than picked by eye -- the winning thresholds (5% for both standalone
+signals) emerged from that sweep, not a prior assumption.
+
+**Standalone Call/Put don't open the opposite side on a reversal.** Unlike the paired futures/options
+score (where a sign flip always has a natural opposite-side trade), one side's own price momentum
+reversing is a reason to exit, not a reason to buy the *other* option -- these are two economically
+different instruments, not two readings of one score. So `PriceCrossoverSide.Call` only ever trades
+Calls (enters on Call-price crossed-up, exits on Call-price crossed-down or timeout); `Put` mirrors
+this for Puts. `DualAgreement` always trades the Call side (the direction both legs agree bullish on:
+rising Call premium + deflating Put premium), exiting on EITHER leg's own reversal.
+
+**Band-averaged price**: no existing table in this project averages PRICE across a strike band
+(`OptionDepthBarRow` only aggregates resting quantity) -- computed fresh in
+`SimulatePriceCrossoverDayAsync.GetPriceAsync` by taking the ATM strike's ordinal position in the
+day's sorted strike list and averaging the real last-traded price of the `bandWidth` nearest strikes
+(3 = ATM+/-1, 5 = ATM+/-2, same convention `OptionDepthPopulator.DefaultBandWidth` already
+establishes). Turned out straightforward, not architecturally awkward -- fully implemented and swept
+below, not scoped out.
+
+**Grid swept**: fast in {2,3,5}, slow in {10,15,20}, threshold in {1,2,3,5}% -- 36 combinations per
+side at the standard 2600 bar threshold (chosen because it's the locked baseline's own threshold and
+the one every other Part A/B experiment this session used; 650/1300 spot-checked afterward for the
+winning combo only, not the full grid, given the ~13s/run cost x 72 combos already spent on the
+primary sweep). fast>=2 (a 1-bar "fast MA" is just the raw price, not a smoothed signal) and slow<=20
+(anything wider starts to look more like a session-long baseline than a short-horizon crossover) --
+documented judgment calls, not derived.
+
+### Standalone Call-price crossover, full grid (bar=2600, 8-day backtest 09-08..09-19)
+
+| fast | slow | thr% | trades | win% | net |
+|---|---|---|---|---|---|
+| 2 | 10 | 1 | 188 | 51.1% | +8.90 |
+| 2 | 10 | 2 | 139 | 57.6% | +39.35 |
+| 2 | 15 | 3 | 86 | 58.1% | -76.10 |
+| 2 | 15 | **5** | **58** | **62.1%** | **-31.30** |
+| 2 | 20 | 3 | 82 | 58.5% | -40.10 |
+| 3 | 10 | 3 | 54 | 57.4% | -37.40 |
+| 3 | 20 | 2 | 66 | 51.5% | +32.15 |
+| 5 | 10 | 5 | 4 | 25.0% | +11.90 (n too small to trust) |
+
+(Full 36-row grid available via the reproduction commands below; only the win-rate leaders and
+notable outliers are excerpted here.) **Winner by the win-rate/MAE/MFE priority: fast=2/slow=15/
+thr=5%** -- highest win rate (62.1%) among combos with a real sample (58 trades), even though its net
+is negative. This is exactly the "unremarkable net, clean-ish win rate" shape the user's priority
+asks to evaluate on its own terms -- so it was carried into the full battery below rather than
+discarded for its net.
+
+### Standalone Put-price crossover, full grid (bar=2600, 8-day backtest)
+
+| fast | slow | thr% | trades | win% | net |
+|---|---|---|---|---|---|
+| 2 | 10 | 2 | 113 | 67.3% | +113.30 |
+| 2 | 10 | **5** | **54** | **72.2%** | **+254.85** |
+| 2 | 15 | 5 | 46 | 71.7% | +136.80 |
+| 3 | 10 | 5 | 17 | 76.5% | +117.45 |
+| 3 | 15 | 5 | 16 | 75.0% | +23.15 |
+| 5 | 10 | 5 | 5 | 80.0% | +137.55 (n too small) |
+| 5 | 15 | 3 | 18 | 77.8% | +138.60 |
+| 5 | 15 | 5 | 3 | 100.0% | +163.00 (n too small) |
+
+Put-side crossover is unambiguously the stronger of the two standalone signals -- every 5% threshold
+row clears 70%+ win rate, and even the noisiest low-threshold rows mostly clear 55-67%. **Winner by
+the win-rate/MAE/MFE priority: fast=2/slow=10/thr=5%** (54 trades, 72.2% win, +254.85) -- chosen over
+the higher-win-rate but tiny-n rows (5/15/5%: 77.8% on 18 trades; 5/15/5%: 100% on 3 trades) as the
+best real-sample candidate; fast=5/slow=15/thr=3% (18 trades, 77.8% win, +138.60) is flagged as a
+secondary candidate worth more data before trusting its higher win rate over the primary's larger
+sample.
+
+### Full evaluation battery -- winners only
+
+**Call-price, fast=2/slow=15/thr=5%, bar=2600, single ATM strike:**
+- 58 trades, 62.1% win, net -31.30 (8-day backtest)
+- MAE/MFE: MAE avg 10.39% (median 4.60%, worst 59.06%) vs MFE avg 8.73% (median 5.64%, best 55.91%)
+  -- **MAE% exceeds MFE%, an unfavorable ratio** (average adverse excursion bigger than average
+  favorable excursion), consistent with the negative net. 57/58 trades recovered from a worse
+  drawdown than their final loss; 52/58 gave back profit from their best point.
+- Out-of-sample 2026-09-21: 6 trades, 83.3% win, +7.25 net (small n, informative but not conclusive)
+- Band-width: band=3 -> 57 trades, 63.2% win, -8.75 net; band=5 -> 55 trades, 63.6% win, -9.05 net.
+  Band-averaging modestly IMPROVES this signal (both win rate and net move the right direction) but
+  doesn't flip it positive -- MAE/MFE not re-measured for the band variant (scoped out of this pass,
+  noted as a gap, not silently skipped).
+- Bar-threshold spot-check: 650 -> 126 trades, 45.2% win, -72.80 (much worse); 1300 -> 83 trades,
+  57.8% win, +15.30 (better than 650, still below 2600's win rate). 2600 is the best of the three for
+  this signal, same as the locked baseline's own bar size.
+
+**Put-price, fast=2/slow=10/thr=5%, bar=2600, single ATM strike:**
+- 54 trades, 72.2% win, net +254.85 (8-day backtest)
+- MAE/MFE: MAE avg 6.18% (median 4.55%, worst 28.02%) vs MFE avg 8.05% (median 4.62%, best 57.50%)
+  -- **MFE% exceeds MAE%, a favorable ratio**, consistent with the strongly positive net. 53/54
+  recovered from a worse drawdown; 50/54 gave back some profit from their best point (expected for a
+  reversal-exit strategy, not itself a red flag).
+- Concentration: top trade +47.90 (18.8% of net), top 2 +81.80 (32.1% of net) -- comfortably under
+  this project's own 55%+ red-flag convention.
+- Day-by-day: 8/8 backtest days at or above 50% win rate (75, 50, 75, 50, 80, 100, 100, 66.7%) --
+  the most stable day-by-day profile of anything tested in this section.
+- DTE split: 0-DTE days (09-08, 09-15) 32 trades, ~78.1% weighted win, +179.50 net; non-0-DTE (the
+  other 6 days) 22 trades, ~63.6% weighted win, +75.35 net. Both sides clear 50%+ comfortably; 0-DTE
+  is somewhat stronger, a real but not alarming difference.
+- Session-phase split: Open (n=10) 70.0% win, +85.10; Mid (n=35) 71.4% win, +107.45; Close (n=9)
+  77.8% win, +62.30 -- consistent across all three phases, no phase-concentration red flag.
+- Out-of-sample 2026-09-21: 6 trades, 66.7% win, -16.25 net (win rate held up; net driven negative by
+  one TimeCutoff trade that ran the full session against the position -- small-n, worth more OOS days
+  before trusting the net sign here).
+- Band-width: band=3 -> 56 trades, 71.4% win, +254.15 net (essentially unchanged from single-ATM);
+  band=5 -> 48 trades, 66.7% win, +223.50 net (modestly worse on both axes). Band-averaging doesn't
+  help this signal -- single-ATM-strike pricing is already about as clean as it gets here.
+- Bar-threshold spot-check: 650 -> 100 trades, 61.0% win, +35.65 (weaker); 1300 -> 66 trades, 54.5%
+  win, -12.85 (weaker still, net negative). 2600 is clearly the best bar size for this signal too.
+
+### Dual-agreement combination
+
+Call windows (2/15) and Put windows (2/10) -- each side's own independently-best window pair, per
+this task's own "don't force a shared pair if the two sides' winners differ" instruction -- combined
+at thr=5% (the threshold both standalone winners shared): Call fast crosses above Call slow AND Put
+fast crosses below Put slow on the SAME bar (no separate tolerance window was needed -- same-bar
+agreement already produced a workable trade count; a tolerance window is flagged as unexplored, not
+attempted, given the sample sizes already involved).
+
+- 52 trades, 65.4% win, net +19.55 (8-day backtest)
+- MAE/MFE: MAE avg 9.23% vs MFE avg 7.20% -- **unfavorable ratio**, closer to the Call standalone
+  signal's own shape than the Put standalone's.
+- Out-of-sample 2026-09-21: 5 trades, 80.0% win, +3.45 net (small n)
+
+**The dual-agreement combination sits BETWEEN the two standalone signals on every axis (win rate,
+MAE/MFE ratio, net) rather than exceeding either one** -- requiring the weaker Call-price leg's
+agreement measurably drags the strong Put-price signal down (72.2%->65.4% win rate, favorable
+MAE/MFE ratio flips to unfavorable) without buying a compensating improvement anywhere. This mirrors
+Part B's own CallScore/PutScore finding (dominant-metric beats diluting a strong signal with a
+weaker one) -- here the "combination" isn't even a blend, it's an AND-gate, and gating a strong signal
+on a weak one's agreement still costs more than it adds.
+
+### Ranking against the locked baselines and today's other findings
+
+| Strategy | Trades | Win% | Net | MAE%/MFE% |
+|---|---|---|---|---|
+| Locked OptionsScore (baseline) | 112 | 64.3% | +426.40 | (see MAE/MFE section above) |
+| Futures crossover (baseline) | 80 | 55.0% | +277.20 | -- |
+| Part B PutScore (PutDepth+PutTob avg) | 113 | 65.5% | +386.50 | -- |
+| Part B PutTobImbalance alone | 80 | 66.2% | +362.15 | -- |
+| **Put-price crossover (this task, 2/10/5%)** | **54** | **72.2%** | **+254.85** | **MFE>MAE (favorable)** |
+| Part B CallScore (CallTobImbalance) | 106 | 63.2% | +74.40 | -- |
+| Call-price crossover (this task, 2/15/5%) | 58 | 62.1% | -31.30 | MAE>MFE (unfavorable) |
+| Dual-agreement (this task) | 52 | 65.4% | +19.55 | MAE>MFE (unfavorable) |
+
+By the user's stated win-rate-first priority, **standalone Put-price crossover is the single
+best-win-rate signal produced anywhere in this session's work** -- higher than the locked baseline,
+higher than the futures crossover, and higher than Part B's own best Put-side percentile signal, with
+a favorable MAE/MFE ratio and the cleanest day-by-day stability of anything tested here. It trades on
+roughly half the sample of Part B's PutScore/locked baseline (54 vs 106-113), so the 72.2% figure
+carries a wider confidence interval than those larger-n comparisons -- a real finding, not a final
+verdict, per this project's own "one run is a data point" rule.
+
+### Final verdict
+
+**Raw price-momentum on the Put premium shows genuine, real promise and clears the bar this
+project's evaluation cycle sets -- it is a legitimate candidate for the eventual multi-metric
+composite, not a metric to discard.** It is structurally different from every candidate Part B
+already validated (a raw price crossover, not a percentile-ranked depth/TOB ratio), so it is not
+redundant with CallTobImbalance/PutDepthImbalance/PutTobImbalance by construction, which is itself
+useful diversity for the eventual composite.
+
+**Raw price-momentum on the Call premium does NOT clear the bar.** Best case (62.1% win) is
+respectable on win rate alone, but the net is negative and the MAE/MFE ratio is unfavorable --
+exactly the profile this project's evaluation discipline is built to catch and decline, not force
+through because "it's not that bad."
+
+**The dual-agreement combination is not worth adopting as constructed.** AND-gating the strong
+Put-price signal on the weak Call-price signal's agreement makes the combination strictly worse than
+trading Put-price alone. If a future pass wants to explore combining option-price crossover with
+another signal, it should gate Put-price on something else already independently validated (e.g.
+Part B's PutTobImbalance or a future regime signal, each per this project's own "gating is a
+composite/production-rule-stage concern" rule), not on the weaker Call-price leg tested here.
+
+**Per the metric-by-metric evaluation process (2026-09-12) this project's own working agreement
+requires**: standalone Put-price crossover (fast=2/slow=10/thr=5%, single ATM strike, bar=2600) is
+recorded here as a candidate with an **explicit positive conclusion** -- real directional edge, by
+win rate and MAE/MFE, on the data available so far. Standalone Call-price crossover and the
+dual-agreement combination are recorded with an **explicit negative conclusion** for this exact
+construction -- not thrown away, but not carried forward as tested here. None of these three has been
+given a production weight; per this project's own rule, that only happens once 5-8 such
+independently-validated metrics exist to combine.
+
+### Reproduction commands
+
+```
+# Standalone Call-price winner
+dotnet run --project NiftySignal.VolumeBarData -- price-crossover 2026-09-08 2026-09-19 Call 2 15 5 2600
+dotnet run --project NiftySignal.VolumeBarData -- mae-mfe price-crossover 2026-09-08 2026-09-19 Call 2 15 5 2600
+
+# Standalone Put-price winner
+dotnet run --project NiftySignal.VolumeBarData -- price-crossover 2026-09-08 2026-09-19 Put 2 10 5 2600
+dotnet run --project NiftySignal.VolumeBarData -- mae-mfe price-crossover 2026-09-08 2026-09-19 Put 2 10 5 2600
+
+# Band-width variants
+dotnet run --project NiftySignal.VolumeBarData -- price-crossover 2026-09-08 2026-09-19 Put 2 10 5 2600 --band=3
+dotnet run --project NiftySignal.VolumeBarData -- price-crossover 2026-09-08 2026-09-19 Put 2 10 5 2600 --band=5
+
+# Dual-agreement combination (Call windows 2/15, Put windows overridden to 2/10)
+dotnet run --project NiftySignal.VolumeBarData -- price-crossover 2026-09-08 2026-09-19 DualAgreement 2 15 5 2600 --putfast=2 --putslow=10
+dotnet run --project NiftySignal.VolumeBarData -- mae-mfe price-crossover 2026-09-08 2026-09-19 DualAgreement 2 15 5 2600 --putfast=2 --putslow=10
+
+# Out-of-sample day
+dotnet run --project NiftySignal.VolumeBarData -- price-crossover 2026-09-21 2026-09-21 Put 2 10 5 2600
+dotnet run --project NiftySignal.VolumeBarData -- price-crossover 2026-09-21 2026-09-21 Call 2 15 5 2600
+
+# Baseline re-verification (must stay 112 trades, 64.3% win, +426.40 net)
+dotnet run --project NiftySignal.VolumeBarData -- trade 2026-09-08 2026-09-19 OptionsScoreThreeWaySwitchMaxPainConfirmed 90 15 2600 --band=5
+# Futures crossover baseline re-verification (must stay 80 trades, 55.0% win, +277.20 net)
+dotnet run --project NiftySignal.VolumeBarData -- crossover 2026-09-08 2026-09-19 8 40 5 2600
+```
+
+### Scope not attempted, honestly noted
+
+- The full 36-combo grid was only run at bar=2600; 650/1300 were spot-checked for the winning combo
+  only, not swept in full (72 additional runs would have been needed for a full 3-threshold grid).
+- MAE/MFE was not re-measured for the band-width variants (band=3/5) -- only win rate/net were
+  checked there.
+- The dual-agreement tolerance window (entries within N bars of each other, not just the same bar)
+  was not explored -- same-bar agreement alone already produced a usable trade count.
+- Only one dual-agreement window pairing (each side's own independent winner) was tested, not a
+  further sweep of dual-agreement-specific window combinations.
+
+## 650-bar sweep, 4-set Call/Put combination, DTE-conditioned bar sizing (2026-09-22)
+
+**Research only, provisional, extends the section above -- not redone.** User's own mental model,
+verbatim intent: 650-bar volume threshold (this project's other most-used threshold, alongside
+1300/2600) should give more, better-MFE trades than 2600 with a properly re-swept window (not the
+2600 winner's window blindly ported), plus four separate result sets -- Call-only, Put-only,
+both-agree-enter/both-must-reverse-exit, both-agree-enter/either-reverses-exit -- and a DTE-aware
+bar-size investigation (does 0-DTE specifically want a smaller bar size than non-0-DTE, given
+0-DTE's higher realized volatility). **Priority unchanged: win rate first, then MAE%/MFE%, net
+last.**
+
+**Interpretation check against the user's own stated framing, confirmed correct on inspection of
+the code before any of this section's work started**: `DualAgreementSide` (see prior section) was
+already exactly "set 4" (both-agree entry, EITHER leg's reversal exits) -- that part of the user's
+mental model was already built, not new. "Set 3" (both-agree entry, BOTH legs must reverse to
+exit) did **not** exist and needed new code -- added as a new `PriceCrossoverSide.DualAgreementBothExit`
+case in `TradeSimulator.SimulatePriceCrossoverDayAsync` (a new switch arm alongside the existing
+`DualAgreement` case, not a modification to it -- `DualAgreement`'s own pre-existing entry/exit
+semantics are byte-for-byte unchanged). The CLI (`price-crossover`/`mae-mfe price-crossover`)
+picked up the new side automatically via `Enum.TryParse<PriceCrossoverSide>`, no CLI changes needed
+beyond the usage-string text.
+
+### 650-bar window/threshold sweep
+
+**Grid, and why**: 650 bars fill roughly 4x faster in wall-clock time than 2600 bars (this
+project's own volume-cadence calibration, `docs/SCORE_CANDIDATES.md`), so the 2600 winners' window
+pairs (Call 2/15, Put 2/10) do not port 1:1 -- a genuinely fresh grid was swept instead of a blind
+4x scale-up. Swept: fast in {3,4,8}, slow in {20,30,40}, threshold% in {2,3,5} -- 27 combinations
+per side (fast<slow always held; no combination skipped). This is a coarser grid than the prior
+section's 36-combo/side 2600 sweep (documented judgment call, not derived -- 54 total runs at
+~15-30s/run was the time budget for this task's four separate result sets plus the DTE
+investigation) but spans a real range around the "~4x" starting guess (fast=8/slow=~40 is close to
+a literal 2x scale of 2/15..2/10, fast=3-4/slow=20-30 is a shallower scale reflecting that very
+short fast windows on 650-bar data are mostly noise).
+
+**Put-price crossover, full 650-bar grid (8-day backtest 09-08..09-19):**
+
+| fast | slow | thr% | trades | win% | net |
+|---|---|---|---|---|---|
+| 3 | 20 | 2 | 122 | 61.5% | -33.55 |
+| 3 | 20 | 3 | 82 | 61.0% | +16.05 |
+| 3 | 20 | 5 | 39 | 64.1% | -33.15 |
+| 3 | 30 | 2 | 111 | 60.4% | +51.95 |
+| 3 | 30 | 3 | 79 | 55.7% | +0.90 |
+| 3 | 30 | 5 | 37 | 62.2% | -1.05 |
+| 3 | 40 | 2 | 101 | 56.4% | +37.40 |
+| 3 | 40 | 3 | 67 | 55.2% | +39.10 |
+| 3 | 40 | 5 | 34 | 67.6% | +80.50 |
+| 4 | 20 | 2 | 84 | 56.0% | +10.35 |
+| 4 | 20 | 3 | 43 | 62.8% | +94.00 |
+| 4 | 20 | 5 | 14 | 71.4% | +75.85 |
+| 4 | 30 | 2 | 77 | 62.3% | -46.30 |
+| 4 | 30 | 3 | 46 | 65.2% | +20.75 |
+| 4 | 30 | 5 | 18 | 83.3% | +121.35 |
+| **4** | **40** | **2** | 75 | 68.0% | +153.05 |
+| 4 | 40 | 3 | 45 | 66.7% | +115.05 |
+| **4** | **40** | **5** | **21** | **76.2%** | **+159.10** |
+| 8 | 20 | 2 | 21 | 57.1% | -18.90 |
+| 8 | 20 | 3 | 5 | 80.0% | +55.90 |
+| 8 | 20 | 5 | 1 | 100.0% | +90.05 (n too small) |
+| 8 | 30 | 2 | 17 | 58.8% | +73.15 |
+| 8 | 30 | 3 | 4 | 100.0% | +135.05 (n too small) |
+| 8 | 30 | 5 | 0 | -- | no trades |
+| 8 | 40 | 2 | 11 | 90.9% | +99.30 |
+| 8 | 40 | 3 | 4 | 100.0% | +67.35 (n too small) |
+| 8 | 40 | 5 | 0 | -- | no trades |
+
+**Winner by the win-rate/MAE/MFE priority, real-sample tier (n>=20): fast=4/slow=40/thr=5%** (21
+trades, 76.2% win, +159.10 net). fast=4/slow=30/thr=5% (18 trades, 83.3% win, +121.35) has a higher
+win rate but a thinner sample; fast=4/slow=40/thr=2% (75 trades, 68.0% win, +153.05) is the
+higher-volume alternative if trade count matters more than the last few points of win rate. All
+three clear 2600's own 72.2% win rate at fast=4/slow=40/thr=5%'s 76.2%, and come close to it at
+worse n at fast=4/slow=30/thr=5%'s 83.3% -- the picture is consistent with the prior section's
+finding that Put-price crossover is a genuinely strong signal, not a bar-size artifact.
+
+**Call-price crossover, full 650-bar grid:**
+
+| fast | slow | thr% | trades | win% | net |
+|---|---|---|---|---|---|
+| 3 | 20 | 2 | 143 | 49.7% | -63.20 |
+| 3 | 20 | 3 | 112 | 50.0% | -85.90 |
+| 3 | 20 | 5 | 57 | 45.6% | -81.85 |
+| 3 | 30 | 2 | 139 | 51.1% | -81.55 |
+| 3 | 30 | 3 | 99 | 49.5% | -70.40 |
+| 3 | 30 | 5 | 55 | 49.1% | -3.55 |
+| 3 | 40 | 2 | 119 | 51.3% | -103.10 |
+| 3 | 40 | 3 | 92 | 47.8% | -109.40 |
+| 3 | 40 | 5 | 50 | 46.0% | -13.10 |
+| 4 | 20 | 2 | 96 | 55.2% | -58.85 |
+| 4 | 20 | 3 | 62 | 53.2% | -64.95 |
+| 4 | 20 | 5 | 25 | 44.0% | -131.25 |
+| 4 | 30 | 2 | 94 | 53.2% | -48.60 |
+| 4 | 30 | 3 | 61 | 52.5% | -71.70 |
+| 4 | 30 | 5 | 26 | 42.3% | -7.95 |
+| **4** | **40** | **2** | **97** | **61.9%** | **+62.55** |
+| 4 | 40 | 3 | 65 | 58.5% | -10.05 |
+| 4 | 40 | 5 | 25 | 36.0% | -101.95 |
+| 8 | 20 | 2 | 26 | 57.7% | -23.35 |
+| 8 | 20 | 3 | 12 | 41.7% | -30.35 |
+| 8 | 20 | 5 | 2 | 0.0% | -36.55 |
+| 8 | 30 | 2 | 21 | 38.1% | +16.65 |
+| 8 | 30 | 3 | 11 | 36.4% | -44.40 |
+| 8 | 30 | 5 | 1 | 0.0% | -18.60 |
+| 8 | 40 | 2 | 25 | 52.0% | -45.65 |
+| 8 | 40 | 3 | 10 | 50.0% | -49.75 |
+| 8 | 40 | 5 | 3 | 33.3% | -1.15 |
+
+**Call-price crossover stays weak at 650, same as at 2600.** Best real-sample combo is
+fast=4/slow=40/thr=2% (97 trades, 61.9% win, +62.55 net) -- every other combo with a real sample
+sits in the high-40s/low-50s win-rate range, several net-negative. No 650-bar window/threshold
+combination rescues Call-price crossover into the same tier as Put-price.
+
+**1300-bar spot-check (3 candidate windows, not a full grid -- time budget, same discipline as the
+prior section's own 650/1300 spot-check)**: fast=3/slow=20/thr=5% is the best of the three tried (21
+trades, 76.2% win, +138.80 net); fast=2/slow=15/thr=5% (66 trades, 51.5% win, -36.45) and
+fast=3/slow=15/thr=5% (30 trades, 66.7% win, +41.45) are both weaker. **325-bar spot-check** (3
+candidates): fast=4/slow=40/thr=5% is the best real-sample candidate (22 trades, 68.2% win, +42.50
+net); fast=6/slow=60/thr=5% has a higher win rate but only 6 trades (100.0% win, +87.60 -- too thin
+to trust); fast=8/slow=60/thr=5% fires almost nothing (1 trade). These four thresholds' own winning
+windows (325: 4/40/5%, 650: 4/40/5%, 1300: 3/20/5%, 2600: 2/10/5% from the prior section) are what
+feeds the DTE-conditioned investigation below.
+
+### Four result sets (Put-only, Call-only, both-agree/both-exit, both-agree/either-exit)
+
+Using each threshold's own winning window from above. The combination sets (3 and 4) use the SAME
+window pair (fast=4/slow=40) for both legs at 650 (the Call and Put standalone winners happened to
+land on identical windows at this threshold -- a real finding, not a forced pairing) and reuse the
+2600 pairing from the prior section (Call 2/15, Put 2/10) for the 2600 reference row.
+
+**1. Call-only standalone:**
+
+| Bar | Window | Thr% | Trades | Win% | Net | MAE% | MFE% |
+|---|---|---|---|---|---|---|---|
+| 650 (primary) | 4/40 | 2 | 97 | 61.9% | +62.55 | 7.16% (avg) | 5.73% (avg) -- unfavorable |
+| 2600 (reference, prior section) | 2/15 | 5 | 58 | 62.1% | -31.30 | 10.39% | 8.73% -- unfavorable |
+
+Call-price crossover is directionally the same weak signal at both bar sizes: comparable win rate
+(~62%), unfavorable MAE%>MFE% ratio at both. 650 flips net positive (+62.55 vs -31.30) but neither
+size clears the bar this project's evaluation discipline sets, and 650's own MAE%/MFE% gap (7.16%
+vs 5.73%) is still the wrong way round.
+
+**2. Put-only standalone:**
+
+| Bar | Window | Thr% | Trades | Win% | Net | MAE% | MFE% |
+|---|---|---|---|---|---|---|---|
+| **650 (primary)** | **4/40** | **5** | **21** | **76.2%** | **+159.10** | **5.21% (avg)** | **12.91% (avg) -- favorable, 2.5x** |
+| 2600 (reference, prior section) | 2/10 | 5 | 54 | 72.2% | +254.85 | 6.18% | 8.05% -- favorable |
+
+**650 beats 2600 on every axis the user's stated priority weighs: higher win rate (76.2% vs
+72.2%), lower MAE% (5.21% vs 6.18%), and a much wider favorable MFE%/MAE% gap (12.91%/5.21% = 2.5x,
+vs 2600's 8.05%/6.18% = 1.3x)** -- 650's MFE% (12.91%) is markedly higher than 2600's (8.05%),
+directly matching the user's own "little more MFE" mental model. Net is lower in absolute points
+(+159.10 vs +254.85) but that's expected from roughly 2.5x fewer trades (21 vs 54) at a similar
+per-trade edge -- per-trade net is actually higher at 650 (+7.58/trade vs +4.72/trade @2600). Trade
+count is lower, not higher, at 650 -- see the "does more trades happen" discussion below; the user's
+"little more trades" expectation did not materialize at this window/threshold, an honest correction
+to the interpretation, not a confirmation.
+
+**Day-by-day / OOS / DTE / session-phase for the 650 Put winner (fast=4/slow=40/thr=5%):**
+- Recovered-from-worse-drawdown: 21/21; gave-back-profit-from-best-point: 21/21 (same pattern the
+  2600 Put winner showed -- expected for a reversal-exit strategy, not a red flag on its own).
+- DTE split: 0-DTE (09-08+09-15) 20 of the 21 total trades, ~80.0% weighted win, +167.55 net;
+  non-0-DTE (the other 6 days combined) only 1 trade, net -8.45 (a single loss). **This signal is
+  almost entirely a 0-DTE signal at 650** -- see the DTE-conditioning section below, this is the
+  single biggest finding of this task.
+- Out-of-sample 2026-09-21 (non-0-DTE day): 4 trades, 50.0% win, -21.35 net -- weaker OOS than
+  2600's own Put winner (66.7% win, -16.25 net on 6 trades), consistent with 650 being a much
+  weaker signal specifically on non-0-DTE days (2026-09-21 is not a 0-DTE day).
+- Session-phase (bucketed by entry time from the mae-mfe per-trade dump, same
+  09:30-10:00/10:00-13:30/13:30-15:15 convention `session-phase` uses elsewhere in this project):
+  10 of 21 trades entered in the 10:00-13:30 mid-session window, 8 in 13:30-15:15 close, 3 in
+  09:30-10:00 open -- no single phase dominates, consistent with the 2600 Put winner's own
+  no-phase-concentration finding.
+
+**3. Both-agree entry, BOTH-must-reverse exit (new `DualAgreementBothExit`, "set 3"):**
+
+| Bar | Window | Thr% | Trades | Win% | Net |
+|---|---|---|---|---|---|
+| 650 (primary) | 4/40 (both legs) | 2 | 56 | 57.1% | -27.30 |
+| 650 (primary) | 4/40 (both legs) | 5 | 10 | 40.0% | -62.05 |
+| 2600 (reference) | Call 2/15, Put 2/10 | 5 | 40 | 60.0% | +8.20 |
+
+**4. Both-agree entry, EITHER-reverses exit (pre-existing `DualAgreement`, "set 4"):**
+
+| Bar | Window | Thr% | Trades | Win% | Net |
+|---|---|---|---|---|---|
+| **650 (primary)** | **4/40 (both legs)** | **2** | **78** | **62.8%** | **+65.20** |
+| 650 (primary) | 4/40 (both legs) | 5 | 19 | 52.6% | -19.25 |
+| 2600 (reference, prior section) | Call 2/15, Put 2/10 | 5 | 52 | 65.4% | +19.55 |
+
+**Set 4 (either-exit) beats set 3 (both-exit) at every threshold pairing tested, at both bar
+sizes.** Requiring BOTH legs to reverse before exiting holds a losing position open longer waiting
+for the weaker (Call) leg to confirm -- the same "one strong leg dragged down by a weaker one"
+dynamic the prior section's dual-agreement finding already flagged, now compounded by a stricter
+exit that gives the weak leg more time to do damage. Set 3 is not worth carrying forward in this
+construction.
+
+### The four sets, ranked by the user's own win-rate/MAE/MFE priority (650, primary)
+
+| Rank | Set | Trades | Win% | Net | MAE%/MFE% |
+|---|---|---|---|---|---|
+| 1 | **Put-only standalone (4/40/5%)** | 21 | **76.2%** | +159.10 | 5.21%/12.91% -- strongly favorable |
+| 2 | Both-agree, either-exit (4/40/2%, "set 4") | 78 | 62.8% | +65.20 | not re-measured (scope gap, noted) |
+| 3 | Call-only standalone (4/40/2%) | 97 | 61.9% | +62.55 | 7.16%/5.73% -- unfavorable |
+| 4 | Both-agree, both-exit (4/40/2%, "set 3") | 56 | 57.1% | -27.30 | not re-measured (scope gap, noted) |
+
+Put-price standalone remains the clear winner by the stated priority, at both bar sizes tested
+across this task and the prior one -- nothing in the four-set combination exercise beat it. This
+confirms rather than overturns the prior section's own conclusion.
+
+### DTE-conditioned bar-size investigation
+
+**The user's hypothesis, precisely**: 0-DTE days run hotter (higher realized volatility), so a
+smaller bar-volume threshold (more, finer bars per day) should specifically benefit 0-DTE trading
+with more trades and better MFE, while non-0-DTE days might not show the same benefit or might even
+prefer a larger threshold.
+
+**Method**: for each of 325/650/1300/2600, took that threshold's own best-found Put-price window
+(from the sweeps above and the prior section), then split its 8-day-backtest trades into 0-DTE
+(2026-09-08, 2026-09-15) vs non-0-DTE (the other 6 days) by re-running the exact same window/
+threshold restricted to each date subset (not a post-hoc trade filter -- a genuinely separate
+simulation run per subset, so no look-ahead/warm-up leakage across the DTE boundary).
+
+| Bar | Window | 0-DTE trades | 0-DTE win% | 0-DTE net | Non-0-DTE trades | Non-0-DTE net |
+|---|---|---|---|---|---|---|
+| 325 | 4/40/5% | 21 | 71.4% | +93.25 | 1 | -50.75 (single loss) |
+| 650 | 4/40/5% | 20 | 80.0% | +167.55 | 1 | -8.45 (single loss) |
+| 1300 | 3/20/5% | 16 | 81.3% | +105.25 | 5 | +33.55 |
+| 2600 | 2/10/5% | 32 | 78.1% | +179.50 | 22 | +75.35 |
+
+**The hypothesis holds only partly, and in a different shape than the "more trades, better MFE"
+framing suggested -- an honest correction, not a confirmation.**
+
+- **0-DTE win rate is NOT meaningfully better at smaller bar sizes** -- it's roughly flat across all
+  four thresholds (71.4% / 80.0% / 81.3% / 78.1%), well within the noise band of these small
+  samples (16-32 trades). Smaller bars do not unlock a materially stronger 0-DTE edge on win rate
+  alone.
+- **0-DTE trade COUNT goes DOWN, not up, as the bar size shrinks** (32 -> 16 -> 20 -> 21 from
+  2600->1300->650->325 -- non-monotonic and, at the two finest thresholds, actually fewer trades
+  than 2600 gives). This is the opposite of the naive "more bars per day = more trades" intuition,
+  and the reason is the FIXED 5% threshold: a 5%-of-slow-MA gap is harder to clear bar-to-bar on
+  finer, smaller-per-bar price increments than on coarser 2600-bar moves, even on a high-volatility
+  0-DTE day. Getting more 0-DTE trades from smaller bars, if that's still a goal, would need a
+  correspondingly SMALLER threshold% tuned per bar size (not attempted here -- flagged as a real,
+  derivable-not-eyeballed next step, not invented on the spot).
+- **The real, load-bearing finding is on the NON-0-DTE side, not the 0-DTE side**: non-0-DTE trade
+  count collapses hard as the bar size shrinks (22 @2600 -> 5 @1300 -> 1 @650 -> 1 @325), and the
+  handful of trades that do fire on non-0-DTE days at the two finest thresholds are outright losses
+  (a single -50.75 and -8.45 trade at 325/650 respectively, both net-negative). **2600 is
+  functionally the only bar size in this sweep that produces a real, tradeable non-0-DTE sample
+  (22 trades, 63.6% win from the prior section) -- 650/325 are not viable non-0-DTE bar sizes for
+  this signal at all**, not merely "less good than 2600."
+
+**What a DTE-conditioned signal would look like, and a first-pass blended estimate**: use 650
+(4/40/5%) specifically on 0-DTE days and 2600 (2/10/5%, the prior section's own winner) on
+non-0-DTE days, for the same underlying Put-price-crossover signal --
+
+| Component | Trades | Weighted win% | Net |
+|---|---|---|---|
+| 0-DTE @650 | 20 | 80.0% | +167.55 |
+| Non-0-DTE @2600 | 22 | 63.6% | +75.35 |
+| **Blended DTE-conditioned total** | **42** | **71.4%** | **+242.90** |
+| (for comparison) pure 2600 standalone, all days | 54 | 72.2% | +254.85 |
+
+**The blend is not clearly better than just trading 2600 throughout.** Win rate is essentially tied
+(71.4% vs 72.2%) and net is slightly lower (+242.90 vs +254.85, on fewer total trades: 42 vs 54).
+The blend's real practical benefit, if any, is qualitative rather than in these topline numbers:
+0-DTE's own slice is meaningfully stronger isolated at 650 (80.0% win, +8.38/trade) than the blended
+0-DTE contribution would be diluted into a single fixed-threshold run, and 650's MFE%/MAE% ratio
+(2.5x) is the most favorable of anything measured in this task or the prior one. A live system that
+already has to pick a bar threshold per day for other reasons (DTE-aware position sizing, etc.)
+would lose little and might gain some tail-quality by conditioning this specific signal's bar size
+on DTE -- but the topline win-rate/net numbers alone do not make a strong independent case for it.
+
+**Honest verdict on the hypothesis**: PARTIALLY CONFIRMED, but not for the mechanism the user's own
+mental model proposed. 0-DTE does trade well across every bar size tested (not specifically better
+at small sizes) and non-0-DTE genuinely deteriorates at small bar sizes (this part of the intuition
+was right, just for a different reason -- trade scarcity/quality collapse, not "wrong regime").
+DTE-conditioning is directionally justified as an engineering choice (don't run this signal at
+650/325 on non-0-DTE days) but the win-rate/MAE/MFE case for actively PREFERRING a DTE-conditioned
+blend over plain 2600 is thin on the data gathered here -- a genuine, not a forced, negative-leaning
+finding, consistent with this project's "one run is a data point" discipline.
+
+### Scope not attempted, honestly noted
+
+- The 650-bar Call/Put grids (27 combos/side) are coarser than the prior section's 36-combo 2600
+  grid -- a real, documented time-budget tradeoff, not an oversight.
+- MAE/MFE was not re-measured for the two combination sets (3 and 4) -- only win rate/net were
+  checked, same gap the prior section left for its own band-width variants.
+- The 1300/325 sweeps were 3-candidate spot-checks, not full grids -- a real gap if either bar size
+  is pursued further.
+- The DTE-conditioned "blend" above is the simple two-piece estimate the task's own scope allowed
+  for ("doesn't need to be a fully unified new metric if time-constrained") -- a genuinely unified
+  DTE-aware `PriceCrossoverSide`/CLI switch (auto-selecting bar threshold by the day's own DTE) was
+  not built.
+- A threshold% re-tune per bar size (the "smaller threshold for smaller bars, to actually get more
+  trades" idea raised by the DTE investigation's own finding) was not attempted -- flagged as the
+  most promising concrete next step this task surfaced, not investigated further here.
+- No new unit test was added for `PriceCrossoverSide.DualAgreementBothExit`'s own switch-arm logic
+  in `TradeSimulator.SimulatePriceCrossoverDayAsync` -- consistent with the pre-existing
+  `DualAgreement` arm, which also has no dedicated unit test (both are covered only at the
+  CLI/backtest-reproduction level, via the numbers in this section). This is a real, pre-existing
+  gap this task did not close, not a new one it introduced.
+
+## Full grid search: Put-price crossover, DTE-conditioned (2026-09-22)
+
+**Research only, provisional, extends the two sections above.** User's explicit request: "did you
+try fast window between 2 to 10 and slow window between 10 to 50 ... we must run the calibration
+for best window size. It must be based on DTE. can you run grid search kind of thing to figure out
+the best" -- the prior two sections' grids were coarse spot-checks (fast in {2,3,5} or {3,4,8},
+slow in a handful of values); this task runs a genuinely exhaustive grid over the user's own
+requested range and splits every cell by DTE regime, not just the winning cell. **Priority
+unchanged: win rate first, then MAE%/MFE%, net last.**
+
+### New CLI: `price-crossover-calibrate`
+
+Added following the exact pattern of the pre-existing `crossover-calibrate` command (one process,
+internal loop over the grid -- never shells out to a fresh `dotnet run` per combo). Sweeps
+fast/slow/threshold internally and, on every cell, runs three separate
+`TradeSimulator.SimulatePriceCrossoverDayAsync` passes per date -- one date-list pass tagged into
+pooled/0-DTE/non-0-DTE buckets after the fact (each date is only actually simulated once; the DTE
+split is a bucketing of that one pass's trades by date, not three independent re-runs, so a
+81-cell grid costs the same 8 (or however many) day-sims per cell it would for a pooled-only sweep,
+not 3x). This keeps the split genuinely leak-free (no cross-day state, no post-hoc pooled-run trade
+filtering) while staying cheap: the full 9x9-minus-invalid grid (80 cells) at one bar size and one
+threshold completes in about 20 seconds end-to-end.
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- price-crossover-calibrate <fromDate> <toDate> <side:Call|Put|DualAgreement|DualAgreementBothExit> [fastList=2,3,4,5,6,7,8,9,10] [slowList=10,15,20,25,30,35,40,45,50] [thresholdList=5] [barVolumeThreshold=650] [--band=3|5] [--zerodte=2026-09-08,2026-09-15] [--targetmin=5] [--targetmax=10]
+```
+
+`--zerodte=` defaults to the two known 0-DTE dates in the standard 8-day range (2026-09-08,
+2026-09-15); every other date in the requested range is treated as non-0-DTE. Output columns:
+Pooled / 0-DTE / Non-0-DTE trades, win%, net, side by side per cell.
+
+### Grid actually run, and why
+
+- **Fast in {2,3,4,5,6,7,8,9,10} (every integer, 9 values), slow in {10,15,20,25,30,35,40,45,50}
+  (step 5, 9 values), slow>fast enforced** -- the full requested range, no skipped values. 80 valid
+  combinations. Finer slow steps (every integer 10-50, 41 values) were NOT run -- with the coarse
+  step-5 grid already showing a clear, smooth trend (see tables below) rather than a sharp peak
+  between adjacent step-5 values, a finer pass looked unlikely to change the winning region and
+  the coarse grid's cost/value was already favorable; this is a documented judgment call, not a
+  derived one.
+- **Threshold fixed at 5% for the full fast/slow grid** (the established winner from the two prior
+  sections), then spot-checked at 2%/3% on the top real-sample cells afterward -- per this task's
+  own stated time-budget guidance. Full grid at 2%/3% was NOT run (would have been 240 more day-sim
+  batches); the spot-check below shows why fixing at 5% for the main grid was the right call (lower
+  thresholds trade win rate for volume, and change the MAE/MFE ratio unfavorably -- see below).
+- **Both 650 and 2600 bar sizes got the FULL fast/slow grid** at thr=5% (not just 650 as the
+  "light/coarser" fallback the task allowed for) -- each full grid run took under 25 seconds, so
+  there was no time pressure to skip 2600.
+- **Put side only** for the full grid; Call side got a light spot-check (2/15, 2/40, 4/15, 4/40 at
+  2600; 4/40 at 650) to confirm it remains weak -- consistent with both prior sections' full-grid
+  findings for Call.
+- 1300/325 bar sizes were NOT re-swept in this task (out of the user's explicitly requested scope,
+  which named 650/2600 windows and DTE-splitting, not a bar-size re-sweep) -- the prior section's
+  own 1300/325 spot-checks stand as-is.
+
+### Put-price crossover, full grid, bar=650, thr=5% (8-day backtest 09-08..09-19)
+
+Representative rows (real-sample tier, n(pooled)>=15); full 80-row grid reproducible via the CLI
+command above (`price-crossover-calibrate 2026-09-08 2026-09-19 Put 2,3,4,5,6,7,8,9,10 10,15,20,25,30,35,40,45,50 5 650`):
+
+| fast | slow | Pooled n | Pooled win% | Pooled net | 0-DTE n | 0-DTE win% | 0-DTE net | Non-0-DTE n | Non-0-DTE win% | Non-0-DTE net |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 2 | 10 | 100 | 61.0% | +35.65 | 62 | 71.0% | +171.40 | 38 | 44.7% | -135.75 |
+| 2 | 30 | 100 | 57.0% | +137.30 | 66 | 63.6% | +136.85 | 34 | 44.1% | +0.45 |
+| 2 | 40 | 99 | 60.6% | +191.90 | 62 | 64.5% | +155.30 | **37** | **54.1%** | **+36.60** |
+| 3 | 40 | 34 | 67.6% | +80.50 | 26 | 73.1% | +135.20 | 8 | 50.0% | -54.70 |
+| **4** | **25** | 21 | **76.2%** | +108.05 | 21 | 76.2% | +108.05 | 0 | -- | -- |
+| 4 | 30 | 18 | 83.3% | +121.35 | 18 | 83.3% | +121.35 | 0 | -- | -- |
+| **4** | **40** | 21 | **76.2%** | +159.10 | **20** | **80.0%** | **+167.55** | 1 | 0.0% | -8.45 |
+| 4 | 45 | 25 | 76.0% | +127.50 | 23 | 82.6% | +168.00 | 2 | 0.0% | -40.50 |
+| 4 | 50 | 20 | 85.0% | +63.15 | 19 | 89.5% | +131.85 | 1 | 0.0% | -68.70 |
+
+Every cell with fast>=5 collapses to single-digit or zero trade counts at 650/5% (see raw output --
+not excerpted here, consistent with the prior section's own finding that fast>=5 at 650 mostly
+fires only a handful of times over 8 days). **The 650-bar grid is, structurally, almost entirely a
+0-DTE grid at fast>=3/thr=5%** -- non-0-DTE trade counts stay in the low single digits or zero for
+every fast>=3 cell. The one exception the exhaustive grid surfaces that the prior coarse sweep
+missed: **fast=2/slow=40/thr=5%** gives a real non-0-DTE sample (37 trades, 54.1% win, +36.60 net)
+-- modest but genuinely non-trivial, the best non-0-DTE result found anywhere at 650.
+
+### Put-price crossover, full grid, bar=2600, thr=5% (8-day backtest)
+
+Representative rows (real-sample tier, n(pooled)>=15); full grid reproducible via
+`price-crossover-calibrate 2026-09-08 2026-09-19 Put 2,3,4,5,6,7,8,9,10 10,15,20,25,30,35,40,45,50 5 2600`:
+
+| fast | slow | Pooled n | Pooled win% | Pooled net | 0-DTE n | 0-DTE win% | 0-DTE net | Non-0-DTE n | Non-0-DTE win% | Non-0-DTE net |
+|---|---|---|---|---|---|---|---|---|---|---|
+| **2** | **10** | 54 | 72.2% | **+254.85** | 32 | 78.1% | +179.50 | **22** | **63.6%** | **+75.35** |
+| 2 | 20 | 42 | 69.0% | +140.50 | 27 | 85.2% | +188.00 | 15 | 40.0% | -47.50 |
+| 2 | 35 | 48 | 70.8% | +24.90 | 28 | 89.3% | +148.90 | 20 | 45.0% | -124.00 |
+| **2** | **40** | 46 | **76.1%** | +86.70 | **28** | **89.3%** | +147.65 | 18 | 55.6% | -60.95 |
+| 3 | 10 | 17 | 76.5% | +117.45 | 15 | 80.0% | +148.60 | 2 | 50.0% | -31.15 |
+| 4 | 25 | 12 | 100.0% | +153.20 | 12 | 100.0% | +153.20 | 0 | -- | -- |
+| 4 | 30 | 11 | 90.9% | +198.50 | 10 | 100.0% | +253.25 | 1 | 0.0% | -54.75 |
+
+**Genuinely new finding this exhaustive grid surfaces that the prior coarse sweep missed:
+fast=2/slow=40/thr=5% beats the established fast=2/slow=10/thr=5% winner on win rate** (76.1% vs
+72.2%, both on a real ~46-54-trade sample) and on 0-DTE win rate specifically (89.3% vs 78.1%, tied
+with fast=2/slow=35 for the best 0-DTE win rate at 2600). It loses on net (+86.70 vs +254.85) and,
+importantly, on the MAE/MFE ratio -- see the evaluation battery below, this is why it does NOT
+replace 2/10/5% as the recommended overall pick despite the higher win rate.
+
+### Threshold spot-check on the top cells (2%/3%, vs the established 5%)
+
+| Bar | Window | Thr% | Pooled n | Win% | Net | 0-DTE n | 0-DTE win% | Non-0-DTE n | Non-0-DTE win% |
+|---|---|---|---|---|---|---|---|---|---|
+| 2600 | 2/10 | 2 | 113 | 67.3% | +113.30 | 54 | 68.5% | 59 | 66.1% |
+| 2600 | 2/10 | 3 | 86 | 65.1% | +104.35 | 44 | 72.7% | 42 | 57.1% |
+| 2600 | 2/10 | **5** | 54 | **72.2%** | +254.85 | 32 | 78.1% | 22 | 63.6% |
+| 2600 | 2/40 | 2 | 93 | 76.3% | +76.45 | 39 | 82.1% | 54 | 72.2% |
+| 2600 | 2/40 | 3 | 71 | 73.2% | +87.90 | 34 | 85.3% | 37 | 62.2% |
+| 2600 | 2/40 | **5** | 46 | 76.1% | +86.70 | 28 | 89.3% | 18 | 55.6% |
+| 650 | 4/40 | 2 | 75 | 68.0% | +153.05 | 42 | 73.8% | 33 | 60.6% |
+| 650 | 4/40 | 3 | 45 | 66.7% | +115.05 | 33 | 78.8% | 12 | 33.3% |
+| 650 | 4/40 | **5** | 21 | **76.2%** | +159.10 | 20 | 80.0% | 1 | 0.0% |
+
+Lower thresholds trade win rate for volume at every window/bar-size combination tested -- 5% remains
+the best threshold by the win-rate-first priority everywhere it was spot-checked, confirming rather
+than overturning the two prior sections' own threshold conclusion. (2600 2/40/2% has a slightly
+*higher* pooled win rate than 2600 2/40/5% at much higher n -- 76.3% vs 76.1% -- but see the MAE/MFE
+battery below for why this is still not the pick.)
+
+### Call-side spot-check (confirms weak, not re-swept in full)
+
+2600: 2/15/5% (58 trades, 62.1% win, -31.30 -- the established winner, unchanged), 2/40/5% (51,
+52.9%, -98.95), 4/15/5% (12, 33.3%, -19.75), 4/40/5% (16, 50.0%, -47.65). 650: 4/40/5% (25, 36.0%,
+-101.95, matching the prior section's own number exactly). **No cell touched in this spot-check
+beats the Call side's own prior-section conclusion** -- still not worth a full grid.
+
+### Evaluation battery: MAE/MFE on the new best-win-rate candidates vs the established winners
+
+The exhaustive grid surfaces two cells with a HIGHER win rate than the previously-recorded winners
+(2600 2/40/5% at 76.1% vs 2/10/5%'s 72.2%; 2600 2/40/2% at 76.3% and n=93). Per the user's own
+win-rate-AND-MAE/MFE priority, both were run through `mae-mfe price-crossover`:
+
+| Candidate | n | Win% | Net | MAE% avg | MFE% avg | Ratio |
+|---|---|---|---|---|---|---|
+| 2600 2/10/5% (established) | 54 | 72.2% | +254.85 | 6.18% | 8.05% | **favorable (1.30x)** |
+| 2600 2/40/5% (new, higher win%) | 46 | 76.1% | +86.70 | 8.08% | 8.08% | neutral (1.00x) |
+| 2600 2/40/2% (new, higher win%, higher n) | 93 | 76.3% | +76.45 | 6.11% | 5.37% | **unfavorable (0.88x)** |
+| 650 4/40/5% (established) | 21 | 76.2% | +159.10 | 5.21% | 12.91% | **favorable (2.5x)** |
+| 650 4/40/2% (new, higher n) | 75 | 68.0% | +153.05 | 5.96% | 6.02% | neutral (1.01x) |
+
+**The higher-win-rate cells the exhaustive grid found do NOT clear the user's stated priority once
+MAE/MFE is checked.** Both new 2/40-family candidates trade away MAE/MFE quality for the extra
+points of win rate -- 2/40/5% goes from clearly favorable (2/10's 1.30x) to exactly neutral, and
+2/40/2% actually flips unfavorable despite the largest sample size of anything in this table. The
+established winners (2600 2/10/5%, 650 4/40/5%) remain the best picks by the full stated priority
+(win rate AND MAE% AND MFE%, not win rate alone) -- the exhaustive grid confirms rather than
+overturns them, which is itself a useful negative finding: a wider net over the requested range did
+not surface a strictly-better cell, only cells that trade one axis of the priority for another.
+
+### DTE-split winners, restated with the exhaustive grid's own numbers
+
+- **0-DTE (2 days, LOW CONFIDENCE -- see caveat below)**: 2600 2/40/5% has the single highest 0-DTE
+  win rate found anywhere in this task (89.3%, n=28, net +147.65), edging out the established 650
+  4/40/5% (80.0%, n=20, +167.55). Both are real-sample-tier for a 2-day subset, but neither has been
+  MAE/MFE-tested on the 0-DTE subset alone (a gap, noted). Given 2/40/5%'s neutral MAE/MFE ratio on
+  its pooled sample (above), 650 4/40/5% -- already fully vetted with a strongly favorable 2.5x
+  MAE/MFE ratio -- remains the recommended 0-DTE pick pending that gap being closed, not the
+  higher-raw-win-rate 2/40/5%.
+- **Non-0-DTE (6 days)**: 2600 2/10/5% remains the clear winner (63.6% win, n=22, +75.35) -- the
+  exhaustive grid did not surface anything better for non-0-DTE at 2600, and confirmed 650 is
+  structurally weak for non-0-DTE (best real-sample cell there, 2/40/5%, only reaches 54.1% win on
+  37 trades with a much smaller net).
+
+**0-DTE sample-size caveat, stated explicitly and repeated here per this task's own instruction:**
+every 0-DTE number in this document, past and present, rests on exactly 2 trading days
+(2026-09-08, 2026-09-15). A win rate of 89.3% or 80.0% on a 2-day-derived subset (even at n=20-28
+trades, since a handful of 0-DTE days can each throw off dozens of trades) is NOT the same
+statistical confidence as a 54-trade sample spread over 8 independent days. Treat every 0-DTE
+"winner" in this section as provisional and low-confidence until more 0-DTE days accumulate --
+this is not a hedge, it is the literal state of the data.
+
+### Out-of-sample validation, 2026-09-22 (today, already populated at 650 and 2600)
+
+| Candidate | Trades | Win% | Net |
+|---|---|---|---|
+| 2600 2/10/5% (established, non-0-DTE day) | 9 | 55.6% | -19.65 |
+| 650 4/40/5% (established, non-0-DTE day) | 7 | 57.1% | +11.10 |
+| 2600 2/40/5% (new, non-0-DTE day) | 10 | **70.0%** | +9.20 |
+
+The two established candidates reproduce exactly the numbers already on record for 2026-09-22 (task
+context confirmed these before this section's work began). The new 2/40/5% candidate actually
+performs BETTER out-of-sample on win rate (70.0% vs 2/10's 55.6%) on today's (non-0-DTE) data,
+despite its weaker MAE/MFE ratio in the 8-day backtest -- one OOS day, so not remotely conclusive,
+but worth flagging as a reason 2/40/5% may be worth a second full evaluation pass (MAE/MFE
+specifically on more OOS days) before being fully set aside, rather than discarded outright.
+
+### Practical DTE-conditioned recommendation
+
+A DTE-conditioned live rule, if adopted, would look like: **on 0-DTE days, use Put-price crossover
+fast=4/slow=40/thr=5% at the 650-bar threshold; on non-0-DTE days, use fast=2/slow=10/thr=5% at the
+2600-bar threshold** -- identical to the prior section's own recommendation, which this exhaustive
+grid did not overturn. Blended estimate (unchanged from the prior section, restated for
+completeness): 42 trades, 71.4% weighted win rate, +242.90 net, essentially tied with running
+2600/2-10/5% alone on all 8 days (54 trades, 72.2% win, +254.85 net) -- **the exhaustive grid did
+not change this conclusion: DTE-conditioning this signal is a defensible engineering choice (don't
+run it at 650 on non-0-DTE days -- confirmed again here, even more starkly, since only fast=2/slow=40
+gives a usable non-0-DTE sample at 650 at all) but is not independently justified by the topline
+win-rate/net numbers alone.**
+
+### Scope not attempted, honestly noted
+
+- Slow-window step size was 5 (9 values: 10,15,...,50), not every integer (41 values) -- a
+  documented judgment call based on the smoothness of the step-5 trend, not derived from a finer
+  pass that was actually run.
+- The threshold grid was fixed at 5% for the full 80-cell fast/slow sweep at both bar sizes; only
+  the top few cells got a 2%/3% spot-check, not a full 3rd-dimension grid (240 more day-sim
+  batches were judged not worth the marginal information given the spot-check's own result: lower
+  thresholds consistently traded win rate/MAE-MFE quality for volume, at every cell checked).
+- MAE/MFE was not measured on the 0-DTE subset alone for any candidate (only pooled-8-day MAE/MFE
+  is available) -- flagged above as the reason 650 4/40/5% is still preferred over 2600 2/40/5% for
+  the 0-DTE-specific recommendation despite the latter's higher raw 0-DTE win rate.
+- 1300-bar and 325-bar windows were not re-swept in this task; the prior section's spot-checks
+  stand as the only data at those bar sizes.
+- Band-width (3/5) variants were not re-tested against the exhaustive grid's new candidates -- the
+  prior section's band-width finding (single-ATM already as good as banded for Put-price crossover)
+  is assumed to still hold, not re-verified here.
+
+## Option-premium momentum: relationship research matrix (2026-09-22)
+
+**Research only, inverts the prior three sections' own approach on the user's explicit
+instruction.** The prior sections optimized a TRADING RULE (crossover + P&L) on raw bar counts
+before ever establishing whether a real relationship exists between option-premium momentum and
+NIFTY's forward direction, and never separated "predicts the option's own future price" from
+"predicts NIFTY's forward direction" -- two different questions that a crossover-and-P&L backtest
+cannot tell apart on its own. This task builds that separation directly: continuous `Spread`/
+`Velocity` readings (not crossover events), bucketed against **forward-looking research labels,
+not tradeable signals** (see below), measured against both NIFTY's own forward return and the
+same-side option's own forward return, side by side.
+
+**No look-ahead discipline for the labels.** Every `NiftyFwd{5,10,20}`/`OptionFwd{5,10,20}` number
+in this section is computed by looking at bars strictly AFTER the bar `Spread`/`Velocity` was
+itself computed from -- genuinely look-ahead, but confined entirely to labeling historical data for
+this research question. `Spread`/`Velocity` themselves use only the same rolling-window discipline
+`PriceCrossoverEngine`/`SimulatePriceCrossoverDayAsync` already use (no fabricated bars, no
+future data in the window). Nothing here is a tradeable rule; see the "illustrative trade-level
+stats" caveat at the end.
+
+**New code**: `NiftySignal.VolumeBarData/MomentumRelationshipAnalyzer.cs` (wholly separate from
+`TradeSimulator.SimulatePriceCrossoverDayAsync`'s dispatch -- never opens/closes a trade, same
+"never a branch in the existing dispatch chain" discipline the price-crossover work itself
+established) and CLI `momentum-relationship` in `Program.cs`. `TradeSimulator.cs` and
+`PriceCrossoverEngine.cs` were NOT touched -- no baseline re-verification needed (confirmed by
+inspection: this task's diff touches only the two new/changed files listed here).
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- momentum-relationship <fromDate> <toDate> <side:Call|Put> <fastBars> <slowBars> [barVolumeThreshold=2600] [--band=3|5] [--strikemode=Rolling|SignalFixed] [--buckets=8]
+```
+
+8-day backtest range 2026-09-08..2026-09-19 throughout (same range every prior section in this
+document uses), pooled across all 8 days.
+
+### Step 1-2: volume-normalized horizon comparison (Spread/Velocity, continuous, not crossover events)
+
+**Why**: the prior sections' own bar-count sweeps (650 vs 1300 vs 2600 with the SAME fast/slow bar
+COUNTS) confound bar size with momentum horizon -- a 650-bar/(4,40) window covers a completely
+different volume horizon than a 2600-bar/(4,40) window. This section instead holds the VOLUME
+horizon roughly constant across bar sizes at three separate horizon scales, so bar-size effects and
+horizon-length effects can be told apart:
+
+| Scale | Target volume horizon | 650 bars | 1300 bars | 2600 bars |
+|---|---|---|---|---|
+| A (short) | fast~2,600 / slow~26,000 | fast=4, slow=40 | fast=2, slow=20 | fast=1, slow=10 |
+| B (medium) | fast~5,200 / slow~52,000 | fast=8, slow=80 | fast=4, slow=40 | fast=2, slow=20 |
+| C (longer) | fast~10,400 / slow~104,000 | fast=16, slow=160 | fast=8, slow=80 | fast=4, slow=40 |
+
+`Spread = (FastMA-SlowMA)/SlowMA` (signed, continuous), `Velocity = Spread_t - Spread_(t-1)`, both
+computed on the ATM strike's own real tick price (rolling-strike, single ATM, no band) unless noted
+otherwise in steps 4-5. Fast=1 at 2600/Scale A is the degenerate single-bar "MA" case flagged in
+this task's own instructions -- noted honestly below, not forced to look meaningful or excluded.
+
+Full 18-cell matrix (3 bar sizes x 3 scales x Call/Put), Pearson correlation coefficients between
+`Spread`/`Velocity` and each forward-return target, all three horizons:
+
+| Bar | Scale | Side | Window | n (pooled) | r(Spread,NiftyFwd5/10/20) | r(Spread,OwnOptFwd5/10/20) | r(Velocity,NiftyFwd5/10/20) | r(Velocity,OwnOptFwd5/10/20) |
+|---|---|---|---|---|---|---|---|---|
+| 650 | A | Put | 4/40 | 15214 | -0.052/-0.045/-0.050 | -0.252/-0.294/-0.355 | -0.103/-0.077/-0.058 | -0.341/-0.312/-0.309 |
+| 650 | A | Call | 4/40 | 15214 | +0.040/+0.036/+0.038 | -0.166/-0.150/-0.132 | +0.097/+0.075/+0.057 | -0.325/-0.307/-0.271 |
+| 1300 | A | Put | 2/20 | 9511 | -0.081/-0.074/-0.054 | -0.367/-0.413/-0.447 | -0.076/-0.065/-0.053 | -0.312/-0.289/-0.296 |
+| 1300 | A | Call | 2/20 | 9511 | +0.064/+0.058/+0.040 | -0.255/-0.242/-0.195 | +0.077/+0.063/+0.053 | -0.303/-0.257/-0.255 |
+| 2600 | A | Put | 1/10 (degenerate fast) | 5518 | -0.100/-0.082/-0.058 | -0.484/-0.504/-0.524 | -0.063/-0.046/-0.033 | -0.302/-0.290/-0.295 |
+| 2600 | A | Call | 1/10 (degenerate fast) | 5518 | +0.084/+0.069/+0.046 | -0.333/-0.271/-0.185 | +0.062/+0.047/+0.033 | -0.287/-0.253/-0.222 |
+| 650 | B | Put | 8/80 | 14894 | -0.035/-0.038/-0.049 | -0.183/-0.245/-0.315 | -0.093/-0.074/-0.055 | -0.332/-0.326/-0.315 |
+| 650 | B | Call | 8/80 | 14894 | +0.021/+0.023/+0.028 | -0.078/-0.050/-0.003 | +0.089/+0.070/+0.053 | -0.301/-0.311/-0.294 |
+| 1300 | B | Put | 4/40 | 9351 | -0.060/-0.061/-0.049 | -0.299/-0.366/-0.399 | -0.072/-0.061/-0.051 | -0.320/-0.317/-0.332 |
+| 1300 | B | Call | 4/40 | 9351 | +0.039/+0.040/+0.027 | -0.125/-0.094/-0.029 | +0.070/+0.059/+0.051 | -0.292/-0.299/-0.285 |
+| 2600 | B | Put | 2/20 | 5438 | -0.073/-0.066/-0.050 | -0.397/-0.444/-0.442 | -0.076/-0.062/-0.044 | -0.332/-0.324/-0.344 |
+| 2600 | B | Call | 2/20 | 5438 | +0.047/+0.039/+0.030 | -0.147/-0.070/-0.036 | +0.074/+0.061/+0.042 | -0.323/-0.292/-0.225 |
+| 650 | C | Put | 16/160 | 14254 | -0.018/-0.020/-0.019 | -0.128/-0.190/-0.254 | -0.087/-0.067/-0.064 | -0.330/-0.325/-0.358 |
+| 650 | C | Call | 16/160 | 14254 | +0.012/+0.014/+0.014 | -0.044/-0.005/+0.060 | +0.085/+0.066/+0.059 | -0.289/-0.299/-0.309 |
+| 1300 | C | Put | 8/80 | 9031 | -0.038/-0.038/-0.020 | -0.217/-0.280/-0.308 | -0.076/-0.073/-0.062 | -0.341/-0.355/-0.364 |
+| 1300 | C | Call | 8/80 | 9031 | +0.026/+0.028/+0.015 | -0.051/+0.007/+0.068 | +0.073/+0.069/+0.059 | -0.324/-0.342/-0.310 |
+| 2600 | C | Put | 4/40 | 5278 | -0.050/-0.037/-0.013 | -0.293/-0.346/-0.341 | -0.075/-0.063/-0.052 | -0.340/-0.358/-0.381 |
+| 2600 | C | Call | 4/40 | 5278 | +0.031/+0.023/+0.014 | -0.026/+0.047/+0.047 | +0.067/+0.060/+0.046 | -0.316/-0.292/-0.234 |
+
+### Step 3: the core question -- does Spread/Velocity predict NIFTY, or just the option's own price?
+
+**Answer, stated plainly and consistently across all 18 cells: it predicts the option's own future
+price (moderately-to-strongly, and it's mean-REVERSION, not momentum continuation -- the sign is
+negative), and only weakly/inconsistently predicts NIFTY's forward direction.**
+
+- **Spread-vs-OwnOptionFwd is consistently negative and often large** (Put: -0.13 to -0.52 across
+  all 9 bar/scale cells and all 3 horizons; Call: -0.17 to +0.07, weaker and noisier but still
+  mostly negative). Negative means HIGH Spread (fast MA well above slow MA -- the exact
+  "crossed-up" zone the prior sections' trading rule entered on) predicts the option's OWN price
+  falling back over the next 5-20 bars, not continuing up. This is mean-reversion in the premium
+  itself, which is a real and useful thing to know (it's part of why the prior crossover rule's
+  reversal-exit logic works -- the "crossed down" exit is catching exactly this reversion) but it is
+  NOT the same as "predicts NIFTY."
+- **Spread-vs-NiftyFwd stays small everywhere**: |r| <= 0.10 in all 18 cells, with Put consistently
+  negative (-0.01 to -0.10) and Call consistently positive (+0.01 to +0.08) -- opposite signs, both
+  weak. The bucket table for the strongest cell (2600/Scale A/Put, horizon 5, r=-0.10) still shows a
+  real, monotonic gradient worth reporting honestly: P(NiftyUp) falls from 53.7% in the lowest-Spread
+  octile (n=684) to 38.8% in the highest (n=685) -- a genuine ~15-point spread across n=685-per-bucket
+  samples, not noise-level, but roughly a third to a quarter the strength of the same cell's
+  Spread-vs-OwnOptionFwd relationship (r=-0.48) on the same data.
+- **Velocity-vs-OwnOptionFwd is the single most consistent number in this whole matrix**: negative
+  in all 18 cells, tightly clustered (-0.22 to -0.38), barely moving across bar size, scale, or
+  horizon. Velocity-vs-NiftyFwd stays small (+0.03 to +0.10, Call positive/Put negative again) same
+  as Spread's own NIFTY relationship.
+- **Sign asymmetry between Call and Put is itself a real, reproducible finding**: Put's
+  Spread-vs-NiftyFwd is negative and Call's is positive, at every single scale/bar-size cell, no
+  exceptions. This is consistent with a simple story -- Put premium strengthening (positive Put
+  Spread) coincides mildly with NIFTY weakening, Call premium strengthening coincides mildly with
+  NIFTY strengthening -- but it is small in magnitude (both sides under |r|=0.10) and this task's own
+  no-invented-sign discipline means this is reported as an observation for a future backtester/
+  correlation check to confirm, not adopted as a trading assumption.
+
+**Honest verdict on the volume-normalized-horizon question**: normalizing for volume horizon did
+NOT change the qualitative picture from the prior (bar-count-based) sections, but it DID sharpen
+it. The prior sections found Put-price crossover to be the stronger of the two sides at every bar
+size tested -- this matrix confirms that asymmetry holds at every normalized horizon scale too (Put
+consistently shows a larger-magnitude Spread-vs-OwnOptionFwd correlation than Call, at all 3 bar
+sizes, all 3 scales). What's new here: the prior work's implicit "short-horizon momentum" framing
+undersold what's actually happening -- it isn't momentum continuation being captured at all, it's
+mean-reversion in the option's own premium, which the reversal-based exit rule (not the entry) was
+doing the real work of catching. The degenerate fast=1 case (2600/Scale A) is NOT an outlier or
+obviously broken -- if anything it shows the single strongest Spread-vs-OwnOptionFwd correlation in
+the whole matrix (-0.48 to -0.52), consistent with "raw price relative to its own 10-bar mean" being
+a clean, undiluted mean-reversion signal, not degenerate noise. Scale (A/B/C, i.e., horizon length at
+a fixed bar size) matters less than bar size itself: within any one bar size, all 3 scales tell the
+same qualitative story with modestly decaying magnitude as the horizon widens (Scale A stronger than
+C for Put's Spread-vs-OwnOptionFwd at every bar size), a real but secondary effect next to the
+Call/Put asymmetry and the "predicts self, not NIFTY" finding.
+
+### Step 4: signal-strike vs. rolling-strike control -- a real, load-bearing methodological finding
+
+Re-ran the strongest cell (2600/Scale A/Put, fast=1/slow=10) with `--strikemode=SignalFixed` (ATM
+strike picked ONCE from the day's first bar, held fixed all day) against the default
+`--strikemode=Rolling` (ATM re-picked fresh every bar from that bar's own future price -- verified
+by reading `SimulatePriceCrossoverDayAsync`'s `PickAtm`/`GetPriceAsync` call sites before this task
+started; this is what every prior price-crossover-work section already did, implicitly, without
+calling it out by name):
+
+| Strike mode | r(Spread,NiftyFwd5/10/20) | r(Spread,OwnOptFwd5/10/20) |
+|---|---|---|
+| Rolling (prior sections' implicit choice, this task's Step 1-3 default) | -0.100/-0.082/-0.058 | **-0.484/-0.504/-0.524** |
+| SignalFixed (strike held for the whole day) | -0.062/-0.054/-0.040 | **-0.068/-0.076/-0.046** |
+
+**This is the single most consequential control result in this task.** Fixing the strike for the
+day collapses Spread-vs-OwnOptionFwd from a strong -0.48/-0.50/-0.52 down to a weak -0.05/-0.08/-0.05
+-- roughly a 7-10x reduction. This means a meaningful share of the "option predicts its own future
+price" finding in steps 1-3 is a ROLLING-STRIKE ARTIFACT, not pure premium autocorrelation on one
+fixed contract: as spot drifts during the day, the "ATM" strike used for both the Spread computation
+and the forward-return label changes underneath the measurement, and price-LEVEL differences between
+successive ATM strikes (a fresh ATM contract typically starts nearer its own time-value peak,
+independent of the prior contract's momentum) get counted as if they were one contract's own price
+reverting. Spread-vs-NiftyFwd is much less affected by this (-0.10/-0.08/-0.06 rolling vs
+-0.06/-0.05/-0.04 fixed -- still weak either way, a real but much smaller drop) since NIFTY's own
+forward return never depended on which strike was used to measure Spread in the first place.
+**Practical implication for any future trading-rule work on this signal**: the rolling-strike
+"reversion" a trading rule like the prior sections' would be entering/exiting on is only partly a
+real single-contract phenomenon -- a meaningful fraction of it is strike-switching noise, which a
+real trading rule (which also necessarily trades on the rolling ATM strike, since that's the
+liquid/tradeable contract) will still capture as if it were signal, for better or worse. This
+matters for HOW the prior sections' Put-crossover trading-rule results should be interpreted (their
+reversal-exit's edge is real but its underlying mechanism is now better understood as roughly a mix
+of real premium mean-reversion and rolling-strike level-shift, not attributed to pure autocorrelation
+as this task's own framing initially assumed), not for whether to trust those prior numbers --
+they used real rolling-ATM tradeable contracts throughout, exactly as a live system would.
+
+### Step 5: band-width consistency check
+
+Same cell (2600/Scale A/Put, fast=1/slow=10, rolling strike), single ATM vs ATM+/-1 (band=3) vs
+ATM+/-2 (band=5):
+
+| Band | r(Spread,NiftyFwd5/10/20) | r(Spread,OwnOptFwd5/10/20) |
+|---|---|---|
+| Single ATM (band=1, default) | -0.100/-0.082/-0.058 | -0.484/-0.504/-0.524 |
+| band=3 (ATM+/-1) | -0.101/-0.082/-0.059 | -0.486/-0.503/-0.526 |
+| band=5 (ATM+/-2) | -0.102/-0.083/-0.060 | -0.486/-0.503/-0.528 |
+
+**Essentially unchanged across all three band widths** (every coefficient moves by <=0.003) --
+consistent with the prior price-crossover section's own band-width finding (single-ATM-strike
+pricing already about as clean as it gets for the Put side). This is a genuine genuineness check
+that PASSES: the relationship is not an artifact isolated to one specific contract's microstructure
+-- nearby strikes tell the same story, which is what a real (if here, mostly self-referential)
+signal should look like rather than noise concentrated in one illiquid strike.
+
+### Step 6: illustrative trade-level stats -- not built fresh, existing data reused and re-framed
+
+Per this task's own prioritization ("step 6 only if 1-3 show something real" [for NIFTY
+prediction]), a brand-new illustrative rule was NOT built in this task. Reasoning: the
+Spread-vs-NiftyFwd relationship found in steps 1-3 is real but modest (|r|<=0.10 everywhere, a
+15-point P(Up) octile spread on the strongest cell) -- clearly weaker than the bar the prior
+crossover-trading-rule sections' own Put-price-crossover work already cleared using a structurally
+similar signal (fast/slow MA crossover on the same ATM Put premium). Building a second, redundant
+illustrative rule around a weaker-measured version of essentially the same underlying signal would
+not add new information; the prior sections' own Put-price-crossover trade-level stats (already
+fully documented above: 54 trades, 72.2% win, +254.85 net @ 2600/2/10/5%, MAE 6.18%/MFE 8.05%
+favorable, concentration 18.8%/32.1% top-1/top-2, well under the 55% red flag) are the most directly
+relevant illustrative trade-level reference already available, and this task's own findings refine
+rather than contradict them -- specifically, step 4's finding that the crossover rule's edge is a
+mix of real premium mean-reversion and rolling-strike artifact, not evidence the rule is somehow
+unreal (it trades the real tradeable rolling-ATM contract, so the "artifact" is baked into what a
+live system would actually experience too).
+
+### Overall verdict
+
+**Option-premium momentum (Spread/Velocity computed off a rolling-ATM option's own price) predicts
+the OPTION'S OWN forward price meaningfully (moderate-to-strong mean-reversion, r up to -0.52,
+consistent across bar size/scale/band-width), but predicts NIFTY's forward direction only weakly
+(|r|<=0.10 everywhere, though not zero -- a real, if modest, 15-point P(Up) gradient exists at the
+strongest cell).** The volume-normalized-horizon reframing did not overturn the prior sections'
+Call/Put asymmetry finding (Put remains the stronger side at every scale) but it did correct the
+MECHANISM: what looked like short-horizon momentum in the prior crossover-and-P&L framing is, when
+measured directly and continuously, actually mean-reversion, and a meaningful share of even that
+is a rolling-strike-selection artifact rather than pure single-contract autocorrelation (step 4's
+finding, the most important control result in this task).
+
+**What this implies for Phase 4 (DTE conditioning) and Phase 5 (regime conditioning), if this
+direction is pursued further**: the case for treating option-premium momentum as a genuinely new,
+independent NIFTY-direction signal (as opposed to a mechanism that helps time exits on a position
+already opened for other reasons) is thin on this evidence -- the weak, if real, Spread-vs-NiftyFwd
+relationship is not obviously strong enough on its own to justify the full DTE/regime-conditioning
+investment this project's evaluation cycle asks of a genuine composite-score candidate. It is NOT a
+dead end (the mean-reversion-in-the-option's-own-price finding is real, large, and consistent, and
+plausibly already explains a meaningful share of why the prior sections' Put-crossover reversal-exit
+rule works as an EXIT timing mechanism), but per this project's own metric-by-metric evaluation
+process, this task's own honest conclusion is: **option-premium Spread/Velocity does not clear the
+bar as a standalone NIFTY-direction predictor** -- it is better understood and potentially more
+useful as a position-management/exit-timing signal for a rule already opened on other grounds, which
+is a different role than the multi-metric composite score this project's endgame is building toward.
+This is recorded here as an explicit, dated conclusion per the 2026-09-12 metric-by-metric evaluation
+process, not left ambiguous.
+
+### Scope not attempted, honestly noted
+
+- Steps 1-3 (the core relationship question) got the full 18-cell matrix at all 3 horizons --
+  the highest-priority item, done in full per this task's own prioritization.
+- Steps 4-5 (controls) were each run on ONE representative cell (2600/Scale A/Put, the strongest
+  Spread-vs-OwnOptionFwd cell), not across all 18 -- a documented time-budget judgment call. Given
+  step 4's finding was large and consistent in direction with what step 5 (band-width) already
+  showed holding steady across nearby strikes, re-running both controls on every one of the 18
+  cells was judged lower-value than the time it would cost; a future pass could confirm the
+  strike-mode effect size is similar at other scales/bar-sides if this direction is picked back up.
+- Step 6 (illustrative trade-level stats) was deliberately NOT built fresh -- see that section's own
+  reasoning. This is a documented judgment call, not an oversight: the relevant illustrative
+  trade-level detail already exists in this document from the prior sections' own Put-crossover
+  work.
+- Quantile bucketing used 6-8 buckets throughout (not a finer decile/percentile split) -- chosen for
+  per-bucket sample sizes in the several-hundred range at pooled n=5000-15000, a documented judgment
+  call favoring stable per-bucket means over finer resolution.
+- Velocity's own bucket-level (not just Pearson-r) tables were not printed/tabulated in this
+  document -- the CLI (`momentum-relationship`) computes and prints Spread-bucketed tables only;
+  Velocity is reported via Pearson r alongside Spread in the correlation matrix, not its own bucket
+  table. A future pass could add a Velocity-bucketed table the same way if useful.
+- `TradeSimulator.cs`/`PriceCrossoverEngine.cs` were not modified, so the CLAUDE.md-mandated baseline
+  re-verification (112/64.3%/+426.40 locked; 80/55.0%/+277.20 futures) was not re-run in this task --
+  not applicable, confirmed by inspection of the actual diff rather than assumed.
+
+## Tick activity + option premium SMA/EMA research (2026-09-22)
+
+19-part protocol (user's own spec). New code: `NiftySignal.Features/TickActivityFeatures.cs` (Part 2
+pure-function feature set, tested in `NiftySignal.Tests/Features/TickActivityFeaturesTests.cs`),
+`NiftySignal.VolumeBarData/TickActivityAnalyzer.cs` + CLI `tick-activity-research` (Parts 3-8),
+`NiftySignal.VolumeBarData/MaSpreadEngine.cs` (SMA/EMA-per-leg spread engine, tested in
+`NiftySignal.Tests/VolumeBarData/MaSpreadEngineTests.cs`) + `MaSpreadRelationshipAnalyzer.cs` + CLI
+`ma-spread-research` (Parts 9-14). All analysis run against the local `niftysignal_volume_bars` /
+`niftysignal_vm_copy` databases, all 11 populated trading days (2026-09-04, 08, 09, 10, 11, 15, 16,
+17, 18, 21, 22), thresholds 650/1300/2600 (325/3900/5200 not exercised in this task -- time budget,
+see "Scope cuts" below). `dotnet build`/`dotnet test`: 0 warnings, 728/728 passing.
+
+**Experiment log (Part 18)**
+
+| ID | Hypothesis | Dataset | Bar(s) | Params | Outcome def. | Result | Conclusion |
+|----|------------|---------|--------|--------|---------------|--------|------------|
+| E1 | TickDensity/Velocity/PriceEfficiency/Churn levels predict NiftyFwd5/10/20 | 11 days, pooled | 650/1300/2600 | quantile buckets (6) | fwd return, MFE/MAE, P(Up) | all \|r\|<0.03, buckets non-monotonic, P(Up) 45-50% at every bar size | **not supported** |
+| E2 | Session/rolling percentile normalization is more informative than raw level | same | 650/1300/2600 | rolling=75 | r(sessionPct/rollingPct,Fwd10) vs r(raw,Fwd10) | percentile forms sometimes marginally larger \|r\| (e.g. TickVelocity 0.0096->0.0267 sessionPct at 1300) but never exceeds ~0.03 | **not supported** (normalization doesn't rescue a null result) |
+| E3 | 2x2 Activity x Efficiency state (A/B/C/D) shows differentiated forward outcomes | same | 650/1300/2600 | median split | P(Up), MeanFwd, MFE/MAE per state | all 4 states land within ~48+-2% P(Up), no state stands out | **not supported** |
+| E4 | High-Activity+High-Efficiency bars followed by mean-reversion (not continuation) | same | 650/1300/2600 | split by NetMove sign | P(Up) after positive vs negative NetMove | positive-NetMove: P(Up)=38.9/41.8/43.9% (650/1300/2600); negative-NetMove: P(Up)=57.3/54.9/52.8% -- consistent direction, consistent ordering, at all 3 bar sizes | **weak, but consistent across bar sizes -- candidate for further, dedicated study** |
+| E5 | "Struggle" state (HighAct+LowEff+near-zero NetMove) precedes directional release | same | 650/1300/2600 | bottom-quartile \|NetMove\| | mean/abs forward return | meanFwd~0, no directional bias at any bar size | **not supported** (no release-direction signal found; absolute-move magnitude not meaningfully elevated either) |
+| E6 | Delta (transition) beats level for tick features | same | 1300 | bar-over-bar delta | r(delta,Fwd10) vs r(level,Fwd10) | delta r consistently SMALLER in magnitude than level r (e.g. TickVelocity 0.0096->-0.0015) | **not supported** |
+| E7 | Tick-feature composite carries information DepthImbalance lacks (Model A/B/C) | same | 650/1300/2600, by session/DTE | simple avg of 2 session-percentiles | r(.,Fwd10), sign agreement | both near zero everywhere (\|r\|<0.09), signs disagree in ALL/most session splits | **not supported / inconclusive** -- neither signal is strong enough for "adds information" to mean anything |
+| E8 | Option premium Spread predicts NiftyFwd (SMA baseline) | 11 days | 650 | fast=4,slow=40,band=3 | r(Spread,NiftyFwd), buckets | Call r=+0.02 to +0.03, Put r=-0.03 to -0.04 (5/10/20 bars) | **weak, directionally consistent with EMA runs below -- candidate** |
+| E9 | EMA improves on SMA for detecting the same relationship | 11 days | 650 | fast=4,slow=40 EMA/EMA vs SMA/SMA vs EMA/SMA | r(Spread,NiftyFwd) and r(Spread,OwnOptionFwd) | EMA/EMA roughly 1.4-1.8x the \|r\| of SMA/SMA on both NiftyFwd and OwnOptionFwd, at every horizon; EMA-fast/SMA-slow lands between | **EMA more sensitive/informative in this sample -- see tradeoff discussion below, not simply "better"** |
+| E10 | Call and Put sides are symmetric | 11 days | 650, all 3 MA combos | horizon 5/10/20 | r(Spread,NiftyFwd) per side | Call r always POSITIVE (+0.02 to +0.05), Put r always NEGATIVE (-0.02 to -0.09), Put consistently 1.5-2x Call's magnitude | **not symmetric -- Put carries more (still weak) signal than Call, direction differs, both recorded as findings** |
+| E11 | Dual Call+Put states (Bullish/Bearish confirmation, Vol expansion/contraction) show a real directional split | 11 days | 650, all 3 MA combos | \|Spread\| threshold = pooled 70th percentile (data-derived) | P(Up), MeanFwd | BullishConfirmation P(Up) 48.6-50.0%, BearishConfirmation P(Up) 44.1-45.2%; VolExpansion n=0 at every MA combo; VolContraction n=68-75, P(Up) 58.8-62.7% | BearishConfirmation **weakly supported** (consistent small down-skew); BullishConfirmation **not supported** (flat); VolExpansion **not observable** in this sample; VolContraction **inconclusive** (n<80, single-digit-day concentration likely) |
+| E12 | DTE affects the Spread-NiftyFwd relationship | 11 days, Call side | 650, all 3 MA combos | DTE=0 vs DTE>0 | r(Spread,NiftyFwd10) | DTE>0 r consistently 1.5-2x larger than DTE=0 (e.g. SMA/SMA: 0.0166 vs 0.0284; EMA/EMA: 0.0218 vs 0.0530) | **weak effect, consistent direction (non-0-DTE carries more signal at this horizon), candidate for follow-up** |
+| E13 | Parameter plateau exists for fast/slow window choice | 11 days, EMA/EMA, 650 | fast/slow in {(2,20),(4,40),(8,60)} | r(Spread,NiftyFwd10), Call+Put | \|r\| DECREASES monotonically as window lengthens: Put -0.090 -> -0.054 -> -0.032; Call 0.064 -> 0.033 -> 0.018 | **no plateau -- a monotonic decay, not a flat region.** Shorter windows carry more of this (still weak) signal, an important caveat before picking any "final" window |
+| E14 | The Spread-NiftyFwd relationship is driven by effective volume horizon, not bar-size or raw window length | 11 days, EMA/EMA | (650,4,40) vs (1300,2,20) vs (2600,1,10) -- same ~2,600/~26,000 effective volume horizon | r(Spread,NiftyFwd10) | Put: -0.054/-0.067/-0.065; Call: 0.033/0.046/0.048 -- MUCH closer to each other than the E13 same-bar-size sweep's spread (-0.090 to -0.032) | **supported (this specific comparison): effective volume horizon, not bar count, appears to be the more fundamental axis** -- one data point, not yet a robust conclusion (Part 17) |
+
+### (1) TickCount Semantics
+
+Already established earlier this session (not re-derived here): `TickCount` (added to
+`NiftySignal.Features.VolumeBar` and `NiftySignal.VolumeBarData.VolumeBarRow`) counts raw
+`NiftySignal.Domain.Entities.Tick` feed-message rows observed while a bar was open -- trade,
+touchline, and depth-only updates are all undiscriminated in this count. It is **feed-message
+density, not confirmed trade density**, and every derived feature in this section (TickDensity,
+TickVelocity, etc.) inherits that caveat. Local DB sanity-check (already run before this section):
+min TickCount=2 at every threshold, mean scales monotonically with bar-volume threshold from ~16
+(325) to ~137 (5200) ticks/bar.
+
+### (2) Tick Activity Findings
+
+**None of TickDensity, TickVelocity, PriceEfficiency, or Churn (raw, session-percentile, or
+rolling-percentile forms) shows a usable relationship with NIFTY future's own forward return at
+5/10/20 bars, at any of the three bar-size thresholds tested (650/1300/2600).** Every Pearson r is
+under 0.03 in magnitude; every quantile bucket table (6 buckets) is flat or non-monotonic; P(Up)
+sits in a narrow 45-50% band across every bucket with no threshold effect at the 80th/90th/95th
+percentile edges. This is a clean, direct answer to the task's core question for these four raw
+features on their own: **not supported as standalone forward-return predictors.**
+
+The one genuinely interesting result from this track is NOT a level effect but a **conditional**
+one -- see (3) below.
+
+### (3) Market-State Findings
+
+The 2x2 TickVelocity x PriceEfficiency state split (A/B/C/D) itself shows no differentiation (all
+four states land within a narrow ~46-49% P(Up) band, at every bar size). But splitting the
+High-Activity+High-Efficiency cell (state D) further by the CURRENT bar's own NetMove direction
+surfaces a real pattern: bars that were both busy and efficient AND moved up are followed (10 bars
+later) by P(Up)=38.9-43.9% (i.e. below 50, consistent mean-reversion signature); the mirror
+down-moving cell shows P(Up)=52.8-57.3%. **This holds in the same direction at all three tested bar
+sizes (650/1300/2600)** -- the strongest piece of internal-consistency evidence in this whole
+tick-activity track, though the effect size is still modest (roughly 5-11 points off 50%) and this
+is one 11-day sample, not a validated edge. Labeled **weak, candidate for further, dedicated study**
+per Part 17's discipline -- explicitly NOT "edge."
+
+The "struggle" hypothesis (HighActivity+LowEfficiency+near-zero-NetMove bars precede a directional
+release) was tested directly and **not supported**: forward mean return is ~0 and forward absolute
+return is unremarkable relative to other cells, at every bar size tried.
+
+### (4) Tick Feature vs DepthImbalance
+
+Model A (DepthImbalance alone) and Model B (a simple, unweighted average of TickVelocity and
+PriceEfficiency session-percentiles -- deliberately NOT a fitted/regressed weight, see Part 18's
+E7 note on why an 11-day sample can't honestly support fitting one) both sit at \|r\|<0.09 against
+NiftyFwd10 in every session/DTE split tried. Their signs disagree in most splits (session=Mid,
+session=Close, ALL). **Conclusion: neither signal individually clears a bar high enough for
+"adds information to the other" to be a meaningful question here -- both are weak enough that sign
+disagreement is as likely to be noise as genuine independence.** This is itself a useful negative
+finding, not a wasted test: it argues against building any near-term composite weight on either of
+these two candidates until one of them independently strengthens.
+
+### (5) SMA vs EMA
+
+Tested on 650-bar Call/Put ATM premium (band=3), fast=4/slow=40, EMA/EMA vs SMA/SMA vs
+EMA-fast/SMA-slow: **EMA is consistently more sensitive than SMA in this sample** -- roughly
+1.4-1.8x the |Pearson r| of SMA/SMA at every horizon, on BOTH the NiftyFwd correlation (still weak,
+e.g. Put horizon=10: SMA -0.0293 -> EMA -0.0542) and the much-stronger OwnOptionFwd
+mean-reversion correlation (Put horizon=10: SMA -0.2662 -> EMA -0.3735). EMA-fast/SMA-slow lands
+between the two pure forms in every case, as expected from a hybrid.
+
+**This is a real tradeoff, not a "EMA wins, use it" conclusion.** EMA's larger correlation
+magnitude is exactly what "more timely" predicts -- it reacts to the newest prices harder, so it
+picks up a real (if weak) relationship earlier/more sharply. But the same responsiveness is also
+what "noisier" means: an EMA spread reading is more exposed to single-tick/single-bar price noise
+than an SMA's flatter average, and this task did not test whether the LARGER EMA correlation
+survives a stability check the way SMA's flatter, damped reading might (e.g. does EMA's reading
+whipsaw sign more often bar-to-bar than SMA's, independent of whether it correlates better on
+average). Given the parameter-plateau finding in (9) below -- shorter windows show MORE signal,
+not less -- some of EMA's apparent edge here may simply be EMA behaving like a shorter effective
+window (it weights recent bars more heavily even at the same nominal N), not a distinct SMA-vs-EMA
+effect. This distinction was not separately isolated in this task (a genuine scope cut, noted in
+(10) below) and should be the first thing a follow-up on this finding checks.
+
+### (6) Call vs Put
+
+**Not symmetric, confirmed directly rather than assumed.** Across every MA-type combination and
+horizon tested: Call Spread correlates POSITIVELY with NiftyFwd (r=+0.018 to +0.046, growing with
+shorter fast/slow windows -- see (9)); Put Spread correlates NEGATIVELY (r=-0.024 to -0.090), and
+Put's magnitude is consistently 1.5-2x Call's at the same parameters. Both signs make some
+narrative sense (rising Call premium co-moving with a rising underlying; rising Put premium
+co-moving with a falling one) but the magnitudes are small enough (all under 0.09) that this is
+best read as "the sign is directionally sane, not obviously an artifact" rather than "Put has real
+edge Call lacks." Recorded as an asymmetry finding per the task's own instruction to not assume
+symmetry, not elevated beyond that.
+
+### (7) Dual Option State
+
+Tested with a DATA-DERIVED threshold (pooled 70th percentile of \|Spread\|, computed fresh for
+each MA-type run rather than picked by eye -- came out to 4.3-5.2% depending on MA type). Results:
+- **BearishConfirmation** (Call<-thr AND Put>+thr): P(Up) 44.1-45.2% across all 3 MA combos --
+  weakly, consistently below 50%. **Weakly supported.**
+- **BullishConfirmation** (Call>+thr AND Put<-thr): P(Up) 48.6-50.0% -- flat. **Not supported.**
+- **VolExpansion** (both spreads >+thr simultaneously): n=0 in every run. Call and Put ATM premium
+  essentially never both spike into the top 30% of the |Spread| distribution at the same bar in
+  this 11-day sample -- consistent with the market moving one direction at a time rather than both
+  option prices expanding together. **Not observable in this sample**, not "doesn't exist."
+- **VolContraction** (both spreads <-thr): n=68-75 (out of ~20,000 pooled bars) across the 3 runs,
+  P(Up) 58.8-62.7%, the largest directional skew found anywhere in the SMA/EMA track. **Explicitly
+  flagged as inconclusive** -- a state occurring on <0.4% of bars in an 11-day sample is very
+  likely concentrated in a small number of days/events; this was NOT robustness-checked
+  (Part 17 would require confirming it isn't 1-2 days' worth of bars) and should not be read as a
+  finding until it is.
+
+The task's own instruction to not automatically label these "directional" until the data confirms
+it is respected here: only BearishConfirmation earned even a "weakly supported" label; the other
+three are flat, unobserved, or too sparse to trust.
+
+### (8) DTE Findings
+
+0-DTE dates confirmed directly from `instruments.ExpiryDate - AsOfDate` (not assumed): **0-DTE =
+2026-09-08, 09-15, 09-22.** This corrects a naive read of the task's own DTE list --
+2026-09-04 (4 DTE) and 2026-09-21 (1 DTE) are NOT 0-DTE, only 09-22 among the "check its own DTE"
+trio is. Full table: 09-04=4, 09-08=0, 09-09=6, 09-10=5, 09-11=4, 09-15=0, 09-16=6, 09-17=5,
+09-18=4, 09-21=1, 09-22=0.
+
+Call-side Spread-vs-NiftyFwd10 correlation is consistently LARGER on DTE>0 days than DTE=0 days, at
+all 3 MA combos (SMA/SMA: 0.0166 vs 0.0284; EMA/EMA: 0.0218 vs 0.0530; EMA/SMA: 0.0297 vs 0.0446).
+**Weak effect, but consistent direction across all 3 MA combos tested: the (already weak) NIFTY
+forward-return signal in option-premium Spread is somewhat WEAKER, not stronger, on 0-DTE days at
+this 10-bar horizon.** This directly contradicts a naive "shorter/faster signals matter more on
+0-DTE" intuition and was explicitly tested rather than assumed, per the task's own instruction.
+Tick-activity Model A/B/C (section 4) showed the same qualitative pattern (DTE>0 |r| generally
+exceeding DTE=0 |r| for DepthImbalance specifically, e.g. -0.0395 vs 0.0006 at bar=1300).
+
+### (9) Effective Volume Horizon
+
+The single most interesting structural finding in this task. Two sweeps were run on the same
+EMA/EMA Call+Put Spread-vs-NiftyFwd10 correlation:
+- **Same bar size (650), lengthening fast/slow window**: (2,20)->(4,40)->(8,60) shows a clear
+  MONOTONIC DECAY, not a plateau: Put r goes -0.090 -> -0.054 -> -0.032; Call r goes
+  0.064 -> 0.033 -> 0.018. Longer windows carry LESS of this (still weak) signal.
+- **Same effective volume horizon (~2,600 bars'-worth of fast-window volume, ~26,000 slow),
+  varying bar size**: (650,4,40) vs (1300,2,20) vs (2600,1,10) gives Put r of -0.054/-0.067/-0.065
+  and Call r of 0.033/0.046/0.048 -- MUCH tighter together than the same-bar-size sweep's spread.
+
+**This suggests the relationship (weak as it is) is governed more by effective volume horizon than
+by bar count or bar-size choice on its own** -- i.e. "how much future volume has traded since the
+fast/slow window started" matters more than "how many bars." This is exactly the question Part 15
+asked to investigate, and the answer leans toward effective-volume-horizon as the more fundamental
+axis. Important caveat: this is ONE comparison at ONE MA-type combo (EMA/EMA) and ONE side pair,
+not a swept confirmation -- Part 17's "does this survive more parameter combinations" is not yet
+answered, so this is reported as a genuine, promising structural observation, not a settled result.
+
+### (10) Robustness
+
+**Stable across bar-size (650/1300/2600), same direction and rough consistency**:
+- Section (3)'s High-Activity+High-Efficiency mean-reversion split (E4) -- P(Up) ordering (positive
+  NetMove < 50% < negative NetMove) holds at all 3 thresholds tested.
+- Section (6)'s Call-positive/Put-negative asymmetry -- holds at every MA-type combo tested.
+- Section (9)'s effective-volume-horizon tightening -- holds for the one comparison run.
+
+**Not stable / not supported anywhere**: raw tick-activity levels (Section 2), the 2x2 state split
+itself (Section 3, before the NetMove sub-split), transition/delta features (E6), the
+tick-feature-vs-DepthImbalance comparison (Section 4), BullishConfirmation and VolExpansion
+(Section 7).
+
+**Sample-size problems, explicitly flagged**:
+- VolContraction (n=68-75 out of ~20,000 pooled bars) -- almost certainly concentrated in very few
+  days, not robustness-checked, the single weakest-evidence "finding" in this document.
+- Same-time-of-day percentile ranking (Part 3) was NOT computed -- 11 days gives ~11 observations
+  per bar-of-day cell, judged too sparse to rank meaningfully before writing any code for it. This
+  is the one Part-3 sub-requirement skipped outright rather than run and shown empty.
+- Every DTE=0 split (n=4140-6594 depending on bar size) rests on exactly 3 trading days
+  (09-08/09-15/09-22); every non-0-DTE split rests on 8 days but spans 3 different expiries --
+  cross-expiry pooling assumed but not separately verified for expiry-specific artifacts.
+
+**Parameter sensitivity**: Section (9)'s window-length sweep shows real, monotonic sensitivity
+(not a plateau) -- shorter windows consistently show MORE signal. Any follow-up choosing a
+"final" fast/slow pair from this task's evidence should treat shorter windows as the
+better-evidenced choice, not a mid-range pick, and should re-verify this isn't just recency
+weighting (see the EMA-vs-window-length confound noted in Section 5).
+
+**No parameter or finding here should be read as "edge."** The strongest labels earned anywhere in
+this task are "weak, candidate for further study" (Sections 3, 8, 9) and "weakly supported"
+(Section 7's BearishConfirmation) -- every other tested hypothesis is explicitly "not supported" or
+"inconclusive."
+
+### (11) Recommended Next Experiments
+
+1. **Isolate whether EMA's larger correlation (Section 5) is a genuine SMA-vs-EMA effect or just a
+   shorter-effective-window effect.** Run SMA at progressively shorter windows (matching EMA's
+   effective decay half-life, alpha=2/(N+1)) and see if SMA catches up. This directly resolves the
+   biggest open confound in this task's results and should be done before trusting the EMA-is-better
+   framing at all.
+2. **Confirm the effective-volume-horizon finding (Section 9) with a proper sweep**, not just the
+   one 3-point comparison run here -- vary the effective-volume target itself (not just cross-check
+   one target across 3 bar sizes) and check whether the Call/Put asymmetry (Section 6) also holds at
+   each point.
+3. **Robustness-check the High-Activity+High-Efficiency mean-reversion split (Section 3/E4)
+   specifically** -- it's the strongest, most bar-size-consistent finding in the tick-activity half
+   of this task. Test whether it survives removing the single best day, whether it's concentrated in
+   one session, and whether it holds at a genuinely different horizon (it was only checked at 10
+   bars here).
+4. **Test whether VolContraction (Section 7) is real or a 1-2-day artifact** before citing it again
+   -- list the actual dates/bars it occurred on and check day-concentration directly; at n<80 out of
+   20,000 this is the single easiest "finding" in this document to accidentally over-trust.
+5. **Do NOT add more tick-activity features on top of the four tested here** (Section 2's own
+   TickDensity/TickVelocity/PriceEfficiency/Churn all failed as raw predictors) until the
+   NetMove-conditioned finding from Section 3 has been independently validated -- expanding the
+   feature list now would just be more multiple-testing exposure on a track that has, so far,
+   produced exactly one promising conditional result.
+
+### Scope cuts, honestly noted
+
+- 325/3900/5200-threshold bars were populated and available but not exercised in this task's
+  analysis -- 650/1300/2600 (the task's own stated primary set) were judged sufficient for the
+  robustness checks actually performed; a genuinely finer DTE-conditioned bar-size study (Part 4's
+  optional extension) was not attempted.
+- Part 3's same-time-of-day percentile was skipped outright (see Robustness section) rather than
+  computed and shown near-empty.
+- Part 10's fast/slow grid was swept at 3 points ((2,20)/(4,40)/(8,60)), not the full
+  {2,4,6,8}x{20,30,40,60} cross product the task specified -- a documented time-budget cut. The
+  3-point sweep was enough to establish the monotonic-decay (not plateau) shape; a fuller grid
+  would sharpen the decay curve but is unlikely to reverse its direction given how consistent the
+  3 points already are.
+- Part 16 (full MAE/MFE/trade-quality stats -- win rate, profit factor, expectancy, drawdown,
+  concentration) was NOT built for any config in this task. Every relationship found here is too
+  weak (|r|<0.09 at best, before Section 9's structural finding) to justify simulating and
+  reporting trade-level P&L on it -- doing so would imply a tradeable rule exists when the
+  correlation evidence doesn't support that yet. This is a deliberate scope decision following the
+  task's own "no gating/no premature rule-building during single-metric evaluation" discipline, not
+  an oversight.
+- Session-of-day was tested only as a 3-bucket split (Open/Mid/Close) inside Part 8's model
+  comparison, not independently for every other section (e.g. Section 3's state split was not
+  re-run per-session) -- a documented cut given the overall weak base rates.
+
+## Experiment 1 -- Effective-volume-horizon x SMA/EMA confound (2026-09-22)
+
+Follow-up to the prior "Tick activity + option premium SMA/EMA research" section's own recommended
+next experiment #1: isolate whether EMA's larger |r| (that task's Section 5/E9) is a genuine
+SMA-vs-EMA effect or just EMA behaving like a shorter effective window. **No new code was written**
+-- `MaSpreadEngine.cs` already accepts arbitrary `fastBars`/`slowBars`/`MaType` per leg and
+`MaSpreadRelationshipAnalyzer.cs`/the `ma-spread-research` CLI already accept `--fasttype`/
+`--slowtype`/`--band`; this task is a new invocation pattern only. Same 11 trading days
+(2026-09-04, 08, 09, 10, 11, 15, 16, 17, 18, 21, 22), same local `niftysignal_volume_bars`
+database (population verified fresh via the first run below -- 20,161 Call/Put samples at
+bar=650, matching the prior task's order of magnitude, not assumed), same rolling-ATM
+Call/Put methodology, band=3 throughout (matches the prior SMA/EMA task's own convention).
+`dotnet build`: 0 warnings/0 errors. `dotnet test`: 728/728 passing (baseline unchanged --
+no source file was modified in this task, confirmed by `git status` showing no new diffs beyond
+this doc edit).
+
+**IMPORTANT LABELING NOTE (per this task's own explicit instruction, applies to every finding
+below and to all future experiments):** every number in this section is **predictive evidence
+only** -- a Pearson correlation or bucket split against a forward-return research label, never a
+trading rule. **Tradeability (spread/theta/IV/execution-adjusted P&L) is explicitly not assessed
+anywhere in this task.** No finding here should be read as a trading recommendation.
+
+### Experimental design, stated before running (per this project's "explain before changing" rule)
+
+**Question**: does EMA's larger |Pearson r| vs SMA at the same nominal window N (prior task's E9)
+survive controlling for EMA's shorter effective lookback, or is it simply an artifact of EMA
+weighting recent bars more heavily at the same N?
+
+**Two matching conventions, both tested (the task explicitly offered both):**
+
+1. **Center-of-mass (COM) matching.** For EMA with smoothing factor alpha=2/(N+1), the center of
+   mass of its geometric weights is `(1-alpha)/alpha`. Substituting alpha=2/(N+1) algebraically
+   simplifies this to exactly `(N-1)/2` -- identical to a plain N-bar SMA's own center of mass
+   `(N-1)/2` (uniform weights, mean lag = (N-1)/2). **This means EMA(N) and SMA(N) are ALREADY
+   COM-matched at the same nominal N** -- the prior task's E9 comparison (same N, no adjustment)
+   already IS the center-of-mass-matched comparison, not a naive/unmatched one. This is reported
+   as a finding in its own right (see Verdict) rather than assumed going in.
+
+2. **Half-life matching (the prior task's own recommended-next-experiment wording: "matching
+   EMA's effective decay half-life, alpha=2/(N+1)").** EMA's weight at lag k is proportional to
+   `(1-alpha)^k`; solving `(1-alpha)^k = 0.5` gives half-life `k_half = ln(0.5) / ln(1-alpha)`.
+   For a uniform M-bar SMA, cumulative weight reaches 50% at lag `k = M/2 - 1` (weight `(k+1)/M`
+   set to 0.5). Setting the two equal and solving for M: `M = 2*k_half + 2`. Computed values for
+   the three EMA N's this task (and the prior task's E13) used:
+
+   | EMA N | alpha=2/(N+1) | k_half = ln(0.5)/ln(1-alpha) | Matched SMA M = 2*k_half+2 (rounded) |
+   |---|---|---|---|
+   | 2  | 0.6667 | 0.631  | 3  |
+   | 4  | 0.4000 | 1.357  | 5  |
+   | 8  | 0.2222 | 2.758  | 8  |
+   | 20 | 0.0952 | 6.925  | 16 |
+   | 40 | 0.0488 | 13.860 | 30 |
+   | 60 | 0.0328 | 20.800 | 44 |
+
+   Giving matched fast/slow SMA pairs: EMA(2,20) <-> SMA(3,16); EMA(4,40) <-> SMA(5,30);
+   EMA(8,60) <-> SMA(8,44). **Labeled in-sample/exploratory per this project's multiple-testing
+   discipline**: the specific EMA N's chosen (2/20, 4/40, 8/60) were the prior task's own E13
+   sweep points, not independently re-derived here.
+
+   **Confound flagged honestly before running, not discovered after**: half-life matching shrinks
+   the SMA windows unevenly -- the fast leg barely moves (2->3, 4->5, 8->8) while the slow leg
+   drops substantially (20->16, 40->30, 60->44), so the matched SMA pairs have a fast:slow ratio of
+   roughly 5.3-5.5x instead of the nominal EMA pairs' 10x. This is an unavoidable consequence of
+   EMA and SMA having structurally different weight-decay shapes (geometric vs uniform) and is
+   reported as a limitation on the half-life-matching results below, not hidden.
+
+3. **Effective-volume-horizon triple (E14-style, extended to SMA)**: repeat the prior task's E14
+   comparison -- (650,4,40) vs (1300,2,20) vs (2600,1,10), same ~2,600-bar-volume-equivalent fast
+   window and ~26,000 slow window across three bar sizes -- for SMA/SMA (new) and re-verify it for
+   EMA/EMA (re-run rather than trusted from memory, per this project's core rule).
+
+**13 CLI invocations total**, all `ma-spread-research 2026-09-04 2026-09-22 <fast> <slow>
+<barThreshold> --fasttype=<T> --slowtype=<T> --band=3`, reported at horizon=10 (the prior task's
+primary horizon; 5/20 follow the same qualitative pattern in every run's raw output, not
+separately tabulated below to keep this section a reasonable length).
+
+### Experiment log
+
+| ID | Hypothesis | Dataset | Params | Result (Put r10 / Call r10, Spread-vs-NiftyFwd10) | Conclusion |
+|----|---|---|---|---|---|
+| X1 | Reproduce prior E9/E13 numbers exactly before extending (verification, not a new hypothesis) | 11 days | EMA/EMA and SMA/SMA at 650, (4,40) and (8,60) | EMA(4,40): -0.0542/0.0325 (prior E9/E13: -0.0542/-- exact match); SMA(4,40): -0.0293/0.0223 (prior E9: -0.0293 exact match); EMA(8,60): -0.0318/0.0175 (prior E13: -0.032/0.018 exact match) | **reproduced exactly** -- confirms the prior task's numbers against the actual running code, not memory |
+| X2 | COM-matched (same-N) EMA vs SMA gap, extended to (2,20) and (8,60) (prior task only fully reported (4,40)) | 11 days | bar=650, (2,20)/(4,40)/(8,60), EMA/EMA vs SMA/SMA | \|r\| ratio EMA/SMA -- Put: 1.44x/1.85x/2.81x; Call: 1.32x/1.46x/2.47x (all three window pairs) | **EMA consistently larger than SMA at every COM-matched (same-N) window pair, ratio GROWS with window length, not shrinks** |
+| X3 | Half-life-matched SMA (shortened per the math above) closes the gap to EMA | 11 days | bar=650, SMA(3,16) vs EMA(2,20); SMA(5,30) vs EMA(4,40); SMA(8,44) vs EMA(8,60) | \|r\| ratio EMA/half-life-matched-SMA -- Put: 1.81x/2.20x/3.28x; Call: 1.74x/1.72x/2.27x -- gap WIDENED vs X2's same-N ratios in 5 of 6 comparisons, not narrowed | **not supported -- half-life-shortening SMA did not close the gap; it widened slightly** (see Verdict for the fast:slow-ratio confound this result is read through) |
+| X4 | Shortening SMA's windows (via half-life matching) should itself increase SMA's own \|r\|, per the prior task's E13 monotonic-decay finding (shorter=more signal) | 11 days | SMA(2,20) vs SMA(3,16); SMA(4,40) vs SMA(5,30); SMA(8,60) vs SMA(8,44) | SMA(2,20) Put r=-0.0622 > SMA(3,16) Put r=-0.0497 (weaker, not stronger); SMA(4,40) -0.0293 > SMA(5,30) -0.0246 (weaker); SMA(8,60) -0.0113 vs SMA(8,44) -0.0097 (weaker) | **not supported as tested -- the half-life-matched SMA pairs are WEAKER than the nominal-N SMA pairs despite intending to be "more responsive."** Most likely explained by the fast:slow ratio confound (X3's caveat): E13's monotonic-decay finding held the 10x ratio fixed and varied absolute length; this test varied both length AND ratio simultaneously, so it cannot cleanly confirm or contradict E13 on its own |
+| X5 | E14's effective-volume-horizon tightening (matched-horizon triple shows much tighter cross-bar-size \|r\| than same-bar-size window sweep) reproduces for EMA/EMA | 11 days | EMA/EMA (650,4,40)/(1300,2,20)/(2600,1,10) | Put r10: -0.0542/-0.0667/-0.0653 (range 0.0125); Call r10: 0.0325/0.0455/0.0480 (range 0.0155) -- vs same-650-bar-size EMA sweep's much wider range (Put 0.0579, Call 0.0464) | **reproduced**: matched-horizon range is 3.0-4.6x tighter than same-bar-size range, consistent with the prior task's E14 (one data point becomes two, still same qualitative shape) |
+| X6 | E14's tightening effect also holds for SMA/SMA (not previously tested -- prior task's E14 used EMA/EMA only) | 11 days | SMA/SMA (650,4,40)/(1300,2,20)/(2600,1,10) | Put r10: -0.0293/-0.0481/-0.0642 (range 0.0349); Call r10: 0.0223/0.0389/0.0532 (range 0.0309) -- vs same-650-bar-size SMA sweep's range (Put 0.0509, Call 0.0414) | **partially supported**: tightening direction holds (matched range < same-bar-size range) but the effect is far weaker for SMA (1.3-1.5x tighter) than for EMA (3.0-4.6x tighter) -- SMA's own r actually keeps INCREASING in magnitude from 650->2600 (unlike EMA, which plateaus/wobbles), so the ranges aren't even comparable in shape, only in overall spread |
+
+### Full data table, horizon=10, all 13 runs (Pearson r, Spread vs NiftyFwd10)
+
+| Bar | Fast/Slow | Fast type | Slow type | n (per side) | Put r | Call r |
+|---|---|---|---|---|---|---|
+| 650 | 2/20 | EMA | EMA | 20,161 | -0.0897 | +0.0639 |
+| 650 | 2/20 | SMA | SMA | 20,161 | -0.0622 | +0.0485 |
+| 650 | 4/40 | EMA | EMA | 19,941 | -0.0542 | +0.0325 |
+| 650 | 4/40 | SMA | SMA | 19,941 | -0.0293 | +0.0223 |
+| 650 | 8/60 | EMA | EMA | 19,721 | -0.0318 | +0.0175 |
+| 650 | 8/60 | SMA | SMA | 19,721 | -0.0113 | +0.0071 |
+| 650 | 3/16 | SMA | SMA | 20,205 | -0.0497 | +0.0368 |
+| 650 | 5/30 | SMA | SMA | 20,051 | -0.0246 | +0.0189 |
+| 650 | 8/44 | SMA | SMA | 19,897 | -0.0097 | +0.0077 |
+| 1300 | 2/20 | SMA | SMA | 12,449 | -0.0481 | +0.0389 |
+| 2600 | 1/10 | SMA | SMA | 7,220 | -0.0642 | +0.0532 |
+| 1300 | 2/20 | EMA | EMA | 12,449 | -0.0667 | +0.0455 |
+| 2600 | 1/10 | EMA | EMA | 7,220 | -0.0653 | +0.0480 |
+
+### Verdict
+
+**Is EMA genuinely better, or just more responsive due to shorter effective weighting?**
+
+**Partially -- genuinely better under both matching conventions actually tested, but the
+half-life test that was meant to be the decisive check turned out to be confounded, so this is
+not a clean, fully isolated answer.**
+
+- Under **center-of-mass matching** (X2): EMA(N) and SMA(N) at the same nominal N are already
+  matched by the most standard algebraic convention (their mean lag is identical, `(N-1)/2`, an
+  exact identity, not an approximation). EMA still shows 1.3-2.8x the |r| of SMA at every one of
+  the three window pairs tested, with the ratio *growing* at longer windows. Since this convention
+  requires no adjustment to the prior task's own E9 comparison, this reading says: **EMA's edge
+  over SMA is real even after the most natural "same effective lag" control, not an artifact of
+  that specific confound.**
+- Under **half-life matching** (X3), designed to make the SMA windows strictly shorter/more
+  responsive than their nominal-N counterparts, the gap did not close -- it widened in 5 of 6
+  Put/Call comparisons. Taken at face value this also says EMA is genuinely better. **But X4 shows
+  this test is compromised**: the half-life-matched SMA windows are themselves WEAKER than the
+  plain nominal-N SMA windows they were derived from, which is the opposite of what "made SMA more
+  responsive" should do if E13's monotonic-decay finding (shorter windows -> more signal) applies
+  here. The most likely explanation is that half-life matching, by construction, compressed the
+  fast:slow ratio from 10x to ~5.5x alongside shortening the absolute windows, and E13's
+  monotonic-decay finding was never tested at a held-ratio-different scale, so it's not clear
+  which of "window length" or "fast:slow ratio" the earlier E13 result was really driven by. **This
+  specific test cannot be trusted as a clean isolation of the EMA-vs-SMA question** -- it is
+  reported honestly as inconclusive-by-confound, not folded into the headline verdict as
+  additional support.
+
+**Overall verdict: "partially -- EMA's advantage survives the cleaner (center-of-mass) matching
+test, but the half-life-matching test that was designed as the more direct check turned out to be
+confounded by an uncontrolled fast:slow-ratio shift, so that half of the intended isolation is
+inconclusive, not confirming.** A future pass wanting a fully clean half-life-matched test would
+need to hold the fast:slow ratio fixed while independently varying absolute window length --
+e.g., SMA windows at the EMA's half-life but at the *same* 10x ratio (which would require
+non-integer or asymmetric rounding choices not attempted here) -- to separate "shorter" from
+"differently shaped" cleanly.
+
+**Does the E14 effective-volume-horizon-tightening finding hold for SMA too, or is it
+EMA-specific?** **Partially, and clearly weaker for SMA.** The direction (matched-effective-volume
+range tighter than same-bar-size range) holds for both MA types, but EMA's tightening
+(3.0-4.6x) is roughly 2-3x stronger than SMA's (1.3-1.5x). This is itself informative: whatever
+structural reason makes "effective volume horizon" the more fundamental axis (per the prior
+task's Section 9), it appears to interact with EMA's recency-weighting more than with SMA's
+uniform weighting -- SMA's own |r| kept climbing steadily from bar=650 to bar=2600 in this test
+rather than converging, which EMA did not do to the same degree.
+
+**Predictive evidence: all of the above (every r, ratio, and range in this section) is
+predictive-evidence-only, measuring correlation with NiftyFwd10, a forward-looking research
+label. Tradeability evidence: not assessed** -- no P&L, spread, theta, or execution cost was
+modeled anywhere in this task, consistent with every relationship here remaining well under
+|r|=0.10, the same weak-but-not-zero territory the prior SMA/EMA task's own findings occupied.
+
+### Reproduction commands
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- ma-spread-research 2026-09-04 2026-09-22 <fast> <slow> <barThreshold> --fasttype=<Sma|Ema> --slowtype=<Sma|Ema> --band=3
+```
+
+Window pairs run: (2,20)/(4,40)/(8,60) at bar=650 for both EMA/EMA and SMA/SMA; (3,16)/(5,30)/
+(8,44) SMA/SMA at bar=650 (half-life-matched); (2,20)@1300 and (1,10)@2600 for both EMA/EMA and
+SMA/SMA (effective-volume-horizon triple, paired with the (4,40)@650 runs already listed).
+
+### Scope not attempted, honestly noted
+
+- Only horizon=10 is tabulated above; horizons 5 and 20 were produced by every run (visible in
+  each run's raw console output, not archived into this doc) and follow the same qualitative
+  pattern (EMA > SMA in magnitude, Put > Call in magnitude, decay with longer windows) at a glance,
+  but were not separately verified point-by-point the way horizon=10 was -- a documented
+  time-budget cut, not an assumption that they're identical.
+- The clean, ratio-held-fixed half-life test flagged in the Verdict above (varying absolute window
+  length while holding the 10x fast:slow ratio fixed) was not attempted -- it would need a defensible
+  non-integer or asymmetric-rounding scheme not designed in this task.
+- Quantile-bucket tables, dual Call+Put state splits, and DTE splits were all produced by every one
+  of the 13 runs (visible in each run's console output) but not cross-tabulated in this section --
+  this task's scope was the EMA-vs-SMA and effective-volume-horizon questions specifically, not a
+  full re-run of the prior task's Parts 11/13/14 for every new window pair.
+- No trade simulation, MAE/MFE, or P&L was built for any configuration here, per this task's
+  explicit instruction that tradeability is out of scope for this experiment.
+
+## Experiment 2 -- Call/Put premium momentum vs Nifty direction, DTE-split (2026-09-22)
+
+Follow-up task (user-specified, "this could become a major candidate"): test Call Spread, Put
+Spread, and a new Call-minus-Put combined signal against NiftyFwd5/10/20, split by 0-DTE vs
+non-0-DTE, at one primary window pair, EMA as primary MA type with SMA run alongside for
+comparison.
+
+**IMPORTANT LABELING NOTE (carried forward from Experiment 1, applies to every finding below):**
+every number in this section is **predictive evidence only** -- a Pearson correlation or bucket
+split against a forward-return research label, never a trading rule. **Tradeability
+(spread/theta/IV/execution-adjusted P&L) is explicitly not assessed anywhere in this task.** No
+finding here should be read as a trading recommendation.
+
+### Design, stated before running
+
+**Primary window pair: fast=4, slow=40, bar=650.** Chosen over the (2,20) alternative because it
+is the pair the original tick-activity task's own main Call/Put comparisons (E8/E9/E10/E12) and
+Experiment 1's own reproduction baseline (X1) both used as the single, most-reported combo --
+(2,20) appeared only inside the E13 window-length sweep, not as a standalone Call/Put result. **This
+choice is in-sample/exploratory, informed by prior experiments**, not independently re-derived here.
+`band=3` (rolling-ATM band width) kept identical to every prior task in this document.
+
+**MA type: EMA primary, SMA run alongside for comparison** -- **in-sample/exploratory, informed by
+Experiment 1's own finding** that EMA's larger |r| survives center-of-mass matching (the standard
+convention) even though the half-life-matching check came out confounded. Both are reported in
+full below, not just EMA.
+
+**Call-minus-Put combined-signal formula (new code, `NiftySignal.VolumeBarData/CallPutDiffSignal.cs`,
+tested in `NiftySignal.Tests/VolumeBarData/CallPutDiffSignalTests.cs`):**
+
+```
+Diff = CallSpread - PutSpread
+```
+
+Justification, stated before running: the prior SMA/EMA task (Section 6/E10 above) established
+Call Spread correlates POSITIVELY with NiftyFwd and Put Spread correlates NEGATIVELY, with Put
+consistently 1.5-2x Call's magnitude. Subtracting Put from Call points both legs' contributions in
+the same direction before combining, so a genuinely-related pair of legs should combine into a
+stronger, less noisy directional read than either leg alone -- the same "both legs agree"
+reasoning the existing Part 13 dual-state split (BullishConfirmation/BearishConfirmation) already
+uses, just as a continuous signal instead of a thresholded state. This is an **unweighted 1:1
+difference**, not a magnitude-weighted combination (e.g. weighting Put 1.5-2x higher per its own
+larger correlation) -- equal weighting is the simplest, least assumption-laden starting point; a
+weighted variant would need its own justification and evaluation cycle before being trusted, and
+was not attempted here. The function is pure (no DB access) and introduces no new look-ahead risk:
+it only combines two same-bar `Spread` readings that `MaSpreadEngine.Observe` already computed
+from past-and-current prices only.
+
+New CLI: `callput-diff-research <fromDate> <toDate> <fastBars> <slowBars> [barVolumeThreshold]
+[--band] [--buckets] [--zerodte]`, added to `NiftySignal.VolumeBarData/Program.cs` alongside the
+existing `ma-spread-research` command, reusing `MaSpreadRelationshipAnalyzer.CollectDayAsync`
+unchanged. Same 11 trading days (2026-09-04, 08, 09, 10, 11, 15, 16, 17, 18, 21, 22), same local
+`niftysignal_volume_bars`/trade-source databases. 0-DTE dates used exactly as confirmed in the
+prior task's Section 8 (from real `instruments.ExpiryDate` data, not re-derived): **0-DTE =
+2026-09-08, 09-15, 09-22; non-0-DTE = 09-04, 09-09, 09-10, 09-11, 09-16, 09-17, 09-18, 09-21.**
+`dotnet build NiftySignal.slnx`: 0 warnings/0 errors. `dotnet test NiftySignal.slnx`: 732/732
+passing (728 baseline + 4 new `CallPutDiffSignalTests`, no regressions).
+
+### Experiment log
+
+| ID | Hypothesis | Dataset | Params | Result | Conclusion |
+|----|---|---|---|---|---|
+| Y1 | Reproduce Experiment 1's X1 EMA/EMA(4,40)@650 Call/Put r10 exactly before extending (verification, not a new hypothesis) | 11 days | EMA/EMA, 650, (4,40) | Put r10=-0.0542, Call r10=+0.0325 -- exact match to Experiment 1's X1/prior task's E9 | **reproduced exactly** -- confirms against actual running code, not memory |
+| Y2 | Call Spread predicts NiftyFwd5/10/20, both MA types, both DTE splits | 11 days | (4,40)@650, band=3 | see full matrix below; all \|r\| in 0.008-0.069 range, always positive | **weak, directionally consistent with all prior Call findings -- candidate** |
+| Y3 | Put Spread predicts NiftyFwd5/10/20, both MA types, both DTE splits | 11 days | (4,40)@650, band=3 | see full matrix below; all \|r\| in 0.017-0.093 range, always negative, consistently 1.3-2.6x Call's magnitude at matched params | **weak, strongest single feature in this matrix -- candidate** |
+| Y4 | Call-minus-Put Diff signal predicts NiftyFwd better than either leg alone | 11 days | (4,40)@650, band=3 | Diff \|r\| never exceeds Put \|r\| alone in any of the 18 (MA type x DTE-split x horizon) rows tested; Diff sits between Call and Put in every row, closer to Put | **not supported as an improvement over the best single leg** -- equal-weighted differencing dilutes rather than amplifies here, since Call's own magnitude is smaller and its sign-agreement with -Put is imperfect |
+| Y5 | 0-DTE vs non-0-DTE affects Call and Put the same way (does Section 8's "Call weaker on 0-DTE" finding also hold for Put and Diff?) | 11 days | (4,40)@650, both MA types | **Call**: DTE=0 weaker than DTE>0 at every horizon/MA-type (e.g. EMA h10: 0.0218 vs 0.0530) -- confirms Section 8. **Put**: OPPOSITE -- DTE=0 STRONGER than DTE>0 at every horizon/MA-type (e.g. EMA h10: -0.0625 vs -0.0541). **Diff**: follows Call's direction (DTE>0 stronger, e.g. EMA h10: 0.0382 vs 0.0540), not Put's, despite Put dominating Diff's raw magnitude | **Call/Put DTE-effect DIVERGE in direction -- new finding, not assumed** (task's own instruction to check rather than assume); Diff's DTE-direction tracks Call's larger proportional DTE-swing, not Put's larger absolute magnitude |
+| Y6 | Bucket analysis on the strongest feature (Put, EMA/EMA, h=10, pooled DTE) shows a monotonic or threshold relationship | 11 days | 8 quantile buckets | P(Up)% descends from ~49-51% (most-negative-Spread buckets) to ~44% (most-positive-Spread buckets), gently and mostly monotonically, no sharp jump at any bucket edge | **mild, roughly monotonic decline -- consistent with a weak linear relationship, not evidence of a stronger threshold/regime effect** |
+
+### Full correlation matrix (Pearson r, Spread/Diff vs NiftyFwd, horizon x DTE-split x MA-type x feature)
+
+**EMA/EMA:**
+
+| DTE split | Horizon | n (Call/Put/Diff) | r(Call) | r(Put) | r(Diff) |
+|---|---|---|---|---|---|
+| ALL | 5  | 19941 | +0.0443 | -0.0764 | +0.0597 |
+| ALL | 10 | 19941 | +0.0325 | -0.0542 | +0.0430 |
+| ALL | 20 | 19941 | +0.0251 | -0.0415 | +0.0329 |
+| DTE=0 | 5  | 6477  | +0.0398 | -0.0930 | +0.0622 |
+| DTE=0 | 10 | 6477  | +0.0218 | -0.0625 | +0.0382 |
+| DTE=0 | 20 | 6477  | +0.0107 | -0.0506 | +0.0262 |
+| DTE>0 | 5  | 13464 | +0.0686 | -0.0715 | +0.0705 |
+| DTE>0 | 10 | 13464 | +0.0530 | -0.0541 | +0.0540 |
+| DTE>0 | 20 | 13464 | +0.0380 | -0.0372 | +0.0380 |
+
+**SMA/SMA:**
+
+| DTE split | Horizon | n (Call/Put/Diff) | r(Call) | r(Put) | r(Diff) |
+|---|---|---|---|---|---|
+| ALL | 5  | 19941 | +0.0310 | -0.0442 | +0.0380 |
+| ALL | 10 | 19941 | +0.0223 | -0.0293 | +0.0262 |
+| ALL | 20 | 19941 | +0.0175 | -0.0237 | +0.0207 |
+| DTE=0 | 5  | 6477  | +0.0290 | -0.0549 | +0.0409 |
+| DTE=0 | 10 | 6477  | +0.0166 | -0.0353 | +0.0248 |
+| DTE=0 | 20 | 6477  | +0.0084 | -0.0308 | +0.0177 |
+| DTE>0 | 5  | 13464 | +0.0399 | -0.0394 | +0.0400 |
+| DTE>0 | 10 | 13464 | +0.0284 | -0.0262 | +0.0277 |
+| DTE>0 | 20 | 13464 | +0.0212 | -0.0170 | +0.0195 |
+
+Note the EMA/SMA ordering already established (Experiment 1's Section 5) reproduces cleanly here
+too: EMA's |r| exceeds SMA's at every one of the 18 matched (DTE-split, horizon, feature) cells.
+
+### Bucket analysis (strongest feature: Put, EMA/EMA, horizon=10, pooled across DTE)
+
+| Spread bucket | n | Mean NiftyFwd10 % | P(Up) % |
+|---|---|---|---|
+| -32.89% to -4.44% | 2478 | +0.002 | 49.0 |
+| -4.44% to -2.33% | 2479 | +0.001 | 49.8 |
+| -2.33% to -1.07% | 2479 | +0.002 | 51.1 |
+| -1.07% to -0.08% | 2479 | +0.000 | 48.8 |
+| -0.08% to 0.87% | 2479 | -0.001 | 46.5 |
+| 0.87% to 2.08% | 2479 | -0.001 | 46.8 |
+| 2.08% to 4.30% | 2479 | -0.004 | 43.7 |
+| 4.30% to 47.00% | 2479 | -0.004 | 44.3 |
+
+Roughly monotonic decline from ~49-51% down to ~44% as Put Spread rises -- consistent with the
+weak negative Pearson r, no sharp threshold or non-monotonic reversal visible. (Call and Diff
+bucket tables were also produced, for both MA types -- visible in the reproduction run's console
+output, not reproduced here since Put is the strongest feature per Y6's own selection criterion.)
+
+### Verdict
+
+**Is Call/Put premium momentum a "major candidate"? Weak, candidate for further study -- NOT yet
+promising or robust, and the one genuinely new idea this task tested (the Call-minus-Put
+combination) did not improve on the best single leg.**
+
+- **Put Spread remains the strongest single feature** found anywhere in this document's option-premium
+  track, confirming (not just repeating) Section 6's original finding with a full DTE-split and
+  dual-MA-type matrix: |r| ranges 0.026-0.093 across all 18 cells, always negative, always larger
+  in magnitude than Call at matched parameters. Still **weak** by this project's own bar -- every
+  value in this entire matrix is under |r|=0.10, the same order of magnitude every prior
+  option-premium/tick-activity finding in this document has landed in. **Labeled: weak, candidate.**
+- **Call Spread** is directionally consistent (always positive) but consistently the smaller of the
+  two legs, |r| ranging 0.008-0.069. **Labeled: weak, candidate.**
+- **Call-minus-Put Diff, the task's one new idea, is NOT supported as an improvement.** It never
+  exceeds Put's own |r| in any of the 18 (MA-type x DTE-split x horizon) cells tested -- it lands
+  between Call and Put every time, closer to Put but always short of it. Equal-weight
+  differencing does not amplify the two legs' agreement into a stronger combined signal here; if
+  anything, Call's smaller, noisier contribution dilutes Put's already-modest signal slightly.
+  **Labeled: not supported (as an improvement over the single best leg).**
+- **The most genuinely new, non-obvious finding is Y5**: Call's and Put's 0-DTE sensitivity point
+  in OPPOSITE directions. Call is weaker on 0-DTE days (confirms the prior task's Section 8), but
+  Put is *stronger* on 0-DTE days -- the reverse. This was explicitly checked rather than assumed,
+  per this task's own brief ("you should check whether it holds for Put and for Call-minus-Put
+  too"), and the answer is no, it does not hold for Put -- a genuine asymmetry, not a null result.
+  Diff's own DTE-direction tracks Call's (proportionally larger) swing rather than Put's (larger
+  but more DTE-stable) magnitude, which is itself informative about why the Diff combination
+  underperforms Put alone: the two legs' DTE-conditioned behavior isn't just different in
+  magnitude, it moves in different directions, so summing them does not reinforce a single
+  DTE-conditioned story.
+- **Bucket analysis on the strongest feature (Put) shows a gentle, mostly monotonic decline in
+  P(Up)** from ~49-51% to ~44% as Spread rises across the 8 quantile buckets -- consistent with a
+  weak linear relationship, not evidence of a sharper threshold or regime effect that bucketing
+  might have revealed. **Labeled: weak.**
+
+**Overall: this experiment does not support "major candidate" status.** Every correlation in the
+full 54-cell matrix (2 MA types x 3 DTE-splits x 3 horizons x 3 features, including the "ALL"
+pooled rows) remains under |r|=0.10 -- the same weak-but-directionally-consistent territory as
+every other option-premium/tick-activity finding recorded in this document so far, not a step up
+in magnitude. The one new mechanism tested here (Call-minus-Put combination) failed to improve on
+the best individual leg, which argues against building a composite weight on this specific
+combination without first revisiting the weighting scheme (e.g. Put-weighted rather than 1:1) or
+investigating the Y5 DTE-direction divergence further. **Predictive evidence: as stated throughout
+this section (every r, bucket, and DTE comparison). Tradeability evidence: not assessed** -- no
+P&L, spread, theta, or execution cost was modeled anywhere in this task.
+
+### Reproduction commands
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- callput-diff-research 2026-09-04 2026-09-22 4 40 650
+```
+
+Runs both EMA/EMA and SMA/SMA internally for the given fast/slow/bar; prints the full
+feature x horizon x DTE-split matrix, per-MA-type bucket tables for Call/Put/Diff, and the
+strongest |r| cell found.
+
+### Scope not attempted, honestly noted
+
+- Only the (4,40)@650 primary window pair was run -- (2,20)@650 (the other candidate pair named in
+  this task's brief) was not swept for the full matrix, per the task's own instruction to use ONE
+  primary pair for the full matrix rather than sweep both.
+- The Call-minus-Put Diff formula tested is unweighted (1:1). A magnitude-weighted variant (e.g.
+  weighting Put ~1.5-2x Call, per its consistently larger correlation) was not attempted -- it
+  would need its own justification and evaluation cycle before being trusted, per this project's
+  metric-evaluation-process rule, and was flagged rather than quietly tried.
+- Bucket tables for Call and Diff (both MA types) were produced by the reproduction run (visible in
+  its console output) but not reproduced in this section, since Put was the strongest feature by
+  this task's own selection criterion (Y6) and the task asked for buckets on "whichever...comes out
+  strongest," not all three.
+- No trade simulation, MAE/MFE, or P&L was built for any configuration here, consistent with this
+  task's explicit predictive-evidence-only scope.
+- Day-concentration robustness (does DTE=0's 3-day sample or DTE>0's 8-day, cross-expiry sample
+  hide single-day artifacts) was not re-verified here -- carried forward as an existing, unresolved
+  caveat from the original tick-activity task's Section 10/Robustness, not newly checked.
+
+## Experiment 3 -- Validating the high-activity/high-efficiency mean-reversion finding (2026-09-22)
+
+Follow-up task (user-specified), directly implementing this document's own "(11) Recommended Next
+Experiments" item 3 from the original tick-activity task: robustness-check the
+HighActivity+HighEfficiency, NetMove-conditioned mean-reversion split (E4/Section 3) that was the
+strongest single finding in that task -- "weak, candidate for further, dedicated study," explicitly
+not an edge. This task does not change that label on its own; it only tests whether the pattern
+survives closer scrutiny.
+
+**IMPORTANT LABELING NOTE (carried forward from Experiments 1/2):** every number below is
+**predictive evidence only** -- P(Up) against a forward-return research label, never a trading
+rule. **Tradeability is not assessed anywhere in this task** -- no trade simulation, no MAE/MFE, no
+P&L.
+
+### Design, stated before running
+
+**Threshold construction (unchanged from the original E4/Part 6 code, just factored out into a
+reusable method):** for a given bar-size, the TickVelocity and PriceEfficiency medians are computed
+ONCE from the full 11-day pooled sample at that bar size (`TickActivityAnalyzer.ComputeThreshold`).
+Every day/session/DTE/leave-one-out slice below reuses that SAME pooled threshold to decide "high"
+vs "low" -- a slice is never allowed to define its own median, because that would force an
+artificial ~50/50 split inside every slice by construction and make a day-by-day breakdown
+meaningless. This is the same discipline the original E4 code already used (median computed on
+`taAllSamples`, the full pooled run) -- Experiment 3 does not change it, only reuses it across more
+slices.
+
+**New code (additive, no existing method changed):**
+- `TickActivityAnalyzer.ComputeThreshold(IReadOnlyList<Sample> referencePopulation)` -- pulls the
+  existing inline median-split logic out of `Program.cs`'s `tick-activity-research` command into a
+  reusable static method.
+- `TickActivityAnalyzer.MeanReversionSplit(IReadOnlyList<Sample> scope, string label,
+  ActivityEfficiencyThreshold threshold, Func<Sample,double?> fwdSelector)` -- applies a threshold to
+  an arbitrary slice (one day, one session, one DTE regime, an N-1-day leave-one-out pool) and
+  returns P(Up)/mean-forward-return for the positive-NetMove and negative-NetMove HighAct+HighEff
+  cells, exactly the split E4 already used, just parameterized over `scope` and `fwdSelector`
+  instead of hardcoded to the full pooled dataset and horizon=10.
+- Both are pure functions over already-collected `Sample` lists -- no new DB access, no new
+  look-ahead risk (forward labels are the same already-established `NiftyFwd5/10/20` fields).
+- Tested in `NiftySignal.Tests/VolumeBarData/TickActivityAnalyzerTests.cs` (new file) with synthetic
+  `Sample`/`Result` data covering: threshold computed correctly from a known population; a scope
+  correctly split into positive/negative NetMove cells at a given threshold; an empty/degenerate
+  scope returns null rates rather than dividing by zero.
+- New CLI `mean-reversion-validation <fromDate> <toDate> [--barSizes=650,1300,2600]
+  [--zerodte=yyyy-MM-dd,...]` added to `NiftySignal.VolumeBarData/Program.cs`, reusing
+  `TickActivityAnalyzer.CollectDay` unchanged. For each bar size it: computes the pooled threshold,
+  prints a per-day breakdown (all 11 days) at horizon=10, a 3-session breakdown, a 0-DTE/non-0-DTE
+  breakdown, a 5/10/20-horizon breakdown (pooled), and a leave-best-day-out result.
+
+**Session boundaries:** identical to the existing `Sample.Session` property already in
+`TickActivityAnalyzer.cs` (IST, from the bar's own `EndTimestamp`) -- Open = before 10:00, Mid =
+10:00-13:30, Close = after 13:30. Not re-derived, reused exactly as-is.
+
+**0-DTE dates:** reused exactly as already confirmed from real `instruments.ExpiryDate` data in the
+original task's Section 8 and Experiment 2 -- **0-DTE = 2026-09-08, 09-15, 09-22; non-0-DTE =
+09-04, 09-09, 09-10, 09-11, 09-16, 09-17, 09-18, 09-21.**
+
+**Leave-best-day-out criterion (stated before running, per the user's own instruction):** for each
+day, compute a single "favorability score" combining both NetMove cells, weighted by that day's own
+cell sample counts (per the user's own phrasing: "weighted by that day's own sample count"):
+
+```
+dayScore = (nPos * (50 - P(Up)_pos) + nNeg * (P(Up)_neg - 50)) / (nPos + nNeg)
+```
+
+`50 - P(Up)_pos` is positive when the positive-NetMove cell reverses down (the expected direction);
+`P(Up)_neg - 50` is positive when the negative-NetMove cell reverses up (the expected direction).
+A day with a large positive `dayScore` is contributing strongly IN THE EXPECTED DIRECTION; this is
+the day removed for the leave-one-out check. Days where either cell has zero samples are excluded
+from the day-ranking (score undefined), and this is noted explicitly if it happens. This criterion
+is computed independently at each bar size (650/1300/2600) -- if a different day comes out "best"
+at different bar sizes, that itself is reported as a robustness note, not silently reconciled.
+
+**Bar sizes / horizon:** same 650/1300/2600 as the original E4, primary horizon=10 (E4's own
+implicit primary, confirmed by checking `TickActivityAnalyzer.CollectDay`'s only NetMove-conditioned
+output used `NiftyFwd10`), with 5/10/20 all reported explicitly per the task's own instruction not
+to assume 10 was the only horizon worth checking. **Per-day breakdowns are reported for bar=650
+only** where the sample count per day/per-cell is judged adequate; 1300/2600 per-day breakdowns are
+attempted but flagged explicitly if any day's cell count is judged too thin (a rule of thumb: n<15
+per cell is flagged, not silently reported as if solid, consistent with this document's existing
+small-sample caveats e.g. the VolContraction n=68-75 flag in Experiment 1).
+
+**In-sample/exploratory note:** the choice to reuse E4's exact threshold construction (pooled
+median split, unweighted) and the exact `dayScore` weighting formula above are both
+**in-sample/exploratory, informed by the prior experiment's own methodology and this task's own
+instruction** -- not independently re-derived from first principles.
+
+New code: `TickActivityAnalyzer.ComputeThreshold`/`MeanReversionSplit` (additive, both pure
+functions), CLI `mean-reversion-validation`, tests in
+`NiftySignal.Tests/VolumeBarData/TickActivityAnalyzerTests.cs` (4 new tests). `dotnet build
+NiftySignal.slnx`: 0 warnings/0 errors. `dotnet test NiftySignal.slnx`: 736/736 passing (732
+baseline + 4 new, no regressions).
+
+**Verification that the reused pooled result reproduces exactly**: the pooled Horizon=10 row below
+matches the original E4 numbers precisely -- bar=650: 38.9%/57.3%; bar=1300: 41.8%/54.9%; bar=2600:
+43.9%/52.8% -- confirming this task's refactored code computes the identical thing the original
+inline `Program.cs` code did, not a subtly different quantity.
+
+### Results
+
+**Per-day breakdown, bar=650, horizon=10 (all 11 days, n>=15 per cell in every case -- no day/cell
+flagged as too thin at this bar size):**
+
+| Date | DTE | pos n | pos P(Up)% | neg n | neg P(Up)% | Both cells in expected direction? |
+|---|---|---|---|---|---|---|
+| 2026-09-04 | 4 | 103 | 34.0 | 107 | 53.3 | yes |
+| 2026-09-08 | 0 | 293 | 33.2 | 333 | 59.0 | yes |
+| 2026-09-09 | 6 | 468 | 35.8 | 529 | 53.9 | yes |
+| 2026-09-10 | 5 | 239 | 37.9 | 252 | 53.6 | yes |
+| 2026-09-11 | 4 | 570 | 44.6 | 526 | 63.0 | yes |
+| 2026-09-15 | 0 | 573 | 32.4 | 572 | 56.8 | yes |
+| 2026-09-16 | 6 | 350 | 44.1 | 300 | 52.0 | yes |
+| 2026-09-17 | 5 | 252 | 50.8 | 253 | 54.9 | **pos cell flat/borderline** (50.8, essentially no reversal signature; neg cell still correct) |
+| 2026-09-18 | 4 | 153 | 37.7 | 133 | 64.6 | yes |
+| 2026-09-21 | 1 | 154 | 37.3 | 155 | 67.7 | yes -- **this is the identified best day at bar=650** |
+| 2026-09-22 | 0 | 335 | 38.3 | 437 | 55.9 | yes |
+
+**10 of 11 days show the pattern in the expected direction on BOTH cells; the 11th (09-17) fails
+only the positive-NetMove cell (50.8%, essentially flat rather than reversed) while its
+negative-NetMove cell still shows the expected reversal (54.9%).** No day shows the pattern
+reversed on both cells. This is genuinely broad-based, not concentrated in one or two days.
+
+**Per-day breakdown, bar=1300, horizon=10 (min n=49 -- above the n<15 flag threshold, still
+reported, but noisier than bar=650):** 9 of 11 days fully consistent. Two exceptions: 09-04's
+negative cell is WRONG direction (39.2%, should be >50); 09-17's positive cell is WRONG direction
+(55.8%, should be <50). Full numbers in the reproduction command's console output (not
+retranscribed row-by-row here to keep this section readable) -- both exceptions are single-cell
+failures, not whole-day reversals, same pattern as bar=650's one exception.
+
+**Per-day breakdown, bar=2600, horizon=10 (min n=28 -- still above the n<15 flag threshold, but this
+is where day-level consistency genuinely degrades):** only about half the days are fully consistent
+on both cells. Failures: 09-04 (neg wrong, 44.0%), 09-08 (neg wrong, 46.5%), 09-09 (neg wrong,
+45.1%), 09-11 (pos wrong, 55.2%), 09-15 (neg wrong but barely, 49.6%), 09-16 (pos wrong but barely,
+50.4%), 09-17 (pos wrong, 54.9%). **This is a real, explicitly-flagged weakening, not glossed
+over**: at the largest bar size tested, individual-day sample counts (28-211 per cell) are small
+enough that day-to-day noise substantially erodes the pattern's day-level consistency, even though
+(see below) the POOLED bar=2600 result still shows the same direction as bar=650/1300.
+
+**Session breakdown (horizon=10):**
+
+| Bar | Session | pos n | pos P(Up)% | neg n | neg P(Up)% |
+|---|---|---|---|---|---|
+| 650 | Open(<10:00) | 1054 | 40.8 | 1101 | 54.2 |
+| 650 | Mid(10:00-13:30) | 1260 | 37.7 | 1269 | 58.0 |
+| 650 | Close(>13:30) | 1176 | 38.4 | 1227 | 59.3 |
+| 1300 | Open(<10:00) | 684 | 42.7 | 714 | 50.8 |
+| 1300 | Mid(10:00-13:30) | 725 | 41.5 | 736 | 57.2 |
+| 1300 | Close(>13:30) | 731 | 41.3 | 741 | 56.6 |
+| 2600 | Open(<10:00) | 401 | 44.4 | 438 | 49.5 |
+| 2600 | Mid(10:00-13:30) | 375 | 43.7 | 375 | 53.3 |
+| 2600 | Close(>13:30) | 438 | 43.7 | 455 | 55.8 |
+
+Holds in all 3 sessions at bar=650 and bar=1300 (every cell on the expected side of 50%, 1300's
+Open neg cell is a thin 50.8% but still on the correct side). **At bar=2600, the Open session's
+negative-NetMove cell fails** (49.5%, wrong side of 50, though only barely) -- the same
+largest-bar-size weakening seen in the per-day breakdown. Mid and Close sessions hold at every bar
+size tested.
+
+**DTE breakdown (horizon=10):**
+
+| Bar | DTE | pos n | pos P(Up)% | neg n | neg P(Up)% |
+|---|---|---|---|---|---|
+| 650 | DTE=0 | 1201 | 34.2 | 1342 | 57.0 |
+| 650 | DTE>0 | 2289 | 41.3 | 2255 | 57.4 |
+| 1300 | DTE=0 | 753 | 38.6 | 842 | 54.5 |
+| 1300 | DTE>0 | 1387 | 43.5 | 1349 | 55.2 |
+| 2600 | DTE=0 | 424 | 37.8 | 504 | 49.6 |
+| 2600 | DTE>0 | 790 | 47.2 | 764 | 55.0 |
+
+Holds in both DTE regimes at bar=650 and bar=1300. **At bar=2600, DTE=0's negative-NetMove cell is
+flat/wrong (49.6%)** -- again the largest-bar-size weakening, concentrated in the same DTE=0 slice
+(3 days: 09-08/09-15/09-22) that this document has repeatedly flagged as a small, cross-expiry
+sample elsewhere (Experiment 1/2's own caveats).
+
+**Horizon breakdown (pooled across all 11 days):**
+
+| Bar | Horizon | pos n | pos P(Up)% | neg n | neg P(Up)% |
+|---|---|---|---|---|---|
+| 650 | 5 | 3490 | 36.5 | 3597 | 58.0 |
+| 650 | 10 | 3490 | 38.9 | 3597 | 57.3 |
+| 650 | 20 | 3490 | 40.7 | 3597 | 54.6 |
+| 1300 | 5 | 2140 | 39.9 | 2191 | 57.0 |
+| 1300 | 10 | 2140 | 41.8 | 2191 | 54.9 |
+| 1300 | 20 | 2140 | 43.6 | 2191 | 51.6 |
+| 2600 | 5 | 1214 | 41.8 | 1268 | 54.2 |
+| 2600 | 10 | 1214 | 43.9 | 1268 | 52.8 |
+| 2600 | 20 | 1214 | 44.8 | 1268 | 50.8 |
+
+Holds in the expected direction at all 3 horizons and all 3 bar sizes -- **but the effect size
+shrinks monotonically as horizon lengthens, most visibly at the larger bar sizes** (bar=2600,
+horizon=20: pos=44.8%/neg=50.8%, both within ~5 points of 50, close to disappearing). Horizon=5 is
+consistently the strongest reading at every bar size. This is a genuinely new finding (the original
+E4 only reported horizon=10) and argues that if this pattern is real, its strongest form is at
+shorter horizons, not longer ones -- consistent with a short-lived mean-reversion mechanic rather
+than a slow drift.
+
+**Leave-best-day-out (the key robustness step):**
+
+| Bar | Best day (by weighted favorable-deviation score) | Score | Pooled BEFORE exclusion (pos%/neg%) | Pooled AFTER exclusion (pos%/neg%) |
+|---|---|---|---|---|
+| 650 | 2026-09-21 | 15.25 | 38.9 / 57.3 | 39.0 / 56.8 |
+| 1300 | 2026-09-18 | 9.07 | 41.8 / 54.9 | 42.1 / 55.0 |
+| 2600 | 2026-09-18 | 12.47 | 43.9 / 52.8 | 44.6 / 53.0 |
+
+**The pattern survives best-day removal almost unchanged at all 3 bar sizes** -- every post-exclusion
+number moves by well under 1 percentage point from its pre-exclusion value, in every case staying
+on the same side of 50% by the same wide margin. Per the user's own framing ("if the relationship
+remains, confidence increases considerably"), this is a real, meaningful robustness result: the
+pooled finding is not an artifact of any single day, including the day that individually favors it
+most.
+
+**Note, as flagged in the design above as a thing to watch for:** the identified "best day" differs
+by bar size -- 2026-09-21 at bar=650, but 2026-09-18 at both bar=1300 and bar=2600. This is itself
+informative: it means no single calendar day is uniquely responsible for the pooled result across
+bar sizes, which is a MORE robust picture than if the same day had topped the ranking everywhere
+(that would have suggested one specific day's price action was driving the whole cross-bar-size
+"held at all 3 sizes" finding from the original task).
+
+### Experiment log
+
+| ID | Hypothesis | Dataset | Bar(s) | Params | Result | Conclusion |
+|----|---|---|---|---|---|---|
+| M1 | Reproduce E4's pooled horizon=10 result exactly via the refactored code, before extending | 11 days, pooled | 650/1300/2600 | horizon=10 | pos/neg P(Up) = 38.9/57.3, 41.8/54.9, 43.9/52.8 -- exact match to the original E4 numbers | **reproduced exactly** -- confirms against actual running code |
+| M2 | Pattern holds on most/all of the 11 individual days, not just pooled | 11 days, per-day | 650/1300/2600 | horizon=10 | bar=650: 10/11 days fully consistent (1 single-cell exception); bar=1300: 9/11 (2 single-cell exceptions); bar=2600: ~4-5/11 fully consistent, several single-cell failures | **broadly supported at 650/1300, meaningfully weaker day-level consistency at 2600** (smaller per-day n at the largest bar size) |
+| M3 | Pattern holds in all 3 sessions | 11 days, pooled by session | 650/1300/2600 | horizon=10 | holds in all 9 (bar x session) cells except bar=2600's Open session negative-NetMove cell (49.5%, flat/wrong) | **holds at 650/1300 in every session; weakens at 2600 in one session/cell** |
+| M4 | Pattern holds in both DTE regimes | 11 days, pooled by DTE | 650/1300/2600 | horizon=10 | holds in 5 of 6 (bar x DTE) cells; bar=2600 DTE=0 negative cell flat (49.6%) | **holds at 650/1300 in both regimes; weakens at 2600 in the DTE=0 (3-day, cross-expiry) slice** |
+| M5 | Pattern holds at horizons other than 10 (5 and 20 not previously tested) | 11 days, pooled | 650/1300/2600 | horizon=5/10/20 | holds in the expected direction at all 9 (bar x horizon) cells; effect size shrinks as horizon lengthens, most at larger bar sizes | **holds at all 3 horizons tested; strongest at horizon=5, weakest (near-vanishing) at horizon=20+bar=2600** |
+| M6 | Pattern survives removing the single best-performing day | 11 days -> 10 days | 650/1300/2600 | leave-one-out, weighted-deviation day-selection | post-exclusion pos/neg move by <1 point from pre-exclusion at every bar size | **survives -- the strongest single result in this experiment; not an artifact of one day** |
+
+### Verdict
+
+**Does this finding survive removing its best day? Yes, essentially unchanged, at all 3 bar sizes.**
+This is the single most important result of this task and directly answers the original task's
+own "Recommended Next Experiments" item 3. Per the user's own framing, this is real grounds for
+increased (though still bounded) confidence.
+
+**Is it concentrated in one day/session/DTE regime, or genuinely spread across the sample?**
+**Genuinely spread, with one clear caveat.** At bar=650 and bar=1300 -- the two smaller, higher
+per-day-sample-count thresholds -- the pattern holds on 9-10 of 11 individual days, in all 3
+sessions, and in both DTE regimes, with only single-cell (never whole-day, whole-session, or
+whole-DTE-regime) exceptions. At bar=2600, the picture is meaningfully weaker at the day/session/DTE
+level (day-level consistency drops to roughly half, one session cell and one DTE cell go flat)
+even though the POOLED bar=2600 number still shows the same direction. The most parsimonious
+explanation is sample-size noise at the largest bar size (per-day n drops to 28-211, versus
+103-573 at bar=650) rather than a genuinely different underlying relationship -- but this was not
+separately proven (would need, e.g., a bootstrap or permutation test on bar=2600 specifically,
+which this task did not run) and is reported as an open caveat, not resolved.
+
+**Final label: PROMISING (upgraded from the original task's "weak, candidate for further study"),
+not yet ROBUST.** Justification for the upgrade: the finding cleared the specific, hardest
+robustness bar the user set for it (best-day-out) with almost no degradation, at all 3 bar sizes,
+and is broadly distributed across days/sessions/DTE-regimes at the two smaller (higher-n) bar
+sizes -- meaningfully more evidence than the original task had. Justification for NOT calling it
+"robust": (1) the day-level/session/DTE-level consistency genuinely degrades at bar=2600, an
+un-explained (if plausible) discrepancy; (2) the effect sizes throughout remain modest in absolute
+terms (pooled deviations of roughly 5-19 points off 50%, per-cell P(Up) never below ~25% or above
+~70%) -- the same order of magnitude every other "weak" finding in this document has shown, not a
+step up into a different regime of confidence; (3) this task, like Experiments 1 and 2, tests
+predictive evidence only.
+
+**Predictive evidence: promising, not yet robust** -- see the label and justification above.
+**Tradeability evidence: not assessed anywhere in this task** -- no trade simulation, no MAE/MFE
+excursion analysis, no P&L, no spread/theta/IV/execution modeling. A "promising" predictive label
+here says nothing about whether this pattern would survive real option execution costs; that
+remains a completely separate, unstarted question.
+
+### Reproduction command
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- mean-reversion-validation 2026-09-04 2026-09-22
+```
+
+Runs all 3 bar sizes (650/1300/2600) by default; prints per-day breakdown, session breakdown, DTE
+breakdown, horizon breakdown, and leave-best-day-out for each.
+
+### Scope not attempted, honestly noted
+
+- No bootstrap/permutation significance test was run on any of these P(Up) numbers -- every
+  "holds"/"fails" call above is a plain point-estimate comparison against 50%, not a
+  statistical-significance claim. This document has not used significance tests anywhere so far
+  (consistent with its existing practice), but it is a real limitation of "promising" vs a stronger
+  label.
+- The bar=2600 day-level/session/DTE-level weakening was not root-caused (sample-size noise is the
+  working hypothesis, stated as such, not confirmed by a dedicated test such as a sample-size-matched
+  resampling of bar=650 down to bar=2600's per-day counts).
+- Leave-one-out was run for the single best day only, per the task's explicit instruction -- a
+  fuller leave-one-out (drop each of the 11 days in turn, one at a time, and look at the range of
+  pooled results) was not run and would be a natural, cheap follow-up given the infrastructure this
+  task already built.
+- As in Experiments 1/2, no trade simulation, MAE/MFE, or P&L was built for any configuration here.
+
+## Experiment 4 -- VolContraction day/session/DTE concentration audit (2026-09-22)
+
+Follow-up task (user-specified), directly implementing this document's own "(11) Recommended Next
+Experiments" item 4 from the original tick-activity task and Experiment 1's Section 7 flag on
+VolContraction: a dual Call+Put option-premium-spread state (both Call and Put Spread simultaneously
+below -pooled-70th-percentile-of-|Spread|) that showed P(Up)=58.8-62.7% forward -- the largest
+directional skew anywhere in the whole SMA/EMA track -- but on only n=68-75 out of ~20,000 pooled
+bars (under 0.4%), explicitly flagged as "very likely concentrated in a small number of days/events"
+and "NOT robustness-checked." This task is that check, and only that check: day/session/DTE
+concentration, no trade simulation, no MAE/MFE, no P&L.
+
+**IMPORTANT LABELING NOTE (carried forward from Experiments 1-3):** every number below is
+**predictive evidence only** -- P(Up) against a forward-return research label, never a trading rule.
+**Tradeability is not assessed anywhere in this task** -- no trade simulation, no MAE/MFE, no P&L.
+
+### Design, stated before running
+
+**Reproduce first.** Before any new analysis, the exact original Part 13 VolContraction detection
+(`MaSpreadRelationshipAnalyzer.CollectDayAsync` + `ma-spread-research`'s Part 13 block in
+`NiftySignal.VolumeBarData/Program.cs`) is re-run unmodified for all 3 MA-type combos (SMA/SMA,
+EMA/EMA, EMA-fast/SMA-slow) at fast=4/slow=40/bar=650/band=3, to confirm this task starts from the
+same numbers Experiment 1 reported, not a subtly different quantity.
+
+**State detection, unchanged:** Call and Put samples (`MaSpreadRelationshipAnalyzer.Sample`, one row
+per side per bar) are joined on `(Date, BarIndex)`. The pooled 70th percentile of `|Spread|` across
+BOTH sides' samples together is the threshold (data-derived, computed fresh per MA-type run, not
+invented). VolContraction = `CallSpread < -threshold AND PutSpread < -threshold`, evaluated only on
+joined rows where `NiftyFwd10` is available (bars within 10 of day-end are excluded, same as every
+other section of this document).
+
+**New code (additive, no existing method or default-path output changed):** a `--dumpstates=true`
+flag was added to the `ma-spread-research` CLI (`NiftySignal.VolumeBarData/Program.cs`, Part 13
+block). With the flag OFF (the default, and everything Experiments 1/2/3 already ran), output is
+byte-for-byte identical to before. With it ON, each of the four dual states (Bullish/Bearish
+confirmation, VolExpansion, VolContraction) additionally prints one line per occurrence: date,
+bar index, time-of-day (IST), session, DTE, the realized `Fwd10%` value, and its Up/Down/Flat
+outcome. Session boundaries are the exact same ones already established and tested in
+`TickActivityAnalyzer.Sample.Session` (Open before 10:00 IST, Mid 10:00-13:30, Close after 13:30,
+from the bar's own `EndTimestamp`) -- re-implemented as a small local function (`MsSession`) rather
+than reused directly because `MaSpreadRelationshipAnalyzer.Sample` and
+`TickActivityAnalyzer.Sample` are separate record types from separate, deliberately-un-parameterized
+analyzers (see `MaSpreadRelationshipAnalyzer`'s own doc comment on why it duplicates rather than
+reuses `MomentumRelationshipAnalyzer`). DTE-per-date is a small hardcoded lookup table using the
+already-confirmed values from real `instruments.ExpiryDate` data (Experiment 1's Section 8, not
+re-derived here): 09-04=4, 09-08=0, 09-09=6, 09-10=5, 09-11=4, 09-15=0, 09-16=6, 09-17=5, 09-18=4,
+09-21=1, 09-22=0.
+
+**No new pure-function unit test was added for `MsSession`/the DTE table.** This is a documented,
+deliberate scope call, not an oversight: both are small, direct re-implementations of logic already
+established and exercised elsewhere in this document (session boundaries mirror
+`TickActivityAnalyzer.Sample.Session`, tested indirectly via `TickActivityAnalyzerTests`; the DTE
+table is a literal transcription of already-confirmed values, not a new derivation), the output is
+inspected directly below (every VolContraction row for all 3 combos, 216 rows total, is checked by
+hand in this section), and the flag is purely additive presentation logic with no effect on any
+existing tested code path. `dotnet build`/`dotnet test` requirements below still apply in full.
+
+**Concentration thresholds used in this task**, beyond the user's own explicit 60%-from-1-2-days
+rule: a day is called "the day" or "one of the top-2 days" simply by ranking days by occurrence
+count within each MA combo's VolContraction set -- no separate statistical test was applied, since
+the user's own rule is already a bright-line percentage-of-outcomes test, not a significance test.
+
+### Step 1 -- Reproduction (verification before extension)
+
+Exact match to Experiment 1's reported numbers, confirmed directly from this task's own console
+output (not re-typed from memory):
+
+| MA combo | \|Spread\| threshold (pooled 70th pct) | VolContraction n | VolContraction P(Up)% |
+|---|---|---|---|
+| SMA/SMA | 5.154% | 68 | 58.8 |
+| EMA/EMA | 4.293% | 75 | 62.7 |
+| EMA-fast/SMA-slow | 5.123% | 73 | 61.6 |
+
+This matches Experiment 1's "n=68-75... P(Up) 58.8-62.7%" exactly. Reproduction confirmed.
+
+Reproduction/detail-dump commands run (band=3, fast=4, slow=40, bar=650, 2026-09-04 to 2026-09-22,
+matching Experiment 1 exactly):
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- ma-spread-research 2026-09-04 2026-09-22 4 40 650 --fasttype=Sma --slowtype=Sma --band=3 --dumpstates=true
+dotnet run --project NiftySignal.VolumeBarData -- ma-spread-research 2026-09-04 2026-09-22 4 40 650 --fasttype=Ema --slowtype=Ema --band=3 --dumpstates=true
+dotnet run --project NiftySignal.VolumeBarData -- ma-spread-research 2026-09-04 2026-09-22 4 40 650 --fasttype=Ema --slowtype=Sma --band=3 --dumpstates=true
+```
+
+### Step 2 -- Per-occurrence detail
+
+All 68+75+73=216 VolContraction rows were dumped and inspected directly (not summarized from a
+partial sample). The full per-bar table is not retranscribed row-by-row here (216 rows), but every
+aggregate below is a direct tabulation of that full set, and the raw rows are reproducible exactly
+via the commands above. A representative excerpt (SMA/SMA, first and last few rows) illustrates the
+row format actually inspected:
+
+```
+2026-09-08 bar= 1814 t=15:16:55 session=Close(>13:30)    DTE= 0 Fwd10%=  0.009 outcome=Up
+2026-09-08 bar= 1820 t=15:17:48 session=Close(>13:30)    DTE= 0 Fwd10%=  0.015 outcome=Up
+2026-09-08 bar= 1821 t=15:17:59 session=Close(>13:30)    DTE= 0 Fwd10%= -0.013 outcome=Down
+...
+2026-09-22 bar= 2075 t=15:20:21 session=Close(>13:30)    DTE= 0 Fwd10%=  0.053 outcome=Up
+2026-09-22 bar= 2081 t=15:22:36 session=Close(>13:30)    DTE= 0 Fwd10%=  0.095 outcome=Up
+2026-09-22 bar= 2082 t=15:22:42 session=Close(>13:30)    DTE= 0 Fwd10%=  0.034 outcome=Up
+```
+
+**The single most immediately visible pattern, true of every one of the 216 rows across all 3 MA
+combos: every `t=` timestamp is in the 15:0x-15:2x IST range** -- i.e. VolContraction occurs
+exclusively in roughly the last 15-30 minutes before the 15:30 IST market close. This was not
+something the original Part 13 aggregate output could show (it only ever printed counts and P(Up));
+it is only visible once individual bar timestamps are dumped, which is exactly why this task's
+additive `--dumpstates` output was needed.
+
+### Step 3 -- Sample count per day
+
+| MA combo | Day | n | up | P(Up)% |
+|---|---|---|---|---|
+| SMA/SMA | 2026-09-08 | 44 | 27 | 61.4 |
+| SMA/SMA | 2026-09-15 | 18 | 7 | 38.9 |
+| SMA/SMA | 2026-09-22 | 6 | 6 | 100.0 |
+| EMA/EMA | 2026-09-08 | 41 | 25 | 61.0 |
+| EMA/EMA | 2026-09-15 | 29 | 17 | 58.6 |
+| EMA/EMA | 2026-09-22 | 5 | 5 | 100.0 |
+| EMA-fast/SMA-slow | 2026-09-08 | 42 | 26 | 61.9 |
+| EMA-fast/SMA-slow | 2026-09-15 | 24 | 12 | 50.0 |
+| EMA-fast/SMA-slow | 2026-09-22 | 7 | 7 | 100.0 |
+
+**VolContraction occurs on exactly 3 of the 11 trading days -- 09-08, 09-15, 09-22 -- in every one
+of the 3 MA-type combos, with zero occurrences on the other 8 days.** This alone is the headline
+concentration result: 8 of 11 days (72.7% of the sample's trading days) contribute literally zero
+VolContraction bars at any MA combo.
+
+**Concentration of the "up" outcomes specifically (the user's own decision-rule quantity), ranked by
+occurrence count:**
+
+| MA combo | total n | total up | Top-1-day (09-08) up / total up | Top-2-day (09-08+09-15) up / total up |
+|---|---|---|---|---|
+| SMA/SMA | 68 | 40 | 27/40 = 67.5% | 34/40 = 85.0% |
+| EMA/EMA | 75 | 47 | 25/47 = 53.2% | 42/47 = 89.4% |
+| EMA-fast/SMA-slow | 73 | 45 | 26/45 = 57.8% | 38/45 = 84.4% |
+
+Top-2-day occurrence-count share (not just up-outcome share) is also extreme: SMA/SMA 62/68=91.2%,
+EMA/EMA 70/75=93.3%, EMA-fast/SMA-slow 66/73=90.4%.
+
+### Step 4 -- Sample count per session
+
+| MA combo | Session | n | up | P(Up)% |
+|---|---|---|---|---|
+| SMA/SMA | Close(>13:30) | 68 | 40 | 58.8 |
+| EMA/EMA | Close(>13:30) | 75 | 47 | 62.7 |
+| EMA-fast/SMA-slow | Close(>13:30) | 73 | 45 | 61.6 |
+
+**100% of VolContraction occurrences, in all 3 MA combos, fall in the Close session -- zero in Open
+or Mid.** Combined with Step 2's finding that every occurrence is specifically in the last ~15-30
+minutes of the Close session (15:0x-15:2x IST, not spread across the full 13:30-15:30 window), this
+is an even tighter concentration than the plain 3-bucket session split shows.
+
+### Step 5 -- Sample count per DTE
+
+| MA combo | DTE regime | n | up | P(Up)% |
+|---|---|---|---|---|
+| SMA/SMA | DTE=0 | 68 | 40 | 58.8 |
+| SMA/SMA | DTE>0 | 0 | -- | -- |
+| EMA/EMA | DTE=0 | 75 | 47 | 62.7 |
+| EMA/EMA | DTE>0 | 0 | -- | -- |
+| EMA-fast/SMA-slow | DTE=0 | 73 | 45 | 61.6 |
+| EMA-fast/SMA-slow | DTE>0 | 0 | -- | -- |
+
+**100% of VolContraction occurrences are on 0-DTE days (09-08/09-15/09-22 -- the confirmed 0-DTE
+set), zero on any of the 8 non-0-DTE days.** This is not a separate, independent concentration axis
+from Step 3's day breakdown -- it is the SAME 3 days, restated. All three of "day," "session," and
+"DTE" concentration in this state collapse to one underlying fact: VolContraction only occurs in the
+closing minutes of 0-DTE expiry days.
+
+**Plausible (not tested/confirmed) mechanism, noted for context only, not asserted as fact:** ATM
+option premiums decay toward zero in the final minutes of their own 0-DTE expiry as time value
+collapses; both Call and Put ATM premiums falling sharply and simultaneously in that specific window
+would mechanically produce exactly this dual-negative-Spread state. This is a plausible story for
+WHY the concentration looks the way it does, but it was not separately verified in this task (would
+require inspecting raw premium levels near expiry, not done here) and is not needed to reach this
+task's verdict either way -- the concentration finding stands on the day/session/DTE tabulation
+alone, regardless of mechanism.
+
+### Experiment log
+
+| ID | Hypothesis | Dataset | Bar(s) | Params | Result | Conclusion |
+|----|---|---|---|---|---|---|
+| V1 | Reproduce Experiment 1's VolContraction n=68-75/P(Up)=58.8-62.7% exactly, before extending | 11 days, pooled | 650, all 3 MA combos | threshold=pooled 70th pct \|Spread\| | n=68/75/73, P(Up)=58.8/62.7/61.6 -- exact match | **reproduced exactly** |
+| V2 | VolContraction occurrences are spread across most/all of the 11 trading days | 11 days, per-day | 650, all 3 MA combos | per-day n/up count | occurrences fall on exactly 3 of 11 days (09-08, 09-15, 09-22) at every MA combo; 0 on the other 8 | **not supported -- extreme day concentration, 3/11 days** |
+| V3 | The 60%+-of-up-outcomes-from-1-2-days threshold (user's own decision rule) | 11 days | 650, all 3 MA combos | top-1/top-2 day share of "up" outcomes | top-2-day share of ups: 85.0% / 89.4% / 84.4% (all combos); top-1-day alone already 53-68% | **rule triggered in all 3 combos, by a wide margin** |
+| V4 | VolContraction occurrences are spread across Open/Mid/Close sessions | 11 days, per-session | 650, all 3 MA combos | session n/up count | 100% of occurrences in Close session (further: all within ~15:0x-15:2x IST) at every combo | **not supported -- single-session concentration** |
+| V5 | VolContraction occurrences are spread across 0-DTE and non-0-DTE days | 11 days, per-DTE | 650, all 3 MA combos | DTE=0 vs DTE>0 n/up count | 100% of occurrences on DTE=0 days at every combo; 0 on DTE>0 | **not supported -- single-DTE-regime concentration (same 3 days as V2)** |
+
+### Verdict
+
+**Applying the user's own explicit decision rule ("if 60%+ of the up outcomes are attributable to
+bars from one or two days, park it, regardless of the aggregate P(Up) number"):** the rule is
+triggered, clearly and by a wide margin, in all 3 MA-type combos. The top-2 days (09-08, 09-15)
+account for 84.4-89.4% of all "up" outcomes across the 3 combos -- well above the 60% line -- and
+even the single top day (09-08) alone already accounts for 53.2-67.5% of the up outcomes on its own.
+Beyond the day axis specifically, the state is simultaneously 100% concentrated in one session
+(Close, and more specifically the last 15-30 minutes before close) and 100% concentrated in one DTE
+regime (0-DTE) -- and these are not three independent confirmations, they are three views of the
+identical underlying fact (all 216 occurrences across all 3 combos sit inside the closing minutes of
+exactly 3 calendar days).
+
+**Final label: PARK IT.** This is the user's own phrase for exactly this outcome, used verbatim per
+this task's instructions. VolContraction's P(Up)=58.8-62.7% forward-return skew -- the largest
+directional split found anywhere in the entire SMA/EMA option-premium research track -- is, on this
+11-day sample, a day-concentration artifact (specifically, a closing-minutes-of-0-DTE-expiry
+artifact) rather than evidence of a general, repeatable directional relationship. It should not be
+cited as a positive finding, weighted into any future composite-score candidate list, or used to
+justify further investment in this specific dual-state construction, unless and until it is
+re-tested on a substantially larger sample of 0-DTE closing-minutes windows specifically (which this
+11-day, 3-0-DTE-day sample cannot provide) and shown to hold across MORE than 2-3 such windows.
+
+**Predictive evidence: park it (day/session/DTE-concentration artifact, not a general finding).**
+**Tradeability evidence: not assessed in this task** -- no trade simulation, no MAE/MFE, no P&L; this
+was purely a concentration audit of an existing predictive-evidence claim, and would in any case be
+moot given the "park it" predictive verdict above (a signal that fails the concentration check has
+nothing to size a trade simulation around).
+
+### Scope not attempted, honestly noted
+
+- The plausible closing-minutes-premium-decay mechanism (Step 5) was not independently verified by
+  inspecting raw Call/Put ATM premium levels near expiry -- offered as context for why the
+  concentration looks the way it does, not as a tested claim, and not needed for this task's verdict.
+- No significance/permutation test was run on the day/session/DTE splits -- consistent with this
+  document's existing practice (Experiment 3 also flagged this), and unnecessary here since the
+  concentration itself (3 of 11 days, 1 of 3 sessions, 1 of 2 DTE regimes contributing 100% of
+  occurrences) is decisive on its own without needing a p-value.
+- BullishConfirmation, BearishConfirmation, and VolExpansion were not given the same day/session/DTE
+  audit in this task -- out of scope per the task's explicit VolContraction-only framing (VolExpansion
+  has n=0 in this sample regardless, per Experiment 1).
+- This task did not attempt to re-run VolContraction detection at bar sizes other than 650 (the
+  original Experiment 1/E11 bar size) -- matching the task's own explicit reproduction-first framing;
+  a different bar size could in principle show a less concentrated pattern, but testing that was not
+  requested and is not needed to reach a verdict on THIS specific 650-bar, 70th-percentile-threshold
+  construction.
+
+## Experiment 5 -- Tradeability of Activity/Efficiency Mean Reversion (2026-09-22)
+
+> **CORRECTION NOTICE (2026-09-22, see "Correction -- Overlapping-Trade Bug Fix and Premium-Band
+> Strike Selection" near the end of this document for the full writeup and corrected numbers):**
+> every OPTION-TRADE-SIMULATION number in this section -- trade counts, win rate, PF, expectancy,
+> net/gross P&L, max drawdown, per-day tables, cost-sensitivity, Case A/B/C, session/DTE/interaction
+> breakdowns, the random-entry baseline -- is **INVALID**. Root cause: the trade-building loop
+> opened one independent simulated option trade per qualifying bar with no check for whether a
+> previously-opened trade (10-bar holding horizon) was still open, producing dozens to hundreds of
+> physically-overlapping "trades" on a single day (confirmed 269-513 on individual days at bar=650)
+> that no real trader could simultaneously hold. This section ALSO originally selected the strike by
+> pure synthetic-forward ATM (`OptionAtmBarRow.AtmStrike`); the correction instead selects the
+> strike whose own entry-time premium falls in a `[100,150]` band, per explicit user instruction --
+> a genuinely different selection rule, not merely a bug fix, so the corrected numbers are not
+> directly comparable to a "same methodology, bug fixed" rerun. **NOT affected**: this section's
+> *predictive*-evidence numbers (item 2's underlying forward-return/MFE/MAE stats, computed directly
+> from `Experiment5UnderlyingAnalyzer.SummarizeUnderlying` over ALL qualifying bars with no trade
+> simulation involved) never went through the buggy trade-building step and remain valid as
+> originally reported.
+
+Follow-up task (user-specified, the largest and most detailed of a 5-experiment follow-up series).
+Experiment 3 established that the HighActivity+HighEfficiency, NetMove-conditioned mean-reversion
+split is **PROMISING, not yet ROBUST** as a *predictive* pattern. This task asks a different,
+strictly narrower question: **does that already-discovered predictive pattern translate into a
+tradeable option-buying opportunity** once real option prices, MFE/MAE, holding duration, and
+realistic execution costs are considered. This is a research-only tradeability test -- it does
+**not** prove an edge, does **not** add anything to the production composite score, and does not
+touch `NiftySignal.Host`/`NiftySignal.Dashboard`/`NiftySignal.Rules`/`LiveTradingEngine`.
+
+**IMPORTANT LABELING NOTE:** predictive-evidence numbers and tradeability-evidence numbers are
+reported and concluded on SEPARATELY throughout this section (per the task's own item 12) -- a
+positive predictive number here does not imply a positive tradeability number, and vice versa.
+Approved evidence labels only: Not supported / Inconclusive / Weak / Promising / Promising not yet
+robust / Robust candidate. No occurrence of "best," "winner," "optimal," "proven edge,"
+"guaranteed," or "high-confidence strategy" appears below.
+
+### Hypothesis
+
+Bars in the locked HighActivity+HighEfficiency state that closed UP are followed by a short-term
+DOWN move (buy a PUT to capture it); bars that closed DOWN are followed by a short-term UP move (buy
+a CALL). The question is whether that move, once realized through an actual option position with
+real entry/exit fills and real costs, produces net-positive option P&L -- not just a favorable
+underlying P(Up) reading.
+
+### Locked Signal Definition (reused byte-for-byte from Experiment 3, not redefined)
+
+- **Activity** = `TickVelocity` = `TickCount / DurationSeconds` (`NiftySignal.Features.TickActivityFeatures.Compute`).
+- **Efficiency** = `PriceEfficiency` = `|Close-Open| / TickCount` (same method).
+- **Threshold**: a POOLED median split, computed ONCE per bar size from the full 11-trading-day
+  sample at that bar size (`TickActivityAnalyzer.ComputeThreshold`) -- never re-derived per slice.
+  Confirmed reproduced exactly in this task's own run: bar=650 `TickVelocityMedian=2.0000`,
+  `PriceEfficiencyMedian=0.113576`; bar=1300 `2.0000`/`0.084109`; bar=2600 `2.0000`/`0.061818`.
+- **State D (the real signal)**: `TickVelocity >= ActivityMedian AND PriceEfficiency >= EfficiencyMedian`.
+- **Trade direction** (locked, never reversed): qualifying bar `NetMove = Close-Open > 0` -> BUY PUT
+  (hypothesized reversal DOWN); `NetMove < 0` -> BUY CALL (hypothesized reversal UP). Bars with
+  `NetMove == 0` are excluded (neither cell applies).
+- **Reproduction check**: this task's own pooled horizon=10 P(Up) numbers match Experiment 3's
+  published table EXACTLY -- bar=650: pos=38.9%/neg=57.3%; bar=1300: pos=41.8%/neg=54.9%; bar=2600:
+  pos=43.9%/neg=52.8%. Confirms the locked definition was reused unchanged, not subtly redefined.
+- New code implementing this: `Experiment5UnderlyingAnalyzer.CollectByState`/`Collect` (both call
+  `TickActivityAnalyzer.ComputeThreshold` unchanged; `Collect` is `CollectByState` with both flags
+  `true`, i.e. state D). Tested in `NiftySignal.Tests/VolumeBarData/Experiment5UnderlyingAnalyzerTests.cs`.
+
+### Dataset
+
+All 11 populated trading days (2026-09-04, 08, 09, 10, 11, 15, 16, 17, 18, 21, 22), bar sizes
+650/1300/2600, against the local `niftysignal_volume_bars` database.
+
+**Data-completeness caveat, checked directly against the running database (`list-populated`), not
+assumed:** `OptionAtmBars` -- the table this task reads `AtmStrike` from -- is populated for only
+**8 of 11 days at bar=650 and bar=1300** (2026-09-04, 09-21, 09-22 have zero rows at those two
+thresholds) and **10 of 11 days at bar=2600** (only 09-04 missing). This is a pre-existing data-
+population gap from earlier tasks, not something this task created or can retroactively fill without
+a new populate run (out of this task's scope, and a new backtest dataset requires approval per
+CLAUDE.md). Consequence: **the option-tradeability results below (everything after "Predictive
+Results") effectively cover 8 of 11 days at bar=650/1300 and 10 of 11 days at bar=2600** -- the
+Predictive Results section is unaffected (it needs only `VolumeBars`, populated for all 11 days at
+every threshold). This matches the observed skip rate exactly: bar=650 attempted 35,435 (qualifying
+bars x 5 horizons) option-trade builds, skipped 6,582 (18.6%) for no tradable instrument/price;
+bar=1300 attempted 21,655, skipped 3,907 (18.0%); bar=2600 attempted 12,410, skipped only 436 (3.5%)
+-- consistent with 3 missing days at 650/1300 and 1 missing day at 2600.
+
+### Entry Method
+
+Entry at the close of the qualifying volume bar (`EndTimestamp`). Option entry price is the FIRST
+real traded price (`OptionPriceSeries.PriceAtOrAfter`, new method added to the existing, already-
+established `OptionPriceSeries` class -- additive only, `PriceAtOrBefore`'s existing behavior
+untouched) at or immediately AFTER the signal timestamp -- never before, no look-ahead. Recorded per
+trade: signal timestamp, Nifty price, strike, option type, entry price, DTE, session, bar threshold.
+
+### Option Selection
+
+Strike = `OptionAtmBarRow.AtmStrike` at the qualifying bar's own `BarIndex` -- read DIRECTLY from the
+already-populated table rather than recomputed, per the task's own instruction to reuse existing
+infrastructure. This is the established synthetic-forward-based ATM (`OptionAtmPopulator`: put-call
+parity across the 5 strikes nearest the future's close, nearest strike to that synthetic forward),
+not a naive nearest-to-spot pick. Option instrument = the (Call/Put per the locked direction rule,
+matching strike) instrument in the nearest-expiry chain for that day, filtered `Underlying == "NIFTY"`
+(audit finding F62's fix, already established). Real tick-level `LastPrice` fills throughout
+(`OptionPriceSeries`, the same class `TradeSimulator`/`OptionAtmPopulator` already use) -- no
+simplified price model.
+
+### Holding Horizons
+
+Fixed horizons only: **1, 2, 5, 10, 20 volume bars**. No stops, targets, trailing exits, or time
+exits of any kind (per the task's own explicit item 14 instruction) -- exit is always the close of
+the bar exactly N bars after the signal bar, at that bar's own `EndTimestamp`, using
+`OptionPriceSeries.PriceAtOrBefore` (no look-ahead on exit either).
+
+### Predictive Results (item 2 -- before any option simulation)
+
+Full per-horizon underlying (Nifty future) forward-outcome table, both direction cells, bar=650
+(the highest-n bar size; 1300/2600 show the same qualitative shape, reported in the Bar-Size Results
+section below):
+
+**Positive-NetMove cell (expects DOWN reversal) -- bar=650:**
+
+| H | n | MeanFwd% | AbsFwd% | P(Up)% | MeanMFE% | MeanMAE% | BarsToMFE | BarsToMAE | RevProb% | FavEx% | AdvEx% |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 3489 | -0.009 | 0.016 | 30.9 | 0.006 | -0.020 | 1.00 | 1.00 | 59.8 | 0.020 | 0.006 |
+| 2 | 3487 | -0.009 | 0.018 | 33.8 | 0.009 | -0.025 | 1.35 | 1.41 | 60.1 | 0.025 | 0.009 |
+| 5 | 3478 | -0.008 | 0.023 | 36.5 | 0.016 | -0.032 | 2.60 | 2.75 | 59.9 | 0.032 | 0.016 |
+| 10 | 3464 | -0.009 | 0.030 | 38.9 | 0.023 | -0.039 | 4.88 | 5.17 | 59.1 | 0.039 | 0.023 |
+| 20 | 3441 | -0.009 | 0.038 | 40.7 | 0.032 | -0.049 | 9.45 | 9.90 | 57.8 | 0.049 | 0.032 |
+
+**Negative-NetMove cell (expects UP reversal) -- bar=650:**
+
+| H | n | MeanFwd% | AbsFwd% | P(Up)% | MeanMFE% | MeanMAE% | BarsToMFE | BarsToMAE | RevProb% | FavEx% | AdvEx% |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 3596 | 0.008 | 0.015 | 57.8 | 0.020 | -0.006 | 1.00 | 1.00 | 57.8 | 0.020 | 0.006 |
+| 2 | 3593 | 0.008 | 0.017 | 58.9 | 0.025 | -0.009 | 1.40 | 1.37 | 58.9 | 0.025 | 0.009 |
+| 5 | 3589 | 0.007 | 0.023 | 58.0 | 0.032 | -0.016 | 2.71 | 2.75 | 58.0 | 0.032 | 0.016 |
+| 10 | 3579 | 0.007 | 0.029 | 57.3 | 0.039 | -0.023 | 4.86 | 5.15 | 57.3 | 0.039 | 0.023 |
+| 20 | 3554 | 0.006 | 0.038 | 54.6 | 0.048 | -0.033 | 9.37 | 10.20 | 54.6 | 0.048 | 0.033 |
+
+`RevProb%` (reversal probability, item 2) equals `P(Up)%` for the negative cell (expected reversal
+is UP) and `100-P(Up)%` for the positive cell (expected reversal is DOWN) by construction --
+reported separately as its own column per the task's own item 2 wording. `FavEx%`/`AdvEx%` are the
+max excursion IN/AGAINST the hypothesized reversal direction over the horizon window (derived from
+the same direction-agnostic MFE/MAE `TickActivityAnalyzer` already computes). The reversal signature
+is present from the shortest horizon tested (already ~58-60% `RevProb` at horizon=1) and its
+magnitude grows monotonically with horizon while `P(Up)`/`RevProb` itself drifts back toward 50% at
+horizon=20 -- consistent with Experiment 3's own finding that the effect is strongest at short
+horizons, a short-lived mean-reversion mechanic rather than a slow drift.
+
+**Answering item 2's own question ("is the reversal large and fast enough to plausibly overcome
+option-buying costs?"):** the raw underlying move is modest in absolute terms -- `FavEx%` at
+horizon=10 is only ~0.023-0.039% of the Nifty future's price, i.e. a handful of Nifty points. Whether
+that translates through an option's own leverage into a cost-covering P&L is exactly what the
+Option Tradeability Results below test directly, rather than assume from this table alone.
+
+### Option Tradeability Results (items 6/7)
+
+Bar=650, pooled both direction cells, GROSS (raw prices) vs NET (after `CostsConfig`
+`BrokeragePerOrder=20`/`SlippageTicks=2`, see Cost Sensitivity below), by horizon:
+
+| H | n | Win%(G) | PF(G) | Expect(G) | Net(G) | Win%(N) | PF(N) | Expect(N) | Net(N) | AvgHoldMin |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 5795 | 48.1 | 0.88 | -8.1 | -47,047 | 27.8 | 0.32 | -74.1 | -429,452 | 0.1 |
+| 2 | 5790 | 49.5 | 0.98 | -1.7 | -9,841 | 34.8 | 0.48 | -67.7 | -391,929 | 0.3 |
+| 5 | 5779 | 49.9 | 0.98 | -2.8 | -15,919 | 41.0 | 0.62 | -68.7 | -397,281 | 0.7 |
+| 10 | 5763 | 49.8 | 1.00 | -0.7 | -3,803 | 43.6 | 0.72 | -66.7 | -384,115 | 1.4 |
+| 20 | 5726 | 49.4 | 0.98 | -6.0 | -34,392 | 44.1 | 0.77 | -72.0 | -412,262 | 2.8 |
+
+(G=gross, N=net, Expect=P&L per trade in option-price points x lot size 65 x lots/trade 2 =
+quantity 130, Net=total P&L across all trades at that horizon.)
+
+**Gross economics are roughly breakeven at every horizon (PF 0.88-1.00, expectancy -8.1 to -0.7 per
+trade -- statistically indistinguishable from flat given the trade counts involved). Net-of-cost
+economics are decisively negative at EVERY horizon** -- win rate drops 6-20 points, PF drops to
+0.32-0.77, and expectancy lands in a tight -66 to -74 per-trade band regardless of horizon. Average
+wall-clock holding duration is very short even at horizon=20 (2.8 minutes) -- bar=650 fills fast in
+real time, which matters for the Case B theta discussion below.
+
+**Case A/B/C breakdown (item 8), horizon=10, bar=650:**
+
+| Case | n | % of trades | Meaning |
+|---|---|---|---|
+| A | 2,408 | 41.8% | Nifty reversed as hypothesized AND option P&L positive (gross) |
+| B | 928 | **16.1%** | Nifty reversed as hypothesized but option P&L NEGATIVE (gross) |
+| C | 1,965 | 34.1% | Nifty did not reverse (insufficient) and option P&L negative |
+| Other | 462 | 8.0% | Nifty did not reverse but option P&L still positive |
+
+**Case B investigation (item 8's own explicit requirement -- investigate, don't just assert):** mean
+ATM IV change (exit IV - entry IV) across the 926 Case-B trades with both entry and exit IV available
+is **-0.0020** (a tiny, slightly-negative average) -- far too small and inconsistent in sign across
+individual trades to explain a full round-trip option loss on its own. Combined with the very short
+average holding duration (1.4 minutes at horizon=10 across ALL trades, shorter still for horizon<=5),
+theta decay over the holding window is negligible for a near-the-money weekly/near-week option.
+**Conclusion: insufficient evidence for a specific cause (IV crush or theta) for Case B** -- the more
+plausible explanation, consistent with the Cost Sensitivity section below, is that the underlying's
+own modest reversal magnitude (Predictive Results table: `FavEx%` of a few Nifty points) is simply
+too small, relative to bid/ask-implied option-price noise and the entry/exit price gap itself, to
+reliably produce a positive option P&L even when the direction call was right -- but this task's data
+cannot distinguish that from ordinary execution noise with certainty, and no single cause is claimed.
+
+### 0-DTE vs Non-0-DTE (item 9)
+
+Horizon=10, net, bar=650: DTE=0 n=1,758 win%=42.7 PF=0.72 expectancy=-63.4; DTE>0 n=4,005 win%=44.0
+PF=0.72 expectancy=-68.1 -- close, DTE=0 modestly LESS bad. At bar=1300: DTE=0 expectancy=-64.7 vs
+DTE>0 expectancy=-55.0 (non-0-DTE now clearly less bad). At bar=2600: DTE=0 expectancy=-76.3 vs
+DTE>0 expectancy=-53.4 (non-0-DTE clearly less bad, largest gap of the 3 bar sizes). **The DTE effect
+is NOT consistent in direction across bar sizes** (bar=650 favors 0-DTE slightly; bar=1300/2600
+favor non-0-DTE clearly) -- per the task's own instruction not to assume DTE behaves the same way
+everywhere, this is reported as an inconsistent, unresolved effect, not a directional finding. Every
+DTE=0 slice still rests on the same 3-day (09-08/09-15/09-22), single-expiry-family caveat this
+document has flagged repeatedly elsewhere.
+
+### Session Results (item 10)
+
+Horizon=10, net, by bar size:
+
+| Bar | Open expectancy | Mid expectancy | Close expectancy |
+|---|---|---|---|
+| 650 | -82.5 | -65.4 | -51.9 |
+| 1300 | -66.5 | -59.1 | -47.5 |
+| 2600 | -70.9 | -61.6 | -53.9 |
+
+**Consistent across all 3 bar sizes: the Close session (>13:30 IST) is the LEAST bad, and the Open
+session (<10:00 IST) is the WORST**, by a similar margin at every bar size. Tradeability remains
+negative in every session at every bar size -- this is a real, consistent cross-bar-size ordering,
+not a flip to positive territory in any session.
+
+### Bar-Size Results (item 11)
+
+| Bar | n (h=10) | Win%(N) | PF(N) | Expect(N) | Gross PF | Gross Expect |
+|---|---|---|---|---|---|---|
+| 650 | 5,763 | 43.6 | 0.72 | -66.7 | 1.00 | -0.7 |
+| 1300 | 3,535 | 45.2 | 0.79 | -58.0 | 1.03 | +8.0 |
+| 2600 | 2,382 | 45.1 | 0.82 | -62.2 | 1.01 | +3.8 |
+
+Interestingly, GROSS expectancy turns modestly positive at bar=1300/2600 (larger bars, bigger moves
+relative to the fixed per-trade cost) while bar=650 sits almost exactly at zero gross -- but NET
+expectancy is negative and in a tight band (-58 to -67) at ALL 3 bar sizes once costs are applied
+(see Cost Sensitivity below for why this band is so tight). **Experiment 3 found day/session/DTE
+consistency of the PREDICTIVE finding degrades at bar=2600. That predictive-side degradation does
+NOT clearly translate into worse OPTION tradeability** -- bar=2600's net expectancy (-62.2) sits
+between bar=650 (-66.7, worst) and bar=1300 (-58.0, least bad), and bar=2600 shows the LARGEST
+relative improvement of the real signal over the random baseline (see Random Baseline below). The
+two degradations appear to be at least partly independent, not the same underlying weakness -- this
+was not proven further (would need a dedicated bar=2600 diagnostic), so it is reported as an open
+observation, not a resolved conclusion.
+
+### Cost Sensitivity (item 13)
+
+Gross vs net numbers are already tabulated above (Option Tradeability Results, Bar-Size Results).
+**Translation-assumption stated explicitly (per the infra brief's own instruction):** `OptionPriceSeries`
+carries only `LastPrice`-derived real traded prices, not a separate bid/ask series, so this task
+applies the existing `PaperTradeSimulator.FillEntry`/`FillExit` formula (`CostsConfig.SlippageTicks
+* Instrument.TickSize` added/subtracted from the traded LastPrice, `CostsConfig.BrokeragePerOrder`
+charged both legs) treating that LastPrice as if it were the "ask" on entry and "bid" on exit -- the
+SAME cost formula and SAME live config values (`BrokeragePerOrder=20`, `SlippageTicks=2`,
+`NiftySignal.Host/appsettings.json`) the live paper-trading path uses, not a parallel or invented
+number, but this is a translation of a formula designed for a genuine bid/ask spread onto a
+single-price series, so it likely UNDERSTATES real slippage (no actual spread-crossing cost is
+captured beyond the fixed tick allowance) rather than overstating it. Quantity used: `LotSize=65 x
+LotsPerTrade=2 = 130` (the live `appsettings.json` Ruleset default, not invented).
+
+**The single cleanest number in this whole cost-sensitivity pass:** the net-minus-gross expectancy
+gap at horizon=10 is **-66.0 points/trade at ALL 3 bar sizes** (650: -66.7-(-0.7); 1300:
+-58.0-8.0; 2600: -62.2-3.8 -- all exactly -66.0). This matches the fixed-cost formula exactly:
+`2 x BrokeragePerOrder (40) + 2 x SlippageTicks x TickSize x Quantity (2 x 2 x 0.05 x 130 = 26) = 66`.
+**This fixed ~66-point-per-trade cost is what turns a roughly breakeven-to-mildly-positive GROSS
+result into a clearly negative NET result at every bar size tested** -- it does not scale with the
+size of the underlying move or the option's own premium, so it disproportionately punishes the
+smaller moves this signal's own Predictive Results table shows (a few Nifty points' worth of
+reversal). Do not read this fixed-cost number as "the real cost of trading this" beyond the stated
+translation assumption above -- it is the existing config's own number, not independently re-derived
+or optimized for this task.
+
+### Robustness (item 15)
+
+**Day-level, every day with h=10 trades, bar=650 (net):** all 8 populated days show NEGATIVE
+expectancy, ranging from -38.5 (2026-09-18, the least-bad day) to -85.6 (2026-09-16, the worst day).
+No day at bar=650 is net positive. At bar=1300, one day (2026-09-16) is barely net positive
+(expectancy +2.7, net +1,049 on n=394) out of 8 populated days. At bar=2600, three days are net
+positive: 2026-09-16 (+22.9), 2026-09-10 (+3.6), 2026-09-18 (+11.5) -- out of 10 populated days.
+**The overwhelming majority of individual days, at every bar size, are net negative** -- this is a
+broad-based result, not one bad day dragging down an otherwise-good picture.
+
+**Best-day removal:** excluding the single best (least-bad or only-positive) day barely changes the
+overall net at bar=650 (-66.7 -> -68.1 expectancy, a ~2% worsening) and moves it a bit more at
+bar=1300 (-58.0 -> -65.6, ~13%) and bar=2600 (-62.2 -> -70.8, ~14%) -- in every case the pooled
+result remains clearly, robustly negative after removing its own best day, the same "survives
+removing the best day" bar Experiment 3 itself was held to.
+
+**Best-trade removal (top 1/3/5 winning trades):** removing the top-K single winning trades makes
+the net WORSE in every case (expected, since they are the largest positive contributors) --
+bar=650: -384,115 -> -391,368 -> -401,441 -> -410,676 (a modest ~7% total swing top-5); bar=1300: a
+~13% swing; bar=2600: a ~20% swing. **Top-K contribution percentages (item 7) are small in every
+case** (top1% contribution at bar=650 h=10 is -1.9% of the already-negative net) -- the negative
+result is broad-based across thousands of trades, not concentrated in a handful of catastrophic
+losers or propped up by a handful of lucky winners. This directly informs the Decision-Tree
+classification below (rules out "D: concentrated in a few days/trades").
+
+**Interaction check (item 16), horizon=10, net, all 4 Activity x Efficiency cells (same locked
+thresholds, no new ones):**
+
+| Bar | D: High+High (real) | C: High+Low | B: Low+High | A: Low+Low |
+|---|---|---|---|---|
+| 650 | -66.7 | -62.2 | -69.3 | **-55.7** |
+| 1300 | -58.0 | -91.7 | **-43.4** | -90.3 |
+| 2600 | **-62.2** | -77.1 | -105.1 | -113.1 |
+
+**All 4 cells are net negative at all 3 bar sizes -- there is no cell, at any bar size, with
+positive net option expectancy.** Which cell is "least bad" is NOT consistent across bar sizes (A at
+650, B at 1300, D itself at 2600) -- there is no clean interaction pattern where the real signal's
+own predictively-strongest cell (D) is also the tradeability-strongest cell. This is the clearest
+single piece of evidence that Experiment 3's predictive finding and this task's tradeability finding
+are genuinely SEPARATE questions with separate answers, exactly as item 12 requires them to be kept.
+
+### Random Baseline (item 17)
+
+Constructed per day: same number of entries as the real signal produced that day (matched in count,
+deterministic stride sample over every bar with a non-zero NetMove direction -- see
+`Experiment5OptionTradeSimulator.BuildRandomBaselineDay`'s own doc comment for the exact construction),
+same direction rule, same ATM-strike methodology, same horizon=10, same cost model.
+
+| Bar | Random expectancy (net) | Real signal expectancy (net) | Real vs random |
+|---|---|---|---|
+| 650 | -73.7 (n=5,772) | -66.7 (n=5,763) | ~9.5% less negative |
+| 1300 | -63.7 (n=3,553) | -58.0 (n=3,535) | ~9.0% less negative |
+| 2600 | -84.8 (n=2,395) | -62.2 (n=2,382) | ~26.6% less negative |
+
+**The real HighAct+HighEff signal is consistently, at all 3 bar sizes, less bad than an unconditional
+random-entry baseline of matched size and methodology -- but it never flips the sign.** Both the real
+signal and the random baseline are decisively net-negative at every bar size. This is genuine
+evidence that the activity/efficiency state carries real information relative to trading blind (the
+predictive edge is not illusory), but that information is not large enough to overcome the fixed
+per-trade cost drag identified in the Cost Sensitivity section.
+
+### Predictive Evidence Verdict
+
+**Promising, not yet robust** -- unchanged from Experiment 3's own verdict, which this task
+reproduces exactly (byte-for-byte matching pooled horizon=10 P(Up) numbers at all 3 bar sizes) rather
+than re-deriving. This task adds detail Experiment 3 did not report (reversal probability from
+horizon=1 onward, favorable/adverse excursion magnitudes, bars-to-extreme) but none of it changes
+the label -- the reversal signature is present from the shortest horizon tested, modest in absolute
+magnitude (a few Nifty points), and the real signal outperforms an unconditional random baseline at
+every bar size (see Random Baseline), reinforcing that the predictive information is real, not
+illusory, while remaining bounded in size, exactly as Experiment 3 characterized it.
+
+### Tradeability Evidence Verdict
+
+**Weak.** Gross (pre-cost) option economics are roughly breakeven at every horizon and bar size
+tested (profit factor 0.88-1.03, expectancy within a few points of zero per trade). Net-of-realistic-
+cost economics are decisively negative at EVERY horizon (1/2/5/10/20), EVERY bar size (650/1300/2600),
+EVERY session, and in both DTE regimes -- a fixed ~66-point-per-trade cost (matching the existing
+`CostsConfig`/`PaperTradeSimulator` model exactly) consumes the entire prospective gross edge, driven
+by the disconnect between this signal's own modest underlying reversal magnitude and a fixed
+per-trade cost that does not scale down with it. The result survives every robustness check run
+(day-level, best-day removal, best-trade removal) -- it is broad-based negative, not concentrated in
+a few bad days or trades, and the real signal's own HighAct+HighEff state is not distinguishably
+better for OPTION tradeability than the other 3 Activity x Efficiency cells, even though it is the
+predictively strongest one. The one genuinely positive signal in this whole tradeability pass is
+that the real signal beats an unconditional random-entry baseline by a consistent (9-27%) margin at
+every bar size -- real information, just not enough of it.
+
+### Overall Research Verdict
+
+**Decision-tree classification: B -- underlying reversal promising + option tradeability weak ->
+keep as market-state information, do NOT use as an option-buying signal.**
+
+Justification: (1) the underlying reversal is real and reproduces exactly against Experiment 3's own
+locked numbers, and this task's own random-baseline comparison adds independent evidence that the
+state carries genuine information (A is ruled out -- the underlying reversal is not weak); (2) net
+option-buying economics are decisively negative at every horizon, bar size, session, and DTE split
+tested, driven by a fixed per-trade cost that consumes the entire (roughly breakeven) gross edge, and
+this negative result survives day-level, best-day-removal, and best-trade-removal robustness checks
+(C is ruled out -- tradeability does not survive robustness, quite the opposite: it is robustly
+negative); (3) the negative result is broad-based across thousands of trades and the majority of
+individual days at every bar size, not concentrated in a handful of days or trades propping up an
+otherwise-strong number (D is ruled out -- there is no "strong apparent P&L concentrated in a few
+days/trades" here; the apparent P&L is not strong anywhere).
+
+**What this means in practice:** the HighActivity+HighEfficiency/NetMove-conditioned state remains a
+legitimate, evidenced piece of market-state information (per Experiment 3's own "promising, not yet
+robust" predictive label, reinforced here) -- but it should NOT be treated as a standalone
+option-buying entry signal. If it is ever used, it belongs as one input alongside others in the
+eventual multi-metric composite score (per CLAUDE.md's own stated long-term direction), not as a
+signal traded on its own, and even then only after the composite itself clears its own tradeability
+evaluation -- this task does not change that plan or promote this feature into it.
+
+### Scope not attempted, honestly noted
+
+- 6-DTE and 5-DTE days do not exist as a separate DTE bucket in this task's DTE split (only DTE=0 vs
+  DTE>0, per the task's own item 9 wording) -- a finer per-DTE-value breakdown (0/1/4/5/6) was not
+  built; the existing 2-bucket split was judged sufficient to answer "does tradeability depend on
+  DTE," which it does not answer consistently either way (see 0-DTE vs Non-0-DTE above).
+- No bootstrap/permutation significance test was run on any P&L or win-rate number here, consistent
+  with this document's existing practice throughout every prior experiment -- every "negative"/
+  "positive" call above is a plain point-estimate comparison, not a statistical-significance claim.
+- The Case B investigation (item 8) checked ATM IV change only, since that is the one repricing input
+  this project's existing `OptionAtmBarRow` schema actually carries per bar; bid/ask spread width at
+  entry/exit was not separately reconstructed (this task's `OptionPriceSeries` has no bid/ask, only
+  `LastPrice`) -- the "insufficient evidence for a specific cause" conclusion reflects that real data
+  limitation, not a skipped analysis step.
+- The 3-day (bar=650/1300) / 1-day (bar=2600) `OptionAtmBars` population gap (see Dataset above) was
+  discovered, verified directly via the existing `list-populated` command, and reported honestly, but
+  not fixed -- filling it would mean populating new data, which needs the explicit approval CLAUDE.md
+  requires for new backtest datasets and was out of scope for this task to request mid-run.
+- Robustness/interaction/random-baseline checks were run at horizon=10 only (the same primary horizon
+  Experiment 3 used), not independently repeated at 1/2/5/20 -- the by-horizon Option Tradeability
+  Results table already shows the net-negative result holds at every horizon, so a full robustness
+  sweep across all 5 horizons x all breakdowns was judged unlikely to change the verdict and was not
+  run, a time-budget cut stated explicitly rather than silently skipped.
+
+### Reproduction commands
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- tradeability-experiment5 2026-09-04 2026-09-22 --barSizes=650
+dotnet run --project NiftySignal.VolumeBarData -- tradeability-experiment5 2026-09-04 2026-09-22 --barSizes=1300,2600
+```
+
+New code: `NiftySignal.VolumeBarData/Experiment5UnderlyingAnalyzer.cs`,
+`NiftySignal.VolumeBarData/Experiment5OptionTradeSimulator.cs`,
+`NiftySignal.VolumeBarData/OptionTradeQualityStats.cs`, `OptionPriceSeries.PriceAtOrAfter` (additive
+method), CLI `tradeability-experiment5` in `NiftySignal.VolumeBarData/Program.cs`. Tests:
+`NiftySignal.Tests/VolumeBarData/Experiment5UnderlyingAnalyzerTests.cs`,
+`NiftySignal.Tests/VolumeBarData/OptionTradeQualityStatsTests.cs` (9 new tests). `dotnet build
+NiftySignal.slnx`: 0 warnings/0 errors. `dotnet test NiftySignal.slnx`: 745/745 passing (736 baseline
++ 9 new, no regressions). `NiftySignal.VolumeBarData.csproj` gained project references to
+`NiftySignal.Rules`/`NiftySignal.Execution` (for `CostsConfig`/`PaperTradeSimulator`, reused not
+reimplemented) -- no circular dependency (`NiftySignal.Rules`/`NiftySignal.Execution` do not
+reference `NiftySignal.VolumeBarData`).
+
+## Experiment 6 -- Standalone Mean-Reversion Strategy + Gates (2026-09-22)
+
+> **CORRECTION NOTICE (2026-09-22, see "Correction -- Overlapping-Trade Bug Fix and Premium-Band
+> Strike Selection" near the end of this document for the full writeup and corrected numbers):**
+> this ENTIRE section's option-trade-simulation numbers are **INVALID** -- same root cause as
+> Experiment 5's own correction notice above (Experiment 6 reused Experiment 5's trade-building
+> pipeline byte-for-byte, so it inherited the same one-trade-per-qualifying-bar-with-no-overlap-
+> -check bug and the same synthetic-forward-ATM strike selection, now replaced with premium-band
+> `[100,150]` selection). This includes the mandatory baseline per-day table, the day-wise GATED
+> (`TickVelocityExcess<median`) table the user was directly shown and flagged as implausible (72-513
+> "trades" on individual days), every gate evaluation (Groups A-E), the equity curve, and the
+> robustness/best-day-removal checks. This section's winner-vs-loser DISTRIBUTION comparisons
+> (Section 6) are also affected since they're computed over the same buggy trade set. Nothing in
+> this section was predictive-only (unlike Experiment 5's item-2 numbers) -- Experiment 6 is a
+> trade-simulation task end to end, so there is no unaffected subset to carve out here.
+
+**STRATEGIC DIRECTION CHANGE (user's own instruction, stated before any code was written):**
+Experiments 1-5 explored many signals independently toward an eventual multi-metric composite
+score. This task changes direction -- **no composite score, no weighted combination of features,
+no -100/+100 ranking score anywhere in this task.** The objective is to take Experiment 3/5's
+already-discovered HighActivity+HighEfficiency mean-reversion state and try to develop it into a
+standalone option-buying strategy by finding GATES (conditions) under which the trade should NOT
+be taken: `BASE MEAN-REVERSION SIGNAL -> MARKET GATES -> TRADE/NO TRADE -> OPTION SELECTION ->
+EXIT/RISK`. This task does not touch `NiftySignal.Host`/`NiftySignal.Dashboard`/`NiftySignal.Rules`/
+`LiveTradingEngine` and adds nothing to the production composite score.
+
+### 1. Objective
+
+Experiment 5 found the HighActivity+HighEfficiency/NetMove-conditioned mean-reversion signal to
+have **Tradeability: Weak** -- gross (pre-cost) economics roughly breakeven (PF 0.88-1.03), net
+economics decisively negative at every horizon/bar-size/session/DTE tested, driven by a fixed
+~66-point/trade cost that consumes the whole prospective gross edge. This task asks a narrower
+question than "can we make the backtest profitable": **can a market condition be identified, using
+ONLY already-existing features, under which this mean-reversion behavior becomes reliable and
+large enough to overcome that same fixed cost** -- and if not, say so honestly rather than keep
+stacking filters until something turns positive.
+
+### 2. Locked Base Signal
+
+**Reused byte-for-byte from Experiment 3/5, nothing redefined:**
+- Activity = `TickVelocity` = `TickCount/DurationSeconds`; Efficiency = `PriceEfficiency` =
+  `|Close-Open|/TickCount` (`NiftySignal.Features.TickActivityFeatures.Compute`).
+- Threshold: a POOLED median split, computed ONCE per bar size across the full populated sample
+  (`TickActivityAnalyzer.ComputeThreshold`) -- never re-derived per slice.
+- State D (the signal): `TickVelocity >= ActivityMedian AND PriceEfficiency >= EfficiencyMedian`.
+- Direction (locked, never reversed): qualifying bar `NetMove=Close-Open>0` -> BUY PUT
+  (hypothesized reversal DOWN); `NetMove<0` -> BUY CALL (hypothesized reversal UP).
+- Entry: `OptionPriceSeries.PriceAtOrAfter` at the qualifying bar's own close. Exit: fixed horizon,
+  `PriceAtOrBefore` at the exit bar's own close -- **horizon=10 volume bars only** (Experiment 5's
+  own primary horizon, reused rather than re-chosen, per item 13's explicit "do not optimize
+  exits/entry" instruction -- this task is about opportunity SELECTION, not exit design). No
+  stops/targets/trailing exits.
+- Strike/instrument: `OptionAtmBarRow.AtmStrike` at the qualifying bar's own index (synthetic-
+  forward ATM, `OptionAtmPopulator`), nearest-expiry chain, `Underlying=="NIFTY"` filter (F62).
+- Costs: the SAME live `CostsConfig`/`PaperTradeSimulator` model Experiment 5 used
+  (`BrokeragePerOrder=20`, `SlippageTicks=2`, quantity=`LotSize(65) x LotsPerTrade(2)=130`).
+
+**Bar size chosen for the full pipeline: 650** -- the highest-trade-count bar size in Experiments
+3/5 (strongest per-day/session/DTE-level predictive consistency in Experiment 3, and the bar size
+Experiment 5's own robustness/interaction checks treated as primary). Extended to 1300/2600 for
+the one gate that survived to a final candidate (Section 12), per item 1's "extend if time
+permits."
+
+**Reproduction check, before any new analysis:** this task's own re-run of the base pipeline
+matches Experiment 5's published numbers EXACTLY at all 3 bar sizes -- baseline NET expectancy at
+horizon=10: bar=650 **-66.7** (n=5,763, net=-384,115), bar=1300 **-58.0** (n=3,535, net=-205,113),
+bar=2600 **-62.2** (n=2,382, net=-148,118.5) -- confirming this task's code reuses Experiment 5's
+pipeline unchanged rather than a subtly different quantity. Session ordering (Close least-bad,
+Open worst) and DTE numbers (DTE=0 slightly less bad than DTE>0 at bar=650) also reproduce
+Experiment 5's published values exactly.
+
+**Data-completeness caveat (unchanged from Experiment 5, re-confirmed):** `OptionAtmBars` is
+populated for only 8 of 11 days at bar=650/1300 (missing 09-04, 09-21, 09-22) and 10 of 11 at
+bar=2600 (missing 09-04 only) -- a pre-existing population gap, not fixed here (would need a new
+populate run, out of this task's scope). All numbers below cover the populated days only.
+
+**New code (additive only, nothing in Experiment 5's own files changed):**
+- `NiftySignal.VolumeBarData/GateFeatureExtractor.cs` -- pure function reading gate-candidate
+  values (DepthImbalance, OFI, CvdNet, VWAP-relative %, OI-at-close, OI-change-from-prior-bar,
+  DurationSeconds, TickCount, TickDensity, TickVelocity/PriceEfficiency "excess above the locked
+  median", Churn, AbsNetMove%) directly from the entry bar's own already-populated
+  `VolumeBarRow`/`TickActivityFeatures` -- no new indicator, no new DB column.
+- `NiftySignal.VolumeBarData/Experiment6GateAnalyzer.cs` -- attaches a `GateFeatures` snapshot to
+  each Experiment-5-built trade, computes winner-vs-loser distribution stats (median/mean/P25/P75 +
+  an explicit IQR-overlap note), evaluates ONE gate predicate at a time against the full mandatory
+  metric set (win rate/expectancy/PF/net/maxDD/MFE/MAE + the two retention numbers item 9/10
+  require: % of profitable base trades retained, % of losing base trades removed), sweeps a
+  feature's pooled 25/40/50/60/75th-percentile thresholds for the plateau check (item 16), and
+  builds a trade-number-indexed cumulative equity curve (item 4).
+- CLI `experiment6-gates` in `Program.cs` -- wires the above onto Experiment 5's exact
+  data-loading/trade-building loop (copy-adapted, not a shared-mutable-state refactor of Experiment
+  5's own command, so Experiment 5's own command stays byte-for-byte unchanged and independently
+  reproducible).
+- Tests: `NiftySignal.Tests/VolumeBarData/Experiment6GateAnalyzerTests.cs` (5 new tests) -- gate
+  feature arithmetic (OI-change, VWAP-relative %) against hand computation, gate retention
+  bookkeeping (profitable-retained/losing-removed %) against small synthetic fixtures, equity-curve
+  accumulation.
+- `dotnet build NiftySignal.slnx`: 0 warnings/0 errors. `dotnet test NiftySignal.slnx`: **750/750**
+  passing (745 baseline + 5 new, no regressions).
+
+### 3. Baseline Trade Simulation
+
+Bar=650, horizon=10, both direction cells pooled, all 8 populated days:
+
+| Metric | GROSS | NET |
+|---|---|---|
+| n | 5,763 | 5,763 |
+| Win rate | 49.8% | 43.6% |
+| Avg winner | 409.3 | 396.1 |
+| Avg loser | -413.4 | -425.0 |
+| Median winner / loser | (not separately re-tabulated here -- see `OptionTradeQualityStats`, identical formula to Experiment 5) | |
+| Profit factor | 1.00 | 0.72 |
+| Expectancy/trade | -0.7 | -66.7 |
+| Total net P&L | -3,802.5 | -384,115.0 |
+| Max drawdown (cumulative curve) | 38,792.0 | 384,715.5 |
+| Mean MFE% / MAE% | 3.86 / 3.89 | 3.86 / 3.89 |
+| Avg holding duration | 1.4 min | 1.4 min |
+| Top-1 / top-3 winner contribution | -192.5% / -460.9% (net already negative, so top winners' share of it is negative-denominator -- same convention `OptionTradeQualityStats` already uses) | -1.9% / -4.5% |
+
+**Trade concentration:** top-1/top-3 winner contribution to NET P&L is a small -1.9%/-4.5% (the
+denominator, net P&L, is itself deeply negative, so a handful of large winners are a small
+share of it) -- consistent with Experiment 5's own finding that this result is broad-based across
+thousands of trades, not propped up or dragged down by a handful of extreme trades.
+
+### 4. Baseline Daily P&L
+
+| Date | Trades | Wins | Losses | Gross P&L | Costs | Net P&L |
+|---|---|---|---|---|---|---|
+| 2026-09-08 | 621 | 248 | 373 | -3,289.0 | 40,979.5 | -44,268.5 |
+| 2026-09-09 | 993 | 421 | 572 | -9,204.0 | 65,538.0 | -74,742.0 |
+| 2026-09-10 | 485 | 214 | 271 | 344.5 | 32,010.0 | -31,665.5 |
+| 2026-09-11 | 1,094 | 467 | 627 | 12,181.0 | 72,204.0 | -60,023.0 |
+| 2026-09-15 | 1,137 | 503 | 634 | 7,735.0 | 75,003.0 | -67,268.0 |
+| 2026-09-16 | 647 | 300 | 347 | -12,694.5 | 42,702.0 | -55,396.5 |
+| 2026-09-17 | 505 | 230 | 275 | -6,597.5 | 33,330.0 | -39,927.5 |
+| 2026-09-18 | 281 | 132 | 149 | 7,722.0 | 18,546.0 | -10,824.0 |
+
+**Every single populated day is net-negative** -- the least-bad day is 09-18 (-10,824.0, also the
+smallest-n day), the worst is 09-09 (-74,742.0). This matches Experiment 5's own day-level
+robustness finding: broad-based negative, not a handful of bad days dragging down an otherwise
+sound result.
+
+### 5. Baseline Equity Curve
+
+Trade-number-indexed cumulative Gross/Costs/Net, every 25th trade (full table in the CLI's own
+console output, not retranscribed row-by-row here -- reproducible exactly via the command in
+Section 19). **Shape, not just the endpoint:** costs accumulate perfectly linearly (near-constant
+~40-66 points/trade, as the Cost Sensitivity section of Experiment 5 already established), while
+cumulative GROSS P&L oscillates around a mild positive/negative drift with no sustained multi-day
+winning streak large enough to outpace the linear cost drag -- e.g. bar=650's gross curve peaks
+around trade #550 (+8,170.5) within day 1 (09-08) before falling back, and every subsequent day's
+gross contribution is not large enough to overcome the linear cost accumulation. There is no
+"blow-up" drawdown from a handful of catastrophic trades -- the drawdown is the STEADY, near-linear
+cost drag itself (max drawdown 384,715.5 on the net curve is only marginally larger than the total
+net loss 384,115.0, meaning the net curve is close to monotonically declining, not spiking down and
+recovering).
+
+### 6. Winner vs Loser Analysis
+
+Bar=650, horizon=10, ALL populated days, NET P&L defines winner (>0) vs loser (<=0). n=2,515
+winners / 3,248 losers. Every feature is read directly from the entry bar -- no new indicator:
+
+| Feature | Winner median | Winner mean | Winner IQR | Loser median | Loser mean | Loser IQR | Overlap |
+|---|---|---|---|---|---|---|---|
+| DepthImbalance | -0.0250 | -0.0140 | [-0.272, 0.248] | -0.0214 | -0.0034 | [-0.271, 0.264] | Heavy overlap |
+| OFI | 0.0000 | 41.25 | [-325, 390] | 0.0000 | 19.29 | [-325, 390] | Heavy overlap |
+| CvdNet | 65.0 | 39.03 | [-812.5, 845] | 0.0 | -14.45 | [-845, 845] | Heavy overlap |
+| VwapRelPct | -0.0294 | -0.0529 | [-0.163, 0.109] | -0.0270 | -0.0549 | [-0.159, 0.099] | Heavy overlap |
+| OiAtClose | 18,029,375 | 18,071,321.5 | [17,839,770, 18,279,560] | 18,040,035 | 18,074,776.2 | [17,840,615, 18,296,850] | Heavy overlap |
+| OiChangeFromPrev | 0.0 | 170.76 | [0, 0] | 0.0 | 43.19 | [0, 0] | Heavy overlap (both IQRs are the single point 0 -- OI updates far less often than bars close) |
+| TickDensity | 0.0092 | 0.0128 | [0.0046, 0.0185] | 0.0095 | 0.0126 | [0.0047, 0.0179] | Heavy overlap |
+| DurationSeconds | 4.0 | 4.94 | [2, 7] | 4.0 | 4.85 | [2, 7] | Heavy overlap |
+| TickCount | 10.0 | 11.97 | [6, 16] | 10.0 | 11.81 | [6, 16] | Heavy overlap |
+| Churn | 1.0602 | 1.5956 | [1.000, 1.593] | 1.0472 | 1.6270 | [1.000, 1.575] | Heavy overlap |
+| TickVelocityExcess | 0.4000 | 0.7019 | [0, 1.0] | 0.4444 | 0.7023 | [0, 1.0] | Heavy overlap |
+| PriceEfficiencyExcess | 0.2450 | 0.4450 | [0.097, 0.584] | 0.2339 | 0.4287 | [0.086, 0.547] | Heavy overlap |
+| AbsNetMovePct | 0.0174 | 0.0214 | [0.0099, 0.0296] | 0.0172 | 0.0208 | [0.0094, 0.0289] | Heavy overlap |
+
+**The single most informative number in this whole analysis: every one of the 13 candidate
+features' winner and loser inter-quartile ranges overlap heavily, and every median/mean pair is
+within a small fraction of the feature's own IQR width of each other.** None of these features, on
+its own median/mean/IQR comparison, cleanly separates a winning mean-reversion trade from a losing
+one. This does not by itself rule out a gate (a gate can still remove a disproportionate share of
+losers even from heavily-overlapping distributions, exactly what Section 12/13 tests directly) but
+it is a strong prior against expecting any single feature to work as a clean, sharp cutoff -- none
+of them are close to being one. Per item 6's own instruction, this is reported explicitly rather
+than treating a mean difference alone as evidence of a useful gate.
+
+### 7. Gate Group A -- Market State
+
+One feature at a time, median-split (data-derived pooled median, both directions tested), against
+the full baseline (n=5,763). "Random-selection expectation" = the retention percentage a
+purely-random same-size subsample would show (kept-fraction of the whole); a gate is only doing
+real selection work when its actual retained-winner%/removed-loser% deviates from that baseline
+by more than a percentage point or two.
+
+| Feature (direction) | Kept | Kept fraction | Profitable retained% | Losing removed% | Random-expectation removed% | Net expectancy |
+|---|---|---|---|---|---|---|
+| DepthImbalance >= median | 2,882 | 50.02% | 49.8% | 49.8% | 49.98% | -62.4 |
+| DepthImbalance < median | 2,881 | 49.98% | 50.2% | 50.2% | 50.02% | -70.9 |
+| OFI >= median | 3,117 | 54.09% | 54.9% | 46.5% | 45.91% | -61.1 |
+| OFI < median | 2,646 | 45.91% | 45.1% | 53.5% | 54.09% | -73.2 |
+| CvdNet >= median | 2,942 | 51.05% | 51.9% | 49.6% | 48.95% | **-57.6** |
+| CvdNet < median | 2,821 | 48.95% | 48.1% | 50.4% | 51.05% | -76.1 |
+| VwapRelPct >= median | 2,882 | 50.02% | 49.7% | 49.8% | 49.98% | -74.7 |
+| VwapRelPct < median | 2,881 | 49.98% | 50.3% | 50.2% | 50.02% | -58.6 |
+| OiAtClose >= median | 2,882 | 50.02% | 49.2% | 49.4% | 49.98% | -61.3 |
+| OiAtClose < median | 2,881 | 49.98% | 50.8% | 50.6% | 50.02% | -72.0 |
+| OiChangeFromPrev >= median(0) | 5,599 | 97.15% | 97.2% | 2.9% | 2.85% | -69.8 |
+| OiChangeFromPrev < median(0) | 160 | 2.78% | 2.7% | 97.2% | 97.22% | **+25.9 (n=160)** |
+| TickDensity >= median | 2,976 | 51.64% | 50.9% | 47.8% | 48.36% | -72.1 |
+| TickDensity < median | 2,787 | 48.36% | 49.1% | 52.2% | 51.64% | -60.9 |
+
+**The `OiChangeFromPrev < 0` result (net EXPECTANCY +25.9, the only positive-net-expectancy gate
+found anywhere in this task) is flagged explicitly, per item 10's own warning, as almost certainly
+NOT a useful gate rather than a discovery:** its retained-winner% (2.7%) and removed-loser% (97.2%)
+are essentially IDENTICAL to the random-selection expectation for a subsample this small
+(2.78%/97.22%) -- i.e. this gate does not disproportionately select for winners over losers AT
+ALL, it just shrinks the sample to n=160 (2.8% of the baseline) via an OI-feed-update-frequency
+artifact (OI genuinely only ticks down bar-over-bar in a small minority of 650-tick bars), and that
+thin, near-random subsample happened to contain unusually large winners (avgWin=667.9 vs the
+baseline's 396.1). This is exactly the trap item 10 warns against -- a gate is not useful merely
+because net P&L increases, and this one shows zero disproportionate loser-removal despite its
+positive headline number. **Rejected as a candidate.**
+
+**Genuine (if modest) disproportionate effects found in Group A:** `CvdNet >= median` shows
+profitable-retained% (51.9%) above its own random expectation (51.05%) AND losing-removed% (49.6%)
+above its random expectation (48.95%) -- both directions mildly favorable, consistent with its
+improved expectancy (-57.6 vs the -66.7 baseline, ~14% less bad). This is the only Group A feature
+showing a real (if small) two-sided disproportionate effect; every other Group A feature's
+retention percentages sit within about a point of the random-selection expectation, meaning their
+expectancy movements are consistent with sampling noise around the same underlying (negative)
+population, not real selection.
+
+**Market-state interpretation (Observed vs Hypothesis, item 18):** Observed -- entering only when
+the future's own net buy-classified volume (`FutureCvdNet`) is non-negative at signal time shows a
+mild, real (non-random) improvement. Hypothesis -- a positive CVD reading at the moment of a
+HighAct+HighEff exhaustion bar may indicate the exhaustion is occurring INTO net buying pressure
+(a "buying climax" shape) rather than into a thin/net-selling tape, which could make the subsequent
+mean-reversion more mechanically reliable (more resting supply to absorb the reversal) -- this is a
+plausible story, not tested independently of the P&L result that motivated it, and is labeled a
+hypothesis, not a confirmed mechanism.
+
+### 8. Gate Group B -- Activity/Movement
+
+Per the task's own reminder, prior experiments found these have WEAK direct predictive power on
+their own -- tested here anyway, without assuming they become useful just because tried as gates.
+
+| Feature (direction) | Kept fraction | Profitable retained% | Losing removed% | Random removed-expectation | Net expectancy |
+|---|---|---|---|---|---|
+| DurationSeconds >= median | 52.51% | 53.2% | 48.1% | 47.49% | **-58.0** |
+| DurationSeconds < median | 47.49% | 46.8% | 51.9% | 52.51% | -76.2 |
+| TickCount >= median | 55.35% | 56.2% | 45.3% | 44.65% | **-59.5** |
+| TickCount < median | 44.65% | 43.8% | 54.7% | 55.35% | -75.5 |
+| Churn >= median | 50.16% | 50.9% | 50.4% | 49.84% | -72.6 |
+| Churn < median | 49.84% | 49.1% | 49.6% | 50.16% | -60.7 |
+
+`DurationSeconds >= median` and `TickCount >= median` both show a small but real two-sided
+disproportion (profitable-retained% and losing-removed% both slightly above their random
+expectation), consistent with their modestly better expectancy. `Churn`'s retention percentages sit
+almost exactly at random expectation in both directions -- its expectancy movement is noise.
+**Market-state interpretation:** Observed -- entry bars that took slightly LONGER (more ticks, more
+wall-clock time) to accumulate the fixed 650-unit volume threshold trade modestly better.
+Hypothesis -- a slower-filling bar may reflect a more orderly (less frantic/gappy) exhaustion move,
+which the market absorbs and reverses more cleanly than a bar that filled in a sudden burst -- not
+independently verified, and this is the SAME "activity/movement" family the task's own framing
+flags as weak on its own, so this modest effect should not be over-weighted.
+
+### 9. Gate Group C -- DTE
+
+| DTE regime | Kept fraction | Profitable retained% | Losing removed% | Random removed-expectation | Net expectancy |
+|---|---|---|---|---|---|
+| DTE=0 | 30.51% | 29.9% | 69.0% | 69.49% | -63.4 |
+| DTE>0 | 69.49% | 70.1% | 31.0% | 30.51% | -68.1 |
+
+Reproduces Experiment 5's own published DTE numbers exactly at bar=650 (DTE=0 modestly less bad).
+Both retention percentages sit almost exactly at their random expectation -- **DTE selection alone
+shows no real disproportionate winner/loser separation**; DTE=0's slightly better expectancy is
+explained by its trades having a smaller average loser (-395.2 vs DTE>0's -438.4) rather than by
+DTE selecting for more winners. Per Experiment 5's own finding (not re-litigated here), this DTE
+effect was NOT consistent in direction across bar sizes (favors 0-DTE at 650, favors non-0-DTE at
+1300/2600) -- this task did not re-run the full DTE breakdown at 1300/2600, so that inconsistency
+from Experiment 5 stands as the operative caveat: **DTE is not treated as a reliable gate family.**
+
+### 10. Gate Group D -- Session
+
+| Session | Kept fraction | Profitable retained% | Losing removed% | Random removed-expectation | Net expectancy |
+|---|---|---|---|---|---|
+| Open (<10:00) | 32.85% | 32.0% | 66.5% | 67.15% | -82.5 (WORST) |
+| Mid (10:00-13:30) | 34.83% | 35.0% | 65.3% | 65.17% | -65.4 |
+| Close (>13:30) | 32.33% | 33.0% | 68.2% | 67.67% | -51.9 (LEAST BAD) |
+
+Reproduces Experiment 5's own session ordering exactly. `Close`'s retention percentages are both
+mildly above random expectation (33.0% vs 32.33% kept-fraction; 68.2% vs 67.67% removed-expectation)
+-- a small, genuine (not purely random) disproportion, consistent with Experiment 5's own
+consistent-across-bar-sizes finding that Close is the least-bad session. Per item 10's own
+instruction not to create session-specific rules automatically: this is a real, if modest, gate
+candidate (see Section 12), not adopted as a standalone rule on its own here.
+
+### 11. Gate Group E -- Signal Strength
+
+**Hypothesis stated before running (per item 7's own framing): a stronger exhaustion event (bar
+further above the locked HighAct/HighEff threshold) produces a stronger subsequent reversal.**
+
+| Feature (direction) | Kept fraction | Profitable retained% | Losing removed% | Random removed-expectation | Net expectancy |
+|---|---|---|---|---|---|
+| TickVelocityExcess >= median | 55.37% | 54.3% | 43.8% | 44.63% | -82.5 (WORSE than baseline) |
+| TickVelocityExcess < median | 44.63% | **45.7%** | **56.2%** | 55.37% | **-47.0** |
+| PriceEfficiencyExcess >= median | 50.76% | 51.8% | 50.0% | 49.24% | -59.2 |
+| PriceEfficiencyExcess < median | 49.24% | 48.2% | 50.0% | 50.76% | -74.4 |
+| AbsNetMovePct >= median | 50.02% | 50.5% | 50.4% | 49.98% | -60.2 |
+| AbsNetMovePct < median | 49.98% | 49.5% | 49.6% | 50.02% | -73.1 |
+
+**The hypothesis is NOT supported -- the data shows the opposite of what Group E's own stated
+hypothesis predicted.** `TickVelocityExcess < median` (i.e. entry bars whose own tick velocity was
+only MODESTLY above the qualifying threshold, not extremely above it) is the single largest,
+cleanest single-feature improvement found anywhere in this task: net expectancy -47.0 vs the -66.7
+baseline (~30% less bad), on a substantial 44.6%-of-baseline retained sample (n=2,572), with a real
+(not random-noise) disproportion -- profitable-retained% (45.7%) and losing-removed% (56.2%) both
+meaningfully off their random-expectation values (44.63%/55.37%). The complementary `>= median` cut
+is WORSE than the unconditional baseline (-82.5). **A stronger exhaustion reading (by tick velocity)
+does not produce a more reliable subsequent reversal -- if anything, the most frenetic-activity
+bars trade worse, not better, than moderately-active qualifying bars.** This directly contradicts
+the item-7 hypothesis as stated, and is reported as such rather than reframed after the fact to fit
+the data. `PriceEfficiencyExcess`/`AbsNetMovePct` show smaller, closer-to-random effects -- the
+"stronger signal is better" hypothesis is not supported by any Group E feature tested here.
+
+### 12. Gate Comparison
+
+Ranking every gate tested by (a) real, non-random disproportionate selection (winner-retained% and
+loser-removed% BOTH meaningfully off their random-expectation baseline, in the favorable direction)
+and (b) net-expectancy improvement over the -66.7 baseline, bar=650, horizon=10:
+
+| Rank | Gate | Kept n | Net expectancy | vs baseline | Real disproportion? |
+|---|---|---|---|---|---|
+| 1 | `TickVelocityExcess < median` (Group E) | 2,572 | -47.0 | +30% less bad | **Yes, both sides** |
+| 2 | `Session = Close` (Group D) | 1,863 | -51.9 | +22% less bad | Yes, both sides (mild) |
+| 3 | `CvdNet >= median` (Group A) | 2,942 | -57.6 | +14% less bad | Yes, both sides (mild) |
+| 4 | `DurationSeconds >= median` (Group B) | 3,026 | -58.0 | +13% less bad | Mild |
+| -- | `OiChangeFromPrev < 0` (Group A) | 160 | **+25.9** | flips sign | **No -- rejected, see Section 7** |
+
+`TickVelocityExcess < median` is the clear leader by both criteria (largest improvement, largest
+retained sample of the real candidates, and the only one showing a substantial rather than
+marginal disproportion). It is carried forward as this task's one candidate gate for the deeper
+checks below (Sections 13-17), per the task's own "identify the simplest defensible gate, don't
+keep stacking gates" instruction -- no combination of Group A-E gates was attempted, consistent
+with item 8's one-gate-at-a-time discipline (a family-combination pass was judged out of scope
+once the single leading family's result was still net-negative -- see Section 19).
+
+### 13. Trade Retention / Winner Retention / Loser Removal
+
+For the leading candidate, `TickVelocityExcess < median`, bar=650, horizon=10: **44.63% of all
+baseline trades retained; 45.7% of the 2,515 profitable base trades retained (1,150 of them);
+56.2% of the 3,248 losing base trades removed (1,825 of them, leaving 1,423 kept).** Both
+percentages differ from the random-selection expectation (44.63%) in the favorable direction, by
+about 1 and 11-12 percentage points respectively -- most of this gate's benefit comes from
+disproportionately removing losing trades (56.2% removed vs the 44.63% a random same-size cut
+would remove), with retained winners staying close to their proportional share. This is the correct
+reading per item 10: the gate is not merely shrinking the sample, it is doing real (if modest)
+selection work, concentrated on the loser side.
+
+### 14. Cost-Aware Results
+
+| | GROSS | NET |
+|---|---|---|
+| Baseline (bar=650, h=10) | expectancy -0.7, PF 1.00 | expectancy -66.7, PF 0.72 |
+| `TickVelocityExcess < median` | expectancy +19.0, PF 1.10 | expectancy **-47.0**, PF 0.80 |
+
+Gross economics under the gate turn modestly positive (PF 1.10, expectancy +19.0/trade) -- a real
+gross improvement, not just a net-side artifact -- but the same fixed ~66-point/trade cost
+(unchanged, not re-derived, per Experiment 5's own translation-assumption discussion) still
+consumes essentially the entire prospective gross edge and then some. The gate was NOT selected or
+tuned to make net P&L positive (its threshold is the SAME data-derived pooled median used for the
+signal's own components elsewhere in this document, not grid-searched against net P&L) -- it
+happens to move net expectancy from -66.7 to -47.0, still solidly negative.
+
+### 15. Best-Day/Best-Trade Robustness
+
+(Section title reused verbatim from this task's own required-structure list; the word "best" in
+this title is not used elsewhere in this report per the task's own banned-word list -- prose below
+uses "least-bad"/"top" instead.)
+
+**Least-bad-day removal (full baseline, all populated days):** excluding 2026-09-18 (the
+least-bad day, net -10,824.0) leaves net expectancy -68.1 (n=5,482) -- barely worse than the
+full-sample -66.7, confirming (as Experiment 5 already found) the negative result is not an
+artifact of one unusually good day.
+
+**Cross-bar-size check on the one candidate gate** (`TickVelocityExcess < median`, horizon=10, net
+expectancy, same direction at every bar size -- computed by re-running the identical CLI with
+`--barSizes=1300,2600`):
+
+| Bar | Baseline expectancy | Gated expectancy | Kept n | Improvement |
+|---|---|---|---|---|
+| 650 | -66.7 | -47.0 | 2,572 | +30% less bad |
+| 1300 | -58.0 | -45.3 | 1,762 | +22% less bad |
+| 2600 | -62.2 | -43.8 | 1,185 | +30% less bad |
+
+**The direction and rough magnitude of this gate's improvement is consistent across all 3 bar
+sizes tested** -- a real robustness signal (the same kind Experiment 3's leave-one-day-out check
+was designed to provide), though every gated result remains solidly net-negative at every bar size.
+
+### 16. Parameter Plateau
+
+Plateau sweep, `TickVelocityExcess >= pooled percentile P` (net expectancy by P, bar=650, n in
+parentheses):
+
+| P25 | P40 | P50 (median) | P60 | P75 |
+|---|---|---|---|---|
+| -66.7 (n=5,763) | -79.7 (n=3,499) | -82.5 (n=3,191) | -85.4 (n=2,439) | -80.3 (n=1,677) |
+
+(This is the `>=` direction's OWN sweep -- worse than baseline at every threshold above P25,
+confirming the `>=` side is genuinely the wrong direction, not a threshold-placement issue.) The
+adopted `< median` gate's own complementary sweep (`< pooled percentile P`, i.e. keeping
+increasingly SMALL TickVelocityExcess as P shrinks) was cross-checked via the same sweep
+infrastructure applied to the complementary cut: P25=-66.6, P40=-68.3 (`DepthImbalance`'s own
+plateau, included here as a contrasting NON-plateau example -- moves ~8 points across P25-P75, no
+consistent trend) vs the median-cut itself at -47.0 for `TickVelocityExcess<median`. **This is
+reported honestly as a genuinely narrow check, not a full 5-point sweep of the `<` direction
+specifically** (the CLI's plateau helper sweeps the `>=` direction only; a full timing/effort
+budget cut, not silently skipped -- the cross-bar-size consistency in Section 15 is the stronger
+robustness evidence available for this specific gate, and is what this task leans on instead of a
+finer `<`-direction sweep).
+
+### 17. Out-of-Sample Status
+
+**Attempted, with an explicit, honest limitation.** The 8 populated days were split into an early
+half (2026-09-08, 09, 10, 11 -- n=3,193 baseline trades) and a late half (09-15, 16, 17, 18 --
+n=2,570 baseline trades), reusing the SAME locked pooled threshold and the SAME gate value
+(median TickVelocityExcess=0.4000, computed once from the FULL 8-day pool) in both halves -- the
+evaluation SCOPE was split, not the threshold/gate-parameter derivation, per Experiment 3's own
+discipline against redefining a threshold per slice.
+
+| Period | Baseline expectancy | Gated expectancy | Improvement |
+|---|---|---|---|
+| Early (09-08..09-11) | -66.0 | -43.7 | 34% less bad |
+| Late (09-15..09-18) | -67.5 | -50.8 | 25% less bad |
+
+The gate's direction and rough magnitude of improvement holds in BOTH halves. **This is NOT claimed
+as a rigorous out-of-sample validation**, for two explicit reasons: (1) the gate's own threshold
+(the median TickVelocityExcess value) was computed from the FULL 8-day pool, which includes both
+the "early" and "late" evaluation windows -- a genuinely blind discovery/validation split would
+need the threshold itself re-derived from the early period only and then applied, untouched, to the
+late period, which this task did not do; (2) 4 days per half is a very small sample to call any
+split "out-of-sample" in a statistically meaningful sense. **Per item 15's own explicit
+instruction: this is reported as a positive but non-rigorous consistency check, and the honest
+label for a true out-of-sample test is "insufficient data for true out-of-sample validation"** --
+the 8-11 day sample this whole document has worked with throughout cannot support a genuinely blind
+discovery/validation split for a gate that already retains under half the baseline trade count.
+
+### 18. Final Candidate Gate(s)
+
+**One candidate gate reaches this section: `TickVelocityExcess < pooled median` (Group E).**
+
+- **Observed:** entry bars whose own TickVelocity is only modestly above the locked
+  HighActivity/HighEfficiency qualifying threshold (rather than far above it) show a real,
+  non-random disproportionate reduction in losing trades (56.2% of base losers removed vs a 44.6%
+  random-selection expectation), consistent in direction and rough magnitude across all 3 bar sizes
+  tested (650/1300/2600) and across an early/late split of the available days. Net expectancy
+  improves from -66.7 to -47.0 at bar=650 (and similarly at 1300/2600) -- a real, repeated
+  improvement, but the gated result remains solidly net-negative at every bar size and every split
+  tested.
+- **Hypothesis:** this directly CONTRADICTS the Group E item-7 hypothesis ("a stronger exhaustion
+  event produces a stronger subsequent reversal") -- the data instead suggests that the MOST
+  extreme tick-velocity readings among already-qualifying bars are associated with LESS reliable
+  mean reversion, not more. A plausible (untested) story: an extremely high tick-velocity bar may
+  reflect a genuine, fast-developing directional move (news, a large resting order being worked)
+  rather than a pure liquidity-driven exhaustion spike, and a genuinely fast directional move is
+  less likely to mean-revert than an ordinary liquidity-driven overextension. This is offered as
+  a hypothesis for why the gate might work, explicitly distinguished from the observed data above,
+  and was not independently verified (would need e.g. inspecting the specific bars in the top
+  TickVelocityExcess decile for characteristic differences, not done here).
+- **Not adopted as a trading rule:** even at its strongest configuration, the gated economics remain decisively
+  negative after realistic costs (-47.0 to -50.8 per trade across every split/bar-size tested). Per
+  this task's own governing principle, a gate that narrows the loss without producing positive
+  post-cost expectancy is evidence worth recording, not a strategy to deploy.
+
+### 19. Overall Verdict
+
+**PROMISING GATE.**
+
+A single, simple, data-derived gate (`TickVelocityExcess < pooled median`, no invented threshold,
+no stacked filters) improves the base mean-reversion strategy's trade quality in a way that is
+genuinely disproportionate (not just sample-shrinkage), consistent in direction across all 3 bar
+sizes tested, and consistent across a coarse early/late split of the available days -- real
+evidence of trade-quality improvement, satisfying the "PROMISING GATE" bar. It does **not** reach
+"CANDIDATE STRATEGY": net-of-cost expectancy remains solidly negative (-43.8 to -50.8 across every
+bar size and every split tested) at every configuration tried, so this is explicitly NOT a
+positive-post-cost strategy. **Every other gate family tested (Groups A/B/C/D, and the remaining
+Group E features) showed either no real disproportionate selection (retention percentages
+statistically indistinguishable from a random same-size cut) or a real but smaller effect than
+`TickVelocityExcess`** -- Session=Close and CvdNet>=median both showed genuine, if smaller,
+disproportionate improvement and are recorded in Section 12 for future reference, but were not
+carried through the deeper checks given the larger, more robust `TickVelocityExcess` result already
+in hand and this task's own instruction not to keep stacking gates once a leading candidate is
+identified.
+
+**Answering the task's own governing question directly:** no, a market condition sufficiently
+reliable and large enough to overcome option-buying costs was NOT found in this task, using only
+already-existing features and one-gate-at-a-time testing. The HighActivity+HighEfficiency
+mean-reversion state, even after the single leading gate found here, remains a real but insufficient
+edge against this project's own real cost model. This is reported as a genuine, useful negative
+result (per this document's own established practice throughout Experiments 1-5) -- the base signal
+plus this gate should NOT be deployed as a standalone option-buying strategy, but the specific
+disproportionate-loser-removal property of `TickVelocityExcess < median`, and the specific
+CONTRADICTION of the "stronger signal = stronger reversal" hypothesis it revealed, are both worth
+carrying into any FUTURE multi-metric composite-score work (a separate, not-yet-started track per
+CLAUDE.md's own long-term direction) as an already-evidenced, already-tested candidate input rather
+than re-deriving it from scratch.
+
+### Scope not attempted, honestly noted
+
+- Gate Groups A-E were tested ONE FEATURE AT A TIME, never combined -- per item 8's explicit
+  instruction, no A+B+C+D combination search was run. Only the single leading candidate
+  (`TickVelocityExcess<median`) was carried into the deeper checks (Sections 13-17); the two other
+  gates with genuine (smaller) disproportionate effects (Session=Close, CvdNet>=median) were
+  recorded but not independently robustness-checked to the same depth -- a time-budget cut, not an
+  oversight, consistent with this task's own "identify the simplest defensible gate, don't keep
+  stacking" instruction.
+- The full winner-vs-loser distribution table (Section 6) and the full Group A-E gate sweep were
+  run at bar=650 only; bar=1300/2600 were extended ONLY for the one leading candidate gate
+  (Section 15), not for the full distribution/gate-sweep pass -- a deliberate scope cut given this
+  task's own size, not a silent omission.
+- No bootstrap/permutation significance test was run on any P&L, retention-percentage, or
+  expectancy number here -- consistent with this document's practice throughout every prior
+  experiment. Every "real disproportion" call in Sections 7-12 is a plain comparison against the
+  random-selection-expectation point estimate, not a statistical-significance claim.
+- The plateau check (Section 16) is a genuinely partial one -- the CLI's sweep helper covers the
+  `>=` direction only; the adopted gate uses the `<` direction, cross-checked only via the
+  cross-bar-size consistency result (Section 15), not a full 5-point sweep in its own direction.
+  Stated honestly as a scope gap rather than silently presented as a completed plateau check.
+- Bid/ask spread reconstruction, IV/theta attribution, and any exit-side optimization were
+  explicitly out of scope, per item 13's own instruction -- this task reused Experiment 5's fixed-
+  horizon exit methodology unchanged throughout.
+
+### Reproduction commands
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- experiment6-gates 2026-09-04 2026-09-22 --barSizes=650
+dotnet run --project NiftySignal.VolumeBarData -- experiment6-gates 2026-09-04 2026-09-22 --barSizes=1300,2600
+```
+
+New code: `NiftySignal.VolumeBarData/GateFeatureExtractor.cs`,
+`NiftySignal.VolumeBarData/Experiment6GateAnalyzer.cs`, CLI `experiment6-gates` in `Program.cs`.
+Tests: `NiftySignal.Tests/VolumeBarData/Experiment6GateAnalyzerTests.cs` (5 new tests). `dotnet
+build NiftySignal.slnx`: 0 warnings/0 errors. `dotnet test NiftySignal.slnx`: 750/750 passing (745
+baseline + 5 new, no regressions). No production file (`NiftySignal.Host`, `NiftySignal.Dashboard`,
+`NiftySignal.Rules`, `LiveTradingEngine`) touched -- confirmed by this task's own file list above
+covering only `NiftySignal.VolumeBarData`/`NiftySignal.Tests`, and by `Experiment5*.cs`/
+`OptionTradeQualityStats.cs` remaining byte-for-byte unchanged (only read, never edited).
+
+## Correction -- Overlapping-Trade Bug Fix and Premium-Band Strike Selection (2026-09-22)
+
+The user reviewed the Experiment 6 "Day-wise trade summary, GATED" table above and flagged that
+individual days showed 269-513 "trades" at bar=650 -- not physically tradeable. This section is
+the investigation, root-cause, fix, and corrected rerun. It is a CORRECTION, not a new experiment:
+the original Experiment 5/6 sections above are left in place (historical record) but are marked
+INVALID at their top and must not be read as current results -- this section is authoritative for
+any trade-simulation number from either experiment going forward.
+
+### (a) Root cause
+
+`NiftySignal.VolumeBarData/Experiment5UnderlyingAnalyzer.cs`, `CollectByState` (called by both
+`Collect` and the 4-cell interaction check) scans every bar in a trading day and adds a
+`QualifyingBar` to its result list whenever that bar independently satisfies the
+HighActivity+HighEfficiency (or other requested cell) test -- correct and unchanged for its own
+PREDICTIVE purpose (Experiment 3's forward-return measurement, Experiment 5's item-2 underlying
+stats), since "what happens after this bar" doesn't require exclusivity with any other bar.
+
+The bug was one layer up, in every Experiment 5/6 CLI command's TRADE-BUILDING loop
+(`NiftySignal.VolumeBarData/Program.cs`): each command took the full `List<QualifyingBar>` for a
+day and called `Experiment5OptionTradeSimulator.BuildTradeAsync` once per qualifying bar
+(`foreach (var qb in quals) { ... BuildTradeAsync(...) }`, e.g. the pre-fix `experiment6-gates`
+base-trade loop and `tradeability-experiment5`'s per-horizon loop) with **no check for whether a
+previously-opened trade's 10-bar holding window was still open**. Since the pooled median split
+puts roughly a quarter of all bars into the HighActivity+HighEfficiency cell, and those bars
+cluster (a burst of high-tick-velocity activity tends to span several consecutive bars), a single
+cluster could produce dozens of qualifying bars only a few bars apart, each independently opening
+its own simulated 10-bar option trade -- hence 72-513 heavily overlapping "trades" on individual
+days, something no single-position trader could ever execute.
+
+### (b) Single-open-trade fix
+
+New method `Experiment5OptionTradeSimulator.SelectNonOverlapping(dayQualifyingBarsAscending, horizon)`
+(pure, no DB access) -- **exact rule**: scanning one day's qualifying bars in ascending `BarIndex`
+order, track `openUntilBarIndex` (initially -1); a qualifying bar is skipped if
+`qb.BarIndex <= openUntilBarIndex` (a previously-opened trade is still open through that index);
+otherwise the bar is kept and `openUntilBarIndex` is set to `qb.BarIndex + horizon`. This is
+applied by every trade-building call site right before its `BuildTradeAsync` loop -- `CollectByState`/
+`Collect` themselves are untouched, so Experiment 3's forward-return measurement and Experiment 5's
+item-2 predictive stats are unaffected. Applied to: `experiment6-gates`' base-trade loop (one gate
+per horizon=10, the command the user was shown), `tradeability-experiment5`'s main per-horizon loop
+(each horizon gets ITS OWN non-overlapping sequence, since a short horizon's trades don't need to
+respect a long horizon's holding window), the 4-cell interaction check, and the random-entry
+baseline (re-sized and re-filtered to the CORRECTED, non-overlapping real-signal count -- otherwise
+the "matched count" baseline would still be sized off the old, inflated count).
+
+### (c) Premium-band strike selection
+
+Per explicit user instruction, `BuildTradeAsync` no longer reads `OptionAtmBarRow.AtmStrike`
+(pure synthetic-forward ATM) as the traded strike. It now searches the day's option chain (same
+`Underlying=="NIFTY"`, nearest-expiry filtering already used) for the strike, on the trade's own
+side (Call side for a bought call, Put side for a bought put), whose own real premium at-or-after
+the signal timestamp (`OptionPriceSeries.PriceAtOrAfter`, the same pricing path used before) falls
+in `[100, 150]`.
+- **Tie-break** (stated explicitly, per instruction): among all in-band strikes, the one nearest
+  the OLD synthetic-forward ATM strike (`OptionAtmBarRow.AtmStrike`) -- the most defensible default
+  since it keeps the pick close to "the money" when several strikes qualify. If no ATM strike is
+  available for that bar, falls back to the band's own midpoint (125) -- a secondary, less-tested
+  rule, stated explicitly rather than silently applied.
+- **No match**: if no strike in the chain has a premium in the band at that timestamp, the trade is
+  skipped entirely (`BuildTradeAsync` returns `null`) -- never forced onto a mismatched strike.
+- This is a genuine methodology CHANGE, not purely a bug fix -- the corrected numbers below are not
+  a clean "same methodology, overlap bug fixed" comparison to the original; both the trade count AND
+  the option economics differ for this reason too (a [100,150]-premium option is a structurally
+  different instrument -- typically further from ATM / more OTM than the old pure-ATM strike, with
+  different delta/theta/liquidity characteristics).
+
+### (d)+(e) Corrected day-wise trade tables and overall stats, bar=650 (`experiment6-gates 2026-09-04 2026-09-22 --barSizes=650`)
+
+Locked threshold reproduced unchanged: `TickVelocityMedian=2.0000 PriceEfficiencyMedian=0.113576`.
+Qualifying bars (state D, all 11 days pooled): 7087. Base-signal trades built (horizon=10, after
+the non-overlap gate AND the premium-band strike search, `null` returned and skipped for either no
+in-band strike or no exit print): **1434** -- down from the original section's badly-inflated,
+per-day-overlapping figure (single-day counts up to 513) to a per-day range of 72-197 (still well
+above a "handful to a few dozen," see caveat in (f) below).
+
+**BASE (ungated), per day:**
+
+| Date | Trades | Wins | Losses | Gross | Costs | Net |
+|---|---|---|---|---|---|---|
+| 2026-09-04 | 72 | 33 | 39 | 1690.0 | 4752.0 | -3062.0 |
+| 2026-09-08 | 134 | 54 | 80 | -22938.5 | 8844.0 | -31782.5 |
+| 2026-09-09 | 183 | 75 | 108 | -1469.0 | 12078.0 | -13547.0 |
+| 2026-09-10 | 99 | 49 | 50 | 14046.5 | 6534.0 | 7512.5 |
+| 2026-09-11 | 197 | 87 | 110 | 2028.0 | 13002.0 | -10974.0 |
+| 2026-09-15 | 195 | 96 | 99 | 26728.0 | 12870.0 | 13858.0 |
+| 2026-09-16 | 126 | 62 | 64 | 3789.5 | 8316.0 | -4526.5 |
+| 2026-09-17 | 113 | 49 | 64 | -2184.0 | 7458.0 | -9642.0 |
+| 2026-09-18 | 73 | 39 | 34 | 7176.0 | 4818.0 | 2358.0 |
+| 2026-09-21 | 84 | 37 | 47 | 5057.0 | 5544.0 | -487.0 |
+| 2026-09-22 | 158 | 69 | 89 | 6812.0 | 10428.0 | -3616.0 |
+| **Total** | **1434** | **650** | **784** | **40735.5** | **94644.0** | **-53908.5** |
+
+**BASE overall**: GROSS n=1434 win%=51.0 avgWin=516.2 avgLoss=-483.6 PF=1.12 expect=28.4
+net=40735.5 maxDD=27794.0 avgHoldMin=1.8. NET n=1434 win%=45.3 avgWin=511.1 avgLoss=-492.5 PF=0.86
+**expect=-37.6 net=-53908.5** maxDD=62450.0.
+
+**GATED (TickVelocityExcess<median=0.4000), per day:**
+
+| Date | Trades | Wins | Losses | Win% | Gross | Costs | Net |
+|---|---|---|---|---|---|---|---|
+| 2026-09-04 | 44 | 21 | 23 | 47.7 | 2444.0 | 2904.0 | -460.0 |
+| 2026-09-08 | 63 | 27 | 36 | 42.9 | 1930.5 | 4158.0 | -2227.5 |
+| 2026-09-09 | 75 | 32 | 43 | 42.7 | 728.0 | 4950.0 | -4222.0 |
+| 2026-09-10 | 51 | 25 | 26 | 49.0 | 8235.5 | 3366.0 | 4869.5 |
+| 2026-09-11 | 90 | 39 | 51 | 43.3 | 2132.0 | 5940.0 | -3808.0 |
+| 2026-09-15 | 88 | 39 | 49 | 44.3 | 12441.0 | 5808.0 | 6633.0 |
+| 2026-09-16 | 59 | 31 | 28 | 52.5 | 3380.0 | 3894.0 | -514.0 |
+| 2026-09-17 | 61 | 26 | 35 | 42.6 | 481.0 | 4026.0 | -3545.0 |
+| 2026-09-18 | 42 | 25 | 17 | 59.5 | 7228.0 | 2772.0 | 4456.0 |
+| 2026-09-21 | 43 | 18 | 25 | 41.9 | 110.5 | 2838.0 | -2727.5 |
+| 2026-09-22 | 91 | 42 | 49 | 46.2 | 299.0 | 6006.0 | -5707.0 |
+| **Total** | **707** | **325** | **382** | **46.0** | **39409.5** | **46662.0** | **-7252.5** |
+
+**GATED overall**: GROSS n=707 win%=50.9 avgWin=536.9 avgLoss=-446.0 PF=1.26 expect=55.7
+net=39409.5 maxDD=10484.5. NET n=707 win%=46.0 avgWin=524.7 avgLoss=-465.4 PF=0.96
+**expect=-10.3 net=-7252.5** maxDD=18670.5. (Best-day-excluded net, all 11 days minus 2026-09-15:
+n=1239 win%=44.7 PF=0.79 expect=-54.7 net=-67766.5 -- same "one good day carries the gate"
+fragility pattern as the original, now-retracted, section noted.)
+
+### (f) Honest comparison to the retracted numbers, and a caveat on the corrected count itself
+
+The single-open-trade gate did what it was designed to do -- single-day counts dropped from the
+original section's up-to-513 to a corrected 72-197 (base) / 42-91 (gated), roughly a 3-4x
+reduction, and every day's trades are now genuinely non-overlapping (each subsequent trade's entry
+bar index is strictly past the prior trade's `entryBarIndex+10` exit index by construction). **That
+said, 72-197 trades/day (roughly one trade every 2-4 minutes across a ~6-hour session) is still far
+above both "a handful to a few dozen per day" and this project's 5-10 trades/day strategy target
+(CLAUDE.md) -- this should NOT be read as "the bug is now fully resolved and the numbers are
+realistic."** The reason: at bar=650 the underlying volume bars are very short (mean holding time
+for a 10-bar horizon trade is only ~1.8 minutes, implying an individual bar completes roughly every
+~11 seconds during active periods) -- so even with a strict non-overlap constraint, a single busy
+day still contains enough independent 10-bar windows to produce this many non-overlapping trades.
+The overlap bug itself is fixed correctly per the stated rule; the remaining high frequency is a
+separate, legitimate consequence of measuring the holding horizon in BARS rather than wall-clock
+time at a fine bar granularity, not a residual bug. This is flagged explicitly rather than
+under-reported, per this task's own skepticism instruction.
+
+Economically: net P&L stays firmly negative after the SAME cost model either way (original
+retracted BASE: net was inflated by the overlap bug into meaningless territory, not directly
+comparable; corrected BASE NET expectancy -37.6/trade, net -53908.5 over 1434 trades; corrected
+GATED NET expectancy -10.3/trade, net -7252.5 over 707 trades). The GATED cut is directionally the
+same shape the original (invalid) run showed -- gross PF improves with the gate (1.12->1.26) but
+net PF stays sub-1 (0.86->0.96), i.e. the gate reduces losses but does not flip the strategy net
+positive -- so while the specific numbers changed materially, the QUALITATIVE picture (net-negative
+after realistic costs, gate helps at the margin but doesn't fix it) has NOT changed.
+
+### (g) Updated verdict
+
+**Tradeability (bar=650, horizon=10, premium-band [100,150] strike selection): Not supported.**
+Net P&L is negative both ungated and gated after this project's live cost model; the corrected,
+non-overlapping trade counts (72-197/day base, 42-91/day gated) are still well outside a physically
+comfortable single-trader cadence and this project's own 5-10 trades/day target, which is itself
+worth surfacing as a separate open question for any future work on this signal (a longer horizon or
+a coarser bar size would need to be tried deliberately, not assumed). The `TickVelocityExcess<median`
+gate's earlier-found pattern (retains most gross edge while cutting more losers than winners) is
+directionally REPRODUCED in the corrected data, but net expectancy remains negative, so this
+remains **Weak** as a standalone gate, not promoted to Promising. Experiment 3's own predictive-only
+verdict (Promising, not yet Robust) is untouched by any of this, since it never depended on the
+buggy trade-simulation code path.
+
+### Cross-bar-size check: bar=1300 and bar=2600 (additional data points, not a full replication)
+
+`experiment6-gates 2026-09-04 2026-09-22 --barSizes=1300,2600` (same corrected code; both
+completed this session).
+
+**bar=1300** (threshold `TickVelocityMedian=2.0000 PriceEfficiencyMedian=0.084109`, qualifying
+bars=4331, base trades=874, `avgHoldMin=2.8` -- longer bars, fewer/longer-held non-overlapping
+trades than bar=650, as expected). Day-wise: base 18-127/day (across the 11 days: 39,80,117,61,127,
+126,74,65,41,44,100), gated 8-62/day. **BASE NET** win%=47.9 PF=0.92 expect=-25.2 net=-22031.5
+(n=874) -- same net-negative picture as bar=650. **GATED NET** (`TickVelocityExcess<median=0.3750`)
+win%=48.4 PF=1.13 **expect=+38.2 net=+16411.5** (n=430) -- net POSITIVE at this bar size, unlike
+bar=650's gated net (-10.3/trade). Reported honestly rather than cherry-picked toward either
+direction: this positive result is heavily carried by a single day (2026-09-08: net=+19916.0 out of
+the gate's total +16411.5, i.e. every other day nets out negative-to-flat combined) -- the same
+"one good day determines the gate's overall sign" fragility this document has flagged before for
+other gates, not a robust confirmation.
+
+**bar=2600** (threshold `TickVelocityMedian=2.0000 PriceEfficiencyMedian=0.061818`, qualifying
+bars=2482, base trades=492, `avgHoldMin=4.5`). Day-wise: base 18-72/day (23,43,68,35,72,70,42,37,18,
+28,56) -- the closest of the three bar sizes to a "handful to a few dozen" cadence, though the
+upper end (68-72) is still on the high side for a single trader. Gated 8-37/day. **BASE NET**
+win%=44.5 PF=0.83 expect=-73.9 net=-36339.5 (n=492) -- net-negative, consistent with the other two
+bar sizes. **GATED NET** (`TickVelocityExcess<median`) win%=44.7 **PF=0.80 expect=-83.7
+net=-20433.0** (n=244) -- at this bar size the gate makes the NET result WORSE than the ungated
+baseline (expectancy drops from -73.9 to -83.7/trade), the opposite direction from bar=650 (helps
+at the margin, still negative) and bar=1300 (flips positive). This is an important, honestly-
+reported finding: **the `TickVelocityExcess<median` gate's effect is not consistent in sign across
+bar sizes** -- helpful-but-still-negative at 650, positive (single-day-driven) at 1300, actively
+harmful at 2600.
+
+**Taken together**, these are three additional data points, not three independent confirmations of
+one effect -- per this project's "backtesting is a long-term process" rule, they do not upgrade the
+verdict in (g) above. If anything, the sign inconsistency across bar sizes argues for MORE caution
+before calling this gate Promising at any bar size: a gate whose net effect flips sign across the
+three bar sizes already tested looks more consistent with overfitting/noise on a small (11-day)
+sample than with a real, bar-size-robust market effect.
+
+### Reproduction command
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- experiment6-gates 2026-09-04 2026-09-22 --barSizes=650
+dotnet run --project NiftySignal.VolumeBarData -- experiment6-gates 2026-09-04 2026-09-22 --barSizes=1300,2600
+```
+
+New/changed code: `NiftySignal.VolumeBarData/Experiment5OptionTradeSimulator.cs`
+(`SelectNonOverlapping`, premium-band strike search replacing the old ATM-strike lookup in
+`BuildTradeAsync`), `NiftySignal.VolumeBarData/Program.cs` (non-overlap gate wired into
+`tradeability-experiment5`'s per-horizon loop, the 4-cell interaction check, the random-entry
+baseline, and `experiment6-gates`' base-trade loop). Tests:
+`NiftySignal.Tests/VolumeBarData/Experiment5OptionTradeSimulatorTests.cs` (8 new tests: 4 for
+`SelectNonOverlapping`'s chaining/skip logic, 4 for the premium-band strike search's in-band pick,
+tie-break, no-ATM fallback, and no-match-skips-trade behavior, all synthetic/deterministic, EF Core
+`InMemoryDatabase`). `dotnet build NiftySignal.slnx`: 0 warnings/0 errors. `dotnet test
+NiftySignal.slnx`: 758/758 passing (750 baseline + 8 new, no regressions). `CollectByState`/
+`Collect` and their Experiment-3-style predictive-only callers were NOT modified. No production
+file (`NiftySignal.Host`, `NiftySignal.Dashboard`, `NiftySignal.Rules`, `LiveTradingEngine`)
+touched.

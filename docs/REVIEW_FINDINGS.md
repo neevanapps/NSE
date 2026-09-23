@@ -3241,4 +3241,70 @@ call sites additionally filter at intake, belt-and-suspenders.
   filter is a no-op there too until Stage 2 ships).
 
 **Numbering note:** this file's own text above (2026-09-11) said F61 was next-free; that note is now
-stale as of this entry — **F62 is next-free** going forward.
+stale as of this entry — F62 was next-free going forward, and is now used by the entry immediately
+below.
+
+## 2026-09-22 — F62: `Instruments` table Underlying-ambiguity, offline-populator follow-up to F61 — fixed same session
+
+**Found while scoping this same follow-up task**, not by an outside review. F61 (immediately above)
+explicitly scoped its fix to the live-path consumers only (`LiveFeatureEngine.cs` and the
+`Live*Populator.cs`/`ReplayLiveCommand.cs`/`Backtest`/`ScoreReplay`/`CoreScoreReplayDiff` call
+sites) — the *offline* backtest populators in `NiftySignal.VolumeBarData` weren't in scope at the
+time, since no multi-underlying data existed yet to motivate checking them. Confirmed via a
+`grep -rn "\.Instruments\b" NiftySignal.VolumeBarData/*.cs` sweep of every hit (not just the ones a
+first pass guessed) that the same unfiltered/unordered pattern was present in every offline
+populator/simulator/CLI helper that resolves a future or an option chain:
+
+- `VolumeBarPopulator.cs` (`PopulateDayAsync`'s future lookup) — bare `FirstOrDefaultAsync`, no
+  `Underlying` filter, no ordering. Same shape F61 fixed in `LiveVolumeBarPopulator.cs`, missed here.
+- `OptionAtmPopulator.cs`, `OptionMaxPainPopulator.cs`, `OptionDepthPopulator.cs`,
+  `OptionBandFlowPopulator.cs`, `OptionOiPopulator.cs`, `OptionSkew25DeltaPopulator.cs`,
+  `CvdProxySumPopulator.cs`, `DepthImbalanceSumPopulator.cs` — each pulls the day's whole option
+  chain via `Where(... && ExpiryDate != null)` with no `Underlying` filter, then picks the nearest
+  expiry via a bare `Min()`.
+- `TradeSimulator.cs` — the same `allOptions`/`Min()` pattern at both `SimulateDayAsync` and
+  `SimulateCrossoverDayAsync`.
+- `LivePaperTradeExecutor.cs` — despite the "Live" prefix, this file was **not** in F61's fix list
+  (confirmed: F61's entry above names `LiveFeatureEngine`, `LiveVolumeBarPopulator`,
+  `LiveOptionAtmPopulator`, `LiveOptionMaxPainPopulator`, `LiveOptionDepthPopulator`, and
+  `ReplayLiveCommand` only) — same unfiltered chain lookup as the others.
+- `CvdProxyTrialSimulator.cs`, `DepthImbalanceTrialSimulator.cs`, `DepthSpreadTrialSimulator.cs` —
+  each has a lazily-loaded `nearestExpiry`/`chain` pair (`MinAsync` + `Where(... ExpiryDate ==
+  nearestExpiry)`), unfiltered.
+- `Program.cs` — three ad hoc CLI-diagnostic call sites (`perf-check`'s option-chain load,
+  `sanity-oi-raw`'s single-instrument lookup, the MAE/MFE analysis command's per-day chain cache).
+
+**Fix:** identical template to F61 — added `i.Underlying == "NIFTY"` to every `Where` clause above
+(reusing the same string literal F61's own live-side fixes use; `NiftySignal.Host` isn't reachable
+from `NiftySignal.VolumeBarData` per the project reference graph, `Host` depends on `VolumeBarData`
+and not the reverse, so a shared constant isn't available without introducing a new cross-project
+dependency — same reasoning F61's own `LiveOptionAtmPopulator.cs`/`LiveOptionMaxPainPopulator.cs`/
+`LiveOptionDepthPopulator.cs`/`LiveVolumeBarPopulator.cs` already used, kept consistent rather than
+reinvented), plus `OrderBy(i => i.ExpiryDate)` on `VolumeBarPopulator.cs`'s bare
+`FirstOrDefaultAsync`. Every site carries a grep-able `// Audit finding F62 (2026-09-22)` comment.
+
+**Current status, confirmed at fix time:** local `niftysignal_vm_copy` still has zero Sensex/Bank
+Nifty rows — behaviorally a no-op today. This closes the gap before the next
+`sync-vm-data-incremental.ps1` pull brings down a day with all three underlyings mixed in
+`Instruments`/`Ticks` (the VM's live Host has collected all three since this morning).
+
+**Verification:**
+- Two new regression tests, same "insert a second underlying's rows first, with an earlier expiry,
+  and prove the query still resolves to NIFTY" technique F61's own tests used:
+  `NiftySignal.Tests/VolumeBarData/VolumeBarPopulatorUnderlyingFilterTests.cs`
+  (`PopulateDayAsync_WithTwoUnderlyingsInInstrumentsTable_UsesNiftyFutureOnly`) and
+  `NiftySignal.Tests/VolumeBarData/OptionMaxPainPopulatorUnderlyingFilterTests.cs`
+  (`PopulateDayAsync_WithTwoUnderlyingsInInstrumentsTable_ResolvesNiftyChainOnly`). Both were
+  confirmed to FAIL against the pre-fix code (reverted locally, re-ran, restored) before being
+  left in place passing — real regression coverage, not defensive filtering added on faith.
+- Full suite: 706/706 passing (704 pre-existing + 2 new), 0 warnings.
+- Locked-baseline reproduction re-run after the fix, both byte-identical to their prior locked
+  values: `trade 2026-09-08 2026-09-19 OptionsScoreThreeWaySwitchMaxPainConfirmed 90 15 2600
+  --band=5` → 112 trades, 64.3% win rate, net +426.40 pts (unchanged). `crossover 2026-09-08
+  2026-09-19 8 40 5 2600` → 80 trades, 55.0% win rate, net +277.20 pts (checked fresh, not compared
+  against a stale prior number — this project's own history notes this figure moved once already
+  after the strike-search feature was added, so it's recorded here as the new current baseline).
+- No live/VM changes — this fix is entirely inside `NiftySignal.VolumeBarData`, does not touch
+  `NiftySignal.Host`/`NiftySignal.Dashboard`, and nothing was deployed.
+
+**Numbering note:** F63 is next-free going forward.

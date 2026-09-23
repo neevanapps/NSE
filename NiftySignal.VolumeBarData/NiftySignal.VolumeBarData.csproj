@@ -48,6 +48,12 @@
          in this dependency-free, pure-function project instead of a duplicated inline copy here.
          See docs/LIVE_PARITY_PLAN.md. -->
     <ProjectReference Include="..\NiftySignal.Scoring\NiftySignal.Scoring.csproj" />
+    <!-- 2026-09-22, Experiment 5 (tradeability of activity/efficiency mean reversion): reuses the
+         real, existing CostsConfig/PaperTradeSimulator cost model (RulesetConfig.cs's Costs section,
+         live values in NiftySignal.Host/appsettings.json) for the cost-sensitivity pass rather than
+         inventing a parallel cost formula. See docs/VOLUME_BAR_FINDINGS.md's Experiment 5 section. -->
+    <ProjectReference Include="..\NiftySignal.Rules\NiftySignal.Rules.csproj" />
+    <ProjectReference Include="..\NiftySignal.Execution\NiftySignal.Execution.csproj" />
   </ItemGroup>
 
 </Project>

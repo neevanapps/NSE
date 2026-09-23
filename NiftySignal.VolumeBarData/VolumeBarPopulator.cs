@@ -44,8 +44,15 @@ public static class VolumeBarPopulator
             return new VolumeBarPopulationResult(VolumeBarPopulationOutcome.AlreadyPopulated, 0);
         }
 
+        // Audit finding F62 (2026-09-22) -- NIFTY-filtered and explicitly ordered, offline
+        // follow-up to F61 (which fixed LiveVolumeBarPopulator.cs but not this offline populator).
+        // See NiftySignal.Host.LiveFeatureEngine.NiftyUnderlying's own doc comment: a bare
+        // FirstOrDefaultAsync with no filter/order would otherwise silently pick whichever
+        // underlying's future Postgres happened to return first.
         var future = await source.Instruments
-            .FirstOrDefaultAsync(i => i.AsOfDate == asOfDate && i.InstrumentType == InstrumentType.Future, cancellationToken);
+            .Where(i => i.AsOfDate == asOfDate && i.InstrumentType == InstrumentType.Future && i.Underlying == "NIFTY")
+            .OrderBy(i => i.ExpiryDate)
+            .FirstOrDefaultAsync(cancellationToken);
 
         if (future is null)
         {
@@ -119,5 +126,6 @@ public static class VolumeBarPopulator
         FutureDepthImbalance = bar.DepthImbalance,
         OrderFlowImbalance = bar.OrderFlowImbalance,
         TopOfBookImbalance = bar.TopOfBookImbalance,
+        TickCount = bar.TickCount,
     };
 }

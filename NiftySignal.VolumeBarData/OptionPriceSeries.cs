@@ -68,4 +68,40 @@ public sealed class OptionPriceSeries
 
         return result >= 0 ? _series[result].Price : null;
     }
+
+    /// <summary>
+    /// 2026-09-22, Experiment 5 (docs/VOLUME_BAR_FINDINGS.md's dated "Experiment 5" section): the
+    /// first real print at or AFTER <paramref name="timestamp"/> -- the "never look before the
+    /// signal" entry-fill convention Experiment 5's own design requires (a qualifying bar's signal
+    /// fires at its own close; entering at a price already known BEFORE that close, as
+    /// <see cref="PriceAtOrBefore"/> would do, is look-ahead). Null if no priced tick exists at or
+    /// after that point (never fabricated). Additive -- does not change
+    /// <see cref="PriceAtOrBefore"/>'s existing behavior or any existing caller.
+    /// </summary>
+    public decimal? PriceAtOrAfter(DateTimeOffset timestamp)
+    {
+        if (_series.Count == 0)
+        {
+            return null;
+        }
+
+        var lo = 0;
+        var hi = _series.Count - 1;
+        var result = -1;
+        while (lo <= hi)
+        {
+            var mid = lo + (hi - lo) / 2;
+            if (_series[mid].Timestamp >= timestamp)
+            {
+                result = mid;
+                hi = mid - 1;
+            }
+            else
+            {
+                lo = mid + 1;
+            }
+        }
+
+        return result >= 0 ? _series[result].Price : null;
+    }
 }

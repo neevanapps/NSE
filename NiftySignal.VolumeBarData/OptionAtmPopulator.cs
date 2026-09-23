@@ -48,8 +48,12 @@ public static class OptionAtmPopulator
             return new OptionAtmPopulationResult(OptionAtmPopulationOutcome.NoTradableData, 0);
         }
 
+        // Audit finding F62 (2026-09-22) -- NIFTY-filtered, offline follow-up to F61 (which fixed
+        // the live-path consumers only). See NiftySignal.Host.LiveFeatureEngine.NiftyUnderlying's
+        // own doc comment: without this, a Sensex/Bank Nifty option with an earlier expiry than
+        // NIFTY's own nearest weekly would silently win the Min() below.
         var allOptions = await source.Instruments
-            .Where(i => i.AsOfDate == asOfDate && i.InstrumentType == InstrumentType.Option && i.ExpiryDate != null)
+            .Where(i => i.AsOfDate == asOfDate && i.InstrumentType == InstrumentType.Option && i.ExpiryDate != null && i.Underlying == "NIFTY")
             .ToListAsync(cancellationToken);
 
         if (allOptions.Count == 0)

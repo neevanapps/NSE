@@ -35,11 +35,21 @@ namespace NiftySignal.Features;
 /// book reads bullish at the touch, bearish in aggregate) -- new 2026-09-17, 9th future-side
 /// candidate. Null if no depth-bearing tick arrived this bar.
 /// </param>
+/// <param name="TickCount">
+/// Count of <see cref="VolumeBarBuilder.ApplyTick"/> calls that fed this bar -- i.e. the number of
+/// raw feed rows (<see cref="NiftySignal.Domain.Entities.Tick"/>) observed while the bar was open,
+/// NOT a count of discrete trades. A Tick row is broker-agnostic and undiscriminated (trade update,
+/// touchline-only quote update, or depth-only update all produce a row), so this is feed-message
+/// density, not confirmed trade density -- see the 2026-09-22 tick-activity research task's own
+/// "TickCount Semantics" finding for why that distinction matters before treating this
+/// economically. New 2026-09-22, first tick-activity candidate metric.
+/// </param>
 public sealed record VolumeBar(
     DateTimeOffset StartTimestamp, DateTimeOffset EndTimestamp,
     decimal OpenPrice, decimal HighPrice, decimal LowPrice, decimal ClosePrice,
     long Volume, long? OpenInterestAtClose, double? VwapAtClose,
-    long? FutureCvdNet, double? DepthImbalance, double? OrderFlowImbalance, double? TopOfBookImbalance)
+    long? FutureCvdNet, double? DepthImbalance, double? OrderFlowImbalance, double? TopOfBookImbalance,
+    int TickCount)
 {
     /// <summary>Wall-clock time this bar took to fill -- the volume-clock's own analogue of "how urgently did participants trade," a candidate metric in its own right per the 2026-09-17 plan, not just plumbing.</summary>
     public TimeSpan Duration => EndTimestamp - StartTimestamp;
@@ -74,6 +84,7 @@ public sealed class VolumeBarBuilder(long barVolumeThreshold)
     decimal? _low;
     decimal? _lastPrice;
     long? _lastOpenInterest;
+    int _tickCount;
 
     /// <summary>
     /// Feeds one tick into the bar under construction. Returns the completed bar once this tick's
@@ -91,6 +102,7 @@ public sealed class VolumeBarBuilder(long barVolumeThreshold)
         _low = _low is { } l ? Math.Min(l, lastPrice) : lastPrice;
         _lastPrice = lastPrice;
         _lastOpenInterest = openInterest ?? _lastOpenInterest;
+        _tickCount++;
 
         _flow.ApplyTick(lastPrice, cumulativeVolume);
         var delta = _flow.LastVolumeDelta;
@@ -125,12 +137,14 @@ public sealed class VolumeBarBuilder(long barVolumeThreshold)
             _barStart!.Value, endTimestamp,
             _open!.Value, _high!.Value, _low!.Value, _lastPrice!.Value,
             _flow.CadenceVolumeDelta, _lastOpenInterest, _flow.Vwap,
-            _cvd.CadenceNet, _depth.CadenceImbalance, _ofi.CadenceNet, _tob.CadenceImbalance);
+            _cvd.CadenceNet, _depth.CadenceImbalance, _ofi.CadenceNet, _tob.CadenceImbalance,
+            _tickCount);
 
         _barStart = null;
         _open = null;
         _high = null;
         _low = null;
+        _tickCount = 0;
         _flow.ResetCadence();
         _cvd.ResetCadence();
         _depth.Reset();

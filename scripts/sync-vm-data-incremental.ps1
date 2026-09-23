@@ -44,6 +44,14 @@
     NiftySignal.DataSync must already be deployed to the VM for this to work -- run this script
     with -DeployTool first (and again whenever NiftySignal.DataSync itself changes).
 
+    2026-09-22 note (F61/F62, docs/REVIEW_FINDINGS.md): the VM's Instruments/Ticks tables now also
+    carry Sensex/Bank Nifty rows alongside NIFTY's own (docs/SENSEX_BANKNIFTY_TICK_COLLECTION.md),
+    distinguished only by Underlying. Every consumer of niftysignal_vm_copy's Instruments table --
+    both the live-path code (F61) and the offline backtest tooling in NiftySignal.VolumeBarData
+    (F62) -- is now confirmed Underlying-safe, so a sync that pulls a mixed-underlying day is safe
+    to run. If a NEW consumer of Instruments is ever added, filter it to Underlying == "NIFTY" from
+    the start rather than rediscovering this gap.
+
 .EXAMPLE
     .\sync-vm-data-incremental.ps1 -SaveCredential
     One-time setup: stores Windows credentials for the VM (DPAPI-encrypted, this user+machine

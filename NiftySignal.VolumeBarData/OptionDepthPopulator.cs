@@ -38,8 +38,10 @@ public static class OptionDepthPopulator
             return new OptionDepthPopulationResult(OptionDepthPopulationOutcome.NoTradableData, 0);
         }
 
+        // Audit finding F62 (2026-09-22) -- NIFTY-filtered, offline follow-up to F61. See
+        // NiftySignal.Host.LiveFeatureEngine.NiftyUnderlying's own doc comment.
         var allOptions = await source.Instruments
-            .Where(i => i.AsOfDate == asOfDate && i.InstrumentType == InstrumentType.Option && i.ExpiryDate != null)
+            .Where(i => i.AsOfDate == asOfDate && i.InstrumentType == InstrumentType.Option && i.ExpiryDate != null && i.Underlying == "NIFTY")
             .ToListAsync(cancellationToken);
 
         if (allOptions.Count == 0)

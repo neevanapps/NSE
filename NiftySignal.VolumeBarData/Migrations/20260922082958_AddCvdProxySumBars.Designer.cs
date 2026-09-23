@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using NiftySignal.VolumeBarData;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace NiftySignal.VolumeBarData.Migrations
 {
     [DbContext(typeof(VolumeBarDbContext))]
-    partial class VolumeBarDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260922082958_AddCvdProxySumBars")]
+    partial class AddCvdProxySumBars
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -702,9 +705,6 @@ namespace NiftySignal.VolumeBarData.Migrations
 
                     b.Property<DateTimeOffset>("StartTimestamp")
                         .HasColumnType("timestamp with time zone");
-
-                    b.Property<int>("TickCount")
-                        .HasColumnType("integer");
 
                     b.Property<double?>("TopOfBookImbalance")
                         .HasColumnType("double precision");

@@ -189,4 +189,35 @@ public sealed class VolumeBarBuilderTests
 
         Assert.Null(builder.FlushPartial(T0.AddSeconds(1)));
     }
+
+    [Fact]
+    public void TickCount_CountsEveryApplyTickCall_RegardlessOfDepthOrVolumeDelta()
+    {
+        var builder = new VolumeBarBuilder(barVolumeThreshold: 1000);
+
+        // Four ApplyTick calls feed this bar -- including one zero-delta baseline tick and one
+        // depth-only tick with no price/volume change -- TickCount must count the CALL, not the
+        // delta or the depth presence (see VolumeBar.TickCount's own "feed message, not trade" doc comment).
+        builder.ApplyTick(T0, 23000m, cumulativeVolume: 0, depth: null, openInterest: null);
+        builder.ApplyTick(T0.AddSeconds(1), 23000m, cumulativeVolume: 0, Depth(bid1: 23000m, bidQty: 10, ask1: 23001m, askQty: 10), openInterest: null);
+        builder.ApplyTick(T0.AddSeconds(2), 23010m, cumulativeVolume: 400, depth: null, openInterest: null);
+        var bar = builder.ApplyTick(T0.AddSeconds(3), 23020m, cumulativeVolume: 1100, depth: null, openInterest: null);
+
+        Assert.NotNull(bar);
+        Assert.Equal(4, bar!.TickCount);
+    }
+
+    [Fact]
+    public void TickCount_ResetsToZero_ForTheNextBar()
+    {
+        var builder = new VolumeBarBuilder(barVolumeThreshold: 1000);
+
+        builder.ApplyTick(T0, 23000m, cumulativeVolume: 0, depth: null, openInterest: null);
+        var bar1 = builder.ApplyTick(T0.AddSeconds(1), 23050m, cumulativeVolume: 1100, depth: null, openInterest: null);
+
+        var bar2 = builder.ApplyTick(T0.AddSeconds(2), 23100m, cumulativeVolume: 2200, depth: null, openInterest: null);
+
+        Assert.Equal(2, bar1!.TickCount);
+        Assert.Equal(1, bar2!.TickCount); // fresh count for bar 2, not carried over from bar 1
+    }
 }

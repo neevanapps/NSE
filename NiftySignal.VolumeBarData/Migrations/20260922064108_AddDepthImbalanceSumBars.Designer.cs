@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using NiftySignal.VolumeBarData;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
@@ -11,9 +12,11 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace NiftySignal.VolumeBarData.Migrations
 {
     [DbContext(typeof(VolumeBarDbContext))]
-    partial class VolumeBarDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260922064108_AddDepthImbalanceSumBars")]
+    partial class AddDepthImbalanceSumBars
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -21,61 +24,6 @@ namespace NiftySignal.VolumeBarData.Migrations
                 .HasAnnotation("Relational:MaxIdentifierLength", 63);
 
             NpgsqlModelBuilderExtensions.UseIdentityByDefaultColumns(modelBuilder);
-
-            modelBuilder.Entity("NiftySignal.VolumeBarData.CvdProxySumBarRow", b =>
-                {
-                    b.Property<long>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("bigint");
-
-                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
-
-                    b.Property<DateOnly>("AsOfDate")
-                        .HasColumnType("date");
-
-                    b.Property<decimal>("AtmStrike")
-                        .HasColumnType("numeric");
-
-                    b.Property<string>("AtmToken")
-                        .IsRequired()
-                        .HasColumnType("text");
-
-                    b.Property<int>("BandWidth")
-                        .HasColumnType("integer");
-
-                    b.Property<int>("BarIndex")
-                        .HasColumnType("integer");
-
-                    b.Property<long>("BarVolumeThreshold")
-                        .HasColumnType("bigint");
-
-                    b.Property<int>("DaysToExpiry")
-                        .HasColumnType("integer");
-
-                    b.Property<DateTimeOffset>("EndTimestamp")
-                        .HasColumnType("timestamp with time zone");
-
-                    b.Property<decimal>("FutureClosePrice")
-                        .HasColumnType("numeric");
-
-                    b.Property<double?>("NotionalCvdSum")
-                        .HasColumnType("double precision");
-
-                    b.Property<double?>("RawCvdSum")
-                        .HasColumnType("double precision");
-
-                    b.Property<int>("Side")
-                        .HasColumnType("integer");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("AsOfDate", "BarVolumeThreshold", "BandWidth", "Side");
-
-                    b.HasIndex("AsOfDate", "BarVolumeThreshold", "BandWidth", "Side", "BarIndex")
-                        .IsUnique();
-
-                    b.ToTable("CvdProxySumBars");
-                });
 
             modelBuilder.Entity("NiftySignal.VolumeBarData.DepthImbalanceSumBarRow", b =>
                 {
@@ -702,9 +650,6 @@ namespace NiftySignal.VolumeBarData.Migrations
 
                     b.Property<DateTimeOffset>("StartTimestamp")
                         .HasColumnType("timestamp with time zone");
-
-                    b.Property<int>("TickCount")
-                        .HasColumnType("integer");
 
                     b.Property<double?>("TopOfBookImbalance")
                         .HasColumnType("double precision");

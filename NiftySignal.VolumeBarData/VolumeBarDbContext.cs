@@ -24,6 +24,12 @@ public sealed class VolumeBarDbContext(DbContextOptions<VolumeBarDbContext> opti
 
     public DbSet<OptionDepthBarRow> OptionDepthBars => Set<OptionDepthBarRow>();
 
+    /// <summary>2026-09-22, "Depth Imbalance, transparent research" track -- sum-accumulated (not averaged) single-side (Call or Put) depth imbalance, see <see cref="DepthImbalanceSumBarRow"/>'s own doc comment.</summary>
+    public DbSet<DepthImbalanceSumBarRow> DepthImbalanceSumBars => Set<DepthImbalanceSumBarRow>();
+
+    /// <summary>2026-09-22, "Options CVD Approximate, transparent research" track -- sum-accumulated quote-rule CVD-proxy volume, single-side (Call or Put), see <see cref="CvdProxySumBarRow"/>'s own doc comment.</summary>
+    public DbSet<CvdProxySumBarRow> CvdProxySumBars => Set<CvdProxySumBarRow>();
+
     /// <summary>Phase C of docs/LIVE_PARITY_PLAN.md -- live per-bar scores for the locked target metric, written by <see cref="TradingDaySession"/>.</summary>
     public DbSet<LiveOptionsScoreRow> LiveOptionsScoreBars => Set<LiveOptionsScoreRow>();
 
@@ -93,6 +99,20 @@ public sealed class VolumeBarDbContext(DbContextOptions<VolumeBarDbContext> opti
             // OptionDepthBarRow's own doc comment for why ATM±1 and ATM±2 need to coexist.
             entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold, b.BandWidth });
             entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold, b.BandWidth, b.BarIndex }).IsUnique();
+        });
+
+        modelBuilder.Entity<DepthImbalanceSumBarRow>(entity =>
+        {
+            // Side is part of the identity here (added 2026-09-22 alongside the Put-side
+            // confirmation run) -- same pattern OptionDepthBarRow.BandWidth already uses.
+            entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold, b.BandWidth, b.Side });
+            entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold, b.BandWidth, b.Side, b.BarIndex }).IsUnique();
+        });
+
+        modelBuilder.Entity<CvdProxySumBarRow>(entity =>
+        {
+            entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold, b.BandWidth, b.Side });
+            entity.HasIndex(b => new { b.AsOfDate, b.BarVolumeThreshold, b.BandWidth, b.Side, b.BarIndex }).IsUnique();
         });
 
         modelBuilder.Entity<LiveOptionsScoreRow>(entity =>
