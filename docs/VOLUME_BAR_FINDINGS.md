@@ -8002,3 +8002,7 @@ NiftySignal.slnx`: 758/758 passing (750 baseline + 8 new, no regressions). `Coll
 `Collect` and their Experiment-3-style predictive-only callers were NOT modified. No production
 file (`NiftySignal.Host`, `NiftySignal.Dashboard`, `NiftySignal.Rules`, `LiveTradingEngine`)
 touched.
+
+> 2026-09-23 onward: further option-PRICE crossover work (EMA/SMA comparison, entry-premium-band
+> fix, and all subsequent price-only strategy experiments) moved to `docs/Price_Based_Findings.md`
+> to keep this session's price-based track separate and easy to read start to finish.

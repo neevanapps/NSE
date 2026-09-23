@@ -122,4 +122,144 @@ public class PriceCrossoverEngineTests
     {
         Assert.Throws<ArgumentOutOfRangeException>(() => new PriceCrossoverEngine(fastBars: 0, slowBars: 4));
     }
+
+    // 2026-09-23 EMA support. Same hand-computed-expectation discipline as the SMA tests above.
+    [Fact]
+    public void Observe_DefaultsToSmaSma_SoExistingCallersAreUnaffectedByEmaSupport()
+    {
+        var withoutType = new PriceCrossoverEngine(fastBars: 2, slowBars: 4);
+        var explicitSma = new PriceCrossoverEngine(fastBars: 2, slowBars: 4, MaType.Sma, MaType.Sma);
+        double[] prices = [100.0, 100.0, 100.0, 100.0, 120.0, 90.0];
+
+        foreach (var p in prices)
+        {
+            var a = withoutType.Observe(p, thresholdFraction: 0.01);
+            var b = explicitSma.Observe(p, thresholdFraction: 0.01);
+            Assert.Equal(a.FastMa, b.FastMa);
+            Assert.Equal(a.SlowMa, b.SlowMa);
+            Assert.Equal(a.DiffFraction, b.DiffFraction);
+            Assert.Equal(a.CrossedUp, b.CrossedUp);
+            Assert.Equal(a.CrossedDown, b.CrossedDown);
+        }
+    }
+
+    [Fact]
+    public void Observe_EmaLeg_SeedsAtSlowWindowFill_WithSmaValue()
+    {
+        // fast=2, slow=4, both EMA. At the seeding bar (window first reaches slowBars=4 real
+        // prices), both EMA legs must equal the plain SMA over their own window -- the documented
+        // seeding convention (no recursion applied on the seeding bar itself).
+        var engine = new PriceCrossoverEngine(fastBars: 2, slowBars: 4, MaType.Ema, MaType.Ema);
+        engine.Observe(10.0, 0.0);
+        engine.Observe(20.0, 0.0);
+        engine.Observe(30.0, 0.0);
+        var seed = engine.Observe(40.0, 0.0); // window: [10,20,30,40]
+
+        Assert.Equal(35.0, seed.FastMa); // avg(30,40)
+        Assert.Equal(25.0, seed.SlowMa); // avg(10,20,30,40)
+    }
+
+    [Fact]
+    public void Observe_EmaLeg_AppliesStandardAlphaRecursion_AfterSeeding()
+    {
+        var engine = new PriceCrossoverEngine(fastBars: 2, slowBars: 4, MaType.Ema, MaType.Ema);
+        engine.Observe(10.0, 0.0);
+        engine.Observe(20.0, 0.0);
+        engine.Observe(30.0, 0.0);
+        engine.Observe(40.0, 0.0); // seed: fastEma=35, slowEma=25
+
+        var next = engine.Observe(50.0, 0.0);
+        // alphaFast = 2/(2+1) = 0.6667: fastEma = (50-35)*0.6667 + 35 = 45.0
+        // alphaSlow = 2/(4+1) = 0.4:    slowEma = (50-25)*0.4 + 25 = 35.0
+        Assert.Equal(45.0, next.FastMa!.Value, precision: 6);
+        Assert.Equal(35.0, next.SlowMa!.Value, precision: 6);
+    }
+
+    [Fact]
+    public void Observe_EmaFastVsSmaSlow_DivergesFromPureSma_OnTheSameRealPriceSeries()
+    {
+        // A jump right after seeding should move the EMA fast leg by a different amount than the
+        // SMA fast leg would, since EMA weights the newest price more heavily -- proves the two
+        // MaType branches are genuinely independent code paths, not just re-labeled SMA.
+        var smaEngine = new PriceCrossoverEngine(fastBars: 2, slowBars: 4, MaType.Sma, MaType.Sma);
+        var emaEngine = new PriceCrossoverEngine(fastBars: 2, slowBars: 4, MaType.Ema, MaType.Sma);
+        double[] prices = [100.0, 100.0, 100.0, 100.0, 130.0];
+
+        PriceCrossoverEngine.Step smaStep = default, emaStep = default;
+        foreach (var p in prices)
+        {
+            smaStep = smaEngine.Observe(p, 0.0);
+            emaStep = emaEngine.Observe(p, 0.0);
+        }
+
+        Assert.Equal(115.0, smaStep.FastMa); // avg(100,130)
+        Assert.Equal(120.0, emaStep.FastMa!.Value, precision: 6); // (130-100)*(2/3)+100
+        Assert.NotEqual(smaStep.FastMa, emaStep.FastMa);
+        // Slow leg (SMA on both engines) must be identical.
+        Assert.Equal(smaStep.SlowMa, emaStep.SlowMa);
+    }
+
+    // 2026-09-23 correctness-review fix (docs/Price_Based_Findings.md): Reset() must let the engine
+    // start fresh on a new instrument's price series without ever averaging it against the prior
+    // instrument's history.
+    [Fact]
+    public void Reset_ClearsWindowAndEmaState_SoNextObserveStartsFreshWarmUp()
+    {
+        var engine = new PriceCrossoverEngine(fastBars: 2, slowBars: 4, MaType.Ema, MaType.Ema);
+        engine.Observe(10.0, 0.0);
+        engine.Observe(20.0, 0.0);
+        engine.Observe(30.0, 0.0);
+        var seeded = engine.Observe(40.0, 0.0);
+        Assert.NotNull(seeded.FastMa); // fully warmed up before reset
+
+        engine.Reset();
+
+        // Immediately after reset, same "no fabricated reading until slowBars real prices" warm-up
+        // discipline as a brand-new engine -- three prices are not enough.
+        engine.Observe(999.0, 0.0);
+        engine.Observe(999.0, 0.0);
+        var stillWarmingUp = engine.Observe(999.0, 0.0);
+        Assert.Null(stillWarmingUp.FastMa);
+    }
+
+    [Fact]
+    public void Reset_ThenFullRewarm_MatchesABrandNewEngineObservingTheSamePricesFromScratch()
+    {
+        var reused = new PriceCrossoverEngine(fastBars: 2, slowBars: 4, MaType.Sma, MaType.Sma);
+        reused.Observe(500.0, 0.0); // pollutes state that Reset must fully erase
+        reused.Observe(500.0, 0.0);
+        reused.Observe(500.0, 0.0);
+        reused.Observe(500.0, 0.0);
+        reused.Reset();
+
+        var fresh = new PriceCrossoverEngine(fastBars: 2, slowBars: 4, MaType.Sma, MaType.Sma);
+        double[] prices = [10.0, 20.0, 30.0, 40.0, 130.0];
+
+        PriceCrossoverEngine.Step reusedStep = default, freshStep = default;
+        foreach (var p in prices)
+        {
+            reusedStep = reused.Observe(p, thresholdFraction: 0.01);
+            freshStep = fresh.Observe(p, thresholdFraction: 0.01);
+        }
+
+        Assert.Equal(freshStep.FastMa, reusedStep.FastMa);
+        Assert.Equal(freshStep.SlowMa, reusedStep.SlowMa);
+        Assert.Equal(freshStep.DiffFraction, reusedStep.DiffFraction);
+        Assert.Equal(freshStep.CrossedUp, reusedStep.CrossedUp);
+    }
+
+    [Fact]
+    public void Observe_EmaLeg_StillDetectsCrossings_UsingSameThresholdRule()
+    {
+        var engine = new PriceCrossoverEngine(fastBars: 2, slowBars: 4, MaType.Ema, MaType.Ema);
+        engine.Observe(100.0, 0.0);
+        engine.Observe(100.0, 0.0);
+        engine.Observe(100.0, 0.0);
+        var flat = engine.Observe(100.0, 0.0); // primes previousDiff=0
+        Assert.Equal(0.0, flat.DiffFraction);
+
+        var jumpUp = engine.Observe(200.0, thresholdFraction: 0.01);
+        Assert.True(jumpUp.CrossedUp);
+        Assert.False(jumpUp.CrossedDown);
+    }
 }

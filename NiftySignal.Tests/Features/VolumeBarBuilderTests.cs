@@ -220,4 +220,73 @@ public sealed class VolumeBarBuilderTests
         Assert.Equal(2, bar1!.TickCount);
         Assert.Equal(1, bar2!.TickCount); // fresh count for bar 2, not carried over from bar 1
     }
+
+    // --- Dynamic threshold (2026-09-23, opt-in, backward-compatible) ---
+
+    [Fact]
+    public void NoDynamicProvider_BehavesExactlyLikeTheOriginalFixedThreshold()
+    {
+        var builder = new VolumeBarBuilder(barVolumeThreshold: 1000);
+
+        builder.ApplyTick(T0, 23000m, cumulativeVolume: 0, depth: null, openInterest: null);
+        var bar = builder.ApplyTick(T0.AddSeconds(1), 23010m, cumulativeVolume: 1100, depth: null, openInterest: null);
+
+        Assert.NotNull(bar);
+        Assert.Equal(1100, bar!.Volume);
+        Assert.Equal(1000, builder.LastCompletedBarThreshold);
+    }
+
+    [Fact]
+    public void DynamicProvider_IsConsultedOnceAtBarStart_AndUsedForTheWholeBar()
+    {
+        var callCount = 0;
+        long? Provider()
+        {
+            callCount++;
+            return 500; // smaller than the 1000 default -- proves the provider's value wins
+        }
+
+        var builder = new VolumeBarBuilder(barVolumeThreshold: 1000, Provider);
+
+        builder.ApplyTick(T0, 23000m, cumulativeVolume: 0, depth: null, openInterest: null); // bar starts -- provider consulted once
+        builder.ApplyTick(T0.AddSeconds(1), 23010m, cumulativeVolume: 300, depth: null, openInterest: null); // still under 500
+        var bar = builder.ApplyTick(T0.AddSeconds(2), 23020m, cumulativeVolume: 600, depth: null, openInterest: null); // crosses 500, NOT 1000
+
+        Assert.NotNull(bar);
+        Assert.Equal(600, bar!.Volume);
+        Assert.Equal(500, builder.LastCompletedBarThreshold);
+        Assert.Equal(1, callCount); // consulted exactly once for this bar, not once per tick
+    }
+
+    [Fact]
+    public void DynamicProvider_ReturningNull_FallsBackToTheDefaultThreshold()
+    {
+        var builder = new VolumeBarBuilder(barVolumeThreshold: 1000, dynamicThresholdProvider: () => null);
+
+        builder.ApplyTick(T0, 23000m, cumulativeVolume: 0, depth: null, openInterest: null);
+        var bar = builder.ApplyTick(T0.AddSeconds(1), 23010m, cumulativeVolume: 1100, depth: null, openInterest: null);
+
+        Assert.NotNull(bar);
+        Assert.Equal(1000, builder.LastCompletedBarThreshold);
+    }
+
+    [Fact]
+    public void DynamicProvider_CanChangeThresholdBetweenBars_NeverMidBar()
+    {
+        var thresholds = new Queue<long>([500, 2000]);
+        var builder = new VolumeBarBuilder(barVolumeThreshold: 1000, () => thresholds.Dequeue());
+
+        builder.ApplyTick(T0, 23000m, cumulativeVolume: 0, depth: null, openInterest: null);
+        var bar1 = builder.ApplyTick(T0.AddSeconds(1), 23010m, cumulativeVolume: 600, depth: null, openInterest: null); // crosses 500
+
+        Assert.NotNull(bar1);
+        Assert.Equal(500, builder.LastCompletedBarThreshold);
+
+        builder.ApplyTick(T0.AddSeconds(2), 23020m, cumulativeVolume: 1800, depth: null, openInterest: null); // +1200, still under bar 2's own 2000
+        var bar2 = builder.ApplyTick(T0.AddSeconds(3), 23030m, cumulativeVolume: 2800, depth: null, openInterest: null); // crosses 2000
+
+        Assert.NotNull(bar2);
+        Assert.Equal(2000, builder.LastCompletedBarThreshold);
+        Assert.Equal(2200, bar2!.Volume); // 1200 (1800-600) + 1000 (2800-1800)
+    }
 }

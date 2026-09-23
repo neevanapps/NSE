@@ -70,13 +70,29 @@ public sealed record VolumeBar(
 /// One instance covers exactly one trading day for one instrument (the future) -- construct a
 /// fresh one per day, same convention every other per-day tracker in this codebase already uses.
 /// </summary>
-public sealed class VolumeBarBuilder(long barVolumeThreshold)
+/// <param name="dynamicThresholdProvider">
+/// 2026-09-23, opt-in, backward-compatible (default null -- every existing caller keeps the exact
+/// original fixed-threshold behavior, unchanged). When supplied, invoked ONCE at the moment each
+/// new bar starts (never mid-bar, so a bar's own threshold can never move out from under it while
+/// it's forming) to decide THAT bar's own volume threshold -- the volume-cadence analogue of
+/// "adjust the bar size to current market conditions," e.g. tick-velocity-conditioned sizing (see
+/// <c>NiftySignal.VolumeBarData.DynamicTickVelocityBarBuilder</c>, backtest-only, for the first use
+/// of this). Falls back to <paramref name="barVolumeThreshold"/> if the provider itself returns
+/// null (e.g. not enough history yet to decide).
+/// </param>
+public sealed class VolumeBarBuilder(long barVolumeThreshold, Func<long?>? dynamicThresholdProvider = null)
 {
     readonly FutureFlowAccumulator _flow = new();
     readonly FutureCvdProxyAccumulator _cvd = new();
     readonly DepthImbalanceAccumulator _depth = new();
     readonly OrderFlowImbalanceAccumulator _ofi = new();
     readonly TopOfBookImbalanceAccumulator _tob = new();
+
+    // Captured into an explicit field (rather than referencing the primary-constructor parameter
+    // directly inside ApplyTick) to avoid CS9124 -- the parameter would otherwise be both "captured
+    // into enclosing state" and "used to initialize a field," which the compiler flags even though
+    // the two uses here are intentional (default threshold as a fallback + initial value).
+    readonly long _defaultThreshold = barVolumeThreshold;
 
     DateTimeOffset? _barStart;
     decimal? _open;
@@ -85,6 +101,10 @@ public sealed class VolumeBarBuilder(long barVolumeThreshold)
     decimal? _lastPrice;
     long? _lastOpenInterest;
     int _tickCount;
+    long _activeThreshold = 0; // set for real on the first ApplyTick call; see below
+
+    /// <summary>The threshold actually used to build the most recently completed bar -- always equal to <paramref name="barVolumeThreshold"/> unless <paramref name="dynamicThresholdProvider"/> is set. Read this right after a non-null <see cref="ApplyTick"/>/<see cref="FlushPartial"/> result if the caller needs to record which threshold produced that specific bar.</summary>
+    public long LastCompletedBarThreshold { get; private set; }
 
     /// <summary>
     /// Feeds one tick into the bar under construction. Returns the completed bar once this tick's
@@ -96,6 +116,11 @@ public sealed class VolumeBarBuilder(long barVolumeThreshold)
     /// <param name="openInterest">Null when this tick carried no OI update -- the bar remembers the latest non-null value it has seen, forward-filled.</param>
     public VolumeBar? ApplyTick(DateTimeOffset timestamp, decimal lastPrice, long cumulativeVolume, MarketDepth? depth, long? openInterest)
     {
+        if (_barStart is null)
+        {
+            _activeThreshold = dynamicThresholdProvider?.Invoke() ?? _defaultThreshold;
+        }
+
         _barStart ??= timestamp;
         _open ??= lastPrice;
         _high = _high is { } h ? Math.Max(h, lastPrice) : lastPrice;
@@ -119,7 +144,7 @@ public sealed class VolumeBarBuilder(long barVolumeThreshold)
             _tob.ApplyTick(d);
         }
 
-        return _flow.CadenceVolumeDelta >= barVolumeThreshold ? CompleteBar(timestamp) : null;
+        return _flow.CadenceVolumeDelta >= _activeThreshold ? CompleteBar(timestamp) : null;
     }
 
     /// <summary>
@@ -139,6 +164,7 @@ public sealed class VolumeBarBuilder(long barVolumeThreshold)
             _flow.CadenceVolumeDelta, _lastOpenInterest, _flow.Vwap,
             _cvd.CadenceNet, _depth.CadenceImbalance, _ofi.CadenceNet, _tob.CadenceImbalance,
             _tickCount);
+        LastCompletedBarThreshold = _activeThreshold;
 
         _barStart = null;
         _open = null;

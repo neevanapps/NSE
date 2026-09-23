@@ -1446,7 +1446,7 @@ if (args.Length > 0 && string.Equals(args[0], "crossover", StringComparison.Ordi
 // 2026-09-22, option-price moving-average-crossover research task (docs/VOLUME_BAR_FINDINGS.md's
 // dated section) -- calls the wholly separate TradeSimulator.SimulatePriceCrossoverDayAsync, never
 // TradeSimulator.SimulateCrossoverDayAsync's own dispatch chain.
-//   dotnet run --project NiftySignal.VolumeBarData -- price-crossover <fromDate> <toDate> <side:Call|Put|DualAgreement|DualAgreementBothExit> [fastBars=3] [slowBars=10] [thresholdPct=1.0] [barVolumeThreshold=2600] [--band=3|5] [--putfast=] [--putslow=]
+//   dotnet run --project NiftySignal.VolumeBarData -- price-crossover <fromDate> <toDate> <side:Call|Put|DualAgreement|DualAgreementBothExit> [fastBars=3] [slowBars=10] [thresholdPct=1.0] [barVolumeThreshold=2600] [--band=3|5] [--bandmode=Symmetric|ItmSide|OtmSide] [--putfast=] [--putslow=] [--fasttype=Sma|Ema] [--slowtype=Sma|Ema] [--minprice=] [--maxprice=]
 if (args.Length > 0 && string.Equals(args[0], "price-crossover", StringComparison.OrdinalIgnoreCase))
 {
     var (pcPositional, pcNamed) = SplitNamedArgs(args);
@@ -1455,7 +1455,7 @@ if (args.Length > 0 && string.Equals(args[0], "price-crossover", StringCompariso
         || !DateOnly.TryParseExact(pcPositional[2], "yyyy-MM-dd", out var pcToDate)
         || !Enum.TryParse<PriceCrossoverSide>(pcPositional[3], ignoreCase: true, out var pcSide))
     {
-        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- price-crossover <fromDate> <toDate> <side:Call|Put|DualAgreement|DualAgreementBothExit> [fastBars=3] [slowBars=10] [thresholdPct=1.0] [barVolumeThreshold=2600] [--band=3|5] [--putfast=] [--putslow=]");
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- price-crossover <fromDate> <toDate> <side:Call|Put|DualAgreement|DualAgreementBothExit> [fastBars=3] [slowBars=10] [thresholdPct=1.0] [barVolumeThreshold=2600] [--band=3|5] [--bandmode=Symmetric|ItmSide|OtmSide] [--putfast=] [--putslow=] [--fasttype=Sma|Ema] [--slowtype=Sma|Ema] [--minprice=] [--maxprice=]");
         return 1;
     }
 
@@ -1464,16 +1464,23 @@ if (args.Length > 0 && string.Equals(args[0], "price-crossover", StringCompariso
     var pcThresholdPct = pcPositional.Length > 6 ? double.Parse(pcPositional[6]) : 1.0;
     var pcBarVolumeThreshold = pcPositional.Length > 7 ? long.Parse(pcPositional[7]) : 2600L;
     var pcBandWidth = pcNamed.TryGetValue("band", out var pcBandStr) ? (int?)int.Parse(pcBandStr) : null;
+    var pcBandComposition = pcNamed.TryGetValue("bandmode", out var pcBandModeStr) ? Enum.Parse<PriceBandComposition>(pcBandModeStr, ignoreCase: true) : PriceBandComposition.Symmetric;
     var pcPutFastBars = pcNamed.TryGetValue("putfast", out var pcPutFastStr) ? (int?)int.Parse(pcPutFastStr) : null;
     var pcPutSlowBars = pcNamed.TryGetValue("putslow", out var pcPutSlowStr) ? (int?)int.Parse(pcPutSlowStr) : null;
+    var pcFastType = pcNamed.TryGetValue("fasttype", out var pcFastTypeStr) ? Enum.Parse<MaType>(pcFastTypeStr, ignoreCase: true) : MaType.Sma;
+    var pcSlowType = pcNamed.TryGetValue("slowtype", out var pcSlowTypeStr) ? Enum.Parse<MaType>(pcSlowTypeStr, ignoreCase: true) : MaType.Sma;
+    var pcMinPrice = pcNamed.TryGetValue("minprice", out var pcMinPriceStr) ? (decimal?)decimal.Parse(pcMinPriceStr) : null;
+    var pcMaxPrice = pcNamed.TryGetValue("maxprice", out var pcMaxPriceStr) ? (decimal?)decimal.Parse(pcMaxPriceStr) : null;
+    var pcEntryStart = pcNamed.TryGetValue("entrystart", out var pcEntryStartStr) ? (TimeSpan?)TimeSpan.Parse(pcEntryStartStr) : null;
+    var pcEntryEnd = pcNamed.TryGetValue("entryend", out var pcEntryEndStr) ? (TimeSpan?)TimeSpan.Parse(pcEntryEndStr) : null;
 
-    Console.WriteLine($"=== Price-crossover simulation: side={pcSide} fast={pcFastBars} slow={pcSlowBars} thresholdPct={pcThresholdPct} barThreshold={pcBarVolumeThreshold}{(pcBandWidth is { } pcbw ? $", band={pcbw}" : ", single ATM strike")}{(pcPutFastBars is not null || pcPutSlowBars is not null ? $", putWindows={pcPutFastBars ?? pcFastBars}/{pcPutSlowBars ?? pcSlowBars}" : "")} ===");
+    Console.WriteLine($"=== Price-crossover simulation: side={pcSide} fast={pcFastBars}({pcFastType}) slow={pcSlowBars}({pcSlowType}) thresholdPct={pcThresholdPct} barThreshold={pcBarVolumeThreshold}{(pcBandWidth is { } pcbw ? $", band={pcbw}({pcBandComposition})" : ", single ATM strike")}{(pcPutFastBars is not null || pcPutSlowBars is not null ? $", putWindows={pcPutFastBars ?? pcFastBars}/{pcPutSlowBars ?? pcSlowBars}" : "")}{(pcMinPrice is not null || pcMaxPrice is not null ? $", entryPriceBand=[{pcMinPrice?.ToString() ?? "-inf"},{pcMaxPrice?.ToString() ?? "+inf"}]" : "")}{(pcEntryStart is not null || pcEntryEnd is not null ? $", entryWindow=[{pcEntryStart?.ToString() ?? "09:30:00"},{pcEntryEnd?.ToString() ?? "15:00:00"}]" : "")} ===");
     var pcAllTrades = new List<VolumeBarTrade>();
     for (var date = pcFromDate; date <= pcToDate; date = date.AddDays(1))
     {
         await using var source = new NiftySignalDbContext(tradeSourceOptions);
         await using var volumeBars = new VolumeBarDbContext(volumeBarOptions);
-        var dayTrades = await TradeSimulator.SimulatePriceCrossoverDayAsync(source, volumeBars, date, pcBarVolumeThreshold, pcSide, pcFastBars, pcSlowBars, pcThresholdPct / 100.0, CancellationToken.None, sharedOptionPriceCache, pcBandWidth, pcPutFastBars, pcPutSlowBars);
+        var dayTrades = await TradeSimulator.SimulatePriceCrossoverDayAsync(source, volumeBars, date, pcBarVolumeThreshold, pcSide, pcFastBars, pcSlowBars, pcThresholdPct / 100.0, CancellationToken.None, sharedOptionPriceCache, pcBandWidth, pcPutFastBars, pcPutSlowBars, pcFastType, pcSlowType, pcMinPrice, pcMaxPrice, pcBandComposition, pcEntryStart, pcEntryEnd);
         if (dayTrades.Count == 0)
         {
             continue;
@@ -1521,7 +1528,7 @@ if (args.Length > 0 && string.Equals(args[0], "price-crossover-calibrate", Strin
         || !DateOnly.TryParseExact(pccPositional[2], "yyyy-MM-dd", out var pccToDate)
         || !Enum.TryParse<PriceCrossoverSide>(pccPositional[3], ignoreCase: true, out var pccSide))
     {
-        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- price-crossover-calibrate <fromDate> <toDate> <side:Call|Put|DualAgreement|DualAgreementBothExit> [fastList=2,3,4,5,6,7,8,9,10] [slowList=10,15,20,25,30,35,40,45,50] [thresholdList=5] [barVolumeThreshold=650] [--band=3|5] [--zerodte=2026-09-08,2026-09-15] [--targetmin=5] [--targetmax=10]");
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- price-crossover-calibrate <fromDate> <toDate> <side:Call|Put|DualAgreement|DualAgreementBothExit> [fastList=2,3,4,5,6,7,8,9,10] [slowList=10,15,20,25,30,35,40,45,50] [thresholdList=5] [barVolumeThreshold=650] [--band=3|5] [--bandmode=Symmetric|ItmSide|OtmSide] [--zerodte=2026-09-08,2026-09-15] [--targetmin=5] [--targetmax=15] [--fasttype=Sma|Ema] [--slowtype=Sma|Ema] [--minprice=] [--maxprice=] [--entrystart=] [--entryend=] [--minsample=10] [--notop5]");
         return 1;
     }
 
@@ -1530,11 +1537,25 @@ if (args.Length > 0 && string.Equals(args[0], "price-crossover-calibrate", Strin
     var pccThresholdOptions = pccPositional.Length > 6 ? pccPositional[6].Split(',').Select(double.Parse).ToArray() : [5.0];
     var pccBarVolumeThreshold = pccPositional.Length > 7 ? long.Parse(pccPositional[7]) : 650L;
     var pccBandWidth = pccNamed.TryGetValue("band", out var pccBandStr) ? (int?)int.Parse(pccBandStr) : null;
+    var pccBandComposition = pccNamed.TryGetValue("bandmode", out var pccBandModeStr) ? Enum.Parse<PriceBandComposition>(pccBandModeStr, ignoreCase: true) : PriceBandComposition.Symmetric;
+    var pccFastType = pccNamed.TryGetValue("fasttype", out var pccFastTypeStr) ? Enum.Parse<MaType>(pccFastTypeStr, ignoreCase: true) : MaType.Sma;
+    var pccSlowType = pccNamed.TryGetValue("slowtype", out var pccSlowTypeStr) ? Enum.Parse<MaType>(pccSlowTypeStr, ignoreCase: true) : MaType.Sma;
+    var pccMinPrice = pccNamed.TryGetValue("minprice", out var pccMinPriceStr) ? (decimal?)decimal.Parse(pccMinPriceStr) : null;
+    var pccMaxPrice = pccNamed.TryGetValue("maxprice", out var pccMaxPriceStr) ? (decimal?)decimal.Parse(pccMaxPriceStr) : null;
+    var pccEntryStart = pccNamed.TryGetValue("entrystart", out var pccEntryStartStr) ? (TimeSpan?)TimeSpan.Parse(pccEntryStartStr) : null;
+    var pccEntryEnd = pccNamed.TryGetValue("entryend", out var pccEntryEndStr) ? (TimeSpan?)TimeSpan.Parse(pccEntryEndStr) : null;
     var pccZeroDteDates = (pccNamed.TryGetValue("zerodte", out var pccZeroDteStr)
         ? pccZeroDteStr.Split(',').Select(d => DateOnly.ParseExact(d, "yyyy-MM-dd"))
         : [DateOnly.Parse("2026-09-08"), DateOnly.Parse("2026-09-15")]).ToHashSet();
+    // 2026-09-23, user's own explicit standing target: "5 to 15 trades per day... ideal for
+    // simulation and live trading" -- replaces the previous 5-10 default (still overridable).
     var pccTargetMin = pccNamed.TryGetValue("targetmin", out var pccTargetMinStr) ? double.Parse(pccTargetMinStr) : 5.0;
-    var pccTargetMax = pccNamed.TryGetValue("targetmax", out var pccTargetMaxStr) ? double.Parse(pccTargetMaxStr) : 10.0;
+    var pccTargetMax = pccNamed.TryGetValue("targetmax", out var pccTargetMaxStr) ? double.Parse(pccTargetMaxStr) : 15.0;
+    // 2026-09-23, user's own explicit request: every sweep must surface top-5-by-metric tables
+    // (win rate, MFE, MAE, net), not just the raw grid -- --notop5 skips this (e.g. for a huge
+    // grid where the caller only wants the raw numbers, or is scripting further analysis).
+    var pccMinSample = pccNamed.TryGetValue("minsample", out var pccMinSampleStr) ? int.Parse(pccMinSampleStr) : 10;
+    var pccShowTop5 = !pccNamed.ContainsKey("notop5");
 
     // Real trading days present in range, split by DTE regime, for trades/day denominators --
     // same "don't divide by the padded calendar span" discipline "calibrate" uses above.
@@ -1551,8 +1572,17 @@ if (args.Length > 0 && string.Equals(args[0], "price-crossover-calibrate", Strin
     var pccZeroDays = pccAllDates.Where(d => pccZeroDteDates.Contains(d)).ToList();
     var pccNonZeroDays = pccAllDates.Where(d => !pccZeroDteDates.Contains(d)).ToList();
 
-    Console.WriteLine($"=== Price-crossover calibration sweep: side={pccSide}, barThreshold={pccBarVolumeThreshold}{(pccBandWidth is { } pccbw ? $", band={pccbw}" : ", single ATM strike")}, {pccFromDate:yyyy-MM-dd}..{pccToDate:yyyy-MM-dd}, {pccAllDates.Count} trading days ({pccZeroDays.Count} 0-DTE, {pccNonZeroDays.Count} non-0-DTE), target {pccTargetMin}-{pccTargetMax} trades/day (pooled) ===");
-    Console.WriteLine($"{"Fast",5} | {"Slow",5} | {"Thr%",5} || {"Pooled",6} {"Win%",6} {"Net",9} || {"0DTE",6} {"Win%",6} {"Net",9} || {"Non0DTE",7} {"Win%",6} {"Net",9} |In target?");
+    Console.WriteLine($"=== Price-crossover calibration sweep: side={pccSide}, maType=fast:{pccFastType}/slow:{pccSlowType}, barThreshold={pccBarVolumeThreshold}{(pccBandWidth is { } pccbw ? $", band={pccbw}({pccBandComposition})" : ", single ATM strike")}{(pccMinPrice is not null || pccMaxPrice is not null ? $", entryPriceBand=[{pccMinPrice?.ToString() ?? "-inf"},{pccMaxPrice?.ToString() ?? "+inf"}]" : "")}, {pccFromDate:yyyy-MM-dd}..{pccToDate:yyyy-MM-dd}, {pccAllDates.Count} trading days ({pccZeroDays.Count} 0-DTE, {pccNonZeroDays.Count} non-0-DTE), target {pccTargetMin}-{pccTargetMax} trades/day (pooled) ===");
+    // 2026-09-23, user's own explicit complaint: a day COUNT ("2 0-DTE days") is not enough to
+    // verify what was actually simulated -- the exact dates must always be stated, not just a count.
+    Console.WriteLine($"    0-DTE dates:     {(pccZeroDays.Count > 0 ? string.Join(", ", pccZeroDays.Select(d => d.ToString("yyyy-MM-dd"))) : "(none in range)")}");
+    Console.WriteLine($"    Non-0-DTE dates: {(pccNonZeroDays.Count > 0 ? string.Join(", ", pccNonZeroDays.Select(d => d.ToString("yyyy-MM-dd"))) : "(none in range)")}");
+    // 2026-09-23: every "Trades" count below is POOLED (summed) across every day in that column's
+    // group, never a single day's own count -- the (/day=X.X) figure alongside each is that
+    // pooled count divided by the number of days in the group, shown so per-day and pooled are
+    // never ambiguous side by side.
+    Console.WriteLine($"    All trade/net figures below are POOLED across every day in the named group (Pooled={pccAllDates.Count} days, 0DTE={pccZeroDays.Count} days, Non0DTE={pccNonZeroDays.Count} days) -- (/day=X.X) is that pooled count divided by the day count.");
+    Console.WriteLine($"{"Fast",5} | {"Slow",5} | {"Thr%",5} || {"PooledTrades",12} {"Win%",6} {"PooledNet",9} || {"0DTETrades",10} {"Win%",6} {"0DTENet",9} || {"N0DTETrades",11} {"Win%",6} {"N0DTENet",9} |In target?");
 
     // One SimulatePriceCrossoverDayAsync call per date (not per DTE-subset) -- a day's own trades
     // are the same regardless of which subset we're about to bucket them into, so running each
@@ -1564,11 +1594,20 @@ if (args.Length > 0 && string.Equals(args[0], "price-crossover-calibrate", Strin
     {
         await using var source = new NiftySignalDbContext(tradeSourceOptions);
         await using var volumeBars = new VolumeBarDbContext(volumeBarOptions);
-        return await TradeSimulator.SimulatePriceCrossoverDayAsync(source, volumeBars, date, pccBarVolumeThreshold, pccSide, fast, slow, thresholdPct / 100.0, CancellationToken.None, sharedOptionPriceCache, pccBandWidth, null, null);
+        return await TradeSimulator.SimulatePriceCrossoverDayAsync(source, volumeBars, date, pccBarVolumeThreshold, pccSide, fast, slow, thresholdPct / 100.0, CancellationToken.None, sharedOptionPriceCache, pccBandWidth, null, null, pccFastType, pccSlowType, pccMinPrice, pccMaxPrice, pccBandComposition, pccEntryStart, pccEntryEnd);
     }
 
     static (int Count, double WinPct, decimal Net) Summarize(List<VolumeBarTrade> trades)
         => (trades.Count, trades.Count > 0 ? 100.0 * trades.Count(t => t.NetPnlPoints > 0) / trades.Count : 0.0, trades.Sum(t => t.NetPnlPoints));
+
+    // 2026-09-23: one row per (fast, slow, threshold) cell, kept for the top-5-by-metric summary
+    // at the end -- cheap (win rate/net only, already computed for the printed grid), MAE/MFE
+    // deliberately NOT computed per-cell here (would require per-trade tick loading for every
+    // trade of every one of potentially thousands of cells -- prohibitively expensive). Instead,
+    // MAE/MFE is computed only for the handful of cells that make a top-5-by-winrate-or-net list,
+    // by re-running just those cells (cheap -- the option price series are already cached).
+    var pccCellRows = new List<(int Fast, int Slow, double Threshold,
+        (int Count, double WinPct, decimal Net) Pooled, (int Count, double WinPct, decimal Net) ZeroDte, (int Count, double WinPct, decimal Net) NonZeroDte)>();
 
     foreach (var fast in pccFastOptions)
     {
@@ -1594,6 +1633,7 @@ if (args.Length > 0 && string.Equals(args[0], "price-crossover-calibrate", Strin
                 var pooled = Summarize(pooledTrades);
                 var zeroDte = Summarize(zeroDteTrades);
                 var nonZeroDte = Summarize(nonZeroDteTrades);
+                pccCellRows.Add((fast, slow, threshold, pooled, zeroDte, nonZeroDte));
 
                 var tradesPerDay = pccAllDates.Count > 0 ? pooled.Count / (double)pccAllDates.Count : 0;
                 var inTarget = tradesPerDay >= pccTargetMin && tradesPerDay <= pccTargetMax;
@@ -1610,9 +1650,595 @@ if (args.Length > 0 && string.Equals(args[0], "price-crossover-calibrate", Strin
                 var tradesPerNonZeroDteDay = pccNonZeroDays.Count > 0 ? nonZeroDte.Count / (double)pccNonZeroDays.Count : 0;
                 var nonZeroDteInTarget = pccNonZeroDays.Count > 0 && tradesPerNonZeroDteDay >= pccTargetMin && tradesPerNonZeroDteDay <= pccTargetMax;
 
-                Console.WriteLine($"{fast,5} | {slow,5} | {threshold,5:F0} || {pooled.Count,6} {pooled.WinPct,5:F1}% {pooled.Net,9:F2} || {zeroDte.Count,6} {zeroDte.WinPct,5:F1}% {zeroDte.Net,9:F2} (/day={tradesPerZeroDteDay,4:F1}) || {nonZeroDte.Count,7} {nonZeroDte.WinPct,5:F1}% {nonZeroDte.Net,9:F2} (/day={tradesPerNonZeroDteDay,4:F1}) |{(inTarget ? "  <-- POOLED TARGET" : "")}{(zeroDteInTarget ? "  <-- 0DTE TARGET" : "")}{(nonZeroDteInTarget ? "  <-- NON0DTE TARGET" : "")}");
+                // 2026-09-23 bugfix: was {threshold,5:F0} -- rounded fractional thresholds (e.g.
+                // 0.5, 1.5, 2.5) to the nearest whole number in the DISPLAY ONLY (the actual
+                // simulation always used the exact double value), silently making two different
+                // threshold cells print with the same misleading label. F2 shows the true value.
+                Console.WriteLine($"{fast,5} | {slow,5} | {threshold,6:F2} || {pooled.Count,12} {pooled.WinPct,5:F1}% {pooled.Net,9:F2} (/day={tradesPerDay,4:F1}) || {zeroDte.Count,10} {zeroDte.WinPct,5:F1}% {zeroDte.Net,9:F2} (/day={tradesPerZeroDteDay,4:F1}) || {nonZeroDte.Count,11} {nonZeroDte.WinPct,5:F1}% {nonZeroDte.Net,9:F2} (/day={tradesPerNonZeroDteDay,4:F1}) |{(inTarget ? "  <-- POOLED TARGET" : "")}{(zeroDteInTarget ? "  <-- 0DTE TARGET" : "")}{(nonZeroDteInTarget ? "  <-- NON0DTE TARGET" : "")}");
             }
         }
+    }
+
+    if (!pccShowTop5)
+    {
+        return 0;
+    }
+
+    // 2026-09-23, user's own explicit standing request: every sweep surfaces top-5-by-metric
+    // tables (win rate, MFE, MAE, net), split by DTE regime -- not one pre-chosen "winner". Win
+    // rate/net come straight from the grid above (already computed, free). MAE/MFE requires
+    // per-trade tick loading, so it's only computed for the small UNION of cells that already
+    // make a top-5-by-winrate-or-net list in either regime (re-running just those cells is cheap
+    // -- the option price series are already cached in sharedOptionPriceCache).
+    async Task<(decimal AvgMaePct, decimal AvgMfePct)> ComputeAvgMaeMfeAsync(List<VolumeBarTrade> trades)
+    {
+        if (trades.Count == 0)
+        {
+            return (0m, 0m);
+        }
+
+        await using var mmSource = new NiftySignalDbContext(tradeSourceOptions);
+        var maePcts = new List<decimal>();
+        var mfePcts = new List<decimal>();
+        var chainCache = new Dictionary<DateOnly, List<NiftySignal.Domain.Entities.Instrument>>();
+        foreach (var t in trades)
+        {
+            var tradeDate = DateOnly.FromDateTime(t.EntryTime.UtcDateTime);
+            if (!chainCache.TryGetValue(tradeDate, out var chain))
+            {
+                var allOptions = await mmSource.Instruments
+                    .Where(i => i.AsOfDate == tradeDate && i.InstrumentType == NiftySignal.Domain.Enums.InstrumentType.Option && i.ExpiryDate != null && i.Underlying == "NIFTY")
+                    .ToListAsync();
+                chain = allOptions;
+                chainCache[tradeDate] = chain;
+            }
+
+            var instrument = chain.FirstOrDefault(i => i.StrikePrice == t.StrikePrice && i.OptionType == t.Side);
+            if (instrument is null)
+            {
+                continue;
+            }
+
+            var series = await OptionPriceSeries.LoadAsync(mmSource, instrument.Token, t.EntryTime, t.ExitTime, CancellationToken.None);
+            var prices = series.AllPrices.Select(p => p.Price).ToList();
+            var result = MaeMfeCalculator.Compute(t.EntryPrice, prices);
+            maePcts.Add(result.MaePercent);
+            mfePcts.Add(result.MfePercent);
+        }
+
+        return (maePcts.Count > 0 ? maePcts.Average() : 0m, mfePcts.Count > 0 ? mfePcts.Average() : 0m);
+    }
+
+    async Task PrintTop5Async(string regimeLabel, bool isZeroDte)
+    {
+        (int Count, double WinPct, decimal Net) Select((int Fast, int Slow, double Threshold, (int Count, double WinPct, decimal Net) Pooled, (int Count, double WinPct, decimal Net) ZeroDte, (int Count, double WinPct, decimal Net) NonZeroDte) row)
+            => isZeroDte ? row.ZeroDte : row.NonZeroDte;
+
+        var eligible = pccCellRows.Where(r => Select(r).Count >= pccMinSample).ToList();
+        if (eligible.Count == 0)
+        {
+            Console.WriteLine($"--- {regimeLabel}: no cell reached the minimum sample size (n>={pccMinSample}) ---");
+            return;
+        }
+
+        var byWinRate = eligible.OrderByDescending(r => Select(r).WinPct).Take(5).ToList();
+        var byNet = eligible.OrderByDescending(r => Select(r).Net).Take(5).ToList();
+
+        // MAE/MFE only computed for the union of cells appearing in either top-5 above -- re-runs
+        // just those cells' day-by-day trades (cached price series make this cheap) to get the
+        // exact trade list for this regime, then averages MAE%/MFE% across them.
+        var shortlist = byWinRate.Concat(byNet).Distinct().ToList();
+        var maeMfeByCell = new Dictionary<(int, int, double), (decimal MaePct, decimal MfePct)>();
+        foreach (var cell in shortlist)
+        {
+            var regimeTrades = new List<VolumeBarTrade>();
+            foreach (var date in (isZeroDte ? pccZeroDays : pccNonZeroDays))
+            {
+                regimeTrades.AddRange(await RunDayAsync(date, cell.Fast, cell.Slow, cell.Threshold));
+            }
+            maeMfeByCell[(cell.Fast, cell.Slow, cell.Threshold)] = await ComputeAvgMaeMfeAsync(regimeTrades);
+        }
+
+        var byMfe = shortlist.OrderByDescending(r => maeMfeByCell[(r.Fast, r.Slow, r.Threshold)].MfePct).Take(5).ToList();
+        var byMae = shortlist.OrderBy(r => maeMfeByCell[(r.Fast, r.Slow, r.Threshold)].MaePct).Take(5).ToList();
+
+        var regimeDayCount = (isZeroDte ? pccZeroDays : pccNonZeroDays).Count;
+
+        void PrintRows(string label, List<(int Fast, int Slow, double Threshold, (int Count, double WinPct, decimal Net) Pooled, (int Count, double WinPct, decimal Net) ZeroDte, (int Count, double WinPct, decimal Net) NonZeroDte)> rows)
+        {
+            Console.WriteLine($"  Top 5 by {label}:");
+            // 2026-09-23, user's own explicit complaint: earlier output didn't make clear whether
+            // "Trades" was per-day or pooled across the whole range -- TradesTotal/TradesPerDay are
+            // now BOTH always shown, no ambiguity. TradesTotal is POOLED across every day in this
+            // regime (regimeDayCount days); Net is likewise the SUM across all of those days, not a
+            // single day's own number.
+            Console.WriteLine($"    {"Fast",5} {"Slow",5} {"Thr%",6} {"TradesTotal",11} {"TradesPerDay",12} {"Win%",6} {"NetTotal",10} {"MAE%",7} {"MFE%",7}");
+            foreach (var r in rows)
+            {
+                var s = Select(r);
+                var (maePct, mfePct) = maeMfeByCell.TryGetValue((r.Fast, r.Slow, r.Threshold), out var mm) ? mm : (0m, 0m);
+                var perDay = regimeDayCount > 0 ? s.Count / (double)regimeDayCount : 0;
+                Console.WriteLine($"    {r.Fast,5} {r.Slow,5} {r.Threshold,6:F2} {s.Count,11} {perDay,12:F1} {s.WinPct,5:F1}% {s.Net,10:F2} {maePct,6:F2}% {mfePct,6:F2}%");
+            }
+        }
+
+        var regimeDates = (isZeroDte ? pccZeroDays : pccNonZeroDays).Select(d => d.ToString("yyyy-MM-dd"));
+        Console.WriteLine($"=== {regimeLabel} (min sample n>={pccMinSample} POOLED trades across {regimeDayCount} days: {string.Join(", ", regimeDates)} -- TradesTotal is pooled, TradesPerDay = TradesTotal / {regimeDayCount}) ===");
+        PrintRows("Win rate", byWinRate);
+        PrintRows("Net", byNet);
+        PrintRows("MFE%", byMfe);
+        PrintRows("MAE% (lowest first)", byMae);
+        Console.WriteLine();
+    }
+
+    Console.WriteLine();
+    Console.WriteLine("############# TOP-5-BY-METRIC SUMMARY #############");
+    await PrintTop5Async("0-DTE", isZeroDte: true);
+    await PrintTop5Async("Non-0-DTE", isZeroDte: false);
+
+    return 0;
+}
+
+// "signal-audit" -- 2026-09-23 correctness-review investigation, structural-only (no trade
+// simulation, no threshold optimization -- explicit user instruction). Reports, per day and side:
+// market-structure stats (bar count, distinct ATM strikes, strike changes, run-length distribution,
+// runs >=10/20/40/60 bars) which are ARCHITECTURE-INDEPENDENT (a property of the raw ATM sequence),
+// plus signal-generation stats (resets, warmed-up bars, raw sign flips, threshold-gated crossings,
+// trade candidates) for one or all three candidate signal architectures
+// (RollingReset/FixedAtm/RollingBackAdjusted -- see SignalArchitectureAudit's own doc comment).
+//   dotnet run --project NiftySignal.VolumeBarData -- signal-audit <fromDate> <toDate> <side:Call|Put> <fastBars> <slowBars> [thresholdPct=5] [barVolumeThreshold=2600] [--architecture=RollingReset|FixedAtm|RollingBackAdjusted|All] [--entrystart=09:30] [--entryend=15:00]
+if (args.Length > 0 && string.Equals(args[0], "signal-audit", StringComparison.OrdinalIgnoreCase))
+{
+    var (saPositional, saNamed) = SplitNamedArgs(args);
+    if (saPositional.Length < 6
+        || !DateOnly.TryParseExact(saPositional[1], "yyyy-MM-dd", out var saFromDate)
+        || !DateOnly.TryParseExact(saPositional[2], "yyyy-MM-dd", out var saToDate)
+        || !Enum.TryParse<OptionType>(saPositional[3], ignoreCase: true, out var saSide)
+        || !int.TryParse(saPositional[4], out var saFastBars)
+        || !int.TryParse(saPositional[5], out var saSlowBars))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- signal-audit <fromDate> <toDate> <side:Call|Put> <fastBars> <slowBars> [thresholdPct=5] [barVolumeThreshold=2600] [--architecture=RollingReset|FixedAtm|RollingBackAdjusted|All] [--entrystart=09:30] [--entryend=15:00]");
+        return 1;
+    }
+
+    var saThresholdPct = saPositional.Length > 6 ? double.Parse(saPositional[6]) : 5.0;
+    var saBarVolumeThreshold = saPositional.Length > 7 ? long.Parse(saPositional[7]) : 2600L;
+    var saArchitectures = saNamed.TryGetValue("architecture", out var saArchStr) && !string.Equals(saArchStr, "All", StringComparison.OrdinalIgnoreCase)
+        ? [Enum.Parse<SignalArchitectureAudit.SignalArchitecture>(saArchStr, ignoreCase: true)]
+        : Enum.GetValues<SignalArchitectureAudit.SignalArchitecture>();
+    var saEntryStart = saNamed.TryGetValue("entrystart", out var saEntryStartStr) ? (TimeSpan?)TimeSpan.Parse(saEntryStartStr) : null;
+    var saEntryEnd = saNamed.TryGetValue("entryend", out var saEntryEndStr) ? (TimeSpan?)TimeSpan.Parse(saEntryEndStr) : null;
+
+    Console.WriteLine($"=== Signal audit: side={saSide} fast={saFastBars} slow={saSlowBars} thr={saThresholdPct}% barThreshold={saBarVolumeThreshold} ===");
+    Console.WriteLine();
+    Console.WriteLine("--- Market structure (architecture-independent) ---");
+    Console.WriteLine($"{"Date",-12} {"Bars",6} {"Strikes",8} {"Changes",8} {"MaxRun",7} {">=10",5} {">=20",5} {">=40",5} {">=60",5}");
+    for (var date = saFromDate; date <= saToDate; date = date.AddDays(1))
+    {
+        await using var saSource0 = new NiftySignalDbContext(tradeSourceOptions);
+        await using var saVolumeBars0 = new VolumeBarDbContext(volumeBarOptions);
+        var ms = await SignalArchitectureAudit.ComputeMarketStructureAsync(saSource0, saVolumeBars0, date, saBarVolumeThreshold, saSide, CancellationToken.None);
+        if (ms.BarCount == 0)
+        {
+            continue;
+        }
+        Console.WriteLine($"{date:yyyy-MM-dd,-12} {ms.BarCount,6} {ms.DistinctStrikesSeen,8} {ms.StrikeChanges,8} {ms.MaxStableRun,7} {ms.RunsAtLeast10,5} {ms.RunsAtLeast20,5} {ms.RunsAtLeast40,5} {ms.RunsAtLeast60,5}");
+    }
+
+    foreach (var arch in saArchitectures)
+    {
+        Console.WriteLine();
+        Console.WriteLine($"--- Signal generation, architecture={arch} ---");
+        Console.WriteLine($"{"Date",-12} {"Resets",7} {"WarmBars",8} {"RawFlips",8} {"ThrUp",6} {"ThrDn",6} {"Candidates",10} {"Fallbacks",9}");
+        int totResets = 0, totWarm = 0, totRaw = 0, totThrUp = 0, totThrDn = 0, totCand = 0, totFallback = 0;
+        for (var date = saFromDate; date <= saToDate; date = date.AddDays(1))
+        {
+            await using var saSource1 = new NiftySignalDbContext(tradeSourceOptions);
+            await using var saVolumeBars1 = new VolumeBarDbContext(volumeBarOptions);
+            var (_, stats) = await SignalArchitectureAudit.RunDayAsync(saSource1, saVolumeBars1, date, saBarVolumeThreshold, saSide, saFastBars, saSlowBars, saThresholdPct / 100.0, arch, CancellationToken.None, saEntryStart, saEntryEnd);
+            if (stats.WarmedUpBars == 0 && stats.EngineResets == 0 && stats.RawSignFlips == 0)
+            {
+                continue;
+            }
+            Console.WriteLine($"{date:yyyy-MM-dd,-12} {stats.EngineResets,7} {stats.WarmedUpBars,8} {stats.RawSignFlips,8} {stats.ThresholdCrossingsUp,6} {stats.ThresholdCrossingsDown,6} {stats.TradeCandidates,10} {stats.FallbackAdjustments,9}");
+            totResets += stats.EngineResets;
+            totWarm += stats.WarmedUpBars;
+            totRaw += stats.RawSignFlips;
+            totThrUp += stats.ThresholdCrossingsUp;
+            totThrDn += stats.ThresholdCrossingsDown;
+            totCand += stats.TradeCandidates;
+            totFallback += stats.FallbackAdjustments;
+        }
+        Console.WriteLine($"{"TOTAL",-12} {totResets,7} {totWarm,8} {totRaw,8} {totThrUp,6} {totThrDn,6} {totCand,10} {totFallback,9}");
+    }
+
+    return 0;
+}
+
+// "signal-trace" -- 2026-09-23 correctness-review investigation: bar-by-bar visual trace for ONE
+// day, so the actual algorithm behavior (future price -> selected ATM strike -> option token ->
+// option price -> engine state -> reset/continue -> signal) can be read directly rather than
+// inferred. Only prints bars where something interesting happened (a strike change/reset, a raw
+// sign flip, or a threshold-gated crossing) by default, to keep output readable on a busy day --
+// pass --all to dump every bar.
+//   dotnet run --project NiftySignal.VolumeBarData -- signal-trace <date> <side:Call|Put> <fastBars> <slowBars> [thresholdPct=5] [barVolumeThreshold=2600] [--architecture=RollingReset|FixedAtm|RollingBackAdjusted] [--all]
+if (args.Length > 0 && string.Equals(args[0], "signal-trace", StringComparison.OrdinalIgnoreCase))
+{
+    var (stPositional, stNamed) = SplitNamedArgs(args);
+    if (stPositional.Length < 5
+        || !DateOnly.TryParseExact(stPositional[1], "yyyy-MM-dd", out var stDate)
+        || !Enum.TryParse<OptionType>(stPositional[2], ignoreCase: true, out var stSide)
+        || !int.TryParse(stPositional[3], out var stFastBars)
+        || !int.TryParse(stPositional[4], out var stSlowBars))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- signal-trace <date> <side:Call|Put> <fastBars> <slowBars> [thresholdPct=5] [barVolumeThreshold=2600] [--architecture=RollingReset|FixedAtm|RollingBackAdjusted] [--all]");
+        return 1;
+    }
+
+    var stThresholdPct = stPositional.Length > 5 ? double.Parse(stPositional[5]) : 5.0;
+    var stBarVolumeThreshold = stPositional.Length > 6 ? long.Parse(stPositional[6]) : 2600L;
+    var stArchitecture = stNamed.TryGetValue("architecture", out var stArchStr) ? Enum.Parse<SignalArchitectureAudit.SignalArchitecture>(stArchStr, ignoreCase: true) : SignalArchitectureAudit.SignalArchitecture.RollingReset;
+    var stAll = stNamed.ContainsKey("all");
+
+    await using var stSource = new NiftySignalDbContext(tradeSourceOptions);
+    await using var stVolumeBars = new VolumeBarDbContext(volumeBarOptions);
+    var (stTrace, stStats) = await SignalArchitectureAudit.RunDayAsync(stSource, stVolumeBars, stDate, stBarVolumeThreshold, stSide, stFastBars, stSlowBars, stThresholdPct / 100.0, stArchitecture, CancellationToken.None);
+
+    Console.WriteLine($"=== Signal trace: {stDate:yyyy-MM-dd} side={stSide} fast={stFastBars} slow={stSlowBars} thr={stThresholdPct}% bar={stBarVolumeThreshold} architecture={stArchitecture} ===");
+    Console.WriteLine($"{"Bar",4} {"TimeIST",8} {"FuturePx",9} {"AtmStrike",9} {"RawPx",8} {"EnginePx",8} {"Chg",3} {"Rst",3} {"FastMa",8} {"SlowMa",8} {"Diff%",7} {"Flip",4} {"Up",2} {"Dn",2}");
+    foreach (var b in stTrace)
+    {
+        if (!stAll && !b.StrikeChangedThisBar && !b.RawSignFlip && !b.ThresholdCrossedUp && !b.ThresholdCrossedDown)
+        {
+            continue;
+        }
+        Console.WriteLine($"{b.BarIndex,4} {FormatIst(b.Timestamp),8} {b.FuturePrice,9:F2} {(b.AtmStrike?.ToString("F0") ?? "--"),9} {(b.RawPrice?.ToString("F2") ?? "--"),8} {(b.EngineInputPrice?.ToString("F2") ?? "--"),8} {(b.StrikeChangedThisBar ? "Y" : ""),3} {(b.EngineReset ? "Y" : ""),3} {(b.FastMa?.ToString("F2") ?? "--"),8} {(b.SlowMa?.ToString("F2") ?? "--"),8} {(b.DiffFraction is { } d ? (d * 100).ToString("F2") : "--"),7} {(b.RawSignFlip ? "Y" : ""),4} {(b.ThresholdCrossedUp ? "Y" : ""),2} {(b.ThresholdCrossedDown ? "Y" : ""),2}");
+    }
+
+    Console.WriteLine();
+    Console.WriteLine($"--- Resets={stStats.EngineResets}, WarmedUpBars={stStats.WarmedUpBars}, RawSignFlips={stStats.RawSignFlips}, ThresholdCrossings={stStats.ThresholdCrossings}, TradeCandidates={stStats.TradeCandidates}, FallbackAdjustments={stStats.FallbackAdjustments} ---");
+    return 0;
+}
+
+// "price-crossover-dynamic" -- 2026-09-23, tests DynamicTickVelocityBarBuilder's adaptive bar
+// sizing against the price-crossover engine, in place of a fixed-threshold VolumeBarRow series.
+// Bars are built fresh IN-MEMORY for each requested date (never persisted -- no new dataset).
+// Reports trades/win/net BOTH per-day AND pooled across the whole range, explicitly labeled, per
+// the user's own explicit complaint that this distinction was unclear in earlier output.
+//   dotnet run --project NiftySignal.VolumeBarData -- price-crossover-dynamic <fromDate> <toDate> <side:Call|Put|DualAgreement|DualAgreementBothExit> [fastBars] [slowBars] [thresholdPct] [--low=2600] [--medium=1300] [--high=650] [--minprice=100] [--maxprice=150] [--zerodte=2026-09-08,2026-09-15]
+if (args.Length > 0 && string.Equals(args[0], "price-crossover-dynamic", StringComparison.OrdinalIgnoreCase))
+{
+    var (pdPositional, pdNamed) = SplitNamedArgs(args);
+    if (pdPositional.Length < 6
+        || !DateOnly.TryParseExact(pdPositional[1], "yyyy-MM-dd", out var pdFromDate)
+        || !DateOnly.TryParseExact(pdPositional[2], "yyyy-MM-dd", out var pdToDate)
+        || !Enum.TryParse<PriceCrossoverSide>(pdPositional[3], ignoreCase: true, out var pdSide)
+        || !int.TryParse(pdPositional[4], out var pdFastBars)
+        || !int.TryParse(pdPositional[5], out var pdSlowBars))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- price-crossover-dynamic <fromDate> <toDate> <side:Call|Put|DualAgreement|DualAgreementBothExit> <fastBars> <slowBars> [thresholdPct=1.0] [--low=2600] [--medium=1300] [--high=650] [--minprice=100] [--maxprice=150] [--zerodte=2026-09-08,2026-09-15]");
+        return 1;
+    }
+
+    var pdThresholdPct = pdPositional.Length > 6 ? double.Parse(pdPositional[6]) : 1.0;
+    var pdLow = pdNamed.TryGetValue("low", out var pdLowStr) ? long.Parse(pdLowStr) : 2600L;
+    var pdMedium = pdNamed.TryGetValue("medium", out var pdMediumStr) ? long.Parse(pdMediumStr) : 1300L;
+    var pdHigh = pdNamed.TryGetValue("high", out var pdHighStr) ? long.Parse(pdHighStr) : 650L;
+    var pdMinPrice = pdNamed.TryGetValue("minprice", out var pdMinPriceStr) ? (decimal?)decimal.Parse(pdMinPriceStr) : 100m;
+    var pdMaxPrice = pdNamed.TryGetValue("maxprice", out var pdMaxPriceStr) ? (decimal?)decimal.Parse(pdMaxPriceStr) : 150m;
+    var pdZeroDteDates = (pdNamed.TryGetValue("zerodte", out var pdZeroDteStr)
+        ? pdZeroDteStr.Split(',').Select(d => DateOnly.ParseExact(d, "yyyy-MM-dd"))
+        : [DateOnly.Parse("2026-09-08"), DateOnly.Parse("2026-09-15")]).ToHashSet();
+
+    Console.WriteLine($"=== Dynamic tick-velocity price-crossover: side={pdSide} fast={pdFastBars} slow={pdSlowBars} thr={pdThresholdPct}% thresholds(low/med/high)={pdLow}/{pdMedium}/{pdHigh} entryPriceBand=[{pdMinPrice},{pdMaxPrice}] ===");
+    Console.WriteLine();
+
+    var pdDayResults = new List<(DateOnly Date, bool IsZeroDte, int Trades, double WinPct, decimal Net, int LowBars, int MedBars, int HighBars)>();
+    for (var date = pdFromDate; date <= pdToDate; date = date.AddDays(1))
+    {
+        await using var pdSource = new NiftySignalDbContext(tradeSourceOptions);
+        var buildResult = await DynamicTickVelocityBarBuilder.BuildDayAsync(pdSource, date, CancellationToken.None, pdLow, pdMedium, pdHigh);
+        if (buildResult.Bars.Count == 0)
+        {
+            continue;
+        }
+
+        await using var pdSource2 = new NiftySignalDbContext(tradeSourceOptions);
+        await using var pdVolumeBars = new VolumeBarDbContext(volumeBarOptions); // unused when prebuiltBars is supplied, but still required by the method signature
+        var dayTrades = await TradeSimulator.SimulatePriceCrossoverDayAsync(pdSource2, pdVolumeBars, date, barVolumeThreshold: pdMedium, pdSide, pdFastBars, pdSlowBars, pdThresholdPct / 100.0, CancellationToken.None, sharedOptionPriceCache, minEntryPrice: pdMinPrice, maxEntryPrice: pdMaxPrice, prebuiltBars: buildResult.Bars);
+
+        var dayWin = dayTrades.Count > 0 ? 100.0 * dayTrades.Count(t => t.NetPnlPoints > 0) / dayTrades.Count : 0.0;
+        var dayNet = dayTrades.Sum(t => t.NetPnlPoints);
+        var isZeroDte = pdZeroDteDates.Contains(date);
+        pdDayResults.Add((date, isZeroDte, dayTrades.Count, dayWin, dayNet, buildResult.LowCount, buildResult.MediumCount, buildResult.HighCount));
+
+        Console.WriteLine($"{date:yyyy-MM-dd} ({(isZeroDte ? "0-DTE" : "non-0-DTE")}): {dayTrades.Count} trades THIS DAY, {dayWin:F1}% win rate, net {dayNet:F2} pts -- bar regime counts: low={buildResult.LowCount} med={buildResult.MediumCount} high={buildResult.HighCount} (total bars={buildResult.Bars.Count})");
+        foreach (var t in dayTrades)
+        {
+            var tside = t.Side == OptionType.Call ? "Call" : "Put";
+            Console.WriteLine($"    {FormatIst(t.EntryTime)} Long {tside}@{t.StrikePrice} entry={t.EntryPrice:F2} -> {FormatIst(t.ExitTime)} exit={t.ExitPrice:F2} ({t.ExitReason}) netPnl={t.NetPnlPoints:F2} ({t.NetPnlPercent:F1}%)");
+        }
+    }
+
+    Console.WriteLine();
+    if (pdDayResults.Count == 0)
+    {
+        Console.WriteLine("No trades fired across the requested range.");
+        return 0;
+    }
+
+    Console.WriteLine("############# SUMMARY -- POOLED ACROSS ALL DAYS IN EACH GROUP, NOT PER-DAY #############");
+    Console.WriteLine("(each day's own trades/win-rate/net were already printed above, per day, as they ran)");
+
+    // Pooled win rate needs the actual trade list, not just per-day win%, to average correctly
+    // (a simple average of daily win% would over-weight low-trade days) -- recompute properly here.
+    async Task<(int Count, double WinPct, decimal Net)> PooledStatsAsync(List<DateOnly> dates)
+    {
+        var all = new List<VolumeBarTrade>();
+        foreach (var date in dates)
+        {
+            await using var s = new NiftySignalDbContext(tradeSourceOptions);
+            var buildResult = await DynamicTickVelocityBarBuilder.BuildDayAsync(s, date, CancellationToken.None, pdLow, pdMedium, pdHigh);
+            if (buildResult.Bars.Count == 0)
+            {
+                continue;
+            }
+            await using var s2 = new NiftySignalDbContext(tradeSourceOptions);
+            await using var vb = new VolumeBarDbContext(volumeBarOptions);
+            all.AddRange(await TradeSimulator.SimulatePriceCrossoverDayAsync(s2, vb, date, pdMedium, pdSide, pdFastBars, pdSlowBars, pdThresholdPct / 100.0, CancellationToken.None, sharedOptionPriceCache, minEntryPrice: pdMinPrice, maxEntryPrice: pdMaxPrice, prebuiltBars: buildResult.Bars));
+        }
+        return (all.Count, all.Count > 0 ? 100.0 * all.Count(t => t.NetPnlPoints > 0) / all.Count : 0.0, all.Sum(t => t.NetPnlPoints));
+    }
+
+    var allStats = await PooledStatsAsync(pdDayResults.Select(r => r.Date).ToList());
+    var zeroStats = await PooledStatsAsync(pdDayResults.Where(r => r.IsZeroDte).Select(r => r.Date).ToList());
+    var nonZeroStats = await PooledStatsAsync(pdDayResults.Where(r => !r.IsZeroDte).Select(r => r.Date).ToList());
+    var zeroDayCount = pdDayResults.Count(r => r.IsZeroDte);
+    var nonZeroDayCount = pdDayResults.Count(r => !r.IsZeroDte);
+
+    Console.WriteLine();
+    // 2026-09-23: dates spelled out explicitly, not just a count -- a day COUNT alone isn't enough
+    // to verify what was actually simulated.
+    var pdAllDatesStr = string.Join(", ", pdDayResults.Select(r => r.Date.ToString("yyyy-MM-dd")));
+    var pdZeroDatesStr = string.Join(", ", pdDayResults.Where(r => r.IsZeroDte).Select(r => r.Date.ToString("yyyy-MM-dd")));
+    var pdNonZeroDatesStr = string.Join(", ", pdDayResults.Where(r => !r.IsZeroDte).Select(r => r.Date.ToString("yyyy-MM-dd")));
+    Console.WriteLine($"ALL DAYS:      {allStats.Count} trades POOLED over {pdDayResults.Count} days [{pdAllDatesStr}] ({allStats.Count / (double)pdDayResults.Count:F1}/day), {allStats.WinPct:F1}% win rate (pooled), net {allStats.Net:F2} pts POOLED");
+    Console.WriteLine($"0-DTE ONLY:    {zeroStats.Count} trades POOLED over {zeroDayCount} days [{pdZeroDatesStr}] ({(zeroDayCount > 0 ? zeroStats.Count / (double)zeroDayCount : 0):F1}/day), {zeroStats.WinPct:F1}% win rate (pooled), net {zeroStats.Net:F2} pts POOLED");
+    Console.WriteLine($"NON-0-DTE:     {nonZeroStats.Count} trades POOLED over {nonZeroDayCount} days [{pdNonZeroDatesStr}] ({(nonZeroDayCount > 0 ? nonZeroStats.Count / (double)nonZeroDayCount : 0):F1}/day), {nonZeroStats.WinPct:F1}% win rate (pooled), net {nonZeroStats.Net:F2} pts POOLED");
+
+    return 0;
+}
+
+// "entry-bar-quality" -- 2026-09-23, first-pass check on the user's question: does the ENTRY bar's
+// own TickCount (how many raw ticks filled it) or DurationSeconds (how long, wall-clock, it took to
+// fill) relate to trade outcome? Re-runs the real simulator to get actual trades, joins each trade's
+// entry bar back to its own VolumeBarRow (already stores both fields), and splits win/loss by
+// tick-count/duration terciles. Read-only, no trading logic touched.
+//   dotnet run --project NiftySignal.VolumeBarData -- entry-bar-quality <fromDate> <toDate> <side:Call|Put> <fastBars> <slowBars> [thresholdPct=5] [barVolumeThreshold=2600] [--minprice=] [--maxprice=]
+if (args.Length > 0 && string.Equals(args[0], "entry-bar-quality", StringComparison.OrdinalIgnoreCase))
+{
+    var (ebqPositional, ebqNamed) = SplitNamedArgs(args);
+    if (ebqPositional.Length < 6
+        || !DateOnly.TryParseExact(ebqPositional[1], "yyyy-MM-dd", out var ebqFromDate)
+        || !DateOnly.TryParseExact(ebqPositional[2], "yyyy-MM-dd", out var ebqToDate)
+        || !Enum.TryParse<PriceCrossoverSide>(ebqPositional[3], ignoreCase: true, out var ebqSide)
+        || !int.TryParse(ebqPositional[4], out var ebqFastBars)
+        || !int.TryParse(ebqPositional[5], out var ebqSlowBars))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- entry-bar-quality <fromDate> <toDate> <side:Call|Put> <fastBars> <slowBars> [thresholdPct=5] [barVolumeThreshold=2600] [--minprice=] [--maxprice=]");
+        return 1;
+    }
+
+    var ebqThresholdPct = ebqPositional.Length > 6 ? double.Parse(ebqPositional[6]) : 5.0;
+    var ebqBarVolumeThreshold = ebqPositional.Length > 7 ? long.Parse(ebqPositional[7]) : 2600L;
+    var ebqMinPrice = ebqNamed.TryGetValue("minprice", out var ebqMinPriceStr) ? (decimal?)decimal.Parse(ebqMinPriceStr) : null;
+    var ebqMaxPrice = ebqNamed.TryGetValue("maxprice", out var ebqMaxPriceStr) ? (decimal?)decimal.Parse(ebqMaxPriceStr) : null;
+
+    var ebqRows = new List<(VolumeBarTrade Trade, int TickCount, double DurationSeconds)>();
+    for (var date = ebqFromDate; date <= ebqToDate; date = date.AddDays(1))
+    {
+        await using var ebqSource = new NiftySignalDbContext(tradeSourceOptions);
+        await using var ebqVolumeBars = new VolumeBarDbContext(volumeBarOptions);
+        var dayTrades = await TradeSimulator.SimulatePriceCrossoverDayAsync(ebqSource, ebqVolumeBars, date, ebqBarVolumeThreshold, ebqSide, ebqFastBars, ebqSlowBars, ebqThresholdPct / 100.0, CancellationToken.None, sharedOptionPriceCache, minEntryPrice: ebqMinPrice, maxEntryPrice: ebqMaxPrice);
+        if (dayTrades.Count == 0)
+        {
+            continue;
+        }
+
+        var dayBars = await ebqVolumeBars.VolumeBars
+            .Where(b => b.AsOfDate == date && b.BarVolumeThreshold == ebqBarVolumeThreshold)
+            .ToListAsync();
+        foreach (var t in dayTrades)
+        {
+            var entryBar = dayBars.FirstOrDefault(b => b.EndTimestamp == t.EntryTime);
+            if (entryBar is not null)
+            {
+                ebqRows.Add((t, entryBar.TickCount, entryBar.DurationSeconds));
+            }
+        }
+    }
+
+    if (ebqRows.Count == 0)
+    {
+        Console.WriteLine("No trades fired across the requested range.");
+        return 0;
+    }
+
+    Console.WriteLine($"=== Entry-bar quality check: {ebqRows.Count} trades, side={ebqSide} fast={ebqFastBars} slow={ebqSlowBars} thr={ebqThresholdPct}% bar={ebqBarVolumeThreshold} ===");
+    Console.WriteLine($"{"EntryTime",10} | {"TickCount",9} | {"DurationSec",11} | {"NetPnl",8} | Win?");
+    foreach (var r in ebqRows.OrderBy(r => r.Trade.EntryTime))
+    {
+        Console.WriteLine($"{FormatIst(r.Trade.EntryTime),10} | {r.TickCount,9} | {r.DurationSeconds,11:F1} | {r.Trade.NetPnlPoints,8:F2} | {(r.Trade.NetPnlPoints > 0 ? "W" : "L")}");
+    }
+
+    var winners = ebqRows.Where(r => r.Trade.NetPnlPoints > 0).ToList();
+    var losers = ebqRows.Where(r => r.Trade.NetPnlPoints <= 0).ToList();
+    Console.WriteLine();
+    Console.WriteLine($"--- Winners (n={winners.Count}): avg TickCount={(winners.Count > 0 ? winners.Average(r => r.TickCount) : 0):F1}, avg DurationSec={(winners.Count > 0 ? winners.Average(r => r.DurationSeconds) : 0):F1} ---");
+    Console.WriteLine($"--- Losers  (n={losers.Count}): avg TickCount={(losers.Count > 0 ? losers.Average(r => r.TickCount) : 0):F1}, avg DurationSec={(losers.Count > 0 ? losers.Average(r => r.DurationSeconds) : 0):F1} ---");
+
+    // Tercile split by TickCount (bar "busyness") and by DurationSeconds (bar "speed") --
+    // reports win rate in each tercile so a relationship (if any) is visible directly, not just
+    // as an average difference that could hide a non-monotonic pattern.
+    void PrintTerciles(string label, Func<(VolumeBarTrade Trade, int TickCount, double DurationSeconds), double> selector)
+    {
+        var sorted = ebqRows.OrderBy(selector).ToList();
+        var third = Math.Max(1, sorted.Count / 3);
+        var low = sorted.Take(third).ToList();
+        var high = sorted.Skip(sorted.Count - third).ToList();
+        var mid = sorted.Skip(third).Take(sorted.Count - 2 * third).ToList();
+        static string Stat(List<(VolumeBarTrade Trade, int TickCount, double DurationSeconds)> g)
+            => g.Count > 0 ? $"n={g.Count}, win%={100.0 * g.Count(r => r.Trade.NetPnlPoints > 0) / g.Count:F1}, net={g.Sum(r => r.Trade.NetPnlPoints):F2}" : "n=0";
+        Console.WriteLine($"--- {label} terciles: LOW [{Stat(low)}]  MID [{Stat(mid)}]  HIGH [{Stat(high)}] ---");
+    }
+
+    PrintTerciles("TickCount", r => r.TickCount);
+    PrintTerciles("DurationSeconds", r => r.DurationSeconds);
+
+    return 0;
+}
+
+// "atm-drift-check" -- 2026-09-23 correctness-review diagnostic, user's explicit request: confirm
+// SimulatePriceCrossoverDayAsync's rolling-ATM signal price doesn't silently splice together
+// different strikes' premiums within one crossover window (e.g. computing a "fast MA" partly from
+// 24500CE and partly from 24400CE without anyone noticing). Read-only, no trade logic touched --
+// runs the REAL price-crossover simulator to get the actual trades fired, then independently
+// recomputes the Call/Put ATM strike at every bar (same AtmStrikeSelector.PickAtm call the
+// simulator itself uses) and checks whether the ATM strike stayed constant across the trailing
+// slowBars-wide window ending at each trade's own entry bar -- i.e., was the fast/slow MA that
+// decided to enter actually built from ONE instrument's price history, or from a strike that
+// rolled underneath the measurement.
+//   dotnet run --project NiftySignal.VolumeBarData -- atm-drift-check <fromDate> <toDate> <side:Call|Put> <fastBars> <slowBars> [thresholdPct=5] [barVolumeThreshold=2600] [--minprice=] [--maxprice=]
+if (args.Length > 0 && string.Equals(args[0], "atm-drift-check", StringComparison.OrdinalIgnoreCase))
+{
+    var (adPositional, adNamed) = SplitNamedArgs(args);
+    if (adPositional.Length < 6
+        || !DateOnly.TryParseExact(adPositional[1], "yyyy-MM-dd", out var adFromDate)
+        || !DateOnly.TryParseExact(adPositional[2], "yyyy-MM-dd", out var adToDate)
+        || !Enum.TryParse<OptionType>(adPositional[3], ignoreCase: true, out var adSide)
+        || !int.TryParse(adPositional[4], out var adFastBars)
+        || !int.TryParse(adPositional[5], out var adSlowBars))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- atm-drift-check <fromDate> <toDate> <side:Call|Put> <fastBars> <slowBars> [thresholdPct=5] [barVolumeThreshold=2600] [--minprice=] [--maxprice=]");
+        return 1;
+    }
+
+    var adThresholdPct = adPositional.Length > 6 ? double.Parse(adPositional[6]) : 5.0;
+    var adBarVolumeThreshold = adPositional.Length > 7 ? long.Parse(adPositional[7]) : 2600L;
+    var adMinPrice = adNamed.TryGetValue("minprice", out var adMinPriceStr) ? (decimal?)decimal.Parse(adMinPriceStr) : null;
+    var adMaxPrice = adNamed.TryGetValue("maxprice", out var adMaxPriceStr) ? (decimal?)decimal.Parse(adMaxPriceStr) : null;
+    var adCrossoverSide = adSide == OptionType.Call ? PriceCrossoverSide.Call : PriceCrossoverSide.Put;
+
+    Console.WriteLine($"=== ATM drift check: side={adSide} fast={adFastBars} slow={adSlowBars} thr={adThresholdPct}% barThreshold={adBarVolumeThreshold}{(adMinPrice is not null || adMaxPrice is not null ? $" entryPriceBand=[{adMinPrice},{adMaxPrice}]" : "")} ===");
+    var adStableCount = 0;
+    var adRolledCount = 0;
+    var adTotalTrades = 0;
+    for (var date = adFromDate; date <= adToDate; date = date.AddDays(1))
+    {
+        await using var adSource1 = new NiftySignalDbContext(tradeSourceOptions);
+        await using var adVolumeBars1 = new VolumeBarDbContext(volumeBarOptions);
+        var adTrades = await TradeSimulator.SimulatePriceCrossoverDayAsync(adSource1, adVolumeBars1, date, adBarVolumeThreshold, adCrossoverSide, adFastBars, adSlowBars, adThresholdPct / 100.0, CancellationToken.None, sharedOptionPriceCache, bandWidth: null, minEntryPrice: adMinPrice, maxEntryPrice: adMaxPrice);
+        if (adTrades.Count == 0)
+        {
+            continue;
+        }
+
+        await using var adSource2 = new NiftySignalDbContext(tradeSourceOptions);
+        await using var adVolumeBars2 = new VolumeBarDbContext(volumeBarOptions);
+        var adBars = await adVolumeBars2.VolumeBars
+            .Where(b => b.AsOfDate == date && b.BarVolumeThreshold == adBarVolumeThreshold)
+            .OrderBy(b => b.BarIndex)
+            .ToListAsync();
+        var adAllOptions = await adSource2.Instruments
+            .Where(i => i.AsOfDate == date && i.InstrumentType == NiftySignal.Domain.Enums.InstrumentType.Option && i.ExpiryDate != null && i.Underlying == "NIFTY")
+            .ToListAsync();
+        if (adBars.Count == 0 || adAllOptions.Count == 0)
+        {
+            continue;
+        }
+
+        var adNearestExpiry = adAllOptions.Select(o => o.ExpiryDate!.Value).Min();
+        var adChain = adAllOptions.Where(o => o.ExpiryDate == adNearestExpiry).ToList();
+        // Same PickAtm call the real simulator uses, recomputed independently per bar for this check.
+        var adAtmStrikePerBar = adBars.Select(b => NiftySignal.Scoring.AtmStrikeSelector.PickAtm(adChain, adSide, b.ClosePrice)?.StrikePrice).ToList();
+
+        foreach (var trade in adTrades)
+        {
+            var entryBarIndex = adBars.FindIndex(b => b.EndTimestamp == trade.EntryTime);
+            if (entryBarIndex < 0)
+            {
+                Console.WriteLine($"  {date:yyyy-MM-dd} {FormatIst(trade.EntryTime)}: WARNING -- could not locate entry bar, skipping");
+                continue;
+            }
+
+            var windowStart = Math.Max(0, entryBarIndex - adSlowBars + 1);
+            var strikesInWindow = adAtmStrikePerBar.Skip(windowStart).Take(entryBarIndex - windowStart + 1).Distinct().ToList();
+            adTotalTrades++;
+            if (strikesInWindow.Count <= 1)
+            {
+                adStableCount++;
+            }
+            else
+            {
+                adRolledCount++;
+                Console.WriteLine($"  {date:yyyy-MM-dd} {FormatIst(trade.EntryTime)} entryStrike={trade.StrikePrice}: ATM ROLLED within the trailing {adSlowBars}-bar signal window -- strikes seen: {string.Join(" -> ", strikesInWindow)}");
+            }
+        }
+    }
+
+    Console.WriteLine();
+    Console.WriteLine($"--- ATM drift summary: {adTotalTrades} trades checked, {adStableCount} with a STABLE signal-window ATM strike, {adRolledCount} where ATM rolled mid-window ({(adTotalTrades > 0 ? 100.0 * adRolledCount / adTotalTrades : 0):F1}%) ---");
+
+    // 2026-09-23: day-level report independent of whether any trades fired at all -- explains WHY a
+    // reset-on-roll fix can end up firing zero trades (if the ATM strike changes almost every bar,
+    // a slowBars-long same-strike run practically never accumulates, regardless of any crossover
+    // logic). Reports raw strike-change frequency and the longest same-strike run, per date.
+    Console.WriteLine();
+    Console.WriteLine("--- Day-level ATM strike stability (independent of trades) ---");
+    for (var date = adFromDate; date <= adToDate; date = date.AddDays(1))
+    {
+        await using var adSource3 = new NiftySignalDbContext(tradeSourceOptions);
+        await using var adVolumeBars3 = new VolumeBarDbContext(volumeBarOptions);
+        var adDayBars = await adVolumeBars3.VolumeBars
+            .Where(b => b.AsOfDate == date && b.BarVolumeThreshold == adBarVolumeThreshold)
+            .OrderBy(b => b.BarIndex)
+            .ToListAsync();
+        var adDayOptions = await adSource3.Instruments
+            .Where(i => i.AsOfDate == date && i.InstrumentType == NiftySignal.Domain.Enums.InstrumentType.Option && i.ExpiryDate != null && i.Underlying == "NIFTY")
+            .ToListAsync();
+        if (adDayBars.Count == 0 || adDayOptions.Count == 0)
+        {
+            continue;
+        }
+
+        var adDayExpiry = adDayOptions.Select(o => o.ExpiryDate!.Value).Min();
+        var adDayChain = adDayOptions.Where(o => o.ExpiryDate == adDayExpiry).ToList();
+        var adDayStrikes = adDayBars.Select(b => NiftySignal.Scoring.AtmStrikeSelector.PickAtm(adDayChain, adSide, b.ClosePrice)?.StrikePrice).ToList();
+
+        var adChanges = 0;
+        var adLongestRun = 0;
+        var adCurrentRun = 0;
+        decimal? adPrev = null;
+        foreach (var s in adDayStrikes)
+        {
+            if (s is null)
+            {
+                continue;
+            }
+            if (adPrev is { } p && s != p)
+            {
+                adChanges++;
+                adCurrentRun = 1;
+            }
+            else
+            {
+                adCurrentRun++;
+            }
+            adLongestRun = Math.Max(adLongestRun, adCurrentRun);
+            adPrev = s;
+        }
+
+        Console.WriteLine($"  {date:yyyy-MM-dd}: {adDayBars.Count} bars, {adDayStrikes.Distinct().Count()} distinct ATM strikes seen, {adChanges} strike changes, longest same-strike run = {adLongestRun} bars (need >= {adSlowBars} for this window's slow leg to ever warm up)");
     }
 
     return 0;
@@ -3178,7 +3804,7 @@ if (args.Length > 0 && string.Equals(args[0], "mae-mfe", StringComparison.Ordina
     {
         Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- mae-mfe trade <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> <metric> [entryPercentile] [trendWindowBars] [barVolumeThreshold] [--band=N] [--minprice=] [--maxprice=]");
         Console.Error.WriteLine("   or: dotnet run --project NiftySignal.VolumeBarData -- mae-mfe crossover <fromDate> <toDate> [fastBars=4] [slowBars=12] [thresholdPoints=2] [barVolumeThreshold=2600] [--metric=] [--band=5] [--minprice=] [--maxprice=]");
-        Console.Error.WriteLine("   or: dotnet run --project NiftySignal.VolumeBarData -- mae-mfe price-crossover <fromDate> <toDate> <side:Call|Put|DualAgreement|DualAgreementBothExit> [fastBars=3] [slowBars=10] [thresholdPct=1.0] [barVolumeThreshold=2600] [--band=3|5] [--putfast=] [--putslow=]");
+        Console.Error.WriteLine("   or: dotnet run --project NiftySignal.VolumeBarData -- mae-mfe price-crossover <fromDate> <toDate> <side:Call|Put|DualAgreement|DualAgreementBothExit> [fastBars=3] [slowBars=10] [thresholdPct=1.0] [barVolumeThreshold=2600] [--band=3|5] [--bandmode=Symmetric|ItmSide|OtmSide] [--putfast=] [--putslow=] [--fasttype=Sma|Ema] [--slowtype=Sma|Ema] [--minprice=] [--maxprice=]");
         return 1;
     }
 
@@ -3268,14 +3894,21 @@ if (args.Length > 0 && string.Equals(args[0], "mae-mfe", StringComparison.Ordina
         var mmPcBandWidth = mmNamed.TryGetValue("band", out var mmPcBandStr) ? (int?)int.Parse(mmPcBandStr) : null;
         var mmPcPutFastBars = mmNamed.TryGetValue("putfast", out var mmPcPutFastStr) ? (int?)int.Parse(mmPcPutFastStr) : null;
         var mmPcPutSlowBars = mmNamed.TryGetValue("putslow", out var mmPcPutSlowStr) ? (int?)int.Parse(mmPcPutSlowStr) : null;
+        var mmPcFastType = mmNamed.TryGetValue("fasttype", out var mmPcFastTypeStr) ? Enum.Parse<MaType>(mmPcFastTypeStr, ignoreCase: true) : MaType.Sma;
+        var mmPcSlowType = mmNamed.TryGetValue("slowtype", out var mmPcSlowTypeStr) ? Enum.Parse<MaType>(mmPcSlowTypeStr, ignoreCase: true) : MaType.Sma;
+        var mmPcMinPrice = mmNamed.TryGetValue("minprice", out var mmPcMinPriceStr) ? (decimal?)decimal.Parse(mmPcMinPriceStr) : null;
+        var mmPcMaxPrice = mmNamed.TryGetValue("maxprice", out var mmPcMaxPriceStr) ? (decimal?)decimal.Parse(mmPcMaxPriceStr) : null;
+        var mmPcBandComposition = mmNamed.TryGetValue("bandmode", out var mmPcBandModeStr) ? Enum.Parse<PriceBandComposition>(mmPcBandModeStr, ignoreCase: true) : PriceBandComposition.Symmetric;
+        var mmPcEntryStart = mmNamed.TryGetValue("entrystart", out var mmPcEntryStartStr) ? (TimeSpan?)TimeSpan.Parse(mmPcEntryStartStr) : null;
+        var mmPcEntryEnd = mmNamed.TryGetValue("entryend", out var mmPcEntryEndStr) ? (TimeSpan?)TimeSpan.Parse(mmPcEntryEndStr) : null;
 
-        Console.WriteLine($"=== mae-mfe price-crossover: side={mmPcSide} fast={mmPcFastBars} slow={mmPcSlowBars} thresholdPct={mmPcThresholdPct} barThreshold={mmPcBarVolumeThreshold}{(mmPcBandWidth is { } mmpcbw ? $", band={mmpcbw}" : "")} ===");
+        Console.WriteLine($"=== mae-mfe price-crossover: side={mmPcSide} fast={mmPcFastBars}({mmPcFastType}) slow={mmPcSlowBars}({mmPcSlowType}) thresholdPct={mmPcThresholdPct} barThreshold={mmPcBarVolumeThreshold}{(mmPcBandWidth is { } mmpcbw ? $", band={mmpcbw}({mmPcBandComposition})" : "")}{(mmPcMinPrice is not null || mmPcMaxPrice is not null ? $", entryPriceBand=[{mmPcMinPrice?.ToString() ?? "-inf"},{mmPcMaxPrice?.ToString() ?? "+inf"}]" : "")} ===");
         mmTrades = [];
         for (var date = mmFromDate; date <= mmToDate; date = date.AddDays(1))
         {
             await using var mmSource = new NiftySignalDbContext(tradeSourceOptions);
             await using var mmVolumeBars = new VolumeBarDbContext(volumeBarOptions);
-            mmTrades.AddRange(await TradeSimulator.SimulatePriceCrossoverDayAsync(mmSource, mmVolumeBars, date, mmPcBarVolumeThreshold, mmPcSide, mmPcFastBars, mmPcSlowBars, mmPcThresholdPct / 100.0, CancellationToken.None, sharedOptionPriceCache, mmPcBandWidth, mmPcPutFastBars, mmPcPutSlowBars));
+            mmTrades.AddRange(await TradeSimulator.SimulatePriceCrossoverDayAsync(mmSource, mmVolumeBars, date, mmPcBarVolumeThreshold, mmPcSide, mmPcFastBars, mmPcSlowBars, mmPcThresholdPct / 100.0, CancellationToken.None, sharedOptionPriceCache, mmPcBandWidth, mmPcPutFastBars, mmPcPutSlowBars, mmPcFastType, mmPcSlowType, mmPcMinPrice, mmPcMaxPrice, mmPcBandComposition, mmPcEntryStart, mmPcEntryEnd));
         }
     }
 

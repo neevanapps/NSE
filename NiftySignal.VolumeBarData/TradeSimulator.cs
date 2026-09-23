@@ -3181,14 +3181,54 @@ public static class TradeSimulator
     /// <paramref name="bandWidth"/> null means single-ATM-strike price (the base case); a value
     /// (3 = ATM+/-1, 5 = ATM+/-2, same convention as <see cref="OptionDepthPopulator"/>) averages
     /// that many strikes' own real prices at each bar instead.
+    ///
+    /// <paramref name="fastType"/>/<paramref name="slowType"/> (2026-09-23) select SMA or EMA for
+    /// each leg -- default SMA/SMA reproduces this method's original behavior exactly. Applied to
+    /// BOTH the Call and Put <see cref="PriceCrossoverEngine"/> instances uniformly (no separate
+    /// per-side type override, unlike the per-side window overrides above) -- a documented scope
+    /// decision, not yet a tested need, per this project's "don't add a knob before a finding
+    /// justifies it" discipline.
+    ///
+    /// <paramref name="bandComposition"/> (2026-09-23) selects which strikes make up the SIGNAL
+    /// price when <paramref name="bandWidth"/> is set -- Symmetric (default) is the original
+    /// ATM+/-N behavior; ItmSide/OtmSide take all <paramref name="bandWidth"/> strikes from one
+    /// side of ATM only. Ignored when <paramref name="bandWidth"/> is null (single-ATM). This is
+    /// about the SIGNAL price the crossover engine reacts to, not the entry strike itself (that is
+    /// <paramref name="minEntryPrice"/>/<paramref name="maxEntryPrice"/>, still always the plain ATM
+    /// strike search).
+    ///
+    /// <paramref name="minEntryPrice"/>/<paramref name="maxEntryPrice"/> (2026-09-23, closing a gap
+    /// this method had that <see cref="SimulateDayAsync"/>/<see cref="SimulateCrossoverDayAsync"/>
+    /// already closed on 2026-09-21): before this, entry ALWAYS used the pure ATM strike regardless
+    /// of that strike's own live premium -- this method had no [100,150]-style entry-premium band at
+    /// all, unlike the other two simulators. Same convention as those two, duplicated rather than
+    /// shared for the same reason (closes over this method's own local state): null/null (the
+    /// default) is byte-identical to the original ATM-only behavior; when either bound is set, the
+    /// chain is searched outward from ATM by strike distance and the FIRST strike whose live premium
+    /// at this bar's timestamp falls inside [minEntryPrice, maxEntryPrice] is taken, not necessarily
+    /// the pure-ATM strike.
     /// </summary>
     public static async Task<List<VolumeBarTrade>> SimulatePriceCrossoverDayAsync(
         NiftySignalDbContext source, VolumeBarDbContext volumeBarDb, DateOnly asOfDate, long barVolumeThreshold,
         PriceCrossoverSide side, int fastBars, int slowBars, double thresholdFraction, CancellationToken cancellationToken,
         Dictionary<(DateOnly, string), OptionPriceSeries>? sharedPriceCache = null,
-        int? bandWidth = null, int? putFastBars = null, int? putSlowBars = null)
+        int? bandWidth = null, int? putFastBars = null, int? putSlowBars = null,
+        MaType fastType = MaType.Sma, MaType slowType = MaType.Sma,
+        decimal? minEntryPrice = null, decimal? maxEntryPrice = null,
+        PriceBandComposition bandComposition = PriceBandComposition.Symmetric,
+        TimeSpan? entryWindowStartOverride = null, TimeSpan? entryWindowEndOverride = null,
+        List<VolumeBarRow>? prebuiltBars = null)
     {
-        var bars = await volumeBarDb.VolumeBars
+        // 2026-09-23, session-of-day drill-down -- same override convention SimulateDayAsync already
+        // uses. Null (default) keeps the original EntryWindowStart/EntryWindowEnd (09:30-15:00)
+        // unchanged for every existing caller.
+        var effectiveEntryWindowStart = entryWindowStartOverride ?? EntryWindowStart;
+        var effectiveEntryWindowEnd = entryWindowEndOverride ?? EntryWindowEnd;
+        // 2026-09-23, dynamic tick-velocity bar-sizing experiment: prebuiltBars lets a caller supply
+        // an already-built, in-memory bar sequence (e.g. DynamicTickVelocityBarBuilder's output)
+        // instead of reading a fixed-threshold series from VolumeBarDbContext -- null (default,
+        // every existing caller) is byte-identical to the original DB-query-only behavior.
+        var bars = prebuiltBars ?? await volumeBarDb.VolumeBars
             .Where(b => b.AsOfDate == asOfDate && b.BarVolumeThreshold == barVolumeThreshold)
             .OrderBy(b => b.BarIndex)
             .ToListAsync(cancellationToken);
@@ -3240,31 +3280,79 @@ public static class TradeSimulator
         // bar's timestamp (there is no existing "average price across a band" field anywhere in this
         // project -- OptionDepthBarRow only aggregates resting QUANTITY, never price -- so this is
         // computed fresh here from the ATM strike's ordinal position in the sorted strike list).
-        async Task<double?> GetPriceAsync(OptionType optSide, decimal futurePrice, DateTimeOffset atTime)
+        //
+        // 2026-09-23: bandComposition ("which side of ATM the extra strikes come from") added
+        // alongside bandWidth ("how many strikes total"). Symmetric is the ORIGINAL, still-default
+        // behavior (bandWidth strikes centered on ATM). ItmSide/OtmSide take bandWidth strikes but
+        // ALL the non-ATM ones from one side only -- ATM plus (bandWidth-1) strikes moving into the
+        // money or out of the money. ITM/OTM DIRECTION FLIPS BY OPTION SIDE in strike-index terms:
+        // for a Call, ITM = strikes BELOW the future price = LOWER index in callStrikesSorted (an
+        // ascending list); for a Put, ITM = strikes ABOVE the future price = HIGHER index in
+        // putStrikesSorted. Getting this backwards for either side would silently swap ITM and OTM
+        // for that side -- handled explicitly per optSide below, not assumed symmetric.
+        // 2026-09-23: returns the ANCHOR ATM strike alongside the price so the caller can detect a
+        // roll and reset the crossover engine (see PriceCrossoverEngine.Reset's own doc comment) --
+        // for the band-averaged case this is the strike the band was centered/anchored on, not
+        // necessarily one of the strikes actually averaged, but it's the correct roll signal either
+        // way since the WHOLE band composition shifts whenever this anchor does.
+        async Task<(double? Price, decimal? AtmStrike)> GetPriceAsync(OptionType optSide, decimal futurePrice, DateTimeOffset atTime)
         {
             var atm = PickAtm(optSide, futurePrice);
             if (atm is null)
             {
-                return null;
+                return (null, null);
             }
 
             if (bandWidth is not { } bw)
             {
                 var atmSeries = await GetSeriesAsync(atm.Token);
                 var atmPrice = atmSeries.PriceAtOrBefore(atTime);
-                return atmPrice is { } ap && ap > 0 ? (double)ap : null;
+                return (atmPrice is { } ap && ap > 0 ? (double)ap : null, atm.StrikePrice);
             }
 
             var strikesSorted = optSide == OptionType.Call ? callStrikesSorted : putStrikesSorted;
             var atmIndex = strikesSorted.IndexOf(atm.StrikePrice!.Value);
             if (atmIndex < 0)
             {
-                return null;
+                return (null, null);
             }
 
-            var half = (bw - 1) / 2;
-            var loIndex = Math.Max(0, atmIndex - half);
-            var hiIndex = Math.Min(strikesSorted.Count - 1, atmIndex + half);
+            int loIndex, hiIndex;
+            switch (bandComposition)
+            {
+                case PriceBandComposition.ItmSide:
+                    // Call ITM = lower strikes = lower index; Put ITM = higher strikes = higher index.
+                    if (optSide == OptionType.Call)
+                    {
+                        loIndex = Math.Max(0, atmIndex - (bw - 1));
+                        hiIndex = atmIndex;
+                    }
+                    else
+                    {
+                        loIndex = atmIndex;
+                        hiIndex = Math.Min(strikesSorted.Count - 1, atmIndex + (bw - 1));
+                    }
+                    break;
+                case PriceBandComposition.OtmSide:
+                    // Mirror image of ItmSide.
+                    if (optSide == OptionType.Call)
+                    {
+                        loIndex = atmIndex;
+                        hiIndex = Math.Min(strikesSorted.Count - 1, atmIndex + (bw - 1));
+                    }
+                    else
+                    {
+                        loIndex = Math.Max(0, atmIndex - (bw - 1));
+                        hiIndex = atmIndex;
+                    }
+                    break;
+                default: // Symmetric -- original, still-default behavior, unchanged.
+                    var half = (bw - 1) / 2;
+                    loIndex = Math.Max(0, atmIndex - half);
+                    hiIndex = Math.Min(strikesSorted.Count - 1, atmIndex + half);
+                    break;
+            }
+
             var prices = new List<double>();
             for (var idx = loIndex; idx <= hiIndex; idx++)
             {
@@ -3278,28 +3366,94 @@ public static class TradeSimulator
                 }
             }
 
-            return prices.Count > 0 ? prices.Average() : null;
+            return (prices.Count > 0 ? prices.Average() : null, atm.StrikePrice);
         }
 
-        var callEngine = new PriceCrossoverEngine(fastBars, slowBars);
+        // 2026-09-23, same convention/rationale as SimulateDayAsync's own PickStrikeInBandAsync
+        // (see that method's doc comment) -- duplicated here rather than shared because this closure
+        // captures this method's own local chain/GetSeriesAsync. With no band set, behaves exactly
+        // like PickAtm + a single price lookup (this method's original, still-locked behavior).
+        async Task<(Domain.Entities.Instrument Instrument, decimal Price)?> PickStrikeInBandAsync(OptionType optSide, decimal futurePrice, DateTimeOffset atTime)
+        {
+            if (minEntryPrice is null && maxEntryPrice is null)
+            {
+                var atm = PickAtm(optSide, futurePrice);
+                if (atm is null)
+                {
+                    return null;
+                }
+                var atmSeries = await GetSeriesAsync(atm.Token);
+                var atmPrice = atmSeries.PriceAtOrBefore(atTime);
+                return atmPrice is { } ap && ap > 0 ? (atm, ap) : null;
+            }
+
+            foreach (var candidate in chain.Where(o => o.OptionType == optSide).OrderBy(o => Math.Abs(o.StrikePrice!.Value - futurePrice)))
+            {
+                var series = await GetSeriesAsync(candidate.Token);
+                var price = series.PriceAtOrBefore(atTime);
+                if (price is { } p && p > 0
+                    && (minEntryPrice is null || p >= minEntryPrice)
+                    && (maxEntryPrice is null || p <= maxEntryPrice))
+                {
+                    return (candidate, p);
+                }
+            }
+
+            return null;
+        }
+
+        var callEngine = new PriceCrossoverEngine(fastBars, slowBars, fastType, slowType);
         var putEngine = side == PriceCrossoverSide.Call
             ? null
-            : new PriceCrossoverEngine(putFastBars ?? fastBars, putSlowBars ?? slowBars);
+            : new PriceCrossoverEngine(putFastBars ?? fastBars, putSlowBars ?? slowBars, fastType, slowType);
 
         var trades = new List<VolumeBarTrade>();
         (DateTimeOffset EntryTime, decimal EntryPrice, OptionType Side, decimal StrikePrice, string Token, double EntryScore)? open = null;
+
+        // 2026-09-23, correctness-review fix (docs/Price_Based_Findings.md): tracks the last ANCHOR
+        // ATM strike each engine's price was drawn from, per side -- when it changes bar to bar (the
+        // atm-drift-check diagnostic found this happens on 90%+ of trades' signal windows at the
+        // established fast/slow settings), the engine is Reset() BEFORE observing the new bar, so its
+        // rolling window/EMA state can never mix two different option contracts' premiums. Null means
+        // "no anchor strike seen yet" -- the very first real bar is never treated as a roll (nothing
+        // to roll FROM), same as PriceCrossoverEngine's own "no fabricated warm-up" convention.
+        decimal? lastCallAtm = null;
+        decimal? lastPutAtm = null;
 
         for (var i = 0; i < bars.Count; i++)
         {
             var bar = bars[i];
             var isLastBar = i == bars.Count - 1;
 
-            PriceCrossoverEngine.Step? callStep = side != PriceCrossoverSide.Put
-                ? callEngine.Observe(await GetPriceAsync(OptionType.Call, bar.ClosePrice, bar.EndTimestamp), thresholdFraction)
-                : null;
-            PriceCrossoverEngine.Step? putStep = side != PriceCrossoverSide.Call
-                ? putEngine!.Observe(await GetPriceAsync(OptionType.Put, bar.ClosePrice, bar.EndTimestamp), thresholdFraction)
-                : null;
+            PriceCrossoverEngine.Step? callStep = null;
+            if (side != PriceCrossoverSide.Put)
+            {
+                var (callPrice, callAtm) = await GetPriceAsync(OptionType.Call, bar.ClosePrice, bar.EndTimestamp);
+                if (callAtm is { } ca && lastCallAtm is { } prevCa && ca != prevCa)
+                {
+                    callEngine.Reset();
+                }
+                if (callAtm is not null)
+                {
+                    lastCallAtm = callAtm;
+                }
+                callStep = callEngine.Observe(callPrice, thresholdFraction);
+            }
+
+            PriceCrossoverEngine.Step? putStep = null;
+            if (side != PriceCrossoverSide.Call)
+            {
+                var (putPrice, putAtm) = await GetPriceAsync(OptionType.Put, bar.ClosePrice, bar.EndTimestamp);
+                if (putAtm is { } pa && lastPutAtm is { } prevPa && pa != prevPa)
+                {
+                    putEngine!.Reset();
+                }
+                if (putAtm is not null)
+                {
+                    lastPutAtm = putAtm;
+                }
+                putStep = putEngine!.Observe(putPrice, thresholdFraction);
+            }
 
             var entrySignal = false;
             var exitSignal = false;
@@ -3350,20 +3504,15 @@ public static class TradeSimulator
                 }
             }
             else if (!isLastBar && entrySignal
-                && IstTimeOfDay(bar.EndTimestamp) >= EntryWindowStart && IstTimeOfDay(bar.EndTimestamp) <= EntryWindowEnd)
+                && IstTimeOfDay(bar.EndTimestamp) >= effectiveEntryWindowStart && IstTimeOfDay(bar.EndTimestamp) <= effectiveEntryWindowEnd)
             {
                 // Dual-agreement always trades the Call side (the direction both legs agree on --
                 // see this method's own doc comment); standalone Call/Put trade their own side.
                 var tradeSide = side == PriceCrossoverSide.Put ? OptionType.Put : OptionType.Call;
-                var atm = PickAtm(tradeSide, bar.ClosePrice);
-                if (atm is not null)
+                var picked = await PickStrikeInBandAsync(tradeSide, bar.ClosePrice, bar.EndTimestamp);
+                if (picked is { } pk)
                 {
-                    var atmSeries = await GetSeriesAsync(atm.Token);
-                    var entryPrice = atmSeries.PriceAtOrBefore(bar.EndTimestamp);
-                    if (entryPrice is { } ep && ep > 0)
-                    {
-                        open = (bar.EndTimestamp, ep, tradeSide, atm.StrikePrice!.Value, atm.Token, entryDiagnostic);
-                    }
+                    open = (bar.EndTimestamp, pk.Price, tradeSide, pk.Instrument.StrikePrice!.Value, pk.Instrument.Token, entryDiagnostic);
                 }
             }
         }
@@ -3380,6 +3529,19 @@ public enum PriceCrossoverSide
     DualAgreement,
     /// <summary>2026-09-22 "four sets" task, set 3 -- same entry gate as <see cref="DualAgreement"/>, but BOTH legs must reverse to exit (stricter/symmetric).</summary>
     DualAgreementBothExit,
+}
+
+/// <summary>
+/// Which strikes make up the SIGNAL price average when <c>bandWidth</c> is set on
+/// <see cref="TradeSimulator.SimulatePriceCrossoverDayAsync"/> (2026-09-23). Symmetric is the
+/// original ATM+/-N behavior. ItmSide/OtmSide take all the non-ATM strikes from one side only --
+/// see that method's own doc comment for the ITM/OTM-direction-flips-by-option-side caveat.
+/// </summary>
+public enum PriceBandComposition
+{
+    Symmetric,
+    ItmSide,
+    OtmSide,
 }
 
 /// <summary>
