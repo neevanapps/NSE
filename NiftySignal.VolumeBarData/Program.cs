@@ -10953,7 +10953,7 @@ if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-a-selectivity
         var allValues = withValue.Select(e => e.Values[variable]!.Value).ToList();
         var allPopulationPeFwd10 = ForwardValidationAnalysis.ComputeForwardMetrics(withValue.Select(e => ScForwardPe(e.Rows, e.Episode.StartEventId, 10)));
 
-        var levelRows = new List<(decimal Level, decimal Threshold, int N, int Sessions, double SignalsPerDay, decimal? PeFwd10Median, double MaxSessionSharePct, int DistinctDteBuckets)>();
+        var levelRows = new List<(decimal Level, decimal Threshold, int N, int Sessions, double SignalsPerDay, decimal? PeFwd10Median, double MaxSessionSharePct, int DistinctDteBuckets, double MaxDteBucketSharePct)>();
         foreach (var level in PatternASelectivityCalibration.PercentileLevels)
         {
             var threshold = PatternASelectivityCalibration.PercentileThreshold(allValues, level);
@@ -10962,9 +10962,16 @@ if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-a-selectivity
             var signalsPerDay = scTotalSessions > 0 ? (double)selected.Count / scTotalSessions : 0.0;
             var peFwd10 = ForwardValidationAnalysis.ComputeForwardMetrics(selected.Select(e => ScForwardPe(e.Rows, e.Episode.StartEventId, 10)));
             var maxSessionShare = selected.Count > 0 ? 100.0 * selected.GroupBy(e => e.Date).Max(g => g.Count()) / selected.Count : 0.0;
-            var distinctDte = selected.Select(e => DteBucketClassifier.Classify(e.Rows[e.Episode.StartEventId].Dte)).Distinct().Count();
+            var dteGroups = selected.GroupBy(e => DteBucketClassifier.Classify(e.Rows[e.Episode.StartEventId].Dte)).ToList();
+            var distinctDte = dteGroups.Count;
+            // Mirrors the single-session dominance check above (same 50% convention, not a new
+            // number): "distinct DTE buckets represented" alone is too weak -- a bucket with n=1
+            // counts as "represented" without demonstrating anything holds outside the dominant
+            // bucket. This is what actually operationalizes the spec's own "no single DTE bucket
+            // explains the effect" requirement.
+            var maxDteBucketShare = selected.Count > 0 ? 100.0 * dteGroups.Max(g => g.Count()) / selected.Count : 0.0;
             var meanStateAge = selected.Count > 0 ? selected.Average(e => (decimal)e.StateAgeEvents) : 0m;
-            levelRows.Add((level, threshold, selected.Count, sessions, signalsPerDay, peFwd10.Median, maxSessionShare, distinctDte));
+            levelRows.Add((level, threshold, selected.Count, sessions, signalsPerDay, peFwd10.Median, maxSessionShare, distinctDte, maxDteBucketShare));
 
             Console.WriteLine($"  [{PatternASelectivityCalibration.LevelLabel(level)}] threshold>={ScFmt4(threshold)} n={selected.Count} sessions={sessions}/{scTotalSessions} signals/day={signalsPerDay:F2}" + (signalsPerDay is >= 5 and <= 20 ? "  ** in target 5-20/day band **" : ""));
             foreach (var h in scForwardHorizons)
@@ -10973,9 +10980,9 @@ if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-a-selectivity
                 var pe = ForwardValidationAnalysis.ComputeForwardMetrics(selected.Select(e => ScForwardPe(e.Rows, e.Episode.StartEventId, h)));
                 Console.WriteLine($"      Futures +{h,2}: n={fut.N} mean={ScFmt4(fut.Mean)}% med={ScFmt4(fut.Median)}% neg%={ScFmtPct(fut.NegativePct)}   |   PE +{h,2}: n={pe.N} mean={ScFmt4(pe.Mean)}% med={ScFmt4(pe.Median)}% pos%={ScFmtPct(pe.PositivePct)}");
             }
-            Console.WriteLine($"      Stability: max single-session share of selected n={maxSessionShare:F1}%" + (sessions <= 1 ? "  ** single session -- not trustworthy **" : "") + $", distinct DTE buckets represented={distinctDte}, mean crossover-state-age (maturity, descriptive only)={meanStateAge:F2} events");
+            Console.WriteLine($"      Stability: max single-session share of selected n={maxSessionShare:F1}%" + (sessions <= 1 ? "  ** single session -- not trustworthy **" : "") + $", distinct DTE buckets represented={distinctDte}, max single-DTE-bucket share={maxDteBucketShare:F1}%" + (maxDteBucketShare >= 50.0 ? "  ** one DTE bucket dominates -- 'distinct buckets represented' alone is not enough **" : "") + $", mean crossover-state-age (maturity, descriptive only)={meanStateAge:F2} events");
             Console.WriteLine("      Sample size per DTE bucket:");
-            foreach (var g in selected.GroupBy(e => DteBucketClassifier.Classify(e.Rows[e.Episode.StartEventId].Dte)).OrderBy(g => g.Key))
+            foreach (var g in dteGroups.OrderBy(g => g.Key))
             {
                 Console.WriteLine($"        [DTE {g.Key}] n={g.Count()}" + (g.Count() <= 2 ? "  ** very small sample **" : ""));
             }
@@ -11003,11 +11010,19 @@ if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-a-selectivity
             ReportTradeDiagnostic($"{variable} | {PatternASelectivityCalibration.LevelLabel(level)}", variantTrades);
         }
 
-        // ---- Decision gate (spec's own 3-way classification). A "materially stronger" forward
-        // read is judged directionally against this candidate's OWN unfiltered (all-episode)
-        // PE+10 median -- not an invented magnitude threshold -- combined with the structural
-        // stability checks the spec itself names (>=3 sessions, >=2 DTE buckets, no single session
-        // over half the selected count). ----
+        // ---- Decision gate (spec's own 3-way classification). "Materially stronger" is judged
+        // SIGNED against this candidate's OWN unfiltered (all-episode) PE+10 median -- not an
+        // invented magnitude threshold, and NOT an absolute-value comparison (2026-09-24
+        // correction: an earlier |m| > |base| comparison let a NEGATIVE, wrong-direction median --
+        // opposite of Pattern A's own "underlying reverses down -> PE up" hypothesis -- count as
+        // "improved" purely because its magnitude was larger; that is not what "materially
+        // stronger" means and could pass a genuinely worse result). Combined with the structural
+        // stability checks the spec itself names: >=3 sessions, no single session over half the
+        // selected count, and no single DTE bucket over half the selected count either (also a
+        // 2026-09-24 correction -- "distinct DTE buckets represented >= 2" alone passed trivially
+        // on a bucket with n=1-2, which is not what "no single DTE bucket explains the effect"
+        // means; a candidate whose apparent improvement is really a DTE-0 concentration effect,
+        // where cheap near-expiry premium exaggerates % moves, must fail here). ----
         var region = levelRows.Where(l => l.SignalsPerDay is >= 5 and <= 20).ToList();
         string decision;
         if (region.Count == 0)
@@ -11016,10 +11031,13 @@ if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-a-selectivity
         }
         else
         {
-            var improves = region.Any(r => r.PeFwd10Median is { } m && allPopulationPeFwd10.Median is { } baseM && Math.Abs(m) > Math.Abs(baseM) && r.Sessions >= 3 && r.DistinctDteBuckets >= 2 && r.MaxSessionSharePct < 50.0);
+            var improves = region.Any(r => r.PeFwd10Median is { } m && allPopulationPeFwd10.Median is { } baseM && m > baseM && r.Sessions >= 3 && r.MaxSessionSharePct < 50.0 && r.MaxDteBucketSharePct < 50.0);
+            var dteConfounded = !improves && region.Any(r => r.PeFwd10Median is { } m2 && allPopulationPeFwd10.Median is { } baseM2 && m2 > baseM2 && r.MaxDteBucketSharePct >= 50.0);
             decision = improves
-                ? "SELECTIVITY CANDIDATE -- a 5-20/day region exists with a materially stronger |PE+10 median| than this candidate's own unfiltered population, spread across >=3 sessions and >=2 DTE buckets, no single session >50% of the selected count. STOP further threshold search on this candidate per the task's own rule -- queued for a single frozen trade-level experiment design in a follow-up session, not built here."
-                : "FREQUENCY IMPROVES BUT QUALITY DOES NOT -- a 5-20/day region exists but forward PE information does not materially strengthen there (or fails the session/DTE/single-session-dominance checks) versus this candidate's own unfiltered population.";
+                ? "SELECTIVITY CANDIDATE -- a 5-20/day region exists with a materially stronger (signed) PE+10 median than this candidate's own unfiltered population, spread across >=3 sessions, no single session >50% and no single DTE bucket >50% of the selected count. STOP further threshold search on this candidate per the task's own rule -- queued for a single frozen trade-level experiment design in a follow-up session, not built here."
+                : dteConfounded
+                    ? "NO USEFUL SELECTIVITY (DTE-CONFOUNDED) -- a 5-20/day region shows an apparently stronger PE+10 median, but it is driven by a single DTE bucket making up >=50% of the selected count (see 'max single-DTE-bucket share' above) -- consistent with the tighter filter simply concentrating on 0-DTE (where cheap premium exaggerates % moves), not a genuine cross-DTE Pattern A strength dimension."
+                    : "FREQUENCY IMPROVES BUT QUALITY DOES NOT -- a 5-20/day region exists but forward PE information does not materially strengthen (in the hypothesis-consistent direction) there, or fails the session/DTE-dominance checks, versus this candidate's own unfiltered population.";
         }
         Console.WriteLine($"  DECISION GATE [{variable}]: {decision}");
         scDecisionSummaries.Add((variable, decision));
