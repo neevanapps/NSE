@@ -4510,11 +4510,12 @@ that run's own printed output, not a hypothetical:
    a useful negative control confirming the other four were an artifact of the check, not the data.
 
 Both are fixed in code (`MaxDteBucketSharePct`, mirroring the existing `MaxSessionSharePct`
-convention at the same 50% threshold; signed median comparison). The numbers below are the REAL
-numbers from the completed run; the verdicts are the corrected classification, hand-verified
-against that run's own printed per-level statistics. The command has not yet been rerun with the
-fixed code to regenerate the authoritative console/CSV for the permanent record -- that is the
-natural next step, not done in this pass.
+convention at the same 50% threshold; signed median comparison). **Confirmed by an actual rerun**
+of the corrected code over the identical date range: every one of the five verdicts, and every
+`max single-DTE-bucket share` value (80.4%/73.0%/81.0%/81.9% for the four confounded candidates,
+28.2% for the DTE-balanced `UnderlyingMoveMagnitude`), came back identical to the hand-verified
+values first derived from the pre-fix run's own printed statistics -- the fix behaves exactly as
+intended, not just in theory.
 
 ### Results -- Top 5% (the only percentile level landing in the 5-20/day target band for every candidate)
 
@@ -4553,11 +4554,10 @@ DTE-independent selectivity curve in this sample.
 - **One data point.** 12 sessions is a starting sample, not a verdict, per the working agreement's
   own "backtesting is a long-term process" principle -- this calibration should be re-run as more
   sessions accumulate, not treated as final after one pass.
-- **Rerun needed for the record.** The pasted console output that surfaced the two bugs above
-  predates the fix; the verdicts here are hand-verified against that run's own numbers (shown
-  inline), not from a fresh run of the corrected code. Re-running
-  `vc0dte-relationship-a-selectivity-calibration` will regenerate the authoritative corrected
-  console text and CSV.
+- **Rerun confirmed.** A fresh run of the corrected code over the same 2026-09-01..09-23 range
+  reproduced every verdict and every `max single-DTE-bucket share` value above exactly -- this is
+  no longer a hand-verified projection, it's the actual corrected output. The CSV
+  (`vc-a-selectivity-calibration.csv`) from that run is the authoritative record for this pass.
 - **A genuine cross-DTE strength dimension for Pattern A remains unfound** among these five
   candidates. Per the task's own selection discipline, no further filter/threshold search is
   warranted on any of them individually; a different candidate family, or accepting that Pattern A
