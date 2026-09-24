@@ -4417,3 +4417,155 @@ or something else.
 ```
 dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-crossover-trade-test 2026-09-01 2026-09-23 --out=vc-a-crossover-trade-test.csv
 ```
+
+## Pattern A Selectivity/Frequency Calibration (2026-09-24)
+
+### Purpose
+
+A deliberately different research question from every prior `vc0dte-relationship-a-*` command
+above: not "does one more filter improve the frozen Pattern A trade simulation" (the crossover-
+conditioned trade test just above answered that, WEAK/MIXED, and per its own rule stops there
+without another filter). Instead: **does Pattern A have a natural strength dimension at all** --
+one whose top-percentile subset fires less often (target region 5-20/day, vs. Pattern A's raw
+~148-271/day depending on whether "signal" means executed trades or raw episodes) while showing
+materially stronger forward directional/option information -- evaluated strictly BEFORE any P&L
+optimization, at a fixed, predefined percentile grid (100/50/30/20/15/10/5%, no arbitrary
+threshold search, no per-day/DTE/session-specific threshold). This is a calibration/descriptive
+exercise, not a final trading strategy.
+
+### Candidates enumerated (see `PatternASelectivityCalibration.cs` for the full reasoning)
+
+Five candidates, each built entirely from quantities the frozen relationship-row/(5,20) CE/PE
+relative-return crossover machinery already produces, computed with no look-ahead (strictly from
+information at or before the signal event):
+
+- **UnderlyingMoveMagnitude** -- `|one-event futures % change|` at the signal.
+- **CeReactionMagnitude** -- `|one-event CE % change|` at the signal.
+- **PeReactionMagnitude** -- `|one-event PE % change|` at the signal.
+- **DivergenceMagnitude** -- `|CE% - PE%|` at the signal. This collapses the task's own "CE-vs-PE
+  relative return" and "divergence magnitude" bullets into one variable: at a Pattern A event CE%
+  is negative and PE% positive by construction, so their signed difference is already one-signed --
+  the only new information a magnitude ranking can add is the absolute spread itself.
+- **CrossoverDistance** -- `|FastMa - SlowMa|` of the already-frozen (5,20) CE/PE relative-return
+  crossover (the same combo validated in the ce-pe-crossover/divergence-maturity/crossover-trade-
+  test commands above) at the signal.
+
+Two of the task's own named candidate categories are deliberately excluded, not silently dropped:
+**divergence maturity** (`CountConsecutiveSameSign`/state age) has no natural single "high=stronger"
+direction to rank by -- the divergence-maturity experiment above found a mature/persisting
+("Confirms") divergence trades WORSE, not better, so a monotonic top-X% ranking would silently pick
+a direction by convention. It is still reported descriptively (mean state age per group) but never
+ranked. The **futures' own trend/crossover context** (fast=3/slow=10, baked into
+`RelationshipObservation.FuturesCrossoverState`) describes the underlying's regime, not a property
+of the Pattern A divergence itself -- folding it in would be a regime filter smuggled into a
+single-pattern calibration, which the working agreement's "no gating during single-metric
+evaluation" principle rules out even outside the strict single-metric-trial context it was written
+for.
+
+### Methodology
+
+- Population = Pattern A **episodes** (first event of each contiguous run of the category, the
+  same convention `EpisodeAnalysis`/the divergence-maturity command already use) -- avoids counting
+  N consecutive event bars of one persisting divergence as N independent observations.
+- Each candidate ranked independently over the WHOLE pooled dataset (no per-day/DTE/session
+  threshold), at the fixed percentile grid.
+- The Step-4 trade-simulation mapping (diagnostic only, explicitly not the calibration answer)
+  reuses `PatternRelationshipTradeSimulator.SimulateDayAsync` completely unmodified via its
+  existing `patternAEntryFilter` -- applied per QUALIFYING EVENT (not just episode-starts) by
+  comparing that event's own candidate value against the fixed numeric threshold derived from the
+  episode-level percentile ranking, so a legitimate flip-re-entry mid-episode is still gated
+  correctly. No exit/holding/SL-TP/cost/strike/size/entry-price change.
+- Dataset: 2026-09-01 to 2026-09-23 (the same range as the crossover-trade-test above, for
+  comparability) -- 24 (date, expiry) pairs, **12 independent calendar sessions**. Total unfiltered
+  Pattern A episodes = 3,253 (271.08/day unfiltered). The shared, candidate-independent unfiltered
+  trade simulation produced **exactly 1,783 trades** -- the identical count the crossover-trade-test
+  produced over this same range, confirming the discovery/relationship-row/trade-simulator wiring
+  is consistent with the already-frozen result, not a new pipeline drifting from it.
+- Matched control (all UP-direction, non-Pattern-A rows): PE+10 median = **-0.1368%** (n=5,569),
+  vs. Pattern A's own unfiltered PE+10 median = **+0.1271%** (n=2,229) -- Pattern A and the control
+  move in *opposite* directions, an independent sanity check that Pattern A carries real
+  information relative to a neutral baseline, run before looking at any candidate.
+
+### Operational note: two decision-gate bugs found and fixed mid-analysis
+
+The first full run (2026-09-01..09-23) initially labeled four of the five candidates
+"SELECTIVITY CANDIDATE." Reviewing the underlying numbers (prompted by the user asking "is it right
+at all" mid-run) surfaced two real bugs in the decision-gate code, both confirmed directly against
+that run's own printed output, not a hypothetical:
+
+1. **Sign-blindness.** The "materially stronger" check compared `Math.Abs(selected PE+10 median)`
+   against `Math.Abs(baseline median)`, so a *negative* median -- the opposite of Pattern A's own
+   "underlying reverses down -> PE up" hypothesis -- could still count as "improved" purely because
+   its magnitude was larger. `PeReactionMagnitude`'s Top-5% region showed a PE+10 median of
+   **-0.3764%** yet was labeled a candidate. Fixed to a signed comparison (selected median greater
+   than baseline median, not just larger in absolute value).
+2. **DTE-dominance blindness.** "distinct DTE buckets represented >= 2" passed trivially on a
+   bucket with n=1-2, so it never actually enforced the task's own "no single DTE bucket explains
+   the effect" requirement. `CeReactionMagnitude`, `PeReactionMagnitude`, `DivergenceMagnitude`, and
+   `CrossoverDistance` all had their apparent Top-5% forward-return improvement **73-82% concentrated
+   in DTE 0** -- consistent with cheap near-expiry premium mechanically producing larger percentage
+   moves, not a genuine cross-DTE Pattern A strength dimension. `UnderlyingMoveMagnitude` (a raw
+   futures % move, which doesn't care about DTE) stayed DTE-balanced at Top 5% (roughly
+   28% in its largest bucket) and is the one candidate the original, buggy gate correctly rejected --
+   a useful negative control confirming the other four were an artifact of the check, not the data.
+
+Both are fixed in code (`MaxDteBucketSharePct`, mirroring the existing `MaxSessionSharePct`
+convention at the same 50% threshold; signed median comparison). The numbers below are the REAL
+numbers from the completed run; the verdicts are the corrected classification, hand-verified
+against that run's own printed per-level statistics. The command has not yet been rerun with the
+fixed code to regenerate the authoritative console/CSV for the permanent record -- that is the
+natural next step, not done in this pass.
+
+### Results -- Top 5% (the only percentile level landing in the 5-20/day target band for every candidate)
+
+| Candidate | n (sessions) | Max single-DTE-bucket share | PE+10 median (selected) | vs. unfiltered PE+10 median | Corrected verdict |
+|---|---|---|---|---|---|
+| UnderlyingMoveMagnitude | 163 (12/12) | 28.2% (DTE 4-6) | +0.0318% | 0.1271% (own unfiltered) | **FREQUENCY IMPROVES BUT QUALITY DOES NOT** -- median did not strengthen |
+| CeReactionMagnitude | 163 (10/12) | 80.4% (DTE 0) | +0.3974% | 0.1271% | **NO USEFUL SELECTIVITY (DTE-CONFOUNDED)** |
+| PeReactionMagnitude | 163 (11/12) | 73.0% (DTE 0) | **-0.3764%** (wrong sign) | 0.1271% | **FREQUENCY IMPROVES BUT QUALITY DOES NOT** -- wrong-signed, not just DTE-confounded |
+| DivergenceMagnitude | 163 (11/12) | 81.0% (DTE 0) | +0.3917% | 0.1271% | **NO USEFUL SELECTIVITY (DTE-CONFOUNDED)** |
+| CrossoverDistance | 160 (11/12) | 81.9% (DTE 0) | +0.2252% | 0.1224% (own unfiltered) | **NO USEFUL SELECTIVITY (DTE-CONFOUNDED)** |
+
+Trade-simulation diagnostic (reference only, not the basis for the verdicts above) at Top 5% tells
+the same story: three of five stayed net-negative per trade (CeReactionMagnitude -186.23/trade,
+PeReactionMagnitude -20.85/trade, CrossoverDistance -32.05/trade); DivergenceMagnitude was barely
+positive (+14.64/trade, PF=1.02); only UnderlyingMoveMagnitude showed a real positive
+(+117.57/trade, PF=1.15, n=141) despite being the one candidate that failed the forward-return
+check -- a reminder, exactly as the task's own instruction anticipated, that a single run's P&L is
+not the calibration answer and should not be read as one (n=141 over 12 sessions is one data point,
+not a verdict). The shared unfiltered baseline: 1,783 trades, -227.25/trade, PF=0.79.
+
+### Decision-gate classification: **NO USEFUL SELECTIVITY** (for this 12-session sample)
+
+None of the five candidates qualifies as a SELECTIVITY CANDIDATE under the corrected gate. Four of
+five (`CeReactionMagnitude`, `PeReactionMagnitude`, `DivergenceMagnitude`, `CrossoverDistance`)
+produce an apparent Top-5% improvement that is either wrong-signed or overwhelmingly explained by
+concentrating on DTE 0 rather than a property of the divergence itself. The fifth
+(`UnderlyingMoveMagnitude`) is the one genuinely DTE-balanced candidate and shows no forward-quality
+improvement at all. Per the task's own instruction: **"If no such region exists, say so"** --
+reported here rather than forcing a result. This is a real, useful negative finding, not a dead
+end to discard quietly (per the working agreement's metric-evaluation-process section): among these
+five simple magnitude/crossover-distance measurements, Pattern A does not show a stable,
+DTE-independent selectivity curve in this sample.
+
+### Caveats and next steps
+
+- **One data point.** 12 sessions is a starting sample, not a verdict, per the working agreement's
+  own "backtesting is a long-term process" principle -- this calibration should be re-run as more
+  sessions accumulate, not treated as final after one pass.
+- **Rerun needed for the record.** The pasted console output that surfaced the two bugs above
+  predates the fix; the verdicts here are hand-verified against that run's own numbers (shown
+  inline), not from a fresh run of the corrected code. Re-running
+  `vc0dte-relationship-a-selectivity-calibration` will regenerate the authoritative corrected
+  console text and CSV.
+- **A genuine cross-DTE strength dimension for Pattern A remains unfound** among these five
+  candidates. Per the task's own selection discipline, no further filter/threshold search is
+  warranted on any of them individually; a different candidate family, or accepting that Pattern A
+  itself does not carry a strength dimension distinct from "is this 0-DTE," would be the next
+  decision, not something to resolve unprompted here.
+
+### Reproduction
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-selectivity-calibration 2026-09-01 2026-09-23 --out=vc-a-selectivity-calibration.csv
+```
