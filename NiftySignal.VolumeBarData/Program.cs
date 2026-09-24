@@ -10767,6 +10767,293 @@ if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-a-crossover-t
     return 0;
 }
 
+// "vc0dte-relationship-a-selectivity-calibration" -- 2026-09-24, Pattern A SELECTIVITY/FREQUENCY
+// CALIBRATION -- descriptive, explicitly NOT a P&L optimization pass (see
+// docs/VolumeCandle_0DTE_Findings.md's "Pattern A Selectivity Calibration" section and
+// PatternASelectivityCalibration.cs's own doc comment for the full candidate enumeration and why
+// two spec-named candidates are excluded). Research question: does Pattern A have a natural
+// strength dimension whose top-percentile subset fires less often (target region 5-20/day) while
+// showing materially stronger forward information -- evaluated BEFORE any P&L optimization, at a
+// FIXED, predefined percentile grid (no arbitrary threshold search, no per-day/DTE/session-specific
+// threshold). Reuses the EXACT same frozen (date,expiry) discovery / relationship-row building /
+// (5,20) RelSpread crossover trace as every other vc0dte-relationship-a-* command; the only new
+// logic is PatternASelectivityCalibration's own candidate-value/percentile-threshold pair (both
+// unit-tested) plus this command's reporting/wiring, and the Step-4 trade-simulator diagnostic
+// reuses PatternRelationshipTradeSimulator.SimulateDayAsync completely unmodified via its existing
+// patternAEntryFilter parameter -- no new exit/holding/SL-TP/cost/strike/size/entry-price rule.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-selectivity-calibration <fromDate> <toDate> --out=path.csv [--tradeSimLevels=1.00,0.20,0.10,0.05]
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-a-selectivity-calibration", StringComparison.OrdinalIgnoreCase))
+{
+    const long scThreshold = 1300L;
+    var scIstOffset = TimeSpan.FromHours(5.5);
+    const string PatternA = ForwardValidationAnalysis.State2_BullishDivergence_PatternA;
+    string[] scExcludedCategories = ["OptionDataIncomplete", "ContractTransition"];
+    int[] scForwardHorizons = [1, 3, 5, 10];
+    const int scFast = 5, scSlow = 20; // the already-selected representative CE/PE relative-return combo -- NOT re-optimized.
+
+    var (scPositional, scNamed) = SplitNamedArgs(args);
+    if (scPositional.Length < 3 || !DateOnly.TryParseExact(scPositional[1], "yyyy-MM-dd", out var scFromDate) || !DateOnly.TryParseExact(scPositional[2], "yyyy-MM-dd", out var scToDate) || !scNamed.TryGetValue("out", out var scOutPath))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-selectivity-calibration <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> --out=path.csv [--tradeSimLevels=1.00,0.20,0.10,0.05]");
+        return 1;
+    }
+    decimal[] scTradeSimLevels = scNamed.TryGetValue("tradeSimLevels", out var scTsl)
+        ? scTsl.Split(',', StringSplitOptions.RemoveEmptyEntries).Select(decimal.Parse).ToArray()
+        : [1.00m, 0.20m, 0.10m, 0.05m];
+
+    Console.WriteLine("=== vc0dte-relationship-a-selectivity-calibration: CALIBRATION/DESCRIPTIVE ONLY -- does Pattern A have a natural strength dimension? NOT a P&L optimization pass. ===");
+    Console.WriteLine("Excluded candidates (reasoning, see PatternASelectivityCalibration.cs): divergence maturity has no natural single 'high=stronger' direction (the completed divergence-maturity");
+    Console.WriteLine("experiment found mature/'Confirms' divergences trade WORSE, not better) -- reported descriptively only, never ranked. The futures' own trend/crossover context describes the");
+    Console.WriteLine("underlying's regime, not a property of Pattern A itself -- folding it in would be a regime filter smuggled into a single-pattern calibration; excluded per the working");
+    Console.WriteLine("agreement's 'no gating during single-metric evaluation' principle. A regime signal gets its own docs/SCORE_CANDIDATES.md entry and evaluation cycle, not this one.");
+    Console.WriteLine($"Step-4 trade-simulation diagnostic (reference only) runs at levels: {string.Join(", ", scTradeSimLevels.Select(PatternASelectivityCalibration.LevelLabel))} -- bounds runtime; the behavioral calibration (Steps 1-3) below still covers all {PatternASelectivityCalibration.PercentileLevels.Length} predefined levels for every candidate.");
+    Console.WriteLine();
+    static string ScFmt4(decimal? v) => v?.ToString("F4") ?? "--";
+    static string ScFmt2(decimal? v) => v?.ToString("F2") ?? "--";
+    static string ScFmtPct(double? v) => v is null ? "--" : $"{v:F1}%";
+
+    // ---- Phase 1/2: EXACT same discovery + relationship-row building + (5,20) RelSpread crossover trace as every other vc0dte-relationship-a-* command ----
+    var scPairs = new List<(DateOnly Date, DateOnly Expiry, int Dte, string Bucket)>();
+    await using (var scScanSource = new NiftySignalDbContext(tradeSourceOptions))
+    {
+        for (var date = scFromDate; date <= scToDate; date = date.AddDays(1))
+        {
+            if (date.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday) { continue; }
+            var hasFutures = await scScanSource.Instruments.AnyAsync(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Future && i.Underlying == "NIFTY");
+            if (!hasFutures) { continue; }
+            var expiries = await scScanSource.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.Underlying == "NIFTY").Select(i => i.ExpiryDate).Distinct().OrderBy(e => e).ToListAsync();
+            foreach (var expiry in expiries)
+            {
+                if (expiry is null) { continue; }
+                var dte = expiry.Value.DayNumber - date.DayNumber;
+                var bucket = DteBucketClassifier.Classify(dte);
+                if (bucket != DteBucketClassifier.Other) { scPairs.Add((date, expiry.Value, dte, bucket)); }
+            }
+            Console.WriteLine($"  [Phase1] scanned {date:yyyy-MM-dd}, pairs so far={scPairs.Count}"); Console.Out.Flush();
+        }
+    }
+    Console.WriteLine($"Phase1 discovery complete: {scPairs.Count} pairs."); Console.Out.Flush();
+    if (scPairs.Count == 0) { Console.WriteLine("No usable (date, expiry) pairs found -- stopping. No fabricated methodology."); return 1; }
+
+    var scPairData = new List<(DateOnly Date, DateOnly Expiry, int Dte, string Bucket, List<RelationshipObservation> Rows, List<Instrument> Chain, List<FutureEventBar> FutureBars, PriceCrossoverEngine.Step?[] RelSpreadTrace)>();
+    foreach (var dateGroup in scPairs.GroupBy(p => p.Date).OrderBy(g => g.Key))
+    {
+        await using var scBuildSource = new NiftySignalDbContext(tradeSourceOptions);
+        Console.WriteLine($"  [Phase2] building futures bars for {dateGroup.Key:yyyy-MM-dd}..."); Console.Out.Flush();
+        var futureBars = await FutureEventBarBuilder.BuildDayAsync(scBuildSource, dateGroup.Key, scThreshold, CancellationToken.None);
+        if (futureBars.Count == 0) { continue; }
+        foreach (var p in dateGroup)
+        {
+            var chain = await scBuildSource.Instruments.Where(i => i.AsOfDate == p.Date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == p.Expiry && i.Underlying == "NIFTY").OrderBy(i => i.StrikePrice).ThenBy(i => i.OptionType).ToListAsync();
+            if (chain.Count == 0) { continue; }
+            Console.WriteLine($"  [Phase2] {p.Date:yyyy-MM-dd} expiry={p.Expiry:yyyy-MM-dd} DTE={p.Dte}: chain size={chain.Count}, building option bars..."); Console.Out.Flush();
+            var optionBars = await SynchronizedOptionBarBuilder.BuildDayForChainAsync(scBuildSource, p.Date, chain, futureBars, CancellationToken.None);
+            var rows = await UnderlyingOptionRelationshipRecorder.RecordAsync(scBuildSource, p.Date, chain, futureBars, optionBars, CancellationToken.None);
+
+            var relSpread = new double?[rows.Count];
+            for (var i = 1; i < rows.Count; i++)
+            {
+                var cePct = UnderlyingOptionRelationshipSummary.ComputeCeChange(rows, i - 1, 1).PercentChange;
+                var pePct = UnderlyingOptionRelationshipSummary.ComputePeChange(rows, i - 1, 1).PercentChange;
+                relSpread[i] = cePct is not null && pePct is not null ? (double)(cePct.Value - pePct.Value) : (double?)null;
+            }
+            var traceEngine = new PriceCrossoverEngine(scFast, scSlow);
+            var trace = new PriceCrossoverEngine.Step?[rows.Count];
+            for (var i = 0; i < rows.Count; i++) { trace[i] = traceEngine.Observe(relSpread[i], 0.0); }
+
+            scPairData.Add((p.Date, p.Expiry, p.Dte, p.Bucket, rows, chain, futureBars, trace));
+            Console.WriteLine($"  [Phase2] {p.Date:yyyy-MM-dd} expiry={p.Expiry:yyyy-MM-dd}: {rows.Count} relationship rows recorded."); Console.Out.Flush();
+        }
+    }
+    Console.WriteLine($"Phase 1/2 complete: {scPairData.Count} (date,expiry) pairs loaded.");
+    Console.WriteLine();
+
+    // ---- Step 1: enumerate Pattern A episodes (one signal per contiguous run of the SAME category
+    // -- avoids counting N consecutive event bars of one persisting divergence as N independent
+    // observations, same convention EpisodeAnalysis/vc0dte-relationship-a-divergence-maturity
+    // already use) and each candidate's own no-look-ahead value at the episode's FIRST event. ----
+    var scEpisodes = new List<(DateOnly Date, List<RelationshipObservation> Rows, EpisodeAnalysis.Episode Episode, Dictionary<PatternASelectivityCalibration.StrengthVariable, decimal?> Values, int StateAgeEvents)>();
+    foreach (var pair in scPairData)
+    {
+        foreach (var ep in EpisodeAnalysis.DetectEpisodes(pair.Date, pair.Rows, PatternA, []))
+        {
+            var values = PatternASelectivityCalibration.AllVariables.ToDictionary(
+                v => v, v => PatternASelectivityCalibration.ComputeValue(v, pair.Rows, ep.StartEventId, pair.RelSpreadTrace));
+            var stateAge = CrossoverResolutionDiagnostics.CountConsecutiveSameSign(pair.RelSpreadTrace, ep.StartEventId);
+            scEpisodes.Add((pair.Date, pair.Rows, ep, values, stateAge));
+        }
+    }
+    // Sessions = independent CALENDAR DATES, not (date,expiry) pairs -- a day contributing both a
+    // 0-DTE and a 7-DTE chain is still ONE session, per the task's own explicit instruction not to
+    // treat repeated DTE views of the same calendar session as independent sessions.
+    var scTotalSessions = scPairData.Select(p => p.Date).Distinct().Count();
+    Console.WriteLine($"Total Pattern A episodes (all, unfiltered) = {scEpisodes.Count}, across {scTotalSessions} independent calendar sessions -- {(scTotalSessions > 0 ? (double)scEpisodes.Count / scTotalSessions : 0):F2} signals/day unfiltered.");
+    Console.WriteLine();
+
+    decimal? ScForwardFutures(List<RelationshipObservation> rows, int eventId, int h) => UnderlyingOptionRelationshipSummary.ComputeFuturesChange(rows, eventId, h).PercentChange;
+    decimal? ScForwardPe(List<RelationshipObservation> rows, int eventId, int h) => UnderlyingOptionRelationshipSummary.ComputePeChange(rows, eventId, h).PercentChange;
+
+    // ---- Matched control (existing tercile-matched-control convention, computed ONCE over the
+    // whole dataset -- a fixed reference that does not vary by candidate/percentile): all
+    // UP-direction, non-Pattern-A, non-excluded rows. ----
+    var scAllRows = scPairData.SelectMany(p => p.Rows.Select(r => (Rows: p.Rows, Row: r))).ToList();
+    var scControlObs = scAllRows.Where(x => x.Row.FuturesDirection1 == RelationshipDirection.Up && x.Row.RelationshipCategory != PatternA && !scExcludedCategories.Contains(x.Row.RelationshipCategory)).ToList();
+    Console.WriteLine("### Matched control (all UP-direction, non-Pattern-A rows; fixed reference, does not vary by candidate/percentile) ###");
+    foreach (var h in scForwardHorizons)
+    {
+        var pe = ForwardValidationAnalysis.ComputeForwardMetrics(scControlObs.Select(x => ScForwardPe(x.Rows, x.Row.EventId, h)));
+        Console.WriteLine($"  PE +{h,2}: n={pe.N} mean={ScFmt4(pe.Mean)}% med={ScFmt4(pe.Median)}% pos%={ScFmtPct(pe.PositivePct)}");
+    }
+    Console.WriteLine();
+
+    // Shared unfiltered baseline trade simulation (candidate-independent) -- computed once, reused
+    // as the Step 4 reference row for every candidate that requests the 100% level.
+    List<PatternRelationshipTradeSimulator.TradeRow>? scBaselineTrades = null;
+    if (scTradeSimLevels.Contains(1.00m))
+    {
+        scBaselineTrades = [];
+        foreach (var pair in scPairData)
+        {
+            await using var scBaseSource = new NiftySignalDbContext(tradeSourceOptions);
+            var result = await PatternRelationshipTradeSimulator.SimulateDayAsync(scBaseSource, pair.Date, pair.Rows, pair.Chain, pair.FutureBars, scIstOffset, CancellationToken.None);
+            scBaselineTrades.AddRange(result.Trades.Where(t => t.Pattern == "PatternA"));
+        }
+        Console.WriteLine($"Shared unfiltered baseline trade simulation (Step 4 reference row): n={scBaselineTrades.Count} trades.");
+        Console.WriteLine();
+    }
+
+    void ReportTradeDiagnostic(string label, List<PatternRelationshipTradeSimulator.TradeRow> trades)
+    {
+        var tradesPerDay = scTotalSessions > 0 ? (double)trades.Count / scTotalSessions : 0.0;
+        Console.WriteLine($"    [{label}] DIAGNOSTIC ONLY -- reference only, no strategy change");
+        Console.WriteLine($"      Trades={trades.Count}, trades/day={tradesPerDay:F2}" + (tradesPerDay is >= 5 and <= 20 ? "  ** in target 5-20/day band **" : ""));
+        if (trades.Count == 0) { Console.WriteLine("      (no trades)"); return; }
+        static decimal Median(List<decimal> sorted) => sorted.Count == 0 ? 0m : sorted.Count % 2 == 1 ? sorted[sorted.Count / 2] : (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2m;
+        var netPnls = trades.Select(t => t.NetPnl).OrderBy(v => v).ToList();
+        var wins = trades.Count(t => t.NetPnl > 0);
+        var grossProfit = trades.Where(t => t.NetPnl > 0).Sum(t => t.NetPnl);
+        var grossLoss = trades.Where(t => t.NetPnl < 0).Sum(t => t.NetPnl);
+        Console.WriteLine($"      Net P&L={ScFmt2(netPnls.Sum())} P&L/trade={ScFmt2(netPnls.Sum() / trades.Count)} Median trade={ScFmt2(Median(netPnls))} Win%={ScFmtPct(100.0 * wins / trades.Count)} PF={(grossLoss < 0 ? ScFmt2(grossProfit / Math.Abs(grossLoss)) : "--")}");
+        Console.WriteLine($"      Median MAE%={ScFmt2(Median(trades.Select(t => t.MaePercent).OrderBy(v => v).ToList()))} Median MFE%={ScFmt2(Median(trades.Select(t => t.MfePercent).OrderBy(v => v).ToList()))}");
+    }
+
+    // ==== Steps 2/3/4 per candidate ====
+    var scDecisionSummaries = new List<(PatternASelectivityCalibration.StrengthVariable Variable, string Decision)>();
+    foreach (var variable in PatternASelectivityCalibration.AllVariables)
+    {
+        Console.WriteLine($"===================== Candidate: {variable} =====================");
+        var withValue = scEpisodes.Where(e => e.Values[variable] is not null).ToList();
+        Console.WriteLine($"  n(defined)={withValue.Count}, n(unavailable for this candidate)={scEpisodes.Count - withValue.Count}");
+        if (withValue.Count == 0)
+        {
+            Console.WriteLine("  INSUFFICIENT -- no episode has a defined value for this candidate. Skipping.");
+            Console.WriteLine();
+            continue;
+        }
+        var allValues = withValue.Select(e => e.Values[variable]!.Value).ToList();
+        var allPopulationPeFwd10 = ForwardValidationAnalysis.ComputeForwardMetrics(withValue.Select(e => ScForwardPe(e.Rows, e.Episode.StartEventId, 10)));
+
+        var levelRows = new List<(decimal Level, decimal Threshold, int N, int Sessions, double SignalsPerDay, decimal? PeFwd10Median, double MaxSessionSharePct, int DistinctDteBuckets)>();
+        foreach (var level in PatternASelectivityCalibration.PercentileLevels)
+        {
+            var threshold = PatternASelectivityCalibration.PercentileThreshold(allValues, level);
+            var selected = withValue.Where(e => e.Values[variable]!.Value >= threshold).ToList();
+            var sessions = selected.Select(e => e.Date).Distinct().Count();
+            var signalsPerDay = scTotalSessions > 0 ? (double)selected.Count / scTotalSessions : 0.0;
+            var peFwd10 = ForwardValidationAnalysis.ComputeForwardMetrics(selected.Select(e => ScForwardPe(e.Rows, e.Episode.StartEventId, 10)));
+            var maxSessionShare = selected.Count > 0 ? 100.0 * selected.GroupBy(e => e.Date).Max(g => g.Count()) / selected.Count : 0.0;
+            var distinctDte = selected.Select(e => DteBucketClassifier.Classify(e.Rows[e.Episode.StartEventId].Dte)).Distinct().Count();
+            var meanStateAge = selected.Count > 0 ? selected.Average(e => (decimal)e.StateAgeEvents) : 0m;
+            levelRows.Add((level, threshold, selected.Count, sessions, signalsPerDay, peFwd10.Median, maxSessionShare, distinctDte));
+
+            Console.WriteLine($"  [{PatternASelectivityCalibration.LevelLabel(level)}] threshold>={ScFmt4(threshold)} n={selected.Count} sessions={sessions}/{scTotalSessions} signals/day={signalsPerDay:F2}" + (signalsPerDay is >= 5 and <= 20 ? "  ** in target 5-20/day band **" : ""));
+            foreach (var h in scForwardHorizons)
+            {
+                var fut = ForwardValidationAnalysis.ComputeForwardMetrics(selected.Select(e => ScForwardFutures(e.Rows, e.Episode.StartEventId, h)));
+                var pe = ForwardValidationAnalysis.ComputeForwardMetrics(selected.Select(e => ScForwardPe(e.Rows, e.Episode.StartEventId, h)));
+                Console.WriteLine($"      Futures +{h,2}: n={fut.N} mean={ScFmt4(fut.Mean)}% med={ScFmt4(fut.Median)}% neg%={ScFmtPct(fut.NegativePct)}   |   PE +{h,2}: n={pe.N} mean={ScFmt4(pe.Mean)}% med={ScFmt4(pe.Median)}% pos%={ScFmtPct(pe.PositivePct)}");
+            }
+            Console.WriteLine($"      Stability: max single-session share of selected n={maxSessionShare:F1}%" + (sessions <= 1 ? "  ** single session -- not trustworthy **" : "") + $", distinct DTE buckets represented={distinctDte}, mean crossover-state-age (maturity, descriptive only)={meanStateAge:F2} events");
+            Console.WriteLine("      Sample size per DTE bucket:");
+            foreach (var g in selected.GroupBy(e => DteBucketClassifier.Classify(e.Rows[e.Episode.StartEventId].Dte)).OrderBy(g => g.Key))
+            {
+                Console.WriteLine($"        [DTE {g.Key}] n={g.Count()}" + (g.Count() <= 2 ? "  ** very small sample **" : ""));
+            }
+        }
+
+        Console.WriteLine("  -- Step 4: trade-simulation diagnostic (reference only; no exit/holding/SL-TP/cost/strike/size/entry-price change) --");
+        foreach (var level in scTradeSimLevels)
+        {
+            if (level == 1.00m)
+            {
+                if (scBaselineTrades is not null) { ReportTradeDiagnostic($"{variable} | {PatternASelectivityCalibration.LevelLabel(level)} (=unfiltered baseline, shared across candidates)", scBaselineTrades); }
+                continue;
+            }
+            var levelRow = levelRows.FirstOrDefault(l => l.Level == level);
+            if (levelRow == default) { continue; }
+            var threshold = levelRow.Threshold;
+            var variantTrades = new List<PatternRelationshipTradeSimulator.TradeRow>();
+            foreach (var pair in scPairData)
+            {
+                await using var scVariantSource = new NiftySignalDbContext(tradeSourceOptions);
+                var result = await PatternRelationshipTradeSimulator.SimulateDayAsync(scVariantSource, pair.Date, pair.Rows, pair.Chain, pair.FutureBars, scIstOffset, CancellationToken.None,
+                    patternAEntryFilter: eventId => PatternASelectivityCalibration.ComputeValue(variable, pair.Rows, eventId, pair.RelSpreadTrace) is { } v && v >= threshold);
+                variantTrades.AddRange(result.Trades.Where(t => t.Pattern == "PatternA"));
+            }
+            ReportTradeDiagnostic($"{variable} | {PatternASelectivityCalibration.LevelLabel(level)}", variantTrades);
+        }
+
+        // ---- Decision gate (spec's own 3-way classification). A "materially stronger" forward
+        // read is judged directionally against this candidate's OWN unfiltered (all-episode)
+        // PE+10 median -- not an invented magnitude threshold -- combined with the structural
+        // stability checks the spec itself names (>=3 sessions, >=2 DTE buckets, no single session
+        // over half the selected count). ----
+        var region = levelRows.Where(l => l.SignalsPerDay is >= 5 and <= 20).ToList();
+        string decision;
+        if (region.Count == 0)
+        {
+            decision = "NO USEFUL SELECTIVITY / FREQUENCY IMPROVES BUT QUALITY DOES NOT -- no predefined percentile level lands in the 5-20/day band (see per-level signals/day above). Reported honestly rather than forced.";
+        }
+        else
+        {
+            var improves = region.Any(r => r.PeFwd10Median is { } m && allPopulationPeFwd10.Median is { } baseM && Math.Abs(m) > Math.Abs(baseM) && r.Sessions >= 3 && r.DistinctDteBuckets >= 2 && r.MaxSessionSharePct < 50.0);
+            decision = improves
+                ? "SELECTIVITY CANDIDATE -- a 5-20/day region exists with a materially stronger |PE+10 median| than this candidate's own unfiltered population, spread across >=3 sessions and >=2 DTE buckets, no single session >50% of the selected count. STOP further threshold search on this candidate per the task's own rule -- queued for a single frozen trade-level experiment design in a follow-up session, not built here."
+                : "FREQUENCY IMPROVES BUT QUALITY DOES NOT -- a 5-20/day region exists but forward PE information does not materially strengthen there (or fails the session/DTE/single-session-dominance checks) versus this candidate's own unfiltered population.";
+        }
+        Console.WriteLine($"  DECISION GATE [{variable}]: {decision}");
+        scDecisionSummaries.Add((variable, decision));
+        Console.WriteLine();
+    }
+
+    using (var writer = new StreamWriter(scOutPath))
+    {
+        writer.WriteLine("Date,Dte,DteBucket,EventId,UnderlyingMoveMagnitude,CeReactionMagnitude,PeReactionMagnitude,DivergenceMagnitude,CrossoverDistance,StateAgeEvents,"
+            + "FuturesFwd1,FuturesFwd3,FuturesFwd5,FuturesFwd10,PeFwd1,PeFwd3,PeFwd5,PeFwd10");
+        foreach (var e in scEpisodes)
+        {
+            var v = e.Values;
+            var dte = e.Rows[e.Episode.StartEventId].Dte;
+            writer.WriteLine(string.Join(',',
+                e.Date.ToString("yyyy-MM-dd"), dte, DteBucketClassifier.Classify(dte), e.Episode.StartEventId,
+                v[PatternASelectivityCalibration.StrengthVariable.UnderlyingMoveMagnitude], v[PatternASelectivityCalibration.StrengthVariable.CeReactionMagnitude],
+                v[PatternASelectivityCalibration.StrengthVariable.PeReactionMagnitude], v[PatternASelectivityCalibration.StrengthVariable.DivergenceMagnitude],
+                v[PatternASelectivityCalibration.StrengthVariable.CrossoverDistance], e.StateAgeEvents,
+                ScForwardFutures(e.Rows, e.Episode.StartEventId, 1), ScForwardFutures(e.Rows, e.Episode.StartEventId, 3), ScForwardFutures(e.Rows, e.Episode.StartEventId, 5), ScForwardFutures(e.Rows, e.Episode.StartEventId, 10),
+                ScForwardPe(e.Rows, e.Episode.StartEventId, 1), ScForwardPe(e.Rows, e.Episode.StartEventId, 3), ScForwardPe(e.Rows, e.Episode.StartEventId, 5), ScForwardPe(e.Rows, e.Episode.StartEventId, 10)));
+        }
+    }
+    Console.WriteLine($"A-selectivity-calibration CSV written to: {Path.GetFullPath(scOutPath)}");
+    Console.WriteLine();
+    Console.WriteLine("### Overall decision-gate summary ###");
+    foreach (var (variable, decision) in scDecisionSummaries)
+    {
+        Console.WriteLine($"  [{variable}] {decision}");
+    }
+
+    return 0;
+}
+
 if (args.Length < 2 || !DateOnly.TryParseExact(args[0], "yyyy-MM-dd", out var fromDate) || !DateOnly.TryParseExact(args[1], "yyyy-MM-dd", out var toDate))
 {
     Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [barVolumeThreshold] [sourceDatabaseNameOverride]");
