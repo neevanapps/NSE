@@ -420,4 +420,69 @@ public sealed class PatternRelationshipTradeSimulatorTests
         var trade = Assert.Single(result.Trades);
         Assert.Equal("PatternB", trade.Pattern);
     }
+
+    [Fact]
+    public async Task SimulateDayAsync_PatternBEntryFilter_SkipsFilteredSignal_ButLaterSignalStillEnters()
+    {
+        await using var source = NewSourceDb();
+        source.Instruments.Add(OptionInstrument(CeToken, 25000m, OptionType.Call));
+        var bar0 = Bar(0, At(9, 20), At(9, 21));
+        var bar1 = Bar(1, At(9, 21), At(9, 22));
+        AddTick(source, CeToken, At(9, 22, 5), 101m); // only consumed if event 1's entry is taken.
+        AddTick(source, CeToken, At(15, 14, 55), 105m);
+        await source.SaveChangesAsync();
+
+        var rows = new List<RelationshipObservation> { Row(0, bar0.EndTimestamp, PatternB), Row(1, bar1.EndTimestamp, PatternB) };
+        var result = await PatternRelationshipTradeSimulator.SimulateDayAsync(
+            source, Day, rows, [source.Instruments.Local.First()], [bar0, bar1], IstOffset, CancellationToken.None,
+            patternBEntryFilter: eventId => eventId != 0); // reject event 0 only.
+
+        var trade = Assert.Single(result.Trades);
+        Assert.Equal(bar1.EndTimestamp, trade.SignalTimestamp); // event 0's signal never opened a position, so event 1 was still free to enter.
+        Assert.Equal(2, result.SignalAudit.Count);
+        Assert.Equal(PatternRelationshipTradeSimulator.SignalOutcome.FilteredByEntryCondition, result.SignalAudit[0].Outcome);
+        Assert.Equal(PatternRelationshipTradeSimulator.SignalOutcome.Executed, result.SignalAudit[1].Outcome);
+    }
+
+    [Fact]
+    public async Task SimulateDayAsync_PatternBEntryFilter_NeverAppliesToPatternA()
+    {
+        await using var source = NewSourceDb();
+        source.Instruments.Add(OptionInstrument(PeToken, 25000m, OptionType.Put));
+        var bar = Bar(0, At(9, 20), At(9, 21));
+        AddTick(source, PeToken, At(9, 21, 5), 51m);
+        AddTick(source, PeToken, At(15, 14, 55), 55m);
+        await source.SaveChangesAsync();
+
+        var rows = new List<RelationshipObservation> { Row(0, bar.EndTimestamp, PatternA) };
+        var result = await PatternRelationshipTradeSimulator.SimulateDayAsync(
+            source, Day, rows, [source.Instruments.Local.First()], [bar], IstOffset, CancellationToken.None,
+            patternBEntryFilter: _ => false); // would reject every signal if it applied to Pattern A -- it must not.
+
+        var trade = Assert.Single(result.Trades);
+        Assert.Equal("PatternA", trade.Pattern);
+    }
+
+    [Fact]
+    public async Task SimulateDayAsync_PatternBEntryFilter_DisablesPatternBEntirely_ButStillClosesAnOpenPatternAPosition()
+    {
+        await using var source = NewSourceDb();
+        source.Instruments.Add(OptionInstrument(PeToken, 25000m, OptionType.Put));
+        source.Instruments.Add(OptionInstrument(CeToken, 25000m, OptionType.Call));
+        var bar0 = Bar(0, At(9, 20), At(9, 21));
+        var bar1 = Bar(1, At(10, 0), At(10, 1));
+        AddTick(source, PeToken, bar0.EndTimestamp.AddSeconds(1), 60m);
+        AddTick(source, PeToken, bar1.EndTimestamp.AddSeconds(1), 58m); // closes the PE position on the Pattern B signal.
+        await source.SaveChangesAsync();
+
+        var rows = new List<RelationshipObservation> { Row(0, bar0.EndTimestamp, PatternA), Row(1, bar1.EndTimestamp, PatternB) };
+        var instruments = source.Instruments.Local.ToList();
+        var result = await PatternRelationshipTradeSimulator.SimulateDayAsync(
+            source, Day, rows, instruments, [bar0, bar1], IstOffset, CancellationToken.None,
+            patternBEntryFilter: _ => false); // Pattern B can never OPEN a position...
+
+        var trade = Assert.Single(result.Trades); // ...but it still closed the open Pattern A position, so no CE trade was ever opened.
+        Assert.Equal("PatternA", trade.Pattern);
+        Assert.Equal(nameof(PatternRelationshipTradeSimulator.ExitReason.OppositePatternSignal), trade.ExitReason);
+    }
 }

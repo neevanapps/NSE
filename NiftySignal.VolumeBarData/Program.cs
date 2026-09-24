@@ -11072,6 +11072,238 @@ if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-a-selectivity
     return 0;
 }
 
+// "vc0dte-relationship-a-only-trade-calibration" -- 2026-09-24, PATTERN-A-ONLY TRADE-LEVEL P&L
+// CALIBRATION -- an explicitly requested, DIFFERENT phase from the descriptive/no-P&L selectivity
+// calibration above (user's own instruction: target net profit/win rate/MFE directly, land in
+// 5-20 trades/day, Pattern A only -- see docs/VolumeCandle_0DTE_Findings.md's "Pattern A
+// Trade-Level Calibration" section for the full write-up, including the overfitting caveat this
+// command's own in-sample/out-of-sample split exists to surface). Reuses the identical frozen
+// discovery/relationship-row/RelSpread-trace pipeline and the SAME 5 dynamic, percentile-based
+// candidates from PatternASelectivityCalibration.cs -- no new indicator, no hardcoded threshold
+// constant. Pattern B is disabled from ever OPENING a position via the new patternBEntryFilter
+// (Pattern A only) -- it still closes an open Pattern A position exactly as before, unmodified.
+// For each candidate at each of the 7 predefined percentile levels, runs the REAL frozen trade
+// simulator (no exit/holding/SL-TP/cost/strike/size/entry-price change) and reports trades/day,
+// net P&L, win rate, MFE, holding time, and time-in-market -- this time as the actual object of
+// interest. Among levels landing in 5-20/day, ranks by net P&L (win rate/MFE reported alongside,
+// never blended into an invented composite score). Also reports a chronological in-sample/
+// out-of-sample split (first ~2/3 of sessions used to derive the threshold, remaining ~1/3 held
+// out) as an overfitting check -- flagged prominently, not a gate on the full-sample numbers.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-only-trade-calibration <fromDate> <toDate> --out=path.csv [--inSampleFraction=0.67]
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-a-only-trade-calibration", StringComparison.OrdinalIgnoreCase))
+{
+    const long acThreshold = 1300L;
+    var acIstOffset = TimeSpan.FromHours(5.5);
+    const int acFast = 5, acSlow = 20; // the already-selected representative CE/PE relative-return combo -- NOT re-optimized.
+    const int acSessionSeconds = (15 * 3600 + 15 * 60) - (9 * 3600 + 15 * 60); // 09:15-15:15 IST -- the SAME position-holding window PatternRelationshipTradeSimulator's own NoNewEntriesAfter(15:00)/ForceCloseAt(15:15) already define, not a new invented constant.
+
+    var (acPositional, acNamed) = SplitNamedArgs(args);
+    if (acPositional.Length < 3 || !DateOnly.TryParseExact(acPositional[1], "yyyy-MM-dd", out var acFromDate) || !DateOnly.TryParseExact(acPositional[2], "yyyy-MM-dd", out var acToDate) || !acNamed.TryGetValue("out", out var acOutPath))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-only-trade-calibration <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> --out=path.csv [--inSampleFraction=0.67]");
+        return 1;
+    }
+    var acInSampleFraction = acNamed.TryGetValue("inSampleFraction", out var acIsf) ? decimal.Parse(acIsf) : 0.67m;
+
+    Console.WriteLine("=== vc0dte-relationship-a-only-trade-calibration: PATTERN A ONLY, TRADE-LEVEL P&L CALIBRATION -- target 5-20 trades/day, optimize net profit (win rate/MFE reported alongside). Pattern B entries disabled; Pattern B still closes an open Pattern A position exactly as before. ===");
+    Console.WriteLine();
+    static string AcFmt2(decimal? v) => v?.ToString("F2") ?? "--";
+    static string AcFmtPct(double? v) => v is null ? "--" : $"{v:F1}%";
+
+    // ---- Phase 1/2: identical discovery + relationship-row building + (5,20) RelSpread crossover trace as every other vc0dte-relationship-a-* command ----
+    var acPairs = new List<(DateOnly Date, DateOnly Expiry, int Dte, string Bucket)>();
+    await using (var acScanSource = new NiftySignalDbContext(tradeSourceOptions))
+    {
+        for (var date = acFromDate; date <= acToDate; date = date.AddDays(1))
+        {
+            if (date.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday) { continue; }
+            var hasFutures = await acScanSource.Instruments.AnyAsync(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Future && i.Underlying == "NIFTY");
+            if (!hasFutures) { continue; }
+            var expiries = await acScanSource.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.Underlying == "NIFTY").Select(i => i.ExpiryDate).Distinct().OrderBy(e => e).ToListAsync();
+            foreach (var expiry in expiries)
+            {
+                if (expiry is null) { continue; }
+                var dte = expiry.Value.DayNumber - date.DayNumber;
+                var bucket = DteBucketClassifier.Classify(dte);
+                if (bucket != DteBucketClassifier.Other) { acPairs.Add((date, expiry.Value, dte, bucket)); }
+            }
+            Console.WriteLine($"  [Phase1] scanned {date:yyyy-MM-dd}, pairs so far={acPairs.Count}"); Console.Out.Flush();
+        }
+    }
+    Console.WriteLine($"Phase1 discovery complete: {acPairs.Count} pairs."); Console.Out.Flush();
+    if (acPairs.Count == 0) { Console.WriteLine("No usable (date, expiry) pairs found -- stopping. No fabricated methodology."); return 1; }
+
+    var acPairData = new List<(DateOnly Date, DateOnly Expiry, int Dte, string Bucket, List<RelationshipObservation> Rows, List<Instrument> Chain, List<FutureEventBar> FutureBars, PriceCrossoverEngine.Step?[] RelSpreadTrace)>();
+    foreach (var dateGroup in acPairs.GroupBy(p => p.Date).OrderBy(g => g.Key))
+    {
+        await using var acBuildSource = new NiftySignalDbContext(tradeSourceOptions);
+        Console.WriteLine($"  [Phase2] building futures bars for {dateGroup.Key:yyyy-MM-dd}..."); Console.Out.Flush();
+        var futureBars = await FutureEventBarBuilder.BuildDayAsync(acBuildSource, dateGroup.Key, acThreshold, CancellationToken.None);
+        if (futureBars.Count == 0) { continue; }
+        foreach (var p in dateGroup)
+        {
+            var chain = await acBuildSource.Instruments.Where(i => i.AsOfDate == p.Date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == p.Expiry && i.Underlying == "NIFTY").OrderBy(i => i.StrikePrice).ThenBy(i => i.OptionType).ToListAsync();
+            if (chain.Count == 0) { continue; }
+            Console.WriteLine($"  [Phase2] {p.Date:yyyy-MM-dd} expiry={p.Expiry:yyyy-MM-dd} DTE={p.Dte}: chain size={chain.Count}, building option bars..."); Console.Out.Flush();
+            var optionBars = await SynchronizedOptionBarBuilder.BuildDayForChainAsync(acBuildSource, p.Date, chain, futureBars, CancellationToken.None);
+            var rows = await UnderlyingOptionRelationshipRecorder.RecordAsync(acBuildSource, p.Date, chain, futureBars, optionBars, CancellationToken.None);
+
+            var relSpread = new double?[rows.Count];
+            for (var i = 1; i < rows.Count; i++)
+            {
+                var cePct = UnderlyingOptionRelationshipSummary.ComputeCeChange(rows, i - 1, 1).PercentChange;
+                var pePct = UnderlyingOptionRelationshipSummary.ComputePeChange(rows, i - 1, 1).PercentChange;
+                relSpread[i] = cePct is not null && pePct is not null ? (double)(cePct.Value - pePct.Value) : (double?)null;
+            }
+            var traceEngine = new PriceCrossoverEngine(acFast, acSlow);
+            var trace = new PriceCrossoverEngine.Step?[rows.Count];
+            for (var i = 0; i < rows.Count; i++) { trace[i] = traceEngine.Observe(relSpread[i], 0.0); }
+
+            acPairData.Add((p.Date, p.Expiry, p.Dte, p.Bucket, rows, chain, futureBars, trace));
+            Console.WriteLine($"  [Phase2] {p.Date:yyyy-MM-dd} expiry={p.Expiry:yyyy-MM-dd}: {rows.Count} relationship rows recorded."); Console.Out.Flush();
+        }
+    }
+    Console.WriteLine($"Phase 1/2 complete: {acPairData.Count} (date,expiry) pairs loaded.");
+    Console.WriteLine();
+
+    var acTotalSessions = acPairData.Select(p => p.Date).Distinct().Count();
+    var acSessionDatesSorted = acPairData.Select(p => p.Date).Distinct().OrderBy(d => d).ToList();
+    var acInSampleCount = Math.Clamp((int)Math.Round(acInSampleFraction * acSessionDatesSorted.Count, MidpointRounding.AwayFromZero), 1, acSessionDatesSorted.Count);
+    var acInSampleDates = acSessionDatesSorted.Take(acInSampleCount).ToHashSet();
+    var acOutSampleDates = acSessionDatesSorted.Skip(acInSampleCount).ToHashSet();
+    Console.WriteLine($"Sessions: {acTotalSessions} total. In-sample (threshold selection)={acInSampleDates.Count} [{acSessionDatesSorted[0]:yyyy-MM-dd}..{acSessionDatesSorted[acInSampleCount - 1]:yyyy-MM-dd}], "
+        + (acOutSampleDates.Count > 0 ? $"Out-of-sample (held out)={acOutSampleDates.Count} [{acSessionDatesSorted[acInSampleCount]:yyyy-MM-dd}..{acSessionDatesSorted[^1]:yyyy-MM-dd}]" : "Out-of-sample (held out)=0 (inSampleFraction covers the whole range -- no overfitting check possible this run)"));
+    Console.WriteLine();
+
+    // ---- Episodes + candidate values: IDENTICAL definition to PatternASelectivityCalibration (one signal per contiguous Pattern A run, no look-ahead) ----
+    var acEpisodes = new List<(DateOnly Date, Dictionary<PatternASelectivityCalibration.StrengthVariable, decimal?> Values)>();
+    foreach (var pair in acPairData)
+    {
+        foreach (var ep in EpisodeAnalysis.DetectEpisodes(pair.Date, pair.Rows, ForwardValidationAnalysis.State2_BullishDivergence_PatternA, []))
+        {
+            var values = PatternASelectivityCalibration.AllVariables.ToDictionary(v => v, v => PatternASelectivityCalibration.ComputeValue(v, pair.Rows, ep.StartEventId, pair.RelSpreadTrace));
+            acEpisodes.Add((pair.Date, values));
+        }
+    }
+
+    // Runs the REAL frozen trade simulator across every (date,expiry) pair, Pattern A only
+    // (Pattern B entries always disabled). variable/threshold null = unfiltered Pattern-A-only
+    // baseline. Each pair's filter closure uses THAT pair's own Rows/RelSpreadTrace -- correct even
+    // on a day with two (date,expiry) pairs (front-week/back-week), since each pair is simulated
+    // and filtered independently.
+    async Task<List<PatternRelationshipTradeSimulator.TradeRow>> AcRunAsync(PatternASelectivityCalibration.StrengthVariable? variable, decimal threshold)
+    {
+        var trades = new List<PatternRelationshipTradeSimulator.TradeRow>();
+        foreach (var pair in acPairData)
+        {
+            await using var acSource = new NiftySignalDbContext(tradeSourceOptions);
+            Func<int, bool>? filter = variable is null ? null
+                : eventId => PatternASelectivityCalibration.ComputeValue(variable.Value, pair.Rows, eventId, pair.RelSpreadTrace) is { } v && v >= threshold;
+            var result = await PatternRelationshipTradeSimulator.SimulateDayAsync(acSource, pair.Date, pair.Rows, pair.Chain, pair.FutureBars, acIstOffset, CancellationToken.None,
+                patternAEntryFilter: filter, patternBEntryFilter: _ => false);
+            trades.AddRange(result.Trades.Where(t => t.Pattern == "PatternA"));
+        }
+        return trades;
+    }
+
+    static decimal AcMedian(List<decimal> sorted) => sorted.Count == 0 ? 0m : sorted.Count % 2 == 1 ? sorted[sorted.Count / 2] : (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2m;
+    static TimeSpan AcMedianTs(List<TimeSpan> sorted) => sorted.Count == 0 ? TimeSpan.Zero : sorted.Count % 2 == 1 ? sorted[sorted.Count / 2] : sorted[sorted.Count / 2 - 1] + TimeSpan.FromTicks((sorted[sorted.Count / 2] - sorted[sorted.Count / 2 - 1]).Ticks / 2);
+    static TimeSpan AcPercentileTs(List<TimeSpan> sorted, decimal fraction) => sorted.Count == 0 ? TimeSpan.Zero : sorted[Math.Clamp((int)Math.Ceiling(fraction * sorted.Count) - 1, 0, sorted.Count - 1)];
+
+    double AcReport(string label, List<PatternRelationshipTradeSimulator.TradeRow> trades, int sessions)
+    {
+        var tradesPerDay = sessions > 0 ? (double)trades.Count / sessions : 0.0;
+        var inBand = tradesPerDay is >= 5 and <= 20;
+        Console.WriteLine($"  [{label}] n={trades.Count}, sessions={sessions}, trades/day={tradesPerDay:F2}" + (inBand ? "  ** IN TARGET 5-20/day BAND **" : ""));
+        if (trades.Count == 0) { Console.WriteLine("      (no trades)"); return tradesPerDay; }
+        var netPnls = trades.Select(t => t.NetPnl).OrderBy(v => v).ToList();
+        var wins = trades.Count(t => t.NetPnl > 0);
+        var grossProfit = trades.Where(t => t.NetPnl > 0).Sum(t => t.NetPnl);
+        var grossLoss = trades.Where(t => t.NetPnl < 0).Sum(t => t.NetPnl);
+        var holdings = trades.Select(t => t.HoldingDuration).OrderBy(h => h).ToList();
+        var timeInMarketSeconds = trades.Sum(t => t.HoldingDuration.TotalSeconds);
+        var availableSeconds = sessions * (double)acSessionSeconds;
+        var mfeCaptures = trades.Where(t => t.MfeCaptured is not null).Select(t => t.MfeCaptured!.Value).ToList();
+        Console.WriteLine($"      Net P&L={AcFmt2(netPnls.Sum())} | P&L/trade={AcFmt2(netPnls.Sum() / trades.Count)} | Median trade={AcFmt2(AcMedian(netPnls))}");
+        Console.WriteLine($"      Win rate={AcFmtPct(100.0 * wins / trades.Count)} | Profit factor={(grossLoss < 0 ? AcFmt2(grossProfit / Math.Abs(grossLoss)) : "--")} | Gross profit={AcFmt2(grossProfit)} | Gross loss={AcFmt2(grossLoss)}");
+        Console.WriteLine($"      Median MAE%={AcFmt2(AcMedian(trades.Select(t => t.MaePercent).OrderBy(v => v).ToList()))} | Median MFE%={AcFmt2(AcMedian(trades.Select(t => t.MfePercent).OrderBy(v => v).ToList()))} | Mean MFE captured={(mfeCaptures.Count > 0 ? $"{mfeCaptures.Average():P1}" : "--")}");
+        Console.WriteLine($"      Holding time: median={AcMedianTs(holdings):hh\\:mm\\:ss} P25={AcPercentileTs(holdings, 0.25m):hh\\:mm\\:ss} P75={AcPercentileTs(holdings, 0.75m):hh\\:mm\\:ss} | Time-in-market={(availableSeconds > 0 ? 100.0 * timeInMarketSeconds / availableSeconds : 0):F1}% of the 09:15-15:15 window");
+        return tradesPerDay;
+    }
+
+    // ==== Pattern-A-only, UNFILTERED baseline (Pattern B disabled; Pattern A entry/exit rules unchanged) ====
+    Console.WriteLine("### Pattern-A-only unfiltered baseline (Pattern B entries disabled; Pattern A entry/exit rules unchanged) ###");
+    var acBaselineTrades = await AcRunAsync(null, 0m);
+    AcReport("Unfiltered", acBaselineTrades, acTotalSessions);
+    Console.WriteLine();
+
+    // ==== Per-candidate calibration: full-sample threshold search across the 7 predefined levels, ranked by net P&L among levels landing in 5-20/day ====
+    var acCsvRows = new List<string>();
+    var acBestByCandidate = new List<(PatternASelectivityCalibration.StrengthVariable Variable, decimal Level, decimal Threshold, List<PatternRelationshipTradeSimulator.TradeRow> Trades)>();
+
+    foreach (var variable in PatternASelectivityCalibration.AllVariables)
+    {
+        Console.WriteLine($"===================== Candidate: {variable} (Pattern A only) =====================");
+        var fullSampleValues = acEpisodes.Where(e => e.Values[variable] is not null).Select(e => e.Values[variable]!.Value).ToList();
+        if (fullSampleValues.Count == 0) { Console.WriteLine("  INSUFFICIENT -- no defined values for this candidate."); Console.WriteLine(); continue; }
+
+        var inBandLevels = new List<(decimal Level, decimal Threshold, List<PatternRelationshipTradeSimulator.TradeRow> Trades)>();
+        foreach (var level in PatternASelectivityCalibration.PercentileLevels)
+        {
+            var threshold = PatternASelectivityCalibration.PercentileThreshold(fullSampleValues, level);
+            var trades = await AcRunAsync(variable, threshold);
+            var tradesPerDay = AcReport($"{PatternASelectivityCalibration.LevelLabel(level)} (threshold>={threshold:F4})", trades, acTotalSessions);
+            if (tradesPerDay is >= 5 and <= 20) { inBandLevels.Add((level, threshold, trades)); }
+
+            acCsvRows.Add(string.Join(',', variable, level, threshold, trades.Count, tradesPerDay.ToString("F2"),
+                trades.Sum(t => t.NetPnl), trades.Count > 0 ? trades.Sum(t => t.NetPnl) / trades.Count : 0m,
+                trades.Count > 0 ? 100.0 * trades.Count(t => t.NetPnl > 0) / trades.Count : 0.0,
+                tradesPerDay is >= 5 and <= 20));
+        }
+
+        if (inBandLevels.Count == 0)
+        {
+            Console.WriteLine("  No percentile level lands in the 5-20 trades/day band for this candidate.");
+        }
+        else
+        {
+            var best = inBandLevels.OrderByDescending(l => l.Trades.Sum(t => t.NetPnl)).First();
+            Console.WriteLine($"  Best-by-net-P&L in-band level: {PatternASelectivityCalibration.LevelLabel(best.Level)} (full stats printed above).");
+            acBestByCandidate.Add((variable, best.Level, best.Threshold, best.Trades));
+        }
+        Console.WriteLine();
+    }
+
+    // ==== Overfitting check: recalibrate each candidate's best level using ONLY in-sample sessions, apply that (different) threshold value across the whole range, report in-sample vs. held-out out-of-sample separately ====
+    if (acOutSampleDates.Count > 0 && acBestByCandidate.Count > 0)
+    {
+        Console.WriteLine("### Overfitting check: in-sample-derived threshold applied out-of-sample (flagged, not a gate on the full-sample numbers above) ###");
+        Console.WriteLine($"For each candidate's best full-sample in-band level, the SAME percentile level is recalibrated using ONLY the {acInSampleDates.Count} in-sample sessions' own episodes (a smaller population -> typically a DIFFERENT threshold value), then that fixed threshold is run across the whole date range and trades are split by date into in-sample vs. held-out out-of-sample.");
+        foreach (var (variable, level, _, _) in acBestByCandidate)
+        {
+            var inSampleValues = acEpisodes.Where(e => acInSampleDates.Contains(e.Date) && e.Values[variable] is not null).Select(e => e.Values[variable]!.Value).ToList();
+            if (inSampleValues.Count == 0) { Console.WriteLine($"  [{variable}] INSUFFICIENT in-sample data for this candidate."); continue; }
+            var inSampleThreshold = PatternASelectivityCalibration.PercentileThreshold(inSampleValues, level);
+            var allTrades = await AcRunAsync(variable, inSampleThreshold);
+            var inSampleTrades = allTrades.Where(t => acInSampleDates.Contains(t.TradingDate)).ToList();
+            var outSampleTrades = allTrades.Where(t => acOutSampleDates.Contains(t.TradingDate)).ToList();
+            Console.WriteLine($"  [{variable}] {PatternASelectivityCalibration.LevelLabel(level)}, in-sample-derived threshold>={inSampleThreshold:F4}");
+            AcReport("In-sample (calibration data)", inSampleTrades, acInSampleDates.Count);
+            AcReport("Out-of-sample (held out)", outSampleTrades, acOutSampleDates.Count);
+        }
+        Console.WriteLine();
+    }
+
+    using (var writer = new StreamWriter(acOutPath))
+    {
+        writer.WriteLine("Variable,Level,Threshold,Trades,TradesPerDay,NetPnl,PnlPerTrade,WinPct,InBand");
+        foreach (var line in acCsvRows) { writer.WriteLine(line); }
+    }
+    Console.WriteLine($"A-only-trade-calibration CSV written to: {Path.GetFullPath(acOutPath)}");
+
+    return 0;
+}
+
 if (args.Length < 2 || !DateOnly.TryParseExact(args[0], "yyyy-MM-dd", out var fromDate) || !DateOnly.TryParseExact(args[1], "yyyy-MM-dd", out var toDate))
 {
     Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [barVolumeThreshold] [sourceDatabaseNameOverride]");

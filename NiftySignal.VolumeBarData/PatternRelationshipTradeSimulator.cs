@@ -63,12 +63,24 @@ public static class PatternRelationshipTradeSimulator
     /// whichever way this filter is used. Null (default) preserves the original frozen behaviour
     /// unchanged for every existing caller.
     /// </param>
+    /// <param name="patternBEntryFilter">
+    /// 2026-09-24 addendum, Pattern-A-only calibration (see
+    /// docs/VolumeCandle_0DTE_Findings.md's "Pattern A Trade-Level Calibration" section). Symmetric
+    /// to <paramref name="patternAEntryFilter"/> -- called ONLY for a Pattern B signal that has
+    /// already cleared every other entry gate, and NEVER consulted for Pattern A or on the close
+    /// path (an already-open Pattern A position still exits on a raw Pattern B signal exactly as
+    /// before; this only blocks Pattern B from ever OPENING a new position). Passing
+    /// <c>eventId => false</c> disables Pattern B entries entirely, for a "Pattern A only" trading
+    /// variant, without touching Pattern A's own entry/exit rules or Pattern B's role as an exit
+    /// trigger. Null (default) preserves the original frozen behaviour unchanged for every existing
+    /// caller.
+    /// </param>
     public static async Task<SimulationResult> SimulateDayAsync(
         NiftySignalDbContext source, DateOnly asOfDate,
         IReadOnlyList<RelationshipObservation> rows, IReadOnlyList<Instrument> chain, IReadOnlyList<FutureEventBar> futureBars,
         TimeSpan istOffset, CancellationToken cancellationToken,
         IReadOnlyList<SynchronizedOptionEventBar>? optionBars = null, decimal? minEntryPrice = null, decimal? maxEntryPrice = null,
-        Func<int, bool>? patternAEntryFilter = null)
+        Func<int, bool>? patternAEntryFilter = null, Func<int, bool>? patternBEntryFilter = null)
     {
         var trades = new List<TradeRow>();
         var audit = new List<SignalAuditRow>();
@@ -201,6 +213,11 @@ public static class PatternRelationshipTradeSimulator
                 continue;
             }
             if (isPatternA && patternAEntryFilter is not null && !patternAEntryFilter(row.EventId))
+            {
+                audit.Add(new SignalAuditRow(asOfDate, row.EndTimestamp, pattern, side, row.AtmStrike, SignalOutcome.FilteredByEntryCondition));
+                continue;
+            }
+            if (isPatternB && patternBEntryFilter is not null && !patternBEntryFilter(row.EventId))
             {
                 audit.Add(new SignalAuditRow(asOfDate, row.EndTimestamp, pattern, side, row.AtmStrike, SignalOutcome.FilteredByEntryCondition));
                 continue;
