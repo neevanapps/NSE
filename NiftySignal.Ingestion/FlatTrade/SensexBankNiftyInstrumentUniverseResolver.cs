@@ -22,16 +22,18 @@ namespace NiftySignal.Ingestion.FlatTrade;
 /// at all right now -- so "nearest expiry" and "current monthly expiry" are the same value today;
 /// this is re-verified (not assumed) on every resolution via <see cref="LogExpirySpacing"/>, which
 /// warns if that ever stops being true (see its own doc comment).</item>
-/// <item><b>No spot-index subscription.</b> FlatTrade's public scrip masters used here (NFO/BFO
-/// index-derivatives CSVs) don't carry a spot-index row, and the equity/index CSV filenames that
-/// might (guessed from <see cref="InstrumentUniverseResolver.NiftySpotToken"/>'s own doc comment,
-/// e.g. "NSE_Equity.csv") returned S3 AccessDenied when tried live 2026-09-22 -- likely gated
-/// behind auth this class doesn't have a reason to acquire. The task's own spec only asks for
-/// "options + future if available" for these two indices, not spot, so this is in-scope as
-/// resolved rather than a silent gap: each index's own nearest FUTURE quote (not a spot quote) is
-/// used as <see cref="FlatTradeAuthClient.GetOptionChainAsync"/>'s ATM-centering <c>midPrice</c>
-/// instead -- economically close to spot (small, well-understood basis), and already exactly the
-/// data this class needs to fetch for the future leg anyway.</item>
+/// <item><b>Spot-index subscription added 2026-09-24.</b> The original 2026-09-22 gap (FlatTrade's
+/// public NFO/BFO index-derivatives CSVs carry no spot row, and the guessed equity/index CSV
+/// filenames returned S3 AccessDenied) is now closed -- not via the equity CSV at all, but via
+/// FlatTrade's live <see cref="FlatTradeAuthClient.SearchScripAsync"/> REST endpoint (a different
+/// data path than the static S3 masters this class otherwise uses), confirmed live against the
+/// real account: NSE search "NIFTY BANK" -&gt; token 26009 ("Nifty Bank", instname=UNDIND -- the
+/// bare "BANKNIFTY" search text instead matches an unrelated ETF, token 5851); BSE search "SENSEX"
+/// -&gt; token 1 ("SENSEX", instname=UNDIND). See <see cref="BankNiftySpotToken"/>/
+/// <see cref="SensexSpotToken"/>. ATM-centering <c>midPrice</c> below still uses each index's own
+/// FUTURE quote, not the new spot quote -- deliberately left unchanged in this same pass (a
+/// same-day switch to spot-based anchoring right before/at market open is a separate, later
+/// decision, not bundled into the "add spot collection" fix).</item>
 /// <item><b>No scoring/volume-bar/rank-tracker resolution of any kind</b> -- this class returns
 /// <see cref="Instrument"/> rows only, the same write-only contract
 /// <see cref="MarketDataIngestionWorker"/>'s tick-flush path already has; nothing here computes or
@@ -43,6 +45,17 @@ public sealed class SensexBankNiftyInstrumentUniverseResolver(
     FlatTradeAuthClient authClient,
     ILogger<SensexBankNiftyInstrumentUniverseResolver> logger)
 {
+    // 2026-09-24 -- confirmed LIVE via FlatTrade's real SearchScrip API (not the equity/index CSV
+    // that returned AccessDenied, see the "No spot-index subscription" doc note below, now
+    // superseded): NSE search for "NIFTY BANK" returned token 26009, tsym "Nifty Bank",
+    // instname=UNDIND ("Underlying Index", not an ETF -- the plain "BANKNIFTY" search text only
+    // ever matched Kotak's BANKNIFTY1-EQ ETF, token 5851, a different, wrong instrument).
+    // BSE search for "SENSEX" returned token 1, tsym "SENSEX", instname=UNDIND (SENSEX50, token
+    // 47, is a different benchmark -- not this one). Same NiftySpotToken/IndiaVixToken hardcoded-
+    // constant pattern InstrumentUniverseResolver already uses for Nifty spot.
+    public const string BankNiftySpotToken = "26009";
+    public const string SensexSpotToken = "1";
+
     // Same ATM+/-10 band Nifty's own resolver uses (InstrumentUniverseResolver.StrikeCountEachSide)
     // -- a structural/data-collection width, not a scoring/entry/exit threshold, so CLAUDE.md's
     // "every rule used for backtesting must be dynamic/DTE-based" constant-discipline doesn't apply
@@ -72,6 +85,28 @@ public sealed class SensexBankNiftyInstrumentUniverseResolver(
         IReadOnlyList<Instrument> master, string underlying, Exchange exchange, string sessionToken, DateOnly asOfDate, CancellationToken cancellationToken)
     {
         var result = new List<Instrument>();
+
+        // 2026-09-24 -- spot index, now that a confirmed-live token exists for both underlyings
+        // (see BankNiftySpotToken/SensexSpotToken's own doc comment). Spot trades on NSE for Bank
+        // Nifty and BSE for Sensex regardless of which segment (NFO/BFO) that underlying's own
+        // derivatives trade on, so this is NOT the same as `exchange` (the derivatives exchange
+        // parameter) -- same Nse/Bse split InstrumentUniverseResolver's own Nifty-spot-on-NSE
+        // convention already establishes.
+        var (spotToken, spotExchange, spotSymbol) = underlying == SensexBankNiftyInstrumentMasterProvider.BankNiftyUnderlying
+            ? (BankNiftySpotToken, Exchange.Nse, "Nifty Bank")
+            : (SensexSpotToken, Exchange.Bse, "SENSEX");
+
+        result.Add(new Instrument
+        {
+            Token = spotToken,
+            Exchange = spotExchange,
+            TradingSymbol = spotSymbol,
+            InstrumentType = InstrumentType.Index,
+            Underlying = underlying,
+            LotSize = 1,
+            TickSize = 0.05m,
+            AsOfDate = asOfDate,
+        });
 
         var expiries = master
             .Where(i => i.Underlying == underlying && i.InstrumentType == InstrumentType.Option && i.ExpiryDate is not null)

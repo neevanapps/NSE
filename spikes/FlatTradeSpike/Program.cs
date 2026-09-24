@@ -29,6 +29,44 @@ if (args.Length == 0)
     Console.WriteLine();
     Console.WriteLine("Step 2: run again with the pasted redirect URL (or just the request_code) as the first argument:");
     Console.WriteLine("""  dotnet run --project spikes/FlatTradeSpike -- "<pasted redirect or code>" [durationSeconds]""");
+    Console.WriteLine("""  dotnet run --project spikes/FlatTradeSpike -- search "<pasted redirect or code>" <exch> <searchText>""");
+    return 0;
+}
+
+// 2026-09-24 addition: "search" mode -- exchanges the request_code and runs SearchScripAsync
+// only (no WS feed connection, no wait), for one-off scrip/token lookups (e.g. confirming a
+// spot-index token before hardcoding it into SensexBankNiftyInstrumentUniverseResolver, the same
+// way NiftySpotToken/IndiaVixToken were originally confirmed). Purely additive -- the original
+// two-arg (requestCode, durationSeconds) tick-logging flow above is untouched.
+if (string.Equals(args[0], "search", StringComparison.OrdinalIgnoreCase))
+{
+    // args[2..] is a flat list of (exch, searchText) pairs -- lets a single, single-use
+    // request_code cover multiple searches in one session-token exchange, since FlatTrade's
+    // request_code is consumed on first exchange.
+    if (args.Length < 4 || (args.Length - 2) % 2 != 0)
+    {
+        Console.WriteLine("""  Usage: dotnet run --project spikes/FlatTradeSpike -- search "<pasted redirect or code>" <exch1> <searchText1> [<exch2> <searchText2> ...]""");
+        return 1;
+    }
+
+    var searchRequestCode = ExtractRequestCode(args[1]);
+    Console.WriteLine("Exchanging request_code for a session token...");
+    var searchToken = await rest.ExchangeRequestCodeForTokenAsync(searchRequestCode, CancellationToken.None);
+    Console.WriteLine("Got session token.");
+
+    for (var i = 2; i + 1 < args.Length; i += 2)
+    {
+        var exch = args[i];
+        var searchText = args[i + 1];
+        Console.WriteLine($"--- Searching {exch} for \"{searchText}\" ---");
+        var searchMatches = await rest.SearchScripAsync(config.UserId, searchToken, exch: exch, searchText: searchText, CancellationToken.None);
+        Console.WriteLine($"{searchMatches.Count} match(es):");
+        foreach (var m in searchMatches)
+        {
+            Console.WriteLine($"  {m.Exch} | {m.Tsym} | token={m.Token}");
+        }
+    }
+
     return 0;
 }
 

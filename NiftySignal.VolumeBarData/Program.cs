@@ -4,9 +4,12 @@ using Npgsql;
 using NiftySignal.BacktestData;
 using NiftySignal.Domain.Entities;
 using NiftySignal.Domain.Enums;
+using NiftySignal.Execution;
 using NiftySignal.Persistence;
 using NiftySignal.Rules;
 using NiftySignal.VolumeBarData;
+using MtmRow = NiftySignal.VolumeBarData.MarkToMarketDiagnostics.MtmRow;
+using ExitAsymmetryRow = NiftySignal.VolumeBarData.MarkToMarketDiagnostics.ExitAsymmetryRow;
 
 // CadenceContext.Timestamp / VolumeBarRow.StartTimestamp/EndTimestamp are all stored UTC (Npgsql's
 // own requirement) -- same convention NiftySignal.MetricTrials/Program.cs already uses.
@@ -7191,6 +7194,3332 @@ if (args.Length > 0 && string.Equals(args[0], "vc-sensex-relationship-validation
         }
     }
     Console.WriteLine($"Sensex cross-index validation CSV written to: {Path.GetFullPath(svOutPath)}");
+
+    return 0;
+}
+
+// "vc0dte-relationship-trade-simulation" -- 2026-09-24, first actual trade simulation of the
+// FROZEN Pattern A/B relationship (HARD FREEZE: event-bar/threshold/dynamic-ATM/pattern/episode
+// methodology all reused unchanged from UnderlyingOptionRelationshipRecorder). Reuses
+// PatternRelationshipTradeSimulator (this task's only new production code) for the entry/exit/
+// cost/MAE-MFE state machine. No optimization anywhere -- ALL parameters (1300 threshold, 10
+// lots, 15:00/15:15 cutoffs, opposite-pattern exit) are exactly what was specified, none tuned.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-trade-simulation <fromDate> <toDate> --label=DISCOVERY --tradesOut=path.csv --auditOut=path.csv
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-trade-simulation", StringComparison.OrdinalIgnoreCase))
+{
+    const long tsThreshold = 1300L;
+    var tsIstOffset = TimeSpan.FromHours(5.5);
+
+    var (tsPositional, tsNamed) = SplitNamedArgs(args);
+    if (tsPositional.Length < 3
+        || !DateOnly.TryParseExact(tsPositional[1], "yyyy-MM-dd", out var tsFromDate)
+        || !DateOnly.TryParseExact(tsPositional[2], "yyyy-MM-dd", out var tsToDate)
+        || !tsNamed.TryGetValue("tradesOut", out var tsTradesOutPath)
+        || !tsNamed.TryGetValue("auditOut", out var tsAuditOutPath))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-trade-simulation <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> --tradesOut=path.csv --auditOut=path.csv [--label=DISCOVERY|OOS] [--minEntryPrice=100 --maxEntryPrice=150]");
+        return 1;
+    }
+    var tsLabel = tsNamed.TryGetValue("label", out var tsLabelValue) ? tsLabelValue : "UNLABELED";
+    decimal? tsMinEntryPrice = tsNamed.TryGetValue("minEntryPrice", out var tsMinStr) ? decimal.Parse(tsMinStr) : null;
+    decimal? tsMaxEntryPrice = tsNamed.TryGetValue("maxEntryPrice", out var tsMaxStr) ? decimal.Parse(tsMaxStr) : null;
+    var tsStrikeRuleDescription = tsMinEntryPrice is not null && tsMaxEntryPrice is not null
+        ? $"band-selected strike, live premium in [{tsMinEntryPrice},{tsMaxEntryPrice}], walked outward from dynamic ATM"
+        : "pinned dynamic-ATM strike (frozen relationship's own contract)";
+
+    Console.WriteLine($"=== vc0dte-relationship-trade-simulation [{tsLabel}]: HARD FREEZE trade simulation -- Pattern A -> BUY PE, Pattern B -> BUY CE. Strike rule: {tsStrikeRuleDescription}. No SL/TP, no optimization. ===");
+    Console.WriteLine();
+
+    var tsAllTrades = new List<PatternRelationshipTradeSimulator.TradeRow>();
+    var tsAllAudit = new List<PatternRelationshipTradeSimulator.SignalAuditRow>();
+    var tsDayLabels = new List<(DateOnly Date, int PatternASignals, int PatternBSignals)>();
+
+    for (var date = tsFromDate; date <= tsToDate; date = date.AddDays(1))
+    {
+        if (date.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday) { continue; }
+        var (tsChain, tsFutureBars, tsOptionBars) = await LoadVc0DteDayAsync(date, tsThreshold);
+        if (tsFutureBars.Count == 0 || tsChain.Count == 0) { continue; }
+
+        await using var tsSource = new NiftySignalDbContext(tradeSourceOptions);
+        var rows = await UnderlyingOptionRelationshipRecorder.RecordAsync(tsSource, date, tsChain, tsFutureBars, tsOptionBars, CancellationToken.None);
+        var result = await PatternRelationshipTradeSimulator.SimulateDayAsync(
+            tsSource, date, rows, tsChain, tsFutureBars, tsIstOffset, CancellationToken.None,
+            optionBars: tsOptionBars, minEntryPrice: tsMinEntryPrice, maxEntryPrice: tsMaxEntryPrice);
+
+        tsAllTrades.AddRange(result.Trades);
+        tsAllAudit.AddRange(result.SignalAudit);
+        var patternASignals = rows.Count(r => r.RelationshipCategory == ForwardValidationAnalysis.State2_BullishDivergence_PatternA);
+        var patternBSignals = rows.Count(r => r.RelationshipCategory == ForwardValidationAnalysis.State4_BearishDivergence_PatternB);
+        tsDayLabels.Add((date, patternASignals, patternBSignals));
+        Console.WriteLine($"  {date:yyyy-MM-dd}: {rows.Count} relationship observations, PatternA signals={patternASignals}, PatternB signals={patternBSignals}, trades={result.Trades.Count}.");
+    }
+    Console.WriteLine();
+
+    if (tsDayLabels.Count == 0)
+    {
+        Console.WriteLine($"[{tsLabel}] No usable sessions found in {tsFromDate:yyyy-MM-dd}..{tsToDate:yyyy-MM-dd} -- stopping. No fabricated data.");
+        return 1;
+    }
+
+    static string Fmt2(decimal v) => v.ToString("F2");
+
+    // ---- Signal audit summary ----
+    Console.WriteLine($"### [{tsLabel}] Signal audit (every Pattern A/B signal, not just executed trades) ###");
+    foreach (var outcome in Enum.GetValues<PatternRelationshipTradeSimulator.SignalOutcome>())
+    {
+        Console.WriteLine($"  {outcome}: {tsAllAudit.Count(a => a.Outcome == outcome)}");
+    }
+    Console.WriteLine();
+
+    // ---- Day-wise report ----
+    Console.WriteLine($"### [{tsLabel}] Day-wise report ###");
+    foreach (var (date, patternASignals, patternBSignals) in tsDayLabels)
+    {
+        var dayTrades = tsAllTrades.Where(t => t.TradingDate == date).OrderBy(t => t.EntryTimestamp).ToList();
+        var wins = dayTrades.Count(t => t.NetPnl > 0);
+        var losses = dayTrades.Count(t => t.NetPnl < 0);
+        var grossPnl = dayTrades.Sum(t => t.GrossPnl);
+        var costs = dayTrades.Sum(t => t.Stt + t.Gst + t.OtherCosts);
+        var netPnl = dayTrades.Sum(t => t.NetPnl);
+        var avgTrade = dayTrades.Count > 0 ? netPnl / dayTrades.Count : 0m;
+
+        var equity = 0m; var peak = 0m; var maxDrawdown = 0m;
+        int consecutiveLosses = 0, maxConsecutiveLosses = 0;
+        foreach (var t in dayTrades)
+        {
+            equity += t.NetPnl;
+            peak = Math.Max(peak, equity);
+            maxDrawdown = Math.Min(maxDrawdown, equity - peak);
+            if (t.NetPnl < 0) { consecutiveLosses++; maxConsecutiveLosses = Math.Max(maxConsecutiveLosses, consecutiveLosses); }
+            else { consecutiveLosses = 0; }
+        }
+        var avgMae = dayTrades.Count > 0 ? dayTrades.Average(t => t.MaeRupees) : 0m;
+        var avgMfe = dayTrades.Count > 0 ? dayTrades.Average(t => t.MfeRupees) : 0m;
+
+        Console.WriteLine($"  {date:yyyy-MM-dd}: PatternASignals={patternASignals} PatternBSignals={patternBSignals} Trades={dayTrades.Count} Wins={wins} Losses={losses} WinRate={(dayTrades.Count > 0 ? 100.0 * wins / dayTrades.Count : 0):F1}% GrossPnl={Fmt2(grossPnl)} Costs={Fmt2(costs)} NetPnl={Fmt2(netPnl)} AvgTrade={Fmt2(avgTrade)} MaxDrawdown={Fmt2(maxDrawdown)} MaxConsecLosses={maxConsecutiveLosses} AvgMAE={Fmt2(avgMae)} AvgMFE={Fmt2(avgMfe)}");
+    }
+    Console.WriteLine();
+
+    // ---- Performance metrics, separately per Pattern A -> PE / Pattern B -> CE ----
+    void ReportPerformance(string label, List<PatternRelationshipTradeSimulator.TradeRow> trades)
+    {
+        Console.WriteLine($"### [{tsLabel}] {label}: n={trades.Count} ###");
+        if (trades.Count == 0) { Console.WriteLine("  NO TRADES."); Console.WriteLine(); return; }
+
+        var wins = trades.Where(t => t.NetPnl > 0).ToList();
+        var losses = trades.Where(t => t.NetPnl < 0).ToList();
+        var grossPnl = trades.Sum(t => t.GrossPnl);
+        var totalCosts = trades.Sum(t => t.Stt + t.Gst + t.OtherCosts);
+        var netPnl = trades.Sum(t => t.NetPnl);
+        var netPnls = trades.Select(t => t.NetPnl).OrderBy(v => v).ToList();
+        var medianNet = netPnls[netPnls.Count / 2];
+        var grossProfit = wins.Sum(t => t.NetPnl);
+        var grossLoss = Math.Abs(losses.Sum(t => t.NetPnl));
+        var profitFactor = grossLoss > 0 ? grossProfit / grossLoss : (decimal?)null;
+        var expectancy = trades.Count > 0 ? netPnl / trades.Count : 0m;
+
+        var equity = 0m; var peak = 0m; var maxDrawdown = 0m;
+        int consecutiveLosses = 0, maxConsecutiveLosses = 0;
+        foreach (var t in trades.OrderBy(t => t.EntryTimestamp))
+        {
+            equity += t.NetPnl;
+            peak = Math.Max(peak, equity);
+            maxDrawdown = Math.Min(maxDrawdown, equity - peak);
+            if (t.NetPnl < 0) { consecutiveLosses++; maxConsecutiveLosses = Math.Max(maxConsecutiveLosses, consecutiveLosses); }
+            else { consecutiveLosses = 0; }
+        }
+
+        var sessions = trades.Select(t => t.TradingDate).Distinct().Count();
+        Console.WriteLine($"  Sessions={sessions}, TradesPerDay={(sessions > 0 ? (double)trades.Count / sessions : 0):F2}");
+        Console.WriteLine($"  WinRate={(100.0 * wins.Count / trades.Count):F1}%, LossRate={(100.0 * losses.Count / trades.Count):F1}%");
+        Console.WriteLine($"  GrossPnl={Fmt2(grossPnl)}, TotalCosts={Fmt2(totalCosts)}, NetPnl={Fmt2(netPnl)}");
+        Console.WriteLine($"  AvgNetPnl/trade={Fmt2(expectancy)}, MedianNetPnl/trade={Fmt2(medianNet)}");
+        Console.WriteLine($"  AvgWin={Fmt2(wins.Count > 0 ? wins.Average(t => t.NetPnl) : 0)}, AvgLoss={Fmt2(losses.Count > 0 ? losses.Average(t => t.NetPnl) : 0)}");
+        Console.WriteLine($"  ProfitFactor={(profitFactor?.ToString("F2") ?? "n/a (no losing trades)")}, Expectancy/trade={Fmt2(expectancy)}");
+        Console.WriteLine($"  MaxDrawdown={Fmt2(maxDrawdown)}, MaxConsecutiveLosses={maxConsecutiveLosses}");
+        Console.WriteLine($"  AvgMAE(Rs)={Fmt2(trades.Average(t => t.MaeRupees))}, MedianMAE(Rs)={Fmt2(trades.Select(t => t.MaeRupees).OrderBy(v => v).ElementAt(trades.Count / 2))}");
+        Console.WriteLine($"  AvgMFE(Rs)={Fmt2(trades.Average(t => t.MfeRupees))}, MedianMFE(Rs)={Fmt2(trades.Select(t => t.MfeRupees).OrderBy(v => v).ElementAt(trades.Count / 2))}");
+        var mfeCaptured = trades.Where(t => t.MfeCaptured is not null).Select(t => t.MfeCaptured!.Value).ToList();
+        Console.WriteLine($"  AvgMFECaptured={(mfeCaptured.Count > 0 ? Fmt2(mfeCaptured.Average()) : "n/a")} (n={mfeCaptured.Count} trades with MFE>0)");
+        var holdingSeconds = trades.Select(t => t.HoldingDuration.TotalSeconds).OrderBy(v => v).ToList();
+        Console.WriteLine($"  AvgHoldingTime={TimeSpan.FromSeconds(holdingSeconds.Average()):hh\\:mm\\:ss}, MedianHoldingTime={TimeSpan.FromSeconds(holdingSeconds[holdingSeconds.Count / 2]):hh\\:mm\\:ss}");
+        Console.WriteLine($"  Normalized: AvgPnlPerLot={Fmt2(trades.Average(t => t.PnlPerLot))}, AvgPnlPerOptionPoint={Fmt2(trades.Average(t => t.PnlPerOptionPoint))}, AvgPnlPercentOfEntryPremium={Fmt2(trades.Average(t => t.PnlPercentOfEntryPremium))}%");
+        Console.WriteLine();
+    }
+    ReportPerformance("Pattern A -> PE", tsAllTrades.Where(t => t.Pattern == "PatternA").ToList());
+    ReportPerformance("Pattern B -> CE", tsAllTrades.Where(t => t.Pattern == "PatternB").ToList());
+
+    // ---- Trade-by-trade report ----
+    Console.WriteLine($"### [{tsLabel}] Trade-by-trade report ###");
+    foreach (var dayGroup in tsAllTrades.GroupBy(t => t.TradingDate).OrderBy(g => g.Key))
+    {
+        Console.WriteLine($"{dayGroup.Key:yyyy-MM-dd}");
+        Console.WriteLine("------------------------------------------------");
+        var n = 1;
+        foreach (var t in dayGroup.OrderBy(t => t.EntryTimestamp))
+        {
+            Console.WriteLine($"Trade {n++}");
+            Console.WriteLine($"  Pattern: {t.Pattern}  Instrument: NIFTY {t.Strike} {t.OptionType}  DTE: {t.Dte}");
+            Console.WriteLine($"  Signal: {t.SignalTimestamp.ToOffset(tsIstOffset):HH:mm:ss}  Entry: {t.EntryTimestamp.ToOffset(tsIstOffset):HH:mm:ss}  Exit: {t.ExitTimestamp.ToOffset(tsIstOffset):HH:mm:ss}");
+            Console.WriteLine($"  Entry Price: {t.EntryPrice}  Exit Price: {t.ExitPrice}  Quantity: {t.Quantity}");
+            Console.WriteLine($"  Gross P&L: {Fmt2(t.GrossPnl)}  STT: {Fmt2(t.Stt)}  GST: {Fmt2(t.Gst)}  Net P&L: {Fmt2(t.NetPnl)}");
+            Console.WriteLine($"  MAE: {Fmt2(t.MaeRupees)} ({Fmt2(t.MaePercent)}%)  MFE: {Fmt2(t.MfeRupees)} ({Fmt2(t.MfePercent)}%)  Holding Time: {t.HoldingDuration:hh\\:mm\\:ss}  Exit Reason: {t.ExitReason}");
+            Console.WriteLine();
+        }
+    }
+
+    PatternRelationshipTradeSimulator.WriteTradesCsv(tsAllTrades, tsTradesOutPath, tsIstOffset);
+    PatternRelationshipTradeSimulator.WriteSignalAuditCsv(tsAllAudit, tsAuditOutPath, tsIstOffset);
+    Console.WriteLine($"Trades CSV written to: {Path.GetFullPath(tsTradesOutPath)}");
+    Console.WriteLine($"Signal-audit CSV written to: {Path.GetFullPath(tsAuditOutPath)}");
+
+    return 0;
+}
+
+// "vc0dte-relationship-trade-diagnostics" -- 2026-09-24, diagnostic-only follow-up to the frozen
+// trade simulation (HARD FREEZE: no change to signal generation, entry/exit rules, cost
+// convention, or the [100,150] band -- this command only OBSERVES an already-frozen simulation
+// run more closely). Uses the [100,150] band by default (the now-intended execution convention),
+// reuses EpisodeAnalysis/ConditionalMovementAnalysis/Vc0DteBehaviorSummary/OptionValueDecomposition
+// completely unchanged, and TradeLifecycleDiagnostics (this task's only new production code, pure
+// and separately tested) for the churn/holding-time/alternation calculations. No SL/TP, no
+// composite score, no optimization, no filter is implemented here -- diagnosis only.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-trade-diagnostics <fromDate> <toDate> --diagOut=path.csv [--minEntryPrice=100 --maxEntryPrice=150]
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-trade-diagnostics", StringComparison.OrdinalIgnoreCase))
+{
+    const long tdThreshold = 1300L;
+    var tdIstOffset = TimeSpan.FromHours(5.5);
+    const string PatternA = ForwardValidationAnalysis.State2_BullishDivergence_PatternA;
+    const string PatternB = ForwardValidationAnalysis.State4_BearishDivergence_PatternB;
+
+    var (tdPositional, tdNamed) = SplitNamedArgs(args);
+    if (tdPositional.Length < 3 || !DateOnly.TryParseExact(tdPositional[1], "yyyy-MM-dd", out var tdFromDate) || !DateOnly.TryParseExact(tdPositional[2], "yyyy-MM-dd", out var tdToDate) || !tdNamed.TryGetValue("diagOut", out var tdDiagOutPath))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-trade-diagnostics <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> --diagOut=path.csv [--minEntryPrice=100 --maxEntryPrice=150]");
+        return 1;
+    }
+    var tdMinEntryPrice = tdNamed.TryGetValue("minEntryPrice", out var tdMinStr) ? decimal.Parse(tdMinStr) : 100m;
+    var tdMaxEntryPrice = tdNamed.TryGetValue("maxEntryPrice", out var tdMaxStr) ? decimal.Parse(tdMaxStr) : 150m;
+
+    Console.WriteLine($"=== vc0dte-relationship-trade-diagnostics: DIAGNOSTIC ONLY -- band=[{tdMinEntryPrice},{tdMaxEntryPrice}]. No strategy change, no optimization. ===");
+    Console.WriteLine();
+    static string Fmt2(decimal v) => v.ToString("F2");
+
+    // ---- Enriched per-trade record: everything Part 11's CSV and Parts 2-10's breakdowns need ----
+    var enriched = new List<(PatternRelationshipTradeSimulator.TradeRow Trade, RelationshipObservation Row, int EventId,
+        string? PriorPattern, int PriorAlternations, int? EventsSincePrev, double? SecondsSincePrev,
+        string SessionBucket, decimal? PriorMovement3, int EpisodeLength, int EventIndexWithinEpisode,
+        decimal StrikeDistanceFromAtm, decimal Moneyness)>();
+
+    var tdAllTrades = new List<PatternRelationshipTradeSimulator.TradeRow>();
+    var tdAllAudit = new List<PatternRelationshipTradeSimulator.SignalAuditRow>();
+    var tdEpisodesA = new List<EpisodeAnalysis.Episode>();
+    var tdEpisodesB = new List<EpisodeAnalysis.Episode>();
+    var tdRawA = 0; var tdRawB = 0;
+
+    for (var date = tdFromDate; date <= tdToDate; date = date.AddDays(1))
+    {
+        if (date.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday) { continue; }
+        var (tdChain, tdFutureBars, tdOptionBars) = await LoadVc0DteDayAsync(date, tdThreshold);
+        if (tdFutureBars.Count == 0 || tdChain.Count == 0) { continue; }
+
+        await using var tdSource = new NiftySignalDbContext(tradeSourceOptions);
+        var rows = await UnderlyingOptionRelationshipRecorder.RecordAsync(tdSource, date, tdChain, tdFutureBars, tdOptionBars, CancellationToken.None);
+        var result = await PatternRelationshipTradeSimulator.SimulateDayAsync(
+            tdSource, date, rows, tdChain, tdFutureBars, tdIstOffset, CancellationToken.None,
+            optionBars: tdOptionBars, minEntryPrice: tdMinEntryPrice, maxEntryPrice: tdMaxEntryPrice);
+
+        tdAllTrades.AddRange(result.Trades);
+        tdAllAudit.AddRange(result.SignalAudit);
+        tdRawA += rows.Count(r => r.RelationshipCategory == PatternA);
+        tdRawB += rows.Count(r => r.RelationshipCategory == PatternB);
+        var dayEpisodesA = EpisodeAnalysis.DetectEpisodes(date, rows, PatternA, []);
+        var dayEpisodesB = EpisodeAnalysis.DetectEpisodes(date, rows, PatternB, []);
+        tdEpisodesA.AddRange(dayEpisodesA);
+        tdEpisodesB.AddRange(dayEpisodesB);
+
+        var actionableRows = rows.Where(r => r.RelationshipCategory == PatternA || r.RelationshipCategory == PatternB).OrderBy(r => r.EventId).ToList();
+        var dayTradesSorted = result.Trades.OrderBy(t => t.EntryTimestamp).ToList();
+
+        for (var i = 0; i < dayTradesSorted.Count; i++)
+        {
+            var trade = dayTradesSorted[i];
+            var row = rows.First(r => r.EndTimestamp == trade.SignalTimestamp);
+            var priorPattern = i > 0 ? dayTradesSorted[i - 1].Pattern : null;
+            var priorAlternations = TradeLifecycleDiagnostics.CountAlternationsBefore(dayTradesSorted.Select(t => t.Pattern).ToList(), i);
+            var actionableIdx = actionableRows.FindIndex(r => r.EventId == row.EventId);
+            int? eventsSincePrev = actionableIdx > 0 ? row.EventId - actionableRows[actionableIdx - 1].EventId : null;
+            double? secondsSincePrev = actionableIdx > 0 ? (row.EndTimestamp - actionableRows[actionableIdx - 1].EndTimestamp).TotalSeconds : null;
+            var sessionBucket = Vc0DteBehaviorSummary.SessionBucket(row.StartTimestamp, tdIstOffset);
+            var priorMovement3 = UnderlyingOptionRelationshipSummary.ComputeFuturesChange(rows, row.EventId - 3, 3).PercentChange;
+            var episode = TradeLifecycleDiagnostics.FindContainingEpisode(trade.Pattern == "PatternA" ? dayEpisodesA : dayEpisodesB, row.EventId);
+            var episodeLength = episode?.EventCount ?? 1;
+            var eventIndexWithinEpisode = episode is not null ? row.EventId - episode.StartEventId : 0;
+            var strikeDistance = trade.Strike - row.AtmStrike;
+            var moneyness = OptionValueDecomposition.ComputeMoneyness(row.FuturesClose, trade.Strike, trade.OptionType);
+
+            enriched.Add((trade, row, row.EventId, priorPattern, priorAlternations, eventsSincePrev, secondsSincePrev,
+                sessionBucket, priorMovement3, episodeLength, eventIndexWithinEpisode, strikeDistance, moneyness));
+        }
+
+        Console.WriteLine($"  {date:yyyy-MM-dd}: {rows.Count} obs, PatternA events={rows.Count(r => r.RelationshipCategory == PatternA)} ({dayEpisodesA.Count} episodes), PatternB events={rows.Count(r => r.RelationshipCategory == PatternB)} ({dayEpisodesB.Count} episodes), trades={result.Trades.Count}.");
+    }
+    Console.WriteLine();
+
+    if (enriched.Count == 0)
+    {
+        Console.WriteLine("No usable sessions/trades found -- stopping. No fabricated data.");
+        return 1;
+    }
+
+    // ==== PART 2: frequency + signal lifecycle ====
+    Console.WriteLine("### PART 2 -- pattern frequency and signal lifecycle ###");
+    void ReportEpisodeStats(string label, int rawEvents, List<EpisodeAnalysis.Episode> episodes)
+    {
+        var lengths = episodes.Select(e => e.EventCount).ToList();
+        Console.WriteLine($"  {label}: RawEvents={rawEvents}, Episodes={episodes.Count}, AvgEvents/Episode={(episodes.Count > 0 ? (double)lengths.Sum() / episodes.Count : 0):F2}, MedianEvents/Episode={(lengths.Count > 0 ? lengths.OrderBy(v => v).ElementAt(lengths.Count / 2) : 0)}, MaxEvents/Episode={(lengths.Count > 0 ? lengths.Max() : 0)}");
+    }
+    ReportEpisodeStats("Pattern A", tdRawA, tdEpisodesA);
+    ReportEpisodeStats("Pattern B", tdRawB, tdEpisodesB);
+    Console.WriteLine("  Signal lifecycle (all signals, from audit):");
+    foreach (var outcome in Enum.GetValues<PatternRelationshipTradeSimulator.SignalOutcome>())
+    {
+        Console.WriteLine($"    {outcome}: {tdAllAudit.Count(a => a.Outcome == outcome)}");
+    }
+    var reversalCloses = tdAllTrades.Count(t => t.ExitReason == nameof(PatternRelationshipTradeSimulator.ExitReason.OppositePatternSignal));
+    Console.WriteLine($"    (derived) OppositeDirectionSignalsCausingExit (= reversal closes -- each is ALSO the entry attempt for the new side): {reversalCloses}");
+    Console.WriteLine();
+
+    // ==== PART 3: churn ====
+    Console.WriteLine("### PART 3 -- churn ###");
+    var patternSeq = tdAllTrades.OrderBy(t => t.EntryTimestamp).Select(t => t.Pattern).ToList();
+    Console.WriteLine($"  A->B: {TradeLifecycleDiagnostics.CountNGram(patternSeq, ["PatternA", "PatternB"])}, B->A: {TradeLifecycleDiagnostics.CountNGram(patternSeq, ["PatternB", "PatternA"])}, A->A: {TradeLifecycleDiagnostics.CountNGram(patternSeq, ["PatternA", "PatternA"])}, B->B: {TradeLifecycleDiagnostics.CountNGram(patternSeq, ["PatternB", "PatternB"])}");
+    Console.WriteLine($"  A->B->A: {TradeLifecycleDiagnostics.CountNGram(patternSeq, ["PatternA", "PatternB", "PatternA"])}, B->A->B: {TradeLifecycleDiagnostics.CountNGram(patternSeq, ["PatternB", "PatternA", "PatternB"])}");
+    Console.WriteLine($"  A->B->A->B: {TradeLifecycleDiagnostics.CountNGram(patternSeq, ["PatternA", "PatternB", "PatternA", "PatternB"])}, B->A->B->A: {TradeLifecycleDiagnostics.CountNGram(patternSeq, ["PatternB", "PatternA", "PatternB", "PatternA"])}");
+
+    var reversalTrades = tdAllTrades.Where(t => t.ExitReason == nameof(PatternRelationshipTradeSimulator.ExitReason.OppositePatternSignal)).ToList();
+    int[] eventThresholds = [1, 2, 3, 5];
+    double[] minuteThresholds = [1, 2, 5, 10, 15, 30];
+    Console.WriteLine($"  Opposite-signal exits (n={reversalTrades.Count}) by holding time (this holding time IS the signal-to-opposite-signal gap):");
+    // Event-gap uses the diagnostic per-trade EventId already captured; exit event id looked up by matching exit timestamp back to that day's rows via SignalTimestamp of the FOLLOWING trade (the opposite signal that closed this one) when available.
+    var withEventGap = new List<(PatternRelationshipTradeSimulator.TradeRow Trade, int EntryEventId, int? ExitEventId)>();
+    foreach (var (trade, row, eventId, _, _, _, _, _, _, _, _, _, _) in enriched)
+    {
+        int? exitEventId = null;
+        if (trade.ExitReason == nameof(PatternRelationshipTradeSimulator.ExitReason.OppositePatternSignal))
+        {
+            var closingTrade = enriched.FirstOrDefault(e => e.Trade.SignalTimestamp == trade.ExitTimestamp || e.Row.EndTimestamp == trade.ExitTimestamp);
+            exitEventId = closingTrade.Row?.EventId;
+        }
+        withEventGap.Add((trade, eventId, exitEventId));
+    }
+    foreach (var n in eventThresholds)
+    {
+        var count = withEventGap.Count(x => x.ExitEventId is not null && x.ExitEventId.Value - x.EntryEventId <= n);
+        Console.WriteLine($"    within {n} event(s): {count} ({100.0 * count / Math.Max(1, reversalTrades.Count):F1}%)");
+    }
+    foreach (var m in minuteThresholds)
+    {
+        var count = reversalTrades.Count(t => t.HoldingDuration.TotalMinutes <= m);
+        Console.WriteLine($"    within {m} minute(s): {count} ({100.0 * count / Math.Max(1, reversalTrades.Count):F1}%)");
+    }
+    Console.WriteLine();
+
+    // ==== PART 4: holding-time analysis ====
+    Console.WriteLine("### PART 4 -- holding-time analysis ###");
+    void ReportHoldingBuckets(string label, List<PatternRelationshipTradeSimulator.TradeRow> trades)
+    {
+        Console.WriteLine($"  [{label}] n={trades.Count}");
+        foreach (var b in TradeLifecycleDiagnostics.BucketTrades(trades))
+        {
+            Console.WriteLine($"    {b.Bucket}: n={b.Count} wins={b.Wins} winRate={(100.0 * b.Wins / b.Count):F1}% avgPnl={Fmt2(b.AvgPnl)} medianPnl={Fmt2(b.MedianPnl)} totalPnl={Fmt2(b.TotalPnl)} avgMAE={Fmt2(b.AvgMae)} avgMFE={Fmt2(b.AvgMfe)}");
+        }
+    }
+    ReportHoldingBuckets("Pattern A -> PE", tdAllTrades.Where(t => t.Pattern == "PatternA").ToList());
+    ReportHoldingBuckets("Pattern B -> CE", tdAllTrades.Where(t => t.Pattern == "PatternB").ToList());
+    Console.WriteLine();
+
+    // ==== PART 5: lifecycle P&L ====
+    Console.WriteLine("### PART 5 -- lifecycle categories ###");
+    void ReportLifecycleCategory(string label, List<PatternRelationshipTradeSimulator.TradeRow> members)
+    {
+        if (members.Count == 0) { Console.WriteLine($"  {label}: n=0"); return; }
+        var wins = members.Count(t => t.NetPnl > 0);
+        var sorted = members.Select(t => t.NetPnl).OrderBy(v => v).ToList();
+        Console.WriteLine($"  {label}: n={members.Count} winRate={(100.0 * wins / members.Count):F1}% avgPnl={Fmt2(members.Average(t => t.NetPnl))} medianPnl={Fmt2(sorted[sorted.Count / 2])} totalPnl={Fmt2(members.Sum(t => t.NetPnl))} avgHolding={TimeSpan.FromSeconds(members.Average(t => t.HoldingDuration.TotalSeconds)):hh\\:mm\\:ss} avgMAE={Fmt2(members.Average(t => t.MaeRupees))} avgMFE={Fmt2(members.Average(t => t.MfeRupees))}");
+    }
+    ReportLifecycleCategory("1. Entry -> EOD", tdAllTrades.Where(t => t.ExitReason == nameof(PatternRelationshipTradeSimulator.ExitReason.ForcedEod)).ToList());
+    Console.WriteLine("  2/3. Entry -> opposite pattern, by holding-time bucket (no invented quick/meaningful cutoff -- same 8 buckets as Part 4):");
+    foreach (var b in TradeLifecycleDiagnostics.BucketTrades(reversalTrades))
+    {
+        Console.WriteLine($"    {b.Bucket}: n={b.Count} winRate={(100.0 * b.Wins / b.Count):F1}% avgPnl={Fmt2(b.AvgPnl)} totalPnl={Fmt2(b.TotalPnl)}");
+    }
+    void ReportChain(string label, List<string> nGram)
+    {
+        var occurrences = new List<List<PatternRelationshipTradeSimulator.TradeRow>>();
+        for (var i = 0; i <= patternSeq.Count - nGram.Count; i++)
+        {
+            var match = true;
+            for (var j = 0; j < nGram.Count; j++) { if (patternSeq[i + j] != nGram[j]) { match = false; break; } }
+            if (match) { occurrences.Add(Enumerable.Range(i, nGram.Count).Select(k => tdAllTrades.OrderBy(t => t.EntryTimestamp).ElementAt(k)).ToList()); }
+        }
+        if (occurrences.Count == 0) { Console.WriteLine($"  {label}: n=0 chains"); return; }
+        var chainPnls = occurrences.Select(c => c.Sum(t => t.NetPnl)).ToList();
+        var wins = chainPnls.Count(v => v > 0);
+        Console.WriteLine($"  {label}: chains={occurrences.Count} winRate(chain net>0)={(100.0 * wins / occurrences.Count):F1}% avgChainPnl={Fmt2(chainPnls.Average())} totalChainPnl={Fmt2(chainPnls.Sum())}");
+    }
+    ReportChain("5. A->B->A", ["PatternA", "PatternB", "PatternA"]);
+    ReportChain("6. B->A->B", ["PatternB", "PatternA", "PatternB"]);
+    ReportChain("7. A->B->A->B", ["PatternA", "PatternB", "PatternA", "PatternB"]);
+    ReportChain("8. B->A->B->A", ["PatternB", "PatternA", "PatternB", "PatternA"]);
+    Console.WriteLine();
+
+    // ==== PART 6/7: improvement dimensions + A/B asymmetry (combined -- same breakdowns, both patterns shown side by side) ====
+    Console.WriteLine("### PART 6/7 -- improvement dimensions (A vs B shown side by side, per task's Part 7) ###");
+
+    void ReportByGroup<TKey>(string dimensionLabel, Func<(PatternRelationshipTradeSimulator.TradeRow Trade, RelationshipObservation Row, int EventId, string? PriorPattern, int PriorAlternations, int? EventsSincePrev, double? SecondsSincePrev, string SessionBucket, decimal? PriorMovement3, int EpisodeLength, int EventIndexWithinEpisode, decimal StrikeDistanceFromAtm, decimal Moneyness), TKey> keySelector)
+    {
+        Console.WriteLine($"  -- {dimensionLabel} --");
+        foreach (var pattern in new[] { "PatternA", "PatternB" })
+        {
+            var members = enriched.Where(e => e.Trade.Pattern == pattern).ToList();
+            foreach (var group in members.GroupBy(e => keySelector(e)).OrderBy(g => g.Key?.ToString()))
+            {
+                var pnls = group.Select(g => g.Trade.NetPnl).ToList();
+                Console.WriteLine($"    [{pattern}] {group.Key}: n={pnls.Count} avgPnl={Fmt2(pnls.Average())} totalPnl={Fmt2(pnls.Sum())} winRate={(100.0 * pnls.Count(v => v > 0) / pnls.Count):F1}%");
+            }
+        }
+    }
+
+    // A. signal strength (prior-3-event futures movement magnitude, tercile-matched WITHIN this trade population -- reuses existing tercile methodology).
+    var priorAbsMoves = enriched.Select(e => e.PriorMovement3).Where(v => v is not null).Select(v => Math.Abs(v!.Value)).ToList();
+    if (priorAbsMoves.Count >= 3)
+    {
+        var (low33, high67) = ForwardValidationAnalysis.ComputeTerciles(priorAbsMoves);
+        ReportByGroup("A. Signal strength (|prior-3-event futures move| tercile)", e => e.PriorMovement3 is null ? "Unavailable" : ConditionalMovementAnalysis.ClassifyTercileBucket(Math.Abs(e.PriorMovement3.Value), low33, high67));
+    }
+    // B. signal persistence: first event of episode vs later; short vs long episode (reusing episode length itself as the bucket, not a new threshold).
+    ReportByGroup("B1. Episode position", e => e.EventIndexWithinEpisode == 0 ? "First event" : "Later event");
+    ReportByGroup("B2. Episode length", e => e.EpisodeLength == 1 ? "1 event" : e.EpisodeLength <= 3 ? "2-3 events" : "4+ events");
+    // C. alternation count.
+    ReportByGroup("C. Prior alternation count", e => e.PriorAlternations == 0 ? "0" : e.PriorAlternations == 1 ? "1" : e.PriorAlternations == 2 ? "2" : "3+");
+    // D. time since previous actionable signal (reusing Part 4's own minute buckets, no new threshold).
+    ReportByGroup("D. Time since previous actionable signal", e => e.SecondsSincePrev is null ? "First signal of day" : TradeLifecycleDiagnostics.BucketHoldingTime(TimeSpan.FromSeconds(e.SecondsSincePrev.Value)));
+    // E. underlying movement context (same tercile calc as A, kept as a separate explicit dimension per the task's own lettering).
+    if (priorAbsMoves.Count >= 3)
+    {
+        var (low33e, high67e) = ForwardValidationAnalysis.ComputeTerciles(priorAbsMoves);
+        ReportByGroup("E. Preceding underlying movement tercile", e => e.PriorMovement3 is null ? "Unavailable" : ConditionalMovementAnalysis.ClassifyTercileBucket(Math.Abs(e.PriorMovement3.Value), low33e, high67e));
+    }
+    // F. DTE.
+    ReportByGroup("F. DTE", e => e.Trade.Dte.ToString());
+    // G. session period.
+    ReportByGroup("G. Session bucket", e => e.SessionBucket);
+    // H. option execution characteristics -- strike distance from ATM tercile (band selection's own effect).
+    var strikeDistances = enriched.Select(e => Math.Abs(e.StrikeDistanceFromAtm)).ToList();
+    if (strikeDistances.Count >= 3)
+    {
+        var distinctNonZero = strikeDistances.Where(d => d > 0).ToList();
+        if (distinctNonZero.Count >= 3)
+        {
+            var (low33h, high67h) = ForwardValidationAnalysis.ComputeTerciles(distinctNonZero);
+            ReportByGroup("H. |Strike distance from ATM| tercile (0 = ATM itself)", e => Math.Abs(e.StrikeDistanceFromAtm) == 0 ? "0 (ATM itself)" : ConditionalMovementAnalysis.ClassifyTercileBucket(Math.Abs(e.StrikeDistanceFromAtm), low33h, high67h));
+        }
+    }
+    Console.WriteLine();
+    Console.WriteLine("  H (cont.) -- raw execution characteristics summary:");
+    foreach (var pattern in new[] { "PatternA", "PatternB" })
+    {
+        var members = enriched.Where(e => e.Trade.Pattern == pattern).ToList();
+        Console.WriteLine($"    [{pattern}] AvgEntryPrice={Fmt2(members.Average(e => e.Trade.EntryPrice))} AvgAbsStrikeDistance={Fmt2(members.Average(e => Math.Abs(e.StrikeDistanceFromAtm)))} AvgMoneyness={Fmt2(members.Average(e => e.Moneyness))}");
+    }
+    Console.WriteLine();
+
+    // ==== PART 10: MAE/MFE excursion behaviour ====
+    Console.WriteLine("### PART 10 -- MAE/MFE excursion behaviour (magnitude only; time-to-MFE path not computed in this pass -- documented limitation) ###");
+    void ReportExcursion(string label, List<PatternRelationshipTradeSimulator.TradeRow> members)
+    {
+        var wins = members.Where(t => t.NetPnl > 0).ToList();
+        var losses = members.Where(t => t.NetPnl < 0).ToList();
+        Console.WriteLine($"  [{label}] Winners(n={wins.Count}): AvgMAE={Fmt2(wins.Count > 0 ? wins.Average(t => t.MaeRupees) : 0)} AvgMFE={Fmt2(wins.Count > 0 ? wins.Average(t => t.MfeRupees) : 0)}. Losers(n={losses.Count}): AvgMAE={Fmt2(losses.Count > 0 ? losses.Average(t => t.MaeRupees) : 0)} AvgMFE={Fmt2(losses.Count > 0 ? losses.Average(t => t.MfeRupees) : 0)}.");
+        var mfeExceedsMae = members.Count(t => t.MfeRupees > t.MaeRupees);
+        Console.WriteLine($"    MFE > MAE in {mfeExceedsMae}/{members.Count} trades ({100.0 * mfeExceedsMae / members.Count:F1}%). Reversal-exited trades' own MFE at exit (n={members.Count(t => t.ExitReason == nameof(PatternRelationshipTradeSimulator.ExitReason.OppositePatternSignal))}): avg={Fmt2(members.Where(t => t.ExitReason == nameof(PatternRelationshipTradeSimulator.ExitReason.OppositePatternSignal)).DefaultIfEmpty().Average(t => t?.MfeRupees ?? 0))}.");
+    }
+    ReportExcursion("Pattern A -> PE", tdAllTrades.Where(t => t.Pattern == "PatternA").ToList());
+    ReportExcursion("Pattern B -> CE", tdAllTrades.Where(t => t.Pattern == "PatternB").ToList());
+    Console.WriteLine();
+
+    // ==== PART 11: diagnostic CSV ====
+    using (var writer = new StreamWriter(tdDiagOutPath))
+    {
+        writer.WriteLine("Date,Pattern,OptionType,Strike,Dte,SignalTimestamp,EntryTimestamp,ExitTimestamp,HoldingSeconds,"
+            + "EntryPrice,ExitPrice,GrossPnl,NetPnl,MAE,MFE,ExitReason,"
+            + "PriorPattern,PriorPatternAlternations,EventsSincePreviousActionableSignal,SecondsSincePreviousActionableSignal,"
+            + "SessionTimeBucket,UnderlyingPriceAtSignal,UnderlyingPriorMovement3Pct,PatternEpisodeLength,EventIndexWithinEpisode,StrikeDistanceFromAtm,Moneyness");
+        foreach (var (trade, row, eventId, priorPattern, priorAlternations, eventsSincePrev, secondsSincePrev, sessionBucket, priorMovement3, episodeLength, eventIndexWithinEpisode, strikeDistance, moneyness) in enriched)
+        {
+            writer.WriteLine(string.Join(',',
+                trade.TradingDate.ToString("yyyy-MM-dd"), trade.Pattern, trade.OptionType, trade.Strike, trade.Dte,
+                trade.SignalTimestamp.ToOffset(tdIstOffset).ToString("HH:mm:ss.fff"), trade.EntryTimestamp.ToOffset(tdIstOffset).ToString("HH:mm:ss.fff"), trade.ExitTimestamp.ToOffset(tdIstOffset).ToString("HH:mm:ss.fff"),
+                trade.HoldingDuration.TotalSeconds, trade.EntryPrice, trade.ExitPrice, trade.GrossPnl, trade.NetPnl, trade.MaeRupees, trade.MfeRupees, trade.ExitReason,
+                priorPattern ?? "", priorAlternations, eventsSincePrev, secondsSincePrev, sessionBucket, trade.UnderlyingPriceAtSignal, priorMovement3, episodeLength, eventIndexWithinEpisode, strikeDistance, moneyness));
+        }
+    }
+    Console.WriteLine($"Diagnostic CSV written to: {Path.GetFullPath(tdDiagOutPath)}");
+
+    return 0;
+}
+
+// "vc0dte-relationship-mtm-diagnostics" -- 2026-09-24, mark-to-market / signal-quality follow-up
+// (HARD FREEZE: diagnostic only, no strategy change -- reuses PatternRelationshipTradeSimulator's
+// already-frozen [100,150]-band simulation unchanged, plus OptionValueDecomposition/
+// UnderlyingOptionRelationshipSummary/EpisodeAnalysis/ConditionalMovementAnalysis completely
+// unmodified). Only new code: MarkToMarketDiagnostics (pure, tested) and this orchestration,
+// which measures mark-to-market outcomes at fixed event/minute horizons and excursion timing --
+// it does NOT introduce any new exit, filter, or threshold into the trading logic itself.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-mtm-diagnostics <fromDate> <toDate> --diagOut=path.csv
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-mtm-diagnostics", StringComparison.OrdinalIgnoreCase))
+{
+    const long mtmThreshold = 1300L;
+    var mtmIstOffset = TimeSpan.FromHours(5.5);
+    const decimal mtmMinEntryPrice = 100m, mtmMaxEntryPrice = 150m;
+    int[] mtmEventHorizons = [1, 3, 5, 10];
+    int[] mtmMinuteHorizons = [1, 2, 3, 5, 10, 15];
+
+    var (mtmPositional, mtmNamed) = SplitNamedArgs(args);
+    if (mtmPositional.Length < 3 || !DateOnly.TryParseExact(mtmPositional[1], "yyyy-MM-dd", out var mtmFromDate) || !DateOnly.TryParseExact(mtmPositional[2], "yyyy-MM-dd", out var mtmToDate) || !mtmNamed.TryGetValue("diagOut", out var mtmDiagOutPath))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-mtm-diagnostics <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> --diagOut=path.csv");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-mtm-diagnostics: DIAGNOSTIC ONLY -- mark-to-market signal quality before opposite-pattern exit. No strategy change. ===");
+    Console.WriteLine();
+    static string Fmt2(decimal v) => v.ToString("F2");
+    static string FmtN(decimal? v) => v?.ToString("F2") ?? "--";
+
+    var mtmRows = new List<MtmRow>();
+
+    for (var date = mtmFromDate; date <= mtmToDate; date = date.AddDays(1))
+    {
+        if (date.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday) { continue; }
+        var (mtmChain, mtmFutureBars, mtmOptionBars) = await LoadVc0DteDayAsync(date, mtmThreshold);
+        if (mtmFutureBars.Count == 0 || mtmChain.Count == 0) { continue; }
+
+        await using var mtmSource = new NiftySignalDbContext(tradeSourceOptions);
+        var rows = await UnderlyingOptionRelationshipRecorder.RecordAsync(mtmSource, date, mtmChain, mtmFutureBars, mtmOptionBars, CancellationToken.None);
+        var result = await PatternRelationshipTradeSimulator.SimulateDayAsync(
+            mtmSource, date, rows, mtmChain, mtmFutureBars, mtmIstOffset, CancellationToken.None,
+            optionBars: mtmOptionBars, minEntryPrice: mtmMinEntryPrice, maxEntryPrice: mtmMaxEntryPrice);
+
+        var barsByToken = mtmOptionBars.GroupBy(b => b.Token).ToDictionary(g => g.Key, g => g.OrderBy(b => b.EventId).ToDictionary(b => b.EventId));
+        var putStrikeStep = MarkToMarketDiagnostics.InferStrikeStepSize(mtmChain.Where(i => i.OptionType == OptionType.Put).Select(i => i.StrikePrice!.Value).Distinct().OrderBy(v => v).ToList());
+        var callStrikeStep = MarkToMarketDiagnostics.InferStrikeStepSize(mtmChain.Where(i => i.OptionType == OptionType.Call).Select(i => i.StrikePrice!.Value).Distinct().OrderBy(v => v).ToList());
+        var tickSeriesCache = new Dictionary<string, OptionTickSeries>();
+        async Task<OptionTickSeries> GetSeriesAsync(string token)
+        {
+            if (!tickSeriesCache.TryGetValue(token, out var series))
+            {
+                var dayStart = mtmFutureBars[0].StartTimestamp;
+                var dayEnd = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 30)), mtmIstOffset).ToUniversalTime();
+                series = await OptionTickSeries.LoadAsync(mtmSource, token, dayStart, dayEnd, CancellationToken.None);
+                tickSeriesCache[token] = series;
+            }
+            return series;
+        }
+
+        foreach (var trade in result.Trades)
+        {
+            var row = rows.First(r => r.EndTimestamp == trade.SignalTimestamp);
+            var signalEventId = row.EventId;
+            var strikeStep = trade.OptionType == OptionType.Put ? putStrikeStep : callStrikeStep;
+            var tradeToken = mtmChain.First(i => i.OptionType == trade.OptionType && i.StrikePrice == trade.Strike).Token;
+
+            var intrinsicAtEntry = OptionValueDecomposition.ComputeIntrinsic(trade.UnderlyingPriceAtEntry, trade.Strike, trade.OptionType);
+            var extrinsicAtEntry = OptionValueDecomposition.ComputeExtrinsic(trade.EntryPrice, intrinsicAtEntry);
+            decimal? intrinsicPct = trade.EntryPrice > 0 ? intrinsicAtEntry / trade.EntryPrice * 100m : null;
+
+            // ---- event-based mark-to-market (baseline = the SIGNAL event, same convention every prior experiment in this research chain uses) ----
+            var eventReturns = new decimal?[mtmEventHorizons.Length];
+            var eventIntrinsicChanges = new decimal?[mtmEventHorizons.Length];
+            var eventExtrinsicChanges = new decimal?[mtmEventHorizons.Length];
+            if (barsByToken.TryGetValue(tradeToken, out var tokenBars))
+            {
+                for (var h = 0; h < mtmEventHorizons.Length; h++)
+                {
+                    var targetEventId = signalEventId + mtmEventHorizons[h];
+                    if (tokenBars.TryGetValue(targetEventId, out var bar) && bar.Close is { } closeAtH && targetEventId < mtmFutureBars.Count)
+                    {
+                        eventReturns[h] = closeAtH - trade.EntryPrice;
+                        var futuresAtH = mtmFutureBars[targetEventId].Close;
+                        var intrinsicAtH = OptionValueDecomposition.ComputeIntrinsic(futuresAtH, trade.Strike, trade.OptionType);
+                        var extrinsicAtH = OptionValueDecomposition.ComputeExtrinsic(closeAtH, intrinsicAtH);
+                        eventIntrinsicChanges[h] = intrinsicAtH - intrinsicAtEntry;
+                        eventExtrinsicChanges[h] = extrinsicAtH - extrinsicAtEntry;
+                    }
+                }
+            }
+
+            // ---- minute-based mark-to-market + excursion timing (real ticks, never look-ahead beyond entry) ----
+            var series = await GetSeriesAsync(tradeToken);
+            var minuteReturns = new decimal?[mtmMinuteHorizons.Length];
+            for (var h = 0; h < mtmMinuteHorizons.Length; h++)
+            {
+                var mark = series.EntryAtOrAfter(trade.EntryTimestamp.AddMinutes(mtmMinuteHorizons[h]));
+                minuteReturns[h] = mark is { } m ? m.LastPrice - trade.EntryPrice : null;
+            }
+            var pathAfterEntry = series.AllEntries.Where(e => e.Timestamp > trade.EntryTimestamp && e.Timestamp <= trade.ExitTimestamp).Select(e => (e.Timestamp, e.LastPrice)).ToList();
+            var (timeToMfe, timeToMae) = MarkToMarketDiagnostics.ComputeExcursionTiming(trade.EntryTimestamp, pathAfterEntry);
+
+            var priorMovement3 = UnderlyingOptionRelationshipSummary.ComputeFuturesChange(rows, signalEventId - 3, 3).PercentChange;
+            var sessionBucket = Vc0DteBehaviorSummary.SessionBucket(row.StartTimestamp, mtmIstOffset);
+
+            mtmRows.Add(new MtmRow(
+                date, trade.Pattern, trade.OptionType, trade.Strike, row.AtmStrike, trade.Strike - row.AtmStrike,
+                MarkToMarketDiagnostics.BucketByStrikeSteps(trade.Strike, row.AtmStrike, strikeStep), trade.Dte,
+                trade.EntryPrice, trade.UnderlyingPriceAtEntry, intrinsicAtEntry, extrinsicAtEntry, intrinsicPct,
+                eventReturns, eventIntrinsicChanges, eventExtrinsicChanges, minuteReturns,
+                trade.HoldingDuration, MarkToMarketDiagnostics.BucketByHoldingTimeCoarse(trade.HoldingDuration),
+                trade.MaeRupees, trade.MaePercent, trade.MfeRupees, trade.MfePercent, MarkToMarketDiagnostics.BucketByMfePercent(trade.MfePercent),
+                timeToMfe, timeToMae, trade.NetPnl, trade.ExitReason, priorMovement3, sessionBucket));
+        }
+
+        Console.WriteLine($"  {date:yyyy-MM-dd}: {result.Trades.Count} trades processed for mark-to-market diagnostics.");
+    }
+    Console.WriteLine();
+
+    if (mtmRows.Count == 0)
+    {
+        Console.WriteLine("No trades found -- stopping. No fabricated data.");
+        return 1;
+    }
+
+    var mtmDates = mtmRows.Select(r => r.Date).Distinct().OrderBy(d => d).ToList();
+
+    // ==== PART 1: mark-to-market before exit (does the option develop positive expectancy?) ====
+    void ReportMtm(string label, IEnumerable<MtmRow> members)
+    {
+        var m = members.ToList();
+        if (m.Count == 0) { Console.WriteLine($"    {label}: n=0"); return; }
+        Console.WriteLine($"    {label}: n={m.Count}");
+        for (var h = 0; h < mtmEventHorizons.Length; h++)
+        {
+            var vals = m.Select(r => r.EventReturns[h]).Where(v => v is not null).Select(v => v!.Value).ToList();
+            if (vals.Count == 0) { continue; }
+            Console.WriteLine($"      +{mtmEventHorizons[h]} event(s): n={vals.Count} avgRs={Fmt2(vals.Average())} medianRs={Fmt2(vals.OrderBy(v => v).ElementAt(vals.Count / 2))}");
+        }
+        for (var h = 0; h < mtmMinuteHorizons.Length; h++)
+        {
+            var vals = m.Select(r => r.MinuteReturns[h]).Where(v => v is not null).Select(v => v!.Value).ToList();
+            if (vals.Count == 0) { continue; }
+            Console.WriteLine($"      +{mtmMinuteHorizons[h]} minute(s): n={vals.Count} avgRs={Fmt2(vals.Average())} medianRs={Fmt2(vals.OrderBy(v => v).ElementAt(vals.Count / 2))}");
+        }
+    }
+    Console.WriteLine("### PART 1 -- mark-to-market before opposite-pattern exit (diagnostic, not a simulated exit) ###");
+    ReportMtm("Pattern A -> PE (pooled)", mtmRows.Where(r => r.Pattern == "PatternA"));
+    ReportMtm("Pattern B -> CE (pooled)", mtmRows.Where(r => r.Pattern == "PatternB"));
+    Console.WriteLine();
+
+    // ==== PART 2: signal quality before opposite pattern (= existing MAE/MFE + excursion timing, since every trade in this dataset IS reversal-exited) ====
+    Console.WriteLine("### PART 2 -- signal quality before opposite pattern fires (every trade here is reversal-exited, so this IS 'before B/A') ###");
+    void ReportSignalQuality(string label, IEnumerable<MtmRow> members)
+    {
+        var m = members.ToList();
+        var withMfeTime = m.Where(r => r.TimeToMfe is not null).Select(r => r.TimeToMfe!.Value.TotalSeconds).ToList();
+        var withMaeTime = m.Where(r => r.TimeToMae is not null).Select(r => r.TimeToMae!.Value.TotalSeconds).ToList();
+        Console.WriteLine($"    {label}: n={m.Count} AvgMFE={Fmt2(m.Average(r => r.Mfe))} AvgMAE={Fmt2(m.Average(r => r.Mae))} AvgTimeToMFE={(withMfeTime.Count > 0 ? TimeSpan.FromSeconds(withMfeTime.Average()) : TimeSpan.Zero):mm\\:ss} AvgTimeToMAE={(withMaeTime.Count > 0 ? TimeSpan.FromSeconds(withMaeTime.Average()) : TimeSpan.Zero):mm\\:ss}");
+    }
+    ReportSignalQuality("Pattern A -> PE", mtmRows.Where(r => r.Pattern == "PatternA"));
+    ReportSignalQuality("Pattern B -> CE", mtmRows.Where(r => r.Pattern == "PatternB"));
+    Console.WriteLine();
+
+    // ==== PART 3: first-5-minutes groups ====
+    Console.WriteLine("### PART 3 -- first-5-minutes groups (NOT filters -- descriptive only) ###");
+    foreach (var group in new[] { "Group1 (<1 min)", "Group2 (1-2 min)", "Group3 (2-5 min)", "Group4 (>5 min)" })
+    {
+        var members = mtmRows.Where(r => r.HoldingGroup == group).ToList();
+        if (members.Count == 0) { Console.WriteLine($"  {group}: n=0"); continue; }
+        var aCount = members.Count(r => r.Pattern == "PatternA");
+        var bCount = members.Count(r => r.Pattern == "PatternB");
+        Console.WriteLine($"  {group}: n={members.Count} (A={aCount}, B={bCount}) AvgMAE={Fmt2(members.Average(r => r.Mae))} AvgMFE={Fmt2(members.Average(r => r.Mfe))} NetPnl={Fmt2(members.Sum(r => r.NetPnl))}");
+        for (var h = 0; h < mtmMinuteHorizons.Length && mtmMinuteHorizons[h] <= 5; h++)
+        {
+            var vals = members.Select(r => r.MinuteReturns[h]).Where(v => v is not null).Select(v => v!.Value).ToList();
+            if (vals.Count == 0) { continue; }
+            Console.WriteLine($"    +{mtmMinuteHorizons[h]}min option return: avgRs={Fmt2(vals.Average())} (n={vals.Count})");
+        }
+    }
+    Console.WriteLine();
+
+    // ==== PART 4: MFE-before-invalidation buckets ====
+    Console.WriteLine("### PART 4 -- MFE-before-invalidation buckets ###");
+    void ReportMfeBuckets(string label, IEnumerable<MtmRow> members)
+    {
+        Console.WriteLine($"  [{label}]");
+        foreach (var bucket in new[] { "MFE<0%", "0-1%", "1-2%", "2-5%", "5-10%", ">10%" })
+        {
+            var m = members.Where(r => r.MfeBucket == bucket).ToList();
+            if (m.Count == 0) { continue; }
+            var withMfeTime = m.Where(r => r.TimeToMfe is not null).Select(r => r.TimeToMfe!.Value.TotalSeconds).ToList();
+            Console.WriteLine($"    {bucket}: n={m.Count} winRate={(100.0 * m.Count(r => r.NetPnl > 0) / m.Count):F1}% realizedPnl={Fmt2(m.Sum(r => r.NetPnl))} avgMFE={Fmt2(m.Average(r => r.Mfe))} avgTimeToMFE={(withMfeTime.Count > 0 ? TimeSpan.FromSeconds(withMfeTime.Average()) : TimeSpan.Zero):mm\\:ss}");
+        }
+    }
+    ReportMfeBuckets("Pattern A -> PE", mtmRows.Where(r => r.Pattern == "PatternA"));
+    ReportMfeBuckets("Pattern B -> CE", mtmRows.Where(r => r.Pattern == "PatternB"));
+    Console.WriteLine();
+
+    // ==== PART 5: entry price / strike distance decomposition ====
+    Console.WriteLine("### PART 5 -- entry price / strike distance / intrinsic-extrinsic decomposition ###");
+    void ReportDecompositionSummary(string label, IEnumerable<MtmRow> members)
+    {
+        var m = members.ToList();
+        var strikeDist = m.Select(r => Math.Abs(r.StrikeDistance)).OrderBy(v => v).ToList();
+        var moneyness = m.Select(r => OptionValueDecomposition.ComputeMoneyness(r.FuturesAtEntry, r.Strike, m[0].OptionType)).OrderBy(v => v).ToList();
+        var premiums = m.Select(r => r.EntryPrice).OrderBy(v => v).ToList();
+        var intrinsics = m.Select(r => r.IntrinsicAtEntry).OrderBy(v => v).ToList();
+        var extrinsics = m.Select(r => r.ExtrinsicAtEntry).OrderBy(v => v).ToList();
+        var intrinsicPcts = m.Select(r => r.IntrinsicPctOfPremium).Where(v => v is not null).Select(v => v!.Value).OrderBy(v => v).ToList();
+        Console.WriteLine($"  [{label}] n={m.Count}");
+        Console.WriteLine($"    MedianStrikeDistance={Fmt2(strikeDist[strikeDist.Count / 2])} MeanStrikeDistance={Fmt2(strikeDist.Average())}");
+        Console.WriteLine($"    MedianMoneyness={Fmt2(moneyness[moneyness.Count / 2])}");
+        Console.WriteLine($"    MedianPremium={Fmt2(premiums[premiums.Count / 2])}");
+        Console.WriteLine($"    MedianIntrinsic={Fmt2(intrinsics[intrinsics.Count / 2])} MedianExtrinsic={Fmt2(extrinsics[extrinsics.Count / 2])}");
+        Console.WriteLine($"    IntrinsicPct(median)={(intrinsicPcts.Count > 0 ? Fmt2(intrinsicPcts[intrinsicPcts.Count / 2]) : "n/a")}% ExtrinsicPct(median)={(intrinsicPcts.Count > 0 ? Fmt2(100m - intrinsicPcts[intrinsicPcts.Count / 2]) : "n/a")}%");
+        Console.WriteLine($"    DTE distribution: {string.Join(",", m.GroupBy(r => r.Dte).Select(g => $"{g.Key}:{g.Count()}"))}");
+    }
+    ReportDecompositionSummary("Pattern A -> PE", mtmRows.Where(r => r.Pattern == "PatternA"));
+    ReportDecompositionSummary("Pattern B -> CE", mtmRows.Where(r => r.Pattern == "PatternB"));
+    Console.WriteLine();
+
+    // ==== PART 6: strike distance vs outcome ====
+    Console.WriteLine("### PART 6 -- strike-step buckets vs outcome (descriptive, no threshold optimization) ###");
+    void ReportStrikeStepBuckets(string label, IEnumerable<MtmRow> members)
+    {
+        Console.WriteLine($"  [{label}]");
+        foreach (var bucket in new[] { "ATM/closest strike", "1 step away", "2 steps away", "3 steps away", "4+ steps away" })
+        {
+            var m = members.Where(r => r.StrikeStepBucket == bucket).ToList();
+            if (m.Count == 0) { continue; }
+            var sorted = m.Select(r => r.NetPnl).OrderBy(v => v).ToList();
+            Console.WriteLine($"    {bucket}: n={m.Count} avgPnl={Fmt2(m.Average(r => r.NetPnl))} medianPnl={Fmt2(sorted[sorted.Count / 2])} winRate={(100.0 * m.Count(r => r.NetPnl > 0) / m.Count):F1}% avgMAE={Fmt2(m.Average(r => r.Mae))} avgMFE={Fmt2(m.Average(r => r.Mfe))} avgHolding={TimeSpan.FromSeconds(m.Average(r => r.HoldingDuration.TotalSeconds)):mm\\:ss}");
+        }
+    }
+    ReportStrikeStepBuckets("Pattern A -> PE", mtmRows.Where(r => r.Pattern == "PatternA"));
+    ReportStrikeStepBuckets("Pattern B -> CE", mtmRows.Where(r => r.Pattern == "PatternB"));
+    Console.WriteLine();
+
+    // ==== PART 7: intrinsic vs extrinsic response ====
+    Console.WriteLine("### PART 7 -- intrinsic vs extrinsic response (mean, since means are exactly additive: mean(Option)=mean(Intrinsic)+mean(Extrinsic)) ###");
+    void ReportIntrinsicExtrinsic(string label, IEnumerable<MtmRow> members)
+    {
+        var m = members.ToList();
+        Console.WriteLine($"  [{label}] n={m.Count}");
+        for (var h = 0; h < mtmEventHorizons.Length; h++)
+        {
+            var opt = m.Select(r => r.EventReturns[h]).Where(v => v is not null).Select(v => v!.Value).ToList();
+            var intr = m.Select(r => r.EventIntrinsicChanges[h]).Where(v => v is not null).Select(v => v!.Value).ToList();
+            var extr = m.Select(r => r.EventExtrinsicChanges[h]).Where(v => v is not null).Select(v => v!.Value).ToList();
+            if (opt.Count == 0) { continue; }
+            Console.WriteLine($"    +{mtmEventHorizons[h]} event(s): n={opt.Count} OptionRs(mean)={Fmt2(opt.Average())} IntrinsicRs(mean)={Fmt2(intr.Average())} ExtrinsicRs(mean)={Fmt2(extr.Average())}");
+        }
+    }
+    ReportIntrinsicExtrinsic("Pattern A -> PE", mtmRows.Where(r => r.Pattern == "PatternA"));
+    ReportIntrinsicExtrinsic("Pattern B -> CE", mtmRows.Where(r => r.Pattern == "PatternB"));
+    Console.WriteLine();
+
+    // ==== PART 8: signal magnitude (reusing existing tercile methodology) ====
+    Console.WriteLine("### PART 8 -- signal magnitude (|prior-3-event futures move| tercile, existing methodology reused) ###");
+    var priorAbsMoves = mtmRows.Select(r => r.PriorMovement3).Where(v => v is not null).Select(v => Math.Abs(v!.Value)).ToList();
+    if (priorAbsMoves.Count >= 3)
+    {
+        var (low33, high67) = ForwardValidationAnalysis.ComputeTerciles(priorAbsMoves);
+        foreach (var pattern in new[] { "PatternA", "PatternB" })
+        {
+            foreach (var bucket in new[] { "Low", "Mid", "High" })
+            {
+                var m = mtmRows.Where(r => r.Pattern == pattern && r.PriorMovement3 is not null && ConditionalMovementAnalysis.ClassifyTercileBucket(Math.Abs(r.PriorMovement3.Value), low33, high67) == bucket).ToList();
+                if (m.Count == 0) { continue; }
+                Console.WriteLine($"    [{pattern}] {bucket}: n={m.Count} avgPnl={Fmt2(m.Average(r => r.NetPnl))} avgMFE={Fmt2(m.Average(r => r.Mfe))} avgMAE={Fmt2(m.Average(r => r.Mae))}");
+            }
+        }
+    }
+    Console.WriteLine();
+
+    // ==== PART 9: consolidated A vs B table ====
+    Console.WriteLine("### PART 9 -- consolidated A vs B table ###");
+    void ConsolidatedRow(string dimension, Func<List<MtmRow>, string> compute)
+    {
+        var a = mtmRows.Where(r => r.Pattern == "PatternA").ToList();
+        var b = mtmRows.Where(r => r.Pattern == "PatternB").ToList();
+        Console.WriteLine($"  {dimension} | A={compute(a)} | B={compute(b)}");
+    }
+    ConsolidatedRow("Trade count", m => m.Count.ToString());
+    ConsolidatedRow("Median holding time", m => { var s = m.Select(r => r.HoldingDuration.TotalSeconds).OrderBy(v => v).ToList(); return TimeSpan.FromSeconds(s[s.Count / 2]).ToString(@"mm\:ss"); });
+    ConsolidatedRow("Median |strike distance|", m => { var s = m.Select(r => Math.Abs(r.StrikeDistance)).OrderBy(v => v).ToList(); return Fmt2(s[s.Count / 2]); });
+    ConsolidatedRow("Median moneyness", m => { var s = m.Select(r => OptionValueDecomposition.ComputeMoneyness(r.FuturesAtEntry, r.Strike, r.OptionType)).OrderBy(v => v).ToList(); return Fmt2(s[s.Count / 2]); });
+    ConsolidatedRow("Median entry premium", m => { var s = m.Select(r => r.EntryPrice).OrderBy(v => v).ToList(); return Fmt2(s[s.Count / 2]); });
+    ConsolidatedRow("Median intrinsic value", m => { var s = m.Select(r => r.IntrinsicAtEntry).OrderBy(v => v).ToList(); return Fmt2(s[s.Count / 2]); });
+    ConsolidatedRow("Median extrinsic value", m => { var s = m.Select(r => r.ExtrinsicAtEntry).OrderBy(v => v).ToList(); return Fmt2(s[s.Count / 2]); });
+    for (var h = 0; h < mtmMinuteHorizons.Length; h++)
+    {
+        var idx = h;
+        if (mtmMinuteHorizons[idx] is 1 or 3 or 5 or 10)
+        {
+            ConsolidatedRow($"Median +{mtmMinuteHorizons[idx]}m option return", m => { var s = m.Select(r => r.MinuteReturns[idx]).Where(v => v is not null).Select(v => v!.Value).OrderBy(v => v).ToList(); return s.Count > 0 ? Fmt2(s[s.Count / 2]) : "n/a"; });
+        }
+    }
+    ConsolidatedRow("Median MFE", m => { var s = m.Select(r => r.Mfe).OrderBy(v => v).ToList(); return Fmt2(s[s.Count / 2]); });
+    ConsolidatedRow("Median MAE", m => { var s = m.Select(r => r.Mae).OrderBy(v => v).ToList(); return Fmt2(s[s.Count / 2]); });
+    ConsolidatedRow("Net P&L", m => Fmt2(m.Sum(r => r.NetPnl)));
+    Console.WriteLine();
+
+    // ==== PART 10: temporal robustness (per day + pooled) ====
+    Console.WriteLine("### PART 10 -- temporal robustness (per day, then pooled) ###");
+    var mtmDateLabels = mtmDates.Select(d => (DateOnly?)d).ToList();
+    mtmDateLabels.Add(null);
+    foreach (var d in mtmDateLabels)
+    {
+        var label = d?.ToString("yyyy-MM-dd") ?? "POOLED";
+        var subset = d is null ? mtmRows : mtmRows.Where(r => r.Date == d.Value).ToList();
+        var a = subset.Where(r => r.Pattern == "PatternA").ToList();
+        var b = subset.Where(r => r.Pattern == "PatternB").ToList();
+        Console.WriteLine($"  [{label}] A: n={a.Count} netPnl={Fmt2(a.Sum(r => r.NetPnl))} | B: n={b.Count} netPnl={Fmt2(b.Sum(r => r.NetPnl))}" + (a.Count < 30 || b.Count < 30 ? "  <-- small sample, interpret cautiously" : ""));
+    }
+    Console.WriteLine();
+
+    // ---- CSV export ----
+    using (var writer = new StreamWriter(mtmDiagOutPath))
+    {
+        writer.WriteLine("Date,Pattern,OptionType,Strike,AtmStrike,StrikeDistance,StrikeStepBucket,Dte,"
+            + "EntryPrice,FuturesAtEntry,IntrinsicAtEntry,ExtrinsicAtEntry,IntrinsicPctOfPremium,"
+            + "Event1Return,Event3Return,Event5Return,Event10Return,"
+            + "Min1Return,Min2Return,Min3Return,Min5Return,Min10Return,Min15Return,"
+            + "HoldingSeconds,HoldingGroup,MAE,MAEPercent,MFE,MFEPercent,MFEBucket,TimeToMFESeconds,TimeToMAESeconds,"
+            + "NetPnl,ExitReason,PriorMovement3Pct,SessionBucket");
+        foreach (var r in mtmRows)
+        {
+            writer.WriteLine(string.Join(',',
+                r.Date.ToString("yyyy-MM-dd"), r.Pattern, r.OptionType, r.Strike, r.AtmStrike, r.StrikeDistance, r.StrikeStepBucket, r.Dte,
+                r.EntryPrice, r.FuturesAtEntry, r.IntrinsicAtEntry, r.ExtrinsicAtEntry, FmtN(r.IntrinsicPctOfPremium),
+                FmtN(r.EventReturns[0]), FmtN(r.EventReturns[1]), FmtN(r.EventReturns[2]), FmtN(r.EventReturns[3]),
+                FmtN(r.MinuteReturns[0]), FmtN(r.MinuteReturns[1]), FmtN(r.MinuteReturns[2]), FmtN(r.MinuteReturns[3]), FmtN(r.MinuteReturns[4]), FmtN(r.MinuteReturns[5]),
+                r.HoldingDuration.TotalSeconds, r.HoldingGroup, r.Mae, r.MaePercent, r.Mfe, r.MfePercent, r.MfeBucket,
+                r.TimeToMfe?.TotalSeconds, r.TimeToMae?.TotalSeconds,
+                r.NetPnl, r.ExitReason, FmtN(r.PriorMovement3), r.SessionBucket));
+        }
+    }
+    Console.WriteLine($"Mark-to-market diagnostic CSV written to: {Path.GetFullPath(mtmDiagOutPath)}");
+
+    return 0;
+}
+
+// "vc0dte-relationship-exit-asymmetry-validation" -- 2026-09-24, robustness check on the
+// A-premature/B-protective exit-asymmetry finding (HARD FREEZE: diagnostic only -- reuses the
+// frozen [100,150]-band PatternRelationshipTradeSimulator, OptionValueDecomposition, MaeMfeCalculator,
+// Vc0DteBehaviorSummary.SessionBucket, and ForensicValidationAnalysis.ComputePercentiles
+// completely unmodified. No exit/filter/threshold change is introduced anywhere in this command).
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-exit-asymmetry-validation <fromDate> <toDate> --diagOut=path.csv
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-exit-asymmetry-validation", StringComparison.OrdinalIgnoreCase))
+{
+    const long eaThreshold = 1300L;
+    var eaIstOffset = TimeSpan.FromHours(5.5);
+    const decimal eaMinEntryPrice = 100m, eaMaxEntryPrice = 150m;
+    int[] eaEventHorizons = [1, 3, 5, 10];
+    int[] eaMinuteHorizons = [1, 3, 5, 10, 15];
+
+    var (eaPositional, eaNamed) = SplitNamedArgs(args);
+    if (eaPositional.Length < 3 || !DateOnly.TryParseExact(eaPositional[1], "yyyy-MM-dd", out var eaFromDate) || !DateOnly.TryParseExact(eaPositional[2], "yyyy-MM-dd", out var eaToDate) || !eaNamed.TryGetValue("diagOut", out var eaDiagOutPath))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-exit-asymmetry-validation <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> --diagOut=path.csv");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-exit-asymmetry-validation: DIAGNOSTIC ONLY -- is the A-premature/B-protective exit asymmetry robust? No strategy change. ===");
+    Console.WriteLine();
+    static string Fmt2(decimal v) => v.ToString("F2");
+    static string FmtN(decimal? v) => v?.ToString("F2") ?? "--";
+    static string MedianOf(IEnumerable<decimal> values)
+    {
+        var s = values.OrderBy(v => v).ToList();
+        return s.Count > 0 ? s[s.Count / 2].ToString("F2") : "n/a";
+    }
+
+    var eaRows = new List<ExitAsymmetryRow>();
+
+    for (var date = eaFromDate; date <= eaToDate; date = date.AddDays(1))
+    {
+        if (date.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday) { continue; }
+        var (eaChain, eaFutureBars, eaOptionBars) = await LoadVc0DteDayAsync(date, eaThreshold);
+        if (eaFutureBars.Count == 0 || eaChain.Count == 0) { continue; }
+
+        await using var eaSource = new NiftySignalDbContext(tradeSourceOptions);
+        var rows = await UnderlyingOptionRelationshipRecorder.RecordAsync(eaSource, date, eaChain, eaFutureBars, eaOptionBars, CancellationToken.None);
+        var result = await PatternRelationshipTradeSimulator.SimulateDayAsync(
+            eaSource, date, rows, eaChain, eaFutureBars, eaIstOffset, CancellationToken.None,
+            optionBars: eaOptionBars, minEntryPrice: eaMinEntryPrice, maxEntryPrice: eaMaxEntryPrice);
+
+        var barsByToken = eaOptionBars.GroupBy(b => b.Token).ToDictionary(g => g.Key, g => g.OrderBy(b => b.EventId).ToDictionary(b => b.EventId));
+        var tickSeriesCache = new Dictionary<string, OptionTickSeries>();
+        async Task<OptionTickSeries> GetSeriesAsync(string token)
+        {
+            if (!tickSeriesCache.TryGetValue(token, out var series))
+            {
+                var dayStart = eaFutureBars[0].StartTimestamp;
+                var dayEnd = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 30)), eaIstOffset).ToUniversalTime();
+                series = await OptionTickSeries.LoadAsync(eaSource, token, dayStart, dayEnd, CancellationToken.None);
+                tickSeriesCache[token] = series;
+            }
+            return series;
+        }
+
+        foreach (var trade in result.Trades)
+        {
+            var row = rows.First(r => r.EndTimestamp == trade.SignalTimestamp);
+            var signalEventId = row.EventId;
+            var tradeToken = eaChain.First(i => i.OptionType == trade.OptionType && i.StrikePrice == trade.Strike).Token;
+
+            var intrinsicAtEntry = OptionValueDecomposition.ComputeIntrinsic(trade.UnderlyingPriceAtEntry, trade.Strike, trade.OptionType);
+            var extrinsicAtEntry = OptionValueDecomposition.ComputeExtrinsic(trade.EntryPrice, intrinsicAtEntry);
+
+            var eventReturns = new decimal?[eaEventHorizons.Length];
+            if (barsByToken.TryGetValue(tradeToken, out var tokenBars))
+            {
+                for (var h = 0; h < eaEventHorizons.Length; h++)
+                {
+                    var targetEventId = signalEventId + eaEventHorizons[h];
+                    if (tokenBars.TryGetValue(targetEventId, out var bar) && bar.Close is { } closeAtH)
+                    {
+                        eventReturns[h] = closeAtH - trade.EntryPrice;
+                    }
+                }
+            }
+
+            var series = await GetSeriesAsync(tradeToken);
+            var minuteReturns = new decimal?[eaMinuteHorizons.Length];
+            var quantity = trade.Quantity;
+            var opportunityCosts = new decimal?[eaMinuteHorizons.Length];
+            for (var h = 0; h < eaMinuteHorizons.Length; h++)
+            {
+                // "Only where the trade remains within the same valid contract/data conditions"
+                // (task's own item 5/6) -- the SAME token's own tick series is used throughout;
+                // a null mark (no real tick found) is reported as missing, never fabricated.
+                var mark = series.EntryAtOrAfter(trade.EntryTimestamp.AddMinutes(eaMinuteHorizons[h]));
+                if (mark is { } m)
+                {
+                    minuteReturns[h] = m.LastPrice - trade.EntryPrice;
+                    var hypotheticalGrossPnl = minuteReturns[h]!.Value * quantity;
+                    // Gross-to-gross by construction: STT only applies to an actually-executed
+                    // sell leg, which this hypothetical horizon never was -- documented, not
+                    // fabricated, per the task's own "descriptive only" framing.
+                    opportunityCosts[h] = MarkToMarketDiagnostics.ComputeOpportunityCost(hypotheticalGrossPnl, trade.GrossPnl);
+                }
+            }
+
+            // MFE/MAE after the actual exit, bounded at EntryTimestamp+15min (the same ceiling
+            // used everywhere else here) -- never an unbounded look-ahead window.
+            var afterExitCeiling = trade.EntryTimestamp.AddMinutes(15);
+            var pathAfterExit = series.AllEntries
+                .Where(e => e.Timestamp > trade.ExitTimestamp && e.Timestamp <= afterExitCeiling)
+                .Select(e => e.LastPrice).ToList();
+            decimal? mfeAfterExit = null, maeAfterExit = null;
+            if (pathAfterExit.Count > 0)
+            {
+                var afterMaeMfe = MaeMfeCalculator.Compute(trade.EntryPrice, pathAfterExit);
+                mfeAfterExit = afterMaeMfe.MfePoints;
+                maeAfterExit = afterMaeMfe.MaePoints;
+            }
+
+            var priorMovement3 = UnderlyingOptionRelationshipSummary.ComputeFuturesChange(rows, signalEventId - 3, 3).PercentChange;
+            var sessionBucket = Vc0DteBehaviorSummary.SessionBucket(row.StartTimestamp, eaIstOffset);
+
+            eaRows.Add(new ExitAsymmetryRow(
+                date, trade.Pattern, trade.OptionType, trade.Strike, row.AtmStrike, trade.Strike - row.AtmStrike, trade.Dte, sessionBucket,
+                trade.EntryPrice, trade.UnderlyingPriceAtEntry, intrinsicAtEntry, extrinsicAtEntry,
+                row.CeChange1, row.PeChange1, priorMovement3,
+                eventReturns, minuteReturns,
+                trade.HoldingDuration, trade.GrossPnl, trade.NetPnl,
+                trade.MfeRupees, trade.MaeRupees, mfeAfterExit, maeAfterExit, opportunityCosts));
+        }
+
+        Console.WriteLine($"  {date:yyyy-MM-dd}: {result.Trades.Count} trades processed.");
+    }
+    Console.WriteLine();
+
+    if (eaRows.Count == 0) { Console.WriteLine("No trades found -- stopping. No fabricated data."); return 1; }
+
+    var eaDates = eaRows.Select(r => r.Date).Distinct().OrderBy(d => d).ToList();
+
+    // ==== 1. core finding, reproduced pooled ====
+    void ReportCore(string label, List<ExitAsymmetryRow> members)
+    {
+        Console.WriteLine($"  [{label}] n={members.Count}");
+        Console.WriteLine($"    RealizedNetPnl={Fmt2(members.Sum(r => r.ActualNetPnl))} MedianHolding={TimeSpan.FromSeconds(members.Select(r => r.HoldingDuration.TotalSeconds).OrderBy(v => v).ElementAt(members.Count / 2)):mm\\:ss}");
+        for (var h = 0; h < eaEventHorizons.Length; h++)
+        {
+            var vals = members.Select(r => r.EventReturns[h]).Where(v => v is not null).Select(v => v!.Value).ToList();
+            if (vals.Count > 0) { Console.WriteLine($"    +{eaEventHorizons[h]}event medianRs={MedianOf(vals)} (n={vals.Count})"); }
+        }
+        for (var h = 0; h < eaMinuteHorizons.Length; h++)
+        {
+            var vals = members.Select(r => r.MinuteReturns[h]).Where(v => v is not null).Select(v => v!.Value).ToList();
+            if (vals.Count > 0) { Console.WriteLine($"    +{eaMinuteHorizons[h]}min medianRs={MedianOf(vals)} (n={vals.Count})"); }
+        }
+        var mfeAfter = members.Select(r => r.MfeAfterExit).Where(v => v is not null).Select(v => v!.Value).ToList();
+        var maeAfter = members.Select(r => r.MaeAfterExit).Where(v => v is not null).Select(v => v!.Value).ToList();
+        Console.WriteLine($"    MFEBeforeExit(median)={MedianOf(members.Select(r => r.MfeBeforeExit))} MAEBeforeExit(median)={MedianOf(members.Select(r => r.MaeBeforeExit))}");
+        Console.WriteLine($"    MFEAfterExit(median)={(mfeAfter.Count > 0 ? MedianOf(mfeAfter) : "n/a")} (n={mfeAfter.Count}) MAEAfterExit(median)={(maeAfter.Count > 0 ? MedianOf(maeAfter) : "n/a")} (n={maeAfter.Count})");
+    }
+    Console.WriteLine("### 1 -- core finding, reproduced pooled ###");
+    ReportCore("Pattern A -> PE", eaRows.Where(r => r.Pattern == "PatternA").ToList());
+    ReportCore("Pattern B -> CE", eaRows.Where(r => r.Pattern == "PatternB").ToList());
+    Console.WriteLine();
+
+    // ==== 2. session-time validation ====
+    Console.WriteLine("### 2 -- session-time validation ###");
+    foreach (var pattern in new[] { "PatternA", "PatternB" })
+    {
+        Console.WriteLine($"  [{pattern}]");
+        foreach (var bucket in new[] { "09:15-10:00", "10:00-11:00", "11:00-12:00", "12:00-13:00", "13:00-14:00", "14:00-15:00", "15:00-15:30" })
+        {
+            var m = eaRows.Where(r => r.Pattern == pattern && r.SessionBucket == bucket).ToList();
+            if (m.Count == 0) { continue; }
+            var m1 = m.Select(r => r.MinuteReturns[0]).Where(v => v is not null).Select(v => v!.Value).ToList();
+            var m3 = m.Select(r => r.MinuteReturns[1]).Where(v => v is not null).Select(v => v!.Value).ToList();
+            var m5 = m.Select(r => r.MinuteReturns[2]).Where(v => v is not null).Select(v => v!.Value).ToList();
+            var m10 = m.Select(r => r.MinuteReturns[3]).Where(v => v is not null).Select(v => v!.Value).ToList();
+            var mfeAfter = m.Select(r => r.MfeAfterExit).Where(v => v is not null).Select(v => v!.Value).ToList();
+            Console.WriteLine($"    [{bucket}] n={m.Count} netPnl={Fmt2(m.Sum(r => r.ActualNetPnl))} medianPnl={MedianOf(m.Select(r => r.ActualNetPnl))} medianHolding={TimeSpan.FromSeconds(m.Select(r => r.HoldingDuration.TotalSeconds).OrderBy(v => v).ElementAt(m.Count / 2)):mm\\:ss} med+1m={MedianOf(m1)} med+3m={MedianOf(m3)} med+5m={MedianOf(m5)} med+10m={MedianOf(m10)} medMFEbefore={MedianOf(m.Select(r => r.MfeBeforeExit))} medMFEafter={(mfeAfter.Count > 0 ? MedianOf(mfeAfter) : "n/a")}(n={mfeAfter.Count})");
+        }
+    }
+    Console.WriteLine();
+
+    // ==== 3. DTE validation ====
+    Console.WriteLine("### 3 -- DTE validation (this discovery dataset is 0-DTE only -- reported as-is, not fabricated) ###");
+    foreach (var pattern in new[] { "PatternA", "PatternB" })
+    {
+        foreach (var dteGroup in eaRows.Where(r => r.Pattern == pattern).GroupBy(r => r.Dte).OrderBy(g => g.Key))
+        {
+            var m = dteGroup.ToList();
+            var m1 = m.Select(r => r.MinuteReturns[0]).Where(v => v is not null).Select(v => v!.Value).ToList();
+            var m3 = m.Select(r => r.MinuteReturns[1]).Where(v => v is not null).Select(v => v!.Value).ToList();
+            var m5 = m.Select(r => r.MinuteReturns[2]).Where(v => v is not null).Select(v => v!.Value).ToList();
+            var m10 = m.Select(r => r.MinuteReturns[3]).Where(v => v is not null).Select(v => v!.Value).ToList();
+            var mfeAfter = m.Select(r => r.MfeAfterExit).Where(v => v is not null).Select(v => v!.Value).ToList();
+            Console.WriteLine($"  [{pattern}] DTE={dteGroup.Key}: n={m.Count} netPnl={Fmt2(m.Sum(r => r.ActualNetPnl))} medianHolding={TimeSpan.FromSeconds(m.Select(r => r.HoldingDuration.TotalSeconds).OrderBy(v => v).ElementAt(m.Count / 2)):mm\\:ss} med+1m={MedianOf(m1)} med+3m={MedianOf(m3)} med+5m={MedianOf(m5)} med+10m={MedianOf(m10)} medMFEbefore={MedianOf(m.Select(r => r.MfeBeforeExit))} medMFEafter={(mfeAfter.Count > 0 ? MedianOf(mfeAfter) : "n/a")}");
+        }
+    }
+    Console.WriteLine("  NOTE: only DTE=0 exists in this discovery dataset (2026-09-08/15/22 are all 0-DTE signalling days) -- the DTE-vs-0-DTE-only question cannot be separated from the day question with this data; see Part 4 for the day-by-day breakdown instead.");
+    Console.WriteLine();
+
+    // ==== 4. day-by-day validation ====
+    Console.WriteLine("### 4 -- day-by-day validation ###");
+    foreach (var pattern in new[] { "PatternA", "PatternB" })
+    {
+        Console.WriteLine($"  [{pattern}]");
+        foreach (var d in eaDates)
+        {
+            var m = eaRows.Where(r => r.Pattern == pattern && r.Date == d).ToList();
+            if (m.Count == 0) { continue; }
+            var m1 = m.Select(r => r.MinuteReturns[0]).Where(v => v is not null).Select(v => v!.Value).ToList();
+            var m3 = m.Select(r => r.MinuteReturns[1]).Where(v => v is not null).Select(v => v!.Value).ToList();
+            var m5 = m.Select(r => r.MinuteReturns[2]).Where(v => v is not null).Select(v => v!.Value).ToList();
+            var m10 = m.Select(r => r.MinuteReturns[3]).Where(v => v is not null).Select(v => v!.Value).ToList();
+            var mfeAfter = m.Select(r => r.MfeAfterExit).Where(v => v is not null).Select(v => v!.Value).ToList();
+            Console.WriteLine($"    [{d:yyyy-MM-dd}] n={m.Count} netPnl={Fmt2(m.Sum(r => r.ActualNetPnl))} medianHolding={TimeSpan.FromSeconds(m.Select(r => r.HoldingDuration.TotalSeconds).OrderBy(v => v).ElementAt(m.Count / 2)):mm\\:ss} med+1m={MedianOf(m1)} med+3m={MedianOf(m3)} med+5m={MedianOf(m5)} med+10m={MedianOf(m10)} medMFEbefore={MedianOf(m.Select(r => r.MfeBeforeExit))} medMFEafter={(mfeAfter.Count > 0 ? MedianOf(mfeAfter) : "n/a")}(n={mfeAfter.Count})");
+        }
+    }
+    Console.WriteLine();
+
+    // ==== 5. exit opportunity cost ====
+    Console.WriteLine("### 5 -- exit opportunity cost (hypothetical gross P&L at horizon minus actual gross P&L; gross-to-gross, STT not double-counted on an unexecuted hypothetical) ###");
+    foreach (var pattern in new[] { "PatternA", "PatternB" })
+    {
+        Console.WriteLine($"  [{pattern}]");
+        var m = eaRows.Where(r => r.Pattern == pattern).ToList();
+        for (var h = 0; h < eaMinuteHorizons.Length; h++)
+        {
+            var vals = m.Select(r => r.OpportunityCostAtMinuteHorizon[h]).Where(v => v is not null).Select(v => v!.Value).ToList();
+            if (vals.Count == 0) { continue; }
+            var pct = ForensicValidationAnalysis.ComputePercentiles(vals);
+            Console.WriteLine($"    +{eaMinuteHorizons[h]}min: n={pct.N} mean={Fmt2(vals.Average())} median={Fmt2(pct.Median)} P25={Fmt2(pct.P25)} P75={Fmt2(pct.P75)}");
+        }
+    }
+    Console.WriteLine();
+
+    // ==== 7. structural A vs B comparison at signal time ====
+    Console.WriteLine("### 7 -- structural A vs B comparison at signal time (existing variables only) ###");
+    void ReportStructural(string label, Func<List<ExitAsymmetryRow>, string> compute)
+    {
+        var a = eaRows.Where(r => r.Pattern == "PatternA").ToList();
+        var b = eaRows.Where(r => r.Pattern == "PatternB").ToList();
+        Console.WriteLine($"  {label} | A={compute(a)} | B={compute(b)}");
+    }
+    ReportStructural("Median |prior-3-event futures move %|", m => MedianOf(m.Select(r => r.PriorMovement3).Where(v => v is not null).Select(v => Math.Abs(v!.Value))));
+    ReportStructural("Median CE change1 at signal", m => MedianOf(m.Select(r => r.CeChange1AtSignal).Where(v => v is not null).Select(v => v!.Value)));
+    ReportStructural("Median PE change1 at signal", m => MedianOf(m.Select(r => r.PeChange1AtSignal).Where(v => v is not null).Select(v => v!.Value)));
+    ReportStructural("Median entry premium", m => MedianOf(m.Select(r => r.EntryPrice)));
+    ReportStructural("Median moneyness", m => MedianOf(m.Select(r => OptionValueDecomposition.ComputeMoneyness(r.FuturesAtEntry, r.Strike, r.OptionType))));
+    ReportStructural("Median intrinsic at entry", m => MedianOf(m.Select(r => r.IntrinsicAtEntry)));
+    ReportStructural("Median extrinsic at entry", m => MedianOf(m.Select(r => r.ExtrinsicAtEntry)));
+    ReportStructural("Median |strike distance|", m => MedianOf(m.Select(r => Math.Abs(r.StrikeDistance))));
+    Console.WriteLine();
+
+    // ==== 8. band execution effect, per day ====
+    Console.WriteLine("### 8 -- ₹100-150 band contract-selection effect, per day (not optimized, confirming consistency only) ###");
+    foreach (var pattern in new[] { "PatternA", "PatternB" })
+    {
+        Console.WriteLine($"  [{pattern}]");
+        foreach (var d in eaDates)
+        {
+            var m = eaRows.Where(r => r.Pattern == pattern && r.Date == d).ToList();
+            if (m.Count == 0) { continue; }
+            Console.WriteLine($"    [{d:yyyy-MM-dd}] n={m.Count} medianStrikeDist={MedianOf(m.Select(r => Math.Abs(r.StrikeDistance)))} medianMoneyness={MedianOf(m.Select(r => OptionValueDecomposition.ComputeMoneyness(r.FuturesAtEntry, r.Strike, r.OptionType)))} medianIntrinsic={MedianOf(m.Select(r => r.IntrinsicAtEntry))} medianExtrinsic={MedianOf(m.Select(r => r.ExtrinsicAtEntry))} medianPremium={MedianOf(m.Select(r => r.EntryPrice))} DTE={string.Join(",", m.Select(r => r.Dte).Distinct())}");
+        }
+    }
+    Console.WriteLine();
+
+    // ---- CSV export ----
+    using (var writer = new StreamWriter(eaDiagOutPath))
+    {
+        writer.WriteLine("Date,Pattern,OptionType,Strike,AtmStrike,StrikeDistance,Dte,SessionBucket,"
+            + "EntryPrice,FuturesAtEntry,IntrinsicAtEntry,ExtrinsicAtEntry,CeChange1AtSignal,PeChange1AtSignal,PriorMovement3Pct,"
+            + "Event1Return,Event3Return,Event5Return,Event10Return,Min1Return,Min3Return,Min5Return,Min10Return,Min15Return,"
+            + "HoldingSeconds,ActualGrossPnl,ActualNetPnl,MFEBeforeExit,MAEBeforeExit,MFEAfterExit,MAEAfterExit,"
+            + "OppCost1m,OppCost3m,OppCost5m,OppCost10m,OppCost15m");
+        foreach (var r in eaRows)
+        {
+            writer.WriteLine(string.Join(',',
+                r.Date.ToString("yyyy-MM-dd"), r.Pattern, r.OptionType, r.Strike, r.AtmStrike, r.StrikeDistance, r.Dte, r.SessionBucket,
+                r.EntryPrice, r.FuturesAtEntry, r.IntrinsicAtEntry, r.ExtrinsicAtEntry, FmtN(r.CeChange1AtSignal), FmtN(r.PeChange1AtSignal), FmtN(r.PriorMovement3),
+                FmtN(r.EventReturns[0]), FmtN(r.EventReturns[1]), FmtN(r.EventReturns[2]), FmtN(r.EventReturns[3]),
+                FmtN(r.MinuteReturns[0]), FmtN(r.MinuteReturns[1]), FmtN(r.MinuteReturns[2]), FmtN(r.MinuteReturns[3]), FmtN(r.MinuteReturns[4]),
+                r.HoldingDuration.TotalSeconds, r.ActualGrossPnl, r.ActualNetPnl, r.MfeBeforeExit, r.MaeBeforeExit, FmtN(r.MfeAfterExit), FmtN(r.MaeAfterExit),
+                FmtN(r.OpportunityCostAtMinuteHorizon[0]), FmtN(r.OpportunityCostAtMinuteHorizon[1]), FmtN(r.OpportunityCostAtMinuteHorizon[2]), FmtN(r.OpportunityCostAtMinuteHorizon[3]), FmtN(r.OpportunityCostAtMinuteHorizon[4])));
+        }
+    }
+    Console.WriteLine($"Exit-asymmetry validation CSV written to: {Path.GetFullPath(eaDiagOutPath)}");
+
+    return 0;
+}
+
+// "vc0dte-relationship-a-exit-delay-sensitivity" -- 2026-09-24, A-side exit-delay sensitivity
+// experiment (HARD FREEZE: the frozen [100,150]-band baseline simulation is run completely
+// unmodified via PatternRelationshipTradeSimulator -- neither Pattern A's nor Pattern B's actual
+// entries/exits/lifecycle are ever changed. The "delayed exit" is a pure COUNTERFACTUAL/
+// diagnostic-layer measurement (DelayedExitCounterfactual, this task's only new production code)
+// over the SAME real option ticks the baseline already used -- exactly the approach the task
+// itself suggested when a true counterfactual is architecturally difficult to simulate live.
+// Pattern B is never touched by this command at all, which trivially satisfies "B must remain
+// invariant." One deliberate, stated simplification: this measures the PRICE PATH only -- it does
+// NOT re-trigger the relationship/signal-generation logic during the hypothetical delay window
+// (e.g. a THIRD signal that would have fired for real during that window is not modeled).
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-exit-delay-sensitivity <fromDate> <toDate> --diagOut=path.csv
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-a-exit-delay-sensitivity", StringComparison.OrdinalIgnoreCase))
+{
+    const long deThreshold2 = 1300L;
+    var deIstOffset2 = TimeSpan.FromHours(5.5);
+    const decimal deMinEntryPrice2 = 100m, deMaxEntryPrice2 = 150m;
+    TimeSpan[] delays = [TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(3), TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(10)];
+    string[] delayLabels = ["+1m", "+3m", "+5m", "+10m"];
+    var costs2 = new CostsConfig(BrokeragePerOrder: 0m, SlippageTicks: 0);
+
+    var (dePositional2, deNamed2) = SplitNamedArgs(args);
+    if (dePositional2.Length < 3 || !DateOnly.TryParseExact(dePositional2[1], "yyyy-MM-dd", out var deFromDate2) || !DateOnly.TryParseExact(dePositional2[2], "yyyy-MM-dd", out var deToDate2) || !deNamed2.TryGetValue("diagOut", out var deDiagOutPath2))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-exit-delay-sensitivity <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> --diagOut=path.csv");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-a-exit-delay-sensitivity: CONTROLLED SENSITIVITY EXPERIMENT -- counterfactual A-only exit delay. B untouched. No rule change to the actual simulator. ===");
+    Console.WriteLine();
+    static string Fmt2(decimal v) => v.ToString("F2");
+    static string FmtN(decimal? v) => v?.ToString("F2") ?? "--";
+    static string Pctile(List<decimal> values, decimal p)
+    {
+        if (values.Count == 0) { return "n/a"; }
+        var s = values.OrderBy(v => v).ToList();
+        var idx = (int)Math.Clamp(Math.Round((s.Count - 1) * p), 0, s.Count - 1);
+        return s[idx].ToString("F2");
+    }
+
+    var allTradesBaseline = new List<PatternRelationshipTradeSimulator.TradeRow>();
+    var allAuditBaseline = new List<PatternRelationshipTradeSimulator.SignalAuditRow>();
+    var delayRows = new List<DelayedExitCounterfactual.DelayExperimentRow>();
+    var dayBRows = new Dictionary<DateOnly, List<PatternRelationshipTradeSimulator.TradeRow>>();
+
+    for (var date = deFromDate2; date <= deToDate2; date = date.AddDays(1))
+    {
+        if (date.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday) { continue; }
+        var (chain, futureBars, optionBars) = await LoadVc0DteDayAsync(date, deThreshold2);
+        if (futureBars.Count == 0 || chain.Count == 0) { continue; }
+
+        await using var source = new NiftySignalDbContext(tradeSourceOptions);
+        var rows = await UnderlyingOptionRelationshipRecorder.RecordAsync(source, date, chain, futureBars, optionBars, CancellationToken.None);
+        // ---- Baseline: the EXACT frozen simulation, unmodified, run once. This is the only simulation run in this whole command. ----
+        var result = await PatternRelationshipTradeSimulator.SimulateDayAsync(
+            source, date, rows, chain, futureBars, deIstOffset2, CancellationToken.None,
+            optionBars: optionBars, minEntryPrice: deMinEntryPrice2, maxEntryPrice: deMaxEntryPrice2);
+
+        allTradesBaseline.AddRange(result.Trades);
+        allAuditBaseline.AddRange(result.SignalAudit);
+        dayBRows[date] = result.Trades.Where(t => t.Pattern == "PatternB").ToList();
+
+        var mandatoryCutoff = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 15)), deIstOffset2).ToUniversalTime();
+        var tickSeriesCache = new Dictionary<string, OptionTickSeries>();
+        async Task<OptionTickSeries> GetSeriesAsync(string token)
+        {
+            if (!tickSeriesCache.TryGetValue(token, out var series))
+            {
+                var dayStart = futureBars[0].StartTimestamp;
+                var dayEnd = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 30)), deIstOffset2).ToUniversalTime();
+                series = await OptionTickSeries.LoadAsync(source, token, dayStart, dayEnd, CancellationToken.None);
+                tickSeriesCache[token] = series;
+            }
+            return series;
+        }
+
+        foreach (var trade in result.Trades.Where(t => t.Pattern == "PatternA"))
+        {
+            var row = rows.First(r => r.EndTimestamp == trade.SignalTimestamp);
+            var tradeToken = chain.First(i => i.OptionType == trade.OptionType && i.StrikePrice == trade.Strike).Token;
+            var series = await GetSeriesAsync(tradeToken);
+            var sessionBucket = Vc0DteBehaviorSummary.SessionBucket(row.StartTimestamp, deIstOffset2);
+
+            var altTimestamp = new DateTimeOffset?[delays.Length];
+            var altPrice = new decimal?[delays.Length];
+            var altGross = new decimal?[delays.Length];
+            var altNet = new decimal?[delays.Length];
+            var altMae = new decimal?[delays.Length];
+            var altMfe = new decimal?[delays.Length];
+            var exitedBy = new string[delays.Length];
+            var maxFavInWait = new decimal?[delays.Length];
+            var maxAdvInWait = new decimal?[delays.Length];
+
+            for (var d = 0; d < delays.Length; d++)
+            {
+                var target = DelayedExitCounterfactual.ComputeAlternativeExitTarget(trade.ExitTimestamp, delays[d], mandatoryCutoff);
+                var isForcedCap = target == mandatoryCutoff && trade.ExitTimestamp + delays[d] > mandatoryCutoff;
+                var tick = isForcedCap ? series.EntryAtOrBefore(target) : series.EntryAtOrAfter(target);
+                if (tick is not { } t)
+                {
+                    exitedBy[d] = "Unavailable";
+                    continue;
+                }
+
+                var basePrice = t.Depth is { } depth ? depth.Bid1Price : t.LastPrice;
+                var fill = PaperTradeSimulator.FillExit(basePrice, chain.First(i => i.Token == tradeToken).TickSize, trade.Quantity, costs2);
+                var costBreakdown = TransactionCostCalculator.Compute(fill.GrossValue, costs2.BrokeragePerOrder * 2);
+                var grossPnl = (fill.FillPrice - trade.EntryPrice) * trade.Quantity;
+
+                altTimestamp[d] = t.Timestamp;
+                altPrice[d] = fill.FillPrice;
+                altGross[d] = grossPnl;
+                altNet[d] = grossPnl - costBreakdown.Total;
+                exitedBy[d] = isForcedCap ? "ForcedEod" : "DelayedOppositeExit";
+
+                var fullPeriodPrices = series.AllEntries.Where(e => e.Timestamp > trade.EntryTimestamp && e.Timestamp <= t.Timestamp).Select(e => e.LastPrice).ToList();
+                var maeMfe = MaeMfeCalculator.Compute(trade.EntryPrice, fullPeriodPrices);
+                altMae[d] = maeMfe.MaePoints;
+                altMfe[d] = maeMfe.MfePoints;
+
+                var waitWindowPrices = series.AllEntries.Where(e => e.Timestamp > trade.ExitTimestamp && e.Timestamp <= t.Timestamp).Select(e => e.LastPrice).ToList();
+                if (waitWindowPrices.Count > 0)
+                {
+                    maxFavInWait[d] = waitWindowPrices.Max() - trade.EntryPrice;
+                    maxAdvInWait[d] = trade.EntryPrice - waitWindowPrices.Min();
+                }
+            }
+
+            delayRows.Add(new DelayedExitCounterfactual.DelayExperimentRow(
+                date, trade.Strike, row.AtmStrike, trade.EntryTimestamp, sessionBucket,
+                trade.EntryPrice, trade.Quantity,
+                trade.ExitTimestamp, trade.ExitPrice, trade.GrossPnl, trade.NetPnl, trade.MaeRupees, trade.MfeRupees, trade.HoldingDuration,
+                altTimestamp, altPrice, altGross, altNet, altMae, altMfe, exitedBy, maxFavInWait, maxAdvInWait));
+        }
+
+        Console.WriteLine($"  {date:yyyy-MM-dd}: {result.Trades.Count} baseline trades ({result.Trades.Count(t => t.Pattern == "PatternA")} A, {result.Trades.Count(t => t.Pattern == "PatternB")} B).");
+    }
+    Console.WriteLine();
+
+    if (delayRows.Count == 0) { Console.WriteLine("No Pattern A trades found -- stopping. No fabricated data."); return 1; }
+
+    var deDates2 = delayRows.Select(r => r.Date).Distinct().OrderBy(d => d).ToList();
+    var aTradesBaseline = allTradesBaseline.Where(t => t.Pattern == "PatternA").ToList();
+    var bTradesBaseline = allTradesBaseline.Where(t => t.Pattern == "PatternB").ToList();
+
+    // ==== 1. baseline reconciliation ====
+    Console.WriteLine("### 1 -- baseline reconciliation (must match the previously validated [100,150] experiment) ###");
+    Console.WriteLine($"  Total signals audited={allAuditBaseline.Count}, Executed={allAuditBaseline.Count(a => a.Outcome == PatternRelationshipTradeSimulator.SignalOutcome.Executed)}, AlreadyInPosition={allAuditBaseline.Count(a => a.Outcome == PatternRelationshipTradeSimulator.SignalOutcome.AlreadyInPosition)}, After3Pm={allAuditBaseline.Count(a => a.Outcome == PatternRelationshipTradeSimulator.SignalOutcome.After3Pm)}");
+    Console.WriteLine($"  A trades={aTradesBaseline.Count}, B trades={bTradesBaseline.Count}");
+    Console.WriteLine($"  A P&L={Fmt2(aTradesBaseline.Sum(t => t.NetPnl))}, B P&L={Fmt2(bTradesBaseline.Sum(t => t.NetPnl))}, Combined={Fmt2(allTradesBaseline.Sum(t => t.NetPnl))}");
+    Console.WriteLine("  Expected from the prior [100,150] experiment: 1135 signals (606 Executed/440 AlreadyInPosition/89 After3Pm), A=304 (+94375.03), B=302 (-163202.47), combined=-68827.44.");
+    var reconciles = allAuditBaseline.Count == 1135 && aTradesBaseline.Count == 304 && bTradesBaseline.Count == 302;
+    Console.WriteLine($"  RECONCILES: {reconciles}");
+    Console.WriteLine();
+
+    // ==== 2. A-side sensitivity table ====
+    Console.WriteLine("### 2 -- A-side sensitivity table ###");
+    void ReportTreatment(string label, Func<DelayedExitCounterfactual.DelayExperimentRow, decimal?> netPnlSelector, Func<DelayedExitCounterfactual.DelayExperimentRow, decimal> maeSelector, Func<DelayedExitCounterfactual.DelayExperimentRow, decimal> mfeSelector)
+    {
+        var vals = delayRows.Select(netPnlSelector).Where(v => v is not null).Select(v => v!.Value).ToList();
+        if (vals.Count == 0) { Console.WriteLine($"  {label}: n=0"); return; }
+        var wins = vals.Count(v => v > 0);
+        var losses = vals.Count(v => v < 0);
+        var grossProfit = vals.Where(v => v > 0).Sum();
+        var grossLoss = Math.Abs(vals.Where(v => v < 0).Sum());
+        var pf = grossLoss > 0 ? (grossProfit / grossLoss).ToString("F2") : "n/a";
+        var maeVals = delayRows.Select(maeSelector).ToList();
+        var mfeVals = delayRows.Select(mfeSelector).ToList();
+        Console.WriteLine($"  {label}: n={vals.Count} TotalPnl={Fmt2(vals.Sum())} MedianTrade={Pctile(vals, 0.5m)} MeanTrade={Fmt2(vals.Average())} WinRate={(100.0 * wins / vals.Count):F1}% PF={pf} P25={Pctile(vals, 0.25m)} P75={Pctile(vals, 0.75m)} AvgMAE={Fmt2(maeVals.Average())} AvgMFE={Fmt2(mfeVals.Average())}");
+    }
+    ReportTreatment("Immediate (baseline)", r => r.BaselineNetPnl, r => r.BaselineMae, r => r.BaselineMfe);
+    for (var d = 0; d < delays.Length; d++)
+    {
+        var idx = d;
+        ReportTreatment(delayLabels[idx], r => r.AlternativeNetPnl[idx], r => r.AlternativeMae[idx] ?? r.BaselineMae, r => r.AlternativeMfe[idx] ?? r.BaselineMfe);
+    }
+    Console.WriteLine();
+
+    // ==== 3. B invariance control ====
+    Console.WriteLine("### 3 -- B invariance control ###");
+    Console.WriteLine($"  B trade count={bTradesBaseline.Count}, B P&L={Fmt2(bTradesBaseline.Sum(t => t.NetPnl))} -- B was never touched by this command (no B trade, entry, or exit is read, modified, or recomputed anywhere above); this holds trivially by construction, not merely by coincidence.");
+    Console.WriteLine();
+
+    // ==== 4. trade-level paired analysis ====
+    Console.WriteLine("### 4 -- trade-level paired analysis ###");
+    for (var d = 0; d < delays.Length; d++)
+    {
+        var idx = d;
+        var paired = delayRows.Where(r => r.AlternativeNetPnl[idx] is not null).ToList();
+        var deltas = paired.Select(r => r.AlternativeNetPnl[idx]!.Value - r.BaselineNetPnl).ToList();
+        var transitions = paired.Select(r => DelayedExitCounterfactual.ClassifyOutcomeTransition(r.BaselineNetPnl, r.AlternativeNetPnl[idx]!.Value)).ToList();
+        Console.WriteLine($"  [{delayLabels[idx]}] n={paired.Count}");
+        foreach (var t in new[] { "LossToWin", "LossToLoss", "WinToWin", "WinToLoss" })
+        {
+            var count = transitions.Count(x => x == t);
+            Console.WriteLine($"    {t}: {count} ({(paired.Count > 0 ? 100.0 * count / paired.Count : 0):F1}%)");
+        }
+        Console.WriteLine($"    DeltaPnl(alt-baseline): mean={Fmt2(deltas.Average())} median={Pctile(deltas, 0.5m)} P25={Pctile(deltas, 0.25m)} P75={Pctile(deltas, 0.75m)} min={Fmt2(deltas.Min())} max={Fmt2(deltas.Max())}");
+    }
+    Console.WriteLine();
+
+    // ==== 5. give-back analysis ====
+    Console.WriteLine("### 5 -- give-back analysis (upside captured vs. given back while waiting) ###");
+    for (var d = 0; d < delays.Length; d++)
+    {
+        var idx = d;
+        var fav = delayRows.Select(r => r.MaxFavorableInWaitWindow[idx]).Where(v => v is not null).Select(v => v!.Value).ToList();
+        var adv = delayRows.Select(r => r.MaxAdverseInWaitWindow[idx]).Where(v => v is not null).Select(v => v!.Value).ToList();
+        Console.WriteLine($"  [{delayLabels[idx]}] MaxFavorableInWaitWindow: n={fav.Count} mean={(fav.Count > 0 ? Fmt2(fav.Average()) : "n/a")} median={Pctile(fav, 0.5m)} P25={Pctile(fav, 0.25m)} P75={Pctile(fav, 0.75m)}");
+        Console.WriteLine($"           MaxAdverseInWaitWindow:   n={adv.Count} mean={(adv.Count > 0 ? Fmt2(adv.Average()) : "n/a")} median={Pctile(adv, 0.5m)} P25={Pctile(adv, 0.25m)} P75={Pctile(adv, 0.75m)}");
+    }
+    Console.WriteLine();
+
+    // ==== 6. day-by-day ====
+    Console.WriteLine("### 6 -- day-by-day ###");
+    foreach (var d in deDates2)
+    {
+        var dayA = delayRows.Where(r => r.Date == d).ToList();
+        var dayB = dayBRows.TryGetValue(d, out var b) ? b : [];
+        Console.WriteLine($"  [{d:yyyy-MM-dd}] A n={dayA.Count} BaselineAPnl={Fmt2(dayA.Sum(r => r.BaselineNetPnl))} BPnl={Fmt2(dayB.Sum(t => t.NetPnl))}");
+        for (var delayIdx = 0; delayIdx < delays.Length; delayIdx++)
+        {
+            var vals = dayA.Select(r => r.AlternativeNetPnl[delayIdx]).Where(v => v is not null).Select(v => v!.Value).ToList();
+            if (vals.Count == 0) { continue; }
+            var wins = vals.Count(v => v > 0);
+            var grossProfit = vals.Where(v => v > 0).Sum(); var grossLoss = Math.Abs(vals.Where(v => v < 0).Sum());
+            Console.WriteLine($"    {delayLabels[delayIdx]}: APnl={Fmt2(vals.Sum())} Combined={Fmt2(vals.Sum() + dayB.Sum(t => t.NetPnl))} MedianTrade={Pctile(vals, 0.5m)} WinRate={(100.0 * wins / vals.Count):F1}% PF={(grossLoss > 0 ? (grossProfit / grossLoss).ToString("F2") : "n/a")}");
+        }
+    }
+    Console.WriteLine();
+
+    // ==== 7. session buckets ====
+    Console.WriteLine("### 7 -- session buckets (paired P&L delta per delay) ###");
+    foreach (var bucket in new[] { "09:15-10:00", "10:00-11:00", "11:00-12:00", "12:00-13:00", "13:00-14:00", "14:00-15:00", "15:00-15:30" })
+    {
+        var m = delayRows.Where(r => r.SessionBucket == bucket).ToList();
+        if (m.Count == 0) { continue; }
+        Console.Write($"  [{bucket}] n={m.Count}");
+        for (var d = 0; d < delays.Length; d++)
+        {
+            var idx = d;
+            var deltas = m.Where(r => r.AlternativeNetPnl[idx] is not null).Select(r => r.AlternativeNetPnl[idx]!.Value - r.BaselineNetPnl).ToList();
+            Console.Write($"  {delayLabels[idx]}medDelta={(deltas.Count > 0 ? Pctile(deltas, 0.5m) : "n/a")}");
+        }
+        Console.WriteLine();
+    }
+    Console.WriteLine();
+
+    // ==== 8. trade-duration analysis ====
+    Console.WriteLine("### 8 -- trade-duration analysis ###");
+    var baseHolding = delayRows.Select(r => r.BaselineHolding.TotalSeconds).ToList();
+    Console.WriteLine($"  Baseline: median={TimeSpan.FromSeconds(baseHolding.OrderBy(v => v).ElementAt(baseHolding.Count / 2)):mm\\:ss}");
+    for (var d = 0; d < delays.Length; d++)
+    {
+        var idx = d;
+        var holdings = delayRows.Where(r => r.AlternativeExitTimestamp[idx] is not null).Select(r => (r.AlternativeExitTimestamp[idx]!.Value - r.EntryTimestamp).TotalSeconds).ToList();
+        var delayedExits = delayRows.Count(r => r.ExitedBy[idx] == "DelayedOppositeExit");
+        var forcedExits = delayRows.Count(r => r.ExitedBy[idx] == "ForcedEod");
+        var unavailable = delayRows.Count(r => r.ExitedBy[idx] == "Unavailable");
+        if (holdings.Count == 0) { continue; }
+        var sortedH = holdings.OrderBy(v => v).ToList();
+        Console.WriteLine($"  {delayLabels[idx]}: medianHolding={TimeSpan.FromSeconds(sortedH[sortedH.Count / 2]):mm\\:ss} meanHolding={TimeSpan.FromSeconds(holdings.Average()):mm\\:ss} P25={TimeSpan.FromSeconds(sortedH[sortedH.Count / 4]):mm\\:ss} P75={TimeSpan.FromSeconds(sortedH[3 * sortedH.Count / 4]):mm\\:ss} DelayedOppositeExit={delayedExits} ForcedEod={forcedExits} Unavailable={unavailable}");
+    }
+    Console.WriteLine();
+
+    // ==== 9. MFE/MAE while waiting ====
+    Console.WriteLine("### 9 -- MFE/MAE while waiting (already reported per-delay in Part 5; summarized here as % better/worse) ###");
+    for (var d = 0; d < delays.Length; d++)
+    {
+        var idx = d;
+        var withAlt = delayRows.Where(r => r.AlternativeNetPnl[idx] is not null).ToList();
+        var better = withAlt.Count(r => r.AlternativeNetPnl[idx]!.Value > r.BaselineNetPnl);
+        var meaningfulAdverse = withAlt.Count(r => (r.MaxAdverseInWaitWindow[idx] ?? 0) > r.BaselineMae); // "meaningful" = exceeds the trade's OWN baseline MAE, not an invented constant.
+        Console.WriteLine($"  {delayLabels[idx]}: n={withAlt.Count} betterThanBaseline={better} ({(withAlt.Count > 0 ? 100.0 * better / withAlt.Count : 0):F1}%) sufferedAdverseExceedingOwnBaselineMAE={meaningfulAdverse} ({(withAlt.Count > 0 ? 100.0 * meaningfulAdverse / withAlt.Count : 0):F1}%)");
+    }
+    Console.WriteLine();
+
+    // ==== 10. shape of the response ====
+    Console.WriteLine("### 10 -- shape of the response ###");
+    for (var d = 0; d < delays.Length; d++)
+    {
+        var idx = d;
+        var deltas = delayRows.Where(r => r.AlternativeNetPnl[idx] is not null).Select(r => r.AlternativeNetPnl[idx]!.Value - r.BaselineNetPnl).ToList();
+        if (deltas.Count == 0) { continue; }
+        Console.WriteLine($"  {delayLabels[idx]}: IncrementalAPnlVsBaseline={Fmt2(deltas.Sum())} MedianDelta={Pctile(deltas, 0.5m)} P25={Pctile(deltas, 0.25m)} P75={Pctile(deltas, 0.75m)}");
+    }
+    Console.WriteLine();
+
+    // ---- CSV export ----
+    using (var writer = new StreamWriter(deDiagOutPath2))
+    {
+        writer.WriteLine("Date,Strike,AtmStrike,EntryTimestamp,SessionBucket,EntryPrice,Quantity,"
+            + "BaselineExitTimestamp,BaselineExitPrice,BaselineGrossPnl,BaselineNetPnl,BaselineMae,BaselineMfe,BaselineHoldingSeconds,"
+            + "Alt1mNetPnl,Alt3mNetPnl,Alt5mNetPnl,Alt10mNetPnl,"
+            + "Alt1mExitedBy,Alt3mExitedBy,Alt5mExitedBy,Alt10mExitedBy,"
+            + "Alt1mMaxFavInWait,Alt3mMaxFavInWait,Alt5mMaxFavInWait,Alt10mMaxFavInWait,"
+            + "Alt1mMaxAdvInWait,Alt3mMaxAdvInWait,Alt5mMaxAdvInWait,Alt10mMaxAdvInWait");
+        foreach (var r in delayRows)
+        {
+            writer.WriteLine(string.Join(',',
+                r.Date.ToString("yyyy-MM-dd"), r.Strike, r.AtmStrike, r.EntryTimestamp.ToString("O"), r.SessionBucket, r.EntryPrice, r.Quantity,
+                r.BaselineExitTimestamp.ToString("O"), r.BaselineExitPrice, r.BaselineGrossPnl, r.BaselineNetPnl, r.BaselineMae, r.BaselineMfe, r.BaselineHolding.TotalSeconds,
+                FmtN(r.AlternativeNetPnl[0]), FmtN(r.AlternativeNetPnl[1]), FmtN(r.AlternativeNetPnl[2]), FmtN(r.AlternativeNetPnl[3]),
+                r.ExitedBy[0], r.ExitedBy[1], r.ExitedBy[2], r.ExitedBy[3],
+                FmtN(r.MaxFavorableInWaitWindow[0]), FmtN(r.MaxFavorableInWaitWindow[1]), FmtN(r.MaxFavorableInWaitWindow[2]), FmtN(r.MaxFavorableInWaitWindow[3]),
+                FmtN(r.MaxAdverseInWaitWindow[0]), FmtN(r.MaxAdverseInWaitWindow[1]), FmtN(r.MaxAdverseInWaitWindow[2]), FmtN(r.MaxAdverseInWaitWindow[3])));
+        }
+    }
+    Console.WriteLine($"A-exit-delay sensitivity CSV written to: {Path.GetFullPath(deDiagOutPath2)}");
+
+    return 0;
+}
+
+// "vc0dte-relationship-a-continuation-diagnostic" -- 2026-09-24, structural diagnosis of whether
+// Pattern A's post-exit continuation/reversal is distinguishable from signal-time information
+// (HARD FREEZE: the frozen [100,150]-band baseline runs completely unmodified via
+// PatternRelationshipTradeSimulator; no trade lifecycle, no Pattern B, is ever touched). Signal-
+// time FEATURES (known at/before the signal) and post-exit OUTCOME (the price path strictly
+// after the actual baseline exit) are kept in clearly separate fields throughout -- never mixed.
+// No classification threshold beyond a zero-sign split (DelayedExitCounterfactual.ClassifyContinuationVsReversal)
+// is introduced anywhere. No predictive model of any kind is trained.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-continuation-diagnostic <fromDate> <toDate> --diagOut=path.csv
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-a-continuation-diagnostic", StringComparison.OrdinalIgnoreCase))
+{
+    const long acThreshold = 1300L;
+    var acIstOffset = TimeSpan.FromHours(5.5);
+    const decimal acMinEntryPrice = 100m, acMaxEntryPrice = 150m;
+    TimeSpan[] acHorizons = [TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(3), TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(10), TimeSpan.FromMinutes(15)];
+    string[] acHorizonLabels = ["+1m", "+3m", "+5m", "+10m", "+15m"];
+
+    var (acPositional, acNamed) = SplitNamedArgs(args);
+    if (acPositional.Length < 3 || !DateOnly.TryParseExact(acPositional[1], "yyyy-MM-dd", out var acFromDate) || !DateOnly.TryParseExact(acPositional[2], "yyyy-MM-dd", out var acToDate) || !acNamed.TryGetValue("diagOut", out var acDiagOutPath))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-continuation-diagnostic <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> --diagOut=path.csv");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-a-continuation-diagnostic: DIAGNOSTIC ONLY -- can signal-time features distinguish A continuation from reversal? No strategy change. ===");
+    Console.WriteLine();
+    static string Fmt2(decimal v) => v.ToString("F2");
+    static string FmtN(decimal? v) => v?.ToString("F2") ?? "--";
+    static (int N, decimal Mean, decimal Median, decimal P25, decimal P75, decimal Min, decimal Max)? Stats(IEnumerable<decimal> values)
+    {
+        var s = values.OrderBy(v => v).ToList();
+        if (s.Count == 0) { return null; }
+        decimal Pct(decimal p) => s[(int)Math.Clamp(Math.Round((s.Count - 1) * p), 0, s.Count - 1)];
+        return (s.Count, s.Average(), Pct(0.5m), Pct(0.25m), Pct(0.75m), s.Min(), s.Max());
+    }
+    static string FmtStats((int N, decimal Mean, decimal Median, decimal P25, decimal P75, decimal Min, decimal Max)? s)
+        => s is { } v ? $"n={v.N} mean={v.Mean:F2} median={v.Median:F2} P25={v.P25:F2} P75={v.P75:F2} min={v.Min:F2} max={v.Max:F2}" : "n=0";
+
+    var rowsData = new List<DelayedExitCounterfactual.ContinuationRow>();
+
+    for (var date = acFromDate; date <= acToDate; date = date.AddDays(1))
+    {
+        if (date.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday) { continue; }
+        var (chain, futureBars, optionBars) = await LoadVc0DteDayAsync(date, acThreshold);
+        if (futureBars.Count == 0 || chain.Count == 0) { continue; }
+
+        await using var source = new NiftySignalDbContext(tradeSourceOptions);
+        var relationshipRows = await UnderlyingOptionRelationshipRecorder.RecordAsync(source, date, chain, futureBars, optionBars, CancellationToken.None);
+        // ---- Baseline: the EXACT frozen simulation, unmodified, run once. ----
+        var result = await PatternRelationshipTradeSimulator.SimulateDayAsync(
+            source, date, relationshipRows, chain, futureBars, acIstOffset, CancellationToken.None,
+            optionBars: optionBars, minEntryPrice: acMinEntryPrice, maxEntryPrice: acMaxEntryPrice);
+
+        var tickSeriesCache = new Dictionary<string, OptionTickSeries>();
+        async Task<OptionTickSeries> GetSeriesAsync(string token)
+        {
+            if (!tickSeriesCache.TryGetValue(token, out var series))
+            {
+                var dayStart = futureBars[0].StartTimestamp;
+                var dayEnd = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 30)), acIstOffset).ToUniversalTime();
+                series = await OptionTickSeries.LoadAsync(source, token, dayStart, dayEnd, CancellationToken.None);
+                tickSeriesCache[token] = series;
+            }
+            return series;
+        }
+
+        foreach (var trade in result.Trades.Where(t => t.Pattern == "PatternA"))
+        {
+            var row = relationshipRows.First(r => r.EndTimestamp == trade.SignalTimestamp);
+            var tradeToken = chain.First(i => i.OptionType == trade.OptionType && i.StrikePrice == trade.Strike).Token;
+            var series = await GetSeriesAsync(tradeToken);
+            var sessionBucket = Vc0DteBehaviorSummary.SessionBucket(row.StartTimestamp, acIstOffset);
+            var priorMovement3 = UnderlyingOptionRelationshipSummary.ComputeFuturesChange(relationshipRows, row.EventId - 3, 3).PercentChange;
+            var divergence = EpisodeTransitionAnalysis.ClassifyCePeDivergence(row.CeChange1, row.PeChange1);
+
+            var intrinsicAtEntry = OptionValueDecomposition.ComputeIntrinsic(trade.UnderlyingPriceAtEntry, trade.Strike, trade.OptionType);
+            var extrinsicAtEntry = OptionValueDecomposition.ComputeExtrinsic(trade.EntryPrice, intrinsicAtEntry);
+            var moneyness = OptionValueDecomposition.ComputeMoneyness(trade.UnderlyingPriceAtEntry, trade.Strike, trade.OptionType);
+
+            var postExitReturn = new decimal?[acHorizons.Length];
+            var continuationLabel = new string[acHorizons.Length];
+            decimal? mfeAfterExit = null, maeAfterExit = null;
+            var farthestCeiling = trade.ExitTimestamp + acHorizons[^1];
+            var pathAfterExit = series.AllEntries.Where(e => e.Timestamp > trade.ExitTimestamp && e.Timestamp <= farthestCeiling).Select(e => (e.Timestamp, e.LastPrice)).ToList();
+            if (pathAfterExit.Count > 0)
+            {
+                var maeMfe = MaeMfeCalculator.Compute(trade.ExitPrice, pathAfterExit.Select(p => p.LastPrice).ToList());
+                mfeAfterExit = maeMfe.MfePoints;
+                maeAfterExit = maeMfe.MaePoints;
+            }
+            for (var h = 0; h < acHorizons.Length; h++)
+            {
+                var target = trade.ExitTimestamp + acHorizons[h];
+                var tick = series.EntryAtOrAfter(target);
+                if (tick is { } t)
+                {
+                    postExitReturn[h] = t.LastPrice - trade.ExitPrice;
+                }
+                continuationLabel[h] = DelayedExitCounterfactual.ClassifyContinuationVsReversal(postExitReturn[h]);
+            }
+
+            rowsData.Add(new DelayedExitCounterfactual.ContinuationRow(
+                date, sessionBucket, trade.SignalTimestamp, DelayedExitCounterfactual.MinutesSinceSessionOpen(trade.SignalTimestamp, acIstOffset),
+                row.CeChange1, row.PeChange1, divergence, row.FuturesChange1, priorMovement3,
+                trade.EntryPrice, trade.Strike, row.AtmStrike, trade.Strike - row.AtmStrike, trade.UnderlyingPriceAtEntry,
+                moneyness, intrinsicAtEntry, extrinsicAtEntry, trade.Dte,
+                postExitReturn, continuationLabel, mfeAfterExit, maeAfterExit));
+        }
+
+        Console.WriteLine($"  {date:yyyy-MM-dd}: {result.Trades.Count(t => t.Pattern == "PatternA")} Pattern A trades processed.");
+    }
+    Console.WriteLine();
+
+    if (rowsData.Count == 0) { Console.WriteLine("No Pattern A trades found -- stopping. No fabricated data."); return 1; }
+
+    var acDates = rowsData.Select(r => r.Date).Distinct().OrderBy(d => d).ToList();
+    const int primaryHorizon = 3; // +10m -- the horizon where the prior sensitivity experiment found the sharpest day-specific divergence.
+
+    // ==== A. core outcome distribution ====
+    Console.WriteLine("### A -- core outcome distribution (post-EXIT PE return, Rs) ###");
+    for (var h = 0; h < acHorizons.Length; h++)
+    {
+        var vals = rowsData.Select(r => r.PostExitReturn[h]).Where(v => v is not null).Select(v => v!.Value).ToList();
+        Console.WriteLine($"  {acHorizonLabels[h]}: {FmtStats(Stats(vals))}");
+    }
+    Console.WriteLine($"  MFEAfterExit: {FmtStats(Stats(rowsData.Select(r => r.MfeAfterExit).Where(v => v is not null).Select(v => v!.Value)))}");
+    Console.WriteLine($"  MAEAfterExit: {FmtStats(Stats(rowsData.Select(r => r.MaeAfterExit).Where(v => v is not null).Select(v => v!.Value)))}");
+    Console.WriteLine();
+    Console.WriteLine("  Continuation/Reversal/Flat counts by horizon:");
+    for (var h = 0; h < acHorizons.Length; h++)
+    {
+        var labels = rowsData.Select(r => r.ContinuationLabel[h]).ToList();
+        Console.WriteLine($"    {acHorizonLabels[h]}: Continuation={labels.Count(l => l == "Continuation")} Reversal={labels.Count(l => l == "Reversal")} Flat={labels.Count(l => l == "Flat")} Unavailable={labels.Count(l => l == "Unavailable")}");
+    }
+    Console.WriteLine();
+
+    // ==== B. feature comparison (primary horizon = +10m) ====
+    Console.WriteLine($"### B -- feature comparison, Continuation vs Reversal at {acHorizonLabels[primaryHorizon]} (primary horizon) ###");
+    var continuation = rowsData.Where(r => r.ContinuationLabel[primaryHorizon] == "Continuation").ToList();
+    var reversal = rowsData.Where(r => r.ContinuationLabel[primaryHorizon] == "Reversal").ToList();
+    Console.WriteLine($"  Continuation n={continuation.Count}, Reversal n={reversal.Count}");
+    void CompareFeature(string label, Func<DelayedExitCounterfactual.ContinuationRow, decimal?> selector)
+    {
+        var cVals = continuation.Select(selector).Where(v => v is not null).Select(v => v!.Value);
+        var rVals = reversal.Select(selector).Where(v => v is not null).Select(v => v!.Value);
+        Console.WriteLine($"    {label}: Continuation[{FmtStats(Stats(cVals))}] Reversal[{FmtStats(Stats(rVals))}]");
+    }
+    CompareFeature("CE change1 at signal", r => r.CeChange1);
+    CompareFeature("PE change1 at signal", r => r.PeChange1);
+    CompareFeature("Futures change1 at signal", r => r.FuturesChange1);
+    CompareFeature("Prior-3-event move %", r => r.PriorMovement3);
+    CompareFeature("PE entry price", r => r.EntryPrice);
+    CompareFeature("Strike distance from ATM", r => r.StrikeDistance);
+    CompareFeature("Moneyness", r => r.Moneyness);
+    CompareFeature("Intrinsic at entry", r => r.IntrinsicAtEntry);
+    CompareFeature("Extrinsic at entry", r => r.ExtrinsicAtEntry);
+    CompareFeature("Minutes since session open", r => (decimal)r.MinutesSinceSessionOpen);
+    Console.WriteLine($"    CE/PE divergence at signal: Continuation[{string.Join(",", continuation.GroupBy(r => r.CePeDivergence).Select(g => $"{g.Key}:{g.Count()}"))}] Reversal[{string.Join(",", reversal.GroupBy(r => r.CePeDivergence).Select(g => $"{g.Key}:{g.Count()}"))}]");
+    Console.WriteLine();
+
+    // ==== D (moved up next to feature comparison for narrative flow): prior movement tercile ====
+    Console.WriteLine("### Prior-movement tercile vs continuation rate (existing tercile methodology, reused) ###");
+    var priorAbsMoves = rowsData.Select(r => r.PriorMovement3).Where(v => v is not null).Select(v => Math.Abs(v!.Value)).ToList();
+    if (priorAbsMoves.Count >= 3)
+    {
+        var (low33, high67) = ForwardValidationAnalysis.ComputeTerciles(priorAbsMoves);
+        foreach (var bucket in new[] { "Low", "Mid", "High" })
+        {
+            var m = rowsData.Where(r => r.PriorMovement3 is not null && ConditionalMovementAnalysis.ClassifyTercileBucket(Math.Abs(r.PriorMovement3.Value), low33, high67) == bucket).ToList();
+            if (m.Count == 0) { continue; }
+            var contCount = m.Count(r => r.ContinuationLabel[primaryHorizon] == "Continuation");
+            Console.WriteLine($"  {bucket}: n={m.Count} ContinuationRate={(100.0 * contCount / m.Count):F1}%");
+        }
+    }
+    Console.WriteLine();
+
+    // ==== day-by-day validation ====
+    Console.WriteLine("### Day-by-day validation (feature means, Continuation vs Reversal, at +10m) ###");
+    foreach (var d in acDates)
+    {
+        var dayRows = rowsData.Where(r => r.Date == d).ToList();
+        var dayCont = dayRows.Where(r => r.ContinuationLabel[primaryHorizon] == "Continuation").ToList();
+        var dayRev = dayRows.Where(r => r.ContinuationLabel[primaryHorizon] == "Reversal").ToList();
+        Console.WriteLine($"  [{d:yyyy-MM-dd}] n={dayRows.Count} Continuation={dayCont.Count} Reversal={dayRev.Count} ContinuationRate={(dayRows.Count > 0 ? 100.0 * dayCont.Count / dayRows.Count : 0):F1}%");
+        Console.WriteLine($"    AvgExtrinsicAtEntry: Cont={FmtN(dayCont.Count > 0 ? dayCont.Average(r => r.ExtrinsicAtEntry) : null)} Rev={FmtN(dayRev.Count > 0 ? dayRev.Average(r => r.ExtrinsicAtEntry) : null)}");
+        Console.WriteLine($"    AvgMoneyness: Cont={FmtN(dayCont.Count > 0 ? dayCont.Average(r => r.Moneyness) : null)} Rev={FmtN(dayRev.Count > 0 ? dayRev.Average(r => r.Moneyness) : null)}");
+        Console.WriteLine($"    AvgPriorMovement3: Cont={FmtN(dayCont.Where(r => r.PriorMovement3 is not null).Select(r => r.PriorMovement3!.Value).DefaultIfEmpty().Average())} Rev={FmtN(dayRev.Where(r => r.PriorMovement3 is not null).Select(r => r.PriorMovement3!.Value).DefaultIfEmpty().Average())}");
+        Console.WriteLine($"    AvgStrikeDistance: Cont={FmtN(dayCont.Count > 0 ? dayCont.Average(r => r.StrikeDistance) : null)} Rev={FmtN(dayRev.Count > 0 ? dayRev.Average(r => r.StrikeDistance) : null)}");
+    }
+    Console.WriteLine();
+
+    // ==== session analysis ====
+    Console.WriteLine("### Session analysis (continuation rate at +10m, per bucket) ###");
+    foreach (var bucket in new[] { "09:15-10:00", "10:00-11:00", "11:00-12:00", "12:00-13:00", "13:00-14:00", "14:00-15:00", "15:00-15:30" })
+    {
+        var m = rowsData.Where(r => r.SessionBucket == bucket).ToList();
+        if (m.Count == 0) { continue; }
+        var cont = m.Count(r => r.ContinuationLabel[primaryHorizon] == "Continuation");
+        Console.WriteLine($"  [{bucket}] n={m.Count} ContinuationRate={(100.0 * cont / m.Count):F1}% AvgExtrinsic={Fmt2(m.Average(r => r.ExtrinsicAtEntry))} AvgMoneyness={Fmt2(m.Average(r => r.Moneyness))}");
+    }
+    Console.WriteLine();
+
+    // ==== C. 09-08 investigation ====
+    Console.WriteLine("### C -- 09-08 investigation (structural comparison vs the other 2 days) ###");
+    var day0908 = rowsData.Where(r => r.Date == new DateOnly(2026, 9, 8)).ToList();
+    var otherDays = rowsData.Where(r => r.Date != new DateOnly(2026, 9, 8)).ToList();
+    void CompareDayFeature(string label, Func<DelayedExitCounterfactual.ContinuationRow, decimal?> selector)
+    {
+        var v0908 = day0908.Select(selector).Where(v => v is not null).Select(v => v!.Value);
+        var vOther = otherDays.Select(selector).Where(v => v is not null).Select(v => v!.Value);
+        Console.WriteLine($"  {label}: 09-08[{FmtStats(Stats(v0908))}] OtherDays[{FmtStats(Stats(vOther))}]");
+    }
+    CompareDayFeature("Futures change1 at signal", r => r.FuturesChange1);
+    CompareDayFeature("CE change1 at signal", r => r.CeChange1);
+    CompareDayFeature("PE change1 at signal", r => r.PeChange1);
+    CompareDayFeature("PE entry price", r => r.EntryPrice);
+    CompareDayFeature("Moneyness", r => r.Moneyness);
+    CompareDayFeature("Extrinsic at entry", r => r.ExtrinsicAtEntry);
+    CompareDayFeature("Strike distance", r => r.StrikeDistance);
+    CompareDayFeature("Prior-3-event move %", r => r.PriorMovement3);
+    Console.WriteLine($"  09-08 session distribution: {string.Join(", ", day0908.GroupBy(r => r.SessionBucket).Select(g => $"{g.Key}:{g.Count()}"))}");
+    Console.WriteLine($"  Other-days session distribution: {string.Join(", ", otherDays.GroupBy(r => r.SessionBucket).Select(g => $"{g.Key}:{g.Count()}"))}");
+    Console.WriteLine();
+
+    // ==== D. contract-selection analysis ====
+    Console.WriteLine("### D -- contract-selection analysis (does moneyness/extrinsic composition explain continuation?) ###");
+    var extrinsicSorted = rowsData.Select(r => r.ExtrinsicAtEntry).OrderBy(v => v).ToList();
+    if (extrinsicSorted.Count >= 3)
+    {
+        var (lowE, highE) = ForwardValidationAnalysis.ComputeTerciles(extrinsicSorted);
+        foreach (var bucket in new[] { "Low", "Mid", "High" })
+        {
+            var m = rowsData.Where(r => ConditionalMovementAnalysis.ClassifyTercileBucket(r.ExtrinsicAtEntry, lowE, highE) == bucket).ToList();
+            if (m.Count == 0) { continue; }
+            var cont = m.Count(r => r.ContinuationLabel[primaryHorizon] == "Continuation");
+            Console.WriteLine($"  ExtrinsicTercile [{bucket}]: n={m.Count} ContinuationRate={(100.0 * cont / m.Count):F1}% AvgExtrinsic={Fmt2(m.Average(r => r.ExtrinsicAtEntry))}");
+        }
+    }
+    Console.WriteLine();
+
+    // ---- CSV export ----
+    using (var writer = new StreamWriter(acDiagOutPath))
+    {
+        writer.WriteLine("Date,SessionBucket,SignalTimestamp,MinutesSinceOpen,CeChange1,PeChange1,CePeDivergence,FuturesChange1,PriorMovement3Pct,"
+            + "EntryPrice,Strike,AtmStrike,StrikeDistance,FuturesAtEntry,Moneyness,IntrinsicAtEntry,ExtrinsicAtEntry,Dte,"
+            + "PostExit1m,PostExit3m,PostExit5m,PostExit10m,PostExit15m,"
+            + "Label1m,Label3m,Label5m,Label10m,Label15m,MFEAfterExit,MAEAfterExit");
+        foreach (var r in rowsData)
+        {
+            writer.WriteLine(string.Join(',',
+                r.Date.ToString("yyyy-MM-dd"), r.SessionBucket, r.SignalTimestamp.ToString("O"), r.MinutesSinceSessionOpen,
+                FmtN(r.CeChange1), FmtN(r.PeChange1), r.CePeDivergence, FmtN(r.FuturesChange1), FmtN(r.PriorMovement3),
+                r.EntryPrice, r.Strike, r.AtmStrike, r.StrikeDistance, r.FuturesAtEntry, r.Moneyness, r.IntrinsicAtEntry, r.ExtrinsicAtEntry, r.Dte,
+                FmtN(r.PostExitReturn[0]), FmtN(r.PostExitReturn[1]), FmtN(r.PostExitReturn[2]), FmtN(r.PostExitReturn[3]), FmtN(r.PostExitReturn[4]),
+                r.ContinuationLabel[0], r.ContinuationLabel[1], r.ContinuationLabel[2], r.ContinuationLabel[3], r.ContinuationLabel[4],
+                FmtN(r.MfeAfterExit), FmtN(r.MaeAfterExit)));
+        }
+    }
+    Console.WriteLine($"A-continuation diagnostic CSV written to: {Path.GetFullPath(acDiagOutPath)}");
+
+    return 0;
+}
+
+// "vc0dte-relationship-a-12to14-market-state" -- 2026-09-24, 12:00-14:00 market-state diagnostic
+// (HARD FREEZE: the frozen [100,150]-band baseline runs completely unmodified; no strategy/
+// filter/exit change anywhere in this command; Pattern B is never touched). CVD-net, OFI-net,
+// depth imbalance, and top-of-book imbalance are deliberately reported as UNAVAILABLE rather
+// than approximately reconstructed -- they exist elsewhere in this codebase (CvdProxySumPopulator,
+// DepthImbalanceSumPopulator, etc.) but on a structurally DIFFERENT bar clock from a separate,
+// earlier score-candidate research track; mapping them onto the frozen relationship's own event
+// boundaries would be an approximate cross-framework reconstruction, which the task explicitly
+// forbids. Everything else reuses existing fields (FutureEventBar.Vwap/High/Low/Volume,
+// RelationshipObservation.FuturesEventDurationMs/CeChange1/PeChange1, EpisodeAnalysis) unmodified.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-12to14-market-state <fromDate> <toDate> --diagOut=path.csv
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-a-12to14-market-state", StringComparison.OrdinalIgnoreCase))
+{
+    const long msThreshold = 1300L;
+    var msIstOffset = TimeSpan.FromHours(5.5);
+    const decimal msMinEntryPrice = 100m, msMaxEntryPrice = 150m;
+    const string PatternA = ForwardValidationAnalysis.State2_BullishDivergence_PatternA;
+    const string PatternB = ForwardValidationAnalysis.State4_BearishDivergence_PatternB;
+    TimeSpan[] msHorizons = [TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(3), TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(10), TimeSpan.FromMinutes(15)];
+    string[] msHorizonLabels = ["+1m", "+3m", "+5m", "+10m", "+15m"];
+
+    var (msPositional, msNamed) = SplitNamedArgs(args);
+    if (msPositional.Length < 3 || !DateOnly.TryParseExact(msPositional[1], "yyyy-MM-dd", out var msFromDate) || !DateOnly.TryParseExact(msPositional[2], "yyyy-MM-dd", out var msToDate) || !msNamed.TryGetValue("diagOut", out var msDiagOutPath))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-12to14-market-state <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> --diagOut=path.csv");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-a-12to14-market-state: DIAGNOSTIC ONLY -- is 12:00-14:00 associated with a different market state? No strategy change, no filter. ===");
+    Console.WriteLine("NOTE: CVD-net/OFI-net/depth-imbalance/top-of-book-imbalance are UNAVAILABLE within this frozen relationship framework (they exist on a different, incompatible bar clock elsewhere in this codebase) -- not approximated.");
+    Console.WriteLine();
+    static string Fmt2(decimal v) => v.ToString("F2");
+    static string FmtN(decimal? v) => v?.ToString("F2") ?? "--";
+    static string FmtNd(double? v) => v?.ToString("F2") ?? "--";
+    static (int N, decimal Mean, decimal Median, decimal P25, decimal P75)? Stats(IEnumerable<decimal> values)
+    {
+        var s = values.OrderBy(v => v).ToList();
+        if (s.Count == 0) { return null; }
+        decimal Pct(decimal p) => s[(int)Math.Clamp(Math.Round((s.Count - 1) * p), 0, s.Count - 1)];
+        return (s.Count, s.Average(), Pct(0.5m), Pct(0.25m), Pct(0.75m));
+    }
+    static string FmtStats((int N, decimal Mean, decimal Median, decimal P25, decimal P75)? s)
+        => s is { } v ? $"n={v.N} mean={v.Mean:F2} median={v.Median:F2} P25={v.P25:F2} P75={v.P75:F2}" : "n=0";
+
+    var rowsData = new List<MarketStateDiagnostics.MarketStateRow>();
+
+    for (var date = msFromDate; date <= msToDate; date = date.AddDays(1))
+    {
+        if (date.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday) { continue; }
+        var (chain, futureBars, optionBars) = await LoadVc0DteDayAsync(date, msThreshold);
+        if (futureBars.Count == 0 || chain.Count == 0) { continue; }
+
+        await using var source = new NiftySignalDbContext(tradeSourceOptions);
+        var relationshipRows = await UnderlyingOptionRelationshipRecorder.RecordAsync(source, date, chain, futureBars, optionBars, CancellationToken.None);
+        // ---- Baseline: the EXACT frozen simulation, unmodified, run once. ----
+        var result = await PatternRelationshipTradeSimulator.SimulateDayAsync(
+            source, date, relationshipRows, chain, futureBars, msIstOffset, CancellationToken.None,
+            optionBars: optionBars, minEntryPrice: msMinEntryPrice, maxEntryPrice: msMaxEntryPrice);
+
+        var episodesA = EpisodeAnalysis.DetectEpisodes(date, relationshipRows, PatternA, []);
+        var tickSeriesCache = new Dictionary<string, OptionTickSeries>();
+        async Task<OptionTickSeries> GetSeriesAsync(string token)
+        {
+            if (!tickSeriesCache.TryGetValue(token, out var series))
+            {
+                var dayStart = futureBars[0].StartTimestamp;
+                var dayEnd = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 30)), msIstOffset).ToUniversalTime();
+                series = await OptionTickSeries.LoadAsync(source, token, dayStart, dayEnd, CancellationToken.None);
+                tickSeriesCache[token] = series;
+            }
+            return series;
+        }
+
+        foreach (var trade in result.Trades.Where(t => t.Pattern == "PatternA"))
+        {
+            var row = relationshipRows.First(r => r.EndTimestamp == trade.SignalTimestamp);
+            var futureBar = futureBars[row.EventId];
+            var tradeToken = chain.First(i => i.OptionType == trade.OptionType && i.StrikePrice == trade.Strike).Token;
+            var series = await GetSeriesAsync(tradeToken);
+            var sessionBucket = Vc0DteBehaviorSummary.SessionBucket(row.StartTimestamp, msIstOffset);
+
+            var volumeRate = MarketStateDiagnostics.ComputeVolumeRate(row.FuturesVolume, row.FuturesEventDurationMs);
+            var closeMinusVwap = futureBar.Vwap is { } vwap ? row.FuturesClose - (decimal)vwap : (decimal?)null;
+            var priorMovement3 = UnderlyingOptionRelationshipSummary.ComputeFuturesChange(relationshipRows, row.EventId - 3, 3).PercentChange;
+            var divergenceMagnitude = MarketStateDiagnostics.ComputeCePeDivergenceMagnitude(row.CeChange1, row.PeChange1);
+
+            var priorRawState = row.EventId > 0 ? relationshipRows[row.EventId - 1].RelationshipCategory : "None (day start)";
+            var priorRawStateClass = MarketStateDiagnostics.ClassifyPriorStateClass(priorRawState);
+
+            var episode = TradeLifecycleDiagnostics.FindContainingEpisode(episodesA, row.EventId);
+            var episodeLength = episode?.EventCount ?? 1;
+            var episodeDurationMs = episode?.DurationMs ?? 0;
+            var eventIndexWithinEpisode = episode is not null ? row.EventId - episode.StartEventId : 0;
+
+            // Straightforward deterministic backward scans over the already-existing, unmodified
+            // RelationshipObservation sequence -- no new formula, same convention as every prior
+            // "time since previous X" computation in this research chain.
+            double? minutesSincePrevA = null, minutesSincePrevB = null, minutesSincePrevTransition = null;
+            for (var i = row.EventId - 1; i >= 0; i--)
+            {
+                if (minutesSincePrevA is null && relationshipRows[i].RelationshipCategory == PatternA) { minutesSincePrevA = (row.EndTimestamp - relationshipRows[i].EndTimestamp).TotalMinutes; }
+                if (minutesSincePrevB is null && relationshipRows[i].RelationshipCategory == PatternB) { minutesSincePrevB = (row.EndTimestamp - relationshipRows[i].EndTimestamp).TotalMinutes; }
+                if (minutesSincePrevA is not null && minutesSincePrevB is not null) { break; }
+            }
+            if (row.EventId > 0)
+            {
+                var priorRunStart = row.EventId - 1;
+                var priorCategory = relationshipRows[priorRunStart].RelationshipCategory;
+                while (priorRunStart > 0 && relationshipRows[priorRunStart - 1].RelationshipCategory == priorCategory) { priorRunStart--; }
+                minutesSincePrevTransition = (row.EndTimestamp - relationshipRows[priorRunStart].StartTimestamp).TotalMinutes;
+            }
+
+            var postExitReturn = new decimal?[msHorizons.Length];
+            decimal? mfeAfterExit = null, maeAfterExit = null;
+            var farthestCeiling = trade.ExitTimestamp + msHorizons[^1];
+            var pathAfterExit = series.AllEntries.Where(e => e.Timestamp > trade.ExitTimestamp && e.Timestamp <= farthestCeiling).Select(e => e.LastPrice).ToList();
+            if (pathAfterExit.Count > 0)
+            {
+                var maeMfe = MaeMfeCalculator.Compute(trade.ExitPrice, pathAfterExit);
+                mfeAfterExit = maeMfe.MfePoints;
+                maeAfterExit = maeMfe.MaePoints;
+            }
+            for (var h = 0; h < msHorizons.Length; h++)
+            {
+                var tick = series.EntryAtOrAfter(trade.ExitTimestamp + msHorizons[h]);
+                if (tick is { } t) { postExitReturn[h] = t.LastPrice - trade.ExitPrice; }
+            }
+            var continuationAt10m = DelayedExitCounterfactual.ClassifyContinuationVsReversal(postExitReturn[3]);
+
+            rowsData.Add(new MarketStateDiagnostics.MarketStateRow(
+                date, sessionBucket, trade.SignalTimestamp,
+                row.FuturesChange1, futureBar.High - futureBar.Low, row.FuturesEventDurationMs, row.FuturesVolume, volumeRate,
+                closeMinusVwap ?? 0m, priorMovement3,
+                row.CeChange1, row.PeChange1, divergenceMagnitude,
+                priorRawState, priorRawStateClass,
+                episodeLength, episodeDurationMs, eventIndexWithinEpisode,
+                minutesSincePrevA, minutesSincePrevB, minutesSincePrevTransition,
+                postExitReturn, mfeAfterExit, maeAfterExit, continuationAt10m));
+        }
+
+        Console.WriteLine($"  {date:yyyy-MM-dd}: {result.Trades.Count(t => t.Pattern == "PatternA")} Pattern A trades processed.");
+    }
+    Console.WriteLine();
+
+    if (rowsData.Count == 0) { Console.WriteLine("No Pattern A trades found -- stopping. No fabricated data."); return 1; }
+
+    var msDates = rowsData.Select(r => r.Date).Distinct().OrderBy(d => d).ToList();
+    bool InGroup1(MarketStateDiagnostics.MarketStateRow r) => r.SessionBucket is "12:00-13:00" or "13:00-14:00";
+
+    void ReportGroupComparison(string label, List<MarketStateDiagnostics.MarketStateRow> members)
+    {
+        var g1 = members.Where(InGroup1).ToList();
+        var g2 = members.Where(r => !InGroup1(r)).ToList();
+        Console.WriteLine($"  [{label}] Group1(12-14) n={g1.Count}, Group2(other) n={g2.Count}");
+        void Feature(string name, Func<MarketStateDiagnostics.MarketStateRow, decimal?> selector)
+        {
+            var v1 = g1.Select(selector).Where(v => v is not null).Select(v => v!.Value);
+            var v2 = g2.Select(selector).Where(v => v is not null).Select(v => v!.Value);
+            Console.WriteLine($"    {name}: G1[{FmtStats(Stats(v1))}] G2[{FmtStats(Stats(v2))}]");
+        }
+        Feature("Futures change1 (event-bar return)", r => r.FuturesChange1);
+        Feature("Futures range (High-Low)", r => r.FuturesRange);
+        Feature("Futures event duration (ms)", r => (decimal)r.FuturesEventDurationMs);
+        Feature("Futures volume", r => r.FuturesVolume);
+        Feature("Volume rate (contracts/sec)", r => r.VolumeRate is { } v ? (decimal)v : null);
+        Feature("Close - VWAP", r => r.FuturesCloseMinusVwap);
+        Feature("Prior-3-event move %", r => r.PriorMovement3);
+        Feature("CE change1 at signal", r => r.CeChange1);
+        Feature("PE change1 at signal", r => r.PeChange1);
+        Feature("CE/PE divergence magnitude", r => r.CePeDivergenceMagnitude);
+        Feature("Episode length (events)", r => r.EpisodeLength);
+        Feature("Episode duration (ms)", r => (decimal)r.EpisodeDurationMs);
+        Feature("Minutes since previous A", r => r.MinutesSincePreviousA is { } v ? (decimal)v : null);
+        Feature("Minutes since previous B", r => r.MinutesSincePreviousB is { } v ? (decimal)v : null);
+        Feature("Minutes since previous relationship transition", r => r.MinutesSincePreviousTransition is { } v ? (decimal)v : null);
+        Console.WriteLine($"    Prior raw state class: G1[{string.Join(",", g1.GroupBy(r => r.PriorRawStateClass).Select(gr => $"{gr.Key}:{gr.Count()}"))}] G2[{string.Join(",", g2.GroupBy(r => r.PriorRawStateClass).Select(gr => $"{gr.Key}:{gr.Count()}"))}]");
+        Console.WriteLine("    CVD-net/OFI-net/depth-imbalance/top-of-book-imbalance: UNAVAILABLE (different bar clock, not reconstructed).");
+    }
+
+    // ==== 1/4. Group1 vs Group2, pooled and day-by-day ====
+    Console.WriteLine("### 1 -- Group1 (12:00-14:00) vs Group2 (all other periods), pooled ###");
+    ReportGroupComparison("POOLED", rowsData);
+    Console.WriteLine();
+    Console.WriteLine("### Day-by-day Group1 vs Group2 ###");
+    foreach (var d in msDates)
+    {
+        ReportGroupComparison(d.ToString("yyyy-MM-dd"), rowsData.Where(r => r.Date == d).ToList());
+        Console.WriteLine();
+    }
+
+    // ==== 2. detailed session buckets ====
+    Console.WriteLine("### 2 -- detailed session buckets ###");
+    foreach (var bucket in new[] { "09:15-10:00", "10:00-11:00", "11:00-12:00", "12:00-13:00", "13:00-14:00", "14:00-15:00", "15:00-15:30" })
+    {
+        var m = rowsData.Where(r => r.SessionBucket == bucket).ToList();
+        if (m.Count == 0) { continue; }
+        Console.WriteLine($"  [{bucket}] n={m.Count} AvgFuturesRange={Fmt2(m.Average(r => r.FuturesRange))} AvgVolumeRate={FmtNd(m.Where(r => r.VolumeRate is not null).Select(r => r.VolumeRate).DefaultIfEmpty().Average())} AvgEpisodeLen={m.Average(r => r.EpisodeLength):F2} AvgMinSincePrevA={FmtNd(m.Where(r => r.MinutesSincePreviousA is not null).Select(r => r.MinutesSincePreviousA).DefaultIfEmpty().Average())}");
+    }
+    Console.WriteLine();
+
+    // ==== 6. relationship-transition analysis (before A) ====
+    Console.WriteLine("### 6 -- relationship-transition analysis: what was happening immediately before A? ###");
+    foreach (var groupLabel in new[] { "Group1(12-14)", "Group2(other)" })
+    {
+        var m = groupLabel == "Group1(12-14)" ? rowsData.Where(InGroup1).ToList() : rowsData.Where(r => !InGroup1(r)).ToList();
+        Console.WriteLine($"  [{groupLabel}] n={m.Count}");
+        Console.WriteLine($"    Followed PatternB: {m.Count(r => r.PriorRawStateClass == "PatternB")} ({(m.Count > 0 ? 100.0 * m.Count(r => r.PriorRawStateClass == "PatternB") / m.Count : 0):F1}%)");
+        Console.WriteLine($"    Followed Other/neutral state: {m.Count(r => r.PriorRawStateClass == "Other")} ({(m.Count > 0 ? 100.0 * m.Count(r => r.PriorRawStateClass == "Other") / m.Count : 0):F1}%)");
+        Console.WriteLine($"    MinutesSincePreviousTransition: {FmtStats(Stats(m.Where(r => r.MinutesSincePreviousTransition is not null).Select(r => (decimal)r.MinutesSincePreviousTransition!.Value)))}");
+    }
+    Console.WriteLine();
+
+    // ==== 5/9. outcome comparison ====
+    Console.WriteLine("### 5/9 -- outcome comparison (does the market-state group difference connect to the previously observed continuation weakness?) ###");
+    foreach (var groupLabel in new[] { "Group1(12-14)", "Group2(other)" })
+    {
+        var m = groupLabel == "Group1(12-14)" ? rowsData.Where(InGroup1).ToList() : rowsData.Where(r => !InGroup1(r)).ToList();
+        Console.WriteLine($"  [{groupLabel}] n={m.Count}");
+        for (var h = 0; h < msHorizons.Length; h++)
+        {
+            var vals = m.Select(r => r.PostExitReturn[h]).Where(v => v is not null).Select(v => v!.Value);
+            Console.WriteLine($"    {msHorizonLabels[h]}: {FmtStats(Stats(vals))}");
+        }
+        Console.WriteLine($"    MFEAfterExit: {FmtStats(Stats(m.Select(r => r.MfeAfterExit).Where(v => v is not null).Select(v => v!.Value)))}");
+        Console.WriteLine($"    MAEAfterExit: {FmtStats(Stats(m.Select(r => r.MaeAfterExit).Where(v => v is not null).Select(v => v!.Value)))}");
+        var contCount = m.Count(r => r.ContinuationLabelAt10m == "Continuation");
+        Console.WriteLine($"    ContinuationRate(+10m): {(m.Count > 0 ? 100.0 * contCount / m.Count : 0):F1}%");
+    }
+    Console.WriteLine();
+
+    // ==== 8. cross-day consistency table (printed as data; narrative labels applied in the write-up) ====
+    Console.WriteLine("### 8 -- cross-day values for the consistency table (Group1 minus Group2, per day) ###");
+    foreach (var d in msDates)
+    {
+        var dayRows = rowsData.Where(r => r.Date == d).ToList();
+        var g1 = dayRows.Where(InGroup1).ToList();
+        var g2 = dayRows.Where(r => !InGroup1(r)).ToList();
+        if (g1.Count == 0 || g2.Count == 0) { Console.WriteLine($"  [{d:yyyy-MM-dd}] insufficient sample in one group (G1 n={g1.Count}, G2 n={g2.Count})"); continue; }
+        Console.WriteLine($"  [{d:yyyy-MM-dd}] G1 n={g1.Count}, G2 n={g2.Count}");
+        Console.WriteLine($"    FuturesRange: G1avg={Fmt2(g1.Average(r => r.FuturesRange))} G2avg={Fmt2(g2.Average(r => r.FuturesRange))}");
+        Console.WriteLine($"    VolumeRate: G1avg={FmtNd(g1.Where(r => r.VolumeRate is not null).Select(r => r.VolumeRate).DefaultIfEmpty().Average())} G2avg={FmtNd(g2.Where(r => r.VolumeRate is not null).Select(r => r.VolumeRate).DefaultIfEmpty().Average())}");
+        Console.WriteLine($"    EpisodeLength: G1avg={g1.Average(r => r.EpisodeLength):F2} G2avg={g2.Average(r => r.EpisodeLength):F2}");
+        Console.WriteLine($"    MinutesSincePrevA: G1avg={FmtNd(g1.Where(r => r.MinutesSincePreviousA is not null).Select(r => r.MinutesSincePreviousA).DefaultIfEmpty().Average())} G2avg={FmtNd(g2.Where(r => r.MinutesSincePreviousA is not null).Select(r => r.MinutesSincePreviousA).DefaultIfEmpty().Average())}");
+        Console.WriteLine($"    ContinuationRate(+10m): G1={(100.0 * g1.Count(r => r.ContinuationLabelAt10m == "Continuation") / g1.Count):F1}% G2={(100.0 * g2.Count(r => r.ContinuationLabelAt10m == "Continuation") / g2.Count):F1}%");
+    }
+    Console.WriteLine();
+
+    // ---- CSV export ----
+    using (var writer = new StreamWriter(msDiagOutPath))
+    {
+        writer.WriteLine("Date,SessionBucket,SignalTimestamp,FuturesChange1,FuturesRange,FuturesEventDurationMs,FuturesVolume,VolumeRate,"
+            + "CloseMinusVwap,PriorMovement3Pct,CeChange1,PeChange1,CePeDivergenceMagnitude,PriorRawState,PriorRawStateClass,"
+            + "EpisodeLength,EpisodeDurationMs,EventIndexWithinEpisode,MinutesSincePreviousA,MinutesSincePreviousB,MinutesSincePreviousTransition,"
+            + "PostExit1m,PostExit3m,PostExit5m,PostExit10m,PostExit15m,MFEAfterExit,MAEAfterExit,ContinuationAt10m");
+        foreach (var r in rowsData)
+        {
+            writer.WriteLine(string.Join(',',
+                r.Date.ToString("yyyy-MM-dd"), r.SessionBucket, r.SignalTimestamp.ToString("O"), FmtN(r.FuturesChange1), r.FuturesRange, r.FuturesEventDurationMs, r.FuturesVolume, FmtNd(r.VolumeRate),
+                r.FuturesCloseMinusVwap, FmtN(r.PriorMovement3), FmtN(r.CeChange1), FmtN(r.PeChange1), FmtN(r.CePeDivergenceMagnitude), r.PriorRawRelationshipState, r.PriorRawStateClass,
+                r.EpisodeLength, r.EpisodeDurationMs, r.EventIndexWithinEpisode, FmtNd(r.MinutesSincePreviousA), FmtNd(r.MinutesSincePreviousB), FmtNd(r.MinutesSincePreviousTransition),
+                FmtN(r.PostExitReturn[0]), FmtN(r.PostExitReturn[1]), FmtN(r.PostExitReturn[2]), FmtN(r.PostExitReturn[3]), FmtN(r.PostExitReturn[4]), FmtN(r.MfeAfterExit), FmtN(r.MaeAfterExit), r.ContinuationLabelAt10m));
+        }
+    }
+    Console.WriteLine($"Market-state diagnostic CSV written to: {Path.GetFullPath(msDiagOutPath)}");
+
+    return 0;
+}
+
+// "vc0dte-relationship-a-dte-validation" -- 2026-09-24, does Pattern A's underlying reversal, PE
+// response, and intrinsic/extrinsic composition survive outside 0-DTE? (HARD FREEZE: reuses the
+// EXACT (date,expiry) pair discovery from vc0dte-relationship-dte-expansion, the unmodified
+// UnderlyingOptionRelationshipRecorder/EpisodeAnalysis/OptionValueDecomposition/
+// ForwardValidationAnalysis/ConditionalMovementAnalysis, and DteBucketClassifier's own fixed
+// bucket boundaries -- nothing here changes any of that. Pattern signal = episode FIRST event,
+// per the frozen methodology description this task itself restates; control stays at the
+// existing per-event granularity, unmodified, same resolution choice already used and documented
+// in the Transition Analysis experiment. Pattern B is out of scope for this task entirely -- not
+// computed. No trade simulator, no [100,150] band, no exit logic anywhere in this command.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-dte-validation <fromDate> <toDate> --out=path.csv
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-a-dte-validation", StringComparison.OrdinalIgnoreCase))
+{
+    const long avThreshold = 1300L;
+    var avIstOffset = TimeSpan.FromHours(5.5);
+    int[] avForwardHorizons = [1, 3, 5, 10];
+    int[] avTercileHorizons = [3, 5, 10];
+    const string PatternA = ForwardValidationAnalysis.State2_BullishDivergence_PatternA;
+    string[] avExcludedCategories = ["OptionDataIncomplete", "ContractTransition"];
+    string[] avBucketOrder = ["0", "1", "4-6", "7-8", "11-13"];
+
+    var (avPositional, avNamed) = SplitNamedArgs(args);
+    if (avPositional.Length < 3 || !DateOnly.TryParseExact(avPositional[1], "yyyy-MM-dd", out var avFromDate) || !DateOnly.TryParseExact(avPositional[2], "yyyy-MM-dd", out var avToDate) || !avNamed.TryGetValue("out", out var avOutPath))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-dte-validation <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> --out=path.csv");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-a-dte-validation: DIAGNOSTIC/VALIDATION ONLY -- does Pattern A's underlying reversal and PE response survive outside 0-DTE? No trade simulator, no optimization. ===");
+    Console.WriteLine();
+    static string Fmt4(decimal? v) => v?.ToString("F4") ?? "--";
+
+    // ---- Phase 1: discover (date, expiry) pairs -- EXACT same discovery as vc0dte-relationship-dte-expansion ----
+    var avPairs = new List<(DateOnly Date, DateOnly Expiry, int Dte, string Bucket)>();
+    await using (var avScanSource = new NiftySignalDbContext(tradeSourceOptions))
+    {
+        for (var date = avFromDate; date <= avToDate; date = date.AddDays(1))
+        {
+            if (date.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday) { continue; }
+            var hasFutures = await avScanSource.Instruments.AnyAsync(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Future && i.Underlying == "NIFTY");
+            if (!hasFutures) { continue; }
+            var expiries = await avScanSource.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.Underlying == "NIFTY").Select(i => i.ExpiryDate).Distinct().OrderBy(e => e).ToListAsync();
+            foreach (var expiry in expiries)
+            {
+                if (expiry is null) { continue; }
+                var dte = expiry.Value.DayNumber - date.DayNumber;
+                var bucket = DteBucketClassifier.Classify(dte);
+                if (bucket != DteBucketClassifier.Other) { avPairs.Add((date, expiry.Value, dte, bucket)); }
+            }
+        }
+    }
+
+    // ---- independence inventory (task's own critical requirement) ----
+    Console.WriteLine("### DTE / session inventory (critical independence check) ###");
+    foreach (var bucket in avBucketOrder)
+    {
+        var bp = avPairs.Where(p => p.Bucket == bucket).ToList();
+        var sessions = bp.Select(p => p.Date).Distinct().OrderBy(d => d).ToList();
+        Console.WriteLine($"  Bucket [{bucket}]: {sessions.Count} unique calendar session(s): {string.Join(", ", sessions.Select(d => d.ToString("yyyy-MM-dd")))}");
+    }
+    var sessionToBuckets = avPairs.GroupBy(p => p.Date).ToDictionary(g => g.Key, g => g.Select(p => p.Bucket).Distinct().ToList());
+    foreach (var (date, buckets) in sessionToBuckets.Where(kv => kv.Value.Count > 1))
+    {
+        Console.WriteLine($"  NOTE: {date:yyyy-MM-dd} contributes to multiple buckets ({string.Join(", ", buckets)}) -- NOT independent observations across those buckets.");
+    }
+    Console.WriteLine();
+
+    if (avPairs.Count == 0) { Console.WriteLine("No usable (date, expiry) pairs found -- stopping. No fabricated methodology."); return 1; }
+
+    // ---- Phase 2: build relationship rows per pair (frozen methodology, unchanged) ----
+    var avPairRows = new List<(DateOnly Date, DateOnly Expiry, int Dte, string Bucket, List<RelationshipObservation> Rows)>();
+    foreach (var dateGroup in avPairs.GroupBy(p => p.Date).OrderBy(g => g.Key))
+    {
+        await using var avSource = new NiftySignalDbContext(tradeSourceOptions);
+        var futureBars = await FutureEventBarBuilder.BuildDayAsync(avSource, dateGroup.Key, avThreshold, CancellationToken.None);
+        if (futureBars.Count == 0) { continue; }
+        foreach (var p in dateGroup)
+        {
+            var chain = await avSource.Instruments.Where(i => i.AsOfDate == p.Date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == p.Expiry && i.Underlying == "NIFTY").OrderBy(i => i.StrikePrice).ThenBy(i => i.OptionType).ToListAsync();
+            if (chain.Count == 0) { continue; }
+            var optionBars = await SynchronizedOptionBarBuilder.BuildDayForChainAsync(avSource, p.Date, chain, futureBars, CancellationToken.None);
+            var rows = await UnderlyingOptionRelationshipRecorder.RecordAsync(avSource, p.Date, chain, futureBars, optionBars, CancellationToken.None);
+            avPairRows.Add((p.Date, p.Expiry, p.Dte, p.Bucket, rows));
+        }
+    }
+    Console.WriteLine($"Phase 2 complete: {avPairRows.Count} (date,expiry) pairs with real relationship observations.");
+    Console.WriteLine();
+
+    decimal? PriorMove(List<RelationshipObservation> rows, int eventId, int n) => UnderlyingOptionRelationshipSummary.ComputeFuturesChange(rows, eventId - n, n).PercentChange;
+    decimal? ForwardMove(List<RelationshipObservation> rows, int eventId, int h) => UnderlyingOptionRelationshipSummary.ComputeFuturesChange(rows, eventId, h).PercentChange;
+    decimal? ForwardPe(List<RelationshipObservation> rows, int eventId, int h) => UnderlyingOptionRelationshipSummary.ComputePeChange(rows, eventId, h).PercentChange;
+
+    (decimal? OptionChange, decimal? IntrinsicChange, decimal? ExtrinsicChange)? Decompose(List<RelationshipObservation> rows, RelationshipObservation row, int h)
+    {
+        var price = row.PeAverageLtp;
+        if (price is null) { return null; }
+        var strike = row.AtmStrike;
+        var signalIntrinsic = OptionValueDecomposition.ComputeIntrinsic(row.FuturesClose, strike, OptionType.Put);
+        var change = UnderlyingOptionRelationshipSummary.ComputePeChange(rows, row.EventId, h);
+        if (change.AbsoluteChange is null) { return (null, null, null); }
+        var endIdx = row.EventId + h;
+        var forwardFutures = rows[endIdx].FuturesClose;
+        var forwardPrice = price.Value + change.AbsoluteChange.Value;
+        var signalExtrinsic = OptionValueDecomposition.ComputeExtrinsic(price.Value, signalIntrinsic);
+        var forwardIntrinsic = OptionValueDecomposition.ComputeIntrinsic(forwardFutures, strike, OptionType.Put);
+        var forwardExtrinsic = OptionValueDecomposition.ComputeExtrinsic(forwardPrice, forwardIntrinsic);
+        return (change.AbsoluteChange, forwardIntrinsic - signalIntrinsic, forwardExtrinsic - signalExtrinsic);
+    }
+
+    // ---- Pattern A episodes (first-event-of-episode signal), per bucket ----
+    var episodesByBucket = new Dictionary<string, List<(DateOnly Date, List<RelationshipObservation> Rows, EpisodeAnalysis.Episode Episode)>>();
+    foreach (var bucket in avBucketOrder)
+    {
+        var list = new List<(DateOnly, List<RelationshipObservation>, EpisodeAnalysis.Episode)>();
+        foreach (var pair in avPairRows.Where(p => p.Bucket == bucket))
+        {
+            foreach (var ep in EpisodeAnalysis.DetectEpisodes(pair.Date, pair.Rows, PatternA, [])) { list.Add((pair.Date, pair.Rows, ep)); }
+        }
+        episodesByBucket[bucket] = list;
+    }
+
+    var avCsvRows = new List<string>();
+
+    foreach (var bucket in avBucketOrder)
+    {
+        var episodes = episodesByBucket[bucket];
+        var bucketPairs = avPairRows.Where(p => p.Bucket == bucket).ToList();
+        var sessions = bucketPairs.Select(p => p.Date).Distinct().OrderBy(d => d).ToList();
+        if (episodes.Count == 0) { Console.WriteLine($"### Bucket [{bucket}] -- NO Pattern A episodes found, skipped ###"); Console.WriteLine(); continue; }
+
+        var independenceLabel = sessions.Count >= 3 ? "repeated across independent sessions" : sessions.Count == 2 ? "limited (2 sessions)" : "insufficient (1 session)";
+        Console.WriteLine($"### Bucket [{bucket}] -- {episodes.Count} Pattern A episodes across {sessions.Count} unique calendar session(s) [{independenceLabel}]: {string.Join(", ", sessions.Select(d => d.ToString("yyyy-MM-dd")))} ###");
+
+        // control population: same bucket's raw-event Up population, unmodified construction.
+        var allRows = bucketPairs.SelectMany(p => p.Rows.Select(r => (p.Date, Rows: p.Rows, Row: r))).ToList();
+        var upPop = allRows.Where(x => x.Row.FuturesDirection1 == RelationshipDirection.Up && !avExcludedCategories.Contains(x.Row.RelationshipCategory)).ToList();
+        var controlAObs = upPop.Where(x => x.Row.RelationshipCategory != PatternA).ToList();
+
+        // ---- Section 1: underlying response ----
+        Console.WriteLine("  -- 1. Pattern A underlying (futures) response --");
+        foreach (var h in avForwardHorizons)
+        {
+            var vals = episodes.Select(e => ForwardMove(e.Rows, e.Episode.StartEventId, h)).Where(v => v is not null).Select(v => v!.Value).ToList();
+            if (vals.Count == 0) { Console.WriteLine($"    +{h,2}: n=0"); continue; }
+            var pct = ForensicValidationAnalysis.ComputePercentiles(vals);
+            var negPct = 100.0 * vals.Count(v => v < 0) / vals.Count;
+            Console.WriteLine($"    +{h,2}: n={pct.N} mean={Fmt4(vals.Average())}% median={Fmt4(pct.Median)}% P25={Fmt4(pct.P25)}% P75={Fmt4(pct.P75)}% negative={negPct:F1}%");
+        }
+
+        // ---- Section 2: PE response ----
+        Console.WriteLine("  -- 2. Pattern A -> PE option response --");
+        foreach (var h in avForwardHorizons)
+        {
+            var vals = episodes.Select(e => ForwardPe(e.Rows, e.Episode.StartEventId, h)).Where(v => v is not null).Select(v => v!.Value).ToList();
+            if (vals.Count == 0) { Console.WriteLine($"    +{h,2}: n=0"); continue; }
+            var pct = ForensicValidationAnalysis.ComputePercentiles(vals);
+            var posPct = 100.0 * vals.Count(v => v > 0) / vals.Count;
+            Console.WriteLine($"    +{h,2}: n={pct.N} mean={Fmt4(vals.Average())}% median={Fmt4(pct.Median)}% P25={Fmt4(pct.P25)}% P75={Fmt4(pct.P75)}% positive={posPct:F1}%");
+        }
+
+        // ---- Section 3: intrinsic/extrinsic decomposition ----
+        Console.WriteLine("  -- 3. PE intrinsic/extrinsic decomposition (mean -- means are exactly additive) --");
+        foreach (var h in avForwardHorizons)
+        {
+            var results = episodes.Select(e => Decompose(e.Rows, e.Rows[e.Episode.StartEventId], h)).Where(r => r is not null).Select(r => r!.Value).Where(r => r.OptionChange is not null).ToList();
+            if (results.Count == 0) { Console.WriteLine($"    +{h,2}: n=0"); continue; }
+            Console.WriteLine($"    +{h,2}: n={results.Count} NetRs(mean)={Fmt4(results.Average(r => r.OptionChange))} IntrinsicRs(mean)={Fmt4(results.Average(r => r.IntrinsicChange))} ExtrinsicRs(mean)={Fmt4(results.Average(r => r.ExtrinsicChange))}");
+        }
+
+        // ---- Section 4: control comparison (tercile-matched, within-bucket, existing construction) ----
+        Console.WriteLine("  -- 4. Matched-control comparison (existing tercile-matched, direction-held-constant methodology) --");
+        foreach (var n in avTercileHorizons)
+        {
+            var dirPriorAbs = upPop.Select(x => PriorMove(x.Rows, x.Row.EventId, n)).Where(v => v is not null).Select(v => Math.Abs(v!.Value)).ToList();
+            if (dirPriorAbs.Count < 3) { Console.WriteLine($"    [n={n}] insufficient direction-population size ({dirPriorAbs.Count}) for tercile matching -- skipped."); continue; }
+            var pm = ForwardValidationAnalysis.ComputeForwardMetrics(episodes.Select(e => ForwardMove(e.Rows, e.Episode.StartEventId, n)));
+            var cm = ForwardValidationAnalysis.ComputeForwardMetrics(controlAObs.Select(x => ForwardMove(x.Rows, x.Row.EventId, n)));
+            var pmPe = ForwardValidationAnalysis.ComputeForwardMetrics(episodes.Select(e => ForwardPe(e.Rows, e.Episode.StartEventId, n)));
+            var cmPe = ForwardValidationAnalysis.ComputeForwardMetrics(controlAObs.Select(x => ForwardPe(x.Rows, x.Row.EventId, n)));
+            Console.WriteLine($"    +{n,2}: Futures Pattern[n={pm.N} med={Fmt4(pm.Median)}%] Control[n={cm.N} med={Fmt4(cm.Median)}%] diff={Fmt4(pm.Median - cm.Median)}pp | PE Pattern[n={pmPe.N} med={Fmt4(pmPe.Median)}%] Control[n={cmPe.N} med={Fmt4(cmPe.Median)}%] diff={Fmt4(pmPe.Median - cmPe.Median)}pp");
+        }
+
+        // ---- Section 5: session interaction (3 broad groups) ----
+        Console.WriteLine("  -- 5. Session interaction (3 broad groups, descriptive only) --");
+        foreach (var broadBucket in new[] { "Morning (09:15-12:00)", "Midday (12:00-14:00)", "Afternoon (14:00-15:15)" })
+        {
+            var m = episodes.Where(e => BroadSessionClassifier.Classify(e.Rows[e.Episode.StartEventId].StartTimestamp, avIstOffset) == broadBucket).ToList();
+            if (m.Count == 0) { continue; }
+            var futVals = m.Select(e => ForwardMove(e.Rows, e.Episode.StartEventId, 10)).Where(v => v is not null).Select(v => v!.Value).ToList();
+            var peVals = m.Select(e => ForwardPe(e.Rows, e.Episode.StartEventId, 10)).Where(v => v is not null).Select(v => v!.Value).ToList();
+            var posPct = peVals.Count > 0 ? 100.0 * peVals.Count(v => v > 0) / peVals.Count : 0;
+            Console.WriteLine($"    [{broadBucket}] n={m.Count} FuturesFwd10(median)={(futVals.Count > 0 ? Fmt4(futVals.OrderBy(v => v).ElementAt(futVals.Count / 2)) : "--")}% PEFwd10(median)={(peVals.Count > 0 ? Fmt4(peVals.OrderBy(v => v).ElementAt(peVals.Count / 2)) : "--")}% PEPositiveRate={posPct:F1}%");
+        }
+
+        // ---- Section 6: day-level evidence ----
+        Console.WriteLine("  -- 6. Day-level evidence --");
+        if (sessions.Count < 2)
+        {
+            Console.WriteLine($"    INSUFFICIENT -- only {sessions.Count} unique session(s); day-wise breakdown would not demonstrate cross-day repetition.");
+        }
+        else
+        {
+            foreach (var d in sessions)
+            {
+                var dayEpisodes = episodes.Where(e => e.Date == d).ToList();
+                if (dayEpisodes.Count == 0) { continue; }
+                var futVals = dayEpisodes.Select(e => ForwardMove(e.Rows, e.Episode.StartEventId, 10)).Where(v => v is not null).Select(v => v!.Value).ToList();
+                var peVals = dayEpisodes.Select(e => ForwardPe(e.Rows, e.Episode.StartEventId, 10)).Where(v => v is not null).Select(v => v!.Value).ToList();
+                Console.WriteLine($"    [{d:yyyy-MM-dd}] n={dayEpisodes.Count} FuturesFwd10(median)={(futVals.Count > 0 ? Fmt4(futVals.OrderBy(v => v).ElementAt(futVals.Count / 2)) : "--")}% PEFwd10(median)={(peVals.Count > 0 ? Fmt4(peVals.OrderBy(v => v).ElementAt(peVals.Count / 2)) : "--")}%");
+            }
+        }
+        Console.WriteLine();
+
+        foreach (var e in episodes)
+        {
+            var futVals4 = avForwardHorizons.Select(h => ForwardMove(e.Rows, e.Episode.StartEventId, h)).ToArray();
+            var peVals4 = avForwardHorizons.Select(h => ForwardPe(e.Rows, e.Episode.StartEventId, h)).ToArray();
+            avCsvRows.Add(string.Join(',', e.Date.ToString("yyyy-MM-dd"), bucket, e.Episode.StartEventId,
+                futVals4[0], futVals4[1], futVals4[2], futVals4[3], peVals4[0], peVals4[1], peVals4[2], peVals4[3]));
+        }
+    }
+
+    // ---- Section 7: DTE comparison table ----
+    Console.WriteLine("### 7 -- DTE comparison table ###");
+    Console.WriteLine("  DTE bucket | Unique sessions | A observations | PE+3 median | PE+5 median | PE+10 median | Futures+10 median | Assessment");
+    foreach (var bucket in avBucketOrder)
+    {
+        var episodes = episodesByBucket[bucket];
+        if (episodes.Count == 0) { continue; }
+        var sessions = avPairRows.Where(p => p.Bucket == bucket).Select(p => p.Date).Distinct().Count();
+        var pe3 = episodes.Select(e => ForwardPe(e.Rows, e.Episode.StartEventId, 3)).Where(v => v is not null).Select(v => v!.Value).ToList();
+        var pe5 = episodes.Select(e => ForwardPe(e.Rows, e.Episode.StartEventId, 5)).Where(v => v is not null).Select(v => v!.Value).ToList();
+        var pe10 = episodes.Select(e => ForwardPe(e.Rows, e.Episode.StartEventId, 10)).Where(v => v is not null).Select(v => v!.Value).ToList();
+        var fut10 = episodes.Select(e => ForwardMove(e.Rows, e.Episode.StartEventId, 10)).Where(v => v is not null).Select(v => v!.Value).ToList();
+        static decimal? Med(List<decimal> v) => v.Count > 0 ? v.OrderBy(x => x).ElementAt(v.Count / 2) : null;
+        var assessment = sessions >= 3 ? "repeated across independent sessions" : sessions == 2 ? "limited" : "insufficient";
+        Console.WriteLine($"  {bucket,-10} | {sessions,15} | {episodes.Count,15} | {Fmt4(Med(pe3)),11}% | {Fmt4(Med(pe5)),11}% | {Fmt4(Med(pe10)),12}% | {Fmt4(Med(fut10)),17}% | {assessment}");
+    }
+    Console.WriteLine();
+
+    using (var writer = new StreamWriter(avOutPath))
+    {
+        writer.WriteLine("Date,Bucket,StartEventId,FuturesFwd1,FuturesFwd3,FuturesFwd5,FuturesFwd10,PeFwd1,PeFwd3,PeFwd5,PeFwd10");
+        foreach (var line in avCsvRows) { writer.WriteLine(line); }
+    }
+    Console.WriteLine($"A-DTE-validation CSV written to: {Path.GetFullPath(avOutPath)}");
+
+    return 0;
+}
+
+// "vc0dte-relationship-a-crossover" -- 2026-09-24, does a futures price crossover add incremental
+// information to Pattern A? (HARD FREEZE: reuses the exact (date,expiry) pair discovery from the
+// DTE-Expansion/A-DTE-Validation experiments, the unmodified UnderlyingOptionRelationshipRecorder/
+// EpisodeAnalysis/OptionValueDecomposition/tercile-control infrastructure, and the ALREADY-TESTED
+// PriceCrossoverEngine -- no new crossover formula anywhere. SignalClock is always the frozen
+// 1300-contract clock (Pattern A itself never changes); CrossoverClock is labeled explicitly per
+// section and is either the SAME frozen clock (the primary grid) or an alternate event-bar size
+// (650/2600, the event-bar-size diagnostic), aligned to each signal via
+// CrossoverResolutionDiagnostics.AlignStepAtOrBefore -- replaying the alternate clock only up to
+// the signal's own timestamp, never beyond it. No trade simulator, no optimization, no filter.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-crossover <fromDate> <toDate> --out=path.csv
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-a-crossover", StringComparison.OrdinalIgnoreCase))
+{
+    const long acThreshold = 1300L;
+    var acIstOffset = TimeSpan.FromHours(5.5);
+    int[] acForwardHorizons = [1, 3, 5, 10];
+    const string PatternA = ForwardValidationAnalysis.State2_BullishDivergence_PatternA;
+    string[] acExcludedCategories = ["OptionDataIncomplete", "ContractTransition"];
+    string[] acBucketOrder = ["0", "1", "4-6", "7-8", "11-13"];
+    (int Fast, int Slow)[] acGrid = [(3, 10), (3, 20), (3, 40), (5, 10), (5, 20), (5, 40), (8, 10), (8, 20), (8, 40)];
+    var (acRepFast, acRepSlow) = (5, 20); // representative combo for the FULL detailed comparison -- a middle point of the grid, not chosen as "best."
+
+    var (acPositional, acNamed) = SplitNamedArgs(args);
+    if (acPositional.Length < 3 || !DateOnly.TryParseExact(acPositional[1], "yyyy-MM-dd", out var acFromDate) || !DateOnly.TryParseExact(acPositional[2], "yyyy-MM-dd", out var acToDate) || !acNamed.TryGetValue("out", out var acOutPath))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-crossover <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> --out=path.csv");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-a-crossover: EDGE-DISCOVERY DIAGNOSTIC -- does a futures crossover add incremental information to Pattern A? No trade simulator, no optimization. ===");
+    Console.WriteLine();
+    static string Fmt4(decimal? v) => v?.ToString("F4") ?? "--";
+
+    // ---- Phase 1/2: EXACT same discovery + relationship-row building as A-DTE-validation ----
+    var acPairs = new List<(DateOnly Date, DateOnly Expiry, int Dte, string Bucket)>();
+    await using (var acScanSource = new NiftySignalDbContext(tradeSourceOptions))
+    {
+        for (var date = acFromDate; date <= acToDate; date = date.AddDays(1))
+        {
+            if (date.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday) { continue; }
+            var hasFutures = await acScanSource.Instruments.AnyAsync(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Future && i.Underlying == "NIFTY");
+            if (!hasFutures) { continue; }
+            var expiries = await acScanSource.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.Underlying == "NIFTY").Select(i => i.ExpiryDate).Distinct().OrderBy(e => e).ToListAsync();
+            foreach (var expiry in expiries)
+            {
+                if (expiry is null) { continue; }
+                var dte = expiry.Value.DayNumber - date.DayNumber;
+                var bucket = DteBucketClassifier.Classify(dte);
+                if (bucket != DteBucketClassifier.Other) { acPairs.Add((date, expiry.Value, dte, bucket)); }
+            }
+            Console.WriteLine($"  [Phase1] scanned {date:yyyy-MM-dd}, pairs so far={acPairs.Count}"); Console.Out.Flush();
+        }
+    }
+    Console.WriteLine($"Phase1 discovery complete: {acPairs.Count} pairs."); Console.Out.Flush();
+    if (acPairs.Count == 0) { Console.WriteLine("No usable (date, expiry) pairs found -- stopping. No fabricated methodology."); return 1; }
+
+    var acPairRows = new List<(DateOnly Date, DateOnly Expiry, int Dte, string Bucket, List<FutureEventBar> FutureBars, List<RelationshipObservation> Rows)>();
+    foreach (var dateGroup in acPairs.GroupBy(p => p.Date).OrderBy(g => g.Key))
+    {
+        await using var acSource = new NiftySignalDbContext(tradeSourceOptions);
+        Console.WriteLine($"  [Phase2] building futures bars for {dateGroup.Key:yyyy-MM-dd}..."); Console.Out.Flush();
+        var futureBars = await FutureEventBarBuilder.BuildDayAsync(acSource, dateGroup.Key, acThreshold, CancellationToken.None);
+        Console.WriteLine($"  [Phase2] {dateGroup.Key:yyyy-MM-dd}: {futureBars.Count} futures bars built."); Console.Out.Flush();
+        if (futureBars.Count == 0) { continue; }
+        foreach (var p in dateGroup)
+        {
+            var chain = await acSource.Instruments.Where(i => i.AsOfDate == p.Date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == p.Expiry && i.Underlying == "NIFTY").OrderBy(i => i.StrikePrice).ThenBy(i => i.OptionType).ToListAsync();
+            if (chain.Count == 0) { continue; }
+            Console.WriteLine($"  [Phase2] {p.Date:yyyy-MM-dd} expiry={p.Expiry:yyyy-MM-dd} DTE={p.Dte}: chain size={chain.Count}, building option bars..."); Console.Out.Flush();
+            var optionBars = await SynchronizedOptionBarBuilder.BuildDayForChainAsync(acSource, p.Date, chain, futureBars, CancellationToken.None);
+            var rows = await UnderlyingOptionRelationshipRecorder.RecordAsync(acSource, p.Date, chain, futureBars, optionBars, CancellationToken.None);
+            acPairRows.Add((p.Date, p.Expiry, p.Dte, p.Bucket, futureBars, rows));
+            Console.WriteLine($"  [Phase2] {p.Date:yyyy-MM-dd} expiry={p.Expiry:yyyy-MM-dd}: {rows.Count} relationship rows recorded."); Console.Out.Flush();
+        }
+    }
+    Console.WriteLine($"Phase 1/2 complete: {acPairRows.Count} (date,expiry) pairs loaded (SignalClock=Frozen1300, unchanged).");
+    Console.WriteLine();
+
+    decimal? ForwardMove(List<RelationshipObservation> rows, int eventId, int h) => UnderlyingOptionRelationshipSummary.ComputeFuturesChange(rows, eventId, h).PercentChange;
+    decimal? ForwardPe(List<RelationshipObservation> rows, int eventId, int h) => UnderlyingOptionRelationshipSummary.ComputePeChange(rows, eventId, h).PercentChange;
+    (decimal? OptionChange, decimal? IntrinsicChange, decimal? ExtrinsicChange)? Decompose(List<RelationshipObservation> rows, RelationshipObservation row, int h)
+    {
+        var price = row.PeAverageLtp;
+        if (price is null) { return null; }
+        var strike = row.AtmStrike;
+        var signalIntrinsic = OptionValueDecomposition.ComputeIntrinsic(row.FuturesClose, strike, OptionType.Put);
+        var change = UnderlyingOptionRelationshipSummary.ComputePeChange(rows, row.EventId, h);
+        if (change.AbsoluteChange is null) { return (null, null, null); }
+        var forwardFutures = rows[row.EventId + h].FuturesClose;
+        var forwardPrice = price.Value + change.AbsoluteChange.Value;
+        var signalExtrinsic = OptionValueDecomposition.ComputeExtrinsic(price.Value, signalIntrinsic);
+        var forwardIntrinsic = OptionValueDecomposition.ComputeIntrinsic(forwardFutures, strike, OptionType.Put);
+        var forwardExtrinsic = OptionValueDecomposition.ComputeExtrinsic(forwardPrice, forwardIntrinsic);
+        return (change.AbsoluteChange, forwardIntrinsic - signalIntrinsic, forwardExtrinsic - signalExtrinsic);
+    }
+
+    // ---- Pattern A episodes (first-event-of-episode), per bucket, same convention as A-DTE-validation ----
+    var episodesByBucket = new Dictionary<string, List<(DateOnly Date, DateOnly Expiry, List<FutureEventBar> FutureBars, List<RelationshipObservation> Rows, EpisodeAnalysis.Episode Episode)>>();
+    foreach (var bucket in acBucketOrder)
+    {
+        var list = new List<(DateOnly, DateOnly, List<FutureEventBar>, List<RelationshipObservation>, EpisodeAnalysis.Episode)>();
+        foreach (var pair in acPairRows.Where(p => p.Bucket == bucket))
+        {
+            foreach (var ep in EpisodeAnalysis.DetectEpisodes(pair.Date, pair.Rows, PatternA, [])) { list.Add((pair.Date, pair.Expiry, pair.FutureBars, pair.Rows, ep)); }
+        }
+        episodesByBucket[bucket] = list;
+    }
+
+    // ---- crossover classification on the FROZEN clock (SignalClock == CrossoverClock here -- no cross-clock alignment needed) ----
+    string ClassifyOnFrozenClock(List<FutureEventBar> futureBars, int signalEventId, int fast, int slow)
+    {
+        var engine = new PriceCrossoverEngine(fast, slow);
+        PriceCrossoverEngine.Step? last = null;
+        for (var i = 0; i <= signalEventId; i++) { last = engine.Observe((double)futureBars[i].Close, 0.0); }
+        return CrossoverResolutionDiagnostics.ClassifyConfirmation(last);
+    }
+
+    // ==== PRIMARY: full detailed Group1/2/3 comparison at the representative combo, per DTE bucket ====
+    Console.WriteLine($"### PRIMARY -- representative combo fast={acRepFast}/slow={acRepSlow}, CrossoverClock=Frozen1300 (SAME as SignalClock) ###");
+    var acCsvRows = new List<string>();
+    foreach (var bucket in acBucketOrder)
+    {
+        var episodes = episodesByBucket[bucket];
+        if (episodes.Count == 0) { continue; }
+        var sessions = episodes.Select(e => e.Date).Distinct().OrderBy(d => d).ToList();
+        var independence = sessions.Count >= 3 ? "repeated across independent sessions" : sessions.Count == 2 ? "limited" : "insufficient";
+
+        var classified = episodes.Select(e => (e.Date, e.Rows, e.Episode, Group: ClassifyOnFrozenClock(e.FutureBars, e.Episode.StartEventId, acRepFast, acRepSlow))).ToList();
+        var group1 = classified; // all Pattern A.
+        var group2 = classified.Where(c => c.Group == "Confirms").ToList();
+        var group3 = classified.Where(c => c.Group == "DoesNotConfirm").ToList();
+        var unavailable = classified.Count(c => c.Group == "Unavailable");
+
+        Console.WriteLine($"  [Bucket {bucket}] {sessions.Count} session(s) [{independence}], Group1(All)={group1.Count}, Group2(Confirms)={group2.Count}, Group3(DoesNotConfirm)={group3.Count}, Unavailable(warming up)={unavailable}");
+
+        void ReportGroup(string label, List<(DateOnly Date, List<RelationshipObservation> Rows, EpisodeAnalysis.Episode Episode, string Group)> members)
+        {
+            if (members.Count == 0) { Console.WriteLine($"    [{label}] n=0"); return; }
+            Console.WriteLine($"    [{label}] n={members.Count}");
+            foreach (var h in acForwardHorizons)
+            {
+                var fut = members.Select(m => ForwardMove(m.Rows, m.Episode.StartEventId, h)).Where(v => v is not null).Select(v => v!.Value).ToList();
+                if (fut.Count > 0) { var p = ForensicValidationAnalysis.ComputePercentiles(fut); Console.WriteLine($"      Futures +{h,2}: n={p.N} mean={Fmt4(fut.Average())}% med={Fmt4(p.Median)}% P25={Fmt4(p.P25)}% P75={Fmt4(p.P75)}% neg%={100.0 * fut.Count(v => v < 0) / fut.Count:F1}"); }
+                var pe = members.Select(m => ForwardPe(m.Rows, m.Episode.StartEventId, h)).Where(v => v is not null).Select(v => v!.Value).ToList();
+                if (pe.Count > 0) { var p = ForensicValidationAnalysis.ComputePercentiles(pe); Console.WriteLine($"      PE      +{h,2}: n={p.N} mean={Fmt4(pe.Average())}% med={Fmt4(p.Median)}% P25={Fmt4(p.P25)}% P75={Fmt4(p.P75)}% pos%={100.0 * pe.Count(v => v > 0) / pe.Count:F1}"); }
+                var decomp = members.Select(m => Decompose(m.Rows, m.Rows[m.Episode.StartEventId], h)).Where(r => r is not null).Select(r => r!.Value).Where(r => r.OptionChange is not null).ToList();
+                if (decomp.Count > 0) { Console.WriteLine($"      Decomp  +{h,2}: n={decomp.Count} NetRs(mean)={Fmt4(decomp.Average(r => r.OptionChange))} IntrinsicRs(mean)={Fmt4(decomp.Average(r => r.IntrinsicChange))} ExtrinsicRs(mean)={Fmt4(decomp.Average(r => r.ExtrinsicChange))}"); }
+            }
+        }
+        ReportGroup("Group1: All Pattern A", group1);
+        ReportGroup("Group2: Confirms", group2);
+        ReportGroup("Group3: DoesNotConfirm", group3);
+
+        // control comparison for Group2/Group3 vs the SAME bucket-level control already established.
+        var bucketPairs = acPairRows.Where(p => p.Bucket == bucket).ToList();
+        var allRows = bucketPairs.SelectMany(p => p.Rows.Select(r => (p.Date, Rows: p.Rows, Row: r))).ToList();
+        var upPop = allRows.Where(x => x.Row.FuturesDirection1 == RelationshipDirection.Up && !acExcludedCategories.Contains(x.Row.RelationshipCategory)).ToList();
+        var controlAObs = upPop.Where(x => x.Row.RelationshipCategory != PatternA).ToList();
+        var controlPe10 = ForwardValidationAnalysis.ComputeForwardMetrics(controlAObs.Select(x => ForwardPe(x.Rows, x.Row.EventId, 10)));
+        Console.WriteLine("    -- Control comparison (PE +10, existing tercile-matched control, same as A-DTE-validation) --");
+        Console.WriteLine($"      Control: n={controlPe10.N} med={Fmt4(controlPe10.Median)}%");
+        foreach (var (label, members) in new[] { ("Group1", group1), ("Group2(Confirms)", group2), ("Group3(DoesNotConfirm)", group3) })
+        {
+            var pe10 = ForwardValidationAnalysis.ComputeForwardMetrics(members.Select(m => ForwardPe(m.Rows, m.Episode.StartEventId, 10)));
+            Console.WriteLine($"      {label}: n={pe10.N} med={Fmt4(pe10.Median)}% diffVsControl={Fmt4(pe10.Median - controlPe10.Median)}pp");
+        }
+
+        // session interaction (3 broad groups) for Group2 vs Group1.
+        Console.WriteLine("    -- Session interaction (Group2 vs Group1, PE +10 median) --");
+        foreach (var broadBucket in new[] { "Morning (09:15-12:00)", "Midday (12:00-14:00)", "Afternoon (14:00-15:15)" })
+        {
+            var g1 = group1.Where(m => BroadSessionClassifier.Classify(m.Rows[m.Episode.StartEventId].StartTimestamp, acIstOffset) == broadBucket).ToList();
+            var g2 = group2.Where(m => BroadSessionClassifier.Classify(m.Rows[m.Episode.StartEventId].StartTimestamp, acIstOffset) == broadBucket).ToList();
+            if (g1.Count == 0) { continue; }
+            var g1Pe = ForwardValidationAnalysis.ComputeForwardMetrics(g1.Select(m => ForwardPe(m.Rows, m.Episode.StartEventId, 10)));
+            var g2Pe = ForwardValidationAnalysis.ComputeForwardMetrics(g2.Select(m => ForwardPe(m.Rows, m.Episode.StartEventId, 10)));
+            Console.WriteLine($"      [{broadBucket}] Group1[n={g1Pe.N} med={Fmt4(g1Pe.Median)}%] Group2[n={g2Pe.N} med={Fmt4(g2Pe.Median)}%]");
+        }
+
+        // day-level (only where >=2 sessions).
+        Console.WriteLine("    -- Day-level (Group2 vs Group1, PE +10 median) --");
+        if (sessions.Count < 2) { Console.WriteLine("      INSUFFICIENT -- only 1 session."); }
+        else
+        {
+            foreach (var d in sessions)
+            {
+                var g1 = group1.Where(m => m.Date == d).ToList();
+                var g2 = group2.Where(m => m.Date == d).ToList();
+                if (g1.Count == 0) { continue; }
+                var g1Pe = ForwardValidationAnalysis.ComputeForwardMetrics(g1.Select(m => ForwardPe(m.Rows, m.Episode.StartEventId, 10)));
+                var g2Pe = ForwardValidationAnalysis.ComputeForwardMetrics(g2.Select(m => ForwardPe(m.Rows, m.Episode.StartEventId, 10)));
+                Console.WriteLine($"      [{d:yyyy-MM-dd}] Group1[n={g1Pe.N} med={Fmt4(g1Pe.Median)}%] Group2[n={g2Pe.N} med={Fmt4(g2Pe.Median)}%]");
+            }
+        }
+        Console.WriteLine();
+
+        foreach (var c in classified)
+        {
+            acCsvRows.Add(string.Join(',', c.Date.ToString("yyyy-MM-dd"), bucket, c.Episode.StartEventId, c.Group,
+                ForwardMove(c.Rows, c.Episode.StartEventId, 10), ForwardPe(c.Rows, c.Episode.StartEventId, 10)));
+        }
+    }
+
+    // ==== GRID: all 9 fast/slow combos, compact, per DTE bucket ====
+    Console.WriteLine("### GRID -- fast/slow robustness (compact; NOT ranked, NOT optimized) ###");
+    Console.WriteLine("  DTE | Fast | Slow | n(Confirms) | PE+10 median (Confirms) | %positive | IncrementalVsAll | DayConsistency");
+    foreach (var bucket in acBucketOrder)
+    {
+        var episodes = episodesByBucket[bucket];
+        if (episodes.Count == 0) { continue; }
+        var allPe10 = ForwardValidationAnalysis.ComputeForwardMetrics(episodes.Select(e => ForwardPe(e.Rows, e.Episode.StartEventId, 10)));
+        foreach (var (fast, slow) in acGrid)
+        {
+            var classified = episodes.Select(e => (e.Date, e.Rows, e.Episode, Group: ClassifyOnFrozenClock(e.FutureBars, e.Episode.StartEventId, fast, slow))).ToList();
+            var confirms = classified.Where(c => c.Group == "Confirms").ToList();
+            if (confirms.Count < 5) { Console.WriteLine($"  {bucket,-5} | {fast,4} | {slow,4} | insufficient sample (n={confirms.Count})"); continue; }
+            var pe10 = ForwardValidationAnalysis.ComputeForwardMetrics(confirms.Select(m => ForwardPe(m.Rows, m.Episode.StartEventId, 10)));
+            var incremental = pe10.Median - allPe10.Median;
+
+            // day-consistency: sign of (confirms median - all median) per contributing day.
+            var perDaySign = confirms.Select(c => c.Date).Distinct().Select(d =>
+            {
+                var dayConfirms = confirms.Where(c => c.Date == d).Select(c => ForwardPe(c.Rows, c.Episode.StartEventId, 10)).Where(v => v is not null).Select(v => v!.Value).ToList();
+                var dayAll = classified.Where(c => c.Date == d).Select(c => ForwardPe(c.Rows, c.Episode.StartEventId, 10)).Where(v => v is not null).Select(v => v!.Value).ToList();
+                if (dayConfirms.Count == 0 || dayAll.Count == 0) { return (int?)null; }
+                var dConf = dayConfirms.OrderBy(v => v).ElementAt(dayConfirms.Count / 2);
+                var dAll = dayAll.OrderBy(v => v).ElementAt(dayAll.Count / 2);
+                return Math.Sign(dConf - dAll);
+            }).Where(s => s is not null).Select(s => s!.Value).ToList();
+            var daysCount = confirms.Select(c => c.Date).Distinct().Count();
+            var consistencyLabel = daysCount < 2 ? "insufficient sample"
+                : perDaySign.All(s => s == perDaySign[0]) ? "broadly consistent"
+                : perDaySign.Count(s => s == Math.Sign(incremental ?? 0m)) >= perDaySign.Count * 0.6 ? "mostly consistent"
+                : "mixed";
+            Console.WriteLine($"  {bucket,-5} | {fast,4} | {slow,4} | {confirms.Count,11} | {Fmt4(pe10.Median),22}% | {pe10.PositivePct,8:F1}% | {Fmt4(incremental),16}pp | {consistencyLabel}");
+        }
+    }
+    Console.WriteLine();
+
+    // ==== EVENT-BAR-SIZE DIAGNOSTIC: 650/2600, representative combo, per DTE bucket ====
+    Console.WriteLine($"### EVENT-BAR-SIZE DIAGNOSTIC -- fast={acRepFast}/slow={acRepSlow}, CrossoverClock=650/2600 (aligned to the frozen signal, never look-ahead) ###");
+    foreach (var altThreshold in new[] { 650L, 2600L })
+    {
+        Console.WriteLine($"  -- CrossoverClock={altThreshold} --");
+        // Build alternate futures bars per contributing date (SIGNAL stays on the frozen clock; only the crossover input changes).
+        var altBarsByDate = new Dictionary<DateOnly, List<(DateTimeOffset EndTimestamp, PriceCrossoverEngine.Step Step)>>();
+        foreach (var date in acPairRows.Select(p => p.Date).Distinct())
+        {
+            await using var altSource = new NiftySignalDbContext(tradeSourceOptions);
+            var altFutureBars = await FutureEventBarBuilder.BuildDayAsync(altSource, date, altThreshold, CancellationToken.None);
+            var engine = new PriceCrossoverEngine(acRepFast, acRepSlow);
+            var steps = new List<(DateTimeOffset, PriceCrossoverEngine.Step)>();
+            foreach (var bar in altFutureBars) { steps.Add((bar.EndTimestamp, engine.Observe((double)bar.Close, 0.0))); }
+            altBarsByDate[date] = steps;
+            Console.WriteLine($"    [altClock={altThreshold}] {date:yyyy-MM-dd}: {altFutureBars.Count} bars built."); Console.Out.Flush();
+        }
+
+        foreach (var bucket in acBucketOrder)
+        {
+            var episodes = episodesByBucket[bucket];
+            if (episodes.Count == 0) { continue; }
+            var allPe10 = ForwardValidationAnalysis.ComputeForwardMetrics(episodes.Select(e => ForwardPe(e.Rows, e.Episode.StartEventId, 10)));
+            var classified = episodes.Select(e =>
+            {
+                var signalTimestamp = e.Rows[e.Episode.StartEventId].EndTimestamp;
+                var aligned = altBarsByDate.TryGetValue(e.Date, out var steps) ? CrossoverResolutionDiagnostics.AlignStepAtOrBefore(steps, signalTimestamp) : null;
+                return (e.Date, e.Rows, e.Episode, Group: CrossoverResolutionDiagnostics.ClassifyConfirmation(aligned));
+            }).ToList();
+            var confirms = classified.Where(c => c.Group == "Confirms").ToList();
+            if (confirms.Count < 5) { Console.WriteLine($"    [{bucket}] insufficient sample (n={confirms.Count})"); continue; }
+            var pe10 = ForwardValidationAnalysis.ComputeForwardMetrics(confirms.Select(m => ForwardPe(m.Rows, m.Episode.StartEventId, 10)));
+            Console.WriteLine($"    [{bucket}] n(Confirms)={confirms.Count} PE+10median={Fmt4(pe10.Median)}% %positive={pe10.PositivePct:F1}% IncrementalVsAll={Fmt4(pe10.Median - allPe10.Median)}pp");
+        }
+    }
+    Console.WriteLine();
+
+    using (var writer = new StreamWriter(acOutPath))
+    {
+        writer.WriteLine("Date,Bucket,StartEventId,Group,FuturesFwd10,PeFwd10");
+        foreach (var line in acCsvRows) { writer.WriteLine(line); }
+    }
+    Console.WriteLine($"A-crossover CSV written to: {Path.GetFullPath(acOutPath)}");
+
+    return 0;
+}
+
+// "vc0dte-relationship-a-ce-pe-crossover" -- 2026-09-24, does the CE/PE RELATIVE-RETURN
+// relationship (never tested by "vc0dte-relationship-a-crossover", which fed only futures
+// Close into PriceCrossoverEngine -- see the 2026-09-24 audit in
+// docs/VolumeCandle_0DTE_Findings.md) add incremental information to Pattern A? Series =
+// Return(CE) - Return(PE), one event bar at a time, computed via the existing, unmodified
+// UnderlyingOptionRelationshipSummary.ComputeCeChange/ComputePeChange (same [StartTimestamp,
+// EndTimestamp) boundaries, same AverageLtp, same missing/stale/same-contract gating already used
+// everywhere else). Fed into a FRESH PriceCrossoverEngine per fast/slow combo -- classified by
+// RAW SIGN of (fastMa - slowMa) via CrossoverResolutionDiagnostics.ClassifyConfirmationBySign,
+// NEVER via ClassifyConfirmation's ratio-based DiffFraction, because this series is zero-centered
+// and a ratio against a near-zero slowMa would be numerically unstable (see the Phase 1 design
+// audit). No trade simulator, no optimization, no EMA (SMA only, matching the futures experiment).
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-ce-pe-crossover <fromDate> <toDate> --out=path.csv
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-a-ce-pe-crossover", StringComparison.OrdinalIgnoreCase))
+{
+    const long cpThreshold = 1300L;
+    var cpIstOffset = TimeSpan.FromHours(5.5);
+    int[] cpForwardHorizons = [1, 3, 5, 10];
+    const string PatternA = ForwardValidationAnalysis.State2_BullishDivergence_PatternA;
+    string[] cpExcludedCategories = ["OptionDataIncomplete", "ContractTransition"];
+    string[] cpBucketOrder = ["0", "1", "4-6", "7-8", "11-13"];
+    (int Fast, int Slow)[] cpGrid = [(3, 10), (3, 20), (3, 40), (5, 10), (5, 20), (5, 40), (8, 10), (8, 20), (8, 40)];
+    var (cpRepFast, cpRepSlow) = (5, 20); // representative combo, a middle point of the grid -- not chosen as "best."
+
+    var (cpPositional, cpNamed) = SplitNamedArgs(args);
+    if (cpPositional.Length < 3 || !DateOnly.TryParseExact(cpPositional[1], "yyyy-MM-dd", out var cpFromDate) || !DateOnly.TryParseExact(cpPositional[2], "yyyy-MM-dd", out var cpToDate) || !cpNamed.TryGetValue("out", out var cpOutPath))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-ce-pe-crossover <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> --out=path.csv");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-a-ce-pe-crossover: does the CE/PE RELATIVE-RETURN relationship (Return(CE)-Return(PE)) add incremental information to Pattern A? No trade simulator, no optimization. ===");
+    Console.WriteLine();
+    static string CpFmt4(decimal? v) => v?.ToString("F4") ?? "--";
+
+    // ---- Phase 1/2: EXACT same discovery + relationship-row building as A-DTE-validation/A-crossover ----
+    var cpPairs = new List<(DateOnly Date, DateOnly Expiry, int Dte, string Bucket)>();
+    await using (var cpScanSource = new NiftySignalDbContext(tradeSourceOptions))
+    {
+        for (var date = cpFromDate; date <= cpToDate; date = date.AddDays(1))
+        {
+            if (date.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday) { continue; }
+            var hasFutures = await cpScanSource.Instruments.AnyAsync(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Future && i.Underlying == "NIFTY");
+            if (!hasFutures) { continue; }
+            var expiries = await cpScanSource.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.Underlying == "NIFTY").Select(i => i.ExpiryDate).Distinct().OrderBy(e => e).ToListAsync();
+            foreach (var expiry in expiries)
+            {
+                if (expiry is null) { continue; }
+                var dte = expiry.Value.DayNumber - date.DayNumber;
+                var bucket = DteBucketClassifier.Classify(dte);
+                if (bucket != DteBucketClassifier.Other) { cpPairs.Add((date, expiry.Value, dte, bucket)); }
+            }
+            Console.WriteLine($"  [Phase1] scanned {date:yyyy-MM-dd}, pairs so far={cpPairs.Count}"); Console.Out.Flush();
+        }
+    }
+    Console.WriteLine($"Phase1 discovery complete: {cpPairs.Count} pairs."); Console.Out.Flush();
+    if (cpPairs.Count == 0) { Console.WriteLine("No usable (date, expiry) pairs found -- stopping. No fabricated methodology."); return 1; }
+
+    // Phase 10: actual TradingDate -> ExpiryDate -> DTE inventory, before any bucketing.
+    Console.WriteLine("### Actual (TradingDate, ExpiryDate, DTE) inventory ###");
+    foreach (var p in cpPairs.OrderBy(p => p.Date).ThenBy(p => p.Expiry))
+    {
+        Console.WriteLine($"  {p.Date:yyyy-MM-dd} -> {p.Expiry:yyyy-MM-dd} (DTE={p.Dte}, bucket={p.Bucket})");
+    }
+    Console.WriteLine();
+
+    var cpPairRows = new List<(DateOnly Date, DateOnly Expiry, int Dte, string Bucket, List<RelationshipObservation> Rows, double?[] RelSpread)>();
+    foreach (var dateGroup in cpPairs.GroupBy(p => p.Date).OrderBy(g => g.Key))
+    {
+        await using var cpSource = new NiftySignalDbContext(tradeSourceOptions);
+        Console.WriteLine($"  [Phase2] building futures bars for {dateGroup.Key:yyyy-MM-dd}..."); Console.Out.Flush();
+        var futureBars = await FutureEventBarBuilder.BuildDayAsync(cpSource, dateGroup.Key, cpThreshold, CancellationToken.None);
+        Console.WriteLine($"  [Phase2] {dateGroup.Key:yyyy-MM-dd}: {futureBars.Count} futures bars built."); Console.Out.Flush();
+        if (futureBars.Count == 0) { continue; }
+        foreach (var p in dateGroup)
+        {
+            var chain = await cpSource.Instruments.Where(i => i.AsOfDate == p.Date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == p.Expiry && i.Underlying == "NIFTY").OrderBy(i => i.StrikePrice).ThenBy(i => i.OptionType).ToListAsync();
+            if (chain.Count == 0) { continue; }
+            Console.WriteLine($"  [Phase2] {p.Date:yyyy-MM-dd} expiry={p.Expiry:yyyy-MM-dd} DTE={p.Dte}: chain size={chain.Count}, building option bars..."); Console.Out.Flush();
+            var optionBars = await SynchronizedOptionBarBuilder.BuildDayForChainAsync(cpSource, p.Date, chain, futureBars, CancellationToken.None);
+            var rows = await UnderlyingOptionRelationshipRecorder.RecordAsync(cpSource, p.Date, chain, futureBars, optionBars, CancellationToken.None);
+
+            // Return(CE) - Return(PE), one event bar at a time (horizon=1, ending at event i),
+            // via the SAME unmodified SeriesChange calculator used for every forward/prior return
+            // elsewhere -- null whenever either leg's 1-bar percent change is unavailable (missing
+            // data, contract transition, or a start price of exactly zero), never fabricated.
+            var relSpread = new double?[rows.Count];
+            for (var i = 1; i < rows.Count; i++)
+            {
+                var cePct = UnderlyingOptionRelationshipSummary.ComputeCeChange(rows, i - 1, 1).PercentChange;
+                var pePct = UnderlyingOptionRelationshipSummary.ComputePeChange(rows, i - 1, 1).PercentChange;
+                relSpread[i] = cePct is not null && pePct is not null ? (double)(cePct.Value - pePct.Value) : (double?)null;
+            }
+
+            cpPairRows.Add((p.Date, p.Expiry, p.Dte, p.Bucket, rows, relSpread));
+            Console.WriteLine($"  [Phase2] {p.Date:yyyy-MM-dd} expiry={p.Expiry:yyyy-MM-dd}: {rows.Count} relationship rows recorded."); Console.Out.Flush();
+        }
+    }
+    Console.WriteLine($"Phase 1/2 complete: {cpPairRows.Count} (date,expiry) pairs loaded (SignalClock=Frozen1300, unchanged).");
+    Console.WriteLine();
+
+    decimal? ForwardMove(List<RelationshipObservation> rows, int eventId, int h) => UnderlyingOptionRelationshipSummary.ComputeFuturesChange(rows, eventId, h).PercentChange;
+    decimal? ForwardPe(List<RelationshipObservation> rows, int eventId, int h) => UnderlyingOptionRelationshipSummary.ComputePeChange(rows, eventId, h).PercentChange;
+    (decimal? OptionChange, decimal? IntrinsicChange, decimal? ExtrinsicChange)? Decompose(List<RelationshipObservation> rows, RelationshipObservation row, int h)
+    {
+        var price = row.PeAverageLtp;
+        if (price is null) { return null; }
+        var strike = row.AtmStrike;
+        var signalIntrinsic = OptionValueDecomposition.ComputeIntrinsic(row.FuturesClose, strike, OptionType.Put);
+        var change = UnderlyingOptionRelationshipSummary.ComputePeChange(rows, row.EventId, h);
+        if (change.AbsoluteChange is null) { return (null, null, null); }
+        var forwardFutures = rows[row.EventId + h].FuturesClose;
+        var forwardPrice = price.Value + change.AbsoluteChange.Value;
+        var signalExtrinsic = OptionValueDecomposition.ComputeExtrinsic(price.Value, signalIntrinsic);
+        var forwardIntrinsic = OptionValueDecomposition.ComputeIntrinsic(forwardFutures, strike, OptionType.Put);
+        var forwardExtrinsic = OptionValueDecomposition.ComputeExtrinsic(forwardPrice, forwardIntrinsic);
+        return (change.AbsoluteChange, forwardIntrinsic - signalIntrinsic, forwardExtrinsic - signalExtrinsic);
+    }
+
+    // ---- Pattern A episodes (first-event-of-episode), per bucket, same convention as before ----
+    var cpEpisodesByBucket = new Dictionary<string, List<(DateOnly Date, DateOnly Expiry, List<RelationshipObservation> Rows, double?[] RelSpread, EpisodeAnalysis.Episode Episode)>>();
+    foreach (var bucket in cpBucketOrder)
+    {
+        var list = new List<(DateOnly, DateOnly, List<RelationshipObservation>, double?[], EpisodeAnalysis.Episode)>();
+        foreach (var pair in cpPairRows.Where(p => p.Bucket == bucket))
+        {
+            foreach (var ep in EpisodeAnalysis.DetectEpisodes(pair.Date, pair.Rows, PatternA, [])) { list.Add((pair.Date, pair.Expiry, pair.Rows, pair.RelSpread, ep)); }
+        }
+        cpEpisodesByBucket[bucket] = list;
+    }
+
+    // Confirms when the recent (fast) average of Return(CE)-Return(PE) sits BELOW the longer-run
+    // (slow) average -- i.e. CE has recently been underperforming PE MORE than its own longer
+    // baseline, the smoothed extension of Pattern A's own defining one-event "CE down, PE up"
+    // condition. Classified purely by SIGN (never DiffFraction's ratio) -- see the design audit.
+    string ClassifyRelSpread(double?[] relSpread, int signalEventId, int fast, int slow)
+    {
+        var engine = new PriceCrossoverEngine(fast, slow);
+        PriceCrossoverEngine.Step? last = null;
+        for (var i = 0; i <= signalEventId; i++) { last = engine.Observe(relSpread[i], 0.0); }
+        return CrossoverResolutionDiagnostics.ClassifyConfirmationBySign(last, confirmsWhenFastBelowSlow: true);
+    }
+
+    // ==== PRIMARY: full detailed Group1/2/3 comparison at the representative combo, per DTE bucket ====
+    Console.WriteLine($"### PRIMARY -- representative combo fast={cpRepFast}/slow={cpRepSlow}, series=Return(CE)-Return(PE) ###");
+    var cpCsvRows = new List<string>();
+    foreach (var bucket in cpBucketOrder)
+    {
+        var episodes = cpEpisodesByBucket[bucket];
+        if (episodes.Count == 0) { continue; }
+        var sessions = episodes.Select(e => e.Date).Distinct().OrderBy(d => d).ToList();
+        var independence = sessions.Count >= 3 ? "repeated across independent sessions" : sessions.Count == 2 ? "limited" : "insufficient";
+
+        var classified = episodes.Select(e => (e.Date, e.Rows, e.Episode, e.RelSpread, Group: ClassifyRelSpread(e.RelSpread, e.Episode.StartEventId, cpRepFast, cpRepSlow))).ToList();
+        var group1 = classified;
+        var group2 = classified.Where(c => c.Group == "Confirms").ToList();
+        var group3 = classified.Where(c => c.Group == "DoesNotConfirm").ToList();
+        var unavailable = classified.Count(c => c.Group == "Unavailable");
+
+        Console.WriteLine($"  [Bucket {bucket}] {sessions.Count} session(s) [{independence}], Group1(All)={group1.Count}, Group2(Confirms)={group2.Count}, Group3(DoesNotConfirm)={group3.Count}, Unavailable(warming up)={unavailable}");
+
+        void ReportGroup(string label, List<(DateOnly Date, List<RelationshipObservation> Rows, EpisodeAnalysis.Episode Episode, double?[] RelSpread, string Group)> members)
+        {
+            if (members.Count == 0) { Console.WriteLine($"    [{label}] n=0"); return; }
+            Console.WriteLine($"    [{label}] n={members.Count}");
+            foreach (var h in cpForwardHorizons)
+            {
+                var fut = members.Select(m => ForwardMove(m.Rows, m.Episode.StartEventId, h)).Where(v => v is not null).Select(v => v!.Value).ToList();
+                if (fut.Count > 0) { var p = ForensicValidationAnalysis.ComputePercentiles(fut); Console.WriteLine($"      Futures +{h,2}: n={p.N} mean={CpFmt4(fut.Average())}% med={CpFmt4(p.Median)}% P25={CpFmt4(p.P25)}% P75={CpFmt4(p.P75)}% neg%={100.0 * fut.Count(v => v < 0) / fut.Count:F1}"); }
+                var pe = members.Select(m => ForwardPe(m.Rows, m.Episode.StartEventId, h)).Where(v => v is not null).Select(v => v!.Value).ToList();
+                if (pe.Count > 0) { var p = ForensicValidationAnalysis.ComputePercentiles(pe); Console.WriteLine($"      PE      +{h,2}: n={p.N} mean={CpFmt4(pe.Average())}% med={CpFmt4(p.Median)}% P25={CpFmt4(p.P25)}% P75={CpFmt4(p.P75)}% pos%={100.0 * pe.Count(v => v > 0) / pe.Count:F1}"); }
+                var decomp = members.Select(m => Decompose(m.Rows, m.Rows[m.Episode.StartEventId], h)).Where(r => r is not null).Select(r => r!.Value).Where(r => r.OptionChange is not null).ToList();
+                if (decomp.Count > 0) { Console.WriteLine($"      Decomp  +{h,2}: n={decomp.Count} NetRs(mean)={CpFmt4(decomp.Average(r => r.OptionChange))} IntrinsicRs(mean)={CpFmt4(decomp.Average(r => r.IntrinsicChange))} ExtrinsicRs(mean)={CpFmt4(decomp.Average(r => r.ExtrinsicChange))}"); }
+            }
+        }
+        ReportGroup("Group1: All Pattern A", group1);
+        ReportGroup("Group2: Confirms", group2);
+        ReportGroup("Group3: DoesNotConfirm", group3);
+
+        // Phase 13: does the crossover grouping merely reflect a BIGGER one-event founding
+        // divergence (already embedded in Pattern A's own definition), rather than adding new
+        // multi-event information? Report the one-event RelSpread AT THE SIGNAL itself.
+        var g2SignalSpread = group2.Select(m => m.RelSpread[m.Episode.StartEventId]).Where(v => v is not null).Select(v => v!.Value).ToList();
+        var g3SignalSpread = group3.Select(m => m.RelSpread[m.Episode.StartEventId]).Where(v => v is not null).Select(v => v!.Value).ToList();
+        if (g2SignalSpread.Count > 0 && g3SignalSpread.Count > 0)
+        {
+            Console.WriteLine($"    -- Phase 13 check: one-event RelSpread AT THE SIGNAL (does the grouping just reflect a bigger founding divergence?) --");
+            Console.WriteLine($"      Group2(Confirms):        n={g2SignalSpread.Count} mean={g2SignalSpread.Average():F4}pp med={g2SignalSpread.OrderBy(v => v).ElementAt(g2SignalSpread.Count / 2):F4}pp");
+            Console.WriteLine($"      Group3(DoesNotConfirm):  n={g3SignalSpread.Count} mean={g3SignalSpread.Average():F4}pp med={g3SignalSpread.OrderBy(v => v).ElementAt(g3SignalSpread.Count / 2):F4}pp");
+        }
+
+        // control comparison for Group2/Group3 vs the SAME bucket-level control already established.
+        var bucketPairs = cpPairRows.Where(p => p.Bucket == bucket).ToList();
+        var allRows = bucketPairs.SelectMany(p => p.Rows.Select(r => (p.Date, Rows: p.Rows, Row: r))).ToList();
+        var upPop = allRows.Where(x => x.Row.FuturesDirection1 == RelationshipDirection.Up && !cpExcludedCategories.Contains(x.Row.RelationshipCategory)).ToList();
+        var controlAObs = upPop.Where(x => x.Row.RelationshipCategory != PatternA).ToList();
+        var controlPe10 = ForwardValidationAnalysis.ComputeForwardMetrics(controlAObs.Select(x => ForwardPe(x.Rows, x.Row.EventId, 10)));
+        Console.WriteLine("    -- Control comparison (PE +10, existing tercile-matched control) --");
+        Console.WriteLine($"      Control: n={controlPe10.N} med={CpFmt4(controlPe10.Median)}%");
+        foreach (var (label, members) in new[] { ("Group1", group1), ("Group2(Confirms)", group2), ("Group3(DoesNotConfirm)", group3) })
+        {
+            var pe10 = ForwardValidationAnalysis.ComputeForwardMetrics(members.Select(m => ForwardPe(m.Rows, m.Episode.StartEventId, 10)));
+            Console.WriteLine($"      {label}: n={pe10.N} med={CpFmt4(pe10.Median)}% diffVsControl={CpFmt4(pe10.Median - controlPe10.Median)}pp");
+        }
+
+        // session interaction (3 broad groups) for Group2 vs Group1.
+        Console.WriteLine("    -- Session interaction (Group2 vs Group1, PE +10 median) --");
+        foreach (var broadBucket in new[] { "Morning (09:15-12:00)", "Midday (12:00-14:00)", "Afternoon (14:00-15:15)" })
+        {
+            var g1 = group1.Where(m => BroadSessionClassifier.Classify(m.Rows[m.Episode.StartEventId].StartTimestamp, cpIstOffset) == broadBucket).ToList();
+            var g2 = group2.Where(m => BroadSessionClassifier.Classify(m.Rows[m.Episode.StartEventId].StartTimestamp, cpIstOffset) == broadBucket).ToList();
+            if (g1.Count == 0) { continue; }
+            var g1Pe = ForwardValidationAnalysis.ComputeForwardMetrics(g1.Select(m => ForwardPe(m.Rows, m.Episode.StartEventId, 10)));
+            var g2Pe = ForwardValidationAnalysis.ComputeForwardMetrics(g2.Select(m => ForwardPe(m.Rows, m.Episode.StartEventId, 10)));
+            Console.WriteLine($"      [{broadBucket}] Group1[n={g1Pe.N} med={CpFmt4(g1Pe.Median)}%] Group2[n={g2Pe.N} med={CpFmt4(g2Pe.Median)}%]");
+        }
+
+        // day-level (mandatory).
+        Console.WriteLine("    -- Day-level (Group2 vs Group1, PE +10 median) --");
+        if (sessions.Count < 2) { Console.WriteLine("      INSUFFICIENT -- only 1 session."); }
+        else
+        {
+            foreach (var d in sessions)
+            {
+                var g1 = group1.Where(m => m.Date == d).ToList();
+                var g2 = group2.Where(m => m.Date == d).ToList();
+                var g3d = group3.Where(m => m.Date == d).ToList();
+                if (g1.Count == 0) { continue; }
+                var g1Pe = ForwardValidationAnalysis.ComputeForwardMetrics(g1.Select(m => ForwardPe(m.Rows, m.Episode.StartEventId, 10)));
+                var g2Pe = ForwardValidationAnalysis.ComputeForwardMetrics(g2.Select(m => ForwardPe(m.Rows, m.Episode.StartEventId, 10)));
+                var g1Fut = ForwardValidationAnalysis.ComputeForwardMetrics(g1.Select(m => ForwardMove(m.Rows, m.Episode.StartEventId, 10)));
+                Console.WriteLine($"      [{d:yyyy-MM-dd}] Group1[n={g1.Count} FutMed={CpFmt4(g1Fut.Median)}% PeMed={CpFmt4(g1Pe.Median)}%] Group2[n={g2.Count} PeMed={CpFmt4(g2Pe.Median)}%] Group3[n={g3d.Count}]");
+            }
+        }
+        Console.WriteLine();
+
+        foreach (var c in classified)
+        {
+            cpCsvRows.Add(string.Join(',', c.Date.ToString("yyyy-MM-dd"), bucket, c.Episode.StartEventId, c.Group,
+                ForwardMove(c.Rows, c.Episode.StartEventId, 10), ForwardPe(c.Rows, c.Episode.StartEventId, 10)));
+        }
+    }
+
+    // ==== GRID: all 9 fast/slow combos, compact, per DTE bucket ====
+    Console.WriteLine("### GRID -- fast/slow robustness (compact; NOT ranked, NOT optimized) ###");
+    Console.WriteLine("  DTE | Fast | Slow | n(Confirms) | PE+10 median (Confirms) | %positive | IncrementalVsAll | DayConsistency");
+    foreach (var bucket in cpBucketOrder)
+    {
+        var episodes = cpEpisodesByBucket[bucket];
+        if (episodes.Count == 0) { continue; }
+        var allPe10 = ForwardValidationAnalysis.ComputeForwardMetrics(episodes.Select(e => ForwardPe(e.Rows, e.Episode.StartEventId, 10)));
+        foreach (var (fast, slow) in cpGrid)
+        {
+            var classified = episodes.Select(e => (e.Date, e.Rows, e.Episode, Group: ClassifyRelSpread(e.RelSpread, e.Episode.StartEventId, fast, slow))).ToList();
+            var confirms = classified.Where(c => c.Group == "Confirms").ToList();
+            if (confirms.Count < 5) { Console.WriteLine($"  {bucket,-5} | {fast,4} | {slow,4} | insufficient sample (n={confirms.Count})"); continue; }
+            var pe10 = ForwardValidationAnalysis.ComputeForwardMetrics(confirms.Select(m => ForwardPe(m.Rows, m.Episode.StartEventId, 10)));
+            var incremental = pe10.Median - allPe10.Median;
+
+            var perDaySign = confirms.Select(c => c.Date).Distinct().Select(d =>
+            {
+                var dayConfirms = confirms.Where(c => c.Date == d).Select(c => ForwardPe(c.Rows, c.Episode.StartEventId, 10)).Where(v => v is not null).Select(v => v!.Value).ToList();
+                var dayAll = classified.Where(c => c.Date == d).Select(c => ForwardPe(c.Rows, c.Episode.StartEventId, 10)).Where(v => v is not null).Select(v => v!.Value).ToList();
+                if (dayConfirms.Count == 0 || dayAll.Count == 0) { return (int?)null; }
+                var dConf = dayConfirms.OrderBy(v => v).ElementAt(dayConfirms.Count / 2);
+                var dAll = dayAll.OrderBy(v => v).ElementAt(dayAll.Count / 2);
+                return Math.Sign(dConf - dAll);
+            }).Where(s => s is not null).Select(s => s!.Value).ToList();
+            var daysCount = confirms.Select(c => c.Date).Distinct().Count();
+            var consistencyLabel = daysCount < 2 ? "insufficient sample"
+                : perDaySign.All(s => s == perDaySign[0]) ? "broadly consistent"
+                : perDaySign.Count(s => s == Math.Sign(incremental ?? 0m)) >= perDaySign.Count * 0.6 ? "mostly consistent"
+                : "mixed";
+            Console.WriteLine($"  {bucket,-5} | {fast,4} | {slow,4} | {confirms.Count,11} | {CpFmt4(pe10.Median),22}% | {pe10.PositivePct,8:F1}% | {CpFmt4(incremental),16}pp | {consistencyLabel}");
+        }
+    }
+    Console.WriteLine();
+
+    using (var writer = new StreamWriter(cpOutPath))
+    {
+        writer.WriteLine("Date,Bucket,StartEventId,Group,FuturesFwd10,PeFwd10");
+        foreach (var line in cpCsvRows) { writer.WriteLine(line); }
+    }
+    Console.WriteLine($"A-ce-pe-crossover CSV written to: {Path.GetFullPath(cpOutPath)}");
+
+    return 0;
+}
+
+// "vc0dte-relationship-a-divergence-maturity" -- 2026-09-24, DIAGNOSTIC ONLY (no trade simulator,
+// no filter, no entry/exit rule). Does Pattern A's expected futures reversal weaken as its CE/PE
+// relative divergence (Return(CE)-Return(PE)) becomes more mature/extended BEFORE the signal?
+// And does the already-completed ce-pe-crossover experiment's "Confirms -> weaker" finding survive
+// once conditioned on that maturity, or does it disappear (i.e. is crossover merely detecting
+// maturity)? Reuses the EXACT frozen pair discovery / RelSpread series / representative (5,20)
+// combo / ClassifyConfirmationBySign definition from vc0dte-relationship-a-ce-pe-crossover --
+// no new parameter, no new window, no grid search.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-divergence-maturity <fromDate> <toDate> --out=path.csv
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-a-divergence-maturity", StringComparison.OrdinalIgnoreCase))
+{
+    const long dmThreshold = 1300L;
+    var dmIstOffset = TimeSpan.FromHours(5.5);
+    int[] dmForwardHorizons = [1, 3, 5, 10];
+    const string PatternA = ForwardValidationAnalysis.State2_BullishDivergence_PatternA;
+    string[] dmExcludedCategories = ["OptionDataIncomplete", "ContractTransition"];
+    string[] dmBucketOrder = ["0", "1", "4-6", "7-8", "11-13"];
+    const int dmFast = 5, dmSlow = 20; // the already-validated representative combo -- NOT re-optimized here.
+    const int dmLag = dmFast; // reuses the fast window length as the "immediately preceding events" lag for the trend comparison -- not a new invented parameter.
+
+    var (dmPositional, dmNamed) = SplitNamedArgs(args);
+    if (dmPositional.Length < 3 || !DateOnly.TryParseExact(dmPositional[1], "yyyy-MM-dd", out var dmFromDate) || !DateOnly.TryParseExact(dmPositional[2], "yyyy-MM-dd", out var dmToDate) || !dmNamed.TryGetValue("out", out var dmOutPath))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-divergence-maturity <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> --out=path.csv");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-a-divergence-maturity: DIAGNOSTIC ONLY -- does Pattern A's reversal weaken as CE/PE divergence matures? Does crossover survive conditioning on maturity? No trade simulator. ===");
+    Console.WriteLine();
+    static string DmFmt4(decimal? v) => v?.ToString("F4") ?? "--";
+
+    // ---- Phase 1/2: EXACT same discovery + relationship-row building + RelSpread as A-ce-pe-crossover ----
+    var dmPairs = new List<(DateOnly Date, DateOnly Expiry, int Dte, string Bucket)>();
+    await using (var dmScanSource = new NiftySignalDbContext(tradeSourceOptions))
+    {
+        for (var date = dmFromDate; date <= dmToDate; date = date.AddDays(1))
+        {
+            if (date.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday) { continue; }
+            var hasFutures = await dmScanSource.Instruments.AnyAsync(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Future && i.Underlying == "NIFTY");
+            if (!hasFutures) { continue; }
+            var expiries = await dmScanSource.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.Underlying == "NIFTY").Select(i => i.ExpiryDate).Distinct().OrderBy(e => e).ToListAsync();
+            foreach (var expiry in expiries)
+            {
+                if (expiry is null) { continue; }
+                var dte = expiry.Value.DayNumber - date.DayNumber;
+                var bucket = DteBucketClassifier.Classify(dte);
+                if (bucket != DteBucketClassifier.Other) { dmPairs.Add((date, expiry.Value, dte, bucket)); }
+            }
+            Console.WriteLine($"  [Phase1] scanned {date:yyyy-MM-dd}, pairs so far={dmPairs.Count}"); Console.Out.Flush();
+        }
+    }
+    Console.WriteLine($"Phase1 discovery complete: {dmPairs.Count} pairs."); Console.Out.Flush();
+    if (dmPairs.Count == 0) { Console.WriteLine("No usable (date, expiry) pairs found -- stopping. No fabricated methodology."); return 1; }
+
+    // Part 6: actual (TradingDate, ExpiryDate, DTE) inventory, before any bucketing.
+    Console.WriteLine("### Actual (TradingDate, ExpiryDate, DTE) inventory ###");
+    foreach (var p in dmPairs.OrderBy(p => p.Date).ThenBy(p => p.Expiry))
+    {
+        Console.WriteLine($"  {p.Date:yyyy-MM-dd} -> {p.Expiry:yyyy-MM-dd} (DTE={p.Dte}, bucket={p.Bucket})");
+    }
+    Console.WriteLine();
+
+    var dmPairRows = new List<(DateOnly Date, DateOnly Expiry, int Dte, string Bucket, List<RelationshipObservation> Rows, PriceCrossoverEngine.Step?[] Trace, double?[] RelSpread)>();
+    foreach (var dateGroup in dmPairs.GroupBy(p => p.Date).OrderBy(g => g.Key))
+    {
+        await using var dmSource = new NiftySignalDbContext(tradeSourceOptions);
+        Console.WriteLine($"  [Phase2] building futures bars for {dateGroup.Key:yyyy-MM-dd}..."); Console.Out.Flush();
+        var futureBars = await FutureEventBarBuilder.BuildDayAsync(dmSource, dateGroup.Key, dmThreshold, CancellationToken.None);
+        Console.WriteLine($"  [Phase2] {dateGroup.Key:yyyy-MM-dd}: {futureBars.Count} futures bars built."); Console.Out.Flush();
+        if (futureBars.Count == 0) { continue; }
+        foreach (var p in dateGroup)
+        {
+            var chain = await dmSource.Instruments.Where(i => i.AsOfDate == p.Date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == p.Expiry && i.Underlying == "NIFTY").OrderBy(i => i.StrikePrice).ThenBy(i => i.OptionType).ToListAsync();
+            if (chain.Count == 0) { continue; }
+            Console.WriteLine($"  [Phase2] {p.Date:yyyy-MM-dd} expiry={p.Expiry:yyyy-MM-dd} DTE={p.Dte}: chain size={chain.Count}, building option bars..."); Console.Out.Flush();
+            var optionBars = await SynchronizedOptionBarBuilder.BuildDayForChainAsync(dmSource, p.Date, chain, futureBars, CancellationToken.None);
+            var rows = await UnderlyingOptionRelationshipRecorder.RecordAsync(dmSource, p.Date, chain, futureBars, optionBars, CancellationToken.None);
+
+            var relSpread = new double?[rows.Count];
+            for (var i = 1; i < rows.Count; i++)
+            {
+                var cePct = UnderlyingOptionRelationshipSummary.ComputeCeChange(rows, i - 1, 1).PercentChange;
+                var pePct = UnderlyingOptionRelationshipSummary.ComputePeChange(rows, i - 1, 1).PercentChange;
+                relSpread[i] = cePct is not null && pePct is not null ? (double)(cePct.Value - pePct.Value) : (double?)null;
+            }
+
+            // Part 1/2: replay the SAME representative (5,20) engine forward through EVERY event
+            // (not just at Pattern A signals) so each signal's crossover STATE AGE ("how long has
+            // this state already persisted") can be measured using only information at/before it.
+            var trace = new PriceCrossoverEngine.Step?[rows.Count];
+            var traceEngine = new PriceCrossoverEngine(dmFast, dmSlow);
+            for (var i = 0; i < rows.Count; i++) { trace[i] = traceEngine.Observe(relSpread[i], 0.0); }
+
+            dmPairRows.Add((p.Date, p.Expiry, p.Dte, p.Bucket, rows, trace, relSpread));
+            Console.WriteLine($"  [Phase2] {p.Date:yyyy-MM-dd} expiry={p.Expiry:yyyy-MM-dd}: {rows.Count} relationship rows recorded."); Console.Out.Flush();
+        }
+    }
+    Console.WriteLine($"Phase 1/2 complete: {dmPairRows.Count} (date,expiry) pairs loaded (SignalClock=Frozen1300, unchanged).");
+    Console.WriteLine();
+
+    decimal? ForwardMove(List<RelationshipObservation> rows, int eventId, int h) => UnderlyingOptionRelationshipSummary.ComputeFuturesChange(rows, eventId, h).PercentChange;
+    decimal? ForwardPe(List<RelationshipObservation> rows, int eventId, int h) => UnderlyingOptionRelationshipSummary.ComputePeChange(rows, eventId, h).PercentChange;
+
+    // ---- Pattern A episodes (first-event-of-episode), per bucket, same convention as before ----
+    // Per-signal descriptive record: everything computed strictly from information at/before the signal.
+    var dmEpisodesByBucket = new Dictionary<string, List<(DateOnly Date, List<RelationshipObservation> Rows, EpisodeAnalysis.Episode Episode,
+        double? CurrentRelReturn, int StateSign, int StateAgeEvents, string ConfirmState, string Trend,
+        decimal? CeChange1AtSignal, decimal? PeChange1AtSignal)>>();
+    foreach (var bucket in dmBucketOrder)
+    {
+        var list = new List<(DateOnly, List<RelationshipObservation>, EpisodeAnalysis.Episode, double?, int, int, string, string, decimal?, decimal?)>();
+        foreach (var pair in dmPairRows.Where(p => p.Bucket == bucket))
+        {
+            foreach (var ep in EpisodeAnalysis.DetectEpisodes(pair.Date, pair.Rows, PatternA, []))
+            {
+                var signalEventId = ep.StartEventId;
+                var step = pair.Trace[signalEventId];
+                var stateSign = CrossoverResolutionDiagnostics.StepSign(step);
+                var stateAge = CrossoverResolutionDiagnostics.CountConsecutiveSameSign(pair.Trace, signalEventId);
+                var confirmState = CrossoverResolutionDiagnostics.ClassifyConfirmationBySign(step, confirmsWhenFastBelowSlow: true);
+                var currentRelReturn = pair.RelSpread[signalEventId];
+
+                // Trend: compare |fastMa-slowMa| now vs. dmLag events earlier (dmLag reuses the
+                // fast window itself, not a new invented parameter) -- Strengthening if the
+                // separation has grown, Weakening if it has shrunk, Stable if unchanged,
+                // Unavailable if either side has no defined state yet.
+                var priorIdx = signalEventId - dmLag;
+                var priorStep = priorIdx >= 0 ? pair.Trace[priorIdx] : null;
+                string trend;
+                if (step is not { FastMa: { } f, SlowMa: { } s } || priorStep is not { FastMa: { } pf, SlowMa: { } ps })
+                {
+                    trend = "Unavailable";
+                }
+                else
+                {
+                    var currMag = Math.Abs(f - s);
+                    var priorMag = Math.Abs(pf - ps);
+                    trend = currMag > priorMag ? "Strengthening" : currMag < priorMag ? "Weakening" : "Stable";
+                }
+
+                var ceChange1 = UnderlyingOptionRelationshipSummary.ComputeCeChange(pair.Rows, signalEventId - 1, 1).AbsoluteChange;
+                var ceChange1Pct = UnderlyingOptionRelationshipSummary.ComputeCeChange(pair.Rows, signalEventId - 1, 1).PercentChange;
+                var peChange1Pct = UnderlyingOptionRelationshipSummary.ComputePeChange(pair.Rows, signalEventId - 1, 1).PercentChange;
+                _ = ceChange1;
+
+                list.Add((pair.Date, pair.Rows, ep, currentRelReturn, stateSign, stateAge, confirmState, trend, ceChange1Pct, peChange1Pct));
+            }
+        }
+        dmEpisodesByBucket[bucket] = list;
+    }
+
+    void ReportOutcome(string label, List<(DateOnly Date, List<RelationshipObservation> Rows, EpisodeAnalysis.Episode Episode,
+        double? CurrentRelReturn, int StateSign, int StateAgeEvents, string ConfirmState, string Trend,
+        decimal? CeChange1AtSignal, decimal? PeChange1AtSignal)> members)
+    {
+        if (members.Count == 0) { return; }
+        foreach (var h in dmForwardHorizons)
+        {
+            var fut = members.Select(m => ForwardMove(m.Rows, m.Episode.StartEventId, h)).Where(v => v is not null).Select(v => v!.Value).ToList();
+            if (fut.Count > 0) { var p = ForensicValidationAnalysis.ComputePercentiles(fut); Console.WriteLine($"      Futures +{h,2}: n={p.N} mean={DmFmt4(fut.Average())}% med={DmFmt4(p.Median)}% P25={DmFmt4(p.P25)}% P75={DmFmt4(p.P75)}% neg%={100.0 * fut.Count(v => v < 0) / fut.Count:F1}"); }
+            var pe = members.Select(m => ForwardPe(m.Rows, m.Episode.StartEventId, h)).Where(v => v is not null).Select(v => v!.Value).ToList();
+            if (pe.Count > 0) { var p = ForensicValidationAnalysis.ComputePercentiles(pe); Console.WriteLine($"      PE      +{h,2}: n={p.N} mean={DmFmt4(pe.Average())}% med={DmFmt4(p.Median)}% P25={DmFmt4(p.P25)}% P75={DmFmt4(p.P75)}% pos%={100.0 * pe.Count(v => v > 0) / pe.Count:F1}"); }
+        }
+    }
+
+    var dmCsvRows = new List<string>();
+    foreach (var bucket in dmBucketOrder)
+    {
+        var episodes = dmEpisodesByBucket[bucket];
+        if (episodes.Count == 0) { continue; }
+        var sessions = episodes.Select(e => e.Date).Distinct().OrderBy(d => d).ToList();
+        var independence = sessions.Count >= 3 ? "repeated across independent sessions" : sessions.Count == 2 ? "limited" : "insufficient";
+        Console.WriteLine($"[Bucket {bucket}] {sessions.Count} session(s) [{independence}], n(Pattern A)={episodes.Count}");
+
+        // ---- Part 1: descriptive state (Strengthening/Weakening/Stable) ----
+        Console.WriteLine("  -- Part 1: divergence trend into the signal (descriptive) --");
+        foreach (var trendState in new[] { "Strengthening", "Weakening", "Stable", "Unavailable" })
+        {
+            var members = episodes.Where(e => e.Trend == trendState).ToList();
+            Console.WriteLine($"    [Trend={trendState}] n={members.Count}");
+            if (trendState != "Unavailable") { ReportOutcome($"Trend={trendState}", members); }
+        }
+
+        // ---- Part 2/3/4: maturity terciles (StateAgeEvents), among signals with a defined state ----
+        var withState = episodes.Where(e => e.StateSign != 0).ToList();
+        var unavailableState = episodes.Count - withState.Count;
+        Console.WriteLine($"  -- Part 2/3: maturity terciles (StateAgeEvents = consecutive prior events sharing the same crossover state) -- n(defined state)={withState.Count}, n(Unavailable state)={unavailableState} --");
+        if (withState.Count < 9) // need at least a few per tercile to be worth reporting at all
+        {
+            Console.WriteLine("    INSUFFICIENT -- too few signals with a defined crossover state for a tercile split.");
+        }
+        else
+        {
+            var ages = withState.Select(e => (decimal)e.StateAgeEvents).ToList();
+            var (low33, high67) = ForwardValidationAnalysis.ComputeTerciles(ages);
+            Console.WriteLine($"    Tercile thresholds on StateAgeEvents: Low<= {low33}, High>= {high67}");
+            var byTercile = withState.ToLookup(e => ConditionalMovementAnalysis.ClassifyTercileBucket(e.StateAgeEvents, low33, high67));
+            foreach (var tercile in new[] { "Low", "Mid", "High" })
+            {
+                var members = byTercile[tercile].ToList();
+                Console.WriteLine($"    [Maturity={tercile} ({(tercile == "Low" ? "early/weak" : tercile == "High" ? "mature/late" : "middle")})] n={members.Count}");
+                ReportOutcome($"Maturity={tercile}", members);
+
+                // matched control (existing tercile-matched control methodology): all UP-direction,
+                // non-Pattern-A, non-excluded rows in this bucket.
+                var pe10 = ForwardValidationAnalysis.ComputeForwardMetrics(members.Select(m => ForwardPe(m.Rows, m.Episode.StartEventId, 10)));
+                Console.WriteLine($"      PE+10 median for control comparison: {DmFmt4(pe10.Median)}% (n={pe10.N})");
+            }
+
+            // Part 4 -- THE MOST IMPORTANT TEST: does Confirms-vs-DoesNotConfirm survive within
+            // BOTH the Low (early/weak) and High (mature/late) maturity terciles, or does it
+            // disappear once maturity is held constant?
+            Console.WriteLine("  -- Part 4: does the Confirms/DoesNotConfirm effect survive after conditioning on maturity? --");
+            foreach (var tercile in new[] { "Low", "High" })
+            {
+                var group = byTercile[tercile].ToList();
+                var confirms = group.Where(e => e.ConfirmState == "Confirms").ToList();
+                var doesNot = group.Where(e => e.ConfirmState == "DoesNotConfirm").ToList();
+                var confirmsPe10 = ForwardValidationAnalysis.ComputeForwardMetrics(confirms.Select(m => ForwardPe(m.Rows, m.Episode.StartEventId, 10)));
+                var doesNotPe10 = ForwardValidationAnalysis.ComputeForwardMetrics(doesNot.Select(m => ForwardPe(m.Rows, m.Episode.StartEventId, 10)));
+                Console.WriteLine($"    [Maturity={tercile}] Confirms[n={confirmsPe10.N} PE+10med={DmFmt4(confirmsPe10.Median)}%] DoesNotConfirm[n={doesNotPe10.N} PE+10med={DmFmt4(doesNotPe10.Median)}%] Gap={DmFmt4(confirmsPe10.Median - doesNotPe10.Median)}pp");
+            }
+        }
+
+        // ---- Control comparison for the bucket overall (existing methodology) ----
+        var bucketPairs = dmPairRows.Where(p => p.Bucket == bucket).ToList();
+        var allRows = bucketPairs.SelectMany(p => p.Rows.Select(r => (p.Date, Rows: p.Rows, Row: r))).ToList();
+        var upPop = allRows.Where(x => x.Row.FuturesDirection1 == RelationshipDirection.Up && !dmExcludedCategories.Contains(x.Row.RelationshipCategory)).ToList();
+        var controlAObs = upPop.Where(x => x.Row.RelationshipCategory != PatternA).ToList();
+        var controlPe10 = ForwardValidationAnalysis.ComputeForwardMetrics(controlAObs.Select(x => ForwardPe(x.Rows, x.Row.EventId, 10)));
+        Console.WriteLine($"  -- Matched control (PE +10, existing tercile-matched control): n={controlPe10.N} med={DmFmt4(controlPe10.Median)}% --");
+
+        // ---- Part 5: F58 connection check (magnitude-only, NOT the Greeks-adjusted F58 residual --
+        // Delta/Gamma/Theta/IV are NOT persisted on this frozen event clock, reported as unavailable
+        // rather than approximated on a different clock). Among the mature/Confirms subgroup, does
+        // |CE one-event change| exceed |PE one-event change| (CE reacting more strongly) more often
+        // than in the early/DoesNotConfirm subgroup?
+        Console.WriteLine("  -- Part 5: F58 connection (magnitude-only proxy; Greeks/IV are UNAVAILABLE on this frozen event clock, not approximated) --");
+        bool? CeReactedMoreStrongly((decimal? Ce, decimal? Pe) m) => m.Ce is not null && m.Pe is not null ? Math.Abs(m.Ce.Value) > Math.Abs(m.Pe.Value) : (bool?)null;
+        foreach (var group in new[] { ("Confirms", episodes.Where(e => e.ConfirmState == "Confirms").ToList()), ("DoesNotConfirm", episodes.Where(e => e.ConfirmState == "DoesNotConfirm").ToList()) })
+        {
+            var flags = group.Item2.Select(e => CeReactedMoreStrongly((e.CeChange1AtSignal, e.PeChange1AtSignal))).Where(v => v is not null).Select(v => v!.Value).ToList();
+            if (flags.Count > 0) { Console.WriteLine($"    [{group.Item1}] n={flags.Count} %CE-reacted-more-strongly-than-PE={100.0 * flags.Count(v => v) / flags.Count:F1}%"); }
+        }
+
+        // ---- Part 6: day-level (mandatory) ----
+        Console.WriteLine("  -- Day-level (Confirms vs DoesNotConfirm, PE +10 median) --");
+        if (sessions.Count < 2) { Console.WriteLine("    INSUFFICIENT -- only 1 session."); }
+        else
+        {
+            foreach (var d in sessions)
+            {
+                var dayConfirms = episodes.Where(e => e.Date == d && e.ConfirmState == "Confirms").ToList();
+                var dayDoesNot = episodes.Where(e => e.Date == d && e.ConfirmState == "DoesNotConfirm").ToList();
+                var cPe = ForwardValidationAnalysis.ComputeForwardMetrics(dayConfirms.Select(m => ForwardPe(m.Rows, m.Episode.StartEventId, 10)));
+                var dPe = ForwardValidationAnalysis.ComputeForwardMetrics(dayDoesNot.Select(m => ForwardPe(m.Rows, m.Episode.StartEventId, 10)));
+                Console.WriteLine($"    [{d:yyyy-MM-dd}] Confirms[n={cPe.N} med={DmFmt4(cPe.Median)}%] DoesNotConfirm[n={dPe.N} med={DmFmt4(dPe.Median)}%]");
+            }
+        }
+        Console.WriteLine();
+
+        foreach (var e in episodes)
+        {
+            dmCsvRows.Add(string.Join(',', e.Date.ToString("yyyy-MM-dd"), bucket, e.Episode.StartEventId, e.ConfirmState, e.Trend, e.StateAgeEvents, e.CurrentRelReturn,
+                ForwardMove(e.Rows, e.Episode.StartEventId, 10), ForwardPe(e.Rows, e.Episode.StartEventId, 10)));
+        }
+    }
+
+    using (var writer = new StreamWriter(dmOutPath))
+    {
+        writer.WriteLine("Date,Bucket,StartEventId,ConfirmState,Trend,StateAgeEvents,CurrentRelReturn,FuturesFwd10,PeFwd10");
+        foreach (var line in dmCsvRows) { writer.WriteLine(line); }
+    }
+    Console.WriteLine($"A-divergence-maturity CSV written to: {Path.GetFullPath(dmOutPath)}");
+
+    return 0;
+}
+
+// "vc0dte-relationship-ab-temporal-context" -- 2026-09-24, DIAGNOSTIC ONLY (no trade simulator, no
+// filter, no majority-vote rule, no cooldown, no optimization). Does the LOCAL temporal mix of
+// Pattern A / Pattern B activity in the minutes immediately before a signal carry information
+// about whether that signal is the start of a genuine directional phase versus short-term
+// oscillation? Reuses the exact frozen pair discovery / episode-first-event convention / DTE
+// buckets / forward horizons already established -- only the new context windows are additive.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-ab-temporal-context <fromDate> <toDate> --out=path.csv
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-ab-temporal-context", StringComparison.OrdinalIgnoreCase))
+{
+    const long tcThreshold = 1300L;
+    int[] tcForwardHorizons = [1, 3, 5, 10];
+    const string PatternA = ForwardValidationAnalysis.State2_BullishDivergence_PatternA;
+    const string PatternB = ForwardValidationAnalysis.State4_BearishDivergence_PatternB;
+    string[] tcExcludedCategories = ["OptionDataIncomplete", "ContractTransition"];
+    string[] tcBucketOrder = ["0", "1", "4-6", "7-8", "11-13"];
+    int[] tcWindowMinutes = [1, 3, 5, 10];
+    const int tcRepWindow = 5; // representative window for the full detailed breakdown -- a middle point of {1,3,5,10}, not chosen because it performed best.
+
+    var (tcPositional, tcNamed) = SplitNamedArgs(args);
+    if (tcPositional.Length < 3 || !DateOnly.TryParseExact(tcPositional[1], "yyyy-MM-dd", out var tcFromDate) || !DateOnly.TryParseExact(tcPositional[2], "yyyy-MM-dd", out var tcToDate) || !tcNamed.TryGetValue("out", out var tcOutPath))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-ab-temporal-context <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> --out=path.csv");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-ab-temporal-context: DIAGNOSTIC ONLY -- does local A/B temporal context carry information about genuine directional phase vs. oscillation? No trade simulator, no filter, no optimization. ===");
+    Console.WriteLine();
+    static string TcFmt4(decimal? v) => v?.ToString("F4") ?? "--";
+
+    // ---- Phase 1/2: EXACT same discovery + relationship-row building as prior commands ----
+    var tcPairs = new List<(DateOnly Date, DateOnly Expiry, int Dte, string Bucket)>();
+    await using (var tcScanSource = new NiftySignalDbContext(tradeSourceOptions))
+    {
+        for (var date = tcFromDate; date <= tcToDate; date = date.AddDays(1))
+        {
+            if (date.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday) { continue; }
+            var hasFutures = await tcScanSource.Instruments.AnyAsync(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Future && i.Underlying == "NIFTY");
+            if (!hasFutures) { continue; }
+            var expiries = await tcScanSource.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.Underlying == "NIFTY").Select(i => i.ExpiryDate).Distinct().OrderBy(e => e).ToListAsync();
+            foreach (var expiry in expiries)
+            {
+                if (expiry is null) { continue; }
+                var dte = expiry.Value.DayNumber - date.DayNumber;
+                var bucket = DteBucketClassifier.Classify(dte);
+                if (bucket != DteBucketClassifier.Other) { tcPairs.Add((date, expiry.Value, dte, bucket)); }
+            }
+            Console.WriteLine($"  [Phase1] scanned {date:yyyy-MM-dd}, pairs so far={tcPairs.Count}"); Console.Out.Flush();
+        }
+    }
+    Console.WriteLine($"Phase1 discovery complete: {tcPairs.Count} pairs."); Console.Out.Flush();
+    if (tcPairs.Count == 0) { Console.WriteLine("No usable (date, expiry) pairs found -- stopping. No fabricated methodology."); return 1; }
+
+    var tcPairRows = new List<(DateOnly Date, DateOnly Expiry, int Dte, string Bucket, List<RelationshipObservation> Rows)>();
+    foreach (var dateGroup in tcPairs.GroupBy(p => p.Date).OrderBy(g => g.Key))
+    {
+        await using var tcSource = new NiftySignalDbContext(tradeSourceOptions);
+        Console.WriteLine($"  [Phase2] building futures bars for {dateGroup.Key:yyyy-MM-dd}..."); Console.Out.Flush();
+        var futureBars = await FutureEventBarBuilder.BuildDayAsync(tcSource, dateGroup.Key, tcThreshold, CancellationToken.None);
+        Console.WriteLine($"  [Phase2] {dateGroup.Key:yyyy-MM-dd}: {futureBars.Count} futures bars built."); Console.Out.Flush();
+        if (futureBars.Count == 0) { continue; }
+        foreach (var p in dateGroup)
+        {
+            var chain = await tcSource.Instruments.Where(i => i.AsOfDate == p.Date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == p.Expiry && i.Underlying == "NIFTY").OrderBy(i => i.StrikePrice).ThenBy(i => i.OptionType).ToListAsync();
+            if (chain.Count == 0) { continue; }
+            Console.WriteLine($"  [Phase2] {p.Date:yyyy-MM-dd} expiry={p.Expiry:yyyy-MM-dd} DTE={p.Dte}: chain size={chain.Count}, building option bars..."); Console.Out.Flush();
+            var optionBars = await SynchronizedOptionBarBuilder.BuildDayForChainAsync(tcSource, p.Date, chain, futureBars, CancellationToken.None);
+            var rows = await UnderlyingOptionRelationshipRecorder.RecordAsync(tcSource, p.Date, chain, futureBars, optionBars, CancellationToken.None);
+            tcPairRows.Add((p.Date, p.Expiry, p.Dte, p.Bucket, rows));
+            Console.WriteLine($"  [Phase2] {p.Date:yyyy-MM-dd} expiry={p.Expiry:yyyy-MM-dd}: {rows.Count} relationship rows recorded."); Console.Out.Flush();
+        }
+    }
+    Console.WriteLine($"Phase 1/2 complete: {tcPairRows.Count} (date,expiry) pairs loaded (SignalClock=Frozen1300, unchanged).");
+    Console.WriteLine();
+
+    decimal? ForwardMove(List<RelationshipObservation> rows, int eventId, int h) => UnderlyingOptionRelationshipSummary.ComputeFuturesChange(rows, eventId, h).PercentChange;
+    decimal? ForwardPe(List<RelationshipObservation> rows, int eventId, int h) => UnderlyingOptionRelationshipSummary.ComputePeChange(rows, eventId, h).PercentChange;
+    decimal? ForwardCe(List<RelationshipObservation> rows, int eventId, int h) => UnderlyingOptionRelationshipSummary.ComputeCeChange(rows, eventId, h).PercentChange;
+
+    // Per-window local A/B context, computed strictly from events STRICTLY BEFORE the signal's own
+    // StartTimestamp -- "now" is defined as the signal's own start, so its own bar can never be
+    // counted as part of its own preceding context (no look-ahead, no self-inclusion).
+    (int ACount, int BCount, int Total, double? AFraction, double? BFraction, int NetDominance,
+        int EventsInWindow, double? SignalRate, decimal? FuturesReturnPct, decimal? DistFromHighPct, decimal? DistFromLowPct, string State)
+        ComputeContext(List<RelationshipObservation> rows, int signalEventId, int windowMinutes)
+    {
+        var signal = rows[signalEventId];
+        var cutoff = signal.StartTimestamp - TimeSpan.FromMinutes(windowMinutes);
+        var startIdx = signalEventId; // first index INCLUDED in the window (inclusive), found by walking backward.
+        for (var i = signalEventId - 1; i >= 0; i--)
+        {
+            if (rows[i].EndTimestamp < cutoff) { break; }
+            startIdx = i;
+        }
+        var windowRows = startIdx <= signalEventId - 1 ? rows.GetRange(startIdx, signalEventId - startIdx) : [];
+        var aCount = windowRows.Count(r => r.RelationshipCategory == PatternA);
+        var bCount = windowRows.Count(r => r.RelationshipCategory == PatternB);
+        var total = aCount + bCount;
+        var eventsInWindow = windowRows.Count;
+
+        string state;
+        if (total == 0)
+        {
+            state = "NoPriorSignal";
+        }
+        else
+        {
+            var abOnly = windowRows.Where(r => r.RelationshipCategory is PatternA or PatternB).ToList();
+            var flipped = abOnly.Count >= 2 && abOnly[0].RelationshipCategory != abOnly[^1].RelationshipCategory;
+            if (flipped) { state = "Transition"; }
+            else if (aCount > bCount) { state = "A-dominant"; }
+            else if (bCount > aCount) { state = "B-dominant"; }
+            else { state = "Balanced"; }
+        }
+
+        decimal? futuresReturnPct = null, distFromHighPct = null, distFromLowPct = null;
+        if (eventsInWindow > 0)
+        {
+            futuresReturnPct = UnderlyingOptionRelationshipSummary.ComputeFuturesChange(rows, startIdx, signalEventId - startIdx).PercentChange;
+            var windowHigh = windowRows.Select(r => r.FuturesHigh).Append(signal.FuturesHigh).Max();
+            var windowLow = windowRows.Select(r => r.FuturesLow).Append(signal.FuturesLow).Min();
+            distFromHighPct = windowHigh != 0 ? (signal.FuturesClose - windowHigh) / windowHigh * 100m : null;
+            distFromLowPct = windowLow != 0 ? (signal.FuturesClose - windowLow) / windowLow * 100m : null;
+        }
+
+        return (aCount, bCount, total, total > 0 ? (double)aCount / total : null, total > 0 ? (double)bCount / total : null,
+            aCount - bCount, eventsInWindow, eventsInWindow > 0 ? (double)total / eventsInWindow : null,
+            futuresReturnPct, distFromHighPct, distFromLowPct, state);
+    }
+
+    // ---- Pattern A and Pattern B episodes (first-event-of-episode), per bucket ----
+    var tcSignalsByBucket = new Dictionary<string, List<(DateOnly Date, List<RelationshipObservation> Rows, EpisodeAnalysis.Episode Episode, string Pattern)>>();
+    foreach (var bucket in tcBucketOrder)
+    {
+        var list = new List<(DateOnly, List<RelationshipObservation>, EpisodeAnalysis.Episode, string)>();
+        foreach (var pair in tcPairRows.Where(p => p.Bucket == bucket))
+        {
+            foreach (var ep in EpisodeAnalysis.DetectEpisodes(pair.Date, pair.Rows, PatternA, [])) { list.Add((pair.Date, pair.Rows, ep, "A")); }
+            foreach (var ep in EpisodeAnalysis.DetectEpisodes(pair.Date, pair.Rows, PatternB, [])) { list.Add((pair.Date, pair.Rows, ep, "B")); }
+        }
+        tcSignalsByBucket[bucket] = list;
+    }
+
+    void ReportOutcome(string label, string pattern, List<(DateOnly Date, List<RelationshipObservation> Rows, EpisodeAnalysis.Episode Episode, string Pattern)> members)
+    {
+        if (members.Count == 0) { Console.WriteLine($"    [{label}] n=0"); return; }
+        Console.WriteLine($"    [{label}] n={members.Count}");
+        foreach (var h in tcForwardHorizons)
+        {
+            var fut = members.Select(m => ForwardMove(m.Rows, m.Episode.StartEventId, h)).Where(v => v is not null).Select(v => v!.Value).ToList();
+            if (fut.Count > 0) { var p = ForensicValidationAnalysis.ComputePercentiles(fut); Console.WriteLine($"      Futures +{h,2}: n={p.N} mean={TcFmt4(fut.Average())}% med={TcFmt4(p.Median)}% P25={TcFmt4(p.P25)}% P75={TcFmt4(p.P75)}% neg%={100.0 * fut.Count(v => v < 0) / fut.Count:F1}"); }
+            var opt = pattern == "A"
+                ? members.Select(m => ForwardPe(m.Rows, m.Episode.StartEventId, h)).Where(v => v is not null).Select(v => v!.Value).ToList()
+                : members.Select(m => ForwardCe(m.Rows, m.Episode.StartEventId, h)).Where(v => v is not null).Select(v => v!.Value).ToList();
+            var optLabel = pattern == "A" ? "PE" : "CE";
+            if (opt.Count > 0) { var p = ForensicValidationAnalysis.ComputePercentiles(opt); Console.WriteLine($"      {optLabel,-6}+{h,2}: n={p.N} mean={TcFmt4(opt.Average())}% med={TcFmt4(p.Median)}% P25={TcFmt4(p.P25)}% P75={TcFmt4(p.P75)}% pos%={100.0 * opt.Count(v => v > 0) / opt.Count:F1}"); }
+        }
+    }
+
+    var tcCsvRows = new List<string>();
+    foreach (var bucket in tcBucketOrder)
+    {
+        var signals = tcSignalsByBucket[bucket];
+        if (signals.Count == 0) { continue; }
+        var sessions = signals.Select(s => s.Date).Distinct().OrderBy(d => d).ToList();
+        var independence = sessions.Count >= 3 ? "repeated across independent sessions" : sessions.Count == 2 ? "limited" : "insufficient";
+        var aSignals = signals.Where(s => s.Pattern == "A").ToList();
+        var bSignals = signals.Where(s => s.Pattern == "B").ToList();
+        Console.WriteLine($"[Bucket {bucket}] {sessions.Count} session(s) [{independence}], n(A)={aSignals.Count}, n(B)={bSignals.Count}");
+
+        // Precompute the representative-window context for every signal (used for the full breakdown and Part6/day-level).
+        var contextRep = signals.ToDictionary(s => (s.Date, s.Episode.StartEventId, s.Pattern), s => ComputeContext(s.Rows, s.Episode.StartEventId, tcRepWindow));
+
+        Console.WriteLine($"  -- Representative window = {tcRepWindow} minutes -- full breakdown by preceding local A/B context state --");
+        foreach (var (patternLabel, patternSignals) in new[] { ("A", aSignals), ("B", bSignals) })
+        {
+            Console.WriteLine($"  === Pattern {patternLabel} (expects {(patternLabel == "A" ? "PE" : "CE")} response) ===");
+            foreach (var state in new[] { "A-dominant", "B-dominant", "Balanced", "Transition", "NoPriorSignal" })
+            {
+                var members = patternSignals.Where(s => contextRep[(s.Date, s.Episode.StartEventId, s.Pattern)].State == state).ToList();
+                ReportOutcome($"Context={state}", patternLabel, members);
+            }
+
+            // Matched control (existing tercile-matched control methodology): direction-held population, non-pattern, non-excluded.
+            var bucketPairs = tcPairRows.Where(p => p.Bucket == bucket).ToList();
+            var allRows = bucketPairs.SelectMany(p => p.Rows.Select(r => (p.Date, Rows: p.Rows, Row: r))).ToList();
+            var wantDirection = patternLabel == "A" ? RelationshipDirection.Up : RelationshipDirection.Down;
+            var patternCategory = patternLabel == "A" ? PatternA : PatternB;
+            var dirPop = allRows.Where(x => x.Row.FuturesDirection1 == wantDirection && !tcExcludedCategories.Contains(x.Row.RelationshipCategory)).ToList();
+            var controlObs = dirPop.Where(x => x.Row.RelationshipCategory != patternCategory).ToList();
+            var controlOpt10 = ForwardValidationAnalysis.ComputeForwardMetrics(controlObs.Select(x => patternLabel == "A" ? ForwardPe(x.Rows, x.Row.EventId, 10) : ForwardCe(x.Rows, x.Row.EventId, 10)));
+            Console.WriteLine($"    -- Control ({(patternLabel == "A" ? "PE" : "CE")} +10, existing tercile-matched control): n={controlOpt10.N} med={TcFmt4(controlOpt10.Median)}% --");
+            foreach (var state in new[] { "A-dominant", "B-dominant", "Balanced", "Transition" })
+            {
+                var members = patternSignals.Where(s => contextRep[(s.Date, s.Episode.StartEventId, s.Pattern)].State == state).ToList();
+                if (members.Count == 0) { continue; }
+                var opt10 = ForwardValidationAnalysis.ComputeForwardMetrics(members.Select(m => patternLabel == "A" ? ForwardPe(m.Rows, m.Episode.StartEventId, 10) : ForwardCe(m.Rows, m.Episode.StartEventId, 10)));
+                Console.WriteLine($"      [{state}] n={opt10.N} med={TcFmt4(opt10.Median)}% diffVsControl={TcFmt4(opt10.Median - controlOpt10.Median)}pp");
+            }
+        }
+
+        // ---- Mechanism questions 1-3: same-pattern-preceded-by-same-vs-opposite dominance ----
+        Console.WriteLine("  -- Mechanism check: does A become stronger after A-dominant context and weaker after B-dominant context (and symmetric for B)? (+10, median) --");
+        foreach (var (patternLabel, patternSignals) in new[] { ("A", aSignals), ("B", bSignals) })
+        {
+            var sameDominant = patternLabel == "A" ? "A-dominant" : "B-dominant";
+            var oppositeDominant = patternLabel == "A" ? "B-dominant" : "A-dominant";
+            var same = patternSignals.Where(s => contextRep[(s.Date, s.Episode.StartEventId, s.Pattern)].State == sameDominant).ToList();
+            var opposite = patternSignals.Where(s => contextRep[(s.Date, s.Episode.StartEventId, s.Pattern)].State == oppositeDominant).ToList();
+            var sameOpt = ForwardValidationAnalysis.ComputeForwardMetrics(same.Select(m => patternLabel == "A" ? ForwardPe(m.Rows, m.Episode.StartEventId, 10) : ForwardCe(m.Rows, m.Episode.StartEventId, 10)));
+            var oppOpt = ForwardValidationAnalysis.ComputeForwardMetrics(opposite.Select(m => patternLabel == "A" ? ForwardPe(m.Rows, m.Episode.StartEventId, 10) : ForwardCe(m.Rows, m.Episode.StartEventId, 10)));
+            Console.WriteLine($"    [Pattern {patternLabel}] preceded-by-{sameDominant}[n={sameOpt.N} med={TcFmt4(sameOpt.Median)}%] preceded-by-{oppositeDominant}[n={oppOpt.N} med={TcFmt4(oppOpt.Median)}%] Gap={TcFmt4(sameOpt.Median - oppOpt.Median)}pp");
+        }
+
+        // ---- Mechanism question 4: does local A/B dominance explain the A<->B transition rate? ----
+        var transitionCount = signals.Count(s => contextRep[(s.Date, s.Episode.StartEventId, s.Pattern)].State == "Transition");
+        Console.WriteLine($"  -- Mechanism check: fraction of signals preceded by a 'Transition' context (A<->B flip within the window) -- n={transitionCount}/{signals.Count} ({100.0 * transitionCount / signals.Count:F1}%) --");
+
+        // ---- Compact cross-window summary (all 4 windows; descriptive only, NOT ranked) ----
+        Console.WriteLine("  -- Compact cross-window summary (NOT ranked, NOT optimized): Gap = preceded-by-same-dominance minus preceded-by-opposite-dominance, +10 median --");
+        foreach (var windowMin in tcWindowMinutes)
+        {
+            foreach (var (patternLabel, patternSignals) in new[] { ("A", aSignals), ("B", bSignals) })
+            {
+                var contextW = patternSignals.ToDictionary(s => (s.Date, s.Episode.StartEventId), s => ComputeContext(s.Rows, s.Episode.StartEventId, windowMin));
+                var sameDominant = patternLabel == "A" ? "A-dominant" : "B-dominant";
+                var oppositeDominant = patternLabel == "A" ? "B-dominant" : "A-dominant";
+                var same = patternSignals.Where(s => contextW[(s.Date, s.Episode.StartEventId)].State == sameDominant).ToList();
+                var opposite = patternSignals.Where(s => contextW[(s.Date, s.Episode.StartEventId)].State == oppositeDominant).ToList();
+                if (same.Count < 5 || opposite.Count < 5) { Console.WriteLine($"    [{windowMin,2}min, Pattern {patternLabel}] insufficient sample (same n={same.Count}, opposite n={opposite.Count})"); continue; }
+                var sameOpt = ForwardValidationAnalysis.ComputeForwardMetrics(same.Select(m => patternLabel == "A" ? ForwardPe(m.Rows, m.Episode.StartEventId, 10) : ForwardCe(m.Rows, m.Episode.StartEventId, 10)));
+                var oppOpt = ForwardValidationAnalysis.ComputeForwardMetrics(opposite.Select(m => patternLabel == "A" ? ForwardPe(m.Rows, m.Episode.StartEventId, 10) : ForwardCe(m.Rows, m.Episode.StartEventId, 10)));
+                Console.WriteLine($"    [{windowMin,2}min, Pattern {patternLabel}] same[n={sameOpt.N} med={TcFmt4(sameOpt.Median)}%] opposite[n={oppOpt.N} med={TcFmt4(oppOpt.Median)}%] Gap={TcFmt4(sameOpt.Median - oppOpt.Median)}pp");
+            }
+        }
+
+        // ---- Day-level (mandatory), representative window, mechanism Gap only ----
+        Console.WriteLine("  -- Day-level (representative window, same-dominance minus opposite-dominance Gap, +10 median) --");
+        if (sessions.Count < 2) { Console.WriteLine("    INSUFFICIENT -- only 1 session."); }
+        else
+        {
+            foreach (var d in sessions)
+            {
+                foreach (var (patternLabel, patternSignals) in new[] { ("A", aSignals), ("B", bSignals) })
+                {
+                    var daySignals = patternSignals.Where(s => s.Date == d).ToList();
+                    var sameDominant = patternLabel == "A" ? "A-dominant" : "B-dominant";
+                    var oppositeDominant = patternLabel == "A" ? "B-dominant" : "A-dominant";
+                    var same = daySignals.Where(s => contextRep[(s.Date, s.Episode.StartEventId, s.Pattern)].State == sameDominant).ToList();
+                    var opposite = daySignals.Where(s => contextRep[(s.Date, s.Episode.StartEventId, s.Pattern)].State == oppositeDominant).ToList();
+                    if (same.Count == 0 && opposite.Count == 0) { continue; }
+                    var sameOpt = ForwardValidationAnalysis.ComputeForwardMetrics(same.Select(m => patternLabel == "A" ? ForwardPe(m.Rows, m.Episode.StartEventId, 10) : ForwardCe(m.Rows, m.Episode.StartEventId, 10)));
+                    var oppOpt = ForwardValidationAnalysis.ComputeForwardMetrics(opposite.Select(m => patternLabel == "A" ? ForwardPe(m.Rows, m.Episode.StartEventId, 10) : ForwardCe(m.Rows, m.Episode.StartEventId, 10)));
+                    Console.WriteLine($"    [{d:yyyy-MM-dd}, Pattern {patternLabel}] same[n={sameOpt.N} med={TcFmt4(sameOpt.Median)}%] opposite[n={oppOpt.N} med={TcFmt4(oppOpt.Median)}%]");
+                }
+            }
+        }
+        Console.WriteLine();
+
+        foreach (var s in signals)
+        {
+            var ctx = contextRep[(s.Date, s.Episode.StartEventId, s.Pattern)];
+            tcCsvRows.Add(string.Join(',', s.Date.ToString("yyyy-MM-dd"), bucket, s.Episode.StartEventId, s.Pattern, ctx.State, ctx.ACount, ctx.BCount, ctx.NetDominance, ctx.SignalRate, ctx.FuturesReturnPct, ctx.DistFromHighPct, ctx.DistFromLowPct,
+                ForwardMove(s.Rows, s.Episode.StartEventId, 10), s.Pattern == "A" ? ForwardPe(s.Rows, s.Episode.StartEventId, 10) : ForwardCe(s.Rows, s.Episode.StartEventId, 10)));
+        }
+    }
+
+    using (var writer = new StreamWriter(tcOutPath))
+    {
+        writer.WriteLine("Date,Bucket,StartEventId,Pattern,ContextState,ACount,BCount,NetDominance,SignalRate,FuturesReturnPctOverWindow,DistFromHighPct,DistFromLowPct,FuturesFwd10,OptionFwd10");
+        foreach (var line in tcCsvRows) { writer.WriteLine(line); }
+    }
+    Console.WriteLine($"AB-temporal-context CSV written to: {Path.GetFullPath(tcOutPath)}");
 
     return 0;
 }
