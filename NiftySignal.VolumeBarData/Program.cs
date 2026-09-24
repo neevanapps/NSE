@@ -11231,10 +11231,27 @@ if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-a-only-trade-
         return tradesPerDay;
     }
 
+    // 2026-09-24 addendum, added after the out-of-sample check showed EVERY candidate negative in
+    // the first 8 sessions and positive in the last 4 -- before trusting any "profitable" full-
+    // sample number, checked whether one or two days are carrying it (same convention every
+    // "P&L by independent calendar session" breakdown elsewhere in this project already uses).
+    void AcReportBySession(List<PatternRelationshipTradeSimulator.TradeRow> trades)
+    {
+        Console.WriteLine("      P&L by calendar session:");
+        var totalAbs = trades.Sum(t => Math.Abs(t.NetPnl));
+        foreach (var g in trades.GroupBy(t => t.TradingDate).OrderBy(g => g.Key))
+        {
+            var dayNet = g.Sum(t => t.NetPnl);
+            var share = totalAbs > 0 ? 100.0 * (double)(Math.Abs(dayNet) / totalAbs) : 0.0;
+            Console.WriteLine($"        [{g.Key:yyyy-MM-dd}] n={g.Count()} netPnl={AcFmt2(dayNet)} ({share:F1}% of total |P&L|)" + (g.Count() == 1 ? "  ** single-trade day **" : ""));
+        }
+    }
+
     // ==== Pattern-A-only, UNFILTERED baseline (Pattern B disabled; Pattern A entry/exit rules unchanged) ====
     Console.WriteLine("### Pattern-A-only unfiltered baseline (Pattern B entries disabled; Pattern A entry/exit rules unchanged) ###");
     var acBaselineTrades = await AcRunAsync(null, 0m);
     AcReport("Unfiltered", acBaselineTrades, acTotalSessions);
+    AcReportBySession(acBaselineTrades);
     Console.WriteLine();
 
     // ==== Per-candidate calibration: full-sample threshold search across the 7 predefined levels, ranked by net P&L among levels landing in 5-20/day ====
@@ -11269,6 +11286,7 @@ if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-a-only-trade-
         {
             var best = inBandLevels.OrderByDescending(l => l.Trades.Sum(t => t.NetPnl)).First();
             Console.WriteLine($"  Best-by-net-P&L in-band level: {PatternASelectivityCalibration.LevelLabel(best.Level)} (full stats printed above).");
+            AcReportBySession(best.Trades);
             acBestByCandidate.Add((variable, best.Level, best.Threshold, best.Trades));
         }
         Console.WriteLine();
@@ -11289,7 +11307,9 @@ if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-a-only-trade-
             var outSampleTrades = allTrades.Where(t => acOutSampleDates.Contains(t.TradingDate)).ToList();
             Console.WriteLine($"  [{variable}] {PatternASelectivityCalibration.LevelLabel(level)}, in-sample-derived threshold>={inSampleThreshold:F4}");
             AcReport("In-sample (calibration data)", inSampleTrades, acInSampleDates.Count);
+            AcReportBySession(inSampleTrades);
             AcReport("Out-of-sample (held out)", outSampleTrades, acOutSampleDates.Count);
+            AcReportBySession(outSampleTrades);
         }
         Console.WriteLine();
     }
