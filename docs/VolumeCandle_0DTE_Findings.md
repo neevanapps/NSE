@@ -4300,3 +4300,120 @@ feed a next experiment. Held pending your decision on whether you still want the
 ```
 dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-ab-temporal-context 2026-09-01 2026-09-23 --out=vc-ab-temporal-context.csv
 ```
+
+## Pattern A Crossover-Conditioned Trade Test (2026-09-24)
+
+**Task**: the first controlled economic test following the A/B Temporal Context Diagnostic's
+weak/mixed verdict (closed above). Tests whether the already-validated CE/PE relative-return
+crossover (`R_t = Return(CE) - Return(PE)`, frozen `PriceCrossoverEngine(5,20)`,
+`ClassifyConfirmationBySign(confirmsWhenFastBelowSlow: true)`) improves the frozen Pattern A → BUY
+PE trade simulation's real economics. Pattern A only; Pattern B kept as a descriptive/control
+reference, never filtered. Range: 2026-09-01 to 2026-09-23 (12 trading sessions, 24 (date,expiry)
+pairs, DTE buckets 0/1/4-6/7-8/11-13).
+
+### Methodology
+
+Added one additive parameter to the frozen simulator, `PatternRelationshipTradeSimulator
+.SimulateDayAsync(..., Func<int,bool>? patternAEntryFilter = null)`, consulted only for Pattern A
+signals, only after all existing entry gates pass (position-open check, after-3pm check, contract-
+transition check), never affecting exits or Pattern B. A rejected signal is recorded with a new
+`SignalOutcome.FilteredByEntryCondition` audit row rather than silently vanishing. Default `null`
+preserves prior behavior byte-for-byte, verified by all 16 pre-existing
+`PatternRelationshipTradeSimulatorTests` passing unchanged; 2 new tests added
+(`..._SkipsFilteredSignal_ButLaterSignalStillEnters`, `..._NeverAppliesToPatternB`). No baseline
+rule was modified: same pinned-ATM contract, single open position, sequential trades, opposite-
+pattern exit, mandatory 15:15 exit, no entries after 15:00, fixed 10 lots, existing cost/fill
+model, no SL/TP.
+
+Two deliberately separate analyses, per the task's own warning against comparing different trade
+populations without explaining the selection effect:
+
+- **PART 1 (zero selection effect)**: baseline's own unchanged 1,783 executed Pattern A trades,
+  split *post-hoc* by the crossover state recorded at each trade's signal timestamp (Confirms /
+  DoesNotConfirm / Unavailable-still-warming-up). No re-simulation; this only answers "do trades
+  that happened to be flagged Confirms look different from ones flagged DoesNotConfirm."
+- **PART 2 (realized committed variants)**: two fresh, independently re-simulated runs — one that
+  only ever enters on Confirms, one that only ever enters on DoesNotConfirm — capturing real
+  cascading effects (a skipped signal can free a position slot for a later, different trade). This
+  answers "what would actually have been traded under this rule," including opportunity-retention
+  metrics against the baseline population.
+
+### PART 1 results — same eligible signal set (post-hoc split, no re-simulation)
+
+| Group | n | Net P&L | P&L/trade | Median trade | Win% | PF | Gross profit | Gross loss |
+|---|---|---|---|---|---|---|---|---|
+| A. Baseline (all Pattern A) | 1,783 | -405,191.95 | -227.25 | -452.95 | 38.4% | 0.79 | 1,491,277.77 | -1,896,469.72 |
+| A + Confirms | 830 | -342,127.09 | -412.20 | -537.92 | 35.4% | 0.63 | 571,068.52 | -913,195.61 |
+| A + DoesNotConfirm | 760 | -57,168.57 | -75.22 | -367.64 | 39.7% | 0.93 | 706,648.56 | -763,817.13 |
+| A + Unavailable (warming up) | 193 | -5,896.29 | -30.55 | -242.21 | 46.1% | 0.97 | 213,560.69 | -219,456.98 |
+| B. Baseline (control, never filtered) | 1,776 | -397,916.55 | -224.05 | -382.24 | 35.4% | 0.75 | 1,205,383.09 | -1,603,299.64 |
+
+Session sign-count: **Confirms positive in 3/12 sessions** (09-15, 09-16, 09-22); **DoesNotConfirm
+positive in 5/12 sessions** (09-10, 09-15, 09-17, 09-18, 09-22); baseline positive in only 2/12
+(09-15, 09-22). DTE-bucket sign-count: DoesNotConfirm net-positive only in DTE 0 (+75,955.83); all
+of DTE 1, 4-6, 7-8, 11-13 remain net-negative for every group including DoesNotConfirm.
+
+**The direction is the opposite of the naive hypothesis**: Confirms (the crossover agreeing with
+Pattern A's implied bearish-CE/bullish-PE direction) selects the *worse* trades (P&L/trade roughly
+1.8x worse than baseline), while DoesNotConfirm selects the *better* (least-bad) trades. This is
+consistent with the divergence-maturity diagnostic's earlier finding that a "confirming" reading
+can reflect an already-mature/exhausted divergence rather than fresh directional information.
+
+### PART 2 results — realized committed variants + opportunity retention
+
+| Variant | n | Net P&L | P&L/trade | Win% | PF |
+|---|---|---|---|---|---|
+| Confirms-only (realized) | 1,201 | -404,702.26 | -336.97 | 36.6% | 0.69 |
+| DoesNotConfirm-only (realized) | 935 | -100,908.03 | -107.92 | 40.0% | 0.89 |
+
+**Confirms-only vs. baseline**: retained 641/1,783 baseline trades (36.0%), 162 new-in-variant-only
+(cascading) trades; retains 50.9% of baseline winners, 55.8% of baseline losers, 60.2% of gross
+profit, removes 31.3% of gross loss, retains 99.9% of baseline net P&L; P&L/trade delta vs.
+baseline = **-109.72** (worse).
+
+**DoesNotConfirm-only vs. baseline**: retained 573/1,783 baseline trades (32.1%), 69 new-in-variant-
+only trades; retains 50.8% of baseline winners, 46.4% of baseline losers (removes more losers
+proportionally than winners), 56.9% of gross profit, removes 50.0% of gross loss, retains 24.9% of
+baseline net P&L; P&L/trade delta vs. baseline = **+119.33** (better — per-trade loss roughly
+halved: -227.25 → -107.92).
+
+The realized (re-simulated, cascading-effects-included) variant confirms the same direction as the
+zero-selection-effect PART 1 split: DoesNotConfirm-conditioned entry is a real, non-artifactual
+improvement in per-trade economics, not a re-simulation shuffling effect.
+
+### Statistical discipline
+
+- Confirms subset: n=830, 12 independent sessions, largest single-session share of total |P&L| =
+  5.3% — not driven by one session.
+- DoesNotConfirm subset: n=760, 12 independent sessions, largest single-session share of total
+  |P&L| = 5.9% — not driven by one session.
+- Both subsets have ample trade counts (n>700) across all 12 sessions and all 5 DTE buckets — no
+  small-sample flag.
+- Neither subset is ever pooled-positive; per the task's own rule, neither is called "profitable."
+
+### Decision-gate classification: **WEAK/MIXED**
+
+Not **CLEAR CANDIDATE**: the DoesNotConfirm-conditioned subgroup remains net-lossmaking overall
+(-57,168.57 post-hoc / -100,908.03 realized) — a materially smaller loss than baseline, but not a
+positive-P&L strategy. It is directionally consistent in win-rate/PF/P&L-per-trade terms and not
+driven by one session, but it is net-positive in only 5 of 12 sessions and only 1 of 5 DTE buckets
+(DTE 0). That falls short of "directionally consistent across multiple independent sessions" in
+the sense the decision gate requires for freezing a strategy.
+
+Not **NO EDGE**: the crossover state clearly and consistently distinguishes worse trades (Confirms)
+from better trades (DoesNotConfirm) — the same direction holds in both the zero-selection-effect
+post-hoc split and the independently re-simulated committed variant, the effect size is large
+(P&L/trade roughly halved), and it isn't concentrated in one session or DTE bucket. This is too
+real and too consistent to dismiss outright.
+
+**Per the task's own rule for WEAK/MIXED: do not add another filter; decide whether to abandon.**
+This result is reported for that decision and no further filter, exit-rule experiment, or OOS test
+design has been built. Stopping here per instruction, pending your decision on whether to abandon
+this line, investigate *why* Confirms trades are worse (a mechanism question, not a new filter),
+or something else.
+
+### Reproduction
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-crossover-trade-test 2026-09-01 2026-09-23 --out=vc-a-crossover-trade-test.csv
+```

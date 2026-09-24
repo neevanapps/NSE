@@ -28,7 +28,7 @@ public static class PatternRelationshipTradeSimulator
     public const int Lots = 10;
 
     public enum ExitReason { OppositePatternSignal, ForcedEod }
-    public enum SignalOutcome { Executed, AlreadyInPosition, After3Pm, MissingOptionData, ContractTransition, NoExecutableTick, NoStrikeInBand }
+    public enum SignalOutcome { Executed, AlreadyInPosition, After3Pm, MissingOptionData, ContractTransition, NoExecutableTick, NoStrikeInBand, FilteredByEntryCondition }
 
     public sealed record TradeRow(
         int TradeId, DateOnly TradingDate, string Pattern, OptionType OptionType, decimal Strike, int Dte,
@@ -51,11 +51,24 @@ public static class PatternRelationshipTradeSimulator
 
     /// <param name="optionBars">Required only when <paramref name="minEntryPrice"/>/<paramref name="maxEntryPrice"/> are supplied -- gives each candidate contract's own live premium at the signal event so a band-selected strike (rather than the dynamic-ATM one) can be found.</param>
     /// <param name="minEntryPrice">2026-09-24 addendum, user's own explicit rule (same convention as <see cref="Vc0DteTradeSimulator"/>'s existing [100,150] band): when supplied together with <paramref name="maxEntryPrice"/>, entry walks the chain outward from the dynamic-ATM strike and selects the FIRST contract whose live premium at the signal event falls in [<paramref name="minEntryPrice"/>, <paramref name="maxEntryPrice"/>], instead of the pinned dynamic-ATM contract. Null (default) preserves the original frozen-relationship pinned-ATM behaviour unchanged.</param>
+    /// <param name="patternAEntryFilter">
+    /// 2026-09-24 addendum, CE/PE-crossover trade test. Called ONLY for a Pattern A signal that has
+    /// already cleared every other entry gate (no position open, before 15:00, no contract
+    /// transition) with that row's own <see cref="RelationshipObservation.EventId"/> -- returning
+    /// false skips opening a position for that signal (recorded as
+    /// <see cref="SignalOutcome.FilteredByEntryCondition"/>) while leaving every other rule
+    /// untouched: a later signal is still free to enter, an already-open position's opposite-signal
+    /// exit is entirely unaffected (this filter is never consulted on the close path), and Pattern B
+    /// is NEVER filtered by this parameter -- it stays a stable, unmodified control/reference
+    /// whichever way this filter is used. Null (default) preserves the original frozen behaviour
+    /// unchanged for every existing caller.
+    /// </param>
     public static async Task<SimulationResult> SimulateDayAsync(
         NiftySignalDbContext source, DateOnly asOfDate,
         IReadOnlyList<RelationshipObservation> rows, IReadOnlyList<Instrument> chain, IReadOnlyList<FutureEventBar> futureBars,
         TimeSpan istOffset, CancellationToken cancellationToken,
-        IReadOnlyList<SynchronizedOptionEventBar>? optionBars = null, decimal? minEntryPrice = null, decimal? maxEntryPrice = null)
+        IReadOnlyList<SynchronizedOptionEventBar>? optionBars = null, decimal? minEntryPrice = null, decimal? maxEntryPrice = null,
+        Func<int, bool>? patternAEntryFilter = null)
     {
         var trades = new List<TradeRow>();
         var audit = new List<SignalAuditRow>();
@@ -185,6 +198,11 @@ public static class PatternRelationshipTradeSimulator
             if (pinnedTransition)
             {
                 audit.Add(new SignalAuditRow(asOfDate, row.EndTimestamp, pattern, side, row.AtmStrike, SignalOutcome.ContractTransition));
+                continue;
+            }
+            if (isPatternA && patternAEntryFilter is not null && !patternAEntryFilter(row.EventId))
+            {
+                audit.Add(new SignalAuditRow(asOfDate, row.EndTimestamp, pattern, side, row.AtmStrike, SignalOutcome.FilteredByEntryCondition));
                 continue;
             }
 

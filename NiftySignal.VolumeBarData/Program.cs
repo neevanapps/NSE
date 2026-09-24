@@ -10524,6 +10524,249 @@ if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-ab-temporal-c
     return 0;
 }
 
+// "vc0dte-relationship-a-crossover-trade-test" -- 2026-09-24, ONE CONTROLLED ECONOMIC TEST (not
+// mechanism discovery, not validation). Does the already-discovered CE/PE relative-return
+// crossover (Return(CE)-Return(PE), representative (5,20) combo, ClassifyConfirmationBySign --
+// all reused UNCHANGED from the completed ce-pe-crossover experiment) improve the FROZEN Pattern
+// A -> BUY PE trade simulation's actual economics? Pattern A only -- Pattern B/BUY CE is kept
+// exactly as-is throughout, as a stable descriptive/control reference, never filtered. Reuses
+// PatternRelationshipTradeSimulator.SimulateDayAsync completely unmodified in its DEFAULT
+// behaviour (the new patternAEntryFilter parameter is optional and additive; the 16 pre-existing
+// tests plus this change's own new filter tests all pass unchanged). No SL/TP/exit change, no
+// parameter search -- exactly the already-selected candidate, tested once.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-crossover-trade-test <fromDate> <toDate> --out=path.csv
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-a-crossover-trade-test", StringComparison.OrdinalIgnoreCase))
+{
+    const long ctThreshold = 1300L;
+    var ctIstOffset = TimeSpan.FromHours(5.5);
+    const int ctFast = 5, ctSlow = 20; // the already-selected representative combo -- NOT re-optimized.
+
+    var (ctPositional, ctNamed) = SplitNamedArgs(args);
+    if (ctPositional.Length < 3 || !DateOnly.TryParseExact(ctPositional[1], "yyyy-MM-dd", out var ctFromDate) || !DateOnly.TryParseExact(ctPositional[2], "yyyy-MM-dd", out var ctToDate) || !ctNamed.TryGetValue("out", out var ctOutPath))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-crossover-trade-test <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> --out=path.csv");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-a-crossover-trade-test: ONE CONTROLLED ECONOMIC TEST -- does the CE/PE crossover improve the frozen Pattern A trade simulation? Pattern A only. No parameter search. ===");
+    Console.WriteLine();
+    static string CtFmt2(decimal? v) => v?.ToString("F2") ?? "--";
+    static string CtFmtPct(double? v) => v is null ? "--" : $"{v:F1}%";
+
+    // ---- Phase 1/2: EXACT same discovery + relationship-row building as prior commands ----
+    var ctPairs = new List<(DateOnly Date, DateOnly Expiry, int Dte, string Bucket)>();
+    await using (var ctScanSource = new NiftySignalDbContext(tradeSourceOptions))
+    {
+        for (var date = ctFromDate; date <= ctToDate; date = date.AddDays(1))
+        {
+            if (date.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday) { continue; }
+            var hasFutures = await ctScanSource.Instruments.AnyAsync(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Future && i.Underlying == "NIFTY");
+            if (!hasFutures) { continue; }
+            var expiries = await ctScanSource.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.Underlying == "NIFTY").Select(i => i.ExpiryDate).Distinct().OrderBy(e => e).ToListAsync();
+            foreach (var expiry in expiries)
+            {
+                if (expiry is null) { continue; }
+                var dte = expiry.Value.DayNumber - date.DayNumber;
+                var bucket = DteBucketClassifier.Classify(dte);
+                if (bucket != DteBucketClassifier.Other) { ctPairs.Add((date, expiry.Value, dte, bucket)); }
+            }
+            Console.WriteLine($"  [Phase1] scanned {date:yyyy-MM-dd}, pairs so far={ctPairs.Count}"); Console.Out.Flush();
+        }
+    }
+    Console.WriteLine($"Phase1 discovery complete: {ctPairs.Count} pairs."); Console.Out.Flush();
+    if (ctPairs.Count == 0) { Console.WriteLine("No usable (date, expiry) pairs found -- stopping. No fabricated methodology."); return 1; }
+
+    var baselineTradesA = new List<PatternRelationshipTradeSimulator.TradeRow>();
+    var baselineTradesB = new List<PatternRelationshipTradeSimulator.TradeRow>();
+    var baselineAuditA = new List<PatternRelationshipTradeSimulator.SignalAuditRow>();
+    var confirmsTradesA = new List<PatternRelationshipTradeSimulator.TradeRow>();
+    var confirmsAuditA = new List<PatternRelationshipTradeSimulator.SignalAuditRow>();
+    var doesNotConfirmTradesA = new List<PatternRelationshipTradeSimulator.TradeRow>();
+    var doesNotConfirmAuditA = new List<PatternRelationshipTradeSimulator.SignalAuditRow>();
+    // per-trade crossover state at signal, keyed by (date, signal timestamp) -- used to split
+    // BASELINE's own executed trades post-hoc (the "exact same eligible signal set" comparison).
+    var stateAtSignal = new Dictionary<(DateOnly, DateTimeOffset), string>();
+    var dteByDate = new Dictionary<(DateOnly, DateTimeOffset), int>();
+
+    foreach (var dateGroup in ctPairs.GroupBy(p => p.Date).OrderBy(g => g.Key))
+    {
+        await using var ctSource = new NiftySignalDbContext(tradeSourceOptions);
+        Console.WriteLine($"  [Phase2] building futures bars for {dateGroup.Key:yyyy-MM-dd}..."); Console.Out.Flush();
+        var futureBars = await FutureEventBarBuilder.BuildDayAsync(ctSource, dateGroup.Key, ctThreshold, CancellationToken.None);
+        Console.WriteLine($"  [Phase2] {dateGroup.Key:yyyy-MM-dd}: {futureBars.Count} futures bars built."); Console.Out.Flush();
+        if (futureBars.Count == 0) { continue; }
+        foreach (var p in dateGroup)
+        {
+            var chain = await ctSource.Instruments.Where(i => i.AsOfDate == p.Date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == p.Expiry && i.Underlying == "NIFTY").OrderBy(i => i.StrikePrice).ThenBy(i => i.OptionType).ToListAsync();
+            if (chain.Count == 0) { continue; }
+            Console.WriteLine($"  [Phase2] {p.Date:yyyy-MM-dd} expiry={p.Expiry:yyyy-MM-dd} DTE={p.Dte}: chain size={chain.Count}, building option bars..."); Console.Out.Flush();
+            var optionBars = await SynchronizedOptionBarBuilder.BuildDayForChainAsync(ctSource, p.Date, chain, futureBars, CancellationToken.None);
+            var rows = await UnderlyingOptionRelationshipRecorder.RecordAsync(ctSource, p.Date, chain, futureBars, optionBars, CancellationToken.None);
+
+            var relSpread = new double?[rows.Count];
+            for (var i = 1; i < rows.Count; i++)
+            {
+                var cePct = UnderlyingOptionRelationshipSummary.ComputeCeChange(rows, i - 1, 1).PercentChange;
+                var pePct = UnderlyingOptionRelationshipSummary.ComputePeChange(rows, i - 1, 1).PercentChange;
+                relSpread[i] = cePct is not null && pePct is not null ? (double)(cePct.Value - pePct.Value) : (double?)null;
+            }
+            var engine = new PriceCrossoverEngine(ctFast, ctSlow);
+            var confirmState = new string[rows.Count];
+            for (var i = 0; i < rows.Count; i++)
+            {
+                var step = engine.Observe(relSpread[i], 0.0);
+                confirmState[i] = CrossoverResolutionDiagnostics.ClassifyConfirmationBySign(step, confirmsWhenFastBelowSlow: true);
+                stateAtSignal[(p.Date, rows[i].EndTimestamp)] = confirmState[i];
+                dteByDate[(p.Date, rows[i].EndTimestamp)] = rows[i].Dte;
+            }
+
+            // A. Baseline -- completely unmodified frozen simulation.
+            var baseline = await PatternRelationshipTradeSimulator.SimulateDayAsync(ctSource, p.Date, rows, chain, futureBars, ctIstOffset, CancellationToken.None);
+            baselineTradesA.AddRange(baseline.Trades.Where(t => t.Pattern == "PatternA"));
+            baselineTradesB.AddRange(baseline.Trades.Where(t => t.Pattern == "PatternB"));
+            baselineAuditA.AddRange(baseline.SignalAudit.Where(a => a.Pattern == "PatternA"));
+
+            // B. Crossover-conditioned Pattern A -- SEPARATE re-simulation per subgroup (captures
+            // any cascading effect of a filtered-out signal freeing a later slot -- the
+            // "opportunity retention" lens, distinct from the post-hoc baseline split below).
+            var confirmsRun = await PatternRelationshipTradeSimulator.SimulateDayAsync(ctSource, p.Date, rows, chain, futureBars, ctIstOffset, CancellationToken.None,
+                patternAEntryFilter: eventId => confirmState[eventId] == "Confirms");
+            confirmsTradesA.AddRange(confirmsRun.Trades.Where(t => t.Pattern == "PatternA"));
+            confirmsAuditA.AddRange(confirmsRun.SignalAudit.Where(a => a.Pattern == "PatternA"));
+
+            var doesNotConfirmRun = await PatternRelationshipTradeSimulator.SimulateDayAsync(ctSource, p.Date, rows, chain, futureBars, ctIstOffset, CancellationToken.None,
+                patternAEntryFilter: eventId => confirmState[eventId] == "DoesNotConfirm");
+            doesNotConfirmTradesA.AddRange(doesNotConfirmRun.Trades.Where(t => t.Pattern == "PatternA"));
+            doesNotConfirmAuditA.AddRange(doesNotConfirmRun.SignalAudit.Where(a => a.Pattern == "PatternA"));
+
+            Console.WriteLine($"  [Phase2] {p.Date:yyyy-MM-dd} expiry={p.Expiry:yyyy-MM-dd}: {rows.Count} relationship rows, baseline A trades so far={baselineTradesA.Count}."); Console.Out.Flush();
+        }
+    }
+    Console.WriteLine($"Phase 1/2 complete. Baseline A trades={baselineTradesA.Count}, Baseline B trades (reference only)={baselineTradesB.Count}.");
+    Console.WriteLine();
+
+    static decimal Median(IReadOnlyList<decimal> sorted) => sorted.Count == 0 ? 0m
+        : sorted.Count % 2 == 1 ? sorted[sorted.Count / 2] : (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2m;
+    static TimeSpan MedianTs(IReadOnlyList<TimeSpan> sorted) => sorted.Count == 0 ? TimeSpan.Zero
+        : sorted.Count % 2 == 1 ? sorted[sorted.Count / 2] : sorted[sorted.Count / 2 - 1] + TimeSpan.FromTicks((sorted[sorted.Count / 2] - sorted[sorted.Count / 2 - 1]).Ticks / 2);
+    static TimeSpan PercentileTs(IReadOnlyList<TimeSpan> sorted, decimal fraction) => sorted.Count == 0 ? TimeSpan.Zero
+        : sorted[Math.Clamp((int)Math.Ceiling(fraction * sorted.Count) - 1, 0, sorted.Count - 1)];
+
+    void ReportMetrics(string label, List<PatternRelationshipTradeSimulator.TradeRow> trades, int? signalCount, int? ignoredWhileInPosition)
+    {
+        Console.WriteLine($"  [{label}]");
+        if (signalCount is not null) { Console.WriteLine($"    Signal count (audit rows)={signalCount}, Ignored-while-in-position={ignoredWhileInPosition}"); }
+        Console.WriteLine($"    Executed trade count={trades.Count}");
+        if (trades.Count == 0) { Console.WriteLine("    (no trades)"); return; }
+        var netPnls = trades.Select(t => t.NetPnl).OrderBy(v => v).ToList();
+        var wins = trades.Count(t => t.NetPnl > 0);
+        var grossProfit = trades.Where(t => t.NetPnl > 0).Sum(t => t.NetPnl);
+        var grossLoss = trades.Where(t => t.NetPnl < 0).Sum(t => t.NetPnl);
+        var totalCosts = trades.Sum(t => t.Stt + t.Gst + t.OtherCosts);
+        var holdings = trades.Select(t => t.HoldingDuration).OrderBy(h => h).ToList();
+        Console.WriteLine($"    Net P&L={CtFmt2(netPnls.Sum())} | P&L/trade={CtFmt2(netPnls.Sum() / trades.Count)} | Median trade P&L={CtFmt2(Median(netPnls))}");
+        Console.WriteLine($"    Win rate={CtFmtPct(100.0 * wins / trades.Count)} | Profit factor={(grossLoss < 0 ? CtFmt2(grossProfit / Math.Abs(grossLoss)) : "--")}");
+        Console.WriteLine($"    Gross profit={CtFmt2(grossProfit)} | Gross loss={CtFmt2(grossLoss)} | Total costs={CtFmt2(totalCosts)} | Worst trade={CtFmt2(netPnls[0])}");
+        Console.WriteLine($"    Median MAE%={CtFmt2(Median(trades.Select(t => t.MaePercent).OrderBy(v => v).ToList()))} | Median MFE%={CtFmt2(Median(trades.Select(t => t.MfePercent).OrderBy(v => v).ToList()))}");
+        Console.WriteLine($"    Holding time: median={MedianTs(holdings):hh\\:mm\\:ss} P25={PercentileTs(holdings, 0.25m):hh\\:mm\\:ss} P50={PercentileTs(holdings, 0.50m):hh\\:mm\\:ss} P75={PercentileTs(holdings, 0.75m):hh\\:mm\\:ss}");
+        Console.WriteLine("    P&L by independent calendar session:");
+        foreach (var g in trades.GroupBy(t => t.TradingDate).OrderBy(g => g.Key))
+        {
+            Console.WriteLine($"      [{g.Key:yyyy-MM-dd}] n={g.Count()} netPnl={CtFmt2(g.Sum(t => t.NetPnl))}" + (g.Count() == 1 ? "  ** single-trade day -- do not read as a stable result **" : ""));
+        }
+        Console.WriteLine("    P&L by actual DTE bucket:");
+        foreach (var g in trades.GroupBy(t => DteBucketClassifier.Classify(t.Dte)).OrderBy(g => g.Key))
+        {
+            Console.WriteLine($"      [DTE {g.Key}] n={g.Count()} netPnl={CtFmt2(g.Sum(t => t.NetPnl))}" + (g.Count() <= 2 ? "  ** very small sample **" : ""));
+        }
+    }
+
+    // ==== PART 1: "exact same eligible signal set" -- post-hoc split of BASELINE's OWN executed
+    // trades by crossover state at signal (no re-simulation, no selection effect: every trade here
+    // is the SAME trade baseline already produced, just grouped by a label computed independently). ====
+    Console.WriteLine("### PART 1 -- Same eligible signal set: baseline's own executed Pattern A trades, split post-hoc by crossover state at signal (no re-simulation) ###");
+    var confirmsSubset = baselineTradesA.Where(t => stateAtSignal.GetValueOrDefault((t.TradingDate, t.SignalTimestamp)) == "Confirms").ToList();
+    var doesNotConfirmSubset = baselineTradesA.Where(t => stateAtSignal.GetValueOrDefault((t.TradingDate, t.SignalTimestamp)) == "DoesNotConfirm").ToList();
+    var unavailableSubset = baselineTradesA.Where(t => stateAtSignal.GetValueOrDefault((t.TradingDate, t.SignalTimestamp)) is null or "Unavailable").ToList();
+    var baselineSignalCount = baselineAuditA.Count;
+    var baselineIgnored = baselineAuditA.Count(a => a.Outcome == PatternRelationshipTradeSimulator.SignalOutcome.AlreadyInPosition);
+    ReportMetrics("A. Baseline (all executed Pattern A trades)", baselineTradesA, baselineSignalCount, baselineIgnored);
+    ReportMetrics("A + Confirms (subset of baseline trades)", confirmsSubset, null, null);
+    ReportMetrics("A + DoesNotConfirm (subset of baseline trades)", doesNotConfirmSubset, null, null);
+    ReportMetrics("A + Unavailable (crossover still warming up)", unavailableSubset, null, null);
+    Console.WriteLine("  -- Pattern B (BUY CE), descriptive/control reference only, never filtered --");
+    ReportMetrics("B. Baseline (reference)", baselineTradesB, null, null);
+    Console.WriteLine();
+
+    // ==== PART 2: opportunity retention -- REALIZED committed variants (separate re-simulation,
+    // cascading effects included) compared back against baseline. ====
+    Console.WriteLine("### PART 2 -- Opportunity retention: realized 'trade only on Confirms' / 'trade only on DoesNotConfirm' variants vs. baseline ###");
+    ReportMetrics("Realized: Confirms-only committed variant", confirmsTradesA, confirmsAuditA.Count, confirmsAuditA.Count(a => a.Outcome == PatternRelationshipTradeSimulator.SignalOutcome.AlreadyInPosition));
+    ReportMetrics("Realized: DoesNotConfirm-only committed variant", doesNotConfirmTradesA, doesNotConfirmAuditA.Count, doesNotConfirmAuditA.Count(a => a.Outcome == PatternRelationshipTradeSimulator.SignalOutcome.AlreadyInPosition));
+
+    void ReportRetention(string label, List<PatternRelationshipTradeSimulator.TradeRow> variant)
+    {
+        var baselineKeys = baselineTradesA.Select(t => (t.TradingDate, t.SignalTimestamp)).ToHashSet();
+        var variantKeys = variant.Select(t => (t.TradingDate, t.SignalTimestamp)).ToHashSet();
+        var retained = baselineKeys.Intersect(variantKeys).Count();
+        var newInVariantOnly = variantKeys.Except(baselineKeys).Count();
+        var baselineWins = baselineTradesA.Where(t => t.NetPnl > 0).ToList();
+        var baselineLosses = baselineTradesA.Where(t => t.NetPnl < 0).ToList();
+        var variantWinKeysRetained = baselineWins.Count(t => variantKeys.Contains((t.TradingDate, t.SignalTimestamp)));
+        var variantLossKeysRetained = baselineLosses.Count(t => variantKeys.Contains((t.TradingDate, t.SignalTimestamp)));
+        var baselineGrossProfit = baselineTradesA.Where(t => t.NetPnl > 0).Sum(t => t.NetPnl);
+        var baselineGrossLoss = baselineTradesA.Where(t => t.NetPnl < 0).Sum(t => t.NetPnl);
+        var baselineNet = baselineTradesA.Sum(t => t.NetPnl);
+        var variantGrossProfit = variant.Where(t => t.NetPnl > 0).Sum(t => t.NetPnl);
+        var variantGrossLoss = variant.Where(t => t.NetPnl < 0).Sum(t => t.NetPnl);
+        var variantNet = variant.Sum(t => t.NetPnl);
+        Console.WriteLine($"  [{label}]");
+        Console.WriteLine($"    Retained (same date+signal-timestamp as a baseline trade)={retained}/{baselineTradesA.Count} baseline trades ({CtFmtPct(baselineTradesA.Count > 0 ? 100.0 * retained / baselineTradesA.Count : 0)})");
+        Console.WriteLine($"    New-in-variant-only trades (cascading effect, NOT in baseline at all)={newInVariantOnly}");
+        Console.WriteLine($"    % of baseline winning trades retained={CtFmtPct(baselineWins.Count > 0 ? 100.0 * variantWinKeysRetained / baselineWins.Count : 0)} ({baselineWins.Count - variantWinKeysRetained} winners removed)");
+        Console.WriteLine($"    % of baseline losing trades retained={CtFmtPct(baselineLosses.Count > 0 ? 100.0 * variantLossKeysRetained / baselineLosses.Count : 0)} ({baselineLosses.Count - variantLossKeysRetained} losers removed)");
+        Console.WriteLine($"    % of baseline gross profit retained={CtFmtPct(baselineGrossProfit > 0 ? (double)(variantGrossProfit / baselineGrossProfit * 100m) : 0)}");
+        Console.WriteLine($"    % of baseline gross loss removed={CtFmtPct(baselineGrossLoss < 0 ? (double)((1m - variantGrossLoss / baselineGrossLoss) * 100m) : 0)}");
+        Console.WriteLine($"    % of baseline net P&L retained={CtFmtPct(baselineNet != 0 ? (double)(variantNet / baselineNet * 100m) : 0)}");
+        Console.WriteLine($"    Candidate P&L uplift per retained trade vs. baseline's own P&L/trade: variant P&L/trade={CtFmt2(variant.Count > 0 ? variantNet / variant.Count : 0)} vs baseline P&L/trade={CtFmt2(baselineTradesA.Count > 0 ? baselineNet / baselineTradesA.Count : 0)}, Delta={CtFmt2((variant.Count > 0 ? variantNet / variant.Count : 0) - (baselineTradesA.Count > 0 ? baselineNet / baselineTradesA.Count : 0))}");
+    }
+    ReportRetention("Confirms-only committed variant vs. Baseline", confirmsTradesA);
+    ReportRetention("DoesNotConfirm-only committed variant vs. Baseline", doesNotConfirmTradesA);
+    Console.WriteLine();
+
+    // ==== Statistical discipline: flag single-trade/single-session dominance already done inline
+    // above (per-session/per-DTE-bucket lines); explicitly restate pooled vs. session-level here. ====
+    Console.WriteLine("### Statistical discipline summary ###");
+    foreach (var (label, trades) in new[] { ("Confirms subset", confirmsSubset), ("DoesNotConfirm subset", doesNotConfirmSubset) })
+    {
+        var sessions = trades.Select(t => t.TradingDate).Distinct().Count();
+        var topSessionShare = sessions > 0 ? trades.GroupBy(t => t.TradingDate).Max(g => Math.Abs(g.Sum(t => t.NetPnl))) : 0m;
+        var totalAbs = trades.Sum(t => Math.Abs(t.NetPnl));
+        Console.WriteLine($"  [{label}] n={trades.Count}, independent sessions={sessions}, largest single-session |P&L| share of total |P&L|={CtFmtPct(totalAbs > 0 ? (double)(topSessionShare / totalAbs * 100m) : 0)}" + (sessions <= 1 ? "  ** driven by a single session -- not trustworthy on its own **" : ""));
+    }
+    Console.WriteLine();
+
+    using (var writer = new StreamWriter(ctOutPath))
+    {
+        writer.WriteLine("Group,TradeId,TradingDate,SignalTimeIST,Dte,DteBucket,CrossoverStateAtSignal,NetPnl,HoldingSeconds");
+        void WriteGroup(string group, List<PatternRelationshipTradeSimulator.TradeRow> trades)
+        {
+            foreach (var t in trades)
+            {
+                var state = stateAtSignal.GetValueOrDefault((t.TradingDate, t.SignalTimestamp), "n/a");
+                writer.WriteLine(string.Join(',', group, t.TradeId, t.TradingDate.ToString("yyyy-MM-dd"), t.SignalTimestamp.ToOffset(ctIstOffset).ToString("HH:mm:ss.fff"), t.Dte, DteBucketClassifier.Classify(t.Dte), state, t.NetPnl, t.HoldingDuration.TotalSeconds));
+            }
+        }
+        WriteGroup("BaselineA", baselineTradesA);
+        WriteGroup("BaselineB_Reference", baselineTradesB);
+        WriteGroup("RealizedConfirmsOnly", confirmsTradesA);
+        WriteGroup("RealizedDoesNotConfirmOnly", doesNotConfirmTradesA);
+    }
+    Console.WriteLine($"A-crossover-trade-test CSV written to: {Path.GetFullPath(ctOutPath)}");
+
+    return 0;
+}
+
 if (args.Length < 2 || !DateOnly.TryParseExact(args[0], "yyyy-MM-dd", out var fromDate) || !DateOnly.TryParseExact(args[1], "yyyy-MM-dd", out var toDate))
 {
     Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [barVolumeThreshold] [sourceDatabaseNameOverride]");

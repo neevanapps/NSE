@@ -378,4 +378,46 @@ public sealed class PatternRelationshipTradeSimulatorTests
         Assert.All(day1Result.Trades, t => Assert.Equal(Day, t.TradingDate));
         Assert.Empty(day2Result.Trades); // no rows/bars for day2 -- proves nothing carried over from day1's open state.
     }
+
+    [Fact]
+    public async Task SimulateDayAsync_PatternAEntryFilter_SkipsFilteredSignal_ButLaterSignalStillEnters()
+    {
+        await using var source = NewSourceDb();
+        source.Instruments.Add(OptionInstrument(PeToken, 25000m, OptionType.Put));
+        var bar0 = Bar(0, At(9, 20), At(9, 21));
+        var bar1 = Bar(1, At(9, 21), At(9, 22));
+        AddTick(source, PeToken, At(9, 22, 5), 51m); // only consumed if event 1's entry is taken.
+        AddTick(source, PeToken, At(15, 14, 55), 55m);
+        await source.SaveChangesAsync();
+
+        var rows = new List<RelationshipObservation> { Row(0, bar0.EndTimestamp, PatternA), Row(1, bar1.EndTimestamp, PatternA) };
+        var result = await PatternRelationshipTradeSimulator.SimulateDayAsync(
+            source, Day, rows, [source.Instruments.Local.First()], [bar0, bar1], IstOffset, CancellationToken.None,
+            patternAEntryFilter: eventId => eventId != 0); // reject event 0 only.
+
+        var trade = Assert.Single(result.Trades);
+        Assert.Equal(bar1.EndTimestamp, trade.SignalTimestamp); // event 0's signal never opened a position, so event 1 was still free to enter.
+        Assert.Equal(2, result.SignalAudit.Count);
+        Assert.Equal(PatternRelationshipTradeSimulator.SignalOutcome.FilteredByEntryCondition, result.SignalAudit[0].Outcome);
+        Assert.Equal(PatternRelationshipTradeSimulator.SignalOutcome.Executed, result.SignalAudit[1].Outcome);
+    }
+
+    [Fact]
+    public async Task SimulateDayAsync_PatternAEntryFilter_NeverAppliesToPatternB()
+    {
+        await using var source = NewSourceDb();
+        source.Instruments.Add(OptionInstrument(CeToken, 25000m, OptionType.Call));
+        var bar = Bar(0, At(9, 20), At(9, 21));
+        AddTick(source, CeToken, At(9, 21, 5), 101m);
+        AddTick(source, CeToken, At(15, 14, 55), 105m);
+        await source.SaveChangesAsync();
+
+        var rows = new List<RelationshipObservation> { Row(0, bar.EndTimestamp, PatternB) };
+        var result = await PatternRelationshipTradeSimulator.SimulateDayAsync(
+            source, Day, rows, [source.Instruments.Local.First()], [bar], IstOffset, CancellationToken.None,
+            patternAEntryFilter: _ => false); // would reject every signal if it applied to Pattern B -- it must not.
+
+        var trade = Assert.Single(result.Trades);
+        Assert.Equal("PatternB", trade.Pattern);
+    }
 }
