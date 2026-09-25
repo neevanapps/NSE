@@ -20,6 +20,9 @@
 
   <ItemGroup>
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" />
+    <!-- 2026-09-25: FileBackedResearchRunner seeds an in-memory DB from export-ticks' NDJSON files
+         so ReversalResearch's report logic can run without a live database connection. -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore.InMemory" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Design">
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
