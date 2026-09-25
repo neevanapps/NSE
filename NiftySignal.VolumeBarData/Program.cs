@@ -12,6 +12,9 @@ using NiftySignal.VolumeBarData;
 using MtmRow = NiftySignal.VolumeBarData.MarkToMarketDiagnostics.MtmRow;
 using ExitAsymmetryRow = NiftySignal.VolumeBarData.MarkToMarketDiagnostics.ExitAsymmetryRow;
 
+// TEMPORARILY DISABLED (2026-09-25, build-speed) -- only used by the legacy commands disabled
+// below; see the matching #if block. Guarded here too so they don't warn as unused (CS8321).
+#if RESEARCH_LEGACY_COMMANDS
 // CadenceContext.Timestamp / VolumeBarRow.StartTimestamp/EndTimestamp are all stored UTC (Npgsql's
 // own requirement) -- same convention NiftySignal.MetricTrials/Program.cs already uses.
 string FormatIst(DateTimeOffset t) => t.ToOffset(TimeSpan.FromHours(5.5)).ToString("HH:mm:ss");
@@ -41,6 +44,7 @@ string FormatIst(DateTimeOffset t) => t.ToOffset(TimeSpan.FromHours(5.5)).ToStri
 
     return (positional.ToArray(), named);
 }
+#endif // RESEARCH_LEGACY_COMMANDS
 
 // 2026-09-17 volume-cadence plan. Usage:
 //   dotnet run --project NiftySignal.VolumeBarData -- <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [barVolumeThreshold] [sourceDatabaseNameOverride]
@@ -116,6 +120,15 @@ var baseConnectionString = configuration.GetConnectionString("NiftySignalDb")
 var volumeBarConnectionString = new NpgsqlConnectionStringBuilder(baseConnectionString) { Database = VolumeBarPopulator.VolumeBarDatabaseName }.ConnectionString;
 var volumeBarOptions = new DbContextOptionsBuilder<VolumeBarDbContext>().UseNpgsql(volumeBarConnectionString).Options;
 
+// TEMPORARILY DISABLED (2026-09-25, build-speed): this project's Program.cs accumulated 60+ CLI
+// commands as one enormous top-level Main, which makes every build of this project slow (~7-8 min
+// in a cold/resource-constrained container). Everything except the three commands the current
+// reversal-contract research needs (reversal-research/export-ticks/research-from-files, just below)
+// is excluded from compilation via #if. Nothing is deleted -- define RESEARCH_LEGACY_COMMANDS
+// (e.g. dotnet build -p:DefineConstants=RESEARCH_LEGACY_COMMANDS) or remove this #if/#endif pair to
+// restore it. IMPORTANT: this is a shared branch -- pulling it elsewhere (e.g. onto the VM) means
+// these commands are unavailable until re-enabled.
+#if RESEARCH_LEGACY_COMMANDS
 if (args.Length > 0 && string.Equals(args[0], "analyze", StringComparison.OrdinalIgnoreCase))
 {
     if (args.Length < 2 || !DateOnly.TryParseExact(args[1], "yyyy-MM-dd", out var analyzeDate))
@@ -451,6 +464,8 @@ if (args.Length > 0 && string.Equals(args[0], "replay-live-futures-crossover-bot
     return await ReplayLiveFuturesCrossoverCommand.RunBothStrategiesAsync(baseConnectionString, fbDate, fbThreshold, CancellationToken.None);
 }
 
+#endif // RESEARCH_LEGACY_COMMANDS (region 1)
+
 var tradeSourceConnectionString = new NpgsqlConnectionStringBuilder(baseConnectionString) { Database = "niftysignal_vm_copy" }.ConnectionString;
 var tradeSourceOptions = new DbContextOptionsBuilder<NiftySignalDbContext>().UseNpgsql(tradeSourceConnectionString).Options;
 if (args.Length > 0 && args[0] == "reversal-research")
@@ -473,6 +488,14 @@ if (args.Length > 0 && string.Equals(args[0], "research-from-files", StringCompa
 {
     return await FileBackedResearchRunner.RunAsync(args);
 }
+
+Console.WriteLine($"Unknown command '{(args.Length > 0 ? args[0] : "(none)")}'. Known commands while " +
+    "RESEARCH_LEGACY_COMMANDS is undefined: reversal-research, export-ticks, research-from-files.");
+return 1;
+
+// TEMPORARILY DISABLED (2026-09-25, build-speed) -- see the matching #if above these three commands.
+// Everything from here to end-of-file is excluded from compilation the same way.
+#if RESEARCH_LEGACY_COMMANDS
 
 // Phase G (docs/LIVE_PARITY_PLAN.md) performance-review helper: measures, READ-ONLY against the
 // real historical source (niftysignal_vm_copy -- never written to), the wall-clock cost of the
@@ -18061,3 +18084,5 @@ for (var date = fromDate; date <= toDate; date = date.AddDays(1))
 
 Console.WriteLine($"Done. {populatedDays} day(s) populated, {skippedDays} day(s) skipped.");
 return 0;
+
+#endif // RESEARCH_LEGACY_COMMANDS (region 2)
