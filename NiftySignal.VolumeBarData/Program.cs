@@ -453,6 +453,10 @@ if (args.Length > 0 && string.Equals(args[0], "replay-live-futures-crossover-bot
 
 var tradeSourceConnectionString = new NpgsqlConnectionStringBuilder(baseConnectionString) { Database = "niftysignal_vm_copy" }.ConnectionString;
 var tradeSourceOptions = new DbContextOptionsBuilder<NiftySignalDbContext>().UseNpgsql(tradeSourceConnectionString).Options;
+if (args.Length > 0 && args[0] == "reversal-research")
+{
+    return await ReversalResearch.RunAsync(tradeSourceOptions, args);
+}
 
 // Phase G (docs/LIVE_PARITY_PLAN.md) performance-review helper: measures, READ-ONLY against the
 // real historical source (niftysignal_vm_copy -- never written to), the wall-clock cost of the

@@ -1,0 +1,19 @@
+  NiftySignal.Domain -> D:\Projects\NSE\NiftySignal.Domain\bin\Debug\net10.0\NiftySignal.Domain.dll
+  NiftySignal.Pricing -> D:\Projects\NSE\NiftySignal.Pricing\bin\Debug\net10.0\NiftySignal.Pricing.dll
+  NiftySignal.Notifications -> D:\Projects\NSE\NiftySignal.Notifications\bin\Debug\net10.0\NiftySignal.Notifications.dll
+  NiftySignal.Ingestion -> D:\Projects\NSE\NiftySignal.Ingestion\bin\Debug\net10.0\NiftySignal.Ingestion.dll
+  NiftySignal.Persistence -> D:\Projects\NSE\NiftySignal.Persistence\bin\Debug\net10.0\NiftySignal.Persistence.dll
+  NiftySignal.Features -> D:\Projects\NSE\NiftySignal.Features\bin\Debug\net10.0\NiftySignal.Features.dll
+  NiftySignal.Scoring -> D:\Projects\NSE\NiftySignal.Scoring\bin\Debug\net10.0\NiftySignal.Scoring.dll
+  NiftySignal.Rules -> D:\Projects\NSE\NiftySignal.Rules\bin\Debug\net10.0\NiftySignal.Rules.dll
+  NiftySignal.Execution -> D:\Projects\NSE\NiftySignal.Execution\bin\Debug\net10.0\NiftySignal.Execution.dll
+  NiftySignal.BacktestData -> D:\Projects\NSE\NiftySignal.BacktestData\bin\Debug\net10.0\NiftySignal.BacktestData.dll
+  NiftySignal.VolumeBarData -> D:\Projects\NSE\NiftySignal.VolumeBarData\bin\Debug\net10.0\NiftySignal.VolumeBarData.dll
+  NiftySignal.Host -> D:\Projects\NSE\NiftySignal.Host\bin\Debug\net10.0\NiftySignal.Host.dll
+  NiftySignal.Backtest -> D:\Projects\NSE\NiftySignal.Backtest\bin\Debug\net10.0\NiftySignal.Backtest.dll
+  NiftySignal.MetricTrials -> D:\Projects\NSE\NiftySignal.MetricTrials\bin\Debug\net10.0\NiftySignal.MetricTrials.dll
+  NiftySignal.Tests -> D:\Projects\NSE\NiftySignal.Tests\bin\Debug\net10.0\NiftySignal.Tests.dll
+Test run for D:\Projects\NSE\NiftySignal.Tests\bin\Debug\net10.0\NiftySignal.Tests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+
+Passed!  - Failed:     0, Passed:  1082, Skipped:     0, Total:  1082, Duration: 1 s - NiftySignal.Tests.dll (net10.0)

@@ -1,0 +1,18 @@
+[
+  {
+    "Path": "D:\\Projects\\NSE\\vc-13k-final-pre-oos-freeze.json",
+    "Hash": "3E595A12F7F50511A97E07E070F0450D90A6F173FA2111D0F9FA8B3603F39CD1"
+  },
+  {
+    "Path": "D:\\Projects\\NSE\\vc-forward-v1-13K_180S_FULLSURFACE_V1-freeze.json",
+    "Hash": "8ABF14DCFB8289ABBBA9A1B6F6BCB39EB1FA79B19EF0530BE504BCE2B85539D8"
+  },
+  {
+    "Path": "D:\\Projects\\NSE\\vc-forward-v1-signals.csv",
+    "Hash": "0931DF035D53BE3E7DAFEDBF909527EE37CCB836D4E6D792C931400D4A7BBDE7"
+  },
+  {
+    "Path": "D:\\Projects\\NSE\\vc-forward-v1-trades.csv",
+    "Hash": "44208AAEFF2980E1EF20B2A25607B786C3B2293C16E333C1E85775B7E9AF3D78"
+  }
+]

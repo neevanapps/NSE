@@ -1,0 +1,25 @@
+  NiftySignal.Domain -> D:\Projects\NSE\NiftySignal.Domain\bin\Debug\net10.0\NiftySignal.Domain.dll
+  FlatTradeSpike -> D:\Projects\NSE\spikes\FlatTradeSpike\bin\Debug\net10.0\FlatTradeSpike.dll
+  NiftySignal.Ingestion -> D:\Projects\NSE\NiftySignal.Ingestion\bin\Debug\net10.0\NiftySignal.Ingestion.dll
+  NiftySignal.Persistence -> D:\Projects\NSE\NiftySignal.Persistence\bin\Debug\net10.0\NiftySignal.Persistence.dll
+  NiftySignal.Notifications -> D:\Projects\NSE\NiftySignal.Notifications\bin\Debug\net10.0\NiftySignal.Notifications.dll
+  NiftySignal.Pricing -> D:\Projects\NSE\NiftySignal.Pricing\bin\Debug\net10.0\NiftySignal.Pricing.dll
+  NiftySignal.Features -> D:\Projects\NSE\NiftySignal.Features\bin\Debug\net10.0\NiftySignal.Features.dll
+  NiftySignal.Scoring -> D:\Projects\NSE\NiftySignal.Scoring\bin\Debug\net10.0\NiftySignal.Scoring.dll
+  NiftySignal.Rules -> D:\Projects\NSE\NiftySignal.Rules\bin\Debug\net10.0\NiftySignal.Rules.dll
+  NiftySignal.Execution -> D:\Projects\NSE\NiftySignal.Execution\bin\Debug\net10.0\NiftySignal.Execution.dll
+  NiftySignal.BacktestData -> D:\Projects\NSE\NiftySignal.BacktestData\bin\Debug\net10.0\NiftySignal.BacktestData.dll
+  NiftySignal.VolumeBarData -> D:\Projects\NSE\NiftySignal.VolumeBarData\bin\Debug\net10.0\NiftySignal.VolumeBarData.dll
+  NiftySignal.Host -> D:\Projects\NSE\NiftySignal.Host\bin\Debug\net10.0\NiftySignal.Host.dll
+  NiftySignal.Backtest -> D:\Projects\NSE\NiftySignal.Backtest\bin\Debug\net10.0\NiftySignal.Backtest.dll
+  NiftySignal.MetricTrials -> D:\Projects\NSE\NiftySignal.MetricTrials\bin\Debug\net10.0\NiftySignal.MetricTrials.dll
+  NiftySignal.Dashboard -> D:\Projects\NSE\NiftySignal.Dashboard\bin\Debug\net10.0\NiftySignal.Dashboard.dll
+  NiftySignal.ScoreReplay -> D:\Projects\NSE\NiftySignal.ScoreReplay\bin\Debug\net10.0\NiftySignal.ScoreReplay.dll
+  NiftySignal.CoreScoreReplayDiff -> D:\Projects\NSE\NiftySignal.CoreScoreReplayDiff\bin\Debug\net10.0\NiftySignal.CoreScoreReplayDiff.dll
+  NiftySignal.Tests -> D:\Projects\NSE\NiftySignal.Tests\bin\Debug\net10.0\NiftySignal.Tests.dll
+
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+
+Time Elapsed 00:01:47.04

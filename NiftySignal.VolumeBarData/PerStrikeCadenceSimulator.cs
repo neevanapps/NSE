@@ -21,6 +21,8 @@ namespace NiftySignal.VolumeBarData;
 /// </summary>
 public static class PerStrikeCadenceSimulator
 {
+    // DEFERRED (audit finding F65) — historical LTP fills predate decisions and missing cadences stretch
+    // MA windows; diagnostic only. Strict timing research is isolated in ReversalResearch. See docs/REVIEW_FINDINGS.md.
     static readonly TimeSpan IstOffset = TimeSpan.FromHours(5.5);
     static readonly TimeOnly MarketOpen = new(9, 15);
     static readonly TimeOnly MarketClose = new(15, 30);
@@ -114,10 +116,9 @@ public static class PerStrikeCadenceSimulator
                     && lastPrice is { } ep && ep >= minEntryPrice && ep <= maxEntryPrice)
                 {
                     open = (instrument, bucketEnd, ep);
-                    // Single-open-position invariant: stop scanning further strikes this bucket
-                    // once one has fired -- matches every other simulator in this project (one
-                    // signal per bucket can open at most one trade).
-                    break;
+                    // Audit finding F63: every token must observe EVERY cadence, including
+                    // those after the purchased token in strike order. `open` already prevents
+                    // a second entry; breaking here silently skipped other tokens' readings.
                 }
             }
         }

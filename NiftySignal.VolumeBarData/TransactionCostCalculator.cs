@@ -21,6 +21,8 @@ namespace NiftySignal.VolumeBarData;
 /// </summary>
 public static class TransactionCostCalculator
 {
+    // DEFERRED (audit finding F64) — legacy STT and omitted charges understate September 2026 costs;
+    // retained for frozen-strategy reproducibility. New research uses ReversalResearch.Fees. See docs/REVIEW_FINDINGS.md.
     public const decimal SttRateOnSellPremium = 0.000625m;
     public const decimal GstRate = 0.18m;
 

@@ -3307,4 +3307,41 @@ Nifty rows — behaviorally a no-op today. This closes the gap before the next
 - No live/VM changes — this fix is entirely inside `NiftySignal.VolumeBarData`, does not touch
   `NiftySignal.Host`/`NiftySignal.Dashboard`, and nothing was deployed.
 
-**Numbering note:** F63 is next-free going forward.
+**Numbering note:** F63 was next-free at this entry; see the subsequent entries below.
+
+## 2026-09-25 — F63: per-contract cadence updates skipped after another strike entered — fixed
+
+`PerStrikeCadenceSimulator.SimulateDayAsync` broke its strike loop after an entry. Later tokens
+did not observe that bucket; on the next bucket their cursors discarded those skipped ticks.
+Removed the break: the open-position check already prevents another simultaneous entry.
+Regression fixture: the first strike buys at 45 seconds; the second must still observe its own
+45-second bucket and buy at 75 seconds, not falsely at 60 seconds. See `ReversalResearchTests`.
+
+## 2026-09-25 — F64: frozen research cost model is incomplete and STT is outdated — deferred
+
+`TransactionCostCalculator` assumes sell STT 0.0625%, no exchange/SEBI/stamp charges, and GST
+only on brokerage. NSE's current STT page states 0.15% from April 1, 2026. Preserve this code
+and all frozen forward records as explicitly requested; do not silently rewrite their P&L.
+New isolated research models current charges in `ReversalResearch.Fees`, with sources and
+assumptions in `docs/REVERSAL_RESEARCH_2026-09-25.md`. Legacy numbers are not after-all-cost results.
+
+## 2026-09-25 — F65: legacy per-strike execution and missing-window timing — deferred
+
+`PerStrikeCadenceSimulator` labels a last price at/before bucket close as a fill at close;
+there is no post-decision order or spread/cost model. Null observations preserve previous
+history, so 40 nonempty observations can span more than ten minutes. Its 2/10 default means
+30/150 seconds on uninterrupted 15-second data, not 2/10 minutes. Preserve this diagnostic
+API; the new separate runner explicitly uses 8/40, resets on an empty interval, fills on
+strictly later valid quotes and never fabricates missing exits. See the new research report.
+
+## 2026-09-25 — F66: receipt availability and depth-field age absent from legacy replay — deferred
+
+`OptionTickSeries.Entry` carries exchange timestamp but omits `Tick.ReceivedAt`. An exchange-time
+as-of lookup can therefore use a snapshot that had not arrived by the decision. The first raw
+September 4 audit measured thousands of such boundary-crossing arrivals per token, with some
+delays over 20 seconds. `FlatTradeFeedState.ApplyDelta` also carries prior LTP/depth fields
+into new snapshots without persisting their individual refresh times. Snapshot age cannot
+establish the last trade's age or the book's age; this limitation cannot be repaired from the
+persisted snapshots alone. The new research uses receipt-available observations and later
+fill timestamps, but explicitly labels quoted P&L conditional. Frozen code behavior and
+forward records are preserved; no ingestion/deployment changes are part of this task.

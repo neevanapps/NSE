@@ -13,6 +13,9 @@ namespace NiftySignal.VolumeBarData;
 /// </summary>
 public sealed class OptionTickSeries
 {
+    // DEFERRED (audit finding F66) — exchange-time-only entries omit receipt availability and
+    // carried depth has no field-refresh timestamp; frozen fills cannot establish quote freshness.
+    // Preserve legacy records; the isolated research replay checks receipt timing. See docs/REVIEW_FINDINGS.md.
     public readonly record struct Entry(DateTimeOffset Timestamp, decimal LastPrice, long VolumeDelta, MarketDepth? Depth, long? OpenInterest);
 
     readonly List<Entry> _series;

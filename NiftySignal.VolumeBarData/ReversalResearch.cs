@@ -1,0 +1,349 @@
+using System.Globalization;
+using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
+using NiftySignal.Domain.Entities;
+using NiftySignal.Domain.Enums;
+using NiftySignal.Persistence;
+
+namespace NiftySignal.VolumeBarData;
+
+/// <summary>Isolated, raw-tick research. Never calls the frozen forward runner or writes a database.</summary>
+public static class ReversalResearch
+{
+    public sealed record Print(long Id, DateTimeOffset Time, DateTimeOffset Received, decimal Price,
+        decimal Bid, decimal Ask, long BidQty, long AskQty);
+    public sealed record Reading(DateTimeOffset End, decimal? Average, int Count, decimal? Fast,
+        decimal? Slow, decimal? Gap, bool Up, bool Down);
+    public sealed record Signal(DateTimeOffset Time, string Side, string Token, string Reason, decimal Gap,
+        bool Extended = false, decimal? Forward1 = null, decimal? Forward2 = null, decimal? Forward5 = null);
+    public sealed record Trade(string Side, string Token, DateTimeOffset Decision, DateTimeOffset Entry,
+        DateTimeOffset ExitDecision, DateTimeOffset Exit, decimal Buy, decimal Sell, int Quantity,
+        decimal Gross, decimal Fees, decimal Net, decimal Mfe, decimal Mae, double Seconds, string Reason, long EntryId, long ExitId);
+    public sealed record ActionRow(DateTimeOffset Time, string Action, string Token, string Reason);
+    public sealed record Simulation(List<Trade> Trades, List<ActionRow> Decisions, int Unresolved);
+    public sealed record PatternRow(DateTimeOffset Time, string State, bool StateEntry, bool Full,
+        decimal Move, decimal Future, int Index, decimal? Forward1, decimal? Forward2, decimal? Forward4);
+    static readonly TimeSpan Ist = TimeSpan.FromHours(5.5);
+    static readonly JsonSerializerOptions Json = new() { WriteIndented = true };
+    public static DateTimeOffset At(DateOnly date, int hour, int minute) => new(date.ToDateTime(new TimeOnly(hour, minute)), Ist);
+
+    public static List<Reading> Cadences(IReadOnlyList<Print> ticks, DateTimeOffset start, DateTimeOffset end,
+        int fast = 8, int slow = 40)
+    {
+        var result = new List<Reading>();
+        var window = new Queue<decimal>();
+        decimal? previous = null;
+        var cursor = 0;
+        for (var left = start; left < end; left += TimeSpan.FromSeconds(15))
+        {
+            var right = left.AddSeconds(15);
+            decimal sum = 0; int count = 0;
+            while (cursor < ticks.Count && ticks[cursor].Time <= right)
+            {
+                var tick = ticks[cursor++];
+                if (tick.Time > left && tick.Price > 0 && tick.Received <= right) { sum += tick.Price; count++; }
+            }
+            if (count == 0)
+            {
+                window.Clear(); previous = null;
+                result.Add(new(right, null, 0, null, null, null, false, false));
+                continue;
+            }
+            var avg = sum / count;
+            window.Enqueue(avg);
+            if (window.Count > slow) { window.Dequeue(); }
+            decimal? f = window.Count >= fast ? window.TakeLast(fast).Average() : null;
+            decimal? s = window.Count == slow ? window.Average() : null;
+            decimal? gap = f - s;
+            result.Add(new(right, avg, count, f, s, gap, previous <= 0 && gap > 0, previous >= 0 && gap < 0));
+            previous = gap;
+        }
+        return result;
+    }
+
+    public static Print? Before(IReadOnlyList<Print> ticks, DateTimeOffset time)
+    {
+        int lo = 0, hi = ticks.Count;
+        while (lo < hi) { var m = (lo + hi) / 2; if (ticks[m].Time <= time) { lo = m + 1; } else { hi = m; } }
+        while (lo > 0 && ticks[lo - 1].Received > time) { lo--; }
+        return lo == 0 ? null : ticks[lo - 1];
+    }
+    public static bool Valid(Print p, int qty) => p.Bid > 0 && p.Ask >= p.Bid && p.BidQty >= qty && p.AskQty >= qty;
+    public static decimal Fees(decimal buy, decimal sell, int qty)
+    {
+        var turnover = (buy + sell) * qty;
+        return Math.Round(sell * qty * .0015m + turnover * (.0003503m + .000001m) * 1.18m + buy * qty * .00003m, 2);
+    }
+    public static Print? Fill(IReadOnlyList<Print> ticks, DateTimeOffset decision, int qty, bool entry)
+    {
+        var minimum = decision.AddSeconds(1);
+        // Entry expires after one cadence. An exit remains pending, never backdates its fill.
+        return ticks.Where(p => p.Time >= minimum && Valid(p, qty))
+            .Select(p => p with { Time = p.Received > p.Time ? p.Received : p.Time })
+            .Where(p => !entry || p.Time <= decision.AddSeconds(15)).OrderBy(p => p.Time).ThenBy(p => p.Id).FirstOrDefault();
+    }
+    static bool Fresh(Print? p, DateTimeOffset at) => p is not null && at - p.Time <= TimeSpan.FromSeconds(15);
+
+    public static List<Signal> CrossSignals(Instrument instrument, IReadOnlyList<Print> ticks,
+        IReadOnlyList<Reading> readings, string mode)
+    {
+        var signals = new List<Signal>();
+        int? armed = null;
+        for (var b = 0; b < readings.Count; b++)
+        {
+            var r = readings[b];
+            if (r.Gap is null || r.Gap <= 0) { armed = null; }
+            if (r.Up) { armed = b; }
+            var p = Before(ticks, r.End);
+            if (!Fresh(p, r.End) || !Valid(p!, instrument.LotSize)) { continue; }
+            var hurdle = p!.Ask - p.Bid + instrument.TickSize * 2 + Fees(p.Ask, p.Bid, instrument.LotSize) / instrument.LotSize;
+            var fires = mode switch
+            {
+                "C0" => r.Up,
+                "C1" => r.Up && r.Gap >= hurdle,
+                "C2" => armed is { } a && b - a < 8 && r.Gap >= hurdle,
+                _ => throw new ArgumentException("Unknown mode", nameof(mode))
+            };
+            if (!fires) { continue; }
+            armed = null;
+            if (p.Ask < 100 || p.Ask > 150) { continue; }
+            signals.Add(new(r.End, instrument.OptionType.ToString(), instrument.Token, mode, r.Gap ?? 0));
+        }
+        return signals;
+    }
+
+    public static Simulation Simulate(DateOnly date, List<Signal> signals, Dictionary<string, Instrument> instruments,
+        Dictionary<string, List<Print>> ticks, Func<Signal, IEnumerable<DateTimeOffset>> exitTimes)
+    {
+        var trades = new List<Trade>(); var decisions = new List<ActionRow>();
+        var busyUntil = DateTimeOffset.MinValue; int unresolved = 0;
+        foreach (var group in signals.GroupBy(s => s.Time).OrderBy(g => g.Key))
+        {
+            if (group.Key >= At(date, 15, 0)) { decisions.Add(new(group.Key, "WAIT", "", "Entry cutoff")); continue; }
+            if (group.Key <= busyUntil) { decisions.Add(new(group.Key, "WAIT", "", "Position or exit order active")); continue; }
+            var selected = group.OrderBy(s => { var p = Before(ticks[s.Token], s.Time)!; return (p.Ask - p.Bid) / p.Ask; })
+                .ThenBy(s => s.Token, StringComparer.Ordinal).First();
+            var inst = instruments[selected.Token];
+            var series = ticks[selected.Token];
+            var entry = Fill(series, selected.Time, inst.LotSize, true);
+            if (entry is null || entry.Time >= At(date, 15, 0))
+            { decisions.Add(new(selected.Time, "WAIT", selected.Token, "No timely valid entry quote")); continue; }
+            var exitDecision = exitTimes(selected).Where(t => t > entry.Time && t < At(date, 15, 15))
+                .Append(At(date, 15, 15)).Min();
+            var exit = Fill(series, exitDecision, inst.LotSize, false);
+            if (exit is null)
+            {
+                unresolved++; busyUntil = At(date, 15, 30);
+                decisions.Add(new(exitDecision, "UNRESOLVED", inst.Token, "No valid quote after exit order; P&L unknown")); continue;
+            }
+            var buy = entry.Ask + inst.TickSize; var sell = exit.Bid - inst.TickSize;
+            var path = series.Where(p => p.Time >= entry.Time && p.Time <= exit.Time).ToList();
+            var gross = (sell - buy) * inst.LotSize;
+            var fees = Fees(buy, sell, inst.LotSize);
+            var reason = exitDecision == At(date, 15, 15) ? "ScheduledClose" : "PremiseReversed";
+            trades.Add(new(selected.Side, inst.Token, selected.Time, entry.Time, exitDecision, exit.Time, buy, sell,
+                inst.LotSize, gross, fees, gross - fees, Math.Max(0, path.Max(p => p.Price) - buy),
+                Math.Max(0, buy - path.Min(p => p.Price)), (exit.Time - entry.Time).TotalSeconds, reason, entry.Id, exit.Id));
+            decisions.Add(new(selected.Time, "BUY", inst.Token, $"{selected.Reason}; fill {entry.Time:O}; ask+tick {buy}"));
+            decisions.Add(new(exitDecision, "EXIT", inst.Token, $"{reason}; fill {exit.Time:O}; bid-tick {sell}"));
+            busyUntil = exit.Time;
+        }
+        return new(trades, decisions, unresolved);
+    }
+
+    public static object Summary(IEnumerable<Trade> source)
+    {
+        var t = source.OrderBy(t => t.Exit).ToList();
+        decimal equity = 0, peak = 0, drawdown = 0;
+        foreach (var row in t) { equity += row.Net; peak = Math.Max(peak, equity); drawdown = Math.Max(drawdown, peak - equity); }
+        var profit = t.Sum(x => Math.Max(0, x.Net)); var loss = t.Sum(x => Math.Max(0, -x.Net));
+        return new { Count = t.Count, Net = equity, PF = loss > 0 ? profit / loss : (decimal?)null,
+            WinPercent = t.Count > 0 ? 100m * t.Count(x => x.Net > 0) / t.Count : 0, Drawdown = drawdown,
+            BestTrade = t.Count > 0 ? t.Max(x => x.Net) : 0, NetWithoutBestTrade = t.Count > 0 ? equity - t.Max(x => x.Net) : 0,
+            MeanMfePoints = t.Count > 0 ? t.Average(x => x.Mfe) : 0, MeanMaePoints = t.Count > 0 ? t.Average(x => x.Mae) : 0,
+            MeanSeconds = t.Count > 0 ? t.Average(x => x.Seconds) : 0 };
+    }
+
+    public static async Task<int> RunAsync(DbContextOptions<NiftySignalDbContext> options, string[] args)
+    {
+        CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
+        var output = args.Length > 1 ? args[1] : "research-reversal";
+        Directory.CreateDirectory(output);
+        await using var db = new NiftySignalDbContext(options);
+        db.ChangeTracker.QueryTrackingBehavior = QueryTrackingBehavior.NoTracking;
+        db.Database.SetCommandTimeout(300);
+        await db.Database.OpenConnectionAsync();
+        await db.Database.ExecuteSqlRawAsync("SET default_transaction_read_only = on");
+        var dates = await db.Instruments.Where(i => i.Underlying == "NIFTY" && i.InstrumentType == InstrumentType.Option)
+            .Select(i => i.AsOfDate).Distinct().OrderBy(d => d).ToListAsync();
+        Console.WriteLine($"Read-only database: {db.Database.GetDbConnection().Database}. Available instrument dates: {string.Join(',', dates)}");
+        if (args.Contains("--inventory")) { return 0; }
+        if (args.Contains("--snapshot25"))
+        {
+            var date = new DateOnly(2026, 9, 25);
+            var tokens = await db.Instruments.Where(i => i.AsOfDate == date && i.Underlying == "NIFTY").Select(i => i.Token).ToListAsync();
+            var from = At(date, 9, 15).ToUniversalTime(); var to = At(date, 15, 30).ToUniversalTime();
+            var summary = await db.Ticks.Where(t => tokens.Contains(t.Token) && t.ExchangeTimestamp >= from && t.ExchangeTimestamp <= to)
+                .GroupBy(t => t.Token).Select(g => new { Token = g.Key, Count = g.LongCount(), First = g.Min(t => t.ExchangeTimestamp),
+                    Last = g.Max(t => t.ExchangeTimestamp), MaxId = g.Max(t => t.Id), LastReceived = g.Max(t => t.ReceivedAt) }).ToListAsync();
+            await File.WriteAllTextAsync(Path.Combine(output, "september25-metadata.json"), JsonSerializer.Serialize(new { CheckedAt = DateTimeOffset.UtcNow, summary }, Json));
+            Console.WriteLine($"September 25 metadata only: {summary.Count} tokens, {summary.Sum(s => s.Count):N0} ticks. No strategy evaluated.");
+            return 0;
+        }
+        var requested = args.FirstOrDefault(a => a.StartsWith("--date=", StringComparison.Ordinal));
+        var researchDates = dates.Where(d => d >= new DateOnly(2026, 9, 4) && d <= new DateOnly(2026, 9, 23)
+            && (requested is null || d == DateOnly.Parse(requested[7..]))).ToList();
+        var daily = new List<object>();
+        foreach (var date in researchDates)
+        {
+            Console.WriteLine($"Loading {date:yyyy-MM-dd} raw option ticks...");
+            var chainAll = await db.Instruments.Where(i => i.AsOfDate == date && i.Underlying == "NIFTY"
+                && i.InstrumentType == InstrumentType.Option && i.ExpiryDate >= date).ToListAsync();
+            var expiry = chainAll.Min(i => i.ExpiryDate)!.Value;
+            var chain = chainAll.Where(i => i.ExpiryDate == expiry).OrderBy(i => i.Token).ToDictionary(i => i.Token);
+            var start = At(date, 9, 15).ToUniversalTime(); var end = At(date, 15, 30).ToUniversalTime();
+            var ticks = new Dictionary<string, List<Print>>(); var readings = new Dictionary<string, List<Reading>>();
+            var coverage = new List<object>(); var samples = new List<object>();
+            foreach (var inst in chain.Values)
+            {
+                var token = inst.Token;
+                var list = await db.Ticks.Where(t => t.Token == token && t.ExchangeTimestamp >= start && t.ExchangeTimestamp <= end && t.LastPrice > 0)
+                    .OrderBy(t => t.ExchangeTimestamp).ThenBy(t => t.Id)
+                    .Select(t => new Print(t.Id, t.ExchangeTimestamp, t.ReceivedAt, t.LastPrice,
+                        t.Depth == null ? 0 : t.Depth.Bid1Price, t.Depth == null ? 0 : t.Depth.Ask1Price,
+                        t.Depth == null ? 0 : t.Depth.Bid1Qty, t.Depth == null ? 0 : t.Depth.Ask1Qty)).ToListAsync();
+                ticks[token] = list; var bars = Cadences(list, start, end); readings[token] = bars;
+                coverage.Add(new { token, inst.OptionType, inst.StrikePrice, inst.LotSize, Count = list.Count,
+                    First = list.FirstOrDefault()?.Time, Last = list.LastOrDefault()?.Time,
+                    Empty = bars.Count(b => b.Count == 0), Warm = bars.Count(b => b.Gap is not null),
+                    InvalidQuotes = list.Count(p => !Valid(p, inst.LotSize)),
+                    ReceiptAfterCadence = list.Count(p => p.Received > start.AddSeconds(Math.Ceiling((p.Time - start).TotalSeconds / 15) * 15)),
+                    MaxReceiptLagSeconds = list.Count > 0 ? list.Max(p => (p.Received - p.Time).TotalSeconds) : 0 });
+                if (list.Count == 0) { continue; }
+                foreach (var index in new[] { 0, 39, 40, 120, 800 })
+                {
+                    var bar = bars[index]; var raw = list.Where(p => p.Time > bar.End.AddSeconds(-15) && p.Time <= bar.End && p.Received <= bar.End).ToList();
+                    decimal? direct = raw.Count > 0 ? raw.Average(p => p.Price) : null;
+                    if (direct != bar.Average || raw.Count != bar.Count) { throw new InvalidOperationException("Raw mean mismatch"); }
+                    if (samples.Count < 20) { samples.Add(new { token, bar, RawTicks = raw }); }
+                }
+            }
+            Console.WriteLine($"{date}: {ticks.Sum(kv => kv.Value.Count):N0} ticks, {chain.Count} tokens; cadence means verified.");
+            var experiments = new Dictionary<string, object>();
+            foreach (var side in new[] { OptionType.Call, OptionType.Put })
+            {
+                foreach (var mode in new[] { "C0", "C1", "C2" })
+                {
+                    var signals = chain.Values.Where(i => i.OptionType == side)
+                        .SelectMany(i => CrossSignals(i, ticks[i.Token], readings[i.Token], mode)).ToList();
+                    signals = signals.Select(s => Forward(s, ticks[s.Token])).ToList();
+                    var simulation = Simulate(date, signals, chain, ticks,
+                        s => readings[s.Token].Where(r => r.Down).Select(r => r.End));
+                    experiments[$"{mode}-{side}"] = new { Summary = Summary(simulation.Trades), simulation, signals };
+                }
+            }
+            var futureBars = await FutureEventBarBuilder.BuildDayAsync(db, date, 13000, CancellationToken.None);
+            var future = await db.Instruments.Where(i => i.AsOfDate == date && i.Underlying == "NIFTY" && i.InstrumentType == InstrumentType.Future)
+                .OrderBy(i => i.ExpiryDate).FirstAsync();
+            var futureReceipts = await db.Ticks.Where(t => t.Token == future.Token && t.ExchangeTimestamp >= start && t.ExchangeTimestamp <= end)
+                .OrderBy(t => t.ExchangeTimestamp).ThenBy(t => t.Id).Select(t => new { t.ExchangeTimestamp, t.ReceivedAt }).ToListAsync();
+            var available = new List<DateTimeOffset>(); var latestReceipt = start; var fc = 0;
+            foreach (var bar in futureBars)
+            {
+                while (fc < futureReceipts.Count && futureReceipts[fc].ExchangeTimestamp <= bar.EndTimestamp)
+                { latestReceipt = latestReceipt > futureReceipts[fc].ReceivedAt ? latestReceipt : futureReceipts[fc].ReceivedAt; fc++; }
+                available.Add(latestReceipt > bar.EndTimestamp ? latestReceipt : bar.EndTimestamp);
+            }
+            var patternRows = Patterns(chain, ticks, futureBars, available);
+            var referencePatterns = Patterns(chain, ticks, futureBars, futureBars.Select(b => b.EndTimestamp).ToList(), false);
+            var patternSignals = new List<Signal>();
+            foreach (var row in patternRows.Where(r => r.StateEntry && r.Full))
+            {
+                var side = row.State == "A" ? OptionType.Put : OptionType.Call;
+                var eligible = chain.Values.Where(i => i.OptionType == side).Select(i => (i, p: Before(ticks[i.Token], row.Time)))
+                    .Where(x => Fresh(x.p, row.Time) && Valid(x.p!, x.i.LotSize) && x.p!.Ask >= 100 && x.p.Ask <= 150)
+                    .OrderBy(x => (x.p!.Ask - x.p.Bid) / x.p.Ask).ThenBy(x => x.i.Token, StringComparer.Ordinal).FirstOrDefault();
+                if (eligible.i is null) { continue; }
+                var history = readings[eligible.i.Token].Where(r => r.End <= row.Time && r.Slow is not null && r.Average is not null).TakeLast(41).ToList();
+                var extended = history.Count < 41 || eligible.p!.Price - history[^1].Slow!.Value > history.Take(40).Max(r => r.Average!.Value - r.Slow!.Value);
+                patternSignals.Add(Forward(new(row.Time, row.State, eligible.i.Token, "Pattern" + row.State, 0, extended), ticks[eligible.i.Token]));
+            }
+            foreach (var mode in new[] { "P0", "P1" })
+            {
+                var signals = patternSignals.Where(s => mode == "P0" || !s.Extended).ToList();
+                var sim = Simulate(date, signals, chain, ticks, s => patternRows.Where(r => r.StateEntry && r.State is "A" or "B" && r.State != s.Side).Select(r => r.Time));
+                experiments[mode] = new { Summary = Summary(sim.Trades), simulation = sim, signals,
+                    BySide = sim.Trades.GroupBy(t => t.Side).ToDictionary(g => g.Key, g => Summary(g)) };
+            }
+            // Full raw tick paths for deterministic first, best and worst baseline trades.
+            var traceSignals = patternSignals;
+            var traceSim = Simulate(date, traceSignals, chain, ticks, s => patternRows.Where(r => r.StateEntry && r.State is "A" or "B" && r.State != s.Side).Select(r => r.Time));
+            var crossTraceSignals = chain.Values.SelectMany(i => CrossSignals(i, ticks[i.Token], readings[i.Token], "C0")).ToList();
+            var crossTrace = Simulate(date, crossTraceSignals, chain, ticks, s => readings[s.Token].Where(r => r.Down).Select(r => r.End));
+            var traces = traceSim.Trades.Take(1).Concat(traceSim.Trades.OrderBy(t => t.Net).Take(1)).Concat(traceSim.Trades.OrderByDescending(t => t.Net).Take(1))
+                .Concat(crossTrace.Trades.Take(2))
+                .Distinct().Select(t => new { Trade = t, RawTicks = ticks[t.Token].Where(p => p.Time >= t.Decision.AddSeconds(-15) && p.Time <= t.Exit).ToList() }).ToList();
+            var report = new { Date = date, Expiry = expiry, Dte = expiry.DayNumber - date.DayNumber, coverage, samples,
+                patternRows, referencePatterns, experiments, traces, QuoteAge = "Individual field age unavailable; modeled fills only" };
+            var path = Path.Combine(output, $"{date:yyyy-MM-dd}.json");
+            if (File.Exists(path)) { throw new IOException($"Report already exists: {path}; use a fresh run directory"); }
+            await File.WriteAllTextAsync(path, JsonSerializer.Serialize(report, Json));
+            daily.Add(new { Date = date, Dte = expiry.DayNumber - date.DayNumber, Reports = path });
+            Console.WriteLine($"Saved {path}; A/B full-surface state entries={patternRows.Count(r => r.StateEntry && r.Full)}.");
+        }
+        await File.WriteAllTextAsync(Path.Combine(output, "manifest.json"), JsonSerializer.Serialize(daily, Json));
+        return 0;
+    }
+
+    static Signal Forward(Signal s, List<Print> ticks)
+    {
+        var p = Before(ticks, s.Time);
+        decimal? Return(int minutes)
+        {
+            var at = s.Time.AddMinutes(minutes); var q = Before(ticks, at);
+            return Fresh(q, at) && p is not null && p.Price > 0 ? (q!.Price / p.Price - 1) * 100 : null;
+        }
+        return s with { Forward1 = Return(1), Forward2 = Return(2), Forward5 = Return(5) };
+    }
+
+    static List<PatternRow> Patterns(Dictionary<string, Instrument> chain, Dictionary<string, List<Print>> ticks, List<FutureEventBar> bars, List<DateTimeOffset> available, bool causal = true)
+    {
+        var result = new List<PatternRow>(); string previous = "Other";
+        var strikes = chain.Values.Select(i => i.StrikePrice!.Value).Distinct().Order().ToList();
+        for (int b = 0; b < bars.Count; b++)
+        {
+            var current = bars[b];
+            if (current.IsFinalPartialBar) { continue; }
+            var first = bars[AdaptiveWindowAnalysis.FindWindowStartIndex(bars, b, 180)];
+            var strike = strikes.OrderBy(k => Math.Abs(k - current.Close)).ThenBy(k => k).First();
+            decimal? Change(decimal k, OptionType side)
+            {
+                var inst = chain.Values.FirstOrDefault(i => i.StrikePrice == k && i.OptionType == side);
+                if (inst is null) { return null; }
+                Print? Lookup(DateTimeOffset time) => causal ? Before(ticks[inst.Token], time)
+                    : ticks[inst.Token].LastOrDefault(p => p.Time <= time);
+                var a = Lookup(first.StartTimestamp); var z = Lookup(current.EndTimestamp);
+                if (causal && (!Fresh(a, first.StartTimestamp) || !Fresh(z, current.EndTimestamp))) { return null; }
+                return a is null || z is null ? null : z.Price - a.Price;
+            }
+            var move = current.Close - first.Open;
+            var ce = Change(strike, OptionType.Call); var pe = Change(strike, OptionType.Put);
+            var state = current.EndTimestamp - first.StartTimestamp < TimeSpan.FromSeconds(180) ? "Other"
+                : move > 0 && ce < 0 && pe > 0 ? "A" : move < 0 && ce > 0 && pe < 0 ? "B" : "Other";
+            var idx = strikes.IndexOf(strike);
+            bool full = state != "Other" && idx >= 2 && idx + 2 < strikes.Count;
+            if (full)
+            {
+                for (int j = idx - 2; j <= idx + 2; j++)
+                {
+                    var c = Change(strikes[j], OptionType.Call); var p = Change(strikes[j], OptionType.Put);
+                    full &= state == "A" ? c < 0 && p > 0 : c > 0 && p < 0;
+                }
+            }
+            decimal? Fwd(int h) => b + h < bars.Count ? bars[b + h].Close - current.Close : null;
+            result.Add(new(available[b], state, state != previous, full, move, current.Close, b, Fwd(1), Fwd(2), Fwd(4)));
+            previous = state;
+        }
+        return result;
+    }
+}
