@@ -99,6 +99,53 @@ public sealed class ReversalResearchTests
         Assert.Equal(Start.AddSeconds(20), ReversalResearch.Fill([tick], Start, 65, false)!.Time);
     }
 
+    [Fact]
+    public void SimulateGiveback_ExitsOnceRetracementClearsHalfOfPeak()
+    {
+        var inst = Instrument("a", 24000);
+        var instruments = new Dictionary<string, Instrument> { ["a"] = inst };
+        var prints = new[]
+        {
+            Print(0),                                    // decision tick
+            Print(1, price: 121, bid: 119, ask: 121),     // entry fill: buy = 121 + .05 = 121.05
+            Print(15, price: 141, bid: 140, ask: 141),    // peak favorable gain ~19.95
+            Print(30, price: 131, bid: 130, ask: 131),    // gain ~9.95 -- retraced exactly 50% of peak
+            Print(45, price: 200, bid: 199, ask: 201),    // must never be reached
+        };
+        var signals = new List<ReversalResearch.Signal> { new(Start, "A", "a", "PatternA", 0) };
+        var ticks = new Dictionary<string, List<ReversalResearch.Print>> { ["a"] = prints.ToList() };
+
+        var sim = ReversalResearch.SimulateGiveback(Date, signals, instruments, ticks, _ => [], 0.5m);
+
+        var trade = Assert.Single(sim.Trades);
+        Assert.Equal("GivebackExit", trade.Reason);
+        Assert.Equal(Start.AddSeconds(30), trade.ExitDecision);
+    }
+
+    [Fact]
+    public void SimulateGiveback_NoQualifyingRetracement_FallsBackToOppositePatternExit()
+    {
+        var inst = Instrument("a", 24000);
+        var instruments = new Dictionary<string, Instrument> { ["a"] = inst };
+        var prints = new[]
+        {
+            Print(0),
+            Print(1, price: 121, bid: 119, ask: 121),   // entry fill
+            Print(15, price: 141, bid: 140, ask: 141),  // peak ~19.95
+            Print(30, price: 138, bid: 137, ask: 138),  // gain ~16.95 -- only ~15% given back, not 50%
+            Print(35, price: 138, bid: 137, ask: 138),  // exit fill tick (>=1s after the exit decision)
+        };
+        var signals = new List<ReversalResearch.Signal> { new(Start, "A", "a", "PatternA", 0) };
+        var ticks = new Dictionary<string, List<ReversalResearch.Print>> { ["a"] = prints.ToList() };
+        var oppositeAt = Start.AddSeconds(30);
+
+        var sim = ReversalResearch.SimulateGiveback(Date, signals, instruments, ticks, _ => [oppositeAt], 0.5m);
+
+        var trade = Assert.Single(sim.Trades);
+        Assert.Equal("PremiseReversed", trade.Reason);
+        Assert.Equal(oppositeAt, trade.ExitDecision);
+    }
+
     static Instrument Instrument(string token, decimal strike) => new()
     {
         Token = token, TradingSymbol = token, Exchange = Exchange.Nfo, Underlying = "NIFTY", AsOfDate = Date,

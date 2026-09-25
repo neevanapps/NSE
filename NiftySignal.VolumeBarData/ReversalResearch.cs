@@ -151,6 +151,71 @@ public static class ReversalResearch
         return new(trades, decisions, unresolved);
     }
 
+    /// <summary>
+    /// Hypothesis (2026-09-25): P0/P1's only exit is waiting for the full opposite-pattern
+    /// confirmation (or scheduled close) -- at DTE 0/4 this pools' own MFE/MAE ratio (~2x) shows a
+    /// real favorable move is usually available, but win rate is only ~50%, so the wait-for-reversal
+    /// exit is giving back an already-earned move rather than locking any of it in. This tests a
+    /// same-entry exit change only (BACKTEST_RULES rule 14): identical signals/entries as
+    /// Simulate would produce, but additionally exits the instant the position has cleared its own
+    /// round-trip cost (so trailing never triggers on noise smaller than what it costs to trade) and
+    /// then given back half of its own peak favorable excursion since entry -- whichever of
+    /// (giveback, opposite-pattern, scheduled close) comes first. The 50% fraction is a first, simple,
+    /// stated-as-such starting choice, not fit to this data -- not swept here.
+    /// Expected if the hypothesis holds: win rate rises at DTE 0/4 without a worse MAE. Fails if it
+    /// mainly cuts winners short before they fully develop (net roughly unchanged or worse despite a
+    /// higher win rate), or degrades MAE/frequency.
+    /// </summary>
+    public static Simulation SimulateGiveback(DateOnly date, List<Signal> signals, Dictionary<string, Instrument> instruments,
+        Dictionary<string, List<Print>> ticks, Func<Signal, IEnumerable<DateTimeOffset>> exitTimes, decimal givebackFraction)
+    {
+        var trades = new List<Trade>(); var decisions = new List<ActionRow>();
+        var busyUntil = DateTimeOffset.MinValue; int unresolved = 0;
+        foreach (var group in signals.GroupBy(s => s.Time).OrderBy(g => g.Key))
+        {
+            if (group.Key >= At(date, 15, 0)) { decisions.Add(new(group.Key, "WAIT", "", "Entry cutoff")); continue; }
+            if (group.Key <= busyUntil) { decisions.Add(new(group.Key, "WAIT", "", "Position or exit order active")); continue; }
+            var selected = group.OrderBy(s => { var p = Before(ticks[s.Token], s.Time)!; return (p.Ask - p.Bid) / p.Ask; })
+                .ThenBy(s => s.Token, StringComparer.Ordinal).First();
+            var inst = instruments[selected.Token];
+            var series = ticks[selected.Token];
+            var entry = Fill(series, selected.Time, inst.LotSize, true);
+            if (entry is null || entry.Time >= At(date, 15, 0))
+            { decisions.Add(new(selected.Time, "WAIT", selected.Token, "No timely valid entry quote")); continue; }
+            var buy = entry.Ask + inst.TickSize;
+            var minPeak = Fees(buy, buy, inst.LotSize) / inst.LotSize + inst.TickSize;
+            var scheduledClose = At(date, 15, 15);
+            var oppositeTime = exitTimes(selected).Where(t => t > entry.Time && t < scheduledClose).Append(scheduledClose).Min();
+
+            decimal peak = 0; DateTimeOffset? givebackTime = null;
+            foreach (var p in series.Where(p => p.Time > entry.Time && p.Time <= oppositeTime).OrderBy(p => p.Time).ThenBy(p => p.Id))
+            {
+                var gain = p.Price - buy;
+                if (gain > peak) { peak = gain; }
+                if (peak >= minPeak && peak - gain >= givebackFraction * peak) { givebackTime = p.Time; break; }
+            }
+            var exitDecision = givebackTime ?? oppositeTime;
+            var exit = Fill(series, exitDecision, inst.LotSize, false);
+            if (exit is null)
+            {
+                unresolved++; busyUntil = At(date, 15, 30);
+                decisions.Add(new(exitDecision, "UNRESOLVED", inst.Token, "No valid quote after exit order; P&L unknown")); continue;
+            }
+            var sell = exit.Bid - inst.TickSize;
+            var path = series.Where(p => p.Time >= entry.Time && p.Time <= exit.Time).ToList();
+            var gross = (sell - buy) * inst.LotSize;
+            var fees = Fees(buy, sell, inst.LotSize);
+            var reason = givebackTime is not null ? "GivebackExit" : exitDecision == scheduledClose ? "ScheduledClose" : "PremiseReversed";
+            trades.Add(new(selected.Side, inst.Token, selected.Time, entry.Time, exitDecision, exit.Time, buy, sell,
+                inst.LotSize, gross, fees, gross - fees, Math.Max(0, path.Max(p => p.Price) - buy),
+                Math.Max(0, buy - path.Min(p => p.Price)), (exit.Time - entry.Time).TotalSeconds, reason, entry.Id, exit.Id));
+            decisions.Add(new(selected.Time, "BUY", inst.Token, $"{selected.Reason}; fill {entry.Time:O}; ask+tick {buy}"));
+            decisions.Add(new(exitDecision, "EXIT", inst.Token, $"{reason}; fill {exit.Time:O}; bid-tick {sell}"));
+            busyUntil = exit.Time;
+        }
+        return new(trades, decisions, unresolved);
+    }
+
     public static object Summary(IEnumerable<Trade> source)
     {
         var t = source.OrderBy(t => t.Exit).ToList();
@@ -296,6 +361,17 @@ public static class ReversalResearch
             {
                 var signals = patternSignals.Where(s => mode == "P0" || !s.Extended).ToList();
                 var sim = Simulate(date, signals, chain, ticks, s => patternRows.Where(r => r.StateEntry && r.State is "A" or "B" && r.State != s.Side).Select(r => r.Time));
+                experiments[mode] = new { Summary = Summary(sim.Trades), simulation = sim, signals,
+                    BySide = sim.Trades.GroupBy(t => t.Side).ToDictionary(g => g.Key, g => Summary(g)) };
+            }
+            // P2/P3: same-entry comparison against P0/P1 (BACKTEST_RULES rule 14) -- identical
+            // signals, only the exit changes (see SimulateGiveback's own doc comment for the
+            // hypothesis). P2 pairs with P0's signal set, P3 with P1's.
+            foreach (var mode in new[] { "P2", "P3" })
+            {
+                var signals = patternSignals.Where(s => mode == "P2" || !s.Extended).ToList();
+                var sim = SimulateGiveback(date, signals, chain, ticks,
+                    s => patternRows.Where(r => r.StateEntry && r.State is "A" or "B" && r.State != s.Side).Select(r => r.Time), 0.5m);
                 experiments[mode] = new { Summary = Summary(sim.Trades), simulation = sim, signals,
                     BySide = sim.Trades.GroupBy(t => t.Side).ToDictionary(g => g.Key, g => Summary(g)) };
             }
