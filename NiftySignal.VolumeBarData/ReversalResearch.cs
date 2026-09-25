@@ -155,13 +155,17 @@ public static class ReversalResearch
     /// Hypothesis (2026-09-25): P0/P1's only exit is waiting for the full opposite-pattern
     /// confirmation (or scheduled close) -- at DTE 0/4 this pools' own MFE/MAE ratio (~2x) shows a
     /// real favorable move is usually available, but win rate is only ~50%, so the wait-for-reversal
-    /// exit is giving back an already-earned move rather than locking any of it in. This tests a
-    /// same-entry exit change only (BACKTEST_RULES rule 14): identical signals/entries as
-    /// Simulate would produce, but additionally exits the instant the position has cleared its own
-    /// round-trip cost (so trailing never triggers on noise smaller than what it costs to trade) and
-    /// then given back half of its own peak favorable excursion since entry -- whichever of
-    /// (giveback, opposite-pattern, scheduled close) comes first. The 50% fraction is a first, simple,
-    /// stated-as-such starting choice, not fit to this data -- not swept here.
+    /// exit is giving back an already-earned move rather than locking any of it in. Exits the instant
+    /// the position has cleared its own round-trip cost (so trailing never triggers on noise smaller
+    /// than what it costs to trade) and then given back half of its own peak favorable excursion since
+    /// entry -- whichever of (giveback, opposite-pattern, scheduled close) comes first. The 50%
+    /// fraction is a first, simple, stated-as-such starting choice, not fit to this data -- not swept.
+    /// IMPORTANT (caught empirically, not assumed): this re-runs the SAME signal-selection/busyUntil
+    /// loop as Simulate, so a faster exit frees capital sooner and lets MORE signals become trades --
+    /// this measures the exit change AND the opportunity-set effect together (BACKTEST_RULES rule 14's
+    /// "complete sequential simulation" step), confirmed directly here (trade count nearly doubled vs
+    /// P0/P1 at every DTE on first run). It is NOT a same-entry comparison by itself --
+    /// SimulateGivebackFixedEntries is the same-entry-only counterpart; report both, never just this one.
     /// Expected if the hypothesis holds: win rate rises at DTE 0/4 without a worse MAE. Fails if it
     /// mainly cuts winners short before they fully develop (net roughly unchanged or worse despite a
     /// higher win rate), or degrades MAE/frequency.
@@ -214,6 +218,50 @@ public static class ReversalResearch
             busyUntil = exit.Time;
         }
         return new(trades, decisions, unresolved);
+    }
+
+    /// <summary>
+    /// The true same-entry-only counterpart to SimulateGiveback (BACKTEST_RULES rule 14's first
+    /// step): reuses each baseline trade's OWN already-fixed entry (same token, same entry time, same
+    /// buy fill) verbatim -- no signal re-selection, no busyUntil, so trade count can never differ
+    /// from the baseline's. Only the exit rule changes. Skips (rather than counts as unresolved) a
+    /// baseline trade whose exit can't be re-filled under the new rule, since this is a diagnostic
+    /// comparison on fixed entries, not a standalone tradeable simulation.
+    /// </summary>
+    public static Simulation SimulateGivebackFixedEntries(DateOnly date, List<Trade> baseline, Dictionary<string, Instrument> instruments,
+        Dictionary<string, List<Print>> ticks, Func<Signal, IEnumerable<DateTimeOffset>> exitTimes, decimal givebackFraction)
+    {
+        var trades = new List<Trade>(); var decisions = new List<ActionRow>();
+        var scheduledClose = At(date, 15, 15);
+        foreach (var b in baseline)
+        {
+            var inst = instruments[b.Token];
+            var series = ticks[b.Token];
+            var buy = b.Buy;
+            var minPeak = Fees(buy, buy, inst.LotSize) / inst.LotSize + inst.TickSize;
+            var pseudoSignal = new Signal(b.Decision, b.Side, b.Token, "SameEntry", 0);
+            var oppositeTime = exitTimes(pseudoSignal).Where(t => t > b.Entry && t < scheduledClose).Append(scheduledClose).Min();
+
+            decimal peak = 0; DateTimeOffset? givebackTime = null;
+            foreach (var p in series.Where(p => p.Time > b.Entry && p.Time <= oppositeTime).OrderBy(p => p.Time).ThenBy(p => p.Id))
+            {
+                var gain = p.Price - buy;
+                if (gain > peak) { peak = gain; }
+                if (peak >= minPeak && peak - gain >= givebackFraction * peak) { givebackTime = p.Time; break; }
+            }
+            var exitDecision = givebackTime ?? oppositeTime;
+            var exit = Fill(series, exitDecision, inst.LotSize, false);
+            if (exit is null) { continue; }
+            var sell = exit.Bid - inst.TickSize;
+            var path = series.Where(p => p.Time >= b.Entry && p.Time <= exit.Time).ToList();
+            var gross = (sell - buy) * inst.LotSize;
+            var fees = Fees(buy, sell, inst.LotSize);
+            var reason = givebackTime is not null ? "GivebackExit" : exitDecision == scheduledClose ? "ScheduledClose" : "PremiseReversed";
+            trades.Add(new(b.Side, b.Token, b.Decision, b.Entry, exitDecision, exit.Time, buy, sell,
+                inst.LotSize, gross, fees, gross - fees, Math.Max(0, path.Max(p => p.Price) - buy),
+                Math.Max(0, buy - path.Min(p => p.Price)), (exit.Time - b.Entry).TotalSeconds, reason, b.EntryId, exit.Id));
+        }
+        return new(trades, decisions, 0);
     }
 
     public static object Summary(IEnumerable<Trade> source)
@@ -357,16 +405,29 @@ public static class ReversalResearch
                 var extended = history.Count < 41 || eligible.p!.Price - history[^1].Slow!.Value > history.Take(40).Max(r => r.Average!.Value - r.Slow!.Value);
                 patternSignals.Add(Forward(new(row.Time, row.State, eligible.i.Token, "Pattern" + row.State, 0, extended), ticks[eligible.i.Token]));
             }
+            var baselineSims = new Dictionary<string, Simulation>();
             foreach (var mode in new[] { "P0", "P1" })
             {
                 var signals = patternSignals.Where(s => mode == "P0" || !s.Extended).ToList();
                 var sim = Simulate(date, signals, chain, ticks, s => patternRows.Where(r => r.StateEntry && r.State is "A" or "B" && r.State != s.Side).Select(r => r.Time));
+                baselineSims[mode] = sim;
                 experiments[mode] = new { Summary = Summary(sim.Trades), simulation = sim, signals,
                     BySide = sim.Trades.GroupBy(t => t.Side).ToDictionary(g => g.Key, g => Summary(g)) };
             }
-            // P2/P3: same-entry comparison against P0/P1 (BACKTEST_RULES rule 14) -- identical
-            // signals, only the exit changes (see SimulateGiveback's own doc comment for the
-            // hypothesis). P2 pairs with P0's signal set, P3 with P1's.
+            // P0G/P1G: TRUE same-entry comparison (BACKTEST_RULES rule 14, first step) -- P0/P1's
+            // own already-fixed entries, only the exit changes. Trade count is identical to the
+            // paired baseline by construction; this isolates the pure exit effect.
+            foreach (var (mode, baseline) in new[] { ("P0G", "P0"), ("P1G", "P1") })
+            {
+                var sim = SimulateGivebackFixedEntries(date, baselineSims[baseline].Trades, chain, ticks,
+                    s => patternRows.Where(r => r.StateEntry && r.State is "A" or "B" && r.State != s.Side).Select(r => r.Time), 0.5m);
+                experiments[mode] = new { Summary = Summary(sim.Trades), simulation = sim,
+                    BySide = sim.Trades.GroupBy(t => t.Side).ToDictionary(g => g.Key, g => Summary(g)) };
+            }
+            // P2/P3: FULL sequential re-simulation with the giveback exit (BACKTEST_RULES rule 14,
+            // second step) -- same starting signal set as P0/P1, but a faster exit frees capital
+            // sooner, so trade count can legitimately differ (opportunity-set effect included).
+            // Report alongside P0G/P1G, never in place of it -- see SimulateGiveback's doc comment.
             foreach (var mode in new[] { "P2", "P3" })
             {
                 var signals = patternSignals.Where(s => mode == "P2" || !s.Extended).ToList();

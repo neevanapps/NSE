@@ -146,6 +146,39 @@ public sealed class ReversalResearchTests
         Assert.Equal(oppositeAt, trade.ExitDecision);
     }
 
+    [Fact]
+    public void SimulateGivebackFixedEntries_ReusesBaselineEntryVerbatim_OnlyExitChanges()
+    {
+        var inst = Instrument("a", 24000);
+        var instruments = new Dictionary<string, Instrument> { ["a"] = inst };
+        var prints = new[]
+        {
+            Print(0),
+            Print(1, price: 121, bid: 119, ask: 121),    // baseline's own entry fill: buy = 121.05
+            Print(15, price: 141, bid: 140, ask: 141),   // peak ~19.95
+            Print(30, price: 131, bid: 130, ask: 131),   // retraced 50% -- giveback exit fires here
+            Print(600, price: 200, bid: 199, ask: 201),  // baseline's own (much later) exit; never reached under giveback
+        };
+        var ticks = new Dictionary<string, List<ReversalResearch.Print>> { ["a"] = prints.ToList() };
+        var baseline = new List<ReversalResearch.Trade>
+        {
+            new("A", "a", Start, Start.AddSeconds(1), Start.AddSeconds(600), Start.AddSeconds(600),
+                121.05m, 200m, 65, 0, 0, 0, 0, 0, 599, "ScheduledClose", 1, 4)
+        };
+
+        var sim = ReversalResearch.SimulateGivebackFixedEntries(Date, baseline, instruments, ticks, _ => [], 0.5m);
+
+        // Same entry count and fields as the baseline (this is the whole point of "fixed entries") --
+        // only the exit differs.
+        var trade = Assert.Single(sim.Trades);
+        Assert.Equal(baseline[0].Decision, trade.Decision);
+        Assert.Equal(baseline[0].Entry, trade.Entry);
+        Assert.Equal(baseline[0].Buy, trade.Buy);
+        Assert.Equal(baseline[0].EntryId, trade.EntryId);
+        Assert.Equal("GivebackExit", trade.Reason);
+        Assert.Equal(Start.AddSeconds(30), trade.ExitDecision);
+    }
+
     static Instrument Instrument(string token, decimal strike) => new()
     {
         Token = token, TradingSymbol = token, Exchange = Exchange.Nfo, Underlying = "NIFTY", AsOfDate = Date,
