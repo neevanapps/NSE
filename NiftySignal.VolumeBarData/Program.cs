@@ -466,6 +466,14 @@ if (args.Length > 0 && string.Equals(args[0], "export-ticks", StringComparison.O
     return await TickExporter.RunAsync(tradeSourceOptions, args);
 }
 
+// Runs ReversalResearch.BuildDayReportAsync against files export-ticks already produced, no live
+// database connection needed. See FileBackedResearchRunner.cs.
+//   dotnet run --project NiftySignal.VolumeBarData -- research-from-files <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [--in=research-ticks] [--out=research-file-run]
+if (args.Length > 0 && string.Equals(args[0], "research-from-files", StringComparison.OrdinalIgnoreCase))
+{
+    return await FileBackedResearchRunner.RunAsync(args);
+}
+
 // Phase G (docs/LIVE_PARITY_PLAN.md) performance-review helper: measures, READ-ONLY against the
 // real historical source (niftysignal_vm_copy -- never written to), the wall-clock cost of the
 // SINGLE most expensive thing LiveOptionAtmPopulator/LiveOptionMaxPainPopulator do on every poll

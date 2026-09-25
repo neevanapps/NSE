@@ -197,6 +197,30 @@ public static class ReversalResearch
         foreach (var date in researchDates)
         {
             Console.WriteLine($"Loading {date:yyyy-MM-dd} raw option ticks...");
+            var report = await BuildDayReportAsync(db, date);
+            var path = Path.Combine(output, $"{date:yyyy-MM-dd}.json");
+            if (File.Exists(path)) { throw new IOException($"Report already exists: {path}; use a fresh run directory"); }
+            await File.WriteAllTextAsync(path, JsonSerializer.Serialize(report, Json));
+            daily.Add(new { Date = date, report.Dte, Reports = path });
+            Console.WriteLine($"Saved {path}; A/B full-surface state entries={report.patternRows.Count(r => r.StateEntry && r.Full)}.");
+        }
+        await File.WriteAllTextAsync(Path.Combine(output, "manifest.json"), JsonSerializer.Serialize(daily, Json));
+        return 0;
+    }
+
+    public sealed record DayReport(DateOnly Date, DateOnly Expiry, int Dte, List<object> coverage, List<object> samples,
+        List<PatternRow> patternRows, List<PatternRow> referencePatterns, Dictionary<string, object> experiments,
+        List<object> traces, string QuoteAge);
+
+    /// <summary>
+    /// Everything for one session: cadence coverage/verification samples, C0/C1/C2 and P0/P1
+    /// experiments, and full raw-tick trade traces. Pure w.r.t. its DbContext -- takes any
+    /// NiftySignalDbContext already populated for this date, live Postgres or a seeded
+    /// EF Core InMemoryDatabase (see FileBackedResearchRunner), so this exact logic is what both
+    /// paths run, never a parallel reimplementation.
+    /// </summary>
+    public static async Task<DayReport> BuildDayReportAsync(NiftySignalDbContext db, DateOnly date)
+    {
             var chainAll = await db.Instruments.Where(i => i.AsOfDate == date && i.Underlying == "NIFTY"
                 && i.InstrumentType == InstrumentType.Option && i.ExpiryDate >= date).ToListAsync();
             var expiry = chainAll.Min(i => i.ExpiryDate)!.Value;
@@ -282,17 +306,9 @@ public static class ReversalResearch
             var crossTrace = Simulate(date, crossTraceSignals, chain, ticks, s => readings[s.Token].Where(r => r.Down).Select(r => r.End));
             var traces = traceSim.Trades.Take(1).Concat(traceSim.Trades.OrderBy(t => t.Net).Take(1)).Concat(traceSim.Trades.OrderByDescending(t => t.Net).Take(1))
                 .Concat(crossTrace.Trades.Take(2))
-                .Distinct().Select(t => new { Trade = t, RawTicks = ticks[t.Token].Where(p => p.Time >= t.Decision.AddSeconds(-15) && p.Time <= t.Exit).ToList() }).ToList();
-            var report = new { Date = date, Expiry = expiry, Dte = expiry.DayNumber - date.DayNumber, coverage, samples,
-                patternRows, referencePatterns, experiments, traces, QuoteAge = "Individual field age unavailable; modeled fills only" };
-            var path = Path.Combine(output, $"{date:yyyy-MM-dd}.json");
-            if (File.Exists(path)) { throw new IOException($"Report already exists: {path}; use a fresh run directory"); }
-            await File.WriteAllTextAsync(path, JsonSerializer.Serialize(report, Json));
-            daily.Add(new { Date = date, Dte = expiry.DayNumber - date.DayNumber, Reports = path });
-            Console.WriteLine($"Saved {path}; A/B full-surface state entries={patternRows.Count(r => r.StateEntry && r.Full)}.");
-        }
-        await File.WriteAllTextAsync(Path.Combine(output, "manifest.json"), JsonSerializer.Serialize(daily, Json));
-        return 0;
+                .Distinct().Select(t => (object)new { Trade = t, RawTicks = ticks[t.Token].Where(p => p.Time >= t.Decision.AddSeconds(-15) && p.Time <= t.Exit).ToList() }).ToList();
+            return new(date, expiry, expiry.DayNumber - date.DayNumber, coverage, samples,
+                patternRows, referencePatterns, experiments, traces, "Individual field age unavailable; modeled fills only");
     }
 
     static Signal Forward(Signal s, List<Print> ticks)
