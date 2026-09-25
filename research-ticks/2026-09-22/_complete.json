@@ -1,0 +1,9 @@
+{
+  "Date": "2026-09-22",
+  "Underlying": "NIFTY",
+  "NearestExpiry": "2026-09-22",
+  "InstrumentCount": 41,
+  "TotalTicks": 2347359,
+  "ExportedAtUtc": "2026-09-25T15:16:54.4874196+00:00",
+  "Schema": "[id, exchangeTimestamp, receivedAt, lastPrice, bid1Price, ask1Price, bid1Qty, ask1Qty, volume, openInterest]"
+}
