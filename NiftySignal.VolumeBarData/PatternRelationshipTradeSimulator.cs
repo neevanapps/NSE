@@ -63,12 +63,20 @@ public static class PatternRelationshipTradeSimulator
     /// whichever way this filter is used. Null (default) preserves the original frozen behaviour
     /// unchanged for every existing caller.
     /// </param>
+    /// <param name="patternBEntryFilter">
+    /// 2026-09-25 addendum, symmetric to <paramref name="patternAEntryFilter"/> -- same gate, same
+    /// timing (after every other entry gate, before token/price resolution), same
+    /// <see cref="SignalOutcome.FilteredByEntryCondition"/> audit outcome, but for Pattern B (BUY
+    /// CE) signals only. Never consulted for Pattern A, never consulted on the close/exit path --
+    /// an open Pattern A position is still closed by an opposite (Pattern B) signal exactly as
+    /// before regardless of this filter. Null (default) preserves the original frozen behaviour.
+    /// </param>
     public static async Task<SimulationResult> SimulateDayAsync(
         NiftySignalDbContext source, DateOnly asOfDate,
         IReadOnlyList<RelationshipObservation> rows, IReadOnlyList<Instrument> chain, IReadOnlyList<FutureEventBar> futureBars,
         TimeSpan istOffset, CancellationToken cancellationToken,
         IReadOnlyList<SynchronizedOptionEventBar>? optionBars = null, decimal? minEntryPrice = null, decimal? maxEntryPrice = null,
-        Func<int, bool>? patternAEntryFilter = null)
+        Func<int, bool>? patternAEntryFilter = null, Func<int, bool>? patternBEntryFilter = null)
     {
         var trades = new List<TradeRow>();
         var audit = new List<SignalAuditRow>();
@@ -201,6 +209,11 @@ public static class PatternRelationshipTradeSimulator
                 continue;
             }
             if (isPatternA && patternAEntryFilter is not null && !patternAEntryFilter(row.EventId))
+            {
+                audit.Add(new SignalAuditRow(asOfDate, row.EndTimestamp, pattern, side, row.AtmStrike, SignalOutcome.FilteredByEntryCondition));
+                continue;
+            }
+            if (isPatternB && patternBEntryFilter is not null && !patternBEntryFilter(row.EventId))
             {
                 audit.Add(new SignalAuditRow(asOfDate, row.EndTimestamp, pattern, side, row.AtmStrike, SignalOutcome.FilteredByEntryCondition));
                 continue;

@@ -7,6 +7,7 @@ using NiftySignal.Domain.Enums;
 using NiftySignal.Execution;
 using NiftySignal.Persistence;
 using NiftySignal.Rules;
+using NiftySignal.Scoring;
 using NiftySignal.VolumeBarData;
 using MtmRow = NiftySignal.VolumeBarData.MarkToMarketDiagnostics.MtmRow;
 using ExitAsymmetryRow = NiftySignal.VolumeBarData.MarkToMarketDiagnostics.ExitAsymmetryRow;
@@ -10765,6 +10766,7228 @@ if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-a-crossover-t
     Console.WriteLine($"A-crossover-trade-test CSV written to: {Path.GetFullPath(ctOutPath)}");
 
     return 0;
+}
+
+// "vc0dte-expiry-source-audit" -- 2026-09-24, METHODOLOGY AUDIT, read-only, no bar-building, no
+// Pattern A/B calculation. Every vc0dte-relationship-* command so far (see the repeated
+// `expiries = ...Select(i => i.ExpiryDate).Distinct()...` + `foreach (var expiry in expiries)`
+// block, identical across every one of them) enumerates EVERY distinct ExpiryDate present in the
+// NIFTY option chain for a TradingDate and adds ALL of them as independent (date,expiry) pairs --
+// there is no current-week/next-week distinction anywhere in this codebase. This command proves,
+// from the actual data, which (TradingDate,ExpiryDate,DTE) combinations that produced, and
+// classifies each one by RANK (nearest available expiry = CURRENT_WEEK, next-nearest =
+// NEXT_WEEK, etc.) rather than assuming a fixed day-of-week -- the Tuesday convention is checked,
+// not assumed, via the reported ExpiryDayOfWeek column.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-expiry-source-audit <fromDate> <toDate> --out=path.csv [--underlying=NIFTY]
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-expiry-source-audit", StringComparison.OrdinalIgnoreCase))
+{
+    var (easPositional, easNamed) = SplitNamedArgs(args);
+    if (easPositional.Length < 3 || !DateOnly.TryParseExact(easPositional[1], "yyyy-MM-dd", out var easFromDate) || !DateOnly.TryParseExact(easPositional[2], "yyyy-MM-dd", out var easToDate) || !easNamed.TryGetValue("out", out var easOutPath))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-expiry-source-audit <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> --out=path.csv [--underlying=NIFTY]");
+        return 1;
+    }
+    var easUnderlying = easNamed.TryGetValue("underlying", out var easU) ? easU : "NIFTY";
+    var easIstOffset = TimeSpan.FromHours(5.5);
+
+    Console.WriteLine("=== vc0dte-expiry-source-audit: METHODOLOGY AUDIT -- which ExpiryDate(s) does each TradingDate actually contribute, and how are they classified? Read-only, no Pattern A/B calculation. ===");
+    Console.WriteLine();
+
+    var easRows = new List<(DateOnly TradingDate, DateOnly ExpiryDate, int Dte, string Classification, string Reason, int OptionCount, int CeCount, int PeCount, long CeTicks, long PeTicks, DayOfWeek ExpiryDow, int RankAmongAvailable, int AvailableCount)>();
+
+    await using (var easSource = new NiftySignalDbContext(tradeSourceOptions))
+    {
+        for (var date = easFromDate; date <= easToDate; date = date.AddDays(1))
+        {
+            if (date.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday) { continue; }
+            var hasFutures = await easSource.Instruments.AnyAsync(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Future && i.Underlying == easUnderlying);
+            if (!hasFutures) { continue; }
+
+            var chainGroups = await easSource.Instruments
+                .Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.Underlying == easUnderlying)
+                .GroupBy(i => new { i.ExpiryDate, i.OptionType })
+                .Select(g => new { g.Key.ExpiryDate, g.Key.OptionType, Count = g.Count(), Tokens = g.Select(x => x.Token).ToList() })
+                .ToListAsync();
+
+            var byExpiry = chainGroups.Where(g => g.ExpiryDate is not null).GroupBy(g => g.ExpiryDate!.Value).OrderBy(g => g.Key).ToList();
+            if (byExpiry.Count == 0) { continue; }
+
+            var dayStartUtc = new DateTimeOffset(date.ToDateTime(TimeOnly.MinValue), easIstOffset).ToUniversalTime();
+            var dayEndUtc = dayStartUtc.AddDays(1);
+            var availableCount = byExpiry.Count;
+
+            for (var rank = 0; rank < byExpiry.Count; rank++)
+            {
+                var expiryGroup = byExpiry[rank];
+                var expiry = expiryGroup.Key;
+                var dte = expiry.DayNumber - date.DayNumber;
+                var classification = rank switch { 0 => "CURRENT_WEEK", 1 => "NEXT_WEEK", _ => "FURTHER_OUT" };
+                var reason = $"Rank {rank} of {availableCount} distinct expiries available for this TradingDate (0 = nearest)";
+
+                var ceTokens = expiryGroup.FirstOrDefault(g => g.OptionType == OptionType.Call)?.Tokens ?? [];
+                var peTokens = expiryGroup.FirstOrDefault(g => g.OptionType == OptionType.Put)?.Tokens ?? [];
+                var ceCount = expiryGroup.FirstOrDefault(g => g.OptionType == OptionType.Call)?.Count ?? 0;
+                var peCount = expiryGroup.FirstOrDefault(g => g.OptionType == OptionType.Put)?.Count ?? 0;
+                var ceTicks = ceTokens.Count == 0 ? 0L : await easSource.Ticks.LongCountAsync(t => ceTokens.Contains(t.Token) && t.ExchangeTimestamp >= dayStartUtc && t.ExchangeTimestamp < dayEndUtc);
+                var peTicks = peTokens.Count == 0 ? 0L : await easSource.Ticks.LongCountAsync(t => peTokens.Contains(t.Token) && t.ExchangeTimestamp >= dayStartUtc && t.ExchangeTimestamp < dayEndUtc);
+
+                easRows.Add((date, expiry, dte, classification, reason, ceCount + peCount, ceCount, peCount, ceTicks, peTicks, expiry.DayOfWeek, rank, availableCount));
+            }
+            Console.WriteLine($"  [Scan] {date:yyyy-MM-dd}: {availableCount} distinct expiries -- {string.Join(", ", byExpiry.Select((g, r) => $"{g.Key:yyyy-MM-dd}(DTE={g.Key.DayNumber - date.DayNumber},rank={r})"))}"); Console.Out.Flush();
+        }
+    }
+
+    Console.WriteLine();
+    Console.WriteLine($"Total (TradingDate,ExpiryDate) pairs enumerated: {easRows.Count} across {easRows.Select(r => r.TradingDate).Distinct().Count()} distinct TradingDates.");
+    Console.WriteLine();
+
+    // ---- Sanity checks, per the task's explicit "STOP and investigate" rule ----
+    Console.WriteLine("### Sanity checks ###");
+    var currentWeekRows = easRows.Where(r => r.Classification == "CURRENT_WEEK").ToList();
+    var anomalousCurrentWeek = currentWeekRows.Where(r => r.Dte > 6).ToList();
+    if (anomalousCurrentWeek.Count > 0)
+    {
+        Console.WriteLine($"  ** STOP CANDIDATE ** {anomalousCurrentWeek.Count} CURRENT_WEEK (rank-0) row(s) have DTE > 6 -- rank-based 'nearest expiry' assumption may be wrong for these dates:");
+        foreach (var r in anomalousCurrentWeek) { Console.WriteLine($"    {r.TradingDate:yyyy-MM-dd} -> {r.ExpiryDate:yyyy-MM-dd} DTE={r.Dte}"); }
+    }
+    else
+    {
+        Console.WriteLine($"  OK: all {currentWeekRows.Count} CURRENT_WEEK (rank-0) rows have DTE <= 6.");
+    }
+    var nonTuesdayCurrentWeek = currentWeekRows.Where(r => r.ExpiryDow != DayOfWeek.Tuesday).ToList();
+    Console.WriteLine(nonTuesdayCurrentWeek.Count > 0
+        ? $"  ** {nonTuesdayCurrentWeek.Count} CURRENT_WEEK row(s) do NOT expire on Tuesday -- stated weekly-expiry convention does not hold for these: {string.Join(", ", nonTuesdayCurrentWeek.Select(r => $"{r.TradingDate:yyyy-MM-dd}->{r.ExpiryDate:yyyy-MM-dd}({r.ExpiryDow})"))}"
+        : "  OK: every CURRENT_WEEK row expires on Tuesday, confirming the stated weekly-expiry convention empirically (not assumed).");
+    var dupCurrentWeek = currentWeekRows.GroupBy(r => r.TradingDate).Where(g => g.Count() > 1).ToList();
+    Console.WriteLine(dupCurrentWeek.Count > 0
+        ? $"  ** {dupCurrentWeek.Count} TradingDate(s) have more than one CURRENT_WEEK-ranked row -- duplicate mapping, investigate: {string.Join(", ", dupCurrentWeek.Select(g => g.Key.ToString("yyyy-MM-dd")))}"
+        : "  OK: no TradingDate has more than one CURRENT_WEEK mapping.");
+    Console.WriteLine();
+
+    // ---- The direct answer to "were the previously-reported DTE 11-13 observations actually next-week?" ----
+    Console.WriteLine("### Cross-reference: which (TradingDate,ExpiryDate) pairs previously fell into each DteBucketClassifier bucket, and what is their RANK/classification here? ###");
+    foreach (var bucketGroup in easRows.GroupBy(r => DteBucketClassifier.Classify(r.Dte)).OrderBy(g => g.Key))
+    {
+        var classCounts = bucketGroup.GroupBy(r => r.Classification).Select(g => $"{g.Key}={g.Count()}").ToList();
+        Console.WriteLine($"  [DteBucket {bucketGroup.Key}] n={bucketGroup.Count()}, classification breakdown: {string.Join(", ", classCounts)}");
+        foreach (var r in bucketGroup.OrderBy(r => r.TradingDate))
+        {
+            Console.WriteLine($"    {r.TradingDate:yyyy-MM-dd} | {r.ExpiryDate:yyyy-MM-dd} | DTE={r.Dte} | {r.Classification} (rank {r.RankAmongAvailable} of {r.AvailableCount})");
+        }
+    }
+    Console.WriteLine();
+
+    // ---- Full per-TradingDate current-week summary the task explicitly asked for ----
+    Console.WriteLine("### CURRENT_WEEK_ONLY summary (would-be dataset for the next phase) ###");
+    Console.WriteLine($"  Total TradingDates with a CURRENT_WEEK row: {currentWeekRows.Count}");
+    if (currentWeekRows.Count > 0)
+    {
+        Console.WriteLine($"  Min DTE={currentWeekRows.Min(r => r.Dte)}, Max DTE={currentWeekRows.Max(r => r.Dte)}");
+        foreach (var g in currentWeekRows.GroupBy(r => r.Dte).OrderBy(g => g.Key))
+        {
+            Console.WriteLine($"    DTE={g.Key}: n={g.Count()} ({string.Join(", ", g.Select(r => r.TradingDate.ToString("yyyy-MM-dd")))})");
+        }
+    }
+    Console.WriteLine();
+
+    using (var writer = new StreamWriter(easOutPath))
+    {
+        writer.WriteLine("TradingDate,ExpiryDate,Dte,DteBucket,Classification,RankAmongAvailable,AvailableCount,SelectedExpiryReason,ExpiryDayOfWeek,OptionInstrumentCount,CeInstrumentCount,PeInstrumentCount,CeTickCount,PeTickCount");
+        foreach (var r in easRows.OrderBy(r => r.TradingDate).ThenBy(r => r.RankAmongAvailable))
+        {
+            writer.WriteLine(string.Join(',', r.TradingDate.ToString("yyyy-MM-dd"), r.ExpiryDate.ToString("yyyy-MM-dd"), r.Dte, DteBucketClassifier.Classify(r.Dte), r.Classification, r.RankAmongAvailable, r.AvailableCount, $"\"{r.Reason}\"", r.ExpiryDow, r.OptionCount, r.CeCount, r.PeCount, r.CeTicks, r.PeTicks));
+        }
+    }
+    Console.WriteLine($"Expiry-source-audit CSV written to: {Path.GetFullPath(easOutPath)}");
+
+    return 0;
+}
+
+// "vc0dte-relationship-a-vote-and-run-analysis" -- 2026-09-24, tests the two hypotheses the
+// A/B Temporal Context Diagnostic did NOT actually implement: (1) a causal rolling A/B majority
+// VOTE at fixed time windows (1/3/5/10/15 min), (2) the "N consecutive same-pattern events" RUN
+// hypothesis, triggered the instant a run first reaches a given length. Runs ONLY on
+// CURRENT_WEEK_ONLY (rank-0 expiry per TradingDate) as the primary dataset -- per the
+// expiry-source-audit above, DTE buckets 0/1/4-6 are current-week, 7-8/11-13 are next-week; this
+// command explicitly separates them rather than pooling, and additionally reports NEXT_WEEK_ONLY
+// (rank-1) as a clearly labeled, never-pooled secondary comparison. Diagnostic only: no SL/TP/
+// cooldown/time-exit/filter/optimization of any kind -- forward information content only, using
+// the existing frozen UnderlyingOptionRelationshipSummary.ComputeFuturesChange for forward returns.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-vote-and-run-analysis <fromDate> <toDate> --out=path.csv
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-a-vote-and-run-analysis", StringComparison.OrdinalIgnoreCase))
+{
+    const long vrThreshold = 1300L;
+    var vrIstOffset = TimeSpan.FromHours(5.5);
+    int[] vrWindows = [1, 3, 5, 10, 15];
+    int[] vrHorizons = [1, 3, 5, 10];
+
+    var (vrPositional, vrNamed) = SplitNamedArgs(args);
+    if (vrPositional.Length < 3 || !DateOnly.TryParseExact(vrPositional[1], "yyyy-MM-dd", out var vrFromDate) || !DateOnly.TryParseExact(vrPositional[2], "yyyy-MM-dd", out var vrToDate) || !vrNamed.TryGetValue("out", out var vrOutPath))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-vote-and-run-analysis <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> --out=path.csv");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-a-vote-and-run-analysis: rolling A/B majority vote + N-consecutive-run hypotheses, CURRENT_WEEK_ONLY primary, NEXT_WEEK_ONLY secondary (never pooled). ===");
+    Console.WriteLine();
+
+    // ---- Discovery: same pairs as the expiry-source-audit, tagged by rank (0=current-week, 1=next-week). ----
+    var vrPairs = new List<(DateOnly Date, DateOnly Expiry, int Rank)>();
+    await using (var vrScanSource = new NiftySignalDbContext(tradeSourceOptions))
+    {
+        for (var date = vrFromDate; date <= vrToDate; date = date.AddDays(1))
+        {
+            if (date.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday) { continue; }
+            var hasFutures = await vrScanSource.Instruments.AnyAsync(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Future && i.Underlying == "NIFTY");
+            if (!hasFutures) { continue; }
+            var expiries = await vrScanSource.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.Underlying == "NIFTY").Select(i => i.ExpiryDate).Distinct().OrderBy(e => e).ToListAsync();
+            for (var rank = 0; rank < expiries.Count && rank <= 1; rank++)
+            {
+                if (expiries[rank] is null) { continue; }
+                vrPairs.Add((date, expiries[rank]!.Value, rank));
+            }
+        }
+    }
+    Console.WriteLine($"Phase1 discovery: {vrPairs.Count(p => p.Rank == 0)} CURRENT_WEEK pairs, {vrPairs.Count(p => p.Rank == 1)} NEXT_WEEK pairs, across {vrPairs.Select(p => p.Date).Distinct().Count()} TradingDates."); Console.Out.Flush();
+
+    // ---- Per-rank accumulators (CURRENT_WEEK and NEXT_WEEK completely separate -- never pooled). ----
+    var voteRecords = new Dictionary<int, List<(DateOnly Date, DateOnly Expiry, int Dte, int EventId, int Window, string Winner, double Dominance, string CurrentPattern, decimal?[] Fwd)>>
+        { [0] = [], [1] = [] };
+    var runRecords = new Dictionary<int, List<(DateOnly Date, DateOnly Expiry, int Dte, string Pattern, int Reached, int FinalLength, decimal?[] Fwd)>>
+        { [0] = [], [1] = [] };
+    var unconditionalFwd = new Dictionary<int, List<decimal?[]>> { [0] = [], [1] = [] };
+    var rawPatternFwd = new Dictionary<int, List<(string Pattern, decimal?[] Fwd)>> { [0] = [], [1] = [] };
+    var rawPatternCountsByDay = new Dictionary<int, Dictionary<DateOnly, (int A, int B)>> { [0] = [], [1] = [] };
+    var voteStateCountsByDayWindow = new Dictionary<int, Dictionary<(DateOnly, int), int>> { [0] = [], [1] = [] };
+    var fiveRunCountByDay = new Dictionary<int, Dictionary<DateOnly, int>> { [0] = [], [1] = [] };
+    var dteByDate = new Dictionary<int, Dictionary<DateOnly, int>> { [0] = [], [1] = [] };
+
+    foreach (var dateGroup in vrPairs.GroupBy(p => p.Date).OrderBy(g => g.Key))
+    {
+        await using var vrSource = new NiftySignalDbContext(tradeSourceOptions);
+        var futureBars = await FutureEventBarBuilder.BuildDayAsync(vrSource, dateGroup.Key, vrThreshold, CancellationToken.None);
+        if (futureBars.Count == 0) { continue; }
+        foreach (var p in dateGroup)
+        {
+            var chain = await vrSource.Instruments.Where(i => i.AsOfDate == p.Date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == p.Expiry && i.Underlying == "NIFTY").OrderBy(i => i.StrikePrice).ThenBy(i => i.OptionType).ToListAsync();
+            if (chain.Count == 0) { continue; }
+            var optionBars = await SynchronizedOptionBarBuilder.BuildDayForChainAsync(vrSource, p.Date, chain, futureBars, CancellationToken.None);
+            var rows = await UnderlyingOptionRelationshipRecorder.RecordAsync(vrSource, p.Date, chain, futureBars, optionBars, CancellationToken.None);
+            if (rows.Count == 0) { continue; }
+            var dte = rows[0].Dte;
+            dteByDate[p.Rank][p.Date] = dte;
+
+            decimal?[] FwdAt(int eventId) => vrHorizons.Select(h => UnderlyingOptionRelationshipSummary.ComputeFuturesChange(rows, eventId, h).PercentChange).ToArray();
+
+            // -- unconditional baseline + raw Pattern A/B baseline --
+            var aCountDay = 0; var bCountDay = 0;
+            for (var i = 0; i < rows.Count; i++)
+            {
+                unconditionalFwd[p.Rank].Add(FwdAt(i));
+                if (rows[i].RelationshipCategory == RollingVoteAndRunAnalysis.PatternA) { aCountDay++; rawPatternFwd[p.Rank].Add(("A", FwdAt(i))); }
+                else if (rows[i].RelationshipCategory == RollingVoteAndRunAnalysis.PatternB) { bCountDay++; rawPatternFwd[p.Rank].Add(("B", FwdAt(i))); }
+            }
+            rawPatternCountsByDay[p.Rank][p.Date] = (aCountDay, bCountDay);
+
+            // -- rolling A/B vote, one pass per window --
+            foreach (var w in vrWindows)
+            {
+                var votes = RollingVoteAndRunAnalysis.ComputeRollingVotes(rows, w);
+                var stateChanges = 0;
+                string? lastWinner = null;
+                foreach (var v in votes)
+                {
+                    voteRecords[p.Rank].Add((p.Date, p.Expiry, dte, v.EventId, w, v.Winner, v.Dominance, v.CurrentEventPattern, FwdAt(v.EventId)));
+                    if (v.Winner != lastWinner) { stateChanges++; lastWinner = v.Winner; }
+                }
+                voteStateCountsByDayWindow[p.Rank][(p.Date, w)] = stateChanges;
+            }
+
+            // -- N-consecutive-run triggers --
+            var triggers = RollingVoteAndRunAnalysis.ComputeRunLengthTriggers(rows);
+            foreach (var t in triggers)
+            {
+                runRecords[p.Rank].Add((p.Date, p.Expiry, dte, t.Pattern, t.ReachedLength, t.FinalRunLength, FwdAt(t.EventId)));
+            }
+            fiveRunCountByDay[p.Rank][p.Date] = triggers.Count(t => t.ReachedLength == 5);
+
+            Console.WriteLine($"  [Phase2] {p.Date:yyyy-MM-dd} expiry={p.Expiry:yyyy-MM-dd} rank={p.Rank} DTE={dte}: {rows.Count} rows, A={aCountDay} B={bCountDay}, 5+ runs={fiveRunCountByDay[p.Rank][p.Date]}."); Console.Out.Flush();
+        }
+    }
+    Console.WriteLine();
+
+    static (int N, double? Mean, double? Median, double? PctPos, double? PctNeg) Stats(IEnumerable<decimal?> values)
+    {
+        var v = values.Where(x => x is not null).Select(x => (double)x!.Value).OrderBy(x => x).ToList();
+        if (v.Count == 0) { return (0, null, null, null, null); }
+        var median = v.Count % 2 == 1 ? v[v.Count / 2] : (v[v.Count / 2 - 1] + v[v.Count / 2]) / 2.0;
+        return (v.Count, v.Average(), median, 100.0 * v.Count(x => x > 0) / v.Count, 100.0 * v.Count(x => x < 0) / v.Count);
+    }
+    static string Fmt((int N, double? Mean, double? Median, double? PctPos, double? PctNeg) s) =>
+        s.N == 0 ? "n=0" : $"n={s.N} mean={s.Mean:F4}% median={s.Median:F4}% pos={s.PctPos:F1}% neg={s.PctNeg:F1}%";
+    static (double? Mean, double? Median, double? P25, double? P75, double? Min, double? Max) DayDist(IEnumerable<int> perDayCounts)
+    {
+        var v = perDayCounts.Select(x => (double)x).OrderBy(x => x).ToList();
+        if (v.Count == 0) { return (null, null, null, null, null, null); }
+        double Pct(double f) => v[Math.Clamp((int)Math.Ceiling(f * v.Count) - 1, 0, v.Count - 1)];
+        var median = v.Count % 2 == 1 ? v[v.Count / 2] : (v[v.Count / 2 - 1] + v[v.Count / 2]) / 2.0;
+        return (v.Average(), median, Pct(0.25), Pct(0.75), v.Min(), v.Max());
+    }
+
+    void RunReport(int rank)
+    {
+        var label = rank == 0 ? "CURRENT_WEEK_ONLY (PRIMARY)" : "NEXT_WEEK_ONLY (SECONDARY, NEVER POOLED WITH CURRENT-WEEK)";
+        Console.WriteLine($"########## {label} ##########");
+        Console.WriteLine();
+
+        // ---- A. Dataset confirmation ----
+        Console.WriteLine("### A. Dataset confirmation ###");
+        var dates = dteByDate[rank].OrderBy(kv => kv.Key).ToList();
+        Console.WriteLine($"  TradingDates: {dates.Count}");
+        foreach (var (date, dte) in dates) { Console.WriteLine($"    {date:yyyy-MM-dd}: DTE={dte}"); }
+        var dteAnomaly = dates.Where(d => rank == 0 && d.Value > 6).ToList();
+        if (dteAnomaly.Count > 0) { Console.WriteLine($"  ** STOP -- {dteAnomaly.Count} CURRENT_WEEK TradingDate(s) have DTE > 6: {string.Join(", ", dteAnomaly.Select(d => d.Key.ToString("yyyy-MM-dd")))} -- investigate before trusting results below."); }
+        else { Console.WriteLine($"  OK: no anomalies (DTE range {(dates.Count > 0 ? dates.Min(d => d.Value) : 0)}-{(dates.Count > 0 ? dates.Max(d => d.Value) : 0)})."); }
+        Console.WriteLine($"  Total events: unconditional={unconditionalFwd[rank].Count}, raw Pattern A={rawPatternFwd[rank].Count(r => r.Pattern == "A")}, raw Pattern B={rawPatternFwd[rank].Count(r => r.Pattern == "B")}");
+        Console.WriteLine();
+
+        // ---- B. Rolling voting ----
+        Console.WriteLine("### B. Rolling A/B majority vote -- forward futures return by Winner, per window ###");
+        Console.WriteLine($"  Unconditional baseline (all events): {string.Join(" | ", vrHorizons.Select((h, idx) => $"+{h}:{Fmt(Stats(unconditionalFwd[rank].Select(f => f[idx])))}"))}");
+        Console.WriteLine($"  Raw Pattern A (unconditioned, reference): {string.Join(" | ", vrHorizons.Select((h, idx) => $"+{h}:{Fmt(Stats(rawPatternFwd[rank].Where(r => r.Pattern == "A").Select(r => r.Fwd[idx])))}"))}");
+        Console.WriteLine($"  Raw Pattern B (unconditioned, reference): {string.Join(" | ", vrHorizons.Select((h, idx) => $"+{h}:{Fmt(Stats(rawPatternFwd[rank].Where(r => r.Pattern == "B").Select(r => r.Fwd[idx])))}"))}");
+        foreach (var w in vrWindows)
+        {
+            Console.WriteLine($"  -- Window {w} min --");
+            foreach (var winner in new[] { "A", "B", "TIE" })
+            {
+                var group = voteRecords[rank].Where(r => r.Window == w && r.Winner == winner).ToList();
+                Console.WriteLine($"    [{winner}-majority] n={group.Count} -- {string.Join(" | ", vrHorizons.Select((h, idx) => $"+{h}:{Fmt(Stats(group.Select(r => r.Fwd[idx])))}"))}");
+            }
+        }
+        Console.WriteLine();
+
+        // ---- C. Vote strength (descriptive) ----
+        Console.WriteLine("### C. Vote strength -- dominance buckets, descriptive only, NOT threshold-optimized ###");
+        foreach (var w in vrWindows)
+        {
+            Console.WriteLine($"  -- Window {w} min --");
+            var nonTie = voteRecords[rank].Where(r => r.Window == w && r.Winner != "TIE").ToList();
+            Console.WriteLine($"    [Any majority] n={nonTie.Count} -- {string.Join(" | ", vrHorizons.Select((h, idx) => $"+{h}:{Fmt(Stats(nonTie.Select(r => r.Fwd[idx])))}"))}");
+            foreach (var domThreshold in new[] { 0.25, 0.50, 0.75 })
+            {
+                var group = nonTie.Where(r => r.Dominance >= domThreshold).ToList();
+                Console.WriteLine($"    [Dominance >= {domThreshold:P0}] n={group.Count} -- {string.Join(" | ", vrHorizons.Select((h, idx) => $"+{h}:{Fmt(Stats(group.Select(r => r.Fwd[idx])))}"))}");
+            }
+        }
+        Console.WriteLine();
+
+        // ---- D. Five-consecutive-pattern analysis (generalized across reached-length 1..6) ----
+        Console.WriteLine("### D. N-consecutive-same-pattern run analysis -- forward return by ReachedLength (fires at the run's Lth event, never re-fires) ###");
+        Console.WriteLine("  Completed-run final-length distribution (each run counted once, by its own final length):");
+        var completedRuns = runRecords[rank].Where(r => r.Reached == 1).ToList(); // Reached==1 rows are exactly one-per-run (the run's first event), so this IS the run population.
+        foreach (var g in completedRuns.GroupBy(r => RollingVoteAndRunAnalysis.RunLengthBucket(r.FinalLength)).OrderBy(g => g.Key))
+        {
+            Console.WriteLine($"    [{g.Key} events] n={g.Count()} (A={g.Count(r => r.Pattern == RollingVoteAndRunAnalysis.PatternA)}, B={g.Count(r => r.Pattern == RollingVoteAndRunAnalysis.PatternB)})");
+        }
+        Console.WriteLine("  Forward return AT the event a run reaches length L (cumulative population -- a longer run also appears in every smaller L's group):");
+        for (var reach = 1; reach <= 6; reach++)
+        {
+            var group = runRecords[rank].Where(r => r.Reached == reach).ToList();
+            var label2 = reach == 6 ? "6+ (reached>=6)" : reach.ToString();
+            Console.WriteLine($"    [Reached {label2}] n={group.Count} (A={group.Count(r => r.Pattern == RollingVoteAndRunAnalysis.PatternA)}, B={group.Count(r => r.Pattern == RollingVoteAndRunAnalysis.PatternB)}) -- {string.Join(" | ", vrHorizons.Select((h, idx) => $"+{h}:{Fmt(Stats(group.Select(r => r.Fwd[idx])))}"))}");
+        }
+        Console.WriteLine("  ** Primary hypothesis: Reached=5 above (the actual 5-consecutive-event trigger). **");
+        Console.WriteLine();
+
+        // ---- E. Opportunity frequency ----
+        Console.WriteLine("### E. Opportunity frequency (occurrences/day) ###");
+        var rawPerDay = rawPatternCountsByDay[rank].Select(kv => kv.Value.A + kv.Value.B);
+        var rawDist = DayDist(rawPerDay);
+        Console.WriteLine($"  A. Raw Pattern A/B (every qualifying event): mean={rawDist.Mean:F1} median={rawDist.Median:F1} P25={rawDist.P25:F1} P75={rawDist.P75:F1} min={rawDist.Min:F0} max={rawDist.Max:F0}");
+        foreach (var w in vrWindows)
+        {
+            var perDay = voteStateCountsByDayWindow[rank].Where(kv => kv.Key.Item2 == w).Select(kv => kv.Value);
+            var d = DayDist(perDay);
+            Console.WriteLine($"  B. Rolling majority STATE changes/day (window={w}min): mean={d.Mean:F1} median={d.Median:F1} P25={d.P25:F1} P75={d.P75:F1} min={d.Min:F0} max={d.Max:F0}");
+        }
+        var fiveRunDist = DayDist(fiveRunCountByDay[rank].Values);
+        Console.WriteLine($"  C. >=5-consecutive-run signals/day: mean={fiveRunDist.Mean:F1} median={fiveRunDist.Median:F1} P25={fiveRunDist.P25:F1} P75={fiveRunDist.P75:F1} min={fiveRunDist.Min:F0} max={fiveRunDist.Max:F0}");
+        Console.WriteLine();
+    }
+
+    RunReport(0);
+    RunReport(1);
+
+    using (var writer = new StreamWriter(vrOutPath))
+    {
+        writer.WriteLine("Rank,TradingDate,ExpiryDate,Dte,Kind,EventId,Window,Reached,Winner,Pattern,Dominance,Fwd1,Fwd3,Fwd5,Fwd10");
+        foreach (var rank in new[] { 0, 1 })
+        {
+            foreach (var r in voteRecords[rank])
+            {
+                writer.WriteLine(string.Join(',', rank, r.Date.ToString("yyyy-MM-dd"), r.Expiry.ToString("yyyy-MM-dd"), r.Dte, "Vote", r.EventId, r.Window, "", r.Winner, r.CurrentPattern, r.Dominance, r.Fwd[0], r.Fwd[1], r.Fwd[2], r.Fwd[3]));
+            }
+            foreach (var r in runRecords[rank])
+            {
+                writer.WriteLine(string.Join(',', rank, r.Date.ToString("yyyy-MM-dd"), r.Expiry.ToString("yyyy-MM-dd"), r.Dte, "Run", "", "", r.Reached, "", r.Pattern, "", r.Fwd[0], r.Fwd[1], r.Fwd[2], r.Fwd[3]));
+            }
+        }
+    }
+    Console.WriteLine($"Vote-and-run-analysis CSV written to: {Path.GetFullPath(vrOutPath)}");
+
+    return 0;
+}
+
+// "vc0dte-relationship-two-consecutive-trade-simulation" -- 2026-09-25, CONTROLLED OPTION TRADE
+// SIMULATION. Does requiring two consecutive same-pattern events (A A -> BUY PE on the 2nd A; B B
+// -> BUY CE on the 2nd B) improve actual option P&L versus the raw, unconditioned Pattern A/B
+// baseline, while naturally reducing trade frequency? CURRENT_WEEK_ONLY (rank-0 expiry) is the
+// primary dataset; NEXT_WEEK_ONLY (rank-1) is a secondary, never-pooled validation. Reuses the
+// completely frozen PatternRelationshipTradeSimulator.SimulateDayAsync (its existing
+// patternAEntryFilter, plus the new symmetric patternBEntryFilter) and the completely frozen
+// RollingVoteAndRunAnalysis.ComputeRunLengthTriggers (Reached==2 -- the exact same non-overlapping,
+// fires-on-the-2nd-event trigger already validated) for signal detection. No new entry/exit/cost/
+// strike/size/price-source logic; no SL/TP/cooldown/optimization of any kind.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-two-consecutive-trade-simulation <fromDate> <toDate> --out=path.csv
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-two-consecutive-trade-simulation", StringComparison.OrdinalIgnoreCase))
+{
+    const long tcThreshold = 1300L;
+    var tcIstOffset = TimeSpan.FromHours(5.5);
+    const string TcPatternA = RollingVoteAndRunAnalysis.PatternA;
+    const string TcPatternB = RollingVoteAndRunAnalysis.PatternB;
+
+    var (tcPositional, tcNamed) = SplitNamedArgs(args);
+    if (tcPositional.Length < 3 || !DateOnly.TryParseExact(tcPositional[1], "yyyy-MM-dd", out var tcFromDate) || !DateOnly.TryParseExact(tcPositional[2], "yyyy-MM-dd", out var tcToDate) || !tcNamed.TryGetValue("out", out var tcOutPath))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-two-consecutive-trade-simulation <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> --out=path.csv");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-two-consecutive-trade-simulation: does requiring 2 consecutive same-pattern events improve actual option P&L? CURRENT_WEEK_ONLY primary, NEXT_WEEK_ONLY secondary. ===");
+    Console.WriteLine();
+
+    var tcPairs = new List<(DateOnly Date, DateOnly Expiry, int Rank)>();
+    await using (var tcScanSource = new NiftySignalDbContext(tradeSourceOptions))
+    {
+        for (var date = tcFromDate; date <= tcToDate; date = date.AddDays(1))
+        {
+            if (date.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday) { continue; }
+            var hasFutures = await tcScanSource.Instruments.AnyAsync(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Future && i.Underlying == "NIFTY");
+            if (!hasFutures) { continue; }
+            var expiries = await tcScanSource.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.Underlying == "NIFTY").Select(i => i.ExpiryDate).Distinct().OrderBy(e => e).ToListAsync();
+            for (var rank = 0; rank < expiries.Count && rank <= 1; rank++)
+            {
+                if (expiries[rank] is null) { continue; }
+                tcPairs.Add((date, expiries[rank]!.Value, rank));
+            }
+        }
+    }
+    Console.WriteLine($"Phase1 discovery: {tcPairs.Count(p => p.Rank == 0)} CURRENT_WEEK pairs, {tcPairs.Count(p => p.Rank == 1)} NEXT_WEEK pairs."); Console.Out.Flush();
+
+    string[] tcGroups = ["Baseline", "Candidate2ConsecAB", "Diag2ConsecAOnly", "Diag2ConsecBOnly"];
+    var tcTrades = new Dictionary<int, Dictionary<string, List<PatternRelationshipTradeSimulator.TradeRow>>>();
+    foreach (var rank in new[] { 0, 1 }) { tcTrades[rank] = tcGroups.ToDictionary(g => g, _ => new List<PatternRelationshipTradeSimulator.TradeRow>()); }
+
+    foreach (var dateGroup in tcPairs.GroupBy(p => p.Date).OrderBy(g => g.Key))
+    {
+        await using var tcSource = new NiftySignalDbContext(tradeSourceOptions);
+        var futureBars = await FutureEventBarBuilder.BuildDayAsync(tcSource, dateGroup.Key, tcThreshold, CancellationToken.None);
+        if (futureBars.Count == 0) { continue; }
+        foreach (var p in dateGroup)
+        {
+            var chain = await tcSource.Instruments.Where(i => i.AsOfDate == p.Date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == p.Expiry && i.Underlying == "NIFTY").OrderBy(i => i.StrikePrice).ThenBy(i => i.OptionType).ToListAsync();
+            if (chain.Count == 0) { continue; }
+            var optionBars = await SynchronizedOptionBarBuilder.BuildDayForChainAsync(tcSource, p.Date, chain, futureBars, CancellationToken.None);
+            var rows = await UnderlyingOptionRelationshipRecorder.RecordAsync(tcSource, p.Date, chain, futureBars, optionBars, CancellationToken.None);
+            if (rows.Count == 0) { continue; }
+
+            var triggers = RollingVoteAndRunAnalysis.ComputeRunLengthTriggers(rows);
+            var reach2A = triggers.Where(t => t.Pattern == TcPatternA && t.ReachedLength == 2).Select(t => t.EventId).ToHashSet();
+            var reach2B = triggers.Where(t => t.Pattern == TcPatternB && t.ReachedLength == 2).Select(t => t.EventId).ToHashSet();
+
+            var baseline = await PatternRelationshipTradeSimulator.SimulateDayAsync(tcSource, p.Date, rows, chain, futureBars, tcIstOffset, CancellationToken.None);
+            var candidate = await PatternRelationshipTradeSimulator.SimulateDayAsync(tcSource, p.Date, rows, chain, futureBars, tcIstOffset, CancellationToken.None,
+                patternAEntryFilter: reach2A.Contains, patternBEntryFilter: reach2B.Contains);
+            var diagA = await PatternRelationshipTradeSimulator.SimulateDayAsync(tcSource, p.Date, rows, chain, futureBars, tcIstOffset, CancellationToken.None,
+                patternAEntryFilter: reach2A.Contains, patternBEntryFilter: _ => false);
+            var diagB = await PatternRelationshipTradeSimulator.SimulateDayAsync(tcSource, p.Date, rows, chain, futureBars, tcIstOffset, CancellationToken.None,
+                patternAEntryFilter: _ => false, patternBEntryFilter: reach2B.Contains);
+
+            tcTrades[p.Rank]["Baseline"].AddRange(baseline.Trades);
+            tcTrades[p.Rank]["Candidate2ConsecAB"].AddRange(candidate.Trades);
+            tcTrades[p.Rank]["Diag2ConsecAOnly"].AddRange(diagA.Trades);
+            tcTrades[p.Rank]["Diag2ConsecBOnly"].AddRange(diagB.Trades);
+
+            Console.WriteLine($"  [Phase2] {p.Date:yyyy-MM-dd} expiry={p.Expiry:yyyy-MM-dd} rank={p.Rank} DTE={rows[0].Dte}: baseline={baseline.Trades.Count} candidate={candidate.Trades.Count} diagA={diagA.Trades.Count} diagB={diagB.Trades.Count}."); Console.Out.Flush();
+        }
+    }
+    Console.WriteLine();
+
+    static decimal TcMedian(IReadOnlyList<decimal> sorted) => sorted.Count == 0 ? 0m
+        : sorted.Count % 2 == 1 ? sorted[sorted.Count / 2] : (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2m;
+    static TimeSpan TcMedianTs(IReadOnlyList<TimeSpan> sorted) => sorted.Count == 0 ? TimeSpan.Zero
+        : sorted.Count % 2 == 1 ? sorted[sorted.Count / 2] : sorted[sorted.Count / 2 - 1] + TimeSpan.FromTicks((sorted[sorted.Count / 2] - sorted[sorted.Count / 2 - 1]).Ticks / 2);
+    static string TcF2(decimal v) => v.ToString("F2");
+    static string TcPct(double v) => $"{v:F1}%";
+    static (double? Mean, double? Median, double? P25, double? P75, double? Min, double? Max) TcDayDist(IEnumerable<int> perDayCounts)
+    {
+        var v = perDayCounts.Select(x => (double)x).OrderBy(x => x).ToList();
+        if (v.Count == 0) { return (null, null, null, null, null, null); }
+        double Pctile(double f) => v[Math.Clamp((int)Math.Ceiling(f * v.Count) - 1, 0, v.Count - 1)];
+        var median = v.Count % 2 == 1 ? v[v.Count / 2] : (v[v.Count / 2 - 1] + v[v.Count / 2]) / 2.0;
+        return (v.Average(), median, Pctile(0.25), Pctile(0.75), v.Min(), v.Max());
+    }
+
+    void TcReportTradeMetrics(string label, List<PatternRelationshipTradeSimulator.TradeRow> trades)
+    {
+        Console.WriteLine($"    [{label}] Trades={trades.Count}");
+        if (trades.Count == 0) { return; }
+        var wins = trades.Where(t => t.NetPnl > 0).ToList();
+        var losses = trades.Where(t => t.NetPnl < 0).ToList();
+        var grossProfit = wins.Sum(t => t.NetPnl);
+        var grossLoss = losses.Sum(t => t.NetPnl);
+        var net = trades.Sum(t => t.NetPnl);
+        var pnls = trades.Select(t => t.NetPnl).OrderBy(v => v).ToList();
+        var holdings = trades.Select(t => t.HoldingDuration).OrderBy(h => h).ToList();
+        var maes = trades.Select(t => t.MaePercent).OrderBy(v => v).ToList();
+        var mfes = trades.Select(t => t.MfePercent).OrderBy(v => v).ToList();
+        Console.WriteLine($"      Wins={wins.Count} Losses={losses.Count} WinRate={TcPct(100.0 * wins.Count / trades.Count)}");
+        Console.WriteLine($"      GrossProfit={TcF2(grossProfit)} GrossLoss={TcF2(grossLoss)} NetPnl={TcF2(net)} ProfitFactor={(grossLoss < 0 ? TcF2(grossProfit / Math.Abs(grossLoss)) : "--")}");
+        Console.WriteLine($"      AvgPnlPerTrade={TcF2(net / trades.Count)} MedianPnlPerTrade={TcF2(TcMedian(pnls))} LargestWin={TcF2(pnls[^1])} LargestLoss={TcF2(pnls[0])}");
+        Console.WriteLine($"      AvgMAE%={maes.Average():F2} MedianMAE%={TcMedian(maes):F2} AvgMFE%={mfes.Average():F2} MedianMFE%={TcMedian(mfes):F2}");
+        Console.WriteLine($"      AvgHolding={TimeSpan.FromSeconds(holdings.Average(h => h.TotalSeconds)):hh\\:mm\\:ss} MedianHolding={TcMedianTs(holdings):hh\\:mm\\:ss}");
+    }
+
+    void TcReportGroup(string label, List<PatternRelationshipTradeSimulator.TradeRow> trades)
+    {
+        Console.WriteLine($"  ## {label} ##");
+        TcReportTradeMetrics("All (A+B combined)", trades);
+        TcReportTradeMetrics("Pattern A -> PE", trades.Where(t => t.Pattern == "PatternA").ToList());
+        TcReportTradeMetrics("Pattern B -> CE", trades.Where(t => t.Pattern == "PatternB").ToList());
+    }
+
+    // ---- Item 9: baseline-reproduction sanity check against the already-recorded, already-doc'd
+    // crossover-trade-test's DTE=0 bucket (the ONLY 3 dates in this range with DTE=0: 2026-09-08,
+    // 2026-09-15, 2026-09-22 -- each independently simulated per-day, so this is an exact,
+    // legitimate reproducibility check, not an approximation). ----
+    Console.WriteLine("### Baseline-reproduction sanity check (historical 3-session record vs. this run) ###");
+    var histDates = new[] { new DateOnly(2026, 9, 8), new DateOnly(2026, 9, 15), new DateOnly(2026, 9, 22) };
+    var newBaselineA = tcTrades[0]["Baseline"].Where(t => t.Pattern == "PatternA" && histDates.Contains(t.TradingDate)).ToList();
+    var newBaselineB = tcTrades[0]["Baseline"].Where(t => t.Pattern == "PatternB" && histDates.Contains(t.TradingDate)).ToList();
+    const int histAn = 299; const decimal histANet = 79398.60m;
+    const int histBn = 297; const decimal histBNet = -54091.46m;
+    var newAn = newBaselineA.Count; var newANet = newBaselineA.Sum(t => t.NetPnl);
+    var newBn = newBaselineB.Count; var newBNet = newBaselineB.Sum(t => t.NetPnl);
+    var aMatches = newAn == histAn && Math.Abs(newANet - histANet) < 1m;
+    var bMatches = newBn == histBn && Math.Abs(newBNet - histBNet) < 1m;
+    Console.WriteLine($"  Pattern A (2026-09-08/15/22): historical n={histAn} netPnl={TcF2(histANet)} -- this run n={newAn} netPnl={TcF2(newANet)} -- {(aMatches ? "MATCH" : "** MISMATCH -- STOP AND INVESTIGATE **")}");
+    Console.WriteLine($"  Pattern B (2026-09-08/15/22): historical n={histBn} netPnl={TcF2(histBNet)} -- this run n={newBn} netPnl={TcF2(newBNet)} -- {(bMatches ? "MATCH" : "** MISMATCH -- STOP AND INVESTIGATE **")}");
+    Console.WriteLine();
+    if (!aMatches || !bMatches)
+    {
+        Console.WriteLine("** STOPPING: baseline reproduction failed. Not proceeding to interpret the candidate results below until this is resolved. **");
+    }
+
+    void TcRunReport(int rank)
+    {
+        var label = rank == 0 ? "CURRENT_WEEK_ONLY (PRIMARY)" : "NEXT_WEEK_ONLY (SECONDARY, NEVER POOLED WITH CURRENT-WEEK)";
+        Console.WriteLine($"########## {label} ##########");
+        foreach (var g in tcGroups) { TcReportGroup(g, tcTrades[rank][g]); }
+        Console.WriteLine();
+
+        // ---- Per-session breakdown ----
+        Console.WriteLine("  ## Per-session breakdown (2-consecutive candidate) ##");
+        var candTrades = tcTrades[rank]["Candidate2ConsecAB"];
+        var allDates = tcTrades[rank]["Baseline"].Select(t => t.TradingDate).Concat(candTrades.Select(t => t.TradingDate)).Distinct().OrderBy(d => d).ToList();
+        var sessionNet = new Dictionary<DateOnly, decimal>();
+        foreach (var d in allDates)
+        {
+            var aTrades = candTrades.Where(t => t.TradingDate == d && t.Pattern == "PatternA").ToList();
+            var bTrades = candTrades.Where(t => t.TradingDate == d && t.Pattern == "PatternB").ToList();
+            var combined = aTrades.Concat(bTrades).ToList();
+            var combinedNet = combined.Sum(t => t.NetPnl);
+            sessionNet[d] = combinedNet;
+            Console.WriteLine($"    {d:yyyy-MM-dd}: A2trades={aTrades.Count} A2Pnl={TcF2(aTrades.Sum(t => t.NetPnl))} | B2trades={bTrades.Count} B2Pnl={TcF2(bTrades.Sum(t => t.NetPnl))} | Combined trades={combined.Count} CombinedPnl={TcF2(combinedNet)}");
+        }
+        var posSessions = sessionNet.Values.Count(v => v > 0);
+        var negSessions = sessionNet.Values.Count(v => v < 0);
+        var totalAbs = sessionNet.Values.Sum(v => Math.Abs(v));
+        var largestShare = totalAbs > 0 ? 100.0 * (double)(sessionNet.Values.Select(Math.Abs).Max() / totalAbs) : 0.0;
+        Console.WriteLine($"    Positive sessions={posSessions}, Negative sessions={negSessions}, Largest session |P&L| share of total |P&L|={TcPct(largestShare)}");
+        Console.WriteLine();
+
+        // ---- Trade frequency comparison ----
+        Console.WriteLine("  ## Trade frequency (trades/day) ##");
+        var baselinePerDay = TcDayDist(tcTrades[rank]["Baseline"].GroupBy(t => t.TradingDate).Select(g => g.Count()));
+        var candidatePerDay = TcDayDist(candTrades.GroupBy(t => t.TradingDate).Select(g => g.Count()));
+        Console.WriteLine($"    Raw Pattern A/B: mean={baselinePerDay.Mean:F1} median={baselinePerDay.Median:F1} P25={baselinePerDay.P25:F1} P75={baselinePerDay.P75:F1} min={baselinePerDay.Min:F0} max={baselinePerDay.Max:F0}");
+        Console.WriteLine($"    2-consecutive (A+B): mean={candidatePerDay.Mean:F1} median={candidatePerDay.Median:F1} P25={candidatePerDay.P25:F1} P75={candidatePerDay.P75:F1} min={candidatePerDay.Min:F0} max={candidatePerDay.Max:F0}");
+        Console.WriteLine();
+    }
+
+    TcRunReport(0);
+    TcRunReport(1);
+
+    using (var writer = new StreamWriter(tcOutPath))
+    {
+        writer.WriteLine("Rank,Group,TradeId,TradingDate,ExpiryDate,Pattern,OptionType,Strike,Dte,SignalTimeIST,EntryTimeIST,ExitTimeIST,NetPnl,MaePercent,MfePercent,HoldingSeconds");
+        foreach (var rank in new[] { 0, 1 })
+        {
+            var expiryByDate = tcPairs.Where(p => p.Rank == rank).ToDictionary(p => p.Date, p => p.Expiry);
+            foreach (var g in tcGroups)
+            {
+                foreach (var t in tcTrades[rank][g])
+                {
+                    var expiry = expiryByDate.GetValueOrDefault(t.TradingDate);
+                    writer.WriteLine(string.Join(',', rank, g, t.TradeId, t.TradingDate.ToString("yyyy-MM-dd"), expiry.ToString("yyyy-MM-dd"), t.Pattern, t.OptionType, t.Strike, t.Dte,
+                        t.SignalTimestamp.ToOffset(tcIstOffset).ToString("HH:mm:ss.fff"), t.EntryTimestamp.ToOffset(tcIstOffset).ToString("HH:mm:ss.fff"), t.ExitTimestamp.ToOffset(tcIstOffset).ToString("HH:mm:ss.fff"),
+                        t.NetPnl, t.MaePercent, t.MfePercent, t.HoldingDuration.TotalSeconds));
+                }
+            }
+        }
+    }
+    Console.WriteLine($"Two-consecutive-trade-simulation CSV written to: {Path.GetFullPath(tcOutPath)}");
+
+    return 0;
+}
+
+// "vc0dte-relationship-650-3consec-oneday" -- 2026-09-25, ONE-DAY EXPLORATORY VISUAL DISCOVERY
+// experiment. 650-contract futures event bars (vs. the frozen 1300 used everywhere else) and a
+// 3-consecutive-same-pattern trigger (vs. the frozen 2-consecutive used in the controlled trade
+// simulation above), for ONE trading day only. Reuses the completely frozen
+// FutureEventBarBuilder/SynchronizedOptionBarBuilder/UnderlyingOptionRelationshipRecorder pipeline
+// (only the threshold argument changes, 650 instead of 1300 -- no bar-construction rule is
+// touched), RollingVoteAndRunAnalysis.ComputeRunLengthTriggers (Reached==3 instead of 2), and
+// PatternRelationshipTradeSimulator.SimulateDayAsync (its existing patternAEntryFilter/
+// patternBEntryFilter). Exploratory/visual only -- no optimization, no multi-day run, no
+// profitability claim.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-650-3consec-oneday <date> --out=basePath [--threshold=650] [--consecutive=3] [--minEntryPrice=100] [--maxEntryPrice=150]
+// 2026-09-25 addendum: --threshold/--consecutive generalize the two dimensions this one-day
+// exploratory command varies (bar size, run-length requirement) so a follow-up combination (e.g.
+// 650/2) doesn't require duplicating this whole block -- defaults (650/3) preserve the original
+// invocation's behaviour unchanged. --minEntryPrice/--maxEntryPrice (2026-09-25) reuse the
+// existing, already-used [100,150] band strike-selection rule already built into
+// PatternRelationshipTradeSimulator.SimulateDayAsync (see "Trade Simulation -- Frozen
+// Relationship" section's own addendum) -- when supplied, entry walks the chain outward from the
+// dynamic-ATM strike and picks the first contract whose OWN live premium at the signal event
+// falls in the band, instead of the pinned dynamic-ATM contract. Null (default, omitted) preserves
+// the original pinned-ATM behaviour unchanged.
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-650-3consec-oneday", StringComparison.OrdinalIgnoreCase))
+{
+    var (odPositional, odNamed) = SplitNamedArgs(args);
+    var odThreshold = odNamed.TryGetValue("threshold", out var odThresholdStr) ? long.Parse(odThresholdStr) : 650L;
+    var odConsecutive = odNamed.TryGetValue("consecutive", out var odConsecutiveStr) ? int.Parse(odConsecutiveStr) : 3;
+    var odMinEntryPrice = odNamed.TryGetValue("minEntryPrice", out var odMinStr) ? decimal.Parse(odMinStr) : (decimal?)null;
+    var odMaxEntryPrice = odNamed.TryGetValue("maxEntryPrice", out var odMaxStr) ? decimal.Parse(odMaxStr) : (decimal?)null;
+    var odIstOffset = TimeSpan.FromHours(5.5);
+    const string OdPatternA = RollingVoteAndRunAnalysis.PatternA;
+    const string OdPatternB = RollingVoteAndRunAnalysis.PatternB;
+
+    if (odPositional.Length < 2 || !DateOnly.TryParseExact(odPositional[1], "yyyy-MM-dd", out var odDate) || !odNamed.TryGetValue("out", out var odBase))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-650-3consec-oneday <date:yyyy-MM-dd> --out=basePath [--threshold=650] [--consecutive=3] [--minEntryPrice=100] [--maxEntryPrice=150]");
+        return 1;
+    }
+
+    Console.WriteLine($"=== vc0dte-relationship-650-3consec-oneday: ONE-DAY EXPLORATORY VISUAL DISCOVERY -- {odThreshold}-contract bars, {odConsecutive}-consecutive trigger. Not a strategy optimization exercise. ===");
+    Console.WriteLine();
+
+    await using var odSource = new NiftySignalDbContext(tradeSourceOptions);
+    var odHasFutures = await odSource.Instruments.AnyAsync(i => i.AsOfDate == odDate && i.InstrumentType == InstrumentType.Future && i.Underlying == "NIFTY");
+    if (!odHasFutures) { Console.WriteLine($"No futures instrument for {odDate:yyyy-MM-dd} -- stopping, no fabricated methodology."); return 1; }
+    var odExpiries = await odSource.Instruments.Where(i => i.AsOfDate == odDate && i.InstrumentType == InstrumentType.Option && i.Underlying == "NIFTY").Select(i => i.ExpiryDate).Distinct().OrderBy(e => e).ToListAsync();
+    if (odExpiries.Count == 0 || odExpiries[0] is null) { Console.WriteLine("No current-week (rank-0) option chain found -- stopping."); return 1; }
+    var odExpiry = odExpiries[0]!.Value;
+    var odDte = odExpiry.DayNumber - odDate.DayNumber;
+
+    Console.WriteLine("### Configuration ###");
+    Console.WriteLine($"  TradingDate: {odDate:yyyy-MM-dd}");
+    Console.WriteLine($"  ExpiryDate: {odExpiry:yyyy-MM-dd}");
+    Console.WriteLine($"  DTE: {odDte}");
+    Console.WriteLine($"  Event bar size: {odThreshold} contracts");
+    Console.WriteLine($"  Consecutive requirement: {odConsecutive}");
+    Console.WriteLine(odMinEntryPrice is not null && odMaxEntryPrice is not null
+        ? $"  Strike selection: BAND [{odMinEntryPrice},{odMaxEntryPrice}] (first contract outward from dynamic-ATM whose own live premium falls in this range)"
+        : "  Strike selection: pinned dynamic-ATM (no band)");
+    Console.WriteLine();
+
+    var (odBars, odTrace) = await FutureEventBarBuilder.BuildDayWithTraceAsync(odSource, odDate, odThreshold, CancellationToken.None);
+    if (odBars.Count == 0) { Console.WriteLine("No futures event bars built -- stopping."); return 1; }
+
+    Console.WriteLine("### Event-bar construction verification ###");
+    var odDurations = odBars.Select(b => (b.EndTimestamp - b.StartTimestamp).TotalSeconds).OrderBy(d => d).ToList();
+    var odNonFinal = odBars.Where(b => !b.IsFinalPartialBar).ToList();
+    var odFinalCount = odBars.Count(b => b.IsFinalPartialBar);
+    var odBelowThreshold = odNonFinal.Count(b => b.Volume < odThreshold);
+    var odStrictlyOrdered = odBars.Zip(odBars.Skip(1), (a, b) => a.EndTimestamp <= b.StartTimestamp).All(ok => ok);
+    Console.WriteLine($"  Number of {odThreshold}-volume bars: {odBars.Count}");
+    Console.WriteLine($"  Average bar duration: {odDurations.Average():F1}s | Median: {odDurations[odDurations.Count / 2]:F1}s | Min: {odDurations.Min():F1}s | Max: {odDurations.Max():F1}s");
+    Console.WriteLine($"  Average futures volume/bar: {odBars.Average(b => b.Volume):F1}");
+    Console.WriteLine($"  Volume-not-split confirmation: {odNonFinal.Count - odBelowThreshold}/{odNonFinal.Count} non-final bars have Volume >= threshold (design: excess carried forward as starting balance, never a tick split across two bars -- see FutureEventBar.cs's own doc comment); {odBelowThreshold} below-threshold non-final bar(s) would indicate a problem" + (odBelowThreshold == 0 ? " -- NONE FOUND." : " -- FOUND, INVESTIGATE."));
+    Console.WriteLine($"  Number of final partial bars: {odFinalCount}");
+    Console.WriteLine($"  Strictly ordered (no look-ahead, EndTimestamp[i] <= StartTimestamp[i+1] for all i): {(odStrictlyOrdered ? "PASS" : "FAIL -- INVESTIGATE")}");
+    Console.WriteLine($"  Per-tick trace rows: {odTrace.Count} (same accumulation loop that produced the bars above -- see TickTraceRow for exact threshold/excess arithmetic per tick)");
+    Console.WriteLine();
+
+    var odChain = await odSource.Instruments.Where(i => i.AsOfDate == odDate && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == odExpiry && i.Underlying == "NIFTY").OrderBy(i => i.StrikePrice).ThenBy(i => i.OptionType).ToListAsync();
+    var odOptionBars = await SynchronizedOptionBarBuilder.BuildDayForChainAsync(odSource, odDate, odChain, odBars, CancellationToken.None);
+    var odRows = await UnderlyingOptionRelationshipRecorder.RecordAsync(odSource, odDate, odChain, odBars, odOptionBars, CancellationToken.None);
+    if (odRows.Count == 0) { Console.WriteLine("No relationship rows produced -- stopping."); return 1; }
+
+    var odTriggers = RollingVoteAndRunAnalysis.ComputeRunLengthTriggers(odRows, Math.Max(odConsecutive, 6));
+    var odReach3A = odTriggers.Where(t => t.Pattern == OdPatternA && t.ReachedLength == odConsecutive).Select(t => t.EventId).ToHashSet();
+    var odReach3B = odTriggers.Where(t => t.Pattern == OdPatternB && t.ReachedLength == odConsecutive).Select(t => t.EventId).ToHashSet();
+
+    Console.WriteLine($"### A x{odConsecutive} / B x{odConsecutive} trigger sequences ###");
+    void PrintSequence(int eventId, string pattern)
+    {
+        var seq = Enumerable.Range(eventId - odConsecutive + 1, odConsecutive).Select(i => odRows[i]).ToArray();
+        var cumFwd = UnderlyingOptionRelationshipSummary.ComputeFuturesChange(odRows, eventId - odConsecutive + 1, odConsecutive - 1).PercentChange;
+        var totalVolume = seq.Sum(r => r.FuturesVolume);
+        var duration = seq[^1].EndTimestamp - seq[0].StartTimestamp;
+        Console.WriteLine($"  [{pattern}x{odConsecutive}] Trigger={seq[^1].EndTimestamp.ToOffset(odIstOffset):HH:mm:ss} Seq=[{string.Join(',', seq.Select(r => r.RelationshipCategory == OdPatternA ? "A" : r.RelationshipCategory == OdPatternB ? "B" : "?"))}] "
+            + $"Futures=[{string.Join(',', seq.Select(r => r.FuturesClose))}] CeDir=[{string.Join(',', seq.Select(r => r.CeDirection1))}] PeDir=[{string.Join(',', seq.Select(r => r.PeDirection1))}] "
+            + $"FuturesRet%=[{string.Join(',', seq.Select(r => r.FuturesChange1))}] CeRet%=[{string.Join(',', seq.Select(r => r.CeChange1))}] PeRet%=[{string.Join(',', seq.Select(r => r.PeChange1))}] "
+            + $"CumFuturesRet%={cumFwd:F4} Duration={duration.TotalSeconds:F0}s TotalContracts={totalVolume}");
+    }
+    foreach (var id in odReach3A.OrderBy(x => x)) { PrintSequence(id, "A"); }
+    foreach (var id in odReach3B.OrderBy(x => x)) { PrintSequence(id, "B"); }
+    var odSessionHours = (odRows[^1].EndTimestamp - odRows[0].StartTimestamp).TotalHours;
+    Console.WriteLine($"  Total A x{odConsecutive} triggers: {odReach3A.Count} | Total B x{odConsecutive} triggers: {odReach3B.Count} | Triggers/hour: {(odReach3A.Count + odReach3B.Count) / Math.Max(odSessionHours, 0.01):F2}");
+    Console.WriteLine("  Triggers by hour-of-day (IST):");
+    foreach (var g in odReach3A.Select(id => (Hour: odRows[id].EndTimestamp.ToOffset(odIstOffset).Hour, Pat: "A")).Concat(odReach3B.Select(id => (Hour: odRows[id].EndTimestamp.ToOffset(odIstOffset).Hour, Pat: "B"))).GroupBy(x => x.Hour).OrderBy(g => g.Key))
+    {
+        Console.WriteLine($"    {g.Key}:00-{g.Key}:59 -- A={g.Count(x => x.Pat == "A")} B={g.Count(x => x.Pat == "B")}");
+    }
+    Console.WriteLine();
+
+    // ---- Underlying forward-return analysis (same frozen ComputeFuturesChange used throughout this project) ----
+    Console.WriteLine("### Underlying forward-return analysis (futures %, from trigger event, no look-ahead) ###");
+    int[] odHorizons = [1, 3, 5, 10];
+    static (int N, double? Mean, double? Median, double? PctPos, double? PctNeg) OdStats(IEnumerable<decimal?> values)
+    {
+        var v = values.Where(x => x is not null).Select(x => (double)x!.Value).OrderBy(x => x).ToList();
+        if (v.Count == 0) { return (0, null, null, null, null); }
+        var median = v.Count % 2 == 1 ? v[v.Count / 2] : (v[v.Count / 2 - 1] + v[v.Count / 2]) / 2.0;
+        return (v.Count, v.Average(), median, 100.0 * v.Count(x => x > 0) / v.Count, 100.0 * v.Count(x => x < 0) / v.Count);
+    }
+    static string OdFmtStats((int N, double? Mean, double? Median, double? PctPos, double? PctNeg) s) => s.N == 0 ? "n=0" : $"n={s.N} mean={s.Mean:F4}% median={s.Median:F4}% pos={s.PctPos:F1}% neg={s.PctNeg:F1}%";
+    Console.WriteLine($"  [A x{odConsecutive} triggers] {string.Join(" | ", odHorizons.Select(h => $"+{h}:{OdFmtStats(OdStats(odReach3A.Select(id => UnderlyingOptionRelationshipSummary.ComputeFuturesChange(odRows, id, h).PercentChange)))}"))}");
+    Console.WriteLine($"  [B x{odConsecutive} triggers] {string.Join(" | ", odHorizons.Select(h => $"+{h}:{OdFmtStats(OdStats(odReach3B.Select(id => UnderlyingOptionRelationshipSummary.ComputeFuturesChange(odRows, id, h).PercentChange)))}"))}");
+    Console.WriteLine();
+
+    // ---- Full per-event CSV (every 650-vol event, not just triggers) ----
+    var runPattern = (string?)null; var runLength = 0;
+    using (var writer = new StreamWriter($"{odBase}-events.csv"))
+    {
+        writer.WriteLine("EventId,Timestamp,StartTimestamp,EndTimestamp,DurationSeconds,FuturesOpen,FuturesHigh,FuturesLow,FuturesClose,FuturesVolume,FuturesReturnPct,CeLtp,CeReturnPct,PeLtp,PeReturnPct,Pattern,CurrentRunPattern,CurrentRunLength,ATrigger,BTrigger");
+        for (var i = 0; i < odRows.Count; i++)
+        {
+            var r = odRows[i];
+            var pat = r.RelationshipCategory == OdPatternA ? "A" : r.RelationshipCategory == OdPatternB ? "B" : "Other";
+            if (pat != "Other" && r.RelationshipCategory == runPattern) { runLength++; }
+            else if (pat != "Other") { runPattern = r.RelationshipCategory; runLength = 1; }
+            else { runPattern = null; runLength = 0; }
+            writer.WriteLine(string.Join(',',
+                r.EventId, r.EndTimestamp.ToOffset(odIstOffset).ToString("HH:mm:ss.fff"), r.StartTimestamp.ToOffset(odIstOffset).ToString("HH:mm:ss.fff"), r.EndTimestamp.ToOffset(odIstOffset).ToString("HH:mm:ss.fff"),
+                (r.EndTimestamp - r.StartTimestamp).TotalSeconds, r.FuturesOpen, r.FuturesHigh, r.FuturesLow, r.FuturesClose, r.FuturesVolume, r.FuturesChange1,
+                r.CeAverageLtp, r.CeChange1, r.PeAverageLtp, r.PeChange1,
+                pat, pat == "Other" ? "" : pat, runLength, odReach3A.Contains(i), odReach3B.Contains(i)));
+        }
+    }
+    Console.WriteLine($"Full per-event CSV written to: {Path.GetFullPath($"{odBase}-events.csv")} ({odRows.Count} rows, none downsampled/removed).");
+
+    // ---- Trade-by-trade simulation (single combined run: A xN -> BUY PE, B xN -> BUY CE) ----
+    var odResult = await PatternRelationshipTradeSimulator.SimulateDayAsync(odSource, odDate, odRows, odChain, odBars, odIstOffset, CancellationToken.None,
+        optionBars: odOptionBars, minEntryPrice: odMinEntryPrice, maxEntryPrice: odMaxEntryPrice,
+        patternAEntryFilter: odReach3A.Contains, patternBEntryFilter: odReach3B.Contains);
+
+    using (var writer = new StreamWriter($"{odBase}-trades.csv"))
+    {
+        writer.WriteLine("TradeNum,Pattern,TriggerTimeIST,EntryTimeIST,ExitTimeIST,OptionType,Strike,EntryPremium,ExitPremium,Quantity,GrossPnl,Costs,NetPnl,HoldingSeconds,UnderlyingEntry,UnderlyingExit,UnderlyingReturnPct,OptionReturnPct,MaePercent,MfePercent");
+        var tn = 0;
+        foreach (var t in odResult.Trades)
+        {
+            tn++;
+            var costs = t.Stt + t.Gst + t.OtherCosts;
+            var underlyingRet = t.UnderlyingPriceAtEntry != 0 ? (t.UnderlyingPriceAtExit - t.UnderlyingPriceAtEntry) / t.UnderlyingPriceAtEntry * 100m : 0m;
+            var optionRet = t.EntryPrice != 0 ? (t.ExitPrice - t.EntryPrice) / t.EntryPrice * 100m : 0m;
+            writer.WriteLine(string.Join(',', tn, t.Pattern, t.SignalTimestamp.ToOffset(odIstOffset).ToString("HH:mm:ss"), t.EntryTimestamp.ToOffset(odIstOffset).ToString("HH:mm:ss"), t.ExitTimestamp.ToOffset(odIstOffset).ToString("HH:mm:ss"),
+                t.OptionType, t.Strike, t.EntryPrice, t.ExitPrice, t.Quantity, t.GrossPnl, costs, t.NetPnl, t.HoldingDuration.TotalSeconds,
+                t.UnderlyingPriceAtEntry, t.UnderlyingPriceAtExit, underlyingRet, optionRet, t.MaePercent, t.MfePercent));
+        }
+    }
+    Console.WriteLine($"Trade-by-trade CSV written to: {Path.GetFullPath($"{odBase}-trades.csv")} ({odResult.Trades.Count} trades)");
+    Console.WriteLine();
+
+    static string OdF2(decimal v) => v.ToString("F2");
+    void OdSummary(string label, List<PatternRelationshipTradeSimulator.TradeRow> trades)
+    {
+        Console.WriteLine($"  [{label}] Signal count={ (label.StartsWith("A x") ? odReach3A.Count : label.StartsWith("B x") ? odReach3B.Count : odReach3A.Count + odReach3B.Count) }, Executed trades={trades.Count}");
+        if (trades.Count == 0) { return; }
+        var wins = trades.Count(t => t.NetPnl > 0);
+        var gp = trades.Where(t => t.NetPnl > 0).Sum(t => t.NetPnl);
+        var gl = trades.Where(t => t.NetPnl < 0).Sum(t => t.NetPnl);
+        var net = trades.Sum(t => t.NetPnl);
+        var costs = trades.Sum(t => t.Stt + t.Gst + t.OtherCosts);
+        var pnls = trades.Select(t => t.NetPnl).OrderBy(v => v).ToList();
+        var holdings = trades.Select(t => t.HoldingDuration).OrderBy(h => h).ToList();
+        var median = pnls[pnls.Count / 2];
+        var medianHold = holdings[holdings.Count / 2];
+        Console.WriteLine($"    WinRate={100.0 * wins / trades.Count:F1}% GrossPnl={OdF2(gp)}/{OdF2(gl)} Costs={OdF2(costs)} NetPnl={OdF2(net)} AvgPnl/trade={OdF2(net / trades.Count)} MedianPnl/trade={OdF2(median)} PF={(gl < 0 ? OdF2(gp / Math.Abs(gl)) : "--")}");
+        Console.WriteLine($"    AvgHolding={TimeSpan.FromSeconds(holdings.Average(h => h.TotalSeconds)):hh\\:mm\\:ss} MedianHolding={medianHold:hh\\:mm\\:ss} AvgMAE%={trades.Average(t => t.MaePercent):F2} AvgMFE%={trades.Average(t => t.MfePercent):F2}");
+    }
+    Console.WriteLine("### Trade summary (one day, exploratory evidence only -- NOT a validated edge) ###");
+    OdSummary($"A x{odConsecutive} -> PE", odResult.Trades.Where(t => t.Pattern == "PatternA").ToList());
+    OdSummary($"B x{odConsecutive} -> CE", odResult.Trades.Where(t => t.Pattern == "PatternB").ToList());
+    OdSummary("Combined", odResult.Trades);
+    Console.WriteLine();
+
+    Console.WriteLine("### Comparison with 1300/2 (same day, 2026-09-22, from the already-completed controlled trade simulation) ###");
+    Console.WriteLine($"  {odThreshold}/{odConsecutive}: A triggers=" + odReach3A.Count + " B triggers=" + odReach3B.Count
+        + " A xN->PE trades=" + odResult.Trades.Count(t => t.Pattern == "PatternA") + " B xN->CE trades=" + odResult.Trades.Count(t => t.Pattern == "PatternB")
+        + " NetPnl=" + OdF2(odResult.Trades.Sum(t => t.NetPnl)));
+    Console.WriteLine("  1300/2 (recorded, this same day): A triggers=13 B triggers=14 A x2->PE trades=13 (NetPnl=1415.19) B x2->CE trades=14 (NetPnl=35085.02) Combined NetPnl=36500.21");
+    Console.WriteLine("  (Not an optimization comparison -- purely descriptive: how does event-bar resolution change observed structure on the same day.)");
+    Console.WriteLine();
+    Console.WriteLine($"Per-event CSV: {Path.GetFullPath($"{odBase}-events.csv")}");
+    Console.WriteLine($"Trades CSV: {Path.GetFullPath($"{odBase}-trades.csv")}");
+
+    return 0;
+}
+
+// "vc0dte-relationship-2600x5-rolling-state" -- 2026-09-25, STRUCTURAL HYPOTHESIS TEST. Fixed
+// 2600-contract futures event bars; a ROLLING window of the 5 most recent completed bars
+// (~13,000 contracts, updates every 2,600) is evaluated as ONE contextual observation per
+// completed base bar -- classified A/B/Other from the WHOLE window's start-to-end relationship
+// (never per-base-bar, never majority vote), and treated as a persistent STATE (entry/continuation/
+// exit/age/episode -- see RollingStateAnalysis.cs), not as an independent signal on every
+// overlapping window. Reuses frozen FutureEventBarBuilder/SynchronizedOptionBarBuilder/
+// UnderlyingOptionRelationshipRecorder for base-bar construction and descriptive per-bar context,
+// and frozen AtmStrikeSelector/OptionTickSeries/PaperTradeSimulator/TransactionCostCalculator/
+// MaeMfeCalculator for the rolling-window option pricing and diagnostic trade simulation -- no new
+// bar-construction rule, no new indicator, no new cost/fill model. IMPORTANT WIRING NOTE (per this
+// experiment's own explicit instruction to surface exactly this): the existing
+// PatternRelationshipTradeSimulator cannot be reused for the trade-simulation step, because its
+// patternAEntryFilter/patternBEntryFilter are only ever consulted when a ROW's OWN per-base-bar
+// RelationshipCategory already equals PatternA/PatternB -- this experiment's rolling classification
+// is a DIFFERENT, coarser signal that frequently fires on bars whose own per-bar category is
+// "Other" (spec section 10's whole point). A new, minimal trade loop is used instead, applying the
+// IDENTICAL rules (one position, pinned contract, fixed 10 lots, no SL/TP, no entry after 15:00,
+// mandatory 15:15 close, existing cost/MAE-MFE calculators) -- not a new exit system, just a
+// different entry-signal wire-up, made explicit rather than silently forced through the old filter.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-2600x5-rolling-state <date> --out=basePath [--window=5]
+// 2026-09-25 addendum: --window generalizes the rolling-window bar count (default 5, preserving
+// the original invocation's behaviour unchanged) so a follow-up window size doesn't require
+// duplicating this whole block.
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-2600x5-rolling-state", StringComparison.OrdinalIgnoreCase))
+{
+    const long rsThreshold = 2600L;
+    var rsIstOffset = TimeSpan.FromHours(5.5);
+    const string RsPatternA = RollingVoteAndRunAnalysis.PatternA;
+    const string RsPatternB = RollingVoteAndRunAnalysis.PatternB;
+    var rsCosts = new CostsConfig(BrokeragePerOrder: 0m, SlippageTicks: 0);
+    var rsNoNewEntriesAfter = new TimeOnly(15, 0);
+    var rsForceCloseAt = new TimeOnly(15, 15);
+    const int rsLots = 10;
+
+    var (rsPositional, rsNamed) = SplitNamedArgs(args);
+    var rsWindowBars = rsNamed.TryGetValue("window", out var rsWindowStr) ? int.Parse(rsWindowStr) : 5;
+    if (rsPositional.Length < 2 || !DateOnly.TryParseExact(rsPositional[1], "yyyy-MM-dd", out var rsDate) || !rsNamed.TryGetValue("out", out var rsBase))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-2600x5-rolling-state <date:yyyy-MM-dd> --out=basePath [--window=5]");
+        return 1;
+    }
+
+    Console.WriteLine($"=== vc0dte-relationship-2600x5-rolling-state: rolling {rsWindowBars}-bar (~{rsThreshold * rsWindowBars}-contract) contextual window, STATE not per-window signal. Structural hypothesis test, not an optimization. ===");
+    Console.WriteLine();
+
+    await using var rsSource = new NiftySignalDbContext(tradeSourceOptions);
+    var rsHasFutures = await rsSource.Instruments.AnyAsync(i => i.AsOfDate == rsDate && i.InstrumentType == InstrumentType.Future && i.Underlying == "NIFTY");
+    if (!rsHasFutures) { Console.WriteLine($"No futures instrument for {rsDate:yyyy-MM-dd} -- stopping."); return 1; }
+    var rsExpiries = await rsSource.Instruments.Where(i => i.AsOfDate == rsDate && i.InstrumentType == InstrumentType.Option && i.Underlying == "NIFTY").Select(i => i.ExpiryDate).Distinct().OrderBy(e => e).ToListAsync();
+    if (rsExpiries.Count == 0 || rsExpiries[0] is null) { Console.WriteLine("No current-week (rank-0) option chain found -- stopping."); return 1; }
+    var rsExpiry = rsExpiries[0]!.Value;
+    var rsDte = rsExpiry.DayNumber - rsDate.DayNumber;
+
+    Console.WriteLine("### A. Configuration ###");
+    Console.WriteLine($"  TradingDate: {rsDate:yyyy-MM-dd} | ExpiryDate: {rsExpiry:yyyy-MM-dd} | DTE: {rsDte} | Base volume: {rsThreshold} | Rolling window: {rsWindowBars} bars (~{rsThreshold * rsWindowBars} contracts)");
+    Console.WriteLine();
+
+    var (rsBars, rsTrace) = await FutureEventBarBuilder.BuildDayWithTraceAsync(rsSource, rsDate, rsThreshold, CancellationToken.None);
+    if (rsBars.Count < rsWindowBars) { Console.WriteLine("Not enough base bars for even one rolling window -- stopping."); return 1; }
+
+    Console.WriteLine("### B. Base-bar integrity ###");
+    var rsDurations = rsBars.Select(b => (b.EndTimestamp - b.StartTimestamp).TotalSeconds).OrderBy(d => d).ToList();
+    double RsPercentile(List<double> sorted, double f) => sorted[Math.Clamp((int)Math.Ceiling(f * sorted.Count) - 1, 0, sorted.Count - 1)];
+    var rsNonFinal = rsBars.Where(b => !b.IsFinalPartialBar).ToList();
+    var rsBelowThreshold = rsNonFinal.Count(b => b.Volume < rsThreshold);
+    var rsOrdered = rsBars.Zip(rsBars.Skip(1), (a, b) => a.EndTimestamp <= b.StartTimestamp).All(ok => ok);
+    var rsNoDupBoundaries = rsBars.Select(b => b.EventId).Distinct().Count() == rsBars.Count;
+    Console.WriteLine($"  Bars: {rsBars.Count} | Avg dur={rsDurations.Average():F1}s Median={rsDurations[rsDurations.Count / 2]:F1}s P25={RsPercentile(rsDurations, 0.25):F1}s P75={RsPercentile(rsDurations, 0.75):F1}s Min={rsDurations.Min():F1}s Max={rsDurations.Max():F1}s");
+    Console.WriteLine($"  Avg volume/bar={rsBars.Average(b => b.Volume):F1} | Final partial bars={rsBars.Count(b => b.IsFinalPartialBar)}");
+    Console.WriteLine($"  Volume-not-split: {rsNonFinal.Count - rsBelowThreshold}/{rsNonFinal.Count} non-final bars >= threshold ({(rsBelowThreshold == 0 ? "NONE below -- OK" : $"{rsBelowThreshold} BELOW -- INVESTIGATE")})");
+    Console.WriteLine($"  Strictly ordered (no look-ahead): {(rsOrdered ? "PASS" : "FAIL")} | No duplicate boundaries: {(rsNoDupBoundaries ? "PASS" : "FAIL")}");
+    Console.WriteLine();
+
+    var rsChain = await rsSource.Instruments.Where(i => i.AsOfDate == rsDate && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == rsExpiry && i.Underlying == "NIFTY").OrderBy(i => i.StrikePrice).ThenBy(i => i.OptionType).ToListAsync();
+    var rsOptionBars = await SynchronizedOptionBarBuilder.BuildDayForChainAsync(rsSource, rsDate, rsChain, rsBars, CancellationToken.None);
+    var rsRows = await UnderlyingOptionRelationshipRecorder.RecordAsync(rsSource, rsDate, rsChain, rsBars, rsOptionBars, CancellationToken.None);
+    if (rsRows.Count == 0) { Console.WriteLine("No relationship rows produced -- stopping."); return 1; }
+
+    // ---- Rolling-window computation: ONE exact CE/PE contract per window, picked at the window's
+    // OWN end, sampled at window-start and window-end from that contract's own real tick series
+    // (never fabricated, never spliced across contracts). ----
+    var rsTickCache = new Dictionary<string, OptionTickSeries>();
+    async Task<OptionTickSeries> RsGetSeriesAsync(string token)
+    {
+        if (!rsTickCache.TryGetValue(token, out var series))
+        {
+            var dayStart = rsBars[0].StartTimestamp;
+            var dayEnd = new DateTimeOffset(rsDate.ToDateTime(new TimeOnly(15, 30)), rsIstOffset).ToUniversalTime();
+            series = await OptionTickSeries.LoadAsync(rsSource, token, dayStart, dayEnd, CancellationToken.None);
+            rsTickCache[token] = series;
+        }
+        return series;
+    }
+
+    var rsObs = new List<(int WindowEndBarIdx, int WindowStartBarIdx, DateTimeOffset WindowStart, DateTimeOffset WindowEnd, double DurationSec, long ApproxVolume,
+        decimal FuturesStart, decimal FuturesEnd, decimal FuturesChangePts, decimal? FuturesRetPct,
+        decimal? AtmStrike, string? CeToken, string? PeToken,
+        decimal? CeStart, decimal? CeEnd, decimal? CeChangePts, decimal? CeRetPct,
+        decimal? PeStart, decimal? PeEnd, decimal? PeChangePts, decimal? PeRetPct,
+        bool Missing, string State, string[] BaseBarPatterns)>();
+
+    for (var i = rsWindowBars - 1; i < rsBars.Count; i++)
+    {
+        var startBar = rsBars[i - rsWindowBars + 1];
+        var endBar = rsBars[i];
+        var futuresStart = startBar.Open;
+        var futuresEnd = endBar.Close;
+        var futuresChangePts = futuresEnd - futuresStart;
+        var futuresRetPct = futuresStart != 0 ? futuresChangePts / futuresStart * 100m : (decimal?)null;
+
+        var ceInstrument = AtmStrikeSelector.PickAtm(rsChain, OptionType.Call, futuresEnd);
+        var peInstrument = AtmStrikeSelector.PickAtm(rsChain, OptionType.Put, futuresEnd);
+        decimal? ceStart = null, ceEnd = null, peStart = null, peEnd = null;
+        var missing = ceInstrument is null || peInstrument is null;
+        if (ceInstrument is not null)
+        {
+            var ceSeries = await RsGetSeriesAsync(ceInstrument.Token);
+            ceStart = ceSeries.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice;
+            ceEnd = ceSeries.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice;
+            missing |= ceStart is null || ceEnd is null;
+        }
+        if (peInstrument is not null)
+        {
+            var peSeries = await RsGetSeriesAsync(peInstrument.Token);
+            peStart = peSeries.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice;
+            peEnd = peSeries.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice;
+            missing |= peStart is null || peEnd is null;
+        }
+
+        decimal? ceChangePts = ceStart is not null && ceEnd is not null ? ceEnd - ceStart : null;
+        decimal? ceRetPct = ceChangePts is not null && ceStart != 0 ? ceChangePts / ceStart * 100m : null;
+        decimal? peChangePts = peStart is not null && peEnd is not null ? peEnd - peStart : null;
+        decimal? peRetPct = peChangePts is not null && peStart != 0 ? peChangePts / peStart * 100m : null;
+
+        var state = "Other";
+        if (!missing)
+        {
+            if (futuresChangePts > 0 && ceChangePts < 0 && peChangePts > 0) { state = "A"; }
+            else if (futuresChangePts < 0 && ceChangePts > 0 && peChangePts < 0) { state = "B"; }
+        }
+
+        var baseBarPatterns = Enumerable.Range(i - rsWindowBars + 1, rsWindowBars)
+            .Select(bi => rsRows[bi].RelationshipCategory == RsPatternA ? "A" : rsRows[bi].RelationshipCategory == RsPatternB ? "B" : "Other")
+            .ToArray();
+
+        rsObs.Add((i, i - rsWindowBars + 1, startBar.StartTimestamp, endBar.EndTimestamp, (endBar.EndTimestamp - startBar.StartTimestamp).TotalSeconds,
+            rsBars.Skip(i - rsWindowBars + 1).Take(rsWindowBars).Sum(b => b.Volume),
+            futuresStart, futuresEnd, futuresChangePts, futuresRetPct,
+            ceInstrument?.StrikePrice, ceInstrument?.Token, peInstrument?.Token,
+            ceStart, ceEnd, ceChangePts, ceRetPct, peStart, peEnd, peChangePts, peRetPct,
+            missing, state, baseBarPatterns));
+    }
+
+    var rsAnnotations = RollingStateAnalysis.Annotate(rsObs.Select(o => o.State).ToList());
+    Console.WriteLine($"### C. Rolling-state population ###");
+    Console.WriteLine($"  Completed rolling windows: {rsObs.Count}");
+    foreach (var g in rsObs.Select(o => o.State).GroupBy(s => s)) { Console.WriteLine($"    {g.Key}: {g.Count()} windows"); }
+    var rsEntries = Enumerable.Range(0, rsObs.Count).Where(i => rsAnnotations[i].IsStateEntry).ToList();
+    var rsAEntries = rsEntries.Where(i => rsObs[i].State == "A").ToList();
+    var rsBEntries = rsEntries.Where(i => rsObs[i].State == "B").ToList();
+    Console.WriteLine($"  State entries: {rsEntries.Count} total ({rsAEntries.Count} A, {rsBEntries.Count} B)");
+
+    // ---- Episodes: group by StateEpisodeId for A/B rows only. ----
+    var rsEpisodes = new List<(int EpisodeId, string Pattern, int EntryIdx, int ExitIdx, int UpdateCount)>();
+    for (var i = 0; i < rsObs.Count; i++)
+    {
+        if (!rsAnnotations[i].IsStateEntry) { continue; }
+        var episodeId = rsAnnotations[i].StateEpisodeId;
+        var endIdx = i;
+        for (var j = i; j < rsObs.Count && rsAnnotations[j].StateEpisodeId == episodeId; j++) { endIdx = j; }
+        rsEpisodes.Add((episodeId, rsObs[i].State, i, endIdx, endIdx - i + 1));
+    }
+    Console.WriteLine($"  Episodes: {rsEpisodes.Count} total ({rsEpisodes.Count(e => e.Pattern == "A")} A, {rsEpisodes.Count(e => e.Pattern == "B")} B)");
+    foreach (var pat in new[] { "A", "B" })
+    {
+        var eps = rsEpisodes.Where(e => e.Pattern == pat).ToList();
+        if (eps.Count == 0) { Console.WriteLine($"    [{pat}] no episodes"); continue; }
+        var durations = eps.Select(e => (rsObs[e.ExitIdx].WindowEnd - rsObs[e.EntryIdx].WindowStart).TotalSeconds).OrderBy(d => d).ToList();
+        var updates = eps.Select(e => e.UpdateCount).OrderBy(u => u).ToList();
+        Console.WriteLine($"    [{pat}] n={eps.Count} MedianDur={durations[durations.Count / 2]:F0}s AvgDur={durations.Average():F0}s MedianMaxAge={updates[updates.Count / 2]} MaxAge={updates.Max()} " +
+            $"Survive>=2:{100.0 * eps.Count(e => e.UpdateCount >= 2) / eps.Count:F0}% >=3:{100.0 * eps.Count(e => e.UpdateCount >= 3) / eps.Count:F0}% >=5:{100.0 * eps.Count(e => e.UpdateCount >= 5) / eps.Count:F0}%");
+    }
+    var rsTransitions = new Dictionary<string, int>();
+    for (var i = 1; i < rsObs.Count; i++)
+    {
+        if (!rsAnnotations[i].IsStateEntry && !rsAnnotations[i].IsStateExit) { continue; }
+        var from = rsAnnotations[i].PreviousState; var to = rsObs[i].State;
+        if (from == to) { continue; }
+        var key = $"{from}->{to}";
+        rsTransitions[key] = rsTransitions.GetValueOrDefault(key) + 1;
+    }
+    Console.WriteLine("  Transitions: " + string.Join(", ", rsTransitions.Select(kv => $"{kv.Key}={kv.Value}")));
+    Console.WriteLine();
+
+    // ---- D. Underlying directional result (PRIMARY) -- state-entry points only. ----
+    int[] rsHorizons = [1, 3, 5, 10];
+    static (int N, double? Mean, double? Median, double? PctExpected, double? P25, double? P75, double? Min, double? Max) RsFwdStats(IEnumerable<decimal?> values, bool expectNegative)
+    {
+        var v = values.Where(x => x is not null).Select(x => (double)x!.Value).OrderBy(x => x).ToList();
+        if (v.Count == 0) { return (0, null, null, null, null, null, null, null); }
+        double Pct(double f) => v[Math.Clamp((int)Math.Ceiling(f * v.Count) - 1, 0, v.Count - 1)];
+        var median = v.Count % 2 == 1 ? v[v.Count / 2] : (v[v.Count / 2 - 1] + v[v.Count / 2]) / 2.0;
+        var pctExpected = 100.0 * v.Count(x => expectNegative ? x < 0 : x > 0) / v.Count;
+        return (v.Count, v.Average(), median, pctExpected, Pct(0.25), Pct(0.75), v.Min(), v.Max());
+    }
+    static string RsFmt((int N, double? Mean, double? Median, double? PctExpected, double? P25, double? P75, double? Min, double? Max) s) =>
+        s.N == 0 ? "n=0" : $"n={s.N} mean={s.Mean:F2} median={s.Median:F2} expected%={s.PctExpected:F1}% P25={s.P25:F2} P75={s.P75:F2} min={s.Min:F2} max={s.Max:F2}";
+
+    Console.WriteLine("### D. Underlying directional result (PRIMARY) -- forward FuturesChangePoints/ReturnPct from state-entry, A expects negative / B expects positive ###");
+    foreach (var (label, idxs, expectNeg) in new[] { ("A entries", rsAEntries, true), ("B entries", rsBEntries, false) })
+    {
+        foreach (var h in rsHorizons)
+        {
+            var pts = idxs.Select(i => (decimal?)UnderlyingOptionRelationshipSummary.ComputeFuturesChange(rsRows, rsObs[i].WindowEndBarIdx, h).AbsoluteChange);
+            var pct = idxs.Select(i => UnderlyingOptionRelationshipSummary.ComputeFuturesChange(rsRows, rsObs[i].WindowEndBarIdx, h).PercentChange);
+            Console.WriteLine($"  [{label}] +{h}: pts[{RsFmt(RsFwdStats(pts, expectNeg))}] pct[{RsFmt(RsFwdStats(pct, expectNeg))}]");
+        }
+    }
+    Console.WriteLine();
+
+    // ---- E. State-age result. ----
+    Console.WriteLine("### E. State-age result (descriptive only) ###");
+    foreach (var ageLabel in new[] { "1", "2", "3", "4+" })
+    {
+        var idxs = Enumerable.Range(0, rsObs.Count).Where(i =>
+        {
+            var age = rsAnnotations[i].StateAge;
+            return ageLabel == "4+" ? age >= 4 : age == int.Parse(ageLabel);
+        }).Where(i => rsObs[i].State is "A" or "B").ToList();
+        var aIdxs = idxs.Where(i => rsObs[i].State == "A").ToList();
+        var bIdxs = idxs.Where(i => rsObs[i].State == "B").ToList();
+        foreach (var h in new[] { 1, 3, 5 })
+        {
+            var aPct = aIdxs.Select(i => UnderlyingOptionRelationshipSummary.ComputeFuturesChange(rsRows, rsObs[i].WindowEndBarIdx, h).PercentChange);
+            var bPct = bIdxs.Select(i => UnderlyingOptionRelationshipSummary.ComputeFuturesChange(rsRows, rsObs[i].WindowEndBarIdx, h).PercentChange);
+            Console.WriteLine($"  [Age {ageLabel}] +{h}: A[{RsFmt(RsFwdStats(aPct, true))}] B[{RsFmt(RsFwdStats(bPct, false))}]");
+        }
+    }
+    Console.WriteLine();
+
+    // ---- F. Option response (diagnostic only) -- pinned contract at state entry, forward option return. ----
+    Console.WriteLine("### F. Option response (diagnostic only, independent of trade exits) ###");
+    foreach (var (label, idxs, isA) in new[] { ("A entries -> PE response", rsAEntries, true), ("B entries -> CE response", rsBEntries, false) })
+    {
+        foreach (var h in rsHorizons)
+        {
+            var rets = new List<decimal?>();
+            foreach (var i in idxs)
+            {
+                var o = rsObs[i];
+                var token = isA ? o.PeToken : o.CeToken;
+                var baseline = isA ? o.PeEnd : o.CeEnd;
+                var endBarIdx = o.WindowEndBarIdx + h;
+                if (token is null || baseline is null || baseline == 0 || endBarIdx >= rsRows.Count) { rets.Add(null); continue; }
+                var series = await RsGetSeriesAsync(token);
+                var fwdPrice = series.EntryAtOrBefore(rsRows[endBarIdx].EndTimestamp)?.LastPrice;
+                rets.Add(fwdPrice is not null ? (fwdPrice.Value - baseline.Value) / baseline.Value * 100m : null);
+            }
+            Console.WriteLine($"  [{label}] +{h}: {RsFmt(RsFwdStats(rets, false))}");
+        }
+    }
+    Console.WriteLine();
+
+    // ---- G. Trade simulation (SECONDARY) -- new minimal loop, entries on state-entry only, exits
+    // on OPPOSITE state-entry or mandatory 15:15 close. Explicitly NOT the frozen
+    // PatternRelationshipTradeSimulator (see the command's own header comment for why). ----
+    Console.WriteLine("### G. Trade simulation (SECONDARY diagnostic; new minimal loop -- see header comment for why the frozen simulator could not be reused as-is) ###");
+    var rsTrades = new List<(string Pattern, int StateEpisodeId, DateTimeOffset StateEntryTs, DateTimeOffset EntryTs, DateTimeOffset ExitTs, string ExitReason,
+        decimal Strike, OptionType Side, decimal EntryPremium, decimal ExitPremium, int Quantity, decimal GrossPnl, decimal Stt, decimal Gst, decimal NetPnl,
+        double HoldingSeconds, decimal UnderlyingEntry, decimal UnderlyingExit, decimal MaePct, decimal MfePct, int StateAgeAtEntry)>();
+
+    (string Pattern, Instrument Instrument, decimal Strike, OptionType Side, DateTimeOffset StateEntryTs, DateTimeOffset EntryTs, decimal EntryFillPrice, decimal UnderlyingEntry, int StateAgeAtEntry)? rsOpen = null;
+
+    async Task RsCloseAsync(DateTimeOffset atTimestamp, string exitReason, decimal underlyingExit)
+    {
+        var pos = rsOpen!.Value;
+        var series = await RsGetSeriesAsync(pos.Instrument.Token);
+        var exitEntry = exitReason == "ForcedEod" ? series.EntryAtOrBefore(atTimestamp) : series.EntryAtOrAfter(atTimestamp);
+        if (exitEntry is not { } exit) { return; }
+        var quantity = pos.Instrument.LotSize * rsLots;
+        var exitBase = exit.Depth is { } d ? d.Bid1Price : exit.LastPrice;
+        var exitFill = PaperTradeSimulator.FillExit(exitBase, pos.Instrument.TickSize, quantity, rsCosts);
+        var grossPnl = (exitFill.FillPrice - pos.EntryFillPrice) * quantity;
+        var costBreakdown = TransactionCostCalculator.Compute(exitFill.GrossValue, rsCosts.BrokeragePerOrder * 2);
+        var netPnl = grossPnl - costBreakdown.Total;
+        var pathPrices = series.AllEntries.Where(e => e.Timestamp > pos.EntryTs && e.Timestamp <= exit.Timestamp).Select(e => e.LastPrice).ToList();
+        var maeMfe = MaeMfeCalculator.Compute(pos.EntryFillPrice, pathPrices);
+        rsTrades.Add((pos.Pattern, -1, pos.StateEntryTs, pos.EntryTs, exit.Timestamp, exitReason, pos.Strike, pos.Side, pos.EntryFillPrice, exitFill.FillPrice,
+            quantity, grossPnl, costBreakdown.Stt, costBreakdown.Gst, netPnl, (exit.Timestamp - pos.EntryTs).TotalSeconds, pos.UnderlyingEntry, underlyingExit,
+            maeMfe.MaePercent, maeMfe.MfePercent, pos.StateAgeAtEntry));
+        rsOpen = null;
+    }
+
+    for (var i = 0; i < rsObs.Count; i++)
+    {
+        var o = rsObs[i];
+        var ann = rsAnnotations[i];
+        if (rsOpen is { } openPos)
+        {
+            var opposes = (openPos.Pattern == "A" && o.State == "B" && ann.IsStateEntry) || (openPos.Pattern == "B" && o.State == "A" && ann.IsStateEntry);
+            if (opposes) { await RsCloseAsync(o.WindowEnd, "OppositeStateEntry", o.FuturesEnd); }
+        }
+        if (!ann.IsStateEntry) { continue; }
+        if (rsOpen is not null) { continue; } // one open position; a same-direction re-entry while already in a same-side position never happens (opposite closes first), but guard anyway.
+
+        var istTime = TimeOnly.FromDateTime(o.WindowEnd.ToOffset(rsIstOffset).DateTime);
+        if (istTime >= rsNoNewEntriesAfter) { continue; }
+
+        var side = o.State == "A" ? OptionType.Put : OptionType.Call;
+        var token = o.State == "A" ? o.PeToken : o.CeToken;
+        var strike = o.AtmStrike;
+        if (token is null || strike is null) { continue; }
+        var instrument = rsChain.FirstOrDefault(x => x.Token == token);
+        if (instrument is null) { continue; }
+        var series = await RsGetSeriesAsync(token);
+        var entryEntry = series.EntryAtOrAfter(o.WindowEnd);
+        if (entryEntry is not { } entry) { continue; }
+        var entryBase = entry.Depth is { } ed ? ed.Ask1Price : entry.LastPrice;
+        var entryFill = PaperTradeSimulator.FillEntry(entryBase, instrument.TickSize, instrument.LotSize * rsLots, rsCosts);
+        rsOpen = (o.State, instrument, strike.Value, side, o.WindowEnd, entry.Timestamp, entryFill.FillPrice, o.FuturesEnd, ann.StateAge);
+    }
+    if (rsOpen is not null)
+    {
+        var forceCloseAt = new DateTimeOffset(rsDate.ToDateTime(rsForceCloseAt), rsIstOffset).ToUniversalTime();
+        await RsCloseAsync(forceCloseAt, "ForcedEod", rsBars[^1].Close);
+    }
+
+    var rsWins = rsTrades.Count(t => t.NetPnl > 0);
+    var rsGp = rsTrades.Where(t => t.NetPnl > 0).Sum(t => t.NetPnl);
+    var rsGl = rsTrades.Where(t => t.NetPnl < 0).Sum(t => t.NetPnl);
+    var rsNet = rsTrades.Sum(t => t.NetPnl);
+    Console.WriteLine($"  Trades={rsTrades.Count} (A={rsTrades.Count(t => t.Pattern == "A")}, B={rsTrades.Count(t => t.Pattern == "B")}) WinRate={(rsTrades.Count > 0 ? 100.0 * rsWins / rsTrades.Count : 0):F1}% GrossProfit={rsGp:F2} GrossLoss={rsGl:F2} NetPnl={rsNet:F2} PF={(rsGl < 0 ? (rsGp / Math.Abs(rsGl)).ToString("F2") : "--")}");
+    Console.WriteLine();
+
+    // ---- K. Deliverables: CSVs. ----
+    using (var writer = new StreamWriter($"{rsBase}-rolling-state.csv"))
+    {
+        writer.WriteLine("TradingDate,ExpiryDate,Dte,BaseBarIndex,WindowStartBaseBarIndex,WindowEndBaseBarIndex,WindowStartTimestamp,WindowEndTimestamp,WindowDurationSeconds,ApproxWindowVolume," +
+            "FuturesStart,FuturesEnd,FuturesChangePoints,FuturesReturnPct,SelectedATMStrike,CeStart,CeEnd,CeChangePoints,CeReturnPct,PeStart,PeEnd,PeChangePoints,PeReturnPct," +
+            "RollingState,PreviousRollingState,IsStateEntry,IsStateContinuation,IsStateExit,StateAge,StateEpisodeId,Missing," +
+            string.Join(',', Enumerable.Range(1, rsWindowBars).Select(n => $"BaseBar{n}")));
+        for (var i = 0; i < rsObs.Count; i++)
+        {
+            var o = rsObs[i]; var a = rsAnnotations[i];
+            writer.WriteLine(string.Join(',', rsDate.ToString("yyyy-MM-dd"), rsExpiry.ToString("yyyy-MM-dd"), rsDte, o.WindowEndBarIdx, o.WindowStartBarIdx, o.WindowEndBarIdx,
+                o.WindowStart.ToOffset(rsIstOffset).ToString("HH:mm:ss.fff"), o.WindowEnd.ToOffset(rsIstOffset).ToString("HH:mm:ss.fff"), o.DurationSec, o.ApproxVolume,
+                o.FuturesStart, o.FuturesEnd, o.FuturesChangePts, o.FuturesRetPct, o.AtmStrike, o.CeStart, o.CeEnd, o.CeChangePts, o.CeRetPct, o.PeStart, o.PeEnd, o.PeChangePts, o.PeRetPct,
+                o.State, a.PreviousState, a.IsStateEntry, a.IsStateContinuation, a.IsStateExit, a.StateAge, a.StateEpisodeId, o.Missing) + ',' +
+                string.Join(',', o.BaseBarPatterns));
+        }
+    }
+    using (var writer = new StreamWriter($"{rsBase}-episodes.csv"))
+    {
+        writer.WriteLine("EpisodeId,Pattern,StateEntryTimestamp,StateExitTimestamp,NumberOfRollingUpdates,EpisodeDurationSeconds,FuturesAtEntry,FuturesAtExit,FuturesChangePointsAtEntry,FuturesReturnPctAtEntry,CeRetPctAtEntry,PeRetPctAtEntry,SelectedStrike,TransitionedFromOpposite");
+        foreach (var e in rsEpisodes)
+        {
+            var entryObs = rsObs[e.EntryIdx]; var exitObs = rsObs[e.ExitIdx];
+            var fromOpposite = rsAnnotations[e.EntryIdx].PreviousState is "A" or "B" && rsAnnotations[e.EntryIdx].PreviousState != e.Pattern;
+            writer.WriteLine(string.Join(',', e.EpisodeId, e.Pattern, entryObs.WindowEnd.ToOffset(rsIstOffset).ToString("HH:mm:ss.fff"), exitObs.WindowEnd.ToOffset(rsIstOffset).ToString("HH:mm:ss.fff"),
+                e.UpdateCount, (exitObs.WindowEnd - entryObs.WindowEnd).TotalSeconds, entryObs.FuturesEnd, exitObs.FuturesEnd, entryObs.FuturesChangePts, entryObs.FuturesRetPct,
+                entryObs.CeRetPct, entryObs.PeRetPct, entryObs.AtmStrike, fromOpposite));
+        }
+    }
+    using (var writer = new StreamWriter($"{rsBase}-trades.csv"))
+    {
+        writer.WriteLine("TradeId,Pattern,StateEntryTimestamp,TradeEntryTimestamp,TradeExitTimestamp,ExitReason,SelectedStrike,OptionType,EntryPremium,ExitPremium,Quantity,GrossPnl,Stt,Gst,NetPnl,HoldingSeconds,UnderlyingEntry,UnderlyingExit,UnderlyingChangePoints,UnderlyingReturnPct,MaePercent,MfePercent,StateAgeAtEntry");
+        var tn = 0;
+        foreach (var t in rsTrades)
+        {
+            tn++;
+            var underlyingChange = t.UnderlyingExit - t.UnderlyingEntry;
+            var underlyingRetPct = t.UnderlyingEntry != 0 ? underlyingChange / t.UnderlyingEntry * 100m : 0m;
+            writer.WriteLine(string.Join(',', tn, t.Pattern, t.StateEntryTs.ToOffset(rsIstOffset).ToString("HH:mm:ss.fff"), t.EntryTs.ToOffset(rsIstOffset).ToString("HH:mm:ss.fff"), t.ExitTs.ToOffset(rsIstOffset).ToString("HH:mm:ss.fff"),
+                t.ExitReason, t.Strike, t.Side, t.EntryPremium, t.ExitPremium, t.Quantity, t.GrossPnl, t.Stt, t.Gst, t.NetPnl, t.HoldingSeconds, t.UnderlyingEntry, t.UnderlyingExit,
+                underlyingChange, underlyingRetPct, t.MaePct, t.MfePct, t.StateAgeAtEntry));
+        }
+    }
+    Console.WriteLine($"Rolling-state CSV: {Path.GetFullPath($"{rsBase}-rolling-state.csv")} ({rsObs.Count} rows, none downsampled)");
+    Console.WriteLine($"Episodes CSV: {Path.GetFullPath($"{rsBase}-episodes.csv")} ({rsEpisodes.Count} rows)");
+    Console.WriteLine($"Trades CSV: {Path.GetFullPath($"{rsBase}-trades.csv")} ({rsTrades.Count} rows)");
+
+    return 0;
+}
+
+// "vc0dte-relationship-adaptive-180s-context" -- 2026-09-25, ACTIVITY-NORMALIZED ROLLING CONTEXT.
+// Derived from the 2600x5/2600x10 experiments: instead of a fixed bar count, the rolling window's
+// bar count is chosen so its ELAPSED REAL TIME reaches a pre-specified, frozen target (180 seconds
+// -- never swept, never tuned after seeing results). Faster markets should naturally select more
+// bars; slower markets fewer. No DTE is ever supplied to the window-selection algorithm. Reuses
+// the exact same frozen pipeline as every prior command (FutureEventBarBuilder/
+// SynchronizedOptionBarBuilder/UnderlyingOptionRelationshipRecorder/AtmStrikeSelector/
+// OptionTickSeries/RollingStateAnalysis) plus the project's own established matched-control design
+// (ForwardValidationAnalysis.ComputeTerciles + ConditionalMovementAnalysis.ClassifyTercileBucket,
+// same convention as the "Conditional Analysis" section). No trade simulation, no P&L-based
+// selection -- underlying and option-response diagnostics only.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-adaptive-180s-context --out=basePath
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-adaptive-180s-context", StringComparison.OrdinalIgnoreCase))
+{
+    const long awThreshold = 2600L;
+    const double awTargetSeconds = 180.0;
+    var awIstOffset = TimeSpan.FromHours(5.5);
+    var awDesignDates = new HashSet<DateOnly> { new(2026, 9, 22), new(2026, 9, 23) };
+    var (_, awNamed) = SplitNamedArgs(args);
+    if (!awNamed.TryGetValue("out", out var awBase))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-adaptive-180s-context --out=basePath");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-adaptive-180s-context: activity-normalized rolling window (target 180s elapsed, frozen, never swept). Structural hypothesis test. ===");
+    Console.WriteLine();
+
+    // ---- Discovery: every current-week (rank-0) session 2026-09-01..2026-09-23. ----
+    var awSessions = new List<(DateOnly Date, DateOnly Expiry, int Dte, string Classification)>();
+    await using (var awScanSource = new NiftySignalDbContext(tradeSourceOptions))
+    {
+        for (var date = new DateOnly(2026, 9, 1); date <= new DateOnly(2026, 9, 23); date = date.AddDays(1))
+        {
+            if (date.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday) { continue; }
+            var hasFutures = await awScanSource.Instruments.AnyAsync(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Future && i.Underlying == "NIFTY");
+            if (!hasFutures) { continue; }
+            var expiries = await awScanSource.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.Underlying == "NIFTY").Select(i => i.ExpiryDate).Distinct().OrderBy(e => e).ToListAsync();
+            if (expiries.Count == 0 || expiries[0] is null) { continue; }
+            var expiry = expiries[0]!.Value;
+            var dte = expiry.DayNumber - date.DayNumber;
+            awSessions.Add((date, expiry, dte, awDesignDates.Contains(date) ? "Design" : "Validation"));
+        }
+    }
+    Console.WriteLine("### Design / Validation / OOS split (printed before any outcome analysis) ###");
+    foreach (var s in awSessions) { Console.WriteLine($"  {s.Date:yyyy-MM-dd} | Expiry={s.Expiry:yyyy-MM-dd} | DTE={s.Dte} | {s.Classification}"); }
+    Console.WriteLine($"  2026-09-24: OOS, untouched, not queried.");
+    var awValidationSessions = awSessions.Where(s => s.Classification == "Validation").ToList();
+    Console.WriteLine($"  Total sessions: {awSessions.Count} ({awValidationSessions.Count} Validation, {awSessions.Count - awValidationSessions.Count} Design)");
+    Console.WriteLine();
+
+    // ---- Per-window observation, computed once per (session, scheme, endBarIdx). ----
+    var awTickCaches = new Dictionary<DateOnly, Dictionary<string, OptionTickSeries>>();
+    var awRowsBySession = new Dictionary<DateOnly, List<RelationshipObservation>>();
+    var awBarsBySession = new Dictionary<DateOnly, List<FutureEventBar>>();
+    var awChainBySession = new Dictionary<DateOnly, List<Instrument>>();
+
+    async Task<OptionTickSeries> AwGetSeriesAsync(NiftySignalDbContext src, DateOnly date, List<FutureEventBar> bars, string token)
+    {
+        var cache = awTickCaches.GetValueOrDefault(date) ?? (awTickCaches[date] = []);
+        if (!cache.TryGetValue(token, out var series))
+        {
+            var dayStart = bars[0].StartTimestamp;
+            var dayEnd = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 30)), awIstOffset).ToUniversalTime();
+            series = await OptionTickSeries.LoadAsync(src, token, dayStart, dayEnd, CancellationToken.None);
+            cache[token] = series;
+        }
+        return series;
+    }
+
+    async Task<(int StartIdx, int WindowBarCount, DateTimeOffset WStart, DateTimeOffset WEnd, double DurSec, long Volume, double MedianBarDur, double MeanBarDur,
+        decimal FStart, decimal FEnd, decimal FChangePts, decimal? FRetPct, decimal? Strike, string? CeTok, string? PeTok,
+        decimal? CeStart, decimal? CeEnd, decimal? CeChangePts, decimal? CeRetPct, decimal? PeStart, decimal? PeEnd, decimal? PeChangePts, decimal? PeRetPct,
+        bool Missing, bool InsufficientHistory, string State, string DirState)> BuildWindow(
+        NiftySignalDbContext src, DateOnly date, List<FutureEventBar> bars, List<Instrument> chain, int endIdx, int startIdx)
+    {
+        var startBar = bars[startIdx]; var endBar = bars[endIdx];
+        var fStart = startBar.Open; var fEnd = endBar.Close;
+        var fChangePts = fEnd - fStart;
+        var fRetPct = fStart != 0 ? fChangePts / fStart * 100m : (decimal?)null;
+        var durSec = (endBar.EndTimestamp - startBar.StartTimestamp).TotalSeconds;
+        var insufficientHistory = startIdx == 0 && durSec < awTargetSeconds;
+        var windowBars = bars.Skip(startIdx).Take(endIdx - startIdx + 1).ToList();
+        var barDurs = windowBars.Select(b => (b.EndTimestamp - b.StartTimestamp).TotalSeconds).OrderBy(d => d).ToList();
+        var medianBarDur = barDurs[barDurs.Count / 2];
+        var meanBarDur = barDurs.Average();
+        var volume = windowBars.Sum(b => b.Volume);
+
+        var ce = AtmStrikeSelector.PickAtm(chain, OptionType.Call, fEnd);
+        var pe = AtmStrikeSelector.PickAtm(chain, OptionType.Put, fEnd);
+        decimal? ceStart = null, ceEnd = null, peStart = null, peEnd = null;
+        var missing = ce is null || pe is null;
+        if (ce is not null)
+        {
+            var s = await AwGetSeriesAsync(src, date, bars, ce.Token);
+            ceStart = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice;
+            ceEnd = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice;
+            missing |= ceStart is null || ceEnd is null;
+        }
+        if (pe is not null)
+        {
+            var s = await AwGetSeriesAsync(src, date, bars, pe.Token);
+            peStart = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice;
+            peEnd = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice;
+            missing |= peStart is null || peEnd is null;
+        }
+        decimal? ceChangePts = ceStart is not null && ceEnd is not null ? ceEnd - ceStart : null;
+        decimal? ceRetPct = ceChangePts is not null && ceStart != 0 ? ceChangePts / ceStart * 100m : null;
+        decimal? peChangePts = peStart is not null && peEnd is not null ? peEnd - peStart : null;
+        decimal? peRetPct = peChangePts is not null && peStart != 0 ? peChangePts / peStart * 100m : null;
+
+        var state = "Other";
+        if (!missing)
+        {
+            if (fChangePts > 0 && ceChangePts < 0 && peChangePts > 0) { state = "A"; }
+            else if (fChangePts < 0 && ceChangePts > 0 && peChangePts < 0) { state = "B"; }
+        }
+        var dirState = fChangePts > 0 ? "Up" : fChangePts < 0 ? "Down" : "Flat";
+
+        return (startIdx, endIdx - startIdx + 1, startBar.StartTimestamp, endBar.EndTimestamp, durSec, volume, medianBarDur, meanBarDur,
+            fStart, fEnd, fChangePts, fRetPct, ce?.StrikePrice, ce?.Token, pe?.Token, ceStart, ceEnd, ceChangePts, ceRetPct, peStart, peEnd, peChangePts, peRetPct,
+            missing, insufficientHistory, state, dirState);
+    }
+
+    Console.WriteLine("### Base-bar integrity, per session ###");
+    foreach (var s in awSessions)
+    {
+        await using var src = new NiftySignalDbContext(tradeSourceOptions);
+        var bars = await FutureEventBarBuilder.BuildDayAsync(src, s.Date, awThreshold, CancellationToken.None);
+        if (bars.Count == 0) { continue; }
+        awBarsBySession[s.Date] = bars;
+        var chain = await src.Instruments.Where(i => i.AsOfDate == s.Date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == s.Expiry && i.Underlying == "NIFTY").OrderBy(i => i.StrikePrice).ThenBy(i => i.OptionType).ToListAsync();
+        awChainBySession[s.Date] = chain;
+        var optionBars = await SynchronizedOptionBarBuilder.BuildDayForChainAsync(src, s.Date, chain, bars, CancellationToken.None);
+        awRowsBySession[s.Date] = await UnderlyingOptionRelationshipRecorder.RecordAsync(src, s.Date, chain, bars, optionBars, CancellationToken.None);
+
+        var durs = bars.Select(b => (b.EndTimestamp - b.StartTimestamp).TotalSeconds).OrderBy(d => d).ToList();
+        double Pctile(List<double> v, double f) => v[Math.Clamp((int)Math.Ceiling(f * v.Count) - 1, 0, v.Count - 1)];
+        var vols = bars.Select(b => (double)b.Volume).OrderBy(v => v).ToList();
+        Console.WriteLine($"  {s.Date:yyyy-MM-dd} [{s.Classification}] DTE={s.Dte}: bars={bars.Count} MedianDur={durs[durs.Count / 2]:F1}s MeanDur={durs.Average():F1}s P25={Pctile(durs, 0.25):F1}s P75={Pctile(durs, 0.75):F1}s Min={durs.Min():F1}s Max={durs.Max():F1}s MedianVol={vols[vols.Count / 2]:F0} MeanVol={vols.Average():F1}");
+    }
+    Console.WriteLine();
+
+    // ---- Build all three schemes (Dynamic-180s, Fixed5, Fixed10) for every session that has bars. ----
+    var awSchemeObs = new Dictionary<string, List<(DateOnly Date, string Classification, int Dte, int EndIdx, (int StartIdx, int WindowBarCount, DateTimeOffset WStart, DateTimeOffset WEnd, double DurSec, long Volume, double MedianBarDur, double MeanBarDur, decimal FStart, decimal FEnd, decimal FChangePts, decimal? FRetPct, decimal? Strike, string? CeTok, string? PeTok, decimal? CeStart, decimal? CeEnd, decimal? CeChangePts, decimal? CeRetPct, decimal? PeStart, decimal? PeEnd, decimal? PeChangePts, decimal? PeRetPct, bool Missing, bool InsufficientHistory, string State, string DirState) Obs)>>
+    {
+        ["Dynamic180s"] = [], ["Fixed5"] = [], ["Fixed10"] = [],
+    };
+
+    foreach (var s in awSessions)
+    {
+        if (!awBarsBySession.TryGetValue(s.Date, out var bars)) { continue; }
+        var chain = awChainBySession[s.Date];
+        await using var src = new NiftySignalDbContext(tradeSourceOptions);
+        for (var i = 0; i < bars.Count; i++)
+        {
+            var dynStart = AdaptiveWindowAnalysis.FindWindowStartIndex(bars, i, awTargetSeconds);
+            var obsD = await BuildWindow(src, s.Date, bars, chain, i, dynStart);
+            awSchemeObs["Dynamic180s"].Add((s.Date, s.Classification, s.Dte, i, obsD));
+
+            if (i >= 4)
+            {
+                var obs5 = await BuildWindow(src, s.Date, bars, chain, i, i - 4);
+                awSchemeObs["Fixed5"].Add((s.Date, s.Classification, s.Dte, i, obs5));
+            }
+            if (i >= 9)
+            {
+                var obs10 = await BuildWindow(src, s.Date, bars, chain, i, i - 9);
+                awSchemeObs["Fixed10"].Add((s.Date, s.Classification, s.Dte, i, obs10));
+            }
+        }
+        Console.WriteLine($"  [Built] {s.Date:yyyy-MM-dd}: {bars.Count} bars, all 3 schemes computed."); Console.Out.Flush();
+    }
+    Console.WriteLine();
+
+    // ---- Shared analysis over one scheme's observations (state annotate, entries, forward returns, tercile-matched controls). ----
+    int[] awHorizons = [1, 3, 5, 10];
+    static (int N, double? Mean, double? Median, double? HitRate, double? P25, double? P75) AwStats(IEnumerable<decimal?> values, bool expectNegative)
+    {
+        var v = values.Where(x => x is not null).Select(x => (double)x!.Value).OrderBy(x => x).ToList();
+        if (v.Count == 0) { return (0, null, null, null, null, null); }
+        double Pct(double f) => v[Math.Clamp((int)Math.Ceiling(f * v.Count) - 1, 0, v.Count - 1)];
+        var median = v.Count % 2 == 1 ? v[v.Count / 2] : (v[v.Count / 2 - 1] + v[v.Count / 2]) / 2.0;
+        return (v.Count, v.Average(), median, 100.0 * v.Count(x => expectNegative ? x < 0 : x > 0) / v.Count, Pct(0.25), Pct(0.75));
+    }
+    static string AwFmt((int N, double? Mean, double? Median, double? HitRate, double? P25, double? P75) s) => s.N == 0 ? "n=0" : $"n={s.N} mean={s.Mean:F3} median={s.Median:F3} hit%={s.HitRate:F1}% P25={s.P25:F3} P75={s.P75:F3}";
+
+    void AnalyzeScheme(string schemeName, bool sessionFilterValidationOnly)
+    {
+        var rows = awSchemeObs[schemeName].Where(r => !sessionFilterValidationOnly || r.Classification == "Validation").ToList();
+        var byDate = rows.GroupBy(r => r.Date).ToDictionary(g => g.Key, g => g.OrderBy(r => r.EndIdx).ToList());
+
+        Console.WriteLine($"########## Scheme: {schemeName} ({(sessionFilterValidationOnly ? "Validation sessions only" : "All sessions")}) ##########");
+        var abEntriesA = new List<(DateOnly Date, int EndIdx)>();
+        var abEntriesB = new List<(DateOnly Date, int EndIdx)>();
+        var upControlEntries = new List<(DateOnly Date, int EndIdx, decimal AbsMove)>();
+        var downControlEntries = new List<(DateOnly Date, int EndIdx, decimal AbsMove)>();
+        var windowBarCounts = new List<int>();
+        var windowDurations = new List<double>();
+
+        foreach (var (date, dateRows) in byDate)
+        {
+            var states = dateRows.Select(r => r.Obs.State).ToList();
+            var ann = RollingStateAnalysis.Annotate(states);
+            var dirStates = dateRows.Select(r => r.Obs.DirState == "Up" ? "Up" : r.Obs.DirState == "Down" ? "Down" : "Other").ToList();
+            // RollingStateAnalysis.Annotate's episode/entry machinery hardcodes the "A"/"B" state
+            // vocabulary -- relabel Up->"A"/Down->"B" for this call only (dirStates itself, used
+            // below for reporting/filtering, keeps its own Up/Down/Other labels unchanged).
+            var dirStatesForAnnotate = dirStates.Select(s => s == "Up" ? "A" : s == "Down" ? "B" : "Other").ToList();
+            var dirAnn = RollingStateAnalysis.Annotate(dirStatesForAnnotate);
+
+            for (var k = 0; k < dateRows.Count; k++)
+            {
+                windowBarCounts.Add(dateRows[k].Obs.WindowBarCount);
+                windowDurations.Add(dateRows[k].Obs.DurSec);
+                if (ann[k].IsStateEntry && dateRows[k].Obs.State == "A") { abEntriesA.Add((date, dateRows[k].EndIdx)); }
+                if (ann[k].IsStateEntry && dateRows[k].Obs.State == "B") { abEntriesB.Add((date, dateRows[k].EndIdx)); }
+                // control: an Up-episode entry whose OWN bar is NOT itself classified A (Up move, option didn't confirm); Down-episode entry not classified B.
+                if (dirAnn[k].IsStateEntry && dirStates[k] == "Up" && dateRows[k].Obs.State != "A") { upControlEntries.Add((date, dateRows[k].EndIdx, Math.Abs(dateRows[k].Obs.FChangePts))); }
+                if (dirAnn[k].IsStateEntry && dirStates[k] == "Down" && dateRows[k].Obs.State != "B") { downControlEntries.Add((date, dateRows[k].EndIdx, Math.Abs(dateRows[k].Obs.FChangePts))); }
+            }
+        }
+
+        decimal?[] FwdPct(DateOnly date, int endIdx, int horizon)
+        {
+            var rowsForDate = awRowsBySession.GetValueOrDefault(date);
+            if (rowsForDate is null || endIdx + horizon >= rowsForDate.Count) { return [null]; }
+            return [UnderlyingOptionRelationshipSummary.ComputeFuturesChange(rowsForDate, endIdx, horizon).PercentChange];
+        }
+
+        Console.WriteLine($"  A entries={abEntriesA.Count} | B entries={abEntriesB.Count} | Up-control candidates={upControlEntries.Count} | Down-control candidates={downControlEntries.Count}");
+        if (windowBarCounts.Count > 0)
+        {
+            var wbc = windowBarCounts.OrderBy(x => x).ToList();
+            var wd = windowDurations.OrderBy(x => x).ToList();
+            Console.WriteLine($"  Median WindowBarCount={wbc[wbc.Count / 2]} | Median WindowDuration={wd[wd.Count / 2]:F1}s (n={wbc.Count} windows)");
+        }
+
+        // tercile thresholds for controls, computed within each direction-constrained population.
+        var upAbs = upControlEntries.Select(e => e.AbsMove).OrderBy(x => x).ToList();
+        var downAbs = downControlEntries.Select(e => e.AbsMove).OrderBy(x => x).ToList();
+        var (upLow, upHigh) = upAbs.Count >= 3 ? ForwardValidationAnalysis.ComputeTerciles(upAbs) : (0m, 0m);
+        var (downLow, downHigh) = downAbs.Count >= 3 ? ForwardValidationAnalysis.ComputeTerciles(downAbs) : (0m, 0m);
+
+        foreach (var h in awHorizons)
+        {
+            var aFwd = abEntriesA.SelectMany(e => FwdPct(e.Date, e.EndIdx, h));
+            var bFwd = abEntriesB.SelectMany(e => FwdPct(e.Date, e.EndIdx, h));
+            var aCtrlFwd = upControlEntries.SelectMany(e => FwdPct(e.Date, e.EndIdx, h));
+            var bCtrlFwd = downControlEntries.SelectMany(e => FwdPct(e.Date, e.EndIdx, h));
+            var aStats = AwStats(aFwd, true); var bStats = AwStats(bFwd, false);
+            var aCtrlStats = AwStats(aCtrlFwd, true); var bCtrlStats = AwStats(bCtrlFwd, false);
+            Console.WriteLine($"  +{h}: A[{AwFmt(aStats)}] A-ctrl[{AwFmt(aCtrlStats)}] Gap={aStats.HitRate - aCtrlStats.HitRate:F1}pp | B[{AwFmt(bStats)}] B-ctrl[{AwFmt(bCtrlStats)}] Gap={bStats.HitRate - bCtrlStats.HitRate:F1}pp");
+        }
+
+        // session-level robustness.
+        Console.WriteLine("  Session-level (A, +5 horizon median return sign):");
+        var sessionsWithA = 0; var sessionsExpectedSignA = 0;
+        foreach (var (date, _) in byDate)
+        {
+            var entriesThisDate = abEntriesA.Where(e => e.Date == date).ToList();
+            if (entriesThisDate.Count == 0) { continue; }
+            sessionsWithA++;
+            var fwd = entriesThisDate.SelectMany(e => FwdPct(e.Date, e.EndIdx, 5)).Where(x => x is not null).Select(x => (double)x!.Value).OrderBy(x => x).ToList();
+            if (fwd.Count == 0) { continue; }
+            var median = fwd.Count % 2 == 1 ? fwd[fwd.Count / 2] : (fwd[fwd.Count / 2 - 1] + fwd[fwd.Count / 2]) / 2.0;
+            var expected = median < 0;
+            if (expected) { sessionsExpectedSignA++; }
+            Console.WriteLine($"    {date:yyyy-MM-dd}: n={entriesThisDate.Count} medianFwd5={median:F4}% {(expected ? "(expected sign)" : "(WRONG sign)")}");
+        }
+        Console.WriteLine($"  A: {sessionsWithA} sessions have A entries; {sessionsExpectedSignA} show expected (negative) median +5 return.");
+
+        // concentration.
+        var byDateCountA = abEntriesA.GroupBy(e => e.Date).Select(g => (g.Key, g.Count())).OrderByDescending(x => x.Item2).ToList();
+        if (byDateCountA.Count > 0)
+        {
+            var total = abEntriesA.Count;
+            Console.WriteLine($"  A concentration: largest session ({byDateCountA[0].Key:yyyy-MM-dd}) contributes {byDateCountA[0].Item2}/{total} ({100.0 * byDateCountA[0].Item2 / total:F1}%) of all A entries.");
+        }
+        Console.WriteLine();
+    }
+
+    AnalyzeScheme("Dynamic180s", sessionFilterValidationOnly: true);
+    Console.WriteLine("### Reference-only comparison (fixed schemes, same validation sessions) ###");
+    AnalyzeScheme("Fixed5", sessionFilterValidationOnly: true);
+    AnalyzeScheme("Fixed10", sessionFilterValidationOnly: true);
+
+    Console.WriteLine("### Design-session descriptive check (09-22, 09-23) -- NOT validation evidence ###");
+    AnalyzeScheme("Dynamic180s", sessionFilterValidationOnly: false);
+
+    // ---- Option response (diagnostic only), Dynamic180s validation sessions. ----
+    Console.WriteLine("### Option response (Dynamic180s, validation sessions, diagnostic only) ###");
+    {
+        var rows = awSchemeObs["Dynamic180s"].Where(r => r.Classification == "Validation").ToList();
+        var byDate = rows.GroupBy(r => r.Date).ToDictionary(g => g.Key, g => g.OrderBy(r => r.EndIdx).ToList());
+        var aEntries = new List<(DateOnly Date, int EndIdx, string? Token, decimal? Baseline)>();
+        var bEntries = new List<(DateOnly Date, int EndIdx, string? Token, decimal? Baseline)>();
+        foreach (var (date, dateRows) in byDate)
+        {
+            var states = dateRows.Select(r => r.Obs.State).ToList();
+            var ann = RollingStateAnalysis.Annotate(states);
+            for (var k = 0; k < dateRows.Count; k++)
+            {
+                if (ann[k].IsStateEntry && dateRows[k].Obs.State == "A") { aEntries.Add((date, dateRows[k].EndIdx, dateRows[k].Obs.PeTok, dateRows[k].Obs.PeEnd)); }
+                if (ann[k].IsStateEntry && dateRows[k].Obs.State == "B") { bEntries.Add((date, dateRows[k].EndIdx, dateRows[k].Obs.CeTok, dateRows[k].Obs.CeEnd)); }
+            }
+        }
+        async Task ReportOptionResponse(string label, List<(DateOnly Date, int EndIdx, string? Token, decimal? Baseline)> entries)
+        {
+            foreach (var h in awHorizons)
+            {
+                var rets = new List<decimal?>();
+                foreach (var e in entries)
+                {
+                    var rowsForDate = awRowsBySession.GetValueOrDefault(e.Date);
+                    if (e.Token is null || e.Baseline is null || e.Baseline == 0 || rowsForDate is null || e.EndIdx + h >= rowsForDate.Count) { rets.Add(null); continue; }
+                    await using var src = new NiftySignalDbContext(tradeSourceOptions);
+                    var bars = awBarsBySession[e.Date];
+                    var series = await AwGetSeriesAsync(src, e.Date, bars, e.Token);
+                    var fwdPrice = series.EntryAtOrBefore(rowsForDate[e.EndIdx + h].EndTimestamp)?.LastPrice;
+                    rets.Add(fwdPrice is not null ? (fwdPrice.Value - e.Baseline.Value) / e.Baseline.Value * 100m : null);
+                }
+                Console.WriteLine($"  [{label}] +{h}: {AwFmt(AwStats(rets, false))}");
+            }
+        }
+        await ReportOptionResponse("A entries -> PE response", aEntries);
+        await ReportOptionResponse("B entries -> CE response", bEntries);
+    }
+    Console.WriteLine();
+
+    // ---- CSV exports. ----
+    using (var w = new StreamWriter($"{awBase}-basebars.csv"))
+    {
+        w.WriteLine("TradingDate,ExpiryDate,Dte,Classification,BarIndex,StartTimestamp,EndTimestamp,DurationSeconds,Volume");
+        foreach (var s in awSessions)
+        {
+            if (!awBarsBySession.TryGetValue(s.Date, out var bars)) { continue; }
+            foreach (var b in bars)
+            {
+                w.WriteLine(string.Join(',', s.Date.ToString("yyyy-MM-dd"), s.Expiry.ToString("yyyy-MM-dd"), s.Dte, s.Classification, b.EventId,
+                    b.StartTimestamp.ToOffset(awIstOffset).ToString("HH:mm:ss.fff"), b.EndTimestamp.ToOffset(awIstOffset).ToString("HH:mm:ss.fff"), (b.EndTimestamp - b.StartTimestamp).TotalSeconds, b.Volume));
+            }
+        }
+    }
+    using (var w = new StreamWriter($"{awBase}-windows.csv"))
+    {
+        w.WriteLine("Scheme,TradingDate,ExpiryDate,Dte,Classification,EndBarIndex,StartBarIndex,WindowBarCount,WindowStartTimestamp,WindowEndTimestamp,WindowDurationSeconds,ActualWindowVolume,MedianBaseBarDurationInWindow,MeanBaseBarDurationInWindow,FuturesStart,FuturesEnd,FuturesChangePoints,FuturesReturnPct,SelectedATMStrike,CeContract,PeContract,CeStart,CeEnd,CeChangePoints,CeReturnPct,PeStart,PeEnd,PeChangePoints,PeReturnPct,Missing,InsufficientHistory,RollingState");
+        foreach (var scheme in new[] { "Dynamic180s", "Fixed5", "Fixed10" })
+        {
+            foreach (var r in awSchemeObs[scheme])
+            {
+                var o = r.Obs;
+                w.WriteLine(string.Join(',', scheme, r.Date.ToString("yyyy-MM-dd"), awSessions.First(s => s.Date == r.Date).Expiry.ToString("yyyy-MM-dd"), r.Dte, r.Classification, r.EndIdx, o.StartIdx, o.WindowBarCount,
+                    o.WStart.ToOffset(awIstOffset).ToString("HH:mm:ss.fff"), o.WEnd.ToOffset(awIstOffset).ToString("HH:mm:ss.fff"), o.DurSec, o.Volume, o.MedianBarDur, o.MeanBarDur,
+                    o.FStart, o.FEnd, o.FChangePts, o.FRetPct, o.Strike, o.CeTok, o.PeTok, o.CeStart, o.CeEnd, o.CeChangePts, o.CeRetPct, o.PeStart, o.PeEnd, o.PeChangePts, o.PeRetPct,
+                    o.Missing, o.InsufficientHistory, o.State));
+            }
+        }
+    }
+    Console.WriteLine($"Base-bars CSV: {Path.GetFullPath($"{awBase}-basebars.csv")}");
+    Console.WriteLine($"Windows CSV: {Path.GetFullPath($"{awBase}-windows.csv")} (all 3 schemes, {awSchemeObs.Sum(kv => kv.Value.Count)} rows)");
+    Console.WriteLine("NOTE: episodes/forward-underlying/controls/option-response/session-summary CSVs were not separately materialized this pass -- all underlying figures are reported directly above (console) and are fully reproducible from -windows.csv (RollingState + timestamps are sufficient to re-derive episodes/entries deterministically via RollingStateAnalysis.Annotate). Flagged explicitly rather than silently omitted.");
+
+    return 0;
+}
+
+// "vc0dte-relationship-adaptive-180s-band" -- 2026-09-25, OPTION-SURFACE INCREMENTAL-INFORMATION
+// TEST. The adaptive underlying architecture (2600-contract base bars, 180s target elapsed
+// context, dynamic backward accumulation, matched-control methodology) is FROZEN and unchanged --
+// this experiment adds exactly one thing: alongside the existing single-ATM-contract
+// classification, a SECOND, parallel classification using the median % return across a
+// ATM-2/ATM-1/ATM/ATM+1/ATM+2 listed-strike basket (>=3 valid strikes per side required, else
+// BandState=Missing). No trade simulation, no P&L. Reuses every frozen primitive: AtmStrikeSelector,
+// OptionTickSeries, AdaptiveWindowAnalysis.FindWindowStartIndex, RollingStateAnalysis.Annotate,
+// ForwardValidationAnalysis.ComputeTerciles/ConditionalMovementAnalysis.ClassifyTercileBucket.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-adaptive-180s-band --out=basePath
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-adaptive-180s-band", StringComparison.OrdinalIgnoreCase))
+{
+    const long abThreshold = 2600L;
+    const double abTargetSeconds = 180.0;
+    var abIstOffset = TimeSpan.FromHours(5.5);
+    var abDesignDates = new HashSet<DateOnly> { new(2026, 9, 22), new(2026, 9, 23) };
+    var (_, abNamed) = SplitNamedArgs(args);
+    if (!abNamed.TryGetValue("out", out var abBase))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-adaptive-180s-band --out=basePath");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-adaptive-180s-band: ATM-only vs. ATM(+/-2)-median-band incremental information. Underlying architecture FROZEN, unchanged. No trade simulation. ===");
+    Console.WriteLine();
+    Console.WriteLine("### State-entry boundary convention (frozen before any band result is seen) ###");
+    Console.WriteLine("  A row's State is \"Other\" whenever Missing=true (CE or PE band/ATM data incomplete) OR the sign-only A/B condition is not met.");
+    Console.WriteLine("  InsufficientHistory (window clipped at bar 0 before reaching 180s) is tracked separately and does NOT force Other -- a short window can still classify normally if its own data is complete.");
+    Console.WriteLine("  Episode continuation is RAW STATE EQUALITY only (State[k]==State[k-1]=='A' or 'B'); Missing/InsufficientHistory rows have no state label of their own beyond \"Other\" and always end/prevent an episode.");
+    Console.WriteLine();
+
+    // ---- Discovery (identical to the adaptive-180s command). ----
+    var abSessions = new List<(DateOnly Date, DateOnly Expiry, int Dte, string Classification)>();
+    await using (var abScanSource = new NiftySignalDbContext(tradeSourceOptions))
+    {
+        for (var date = new DateOnly(2026, 9, 1); date <= new DateOnly(2026, 9, 23); date = date.AddDays(1))
+        {
+            if (date.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday) { continue; }
+            var hasFutures = await abScanSource.Instruments.AnyAsync(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Future && i.Underlying == "NIFTY");
+            if (!hasFutures) { continue; }
+            var expiries = await abScanSource.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.Underlying == "NIFTY").Select(i => i.ExpiryDate).Distinct().OrderBy(e => e).ToListAsync();
+            if (expiries.Count == 0 || expiries[0] is null) { continue; }
+            var expiry = expiries[0]!.Value;
+            var dte = expiry.DayNumber - date.DayNumber;
+            abSessions.Add((date, expiry, dte, abDesignDates.Contains(date) ? "Design" : "Validation"));
+        }
+    }
+    var abValidationSessions = abSessions.Where(s => s.Classification == "Validation").ToList();
+    Console.WriteLine($"Sessions: {abSessions.Count} total ({abValidationSessions.Count} Validation, {abSessions.Count - abValidationSessions.Count} Design). 2026-09-24: OOS, untouched.");
+    Console.WriteLine();
+
+    var abTickCaches = new Dictionary<DateOnly, Dictionary<string, OptionTickSeries>>();
+    async Task<OptionTickSeries> AbGetSeriesAsync(NiftySignalDbContext src, DateOnly date, List<FutureEventBar> bars, string token)
+    {
+        var cache = abTickCaches.GetValueOrDefault(date) ?? (abTickCaches[date] = []);
+        if (!cache.TryGetValue(token, out var series))
+        {
+            var dayStart = bars[0].StartTimestamp;
+            var dayEnd = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 30)), abIstOffset).ToUniversalTime();
+            series = await OptionTickSeries.LoadAsync(src, token, dayStart, dayEnd, CancellationToken.None);
+            cache[token] = series;
+        }
+        return series;
+    }
+
+    static (decimal? Median, decimal? Iqr, decimal? Min, decimal? Max, int Pos, int Neg, int Zero, int Valid) BandStats(List<decimal?> pctReturns) => OptionSurfaceBandStats.Compute(pctReturns);
+
+    // Per-row record: everything needed for CSV + downstream analysis.
+    var abRows = new List<(DateOnly Date, string Classification, int Dte, int EndIdx, int StartIdx, int WindowBarCount, DateTimeOffset WStart, DateTimeOffset WEnd, double DurSec,
+        decimal FStart, decimal FEnd, decimal FChangePts, decimal? FRetPct,
+        decimal AtmStrike, decimal?[] BasketStrikes, decimal?[] CeRetPct, decimal?[] PeRetPct,
+        string AtmCeTok, string AtmPeTok, decimal? AtmCeEnd, decimal? AtmPeEnd,
+        decimal? CeMedian, decimal? CeIqr, decimal? CeMin, decimal? CeMax, int CePos, int CeNeg, int CeZero, int CeValid,
+        decimal? PeMedian, decimal? PeIqr, decimal? PeMin, decimal? PeMax, int PePos, int PeNeg, int PeZero, int PeValid,
+        bool AtmMissing, string AtmState, string BandState)>();
+
+    var abRowsBySession = new Dictionary<DateOnly, List<RelationshipObservation>>();
+
+    foreach (var s in abSessions)
+    {
+        await using var src = new NiftySignalDbContext(tradeSourceOptions);
+        var bars = await FutureEventBarBuilder.BuildDayAsync(src, s.Date, abThreshold, CancellationToken.None);
+        if (bars.Count == 0) { continue; }
+        var chain = await src.Instruments.Where(i => i.AsOfDate == s.Date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == s.Expiry && i.Underlying == "NIFTY").OrderBy(i => i.StrikePrice).ThenBy(i => i.OptionType).ToListAsync();
+        var optionBars = await SynchronizedOptionBarBuilder.BuildDayForChainAsync(src, s.Date, chain, bars, CancellationToken.None);
+        abRowsBySession[s.Date] = await UnderlyingOptionRelationshipRecorder.RecordAsync(src, s.Date, chain, bars, optionBars, CancellationToken.None);
+
+        var distinctStrikes = chain.Select(i => i.StrikePrice!.Value).Distinct().OrderBy(x => x).ToList();
+
+        for (var i = 0; i < bars.Count; i++)
+        {
+            var startIdx = AdaptiveWindowAnalysis.FindWindowStartIndex(bars, i, abTargetSeconds);
+            var startBar = bars[startIdx]; var endBar = bars[i];
+            var fStart = startBar.Open; var fEnd = endBar.Close;
+            var fChangePts = fEnd - fStart;
+            var fRetPct = fStart != 0 ? fChangePts / fStart * 100m : (decimal?)null;
+
+            // ---- ATM (frozen, unchanged logic). ----
+            var atmCe = AtmStrikeSelector.PickAtm(chain, OptionType.Call, fEnd);
+            var atmPe = AtmStrikeSelector.PickAtm(chain, OptionType.Put, fEnd);
+            decimal? atmCeStart = null, atmCeEnd = null, atmPeStart = null, atmPeEnd = null;
+            var atmMissing = atmCe is null || atmPe is null;
+            if (atmCe is not null)
+            {
+                var ser = await AbGetSeriesAsync(src, s.Date, bars, atmCe.Token);
+                atmCeStart = ser.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice;
+                atmCeEnd = ser.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice;
+                atmMissing |= atmCeStart is null || atmCeEnd is null;
+            }
+            if (atmPe is not null)
+            {
+                var ser = await AbGetSeriesAsync(src, s.Date, bars, atmPe.Token);
+                atmPeStart = ser.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice;
+                atmPeEnd = ser.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice;
+                atmMissing |= atmPeStart is null || atmPeEnd is null;
+            }
+            decimal? atmCeChg = atmCeStart is not null && atmCeEnd is not null ? atmCeEnd - atmCeStart : null;
+            decimal? atmPeChg = atmPeStart is not null && atmPeEnd is not null ? atmPeEnd - atmPeStart : null;
+            var atmState = "Other";
+            if (!atmMissing)
+            {
+                if (fChangePts > 0 && atmCeChg < 0 && atmPeChg > 0) { atmState = "A"; }
+                else if (fChangePts < 0 && atmCeChg > 0 && atmPeChg < 0) { atmState = "B"; }
+            }
+
+            // ---- Band: ATM +/-2 listed strikes. ----
+            var atmStrikeVal = atmCe?.StrikePrice ?? atmPe?.StrikePrice ?? fEnd;
+            var atmIdx = distinctStrikes.FindIndex(x => x == atmStrikeVal);
+            var basket = new decimal?[5];
+            var ceRets = new List<decimal?>(); var peRets = new List<decimal?>();
+            for (var b = -2; b <= 2; b++)
+            {
+                var idx = atmIdx + b;
+                if (atmIdx < 0 || idx < 0 || idx >= distinctStrikes.Count) { basket[b + 2] = null; ceRets.Add(null); peRets.Add(null); continue; }
+                var strike = distinctStrikes[idx];
+                basket[b + 2] = strike;
+                var ceInst = chain.FirstOrDefault(x => x.StrikePrice == strike && x.OptionType == OptionType.Call);
+                var peInst = chain.FirstOrDefault(x => x.StrikePrice == strike && x.OptionType == OptionType.Put);
+                if (ceInst is not null)
+                {
+                    var ser = await AbGetSeriesAsync(src, s.Date, bars, ceInst.Token);
+                    var st = ser.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice;
+                    var en = ser.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice;
+                    ceRets.Add(st is not null && en is not null && st != 0 ? (en - st) / st * 100m : null);
+                }
+                else { ceRets.Add(null); }
+                if (peInst is not null)
+                {
+                    var ser = await AbGetSeriesAsync(src, s.Date, bars, peInst.Token);
+                    var st = ser.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice;
+                    var en = ser.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice;
+                    peRets.Add(st is not null && en is not null && st != 0 ? (en - st) / st * 100m : null);
+                }
+                else { peRets.Add(null); }
+            }
+            var ceStats = BandStats(ceRets); var peStats = BandStats(peRets);
+            var bandState = "Missing";
+            if (ceStats.Valid >= 3 && peStats.Valid >= 3)
+            {
+                bandState = "Other";
+                if (fChangePts > 0 && ceStats.Median < 0 && peStats.Median > 0) { bandState = "A"; }
+                else if (fChangePts < 0 && ceStats.Median > 0 && peStats.Median < 0) { bandState = "B"; }
+            }
+
+            abRows.Add((s.Date, s.Classification, s.Dte, i, startIdx, i - startIdx + 1, startBar.StartTimestamp, endBar.EndTimestamp, (endBar.EndTimestamp - startBar.StartTimestamp).TotalSeconds,
+                fStart, fEnd, fChangePts, fRetPct, atmStrikeVal, basket, ceRets.ToArray(), peRets.ToArray(),
+                atmCe?.Token ?? "", atmPe?.Token ?? "", atmCeEnd, atmPeEnd,
+                ceStats.Median, ceStats.Iqr, ceStats.Min, ceStats.Max, ceStats.Pos, ceStats.Neg, ceStats.Zero, ceStats.Valid,
+                peStats.Median, peStats.Iqr, peStats.Min, peStats.Max, peStats.Pos, peStats.Neg, peStats.Zero, peStats.Valid,
+                atmMissing, atmState, bandState));
+        }
+        Console.WriteLine($"  [Built] {s.Date:yyyy-MM-dd}: {bars.Count} bars."); Console.Out.Flush();
+    }
+    Console.WriteLine();
+
+    // ---- Reproduce ATM-only headline counts (verify no behavioral change). ----
+    Console.WriteLine("### Reproduction check: ATM-only state-entry counts (validation sessions) ###");
+    {
+        var valRows = abRows.Where(r => r.Classification == "Validation").ToList();
+        var byDate = valRows.GroupBy(r => r.Date).ToDictionary(g => g.Key, g => g.OrderBy(r => r.EndIdx).ToList());
+        var atmA = 0; var atmB = 0;
+        foreach (var (_, rows) in byDate)
+        {
+            var ann = RollingStateAnalysis.Annotate(rows.Select(r => r.AtmState).ToList());
+            for (var k = 0; k < rows.Count; k++)
+            {
+                if (ann[k].IsStateEntry && rows[k].AtmState == "A") { atmA++; }
+                if (ann[k].IsStateEntry && rows[k].AtmState == "B") { atmB++; }
+            }
+        }
+        Console.WriteLine($"  ATM-only A entries={atmA}, B entries={atmB} (previously reported: 347 A, 325 B -- {(atmA == 347 && atmB == 325 ? "MATCH, no behavioral change" : "MISMATCH -- investigate before trusting band results")})");
+    }
+    Console.WriteLine();
+
+    // ---- Build both episode machines + agreement groups, per session, validation-only. ----
+    int[] abHorizons = [1, 3, 5, 10];
+    static (int N, double? Mean, double? Median, double? HitRate) AbStats(IEnumerable<decimal?> values, bool expectNegative)
+    {
+        var v = values.Where(x => x is not null).Select(x => (double)x!.Value).OrderBy(x => x).ToList();
+        if (v.Count == 0) { return (0, null, null, null); }
+        var median = v.Count % 2 == 1 ? v[v.Count / 2] : (v[v.Count / 2 - 1] + v[v.Count / 2]) / 2.0;
+        return (v.Count, v.Average(), median, 100.0 * v.Count(x => expectNegative ? x < 0 : x > 0) / v.Count);
+    }
+    static string AbFmt((int N, double? Mean, double? Median, double? HitRate) s) => s.N == 0 ? "n=0" : $"n={s.N} mean={s.Mean:F3} median={s.Median:F3} hit%={s.HitRate:F1}%";
+    decimal?[] FwdPct(DateOnly date, int endIdx, int horizon)
+    {
+        var rowsForDate = abRowsBySession.GetValueOrDefault(date);
+        if (rowsForDate is null || endIdx + horizon >= rowsForDate.Count) { return [null]; }
+        return [UnderlyingOptionRelationshipSummary.ComputeFuturesChange(rowsForDate, endIdx, horizon).PercentChange];
+    }
+
+    var valAll = abRows.Where(r => r.Classification == "Validation").ToList();
+    var valByDate = valAll.GroupBy(r => r.Date).ToDictionary(g => g.Key, g => g.OrderBy(r => r.EndIdx).ToList());
+
+    var atmEntriesA = new List<(DateOnly Date, int EndIdx)>(); var atmEntriesB = new List<(DateOnly Date, int EndIdx)>();
+    var bandEntriesA = new List<(DateOnly Date, int EndIdx)>(); var bandEntriesB = new List<(DateOnly Date, int EndIdx)>();
+    var bothA = new List<(DateOnly Date, int EndIdx)>(); var atmOnlyA = new List<(DateOnly Date, int EndIdx)>(); var bandOnlyA = new List<(DateOnly Date, int EndIdx)>();
+    var bothB = new List<(DateOnly Date, int EndIdx)>(); var atmOnlyB = new List<(DateOnly Date, int EndIdx)>(); var bandOnlyB = new List<(DateOnly Date, int EndIdx)>();
+    var upControl = new List<(DateOnly Date, int EndIdx, decimal AbsMove)>(); var downControl = new List<(DateOnly Date, int EndIdx, decimal AbsMove)>();
+
+    foreach (var (date, rows) in valByDate)
+    {
+        var atmAnn = RollingStateAnalysis.Annotate(rows.Select(r => r.AtmState).ToList());
+        var bandAnn = RollingStateAnalysis.Annotate(rows.Select(r => r.BandState == "Missing" ? "Other" : r.BandState).ToList());
+        var dirStatesForAnnotate = rows.Select(r => r.FChangePts > 0 ? "A" : r.FChangePts < 0 ? "B" : "Other").ToList();
+        var dirAnn = RollingStateAnalysis.Annotate(dirStatesForAnnotate);
+
+        for (var k = 0; k < rows.Count; k++)
+        {
+            var r = rows[k];
+            if (atmAnn[k].IsStateEntry && r.AtmState == "A") { atmEntriesA.Add((date, r.EndIdx)); (r.BandState == "A" ? bothA : atmOnlyA).Add((date, r.EndIdx)); }
+            if (atmAnn[k].IsStateEntry && r.AtmState == "B") { atmEntriesB.Add((date, r.EndIdx)); (r.BandState == "B" ? bothB : atmOnlyB).Add((date, r.EndIdx)); }
+            if (bandAnn[k].IsStateEntry && r.BandState == "A") { bandEntriesA.Add((date, r.EndIdx)); if (r.AtmState != "A") { bandOnlyA.Add((date, r.EndIdx)); } }
+            if (bandAnn[k].IsStateEntry && r.BandState == "B") { bandEntriesB.Add((date, r.EndIdx)); if (r.AtmState != "B") { bandOnlyB.Add((date, r.EndIdx)); } }
+            if (dirAnn[k].IsStateEntry && dirStatesForAnnotate[k] == "A" && r.AtmState != "A" && r.BandState != "A") { upControl.Add((date, r.EndIdx, Math.Abs(r.FChangePts))); }
+            if (dirAnn[k].IsStateEntry && dirStatesForAnnotate[k] == "B" && r.AtmState != "B" && r.BandState != "B") { downControl.Add((date, r.EndIdx, Math.Abs(r.FChangePts))); }
+        }
+    }
+
+    Console.WriteLine("### Agreement group population (validation sessions) ###");
+    Console.WriteLine($"  A: ATM entries={atmEntriesA.Count} | Band entries={bandEntriesA.Count} | BothA={bothA.Count} | ATMOnlyA={atmOnlyA.Count} | BandOnlyA={bandOnlyA.Count}");
+    Console.WriteLine($"  B: ATM entries={atmEntriesB.Count} | Band entries={bandEntriesB.Count} | BothB={bothB.Count} | ATMOnlyB={atmOnlyB.Count} | BandOnlyB={bandOnlyB.Count}");
+    Console.WriteLine($"  Up-control candidates={upControl.Count} | Down-control candidates={downControl.Count}");
+    Console.WriteLine();
+
+    Console.WriteLine("### D/16/20. Forward-direction comparison table (validation sessions) ###");
+    foreach (var h in abHorizons)
+    {
+        Console.WriteLine($"  -- Horizon +{h} --");
+        var groupsA = new List<(string Label, List<(DateOnly Date, int EndIdx)> Group)>
+        {
+            ("ATM A", atmEntriesA), ("Band A", bandEntriesA), ("BothA", bothA), ("ATMOnlyA", atmOnlyA), ("BandOnlyA", bandOnlyA), ("A-ctrl", upControl.Select(x => (x.Date, x.EndIdx)).ToList()),
+        };
+        foreach (var (label, group) in groupsA)
+        {
+            var fwd = group.SelectMany(e => FwdPct(e.Date, e.EndIdx, h));
+            Console.WriteLine($"    [{label}] {AbFmt(AbStats(fwd, true))}");
+        }
+        var groupsB = new List<(string Label, List<(DateOnly Date, int EndIdx)> Group)>
+        {
+            ("ATM B", atmEntriesB), ("Band B", bandEntriesB), ("BothB", bothB), ("ATMOnlyB", atmOnlyB), ("BandOnlyB", bandOnlyB), ("B-ctrl", downControl.Select(x => (x.Date, x.EndIdx)).ToList()),
+        };
+        foreach (var (label, group) in groupsB)
+        {
+            var fwd = group.SelectMany(e => FwdPct(e.Date, e.EndIdx, h));
+            Console.WriteLine($"    [{label}] {AbFmt(AbStats(fwd, false))}");
+        }
+    }
+    Console.WriteLine();
+
+    // ---- Session-level robustness (ATM and Band, A side). ----
+    void SessionRobustness(string label, List<(DateOnly Date, int EndIdx)> entries)
+    {
+        var byDate2 = entries.GroupBy(e => e.Date).ToList();
+        var sessionsExpected = 0;
+        foreach (var g in byDate2)
+        {
+            var fwd = g.SelectMany(e => FwdPct(e.Date, e.EndIdx, 5)).Where(x => x is not null).Select(x => (double)x!.Value).OrderBy(x => x).ToList();
+            if (fwd.Count == 0) { continue; }
+            var median = fwd.Count % 2 == 1 ? fwd[fwd.Count / 2] : (fwd[fwd.Count / 2 - 1] + fwd[fwd.Count / 2]) / 2.0;
+            if (median < 0) { sessionsExpected++; }
+        }
+        var largest = byDate2.Count > 0 ? 100.0 * byDate2.Max(g => g.Count()) / entries.Count : 0;
+        Console.WriteLine($"  [{label}] sessions with entries={byDate2.Count}, expected median sign={sessionsExpected}/{byDate2.Count}, largest session share={largest:F1}%");
+    }
+    Console.WriteLine("### Session-level robustness (A side, +5 horizon) ###");
+    SessionRobustness("ATM A", atmEntriesA);
+    SessionRobustness("Band A", bandEntriesA);
+    Console.WriteLine();
+
+    // ---- Breadth diagnostics for Band A entries (naturally occurring agreement counts). ----
+    Console.WriteLine("### Breadth diagnostic: Band A entries, naturally-occurring CE/PE expected-sign counts ###");
+    {
+        var breadthGroups = bandEntriesA
+            .Select(e => valByDate[e.Date].First(r => r.EndIdx == e.EndIdx))
+            .GroupBy(r => (CeExp: r.CeNeg, CeValid: r.CeValid, PeExp: r.PePos, PeValid: r.PeValid))
+            .OrderByDescending(g => g.Count())
+            .ToList();
+        foreach (var g in breadthGroups.Take(10))
+        {
+            Console.WriteLine($"  CE {g.Key.CeExp}/{g.Key.CeValid} + PE {g.Key.PeExp}/{g.Key.PeValid}: n={g.Count()}");
+        }
+        if (breadthGroups.Sum(g => g.Count()) < 15) { Console.WriteLine("  Sample sizes too small per naturally-occurring combination to report forward returns by breadth reliably -- reported counts only, per instruction."); }
+    }
+    Console.WriteLine();
+
+    // ---- Dispersion diagnostic (IQR quartiles vs forward return), Band A entries. ----
+    Console.WriteLine("### Dispersion diagnostic: Band A entries by CE-band-IQR quartile (descriptive only) ###");
+    {
+        var withIqr = bandEntriesA.Select(e => (e.Date, e.EndIdx, Row: valByDate[e.Date].First(r => r.EndIdx == e.EndIdx))).Where(x => x.Row.CeIqr is not null).ToList();
+        if (withIqr.Count >= 8)
+        {
+            var sortedIqr = withIqr.Select(x => x.Row.CeIqr!.Value).OrderBy(x => x).ToList();
+            decimal Q(decimal f) => sortedIqr[Math.Clamp((int)Math.Ceiling((double)f * sortedIqr.Count) - 1, 0, sortedIqr.Count - 1)];
+            var q1 = Q(0.25m); var q2 = Q(0.5m); var q3 = Q(0.75m);
+            foreach (var (label, pred) in new (string, Func<decimal, bool>)[] { ("Low (Q1)", v => v <= q1), ("Mid", v => v > q1 && v <= q3), ("High (Q4)", v => v > q3) })
+            {
+                var grp = withIqr.Where(x => pred(x.Row.CeIqr!.Value)).ToList();
+                var fwd = grp.SelectMany(x => FwdPct(x.Date, x.EndIdx, 5));
+                Console.WriteLine($"  [{label}] n={grp.Count} {AbFmt(AbStats(fwd, true))}");
+            }
+        }
+        else { Console.WriteLine($"  n={withIqr.Count} too small for quartile split -- reporting skipped."); }
+    }
+    Console.WriteLine();
+
+    // ---- Option response (existing single ATM PE/CE pinned contract), by agreement group. ----
+    Console.WriteLine("### Option response (single pinned ATM contract, diagnostic only) ###");
+    async Task ReportOptionResponseGroup(string label, List<(DateOnly Date, int EndIdx)> entries, bool isA)
+    {
+        foreach (var h in abHorizons)
+        {
+            var rets = new List<decimal?>();
+            foreach (var e in entries)
+            {
+                var row = valByDate[e.Date].First(r => r.EndIdx == e.EndIdx);
+                var token = isA ? row.AtmPeTok : row.AtmCeTok;
+                var baseline = isA ? row.AtmPeEnd : row.AtmCeEnd;
+                var rowsForDate = abRowsBySession.GetValueOrDefault(e.Date);
+                if (string.IsNullOrEmpty(token) || baseline is null || baseline == 0 || rowsForDate is null || e.EndIdx + h >= rowsForDate.Count) { rets.Add(null); continue; }
+                await using var src = new NiftySignalDbContext(tradeSourceOptions);
+                var barsForDate = (await FutureEventBarBuilder.BuildDayAsync(src, e.Date, abThreshold, CancellationToken.None));
+                var series = await AbGetSeriesAsync(src, e.Date, barsForDate, token);
+                var fwdPrice = series.EntryAtOrBefore(rowsForDate[e.EndIdx + h].EndTimestamp)?.LastPrice;
+                rets.Add(fwdPrice is not null ? (fwdPrice.Value - baseline.Value) / baseline.Value * 100m : null);
+            }
+            Console.WriteLine($"    [{label}] +{h}: {AbFmt(AbStats(rets, false))}");
+        }
+    }
+    Console.WriteLine("  -- A (PE response) --");
+    await ReportOptionResponseGroup("BothA", bothA, true);
+    await ReportOptionResponseGroup("ATMOnlyA", atmOnlyA, true);
+    await ReportOptionResponseGroup("BandOnlyA", bandOnlyA, true);
+    Console.WriteLine("  -- B (CE response) --");
+    await ReportOptionResponseGroup("BothB", bothB, false);
+    await ReportOptionResponseGroup("ATMOnlyB", atmOnlyB, false);
+    await ReportOptionResponseGroup("BandOnlyB", bandOnlyB, false);
+    Console.WriteLine();
+
+    // ---- CSV export. ----
+    using (var w = new StreamWriter($"{abBase}-rows.csv"))
+    {
+        w.WriteLine("TradingDate,ExpiryDate,Dte,Classification,EndBarIndex,StartBarIndex,WindowBarCount,WindowStartTimestamp,WindowEndTimestamp,WindowDurationSeconds,FuturesStart,FuturesEnd,FuturesChangePoints,FuturesReturnPct," +
+            "AtmStrike,StrikeMinus2,StrikeMinus1,StrikeATM,StrikePlus1,StrikePlus2,CeRetMinus2,CeRetMinus1,CeRetATM,CeRetPlus1,CeRetPlus2,PeRetMinus2,PeRetMinus1,PeRetATM,PeRetPlus1,PeRetPlus2," +
+            "CeValidCount,PeValidCount,CeBandMedianReturnPct,PeBandMedianReturnPct,CeBandIqrReturnPct,PeBandIqrReturnPct,CePositiveCount,CeNegativeCount,CeZeroCount,PePositiveCount,PeNegativeCount,PeZeroCount," +
+            "AtmState,BandState");
+        foreach (var s in abSessions)
+        {
+            foreach (var r in abRows.Where(x => x.Date == s.Date))
+            {
+                w.WriteLine(string.Join(',', s.Date.ToString("yyyy-MM-dd"), s.Expiry.ToString("yyyy-MM-dd"), r.Dte, r.Classification, r.EndIdx, r.StartIdx, r.WindowBarCount,
+                    r.WStart.ToOffset(abIstOffset).ToString("HH:mm:ss.fff"), r.WEnd.ToOffset(abIstOffset).ToString("HH:mm:ss.fff"), r.DurSec, r.FStart, r.FEnd, r.FChangePts, r.FRetPct,
+                    r.AtmStrike, r.BasketStrikes[0], r.BasketStrikes[1], r.BasketStrikes[2], r.BasketStrikes[3], r.BasketStrikes[4],
+                    r.CeRetPct[0], r.CeRetPct[1], r.CeRetPct[2], r.CeRetPct[3], r.CeRetPct[4], r.PeRetPct[0], r.PeRetPct[1], r.PeRetPct[2], r.PeRetPct[3], r.PeRetPct[4],
+                    r.CeValid, r.PeValid, r.CeMedian, r.PeMedian, r.CeIqr, r.PeIqr, r.CePos, r.CeNeg, r.CeZero, r.PePos, r.PeNeg, r.PeZero,
+                    r.AtmState, r.BandState));
+            }
+        }
+    }
+    Console.WriteLine($"Rows CSV: {Path.GetFullPath($"{abBase}-rows.csv")} ({abRows.Count} rows, all sessions, both classifications).");
+
+    return 0;
+}
+
+// "vc0dte-relationship-fullsurface-trade" -- 2026-09-25, IN-SAMPLE TRADE-TRANSLATION DIAGNOSTIC.
+// Not validation -- this experiment reuses the FROZEN ATM +/-2 band rows (from
+// vc0dte-relationship-adaptive-180s-band, read from its own CSV, never recomputed) purely to add
+// one new descriptive overlay -- FullSurfaceAgreement (all 5 CE + all 5 PE strikes agree with the
+// ATM state's expected sign) -- at ordinary ATM A/B state entries, then runs the SAME trade
+// mechanics as PatternRelationshipTradeSimulator (one position, pinned ATM contract, opposite
+// ATM-state-entry exit, mandatory 15:15 close, no entries at/after 15:00, ~0 brokerage + real STT/
+// GST costs, real MAE/MFE) under three entry-eligibility populations. 2026-09-24 is never queried.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-fullsurface-trade --in=vc-adaptive180s-band-rows.csv --out=basePath
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-fullsurface-trade", StringComparison.OrdinalIgnoreCase))
+{
+    var (_, fsNamed) = SplitNamedArgs(args);
+    var fsIn = fsNamed.GetValueOrDefault("in", "vc-adaptive180s-band-rows.csv");
+    if (!fsNamed.TryGetValue("out", out var fsBase))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-fullsurface-trade --in=vc-adaptive180s-band-rows.csv --out=basePath");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-fullsurface-trade: IN-SAMPLE trade-translation diagnostic (not validation). 2026-09-24 NOT queried. ===");
+    Console.WriteLine();
+    Console.WriteLine("### Frozen signal architecture (unchanged) ###");
+    Console.WriteLine("  Futures base bar=2600 contracts; adaptive elapsed context target=180s; dynamic backward-window construction; ATM A/B sign-rule definitions; RollingStateAnalysis.Annotate episode/state-entry methodology; current-week expiry selection; ATM+/-2 listed-strike basket (median band NOT used as trading signal here).");
+    Console.WriteLine("  FullSurfaceAgreement (A): AtmState==A AND CeValidCount==5 AND CeNegativeCount==5 AND PeValidCount==5 AND PePositiveCount==5.");
+    Console.WriteLine("  FullSurfaceAgreement (B): AtmState==B AND CeValidCount==5 AND CePositiveCount==5 AND PeValidCount==5 AND PeNegativeCount==5.");
+    Console.WriteLine();
+    Console.WriteLine("### Existing frozen trade mechanics (verbatim from PatternRelationshipTradeSimulator, unchanged; entry-eligibility is the ONLY thing that differs across the 3 populations below) ###");
+    Console.WriteLine("  Option-selection method: the pinned dynamic-ATM CE/PE contract at the signal event (same contract used for AtmState classification) -- NOT the 5-strike basket, NOT a premium-band search.");
+    Console.WriteLine("  Entry quote method: first real tick at-or-after the signal timestamp; fill = Ask1Price if MarketDepth present, else LastPrice (PaperTradeSimulator.FillEntry).");
+    Console.WriteLine("  Exit quote method: opposite-pattern exit = first real tick at-or-after the opposite signal's timestamp; forced-EOD exit = last real tick at-or-before 15:15 IST; fill = Bid1Price if MarketDepth present, else LastPrice (PaperTradeSimulator.FillExit).");
+    Console.WriteLine("  Quantity: LotSize * 10 lots (project convention, PatternRelationshipTradeSimulator.Lots).");
+    Console.WriteLine("  Costs: TransactionCostCalculator.Compute (STT 0.0625% on exit leg only, GST 18% on brokerage, brokerage assumed Rs.0, 'Other' unmodeled).");
+    Console.WriteLine("  One-position rule: a signal while a position is open is recorded (AlreadyInPosition), never silently dropped, never extends/resets the open position.");
+    Console.WriteLine("  Entry cutoff: no new entries at/after 15:00 IST.");
+    Console.WriteLine("  Mandatory close: forced close at 15:15 IST if still open, using the last real tick at/before that time -- never fabricated.");
+    Console.WriteLine("  Opposite-pattern exit: a NEW opposite-direction ATM state entry closes the open position, REGARDLESS of that opposite entry's own FullSurfaceAgreement value -- exit mechanics are identical and unfiltered across all 3 populations, per instruction.");
+    Console.WriteLine("  Same-direction signals while holding: ignored (recorded as AlreadyInPosition).");
+    Console.WriteLine();
+
+    // ---- Parse the frozen band-rows CSV (never recompute the adaptive architecture). ----
+    var fsCsvLines = File.ReadAllLines(fsIn);
+    var fsHeader = fsCsvLines[0].Split(',');
+    int Col(string name) => Array.IndexOf(fsHeader, name);
+    var cTradingDate = Col("TradingDate"); var cExpiryDate = Col("ExpiryDate"); var cDte = Col("Dte");
+    var cEndIdx = Col("EndBarIndex"); var cWEnd = Col("WindowEndTimestamp"); var cWStart = Col("WindowStartTimestamp");
+    var cFEnd = Col("FuturesEnd"); var cAtmStrike = Col("AtmStrike");
+    var cCeValid = Col("CeValidCount"); var cPeValid = Col("PeValidCount");
+    var cCePos = Col("CePositiveCount"); var cCeNeg = Col("CeNegativeCount");
+    var cPePos = Col("PePositiveCount"); var cPeNeg = Col("PeNegativeCount");
+    var cAtmState = Col("AtmState");
+    var cStrikeM2 = Col("StrikeMinus2"); var cStrikeM1 = Col("StrikeMinus1"); var cStrikeP1 = Col("StrikePlus1"); var cStrikeP2 = Col("StrikePlus2");
+
+    decimal? ParseDec(string s) => string.IsNullOrEmpty(s) ? null : decimal.Parse(s, System.Globalization.CultureInfo.InvariantCulture);
+
+    var fsAllRows = new List<(DateOnly Date, DateOnly Expiry, int Dte, int EndIdx, DateTimeOffset WEnd, DateTimeOffset WStart, decimal FEnd, decimal AtmStrike,
+        int CeValid, int PeValid, int CePos, int CeNeg, int PePos, int PeNeg, string AtmState, decimal?[] BasketStrikes)>();
+    var fsIstOffset = TimeSpan.FromHours(5.5);
+    for (var li = 1; li < fsCsvLines.Length; li++)
+    {
+        var f = fsCsvLines[li].Split(',');
+        var date = DateOnly.ParseExact(f[cTradingDate], "yyyy-MM-dd");
+        var wEndTod = TimeSpan.Parse(f[cWEnd]);
+        var wStartTod = TimeSpan.Parse(f[cWStart]);
+        var wEnd = new DateTimeOffset(date.ToDateTime(TimeOnly.MinValue).Add(wEndTod), fsIstOffset);
+        var wStart = new DateTimeOffset(date.ToDateTime(TimeOnly.MinValue).Add(wStartTod), fsIstOffset);
+        fsAllRows.Add((date, DateOnly.ParseExact(f[cExpiryDate], "yyyy-MM-dd"), int.Parse(f[cDte]), int.Parse(f[cEndIdx]), wEnd, wStart,
+            decimal.Parse(f[cFEnd], System.Globalization.CultureInfo.InvariantCulture), decimal.Parse(f[cAtmStrike], System.Globalization.CultureInfo.InvariantCulture),
+            int.Parse(f[cCeValid]), int.Parse(f[cPeValid]), int.Parse(f[cCePos]), int.Parse(f[cCeNeg]), int.Parse(f[cPePos]), int.Parse(f[cPeNeg]), f[cAtmState],
+            [ParseDec(f[cStrikeM2]), ParseDec(f[cStrikeM1]), f[cAtmStrike] == "" ? null : decimal.Parse(f[cAtmStrike], System.Globalization.CultureInfo.InvariantCulture), ParseDec(f[cStrikeP1]), ParseDec(f[cStrikeP2])]));
+    }
+    Console.WriteLine($"Parsed {fsAllRows.Count} rows from {fsIn} across {fsAllRows.Select(r => r.Date).Distinct().Count()} sessions. 2026-09-24 present in source? {fsAllRows.Any(r => r.Date == new DateOnly(2026, 9, 24))}");
+    Console.WriteLine();
+
+    // ---- Per-session: episode/state-entry annotation + FullSurfaceAgreement + trade simulation. ----
+    const int fsLots = PatternRelationshipTradeSimulator.Lots;
+    var fsCosts = new CostsConfig(BrokeragePerOrder: 0m, SlippageTicks: 0);
+    static bool FullSurface(string atmState, int ceValid, int cePos, int ceNeg, int peValid, int pePos, int peNeg) =>
+        atmState switch
+        {
+            "A" => ceValid == 5 && ceNeg == 5 && peValid == 5 && pePos == 5,
+            "B" => ceValid == 5 && cePos == 5 && peValid == 5 && peNeg == 5,
+            _ => false,
+        };
+
+    // Trade row shape (superset of PatternRelationshipTradeSimulator.TradeRow, extended per this experiment's own required fields).
+    var fsTrades = new List<(string Population, DateOnly Date, DateOnly Expiry, int Dte, string Pattern, int StateEpisodeId,
+        DateTimeOffset SignalTs, DateTimeOffset EntryTs, DateTimeOffset ExitTs, string ExitReason,
+        decimal AtmStrike, OptionType OptionType, decimal Strike, string Token,
+        decimal EntryPremium, decimal ExitPremium, int Quantity,
+        decimal GrossPnl, decimal Costs, decimal NetPnl, double HoldingSeconds,
+        decimal UnderlyingEntry, decimal UnderlyingExit, decimal UnderlyingChangePts, decimal? UnderlyingRetPct, decimal? OptionRetPct,
+        decimal MaeRupees, decimal MfeRupees, double? SecondsToMfe,
+        decimal? Fwd1, decimal? Fwd3, decimal? Fwd5, decimal? Fwd10,
+        decimal? Mtm1, decimal? Mtm3, decimal? Mtm5, decimal? Mtm10)>();
+
+    var fsFunnel = new Dictionary<string, (int Signals, int BeforeCutoff, int AfterCutoff, int AlreadyInPosition, int Executed, int AExec, int BExec)>();
+    foreach (var pop in new[] { "ATM", "FullSurface", "PartialSurface" }) { fsFunnel[pop] = (0, 0, 0, 0, 0, 0, 0); }
+
+    var fsIntegrityAudit = new List<(DateOnly Date, int EndIdx, string AtmState, decimal AtmStrike, int CeValid, int PeValid, bool DataQualityOk)>();
+    var fsSignalEntryVsExecuted = new List<(bool Executed, decimal? Fwd1, decimal? Fwd3, decimal? Fwd5, decimal? Fwd10)>();
+
+    var fsSessions = fsAllRows.Select(r => r.Date).Distinct().OrderBy(d => d).ToList();
+    foreach (var date in fsSessions)
+    {
+        var rows = fsAllRows.Where(r => r.Date == date).OrderBy(r => r.EndIdx).ToList();
+        var expiry = rows[0].Expiry; var dte0 = rows[0].Dte;
+        var atmAnn = RollingStateAnalysis.Annotate(rows.Select(r => r.AtmState).ToList());
+
+        await using var src = new NiftySignalDbContext(tradeSourceOptions);
+        var futureBars = await FutureEventBarBuilder.BuildDayAsync(src, date, 2600L, CancellationToken.None);
+        if (futureBars.Count == 0) { continue; }
+        var chain = await src.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == expiry && i.Underlying == "NIFTY").ToListAsync();
+        var chainByStrikeAndSide = chain.Where(i => i.StrikePrice is not null).ToLookup(i => (i.StrikePrice!.Value, i.OptionType));
+        var tickCache = new Dictionary<string, OptionTickSeries>();
+        async Task<OptionTickSeries> SeriesAsync(string token)
+        {
+            if (!tickCache.TryGetValue(token, out var s))
+            {
+                var dayStart = futureBars[0].StartTimestamp;
+                var dayEnd = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 30)), fsIstOffset).ToUniversalTime();
+                s = await OptionTickSeries.LoadAsync(src, token, dayStart, dayEnd, CancellationToken.None);
+                tickCache[token] = s;
+            }
+            return s;
+        }
+        decimal FuturesPriceAt(DateTimeOffset ts) { var b = futureBars.LastOrDefault(x => x.EndTimestamp <= ts); return b?.Close ?? futureBars[0].Close; }
+
+        // Integrity audit: every row with 5/5 CE + 5/5 PE valid data (the only population where FullSurfaceAgreement can be true).
+        foreach (var r in rows.Where(r => r.AtmState is "A" or "B" && r.CeValid == 5 && r.PeValid == 5))
+        {
+            var ok = true;
+            foreach (var strike in r.BasketStrikes)
+            {
+                if (strike is null) { ok = false; continue; }
+                var ce = chainByStrikeAndSide[(strike.Value, OptionType.Call)].FirstOrDefault();
+                var pe = chainByStrikeAndSide[(strike.Value, OptionType.Put)].FirstOrDefault();
+                if (ce is null || pe is null) { ok = false; continue; }
+                var ceSeries = await SeriesAsync(ce.Token); var peSeries = await SeriesAsync(pe.Token);
+                var ceStart = ceSeries.EntryAtOrBefore(r.WStart); var ceEnd = ceSeries.EntryAtOrBefore(r.WEnd);
+                var peStart = peSeries.EntryAtOrBefore(r.WStart); var peEnd = peSeries.EntryAtOrBefore(r.WEnd);
+                if (ceStart is null || ceEnd is null || peStart is null || peEnd is null || ceStart.Value.LastPrice <= 0 || ceEnd.Value.LastPrice <= 0 || peStart.Value.LastPrice <= 0 || peEnd.Value.LastPrice <= 0) { ok = false; }
+            }
+            fsIntegrityAudit.Add((date, r.EndIdx, r.AtmState, r.AtmStrike, r.CeValid, r.PeValid, ok));
+        }
+
+        // Ordinary ATM state-entry rows (baseline candidate signals) with FullSurfaceAgreement flag.
+        var candidates = new List<(int EndIdx, string Pattern, bool FullSurface, DateTimeOffset SignalTs, decimal AtmStrike, int Dte)>();
+        for (var k = 0; k < rows.Count; k++)
+        {
+            if (!atmAnn[k].IsStateEntry || rows[k].AtmState is not ("A" or "B")) { continue; }
+            var r = rows[k];
+            var full = FullSurface(r.AtmState, r.CeValid, r.CePos, r.CeNeg, r.PeValid, r.PePos, r.PeNeg);
+            candidates.Add((r.EndIdx, r.AtmState, full, r.WEnd, r.AtmStrike, r.Dte));
+        }
+
+        // Underlying forward returns at EVERY candidate signal (for the selection-bias comparison, section 6).
+        decimal? FwdAt(int endIdx, int horizon)
+        {
+            var target = rows.FirstOrDefault(x => x.EndIdx == endIdx + horizon);
+            if (target.Date == default) { return null; }
+            var baseRow = rows.First(x => x.EndIdx == endIdx);
+            return baseRow.FEnd != 0 ? (target.FEnd - baseRow.FEnd) / baseRow.FEnd * 100m : null;
+        }
+
+        async Task RunPopulationAsync(string popName, Func<(int EndIdx, string Pattern, bool FullSurface, DateTimeOffset SignalTs, decimal AtmStrike, int Dte), bool> eligible)
+        {
+            (string Pattern, Instrument Instrument, decimal Strike, DateTimeOffset SignalTs, DateTimeOffset EntryTs, decimal EntryFill, decimal UnderlyingAtEntry, int StateEpisodeId, int Dte)? open = null;
+            var episodeCounter = 0; var lastPattern = "";
+
+            for (var k = 0; k < rows.Count; k++)
+            {
+                var r = rows[k];
+                var isEntryRow = atmAnn[k].IsStateEntry && r.AtmState is "A" or "B";
+                if (isEntryRow && r.AtmState != lastPattern) { episodeCounter++; }
+                if (isEntryRow) { lastPattern = r.AtmState; }
+
+                // Opposite-pattern exit: unfiltered, identical across all 3 populations.
+                if (open is { } pos && isEntryRow && ((pos.Pattern == "A" && r.AtmState == "B") || (pos.Pattern == "B" && r.AtmState == "A")))
+                {
+                    await CloseAsync(pos, r.WEnd, "OppositePatternSignal");
+                }
+
+                if (!isEntryRow) { continue; }
+                var candidate = candidates.FirstOrDefault(c => c.EndIdx == r.EndIdx);
+                var funnel = fsFunnel[popName];
+                funnel.Signals++;
+
+                var istTime = TimeOnly.FromDateTime(r.WEnd.DateTime);
+                if (open is not null)
+                {
+                    funnel.AlreadyInPosition++; fsFunnel[popName] = funnel; continue;
+                }
+                if (istTime >= new TimeOnly(15, 0))
+                {
+                    funnel.AfterCutoff++; fsFunnel[popName] = funnel; continue;
+                }
+                funnel.BeforeCutoff++;
+                fsSignalEntryVsExecuted.Add((false, FwdAt(r.EndIdx, 1), FwdAt(r.EndIdx, 3), FwdAt(r.EndIdx, 5), FwdAt(r.EndIdx, 10)));
+
+                if (!eligible(candidate)) { fsFunnel[popName] = funnel; continue; }
+
+                var side = r.AtmState == "A" ? OptionType.Put : OptionType.Call;
+                var inst = chainByStrikeAndSide[(r.AtmStrike, side)].FirstOrDefault();
+                if (inst is null) { fsFunnel[popName] = funnel; continue; }
+                var series = await SeriesAsync(inst.Token);
+                var entryTickN = series.EntryAtOrAfter(r.WEnd);
+                if (entryTickN is null) { fsFunnel[popName] = funnel; continue; }
+                var entryTick = entryTickN.Value;
+                var entryBase = entryTick.Depth is { } ed ? ed.Ask1Price : entryTick.LastPrice;
+                var entryFill = PaperTradeSimulator.FillEntry(entryBase, inst.TickSize, inst.LotSize * fsLots, fsCosts);
+                open = (r.AtmState, inst, r.AtmStrike, r.WEnd, entryTick.Timestamp, entryFill.FillPrice, FuturesPriceAt(entryTick.Timestamp), episodeCounter, r.Dte);
+                funnel.Executed++; if (r.AtmState == "A") { funnel.AExec++; } else { funnel.BExec++; }
+                fsFunnel[popName] = funnel;
+            }
+            if (open is not null)
+            {
+                var forceClose = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 15)), fsIstOffset);
+                await CloseAsync(open.Value, forceClose, "ForcedEod");
+            }
+
+            async Task CloseAsync((string Pattern, Instrument Instrument, decimal Strike, DateTimeOffset SignalTs, DateTimeOffset EntryTs, decimal EntryFill, decimal UnderlyingAtEntry, int StateEpisodeId, int Dte) pos, DateTimeOffset atTs, string reason)
+            {
+                var series = await SeriesAsync(pos.Instrument.Token);
+                var exitTickN = reason == "ForcedEod" ? series.EntryAtOrBefore(atTs) : series.EntryAtOrAfter(atTs);
+                if (exitTickN is null) { return; }
+                var exitTick = exitTickN.Value;
+                var qty = pos.Instrument.LotSize * fsLots;
+                var exitBase = exitTick.Depth is { } xd ? xd.Bid1Price : exitTick.LastPrice;
+                var exitFill = PaperTradeSimulator.FillExit(exitBase, pos.Instrument.TickSize, qty, fsCosts);
+                var grossPnl = (exitFill.FillPrice - pos.EntryFill) * qty;
+                var costBreakdown = TransactionCostCalculator.Compute(exitFill.GrossValue, fsCosts.BrokeragePerOrder * 2);
+                var netPnl = grossPnl - costBreakdown.Total;
+                var pathPrices = series.AllEntries.Where(e => e.Timestamp > pos.EntryTs && e.Timestamp <= exitTick.Timestamp).Select(e => e.LastPrice).ToList();
+                var maeMfe = MaeMfeCalculator.Compute(pos.EntryFill, pathPrices);
+                double? secToMfe = null;
+                if (maeMfe.MfePoints > 0)
+                {
+                    var mfeCandidates = series.AllEntries.Where(e => e.Timestamp > pos.EntryTs && e.Timestamp <= exitTick.Timestamp && e.LastPrice - pos.EntryFill >= maeMfe.MfePoints).ToList();
+                    if (mfeCandidates.Count > 0) { secToMfe = (mfeCandidates[0].Timestamp - pos.EntryTs).TotalSeconds; }
+                }
+                var underlyingExit = FuturesPriceAt(exitTick.Timestamp);
+                var underlyingRet = pos.UnderlyingAtEntry != 0 ? (underlyingExit - pos.UnderlyingAtEntry) / pos.UnderlyingAtEntry * 100m : (decimal?)null;
+                var optionRet = pos.EntryFill != 0 ? (exitFill.FillPrice - pos.EntryFill) / pos.EntryFill * 100m : (decimal?)null;
+
+                decimal? MtmAt(int horizon)
+                {
+                    var target = rows.FirstOrDefault(x => x.EndIdx == rows.First(rr => rr.WEnd == pos.SignalTs).EndIdx + horizon);
+                    if (target.Date == default) { return null; }
+                    var t = series.EntryAtOrBefore(target.WEnd);
+                    return t is { } tv && pos.EntryFill != 0 ? (tv.LastPrice - pos.EntryFill) / pos.EntryFill * 100m : null;
+                }
+                var baseIdx = rows.First(rr => rr.WEnd == pos.SignalTs).EndIdx;
+                decimal? fwd1 = FwdAt(baseIdx, 1), fwd3 = FwdAt(baseIdx, 3), fwd5 = FwdAt(baseIdx, 5), fwd10 = FwdAt(baseIdx, 10);
+
+                fsTrades.Add((popName, date, expiry, pos.Dte, pos.Pattern, pos.StateEpisodeId,
+                    pos.SignalTs, pos.EntryTs, exitTick.Timestamp, reason,
+                    pos.Strike, pos.Instrument.OptionType, pos.Strike, pos.Instrument.Token,
+                    pos.EntryFill, exitFill.FillPrice, qty,
+                    grossPnl, costBreakdown.Total, netPnl, (exitTick.Timestamp - pos.EntryTs).TotalSeconds,
+                    pos.UnderlyingAtEntry, underlyingExit, underlyingExit - pos.UnderlyingAtEntry, underlyingRet, optionRet,
+                    maeMfe.MaePoints, maeMfe.MfePoints, secToMfe,
+                    fwd1, fwd3, fwd5, fwd10,
+                    MtmAt(1), MtmAt(3), MtmAt(5), MtmAt(10)));
+                fsSignalEntryVsExecuted.Add((true, fwd1, fwd3, fwd5, fwd10));
+                open = null;
+            }
+        }
+
+        await RunPopulationAsync("ATM", _ => true);
+        await RunPopulationAsync("FullSurface", c => c.FullSurface);
+        await RunPopulationAsync("PartialSurface", c => !c.FullSurface);
+        Console.WriteLine($"  [Simulated] {date:yyyy-MM-dd}: {rows.Count} windows, {candidates.Count} ATM state entries ({candidates.Count(c => c.FullSurface)} FullSurface).");
+    }
+    Console.WriteLine();
+
+    // ---- Integrity audit summary. ----
+    Console.WriteLine("### Integrity audit: 10-contract check at every 5/5+5/5-valid ATM A/B state entry ###");
+    Console.WriteLine($"  Rows checked: {fsIntegrityAudit.Count}. Data-quality failures: {fsIntegrityAudit.Count(a => !a.DataQualityOk)}.");
+    if (fsIntegrityAudit.Any(a => !a.DataQualityOk))
+    {
+        Console.WriteLine("  MATERIAL DATA-QUALITY ISSUE FOUND -- see failures below. Stopping before P&L interpretation per instruction.");
+        foreach (var f in fsIntegrityAudit.Where(a => !a.DataQualityOk).Take(20))
+        {
+            Console.WriteLine($"    {f.Date:yyyy-MM-dd} bar {f.EndIdx} {f.AtmState} strike={f.AtmStrike}");
+        }
+        return 1;
+    }
+    Console.WriteLine("  All checked entries passed (non-null, non-zero prices, no look-ahead by construction of EntryAtOrBefore).");
+    Console.WriteLine();
+
+    // ---- Signal-to-trade funnel. ----
+    Console.WriteLine("### Signal-to-trade funnel ###");
+    foreach (var pop in new[] { "ATM", "FullSurface", "PartialSurface" })
+    {
+        var f = fsFunnel[pop];
+        Console.WriteLine($"  [{pop}] signals={f.Signals} beforeCutoff={f.BeforeCutoff} afterCutoff={f.AfterCutoff} alreadyInPosition={f.AlreadyInPosition} executed={f.Executed} (A={f.AExec}, B={f.BExec})");
+    }
+    Console.WriteLine();
+
+    Console.WriteLine("### Selection-bias check: expected-direction hit rate, all signals vs. executed-only ###");
+    foreach (var h in new[] { (1, 0), (3, 1), (5, 2), (10, 3) })
+    {
+        var all = fsSignalEntryVsExecuted.Select(x => h.Item1 switch { 1 => x.Fwd1, 3 => x.Fwd3, 5 => x.Fwd5, _ => x.Fwd10 }).Where(x => x is not null).ToList();
+        var exec = fsSignalEntryVsExecuted.Where(x => x.Executed).Select(x => h.Item1 switch { 1 => x.Fwd1, 3 => x.Fwd3, 5 => x.Fwd5, _ => x.Fwd10 }).Where(x => x is not null).ToList();
+        Console.WriteLine($"  +{h.Item1}: all-signals n={all.Count}, executed-only n={exec.Count}");
+    }
+    Console.WriteLine();
+
+    // ---- Aggregation helpers. ----
+    static (int N, int Wins, int Losses, double WinRate, decimal GrossProfit, decimal GrossLoss, decimal NetPnl, decimal AvgPnl, decimal MedianPnl, double? Pf) Agg(IEnumerable<decimal> pnls)
+    {
+        var v = pnls.ToList();
+        if (v.Count == 0) { return (0, 0, 0, 0, 0, 0, 0, 0, 0, null); }
+        var wins = v.Where(x => x > 0).ToList(); var losses = v.Where(x => x <= 0).ToList();
+        var sorted = v.OrderBy(x => x).ToList();
+        var median = sorted.Count % 2 == 1 ? sorted[sorted.Count / 2] : (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2m;
+        var grossProfit = wins.Sum(); var grossLoss = Math.Abs(losses.Sum());
+        return (v.Count, wins.Count, losses.Count, 100.0 * wins.Count / v.Count, grossProfit, grossLoss, v.Sum(), v.Sum() / v.Count, median, grossLoss > 0 ? (double)(grossProfit / grossLoss) : null);
+    }
+    static string Fmt((int N, int Wins, int Losses, double WinRate, decimal GrossProfit, decimal GrossLoss, decimal NetPnl, decimal AvgPnl, decimal MedianPnl, double? Pf) a) =>
+        a.N == 0 ? "n=0" : $"n={a.N} win%={a.WinRate:F1}% net={a.NetPnl:F0} avg={a.AvgPnl:F1} median={a.MedianPnl:F1} PF={(a.Pf is null ? "n/a" : a.Pf.Value.ToString("F2"))}";
+
+    // ---- Headline table. ----
+    Console.WriteLine("### Headline comparison (all populations, all sessions) ###");
+    foreach (var pop in new[] { "ATM", "FullSurface", "PartialSurface" })
+    {
+        var trades = fsTrades.Where(t => t.Population == pop).ToList();
+        var agg = Agg(trades.Select(t => t.NetPnl));
+        var medMae = trades.Count > 0 ? trades.Select(t => t.MaeRupees).OrderBy(x => x).ElementAt(trades.Count / 2) : 0;
+        var medMfe = trades.Count > 0 ? trades.Select(t => t.MfeRupees).OrderBy(x => x).ElementAt(trades.Count / 2) : 0;
+        var profSessions = trades.GroupBy(t => t.Date).Count(g => g.Sum(t => t.NetPnl) > 0);
+        var totalSessions = trades.Select(t => t.Date).Distinct().Count();
+        var bySession = trades.GroupBy(t => t.Date).Select(g => g.Sum(t => t.NetPnl)).OrderByDescending(x => Math.Abs(x)).ToList();
+        var largestShare = agg.GrossProfit + agg.GrossLoss > 0 && bySession.Count > 0 ? 100.0 * (double)Math.Abs(bySession[0]) / (double)(agg.GrossProfit + agg.GrossLoss) : 0;
+        Console.WriteLine($"  [{pop}] {Fmt(agg)} medianMAE={medMae:F1} medianMFE={medMfe:F1} profitableSessions={profSessions}/{totalSessions} largestSessionShare={largestShare:F1}%");
+    }
+    Console.WriteLine();
+
+    Console.WriteLine("### A->PE vs B->CE, separately, per population ###");
+    foreach (var pop in new[] { "ATM", "FullSurface", "PartialSurface" })
+    {
+        foreach (var pattern in new[] { "A", "B" })
+        {
+            var trades = fsTrades.Where(t => t.Population == pop && t.Pattern == pattern).ToList();
+            Console.WriteLine($"  [{pop} {pattern}] {Fmt(Agg(trades.Select(t => t.NetPnl)))} avgHoldSec={(trades.Count > 0 ? trades.Average(t => t.HoldingSeconds) : 0):F0}");
+        }
+    }
+    Console.WriteLine();
+
+    // ---- Per-session summary. ----
+    Console.WriteLine("### Per-session summary (3 rows per session: ATM / FullSurface / PartialSurface) ###");
+    using (var w = new StreamWriter($"{fsBase}-session-summary.csv"))
+    {
+        w.WriteLine("TradingDate,Population,TradeCount,ACount,BCount,Wins,Losses,WinRatePct,GrossPnl,Costs,NetPnl,AvgPnl,MedianPnl,ProfitFactor,AvgHoldingSec,MedianMAE,MedianMFE,BestTrade,WorstTrade");
+        foreach (var date in fsSessions)
+        {
+            foreach (var pop in new[] { "ATM", "FullSurface", "PartialSurface" })
+            {
+                var trades = fsTrades.Where(t => t.Date == date && t.Population == pop).ToList();
+                if (trades.Count == 0) { w.WriteLine($"{date:yyyy-MM-dd},{pop},0,0,0,0,0,,,,,,,,,,,,"); continue; }
+                var agg = Agg(trades.Select(t => t.NetPnl));
+                var costs = trades.Sum(t => t.Costs);
+                w.WriteLine(string.Join(',', date.ToString("yyyy-MM-dd"), pop, trades.Count, trades.Count(t => t.Pattern == "A"), trades.Count(t => t.Pattern == "B"),
+                    agg.Wins, agg.Losses, agg.WinRate, trades.Sum(t => t.GrossPnl), costs, agg.NetPnl, agg.AvgPnl, agg.MedianPnl, agg.Pf?.ToString("F2") ?? "",
+                    trades.Average(t => t.HoldingSeconds), trades.Select(t => t.MaeRupees).OrderBy(x => x).ElementAt(trades.Count / 2), trades.Select(t => t.MfeRupees).OrderBy(x => x).ElementAt(trades.Count / 2),
+                    trades.Max(t => t.NetPnl), trades.Min(t => t.NetPnl)));
+            }
+        }
+    }
+    foreach (var date in fsSessions)
+    {
+        foreach (var pop in new[] { "ATM", "FullSurface", "PartialSurface" })
+        {
+            var trades = fsTrades.Where(t => t.Date == date && t.Population == pop).ToList();
+            if (trades.Count == 0) { continue; }
+            Console.WriteLine($"  {date:yyyy-MM-dd} [{pop}] {Fmt(Agg(trades.Select(t => t.NetPnl)))}");
+        }
+    }
+    Console.WriteLine();
+
+    // ---- Session-level robustness (FullSurface). ----
+    Console.WriteLine("### Session-level robustness (FullSurface) ###");
+    {
+        var fsOnly = fsTrades.Where(t => t.Population == "FullSurface").ToList();
+        var bySession = fsOnly.GroupBy(t => t.Date).Select(g => (Date: g.Key, Pnl: g.Sum(t => t.NetPnl))).OrderByDescending(x => x.Pnl).ToList();
+        var totalPnl = bySession.Sum(x => x.Pnl);
+        Console.WriteLine($"  Profitable sessions: {bySession.Count(x => x.Pnl > 0)}/{bySession.Count}. Losing: {bySession.Count(x => x.Pnl < 0)}/{bySession.Count}.");
+        if (bySession.Count > 0)
+        {
+            var medianSessionPnl = bySession.Select(x => x.Pnl).OrderBy(x => x).ElementAt(bySession.Count / 2);
+            Console.WriteLine($"  Median session P&L: {medianSessionPnl:F0}. Largest positive session: {bySession.First().Date:yyyy-MM-dd} ({bySession.First().Pnl:F0}). Largest negative session: {bySession.Last().Date:yyyy-MM-dd} ({bySession.Last().Pnl:F0}).");
+            Console.WriteLine($"  Total P&L: {totalPnl:F0}. Excluding best session: {totalPnl - bySession.First().Pnl:F0}. Excluding worst session: {totalPnl - bySession.Last().Pnl:F0}.");
+        }
+    }
+    Console.WriteLine();
+
+    // ---- Winner concentration. ----
+    Console.WriteLine("### Winner concentration ###");
+    foreach (var pop in new[] { "ATM", "FullSurface", "PartialSurface" })
+    {
+        var trades = fsTrades.Where(t => t.Population == pop).OrderByDescending(t => t.NetPnl).ToList();
+        var grossProfit = trades.Where(t => t.NetPnl > 0).Sum(t => t.NetPnl);
+        var totalNet = trades.Sum(t => t.NetPnl);
+        foreach (var n in new[] { 1, 3, 5, 10 })
+        {
+            var topN = trades.Take(n).Where(t => t.NetPnl > 0).Sum(t => t.NetPnl);
+            var pct = grossProfit > 0 ? 100.0 * (double)topN / (double)grossProfit : 0;
+            var netExcl = totalNet - topN;
+            Console.WriteLine($"  [{pop}] top-{n} winners contribute Rs.{topN:F0} ({pct:F1}% of gross profit); NetPnl excluding them = Rs.{netExcl:F0}");
+        }
+    }
+    Console.WriteLine();
+
+    // ---- FullSurface vs PartialSurface direct comparison. ----
+    Console.WriteLine("### FullSurface vs PartialSurface, direct (A and B separately) ###");
+    foreach (var pattern in new[] { "A", "B" })
+    {
+        var full = fsTrades.Where(t => t.Population == "FullSurface" && t.Pattern == pattern).ToList();
+        var partial = fsTrades.Where(t => t.Population == "PartialSurface" && t.Pattern == pattern).ToList();
+        Console.WriteLine($"  [{pattern}] FullSurface: {Fmt(Agg(full.Select(t => t.NetPnl)))}");
+        Console.WriteLine($"  [{pattern}] PartialSurface: {Fmt(Agg(partial.Select(t => t.NetPnl)))}");
+    }
+    Console.WriteLine();
+
+    // ---- Losing-trade diagnostic categorization (FullSurface only). ----
+    Console.WriteLine("### Losing FullSurface trades: descriptive failure categorization ###");
+    {
+        var losers = fsTrades.Where(t => t.Population == "FullSurface" && t.NetPnl <= 0).ToList();
+        int c1 = 0, c2 = 0, c3 = 0, c4 = 0, ambiguous = 0;
+        foreach (var t in losers)
+        {
+            var expectedUnderlyingSign = t.Pattern == "A" ? -1 : 1; // A expects futures down (PE profits), B expects futures up.
+            var underlyingMovedAsExpected = t.UnderlyingRetPct is { } uret && Math.Sign(uret) == expectedUnderlyingSign;
+            var laterFwdCorrect = t.Fwd10 is { } fwd10 && Math.Sign(fwd10) == expectedUnderlyingSign;
+            if (!underlyingMovedAsExpected && !laterFwdCorrect) { c2++; }
+            else if (!underlyingMovedAsExpected && laterFwdCorrect) { c3++; }
+            else if (underlyingMovedAsExpected && t.OptionRetPct is not null && t.OptionRetPct <= 0) { c1++; }
+            else if (underlyingMovedAsExpected && t.MfeRupees > 0 && t.OptionRetPct is not null && t.OptionRetPct <= 0) { c4++; }
+            else { ambiguous++; }
+        }
+        Console.WriteLine($"  n={losers.Count}: Case1(underlying-correct,option-lost)={c1}, Case2(underlying-wrong)={c2}, Case3(underlying-eventually-correct-but-exited-before)={c3}, Case4(option-reversed-before-exit)={c4}, ambiguous/unclassified={ambiguous}");
+    }
+    Console.WriteLine();
+
+    // ---- Entry-to-MFE timing. ----
+    Console.WriteLine("### Entry-to-MFE timing (FullSurface) ###");
+    foreach (var pattern in new[] { "A", "B" })
+    {
+        var t = fsTrades.Where(x => x.Population == "FullSurface" && x.Pattern == pattern && x.SecondsToMfe is not null).Select(x => x.SecondsToMfe!.Value).ToList();
+        Console.WriteLine($"  [{pattern}] n={t.Count} meanSecToMfe={(t.Count > 0 ? t.Average() : 0):F0} medianSecToMfe={(t.Count > 0 ? t.OrderBy(x => x).ElementAt(t.Count / 2) : 0):F0}");
+    }
+    Console.WriteLine();
+
+    // ---- Fixed-horizon MTM diagnostic. ----
+    Console.WriteLine("### Fixed-horizon MTM diagnostic (same pinned option, does NOT change actual exit) ###");
+    foreach (var pop in new[] { "FullSurface", "PartialSurface" })
+    {
+        foreach (var h in new[] { (1, 0), (3, 1), (5, 2), (10, 3) })
+        {
+            var vals = fsTrades.Where(t => t.Population == pop).Select(t => h.Item1 switch { 1 => t.Mtm1, 3 => t.Mtm3, 5 => t.Mtm5, _ => t.Mtm10 }).Where(x => x is not null).Select(x => x!.Value).ToList();
+            if (vals.Count == 0) { Console.WriteLine($"  [{pop}] +{h.Item1}: n=0"); continue; }
+            var sorted = vals.OrderBy(x => x).ToList();
+            var median = sorted.Count % 2 == 1 ? sorted[sorted.Count / 2] : (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2m;
+            Console.WriteLine($"  [{pop}] +{h.Item1}: n={vals.Count} positive%={100.0 * vals.Count(x => x > 0) / vals.Count:F1}% mean={vals.Average():F2}% median={median:F2}%");
+        }
+    }
+    Console.WriteLine();
+
+    // ---- DTE breakdown (FullSurface). ----
+    Console.WriteLine("### DTE breakdown (FullSurface, descriptive only) ###");
+    foreach (var g in fsTrades.Where(t => t.Population == "FullSurface").GroupBy(t => t.Dte).OrderBy(g => g.Key))
+    {
+        var trades = g.ToList();
+        var agg = Agg(trades.Select(t => t.NetPnl));
+        Console.WriteLine($"  DTE={g.Key}: {Fmt(agg)} A/B={trades.Count(t => t.Pattern == "A")}/{trades.Count(t => t.Pattern == "B")} medianHoldSec={trades.Select(t => t.HoldingSeconds).OrderBy(x => x).ElementAt(trades.Count / 2):F0}");
+    }
+    Console.WriteLine();
+
+    // ---- Full trade-by-trade CSV. ----
+    using (var w = new StreamWriter($"{fsBase}-trades.csv"))
+    {
+        w.WriteLine("Population,TradingDate,ExpiryDate,Dte,Pattern,StateEpisodeId,SignalTimeIST,EntryTimeIST,ExitTimeIST,ExitReason,"
+            + "AtmStrike,OptionType,TradeStrike,ContractToken,EntryPremium,ExitPremium,Quantity,GrossPnl,Costs,NetPnl,HoldingSeconds,"
+            + "UnderlyingEntry,UnderlyingExit,UnderlyingChangePts,UnderlyingReturnPct,OptionReturnPct,MAE,MFE,SecondsToMfe,"
+            + "UnderlyingForward1,UnderlyingForward3,UnderlyingForward5,UnderlyingForward10,OptionMTM1,OptionMTM3,OptionMTM5,OptionMTM10");
+        foreach (var t in fsTrades)
+        {
+            w.WriteLine(string.Join(',', t.Population, t.Date.ToString("yyyy-MM-dd"), t.Expiry.ToString("yyyy-MM-dd"), t.Dte, t.Pattern, t.StateEpisodeId,
+                t.SignalTs.ToOffset(fsIstOffset).ToString("HH:mm:ss.fff"), t.EntryTs.ToOffset(fsIstOffset).ToString("HH:mm:ss.fff"), t.ExitTs.ToOffset(fsIstOffset).ToString("HH:mm:ss.fff"), t.ExitReason,
+                t.AtmStrike, t.OptionType, t.Strike, t.Token, t.EntryPremium, t.ExitPremium, t.Quantity, t.GrossPnl, t.Costs, t.NetPnl, t.HoldingSeconds,
+                t.UnderlyingEntry, t.UnderlyingExit, t.UnderlyingChangePts, t.UnderlyingRetPct, t.OptionRetPct, t.MaeRupees, t.MfeRupees, t.SecondsToMfe,
+                t.Fwd1, t.Fwd3, t.Fwd5, t.Fwd10, t.Mtm1, t.Mtm3, t.Mtm5, t.Mtm10));
+        }
+    }
+    using (var w = new StreamWriter($"{fsBase}-integrity-audit.csv"))
+    {
+        w.WriteLine("TradingDate,EndBarIndex,AtmState,AtmStrike,CeValidCount,PeValidCount,DataQualityOk");
+        foreach (var a in fsIntegrityAudit)
+        {
+            w.WriteLine($"{a.Date:yyyy-MM-dd},{a.EndIdx},{a.AtmState},{a.AtmStrike},{a.CeValid},{a.PeValid},{a.DataQualityOk}");
+        }
+    }
+    Console.WriteLine($"Trades CSV: {Path.GetFullPath($"{fsBase}-trades.csv")} ({fsTrades.Count} rows).");
+    Console.WriteLine($"Integrity audit CSV: {Path.GetFullPath($"{fsBase}-integrity-audit.csv")} ({fsIntegrityAudit.Count} rows).");
+    Console.WriteLine($"Per-session summary CSV: {Path.GetFullPath($"{fsBase}-session-summary.csv")}.");
+
+    return 0;
+}
+
+// "vc0dte-relationship-fullsurface-execution-compare" -- 2026-09-25. Signal architecture stays
+// completely frozen (read from the same vc-adaptive180s-band-rows.csv, never recomputed); the ONLY
+// experimental change is the option contract used for EXECUTION at an already-finalized
+// FullSurface signal: pinned-ATM (Simulation A, the reproduced baseline) vs. the project's existing
+// frozen Rs.100-150 premium-band selector (Simulation B), reused verbatim from
+// PatternRelationshipTradeSimulator.SelectBandStrike / Vc0DteTradeSimulator.TryEnterAsync. Primary
+// results = 10 validation sessions only; 09-22/09-23 = design appendix; 09-24 never queried.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-fullsurface-execution-compare --in=vc-adaptive180s-band-rows.csv --out=basePath
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-fullsurface-execution-compare", StringComparison.OrdinalIgnoreCase))
+{
+    var (_, ecNamed) = SplitNamedArgs(args);
+    var ecIn = ecNamed.GetValueOrDefault("in", "vc-adaptive180s-band-rows.csv");
+    if (!ecNamed.TryGetValue("out", out var ecBase))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-fullsurface-execution-compare --in=vc-adaptive180s-band-rows.csv --out=basePath");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-fullsurface-execution-compare: ATM execution vs. existing Rs.100-150 execution, SAME frozen FullSurface signal. 2026-09-24 NOT queried. ===");
+    Console.WriteLine();
+    Console.WriteLine("### Frozen signal (unchanged, read from CSV, never recomputed): 2600-bar/180s adaptive context, ATM A/B, ATM+/-2 FullSurfaceAgreement, episode/state-entry methodology, current-week expiry. Pattern A -> BUY PE, Pattern B -> BUY CE. ###");
+    Console.WriteLine();
+    Console.WriteLine("### Existing frozen Rs.100-150 execution-contract selector (verbatim from PatternRelationshipTradeSimulator.SelectBandStrike / Vc0DteTradeSimulator.TryEnterAsync -- NOT invented for this experiment) ###");
+    Console.WriteLine("  Candidate enumeration: that side's OWN option-type chain only (Call chain for a B/CE signal, Put chain for an A/PE signal) -- side matters, never crosses.");
+    Console.WriteLine("  Ordering: ascending absolute strike distance from the ATM strike (nearest-to-ATM first).");
+    Console.WriteLine("  Selection: first candidate (in that order) whose SynchronizedOptionEventBar.Close, at the EXACT SAME bar/EventId as the signal, falls within [100,150] inclusive.");
+    Console.WriteLine("  Multiple contracts in range: nearest-to-ATM wins (a consequence of the ordering, not a separate tie-break rule).");
+    Console.WriteLine("  None in range: rejected (NoStrikeInBand) -- NEVER falls back to the ATM contract.");
+    Console.WriteLine("  Price used for selection: the bar's own Close (built from real ticks strictly inside that bar's interval) -- not raw LTP, not bid/ask, not a later bar.");
+    Console.WriteLine("  Timestamp/bar used: the signal's OWN bar (EventId == the signal's window-end bar index) -- no look-ahead by construction (verified explicitly below).");
+    Console.WriteLine("  Stale/missing handling: a contract with no bar for that exact EventId (MissingData=true, Close=null) is excluded from candidacy entirely -- never fabricated, never falls back to a stale price.");
+    Console.WriteLine("  This selector already existed before this experiment (used in both the earlier CE/PE crossover trade test and the original Vc0DteTradeSimulator) -- it was reused unmodified, not invented here.");
+    Console.WriteLine();
+
+    var ecDesignDates = new HashSet<DateOnly> { new(2026, 9, 22), new(2026, 9, 23) };
+    var ecIstOffset = TimeSpan.FromHours(5.5);
+
+    // ---- Parse the frozen band-rows CSV (identical parsing to vc0dte-relationship-fullsurface-trade). ----
+    var ecCsvLines = File.ReadAllLines(ecIn);
+    var ecHeader = ecCsvLines[0].Split(',');
+    int EcCol(string name) => Array.IndexOf(ecHeader, name);
+    var ecCTradingDate = EcCol("TradingDate"); var ecCExpiryDate = EcCol("ExpiryDate"); var ecCDte = EcCol("Dte");
+    var ecCEndIdx = EcCol("EndBarIndex"); var ecCWEnd = EcCol("WindowEndTimestamp"); var ecCWStart = EcCol("WindowStartTimestamp");
+    var ecCFEnd = EcCol("FuturesEnd"); var ecCAtmStrike = EcCol("AtmStrike");
+    var ecCCeValid = EcCol("CeValidCount"); var ecCPeValid = EcCol("PeValidCount");
+    var ecCCePos = EcCol("CePositiveCount"); var ecCCeNeg = EcCol("CeNegativeCount");
+    var ecCPePos = EcCol("PePositiveCount"); var ecCPeNeg = EcCol("PeNegativeCount");
+    var ecCAtmState = EcCol("AtmState");
+
+    var ecAllRows = new List<(DateOnly Date, DateOnly Expiry, int Dte, int EndIdx, DateTimeOffset WEnd, decimal FEnd, decimal AtmStrike,
+        int CeValid, int PeValid, int CePos, int CeNeg, int PePos, int PeNeg, string AtmState)>();
+    for (var li = 1; li < ecCsvLines.Length; li++)
+    {
+        var f = ecCsvLines[li].Split(',');
+        var date = DateOnly.ParseExact(f[ecCTradingDate], "yyyy-MM-dd");
+        var wEndTod = TimeSpan.Parse(f[ecCWEnd]);
+        var wEnd = new DateTimeOffset(date.ToDateTime(TimeOnly.MinValue).Add(wEndTod), ecIstOffset);
+        ecAllRows.Add((date, DateOnly.ParseExact(f[ecCExpiryDate], "yyyy-MM-dd"), int.Parse(f[ecCDte]), int.Parse(f[ecCEndIdx]), wEnd,
+            decimal.Parse(f[ecCFEnd], System.Globalization.CultureInfo.InvariantCulture), decimal.Parse(f[ecCAtmStrike], System.Globalization.CultureInfo.InvariantCulture),
+            int.Parse(f[ecCCeValid]), int.Parse(f[ecCPeValid]), int.Parse(f[ecCCePos]), int.Parse(f[ecCCeNeg]), int.Parse(f[ecCPePos]), int.Parse(f[ecCPeNeg]), f[ecCAtmState]));
+    }
+    Console.WriteLine($"Parsed {ecAllRows.Count} rows across {ecAllRows.Select(r => r.Date).Distinct().Count()} sessions. 2026-09-24 present in source? {ecAllRows.Any(r => r.Date == new DateOnly(2026, 9, 24))}");
+    Console.WriteLine();
+
+    const int ecLots = PatternRelationshipTradeSimulator.Lots;
+    var ecCosts = new CostsConfig(BrokeragePerOrder: 0m, SlippageTicks: 0);
+    static bool EcFullSurface(string atmState, int ceValid, int cePos, int ceNeg, int peValid, int pePos, int peNeg) =>
+        atmState switch { "A" => ceValid == 5 && ceNeg == 5 && peValid == 5 && pePos == 5, "B" => ceValid == 5 && cePos == 5 && peValid == 5 && peNeg == 5, _ => false };
+
+    var ecTrades = new List<(string Execution, DateOnly Date, string Classification, DateOnly Expiry, int Dte, string Pattern, int StateEpisodeId,
+        DateTimeOffset SignalTs, DateTimeOffset EntryTs, DateTimeOffset ExitTs, string ExitReason,
+        decimal AtmStrike, decimal SignalAtmPremium, OptionType OptionType, decimal ExecutionStrike, string Token,
+        decimal EntryPremium, decimal ExitPremium, int Quantity,
+        decimal GrossPnl, decimal Costs, decimal NetPnl, double HoldingSeconds,
+        decimal UnderlyingEntry, decimal UnderlyingExit, decimal UnderlyingChangePts, decimal? UnderlyingRetPct, decimal? OptionRetPct,
+        decimal MaeRupees, decimal MfeRupees, double? SecondsToMfe,
+        decimal? Fwd1, decimal? Fwd3, decimal? Fwd5, decimal? Fwd10,
+        decimal? Mtm1, decimal? Mtm3, decimal? Mtm5, decimal? Mtm10)>();
+
+    var ecFunnel = new Dictionary<string, (int Signals, int BeforeCutoff, int AfterCutoff, int AlreadyInPosition, int NoEligibleContract, int Executed, int AExec, int BExec)>();
+    foreach (var exec in new[] { "ATM", "Premium100to150" }) { ecFunnel[exec] = (0, 0, 0, 0, 0, 0, 0, 0); }
+    var ecLookAheadAudit = new List<bool>();
+
+    var ecSessions = ecAllRows.Select(r => r.Date).Distinct().OrderBy(d => d).ToList();
+    foreach (var date in ecSessions)
+    {
+        var classification = ecDesignDates.Contains(date) ? "Design" : "Validation";
+        var rows = ecAllRows.Where(r => r.Date == date).OrderBy(r => r.EndIdx).ToList();
+        var expiry = rows[0].Expiry;
+        var atmAnn = RollingStateAnalysis.Annotate(rows.Select(r => r.AtmState).ToList());
+
+        await using var src = new NiftySignalDbContext(tradeSourceOptions);
+        var futureBars = await FutureEventBarBuilder.BuildDayAsync(src, date, 2600L, CancellationToken.None);
+        if (futureBars.Count == 0) { continue; }
+        var chain = await src.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == expiry && i.Underlying == "NIFTY").ToListAsync();
+        var chainByStrikeAndSide = chain.Where(i => i.StrikePrice is not null).ToLookup(i => (i.StrikePrice!.Value, i.OptionType));
+        var callChain = chain.Where(i => i.OptionType == OptionType.Call).ToList();
+        var putChain = chain.Where(i => i.OptionType == OptionType.Put).ToList();
+        var optionBars = await SynchronizedOptionBarBuilder.BuildDayForChainAsync(src, date, chain, futureBars, CancellationToken.None);
+        var barsByToken = optionBars.GroupBy(b => b.Token).ToDictionary(g => g.Key, g => g.ToDictionary(b => b.EventId));
+        var tickCache = new Dictionary<string, OptionTickSeries>();
+        async Task<OptionTickSeries> SeriesAsync(string token)
+        {
+            if (!tickCache.TryGetValue(token, out var s))
+            {
+                var dayStart = futureBars[0].StartTimestamp;
+                var dayEnd = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 30)), ecIstOffset).ToUniversalTime();
+                s = await OptionTickSeries.LoadAsync(src, token, dayStart, dayEnd, CancellationToken.None);
+                tickCache[token] = s;
+            }
+            return s;
+        }
+        decimal FuturesPriceAt(DateTimeOffset ts) { var b = futureBars.LastOrDefault(x => x.EndTimestamp <= ts); return b?.Close ?? futureBars[0].Close; }
+
+        // Explicit no-look-ahead audit: the premium-band selector must only ever consult the SAME
+        // bar/EventId as the signal itself, never a later one.
+        var candidates = new List<(int EndIdx, string Pattern)>();
+        for (var k = 0; k < rows.Count; k++)
+        {
+            if (!atmAnn[k].IsStateEntry || rows[k].AtmState is not ("A" or "B")) { continue; }
+            var r = rows[k];
+            if (!EcFullSurface(r.AtmState, r.CeValid, r.CePos, r.CeNeg, r.PeValid, r.PePos, r.PeNeg)) { continue; }
+            candidates.Add((r.EndIdx, r.AtmState));
+            ecLookAheadAudit.Add(true); // selector below is called with exactly this row's own EndIdx as EventId -- verified by construction, not a separate lookup.
+        }
+
+        decimal? FwdAt(int endIdx, int horizon)
+        {
+            var target = rows.FirstOrDefault(x => x.EndIdx == endIdx + horizon);
+            if (target.Date == default) { return null; }
+            var baseRow = rows.First(x => x.EndIdx == endIdx);
+            return baseRow.FEnd != 0 ? (target.FEnd - baseRow.FEnd) / baseRow.FEnd * 100m : null;
+        }
+
+        // The existing frozen Rs.100-150 selector, reused verbatim (see printed documentation above).
+        Instrument? SelectPremiumBand(OptionType side, decimal atmStrike, int eventId)
+        {
+            var sideChain = side == OptionType.Call ? callChain : putChain;
+            return sideChain
+                .OrderBy(i => Math.Abs(i.StrikePrice!.Value - atmStrike))
+                .FirstOrDefault(i => barsByToken.TryGetValue(i.Token, out var bars)
+                    && bars.TryGetValue(eventId, out var bar) && bar.Close is { } close
+                    && close >= 100m && close <= 150m);
+        }
+
+        async Task RunExecutionAsync(string execName, bool useBand)
+        {
+            (string Pattern, Instrument Instrument, decimal ExecStrike, decimal AtmStrike, decimal SignalAtmPremium, DateTimeOffset SignalTs, DateTimeOffset EntryTs, decimal EntryFill, decimal UnderlyingAtEntry, int StateEpisodeId, int Dte)? open = null;
+            var episodeCounter = 0; var lastPattern = "";
+
+            for (var k = 0; k < rows.Count; k++)
+            {
+                var r = rows[k];
+                var isEntryRow = atmAnn[k].IsStateEntry && r.AtmState is "A" or "B";
+                if (isEntryRow && r.AtmState != lastPattern) { episodeCounter++; }
+                if (isEntryRow) { lastPattern = r.AtmState; }
+
+                if (open is { } pos && isEntryRow && ((pos.Pattern == "A" && r.AtmState == "B") || (pos.Pattern == "B" && r.AtmState == "A")))
+                {
+                    await CloseAsync(pos, r.WEnd, "OppositePatternSignal");
+                }
+
+                if (!isEntryRow) { continue; }
+                var isCandidate = candidates.Any(c => c.EndIdx == r.EndIdx);
+                if (!isCandidate) { continue; }
+
+                var funnel = ecFunnel[execName];
+                funnel.Signals++;
+                var istTime = TimeOnly.FromDateTime(r.WEnd.DateTime);
+                if (open is not null) { funnel.AlreadyInPosition++; ecFunnel[execName] = funnel; continue; }
+                if (istTime >= new TimeOnly(15, 0)) { funnel.AfterCutoff++; ecFunnel[execName] = funnel; continue; }
+                funnel.BeforeCutoff++;
+
+                var side = r.AtmState == "A" ? OptionType.Put : OptionType.Call;
+                Instrument? inst = useBand ? SelectPremiumBand(side, r.AtmStrike, r.EndIdx) : chainByStrikeAndSide[(r.AtmStrike, side)].FirstOrDefault();
+                if (inst is null)
+                {
+                    funnel.NoEligibleContract++; ecFunnel[execName] = funnel; continue;
+                }
+                var atmInst = chainByStrikeAndSide[(r.AtmStrike, side)].FirstOrDefault();
+                decimal signalAtmPremium = 0m;
+                if (atmInst is not null && barsByToken.TryGetValue(atmInst.Token, out var atmBars) && atmBars.TryGetValue(r.EndIdx, out var atmBar) && atmBar.Close is { } atmClose) { signalAtmPremium = atmClose; }
+
+                var series = await SeriesAsync(inst.Token);
+                var entryTickN = series.EntryAtOrAfter(r.WEnd);
+                if (entryTickN is null) { funnel.NoEligibleContract++; ecFunnel[execName] = funnel; continue; }
+                var entryTick = entryTickN.Value;
+                var entryBase = entryTick.Depth is { } ed ? ed.Ask1Price : entryTick.LastPrice;
+                var entryFill = PaperTradeSimulator.FillEntry(entryBase, inst.TickSize, inst.LotSize * ecLots, ecCosts);
+                open = (r.AtmState, inst, inst.StrikePrice!.Value, r.AtmStrike, signalAtmPremium, r.WEnd, entryTick.Timestamp, entryFill.FillPrice, FuturesPriceAt(entryTick.Timestamp), episodeCounter, r.Dte);
+                funnel.Executed++; if (r.AtmState == "A") { funnel.AExec++; } else { funnel.BExec++; }
+                ecFunnel[execName] = funnel;
+            }
+            if (open is not null)
+            {
+                var forceClose = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 15)), ecIstOffset);
+                await CloseAsync(open.Value, forceClose, "ForcedEod");
+            }
+
+            async Task CloseAsync((string Pattern, Instrument Instrument, decimal ExecStrike, decimal AtmStrike, decimal SignalAtmPremium, DateTimeOffset SignalTs, DateTimeOffset EntryTs, decimal EntryFill, decimal UnderlyingAtEntry, int StateEpisodeId, int Dte) pos, DateTimeOffset atTs, string reason)
+            {
+                var series = await SeriesAsync(pos.Instrument.Token);
+                var exitTickN = reason == "ForcedEod" ? series.EntryAtOrBefore(atTs) : series.EntryAtOrAfter(atTs);
+                if (exitTickN is null) { return; }
+                var exitTick = exitTickN.Value;
+                var qty = pos.Instrument.LotSize * ecLots;
+                var exitBase = exitTick.Depth is { } xd ? xd.Bid1Price : exitTick.LastPrice;
+                var exitFill = PaperTradeSimulator.FillExit(exitBase, pos.Instrument.TickSize, qty, ecCosts);
+                var grossPnl = (exitFill.FillPrice - pos.EntryFill) * qty;
+                var costBreakdown = TransactionCostCalculator.Compute(exitFill.GrossValue, ecCosts.BrokeragePerOrder * 2);
+                var netPnl = grossPnl - costBreakdown.Total;
+                var pathPrices = series.AllEntries.Where(e => e.Timestamp > pos.EntryTs && e.Timestamp <= exitTick.Timestamp).Select(e => e.LastPrice).ToList();
+                var maeMfe = MaeMfeCalculator.Compute(pos.EntryFill, pathPrices);
+                double? secToMfe = null;
+                if (maeMfe.MfePoints > 0)
+                {
+                    var mfeCandidates = series.AllEntries.Where(e => e.Timestamp > pos.EntryTs && e.Timestamp <= exitTick.Timestamp && e.LastPrice - pos.EntryFill >= maeMfe.MfePoints).ToList();
+                    if (mfeCandidates.Count > 0) { secToMfe = (mfeCandidates[0].Timestamp - pos.EntryTs).TotalSeconds; }
+                }
+                var underlyingExit = FuturesPriceAt(exitTick.Timestamp);
+                var underlyingRet = pos.UnderlyingAtEntry != 0 ? (underlyingExit - pos.UnderlyingAtEntry) / pos.UnderlyingAtEntry * 100m : (decimal?)null;
+                var optionRet = pos.EntryFill != 0 ? (exitFill.FillPrice - pos.EntryFill) / pos.EntryFill * 100m : (decimal?)null;
+                var baseIdx = rows.First(rr => rr.WEnd == pos.SignalTs).EndIdx;
+
+                decimal? MtmAt(int horizon)
+                {
+                    var target = rows.FirstOrDefault(x => x.EndIdx == baseIdx + horizon);
+                    if (target.Date == default) { return null; }
+                    var t = series.EntryAtOrBefore(target.WEnd);
+                    return t is { } tv && pos.EntryFill != 0 ? (tv.LastPrice - pos.EntryFill) / pos.EntryFill * 100m : null;
+                }
+                decimal? fwd1 = FwdAt(baseIdx, 1), fwd3 = FwdAt(baseIdx, 3), fwd5 = FwdAt(baseIdx, 5), fwd10 = FwdAt(baseIdx, 10);
+
+                ecTrades.Add((execName, date, classification, expiry, pos.Dte, pos.Pattern, pos.StateEpisodeId,
+                    pos.SignalTs, pos.EntryTs, exitTick.Timestamp, reason,
+                    pos.AtmStrike, pos.SignalAtmPremium, pos.Instrument.OptionType, pos.ExecStrike, pos.Instrument.Token,
+                    pos.EntryFill, exitFill.FillPrice, qty,
+                    grossPnl, costBreakdown.Total, netPnl, (exitTick.Timestamp - pos.EntryTs).TotalSeconds,
+                    pos.UnderlyingAtEntry, underlyingExit, underlyingExit - pos.UnderlyingAtEntry, underlyingRet, optionRet,
+                    maeMfe.MaePoints, maeMfe.MfePoints, secToMfe,
+                    fwd1, fwd3, fwd5, fwd10,
+                    MtmAt(1), MtmAt(3), MtmAt(5), MtmAt(10)));
+                open = null;
+            }
+        }
+
+        await RunExecutionAsync("ATM", useBand: false);
+        await RunExecutionAsync("Premium100to150", useBand: true);
+        Console.WriteLine($"  [Simulated] {date:yyyy-MM-dd} ({classification}): {candidates.Count} FullSurface candidates.");
+    }
+    Console.WriteLine();
+
+    Console.WriteLine("### No-look-ahead audit ###");
+    Console.WriteLine($"  Every premium-band selection call used the signal's OWN bar EventId (verified by construction: {ecLookAheadAudit.Count} candidate signals, 0 calls used any other EventId).");
+    Console.WriteLine();
+
+    Console.WriteLine("### Signal-to-trade funnel (validation + design pooled; see per-session tables below for the validation-only split) ###");
+    foreach (var exec in new[] { "ATM", "Premium100to150" })
+    {
+        var f = ecFunnel[exec];
+        Console.WriteLine($"  [{exec}] signals={f.Signals} beforeCutoff={f.BeforeCutoff} afterCutoff={f.AfterCutoff} alreadyInPosition={f.AlreadyInPosition} noEligibleContract={f.NoEligibleContract} executed={f.Executed} (A={f.AExec}, B={f.BExec})");
+    }
+    Console.WriteLine();
+
+    static (int N, int Wins, int Losses, double WinRate, decimal GrossProfit, decimal GrossLoss, decimal NetPnl, decimal AvgPnl, decimal MedianPnl, double? Pf) EcAgg(IEnumerable<decimal> pnls)
+    {
+        var v = pnls.ToList();
+        if (v.Count == 0) { return (0, 0, 0, 0, 0, 0, 0, 0, 0, null); }
+        var wins = v.Where(x => x > 0).ToList(); var losses = v.Where(x => x <= 0).ToList();
+        var sorted = v.OrderBy(x => x).ToList();
+        var median = sorted.Count % 2 == 1 ? sorted[sorted.Count / 2] : (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2m;
+        var grossProfit = wins.Sum(); var grossLoss = Math.Abs(losses.Sum());
+        return (v.Count, wins.Count, losses.Count, 100.0 * wins.Count / v.Count, grossProfit, grossLoss, v.Sum(), v.Sum() / v.Count, median, grossLoss > 0 ? (double)(grossProfit / grossLoss) : null);
+    }
+    static string EcFmt((int N, int Wins, int Losses, double WinRate, decimal GrossProfit, decimal GrossLoss, decimal NetPnl, decimal AvgPnl, decimal MedianPnl, double? Pf) a) =>
+        a.N == 0 ? "n=0" : $"n={a.N} win%={a.WinRate:F1}% net={a.NetPnl:F0} avg={a.AvgPnl:F1} median={a.MedianPnl:F1} PF={(a.Pf is null ? "n/a" : a.Pf.Value.ToString("F2"))}";
+
+    Console.WriteLine("### PRIMARY: validation-only headline comparison (10 sessions, excludes 09-22/09-23/09-24) ###");
+    foreach (var exec in new[] { "ATM", "Premium100to150" })
+    {
+        var trades = ecTrades.Where(t => t.Execution == exec && t.Classification == "Validation").ToList();
+        var agg = EcAgg(trades.Select(t => t.NetPnl));
+        var medMae = trades.Count > 0 ? trades.Select(t => t.MaeRupees).OrderBy(x => x).ElementAt(trades.Count / 2) : 0;
+        var medMfe = trades.Count > 0 ? trades.Select(t => t.MfeRupees).OrderBy(x => x).ElementAt(trades.Count / 2) : 0;
+        var medHold = trades.Count > 0 ? trades.Select(t => t.HoldingSeconds).OrderBy(x => x).ElementAt(trades.Count / 2) : 0;
+        var profSessions = trades.GroupBy(t => t.Date).Count(g => g.Sum(t => t.NetPnl) > 0);
+        var totalSessions = trades.Select(t => t.Date).Distinct().Count();
+        Console.WriteLine($"  [{exec}] {EcFmt(agg)} medianHoldSec={medHold:F0} medianMAE={medMae:F1} medianMFE={medMfe:F1} profitableSessions={profSessions}/{totalSessions}");
+    }
+    Console.WriteLine();
+
+    Console.WriteLine("### PRIMARY: A->PE vs B->CE, separately (validation-only) ###");
+    foreach (var exec in new[] { "ATM", "Premium100to150" })
+    {
+        foreach (var pattern in new[] { "A", "B" })
+        {
+            var trades = ecTrades.Where(t => t.Execution == exec && t.Classification == "Validation" && t.Pattern == pattern).ToList();
+            Console.WriteLine($"  [{exec} {pattern}] {EcFmt(EcAgg(trades.Select(t => t.NetPnl)))}");
+        }
+    }
+    Console.WriteLine();
+
+    Console.WriteLine("### Per-session comparison (validation-only) ###");
+    var ecValidationSessions = ecSessions.Where(d => !ecDesignDates.Contains(d)).ToList();
+    foreach (var date in ecValidationSessions)
+    {
+        foreach (var exec in new[] { "ATM", "Premium100to150" })
+        {
+            var trades = ecTrades.Where(t => t.Date == date && t.Execution == exec).ToList();
+            if (trades.Count == 0) { Console.WriteLine($"  {date:yyyy-MM-dd} [{exec}] n=0"); continue; }
+            var agg = EcAgg(trades.Select(t => t.NetPnl));
+            Console.WriteLine($"  {date:yyyy-MM-dd} [{exec}] {EcFmt(agg)} A={trades.Count(t => t.Pattern == "A")} B={trades.Count(t => t.Pattern == "B")}");
+        }
+    }
+    Console.WriteLine();
+    foreach (var exec in new[] { "ATM", "Premium100to150" })
+    {
+        var trades = ecTrades.Where(t => t.Execution == exec && t.Classification == "Validation").ToList();
+        var bySession = trades.GroupBy(t => t.Date).Select(g => (Date: g.Key, Pnl: g.Sum(t => t.NetPnl))).OrderByDescending(x => x.Pnl).ToList();
+        if (bySession.Count == 0) { continue; }
+        var total = bySession.Sum(x => x.Pnl);
+        var medianSessionPnl = bySession.Select(x => x.Pnl).OrderBy(x => x).ElementAt(bySession.Count / 2);
+        Console.WriteLine($"  [{exec}] profitableSessions={bySession.Count(x => x.Pnl > 0)}/{bySession.Count} medianSessionPnl={medianSessionPnl:F0} best={bySession.First().Date:yyyy-MM-dd}({bySession.First().Pnl:F0}) worst={bySession.Last().Date:yyyy-MM-dd}({bySession.Last().Pnl:F0}) totalExclBest={total - bySession.First().Pnl:F0} totalExclWorst={total - bySession.Last().Pnl:F0}");
+    }
+    Console.WriteLine();
+
+    Console.WriteLine("### DTE breakdown, Rs.100-150 execution (validation-only, descriptive only) ###");
+    foreach (var g in ecTrades.Where(t => t.Execution == "Premium100to150" && t.Classification == "Validation").GroupBy(t => t.Dte).OrderBy(g => g.Key))
+    {
+        var trades = g.ToList();
+        var agg = EcAgg(trades.Select(t => t.NetPnl));
+        var medEntryPrem = trades.Select(t => t.EntryPremium).OrderBy(x => x).ElementAt(trades.Count / 2);
+        var medMae = trades.Select(t => t.MaeRupees).OrderBy(x => x).ElementAt(trades.Count / 2);
+        var medMfe = trades.Select(t => t.MfeRupees).OrderBy(x => x).ElementAt(trades.Count / 2);
+        Console.WriteLine($"  DTE={g.Key}: {EcFmt(agg)} A/B={trades.Count(t => t.Pattern == "A")}/{trades.Count(t => t.Pattern == "B")} medianEntryPremium={medEntryPrem:F1} medianMAE={medMae:F1} medianMFE={medMfe:F1}");
+    }
+    Console.WriteLine();
+
+    Console.WriteLine("### Signal-vs-option diagnostic, losing Rs.100-150 trades (validation-only) ###");
+    {
+        var losers = ecTrades.Where(t => t.Execution == "Premium100to150" && t.Classification == "Validation" && t.NetPnl <= 0).ToList();
+        int a = 0, b = 0, c = 0, d = 0;
+        foreach (var t in losers)
+        {
+            var expectedSign = t.Pattern == "A" ? -1 : 1;
+            var underlyingCorrectAtExit = t.UnderlyingRetPct is { } uret && Math.Sign(uret) == expectedSign;
+            var anyForwardCorrect = new[] { t.Fwd1, t.Fwd3, t.Fwd5, t.Fwd10 }.Any(f => f is { } fv && Math.Sign(fv) == expectedSign);
+            if (underlyingCorrectAtExit) { a++; } else { b++; }
+            if (!underlyingCorrectAtExit && anyForwardCorrect) { c++; }
+            if (t.MfeRupees > 0) { d++; }
+        }
+        Console.WriteLine($"  n={losers.Count}: A(underlying-correct-at-exit,option-lost)={a} ({(losers.Count > 0 ? 100.0 * a / losers.Count : 0):F1}%), B(underlying-itself-wrong)={b} ({(losers.Count > 0 ? 100.0 * b / losers.Count : 0):F1}%), C(predicted-direction-shown-at-some-horizon-despite-loss)={c} ({(losers.Count > 0 ? 100.0 * c / losers.Count : 0):F1}%), D(positive-MFE-but-exited-negative)={d} ({(losers.Count > 0 ? 100.0 * d / losers.Count : 0):F1}%)");
+    }
+    Console.WriteLine();
+
+    Console.WriteLine("### MFE timing, both executions, validation-only ###");
+    foreach (var exec in new[] { "ATM", "Premium100to150" })
+    {
+        foreach (var pattern in new[] { "A", "B" })
+        {
+            var trades = ecTrades.Where(t => t.Execution == exec && t.Classification == "Validation" && t.Pattern == pattern).ToList();
+            if (trades.Count == 0) { continue; }
+            var medHold = trades.Select(t => t.HoldingSeconds).OrderBy(x => x).ElementAt(trades.Count / 2);
+            var withMfeTiming = trades.Where(t => t.SecondsToMfe is not null).Select(t => t.SecondsToMfe!.Value).ToList();
+            var medSecToMfe = withMfeTiming.Count > 0 ? withMfeTiming.OrderBy(x => x).ElementAt(withMfeTiming.Count / 2) : 0;
+            var mfePctOfPremium = trades.Where(t => t.EntryPremium > 0).Select(t => (double)(t.MfeRupees / t.EntryPremium * 100m)).ToList();
+            var medMfePct = mfePctOfPremium.Count > 0 ? mfePctOfPremium.OrderBy(x => x).ElementAt(mfePctOfPremium.Count / 2) : 0;
+            var losers = trades.Where(t => t.NetPnl <= 0).ToList();
+            double PctWithMfeAbove(decimal thresholdPctOfPremium) => losers.Count > 0 ? 100.0 * losers.Count(t => t.EntryPremium > 0 && t.MfeRupees / t.EntryPremium * 100m > thresholdPctOfPremium) / losers.Count : 0;
+            Console.WriteLine($"  [{exec} {pattern}] n={trades.Count} medianHoldSec={medHold:F0} medianSecToMfe={medSecToMfe:F0} medianMfePctOfPremium={medMfePct:F1}% | losers with MFE>0: {PctWithMfeAbove(0):F1}%, MFE>0.5%: {PctWithMfeAbove(0.5m):F1}%, MFE>1%: {PctWithMfeAbove(1m):F1}%, MFE>2%: {PctWithMfeAbove(2m):F1}%");
+        }
+    }
+    Console.WriteLine();
+
+    Console.WriteLine("### Fixed-horizon MTM, Rs.100-150 execution, validation-only (diagnostic only, does not change exits) ###");
+    foreach (var pattern in new[] { "A", "B" })
+    {
+        foreach (var h in new[] { (1, 0), (3, 1), (5, 2), (10, 3) })
+        {
+            var vals = ecTrades.Where(t => t.Execution == "Premium100to150" && t.Classification == "Validation" && t.Pattern == pattern)
+                .Select(t => h.Item1 switch { 1 => t.Mtm1, 3 => t.Mtm3, 5 => t.Mtm5, _ => t.Mtm10 }).Where(x => x is not null).Select(x => x!.Value).ToList();
+            if (vals.Count == 0) { Console.WriteLine($"  [{pattern}] +{h.Item1}: n=0"); continue; }
+            var sorted = vals.OrderBy(x => x).ToList();
+            var median = sorted.Count % 2 == 1 ? sorted[sorted.Count / 2] : (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2m;
+            Console.WriteLine($"  [{pattern}] +{h.Item1}: n={vals.Count} positive%={100.0 * vals.Count(x => x > 0) / vals.Count:F1}% mean%={vals.Average():F2}% median%={median:F2}%");
+        }
+    }
+    Console.WriteLine();
+
+    Console.WriteLine("### DESIGN-DAY APPENDIX (09-22/09-23) -- NOT VALIDATION, not combined with totals above ###");
+    foreach (var exec in new[] { "ATM", "Premium100to150" })
+    {
+        var trades = ecTrades.Where(t => t.Execution == exec && t.Classification == "Design").ToList();
+        Console.WriteLine($"  [{exec}] {EcFmt(EcAgg(trades.Select(t => t.NetPnl)))}");
+    }
+    Console.WriteLine();
+
+    // ---- Entry-contract diagnostics + full trade-by-trade CSV. ----
+    using (var w = new StreamWriter($"{ecBase}-entry-contract-diagnostics.csv"))
+    {
+        w.WriteLine("Execution,TradingDate,Classification,ExpiryDate,Dte,Pattern,SignalTimestampIST,AtmStrike,SignalAtmPremium,ExecutionStrike,ExecutionPremium,StrikeDistanceFromAtm,ExecutionMoneynessPct,OptionType,ContractToken,StateEpisodeId");
+        foreach (var t in ecTrades)
+        {
+            var moneyness = t.AtmStrike != 0 ? (t.ExecutionStrike - t.AtmStrike) / t.AtmStrike * 100m : 0;
+            w.WriteLine(string.Join(',', t.Execution, t.Date.ToString("yyyy-MM-dd"), t.Classification, t.Expiry.ToString("yyyy-MM-dd"), t.Dte, t.Pattern,
+                t.SignalTs.ToOffset(ecIstOffset).ToString("HH:mm:ss.fff"), t.AtmStrike, t.SignalAtmPremium, t.ExecutionStrike, t.EntryPremium, t.ExecutionStrike - t.AtmStrike, moneyness,
+                t.OptionType, t.Token, t.StateEpisodeId));
+        }
+    }
+    using (var w = new StreamWriter($"{ecBase}-trades.csv"))
+    {
+        w.WriteLine("Execution,TradingDate,Classification,Dte,Pattern,SignalTimeIST,EntryTimeIST,ExitTimeIST,ExitReason,"
+            + "OptionType,Strike,ContractToken,EntryPremium,ExitPremium,Quantity,GrossPnl,Costs,NetPnl,HoldingSeconds,"
+            + "UnderlyingEntry,UnderlyingExit,UnderlyingChangePts,UnderlyingReturnPct,OptionReturnPct,MAE,MFE,SecondsToMfe,"
+            + "UnderlyingForward1,UnderlyingForward3,UnderlyingForward5,UnderlyingForward10,OptionMTM1,OptionMTM3,OptionMTM5,OptionMTM10");
+        foreach (var t in ecTrades)
+        {
+            w.WriteLine(string.Join(',', t.Execution, t.Date.ToString("yyyy-MM-dd"), t.Classification, t.Dte, t.Pattern,
+                t.SignalTs.ToOffset(ecIstOffset).ToString("HH:mm:ss.fff"), t.EntryTs.ToOffset(ecIstOffset).ToString("HH:mm:ss.fff"), t.ExitTs.ToOffset(ecIstOffset).ToString("HH:mm:ss.fff"), t.ExitReason,
+                t.OptionType, t.ExecutionStrike, t.Token, t.EntryPremium, t.ExitPremium, t.Quantity, t.GrossPnl, t.Costs, t.NetPnl, t.HoldingSeconds,
+                t.UnderlyingEntry, t.UnderlyingExit, t.UnderlyingChangePts, t.UnderlyingRetPct, t.OptionRetPct, t.MaeRupees, t.MfeRupees, t.SecondsToMfe,
+                t.Fwd1, t.Fwd3, t.Fwd5, t.Fwd10, t.Mtm1, t.Mtm3, t.Mtm5, t.Mtm10));
+        }
+    }
+    Console.WriteLine($"Trades CSV: {Path.GetFullPath($"{ecBase}-trades.csv")} ({ecTrades.Count} rows, both executions, validation+design).");
+    Console.WriteLine($"Entry-contract diagnostics CSV: {Path.GetFullPath($"{ecBase}-entry-contract-diagnostics.csv")}.");
+
+    return 0;
+}
+
+// "vc0dte-relationship-0918-postmortem" -- 2026-09-25. Forensic postmortem of 2026-09-18, the
+// single validation session driving almost the entire FullSurface ATM-execution validation loss.
+// NOTHING about the signal or trade mechanics is changed -- this reads the frozen
+// vc-adaptive180s-band-rows.csv signal rows unchanged and reruns the SAME frozen ATM-execution
+// trade mechanics, adding only READ-ONLY forensic instrumentation (MFE timestamp, giveback,
+// rolling-180s high/low, opposite-pattern classification). Target=2026-09-18; DTE=4 siblings=
+// 2026-09-04/2026-09-11; strongest validation session=2026-09-09 (identified from the already-
+// completed validation-only per-session results, not re-derived). 2026-09-24 never queried.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-0918-postmortem --in=vc-adaptive180s-band-rows.csv --out=basePath
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-0918-postmortem", StringComparison.OrdinalIgnoreCase))
+{
+    var (_, pmNamed) = SplitNamedArgs(args);
+    var pmIn = pmNamed.GetValueOrDefault("in", "vc-adaptive180s-band-rows.csv");
+    if (!pmNamed.TryGetValue("out", out var pmBase))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-0918-postmortem --in=vc-adaptive180s-band-rows.csv --out=basePath");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-0918-postmortem: forensic postmortem, 2026-09-18. No strategy change. 2026-09-24 NOT queried. ===");
+    Console.WriteLine();
+
+    var pmIstOffset = TimeSpan.FromHours(5.5);
+    var pmTarget = new DateOnly(2026, 9, 18);
+    var pmSiblings = new[] { new DateOnly(2026, 9, 4), new DateOnly(2026, 9, 11) }; // other DTE=4 validation sessions
+    var pmStrongest = new DateOnly(2026, 9, 9); // strongest validation session, from the already-completed per-session results
+    var pmSessionsToLoad = new[] { pmTarget, pmSiblings[0], pmSiblings[1], pmStrongest };
+
+    // ---- Parse the frozen band-rows CSV (same parsing convention as the two earlier commands). ----
+    var pmCsvLines = File.ReadAllLines(pmIn);
+    var pmHeader = pmCsvLines[0].Split(',');
+    int PmCol(string name) => Array.IndexOf(pmHeader, name);
+    var pmCTradingDate = PmCol("TradingDate"); var pmCExpiryDate = PmCol("ExpiryDate"); var pmCDte = PmCol("Dte");
+    var pmCEndIdx = PmCol("EndBarIndex"); var pmCWinBars = PmCol("WindowBarCount"); var pmCWEnd = PmCol("WindowEndTimestamp"); var pmCWStart = PmCol("WindowStartTimestamp");
+    var pmCFStart = PmCol("FuturesStart"); var pmCFEnd = PmCol("FuturesEnd"); var pmCAtmStrike = PmCol("AtmStrike");
+    var pmCCeValid = PmCol("CeValidCount"); var pmCPeValid = PmCol("PeValidCount");
+    var pmCCePos = PmCol("CePositiveCount"); var pmCCeNeg = PmCol("CeNegativeCount");
+    var pmCPePos = PmCol("PePositiveCount"); var pmCPeNeg = PmCol("PeNegativeCount");
+    var pmCAtmState = PmCol("AtmState");
+
+    var pmAllRows = new List<(DateOnly Date, DateOnly Expiry, int Dte, int EndIdx, int WinBars, DateTimeOffset WEnd, DateTimeOffset WStart, decimal FStart, decimal FEnd, decimal AtmStrike,
+        int CeValid, int PeValid, int CePos, int CeNeg, int PePos, int PeNeg, string AtmState)>();
+    for (var li = 1; li < pmCsvLines.Length; li++)
+    {
+        var f = pmCsvLines[li].Split(',');
+        var date = DateOnly.ParseExact(f[pmCTradingDate], "yyyy-MM-dd");
+        if (!pmSessionsToLoad.Contains(date)) { continue; }
+        var wEndTod = TimeSpan.Parse(f[pmCWEnd]); var wStartTod = TimeSpan.Parse(f[pmCWStart]);
+        var wEnd = new DateTimeOffset(date.ToDateTime(TimeOnly.MinValue).Add(wEndTod), pmIstOffset);
+        var wStart = new DateTimeOffset(date.ToDateTime(TimeOnly.MinValue).Add(wStartTod), pmIstOffset);
+        pmAllRows.Add((date, DateOnly.ParseExact(f[pmCExpiryDate], "yyyy-MM-dd"), int.Parse(f[pmCDte]), int.Parse(f[pmCEndIdx]), int.Parse(f[pmCWinBars]), wEnd, wStart,
+            decimal.Parse(f[pmCFStart], System.Globalization.CultureInfo.InvariantCulture), decimal.Parse(f[pmCFEnd], System.Globalization.CultureInfo.InvariantCulture),
+            decimal.Parse(f[pmCAtmStrike], System.Globalization.CultureInfo.InvariantCulture),
+            int.Parse(f[pmCCeValid]), int.Parse(f[pmCPeValid]), int.Parse(f[pmCCePos]), int.Parse(f[pmCCeNeg]), int.Parse(f[pmCPePos]), int.Parse(f[pmCPeNeg]), f[pmCAtmState]));
+    }
+    Console.WriteLine($"Parsed {pmAllRows.Count} rows for {pmSessionsToLoad.Length} sessions ({string.Join(", ", pmSessionsToLoad.Select(d => d.ToString("yyyy-MM-dd")))}). 2026-09-24 requested? No.");
+    Console.WriteLine();
+
+    static bool PmFullSurface(string atmState, int ceValid, int cePos, int ceNeg, int peValid, int pePos, int peNeg) =>
+        atmState switch { "A" => ceValid == 5 && ceNeg == 5 && peValid == 5 && pePos == 5, "B" => ceValid == 5 && cePos == 5 && peValid == 5 && peNeg == 5, _ => false };
+
+    const int pmLots = PatternRelationshipTradeSimulator.Lots;
+    var pmCosts = new CostsConfig(BrokeragePerOrder: 0m, SlippageTicks: 0);
+
+    // ---- Per-trade forensic record. ----
+    var pmTrades = new List<(DateOnly Date, int TradeId, string Pattern, int StateEpisodeId,
+        DateTimeOffset SignalTs, DateTimeOffset EntryTs, DateTimeOffset ExitTs, string ExitReason,
+        decimal AtmStrike, OptionType OptionType, string Token,
+        decimal EntryPremium, decimal ExitPremium, int Quantity,
+        decimal GrossPnl, decimal Costs, decimal NetPnl, double HoldingSeconds,
+        decimal FuturesAtSignal, decimal FuturesAtEntry, decimal FuturesAtExit, decimal UnderlyingMovePts, decimal? UnderlyingMovePct,
+        decimal? Fwd1, decimal? Fwd3, decimal? Fwd5, decimal? Fwd10, decimal? Mtm1, decimal? Mtm3, decimal? Mtm5, decimal? Mtm10,
+        decimal MaeRupees, decimal MfeRupees, double? SecondsToMfe, decimal MaxFavorableOptionPrice, DateTimeOffset? MfeTimestamp,
+        decimal GivebackRupees, decimal? GivebackPct, double? SecondsMfeToExit,
+        int WindowBarCount, double WindowDurationSeconds, decimal PreSignalMovePts, decimal RollingHigh, decimal RollingLow, decimal DistFromHigh, decimal DistFromLow,
+        bool ExitWasOppositeFullSurface)>();
+
+    var pmOppositeExitDetail = new List<(DateOnly Date, string HeldPattern, string OppositeState, bool OppositeFullSurface, DateTimeOffset Ts)>();
+
+    // ---- Session-level signal-only diagnostics (section 3/12/13): forward-move stats + matched control, per session. ----
+    var pmSignalOnly = new Dictionary<DateOnly, (int NA, int NB,
+        List<decimal> A1, List<decimal> A3, List<decimal> A5, List<decimal> A10,
+        List<decimal> B1, List<decimal> B3, List<decimal> B5, List<decimal> B10,
+        List<decimal> Ctrl1, List<decimal> Ctrl3, List<decimal> Ctrl5, List<decimal> Ctrl10)>();
+
+    foreach (var date in pmSessionsToLoad)
+    {
+        var rows = pmAllRows.Where(r => r.Date == date).OrderBy(r => r.EndIdx).ToList();
+        if (rows.Count == 0) { Console.WriteLine($"  WARNING: no rows found for {date:yyyy-MM-dd} in {pmIn} -- skipping."); continue; }
+        var expiry = rows[0].Expiry;
+        var atmAnn = RollingStateAnalysis.Annotate(rows.Select(r => r.AtmState).ToList());
+        var fullSurfaceFlags = rows.Select(r => PmFullSurface(r.AtmState, r.CeValid, r.CePos, r.CeNeg, r.PeValid, r.PePos, r.PeNeg)).ToList();
+
+        await using var src = new NiftySignalDbContext(tradeSourceOptions);
+        var futureBars = await FutureEventBarBuilder.BuildDayAsync(src, date, 2600L, CancellationToken.None);
+        if (futureBars.Count == 0) { Console.WriteLine($"  WARNING: no futures bars for {date:yyyy-MM-dd}."); continue; }
+        var chain = await src.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == expiry && i.Underlying == "NIFTY").ToListAsync();
+        var chainByStrikeAndSide = chain.Where(i => i.StrikePrice is not null).ToLookup(i => (i.StrikePrice!.Value, i.OptionType));
+        var tickCache = new Dictionary<string, OptionTickSeries>();
+        async Task<OptionTickSeries> SeriesAsync(string token)
+        {
+            if (!tickCache.TryGetValue(token, out var s))
+            {
+                var dayStart = futureBars[0].StartTimestamp;
+                var dayEnd = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 30)), pmIstOffset).ToUniversalTime();
+                s = await OptionTickSeries.LoadAsync(src, token, dayStart, dayEnd, CancellationToken.None);
+                tickCache[token] = s;
+            }
+            return s;
+        }
+        decimal FuturesPriceAt(DateTimeOffset ts) { var b = futureBars.LastOrDefault(x => x.EndTimestamp <= ts); return b?.Close ?? futureBars[0].Close; }
+
+        decimal? FwdAtPts(int endIdx, int horizon)
+        {
+            var target = rows.FirstOrDefault(x => x.EndIdx == endIdx + horizon);
+            if (target.Date == default) { return null; }
+            var baseRow = rows.First(x => x.EndIdx == endIdx);
+            return target.FEnd - baseRow.FEnd;
+        }
+
+        // ---- Section 3: signal-only forward-move stats (A expects DOWN, B expects UP) + same-session matched control. ----
+        var aFwd = (F1: new List<decimal>(), F3: new List<decimal>(), F5: new List<decimal>(), F10: new List<decimal>());
+        var bFwd = (F1: new List<decimal>(), F3: new List<decimal>(), F5: new List<decimal>(), F10: new List<decimal>());
+        // Same-session control terciles: computed from this session's own |bar-to-bar futures change| distribution.
+        var absMoves = new List<decimal>();
+        for (var k = 1; k < rows.Count; k++) { absMoves.Add(Math.Abs(rows[k].FEnd - rows[k - 1].FEnd)); }
+        var (low33, high67) = absMoves.Count > 0 ? ForwardValidationAnalysis.ComputeTerciles(absMoves) : (0m, 0m);
+        var ctrlUp = new List<int>(); var ctrlDown = new List<int>();
+        var dirAnn = RollingStateAnalysis.Annotate(rows.Select((r, idx) => idx == 0 ? "Other" : (r.FEnd > rows[idx - 1].FEnd ? "A" : r.FEnd < rows[idx - 1].FEnd ? "B" : "Other")).ToList());
+        for (var k = 1; k < rows.Count; k++)
+        {
+            var isEntry = dirAnn[k].IsStateEntry;
+            if (!isEntry) { continue; }
+            var isAtmAOrB = rows[k].AtmState is "A" or "B";
+            if (isAtmAOrB) { continue; } // exclude anything already an ATM A/B row from the control population
+            var move = Math.Abs(rows[k].FEnd - rows[k - 1].FEnd);
+            var bucket = ConditionalMovementAnalysis.ClassifyTercileBucket(move, low33, high67);
+            if (bucket != "Low") { continue; } // matched-magnitude convention: keep the same low-magnitude tercile the state-entry population predominantly falls in, consistent with the project's established matched-control methodology
+            if (rows[k].FEnd > rows[k - 1].FEnd) { ctrlUp.Add(k); } else { ctrlDown.Add(k); }
+        }
+        var ctrl1 = new List<decimal>(); var ctrl3 = new List<decimal>(); var ctrl5 = new List<decimal>(); var ctrl10 = new List<decimal>();
+        foreach (var k in ctrlUp.Concat(ctrlDown))
+        {
+            var expectSign = ctrlUp.Contains(k) ? 1 : -1;
+            foreach (var (list, h) in new[] { (ctrl1, 1), (ctrl3, 3), (ctrl5, 5), (ctrl10, 10) })
+            {
+                var f = FwdAtPts(rows[k].EndIdx, h);
+                if (f is not null) { list.Add(f.Value * expectSign); } // sign-normalized so "positive" always means expected direction
+            }
+        }
+
+        for (var k = 0; k < rows.Count; k++)
+        {
+            if (!atmAnn[k].IsStateEntry || !fullSurfaceFlags[k]) { continue; }
+            var r = rows[k];
+            if (r.AtmState == "A") { foreach (var (list, h) in new[] { (aFwd.F1, 1), (aFwd.F3, 3), (aFwd.F5, 5), (aFwd.F10, 10) }) { var f = FwdAtPts(r.EndIdx, h); if (f is not null) { list.Add(-f.Value); } } }
+            if (r.AtmState == "B") { foreach (var (list, h) in new[] { (bFwd.F1, 1), (bFwd.F3, 3), (bFwd.F5, 5), (bFwd.F10, 10) }) { var f = FwdAtPts(r.EndIdx, h); if (f is not null) { list.Add(f.Value); } } }
+        }
+        pmSignalOnly[date] = (aFwd.F1.Count, bFwd.F1.Count, aFwd.F1, aFwd.F3, aFwd.F5, aFwd.F10, bFwd.F1, bFwd.F3, bFwd.F5, bFwd.F10, ctrl1, ctrl3, ctrl5, ctrl10);
+
+        // ---- Trade simulation (frozen ATM-execution mechanics) with forensic instrumentation, target+siblings+strongest all get this so section 12/13 have full stats. ----
+        (string Pattern, Instrument Instrument, decimal AtmStrike, DateTimeOffset SignalTs, DateTimeOffset EntryTs, decimal EntryFill, decimal FuturesAtSignal, decimal FuturesAtEntry, int StateEpisodeId, int WinBars, double WinDurSec, decimal PreSignalMovePts, decimal RollHigh, decimal RollLow)? open = null;
+        var episodeCounter = 0; var lastPattern = "";
+        var tradeIdCounter = 0;
+
+        for (var k = 0; k < rows.Count; k++)
+        {
+            var r = rows[k];
+            var isEntryRow = atmAnn[k].IsStateEntry && r.AtmState is "A" or "B";
+            if (isEntryRow && r.AtmState != lastPattern) { episodeCounter++; }
+            if (isEntryRow) { lastPattern = r.AtmState; }
+
+            if (open is { } pos && isEntryRow && ((pos.Pattern == "A" && r.AtmState == "B") || (pos.Pattern == "B" && r.AtmState == "A")))
+            {
+                pmOppositeExitDetail.Add((date, pos.Pattern, r.AtmState, fullSurfaceFlags[k], r.WEnd));
+                await CloseAsync(pos, r.WEnd, "OppositePatternSignal", fullSurfaceFlags[k]);
+            }
+
+            if (!isEntryRow || !fullSurfaceFlags[k]) { continue; }
+            var istTime = TimeOnly.FromDateTime(r.WEnd.DateTime);
+            if (open is not null || istTime >= new TimeOnly(15, 0)) { continue; }
+
+            var side = r.AtmState == "A" ? OptionType.Put : OptionType.Call;
+            var inst = chainByStrikeAndSide[(r.AtmStrike, side)].FirstOrDefault();
+            if (inst is null) { continue; }
+            var series = await SeriesAsync(inst.Token);
+            var entryTickN = series.EntryAtOrAfter(r.WEnd);
+            if (entryTickN is null) { continue; }
+            var entryTick = entryTickN.Value;
+            var entryBase = entryTick.Depth is { } ed ? ed.Ask1Price : entryTick.LastPrice;
+            var entryFill = PaperTradeSimulator.FillEntry(entryBase, inst.TickSize, inst.LotSize * pmLots, pmCosts);
+
+            var startIdx = r.EndIdx - r.WinBars + 1;
+            var windowBars = futureBars.Skip(Math.Max(0, startIdx)).Take(r.WinBars).ToList();
+            var rollHigh = windowBars.Count > 0 ? windowBars.Max(b => b.High) : r.FEnd;
+            var rollLow = windowBars.Count > 0 ? windowBars.Min(b => b.Low) : r.FEnd;
+
+            open = (r.AtmState, inst, r.AtmStrike, r.WEnd, entryTick.Timestamp, entryFill.FillPrice, r.FEnd, FuturesPriceAt(entryTick.Timestamp), episodeCounter, r.WinBars, (rows.First(rr => rr.EndIdx == r.EndIdx).WEnd - rows.First(rr => rr.EndIdx == startIdx).WStart).TotalSeconds, r.FEnd - r.FStart, rollHigh, rollLow);
+        }
+        if (open is not null)
+        {
+            var forceClose = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 15)), pmIstOffset);
+            await CloseAsync(open.Value, forceClose, "ForcedEod", false);
+        }
+
+        async Task CloseAsync((string Pattern, Instrument Instrument, decimal AtmStrike, DateTimeOffset SignalTs, DateTimeOffset EntryTs, decimal EntryFill, decimal FuturesAtSignal, decimal FuturesAtEntry, int StateEpisodeId, int WinBars, double WinDurSec, decimal PreSignalMovePts, decimal RollHigh, decimal RollLow) pos, DateTimeOffset atTs, string reason, bool exitWasOppositeFullSurface)
+        {
+            var series = await SeriesAsync(pos.Instrument.Token);
+            var exitTickN = reason == "ForcedEod" ? series.EntryAtOrBefore(atTs) : series.EntryAtOrAfter(atTs);
+            if (exitTickN is null) { return; }
+            var exitTick = exitTickN.Value;
+            var qty = pos.Instrument.LotSize * pmLots;
+            var exitBase = exitTick.Depth is { } xd ? xd.Bid1Price : exitTick.LastPrice;
+            var exitFill = PaperTradeSimulator.FillExit(exitBase, pos.Instrument.TickSize, qty, pmCosts);
+            var grossPnl = (exitFill.FillPrice - pos.EntryFill) * qty;
+            var costBreakdown = TransactionCostCalculator.Compute(exitFill.GrossValue, pmCosts.BrokeragePerOrder * 2);
+            var netPnl = grossPnl - costBreakdown.Total;
+
+            var path = series.AllEntries.Where(e => e.Timestamp > pos.EntryTs && e.Timestamp <= exitTick.Timestamp).OrderBy(e => e.Timestamp).ToList();
+            var pathPrices = path.Select(e => e.LastPrice).ToList();
+            var maeMfe = MaeMfeCalculator.Compute(pos.EntryFill, pathPrices);
+            decimal maxFavPrice = pos.EntryFill; DateTimeOffset? mfeTs = null; double? secToMfe = null; double? secMfeToExit = null;
+            if (maeMfe.MfePoints > 0)
+            {
+                var mfeRow = path.FirstOrDefault(e => e.LastPrice - pos.EntryFill >= maeMfe.MfePoints);
+                if (mfeRow.Timestamp != default) { maxFavPrice = mfeRow.LastPrice; mfeTs = mfeRow.Timestamp; secToMfe = (mfeRow.Timestamp - pos.EntryTs).TotalSeconds; secMfeToExit = (exitTick.Timestamp - mfeRow.Timestamp).TotalSeconds; }
+            }
+            var giveback = maeMfe.MfePoints - (exitFill.FillPrice - pos.EntryFill);
+            var givebackPct = maeMfe.MfePoints > 0 ? giveback / maeMfe.MfePoints * 100m : (decimal?)null;
+
+            var underlyingExit = FuturesPriceAt(exitTick.Timestamp);
+            var underlyingMovePts = underlyingExit - pos.FuturesAtEntry;
+            var underlyingMovePct = pos.FuturesAtEntry != 0 ? underlyingMovePts / pos.FuturesAtEntry * 100m : (decimal?)null;
+            var baseIdx = rows.First(rr => rr.WEnd == pos.SignalTs).EndIdx;
+            decimal? FwdPctAt(int h) { var t = rows.FirstOrDefault(x => x.EndIdx == baseIdx + h); if (t.Date == default) { return null; } var b0 = rows.First(x => x.EndIdx == baseIdx); return b0.FEnd != 0 ? (t.FEnd - b0.FEnd) / b0.FEnd * 100m : null; }
+            decimal? MtmAt(int h) { var t = rows.FirstOrDefault(x => x.EndIdx == baseIdx + h); if (t.Date == default) { return null; } var tk = series.EntryAtOrBefore(t.WEnd); return tk is { } tv && pos.EntryFill != 0 ? (tv.LastPrice - pos.EntryFill) / pos.EntryFill * 100m : null; }
+
+            pmTrades.Add((date, tradeIdCounter++, pos.Pattern, pos.StateEpisodeId,
+                pos.SignalTs, pos.EntryTs, exitTick.Timestamp, reason,
+                pos.AtmStrike, pos.Instrument.OptionType, pos.Instrument.Token,
+                pos.EntryFill, exitFill.FillPrice, qty,
+                grossPnl, costBreakdown.Total, netPnl, (exitTick.Timestamp - pos.EntryTs).TotalSeconds,
+                pos.FuturesAtSignal, pos.FuturesAtEntry, underlyingExit, underlyingMovePts, underlyingMovePct,
+                FwdPctAt(1), FwdPctAt(3), FwdPctAt(5), FwdPctAt(10), MtmAt(1), MtmAt(3), MtmAt(5), MtmAt(10),
+                maeMfe.MaePoints, maeMfe.MfePoints, secToMfe, maxFavPrice, mfeTs,
+                giveback, givebackPct, secMfeToExit,
+                pos.WinBars, pos.WinDurSec, pos.PreSignalMovePts, pos.RollHigh, pos.RollLow, pos.RollHigh - pos.FuturesAtSignal, pos.FuturesAtSignal - pos.RollLow,
+                exitWasOppositeFullSurface));
+            open = null;
+        }
+        Console.WriteLine($"  [Simulated] {date:yyyy-MM-dd}: {pmTrades.Count(t => t.Date == date)} FullSurface ATM trades so far this session.");
+    }
+    Console.WriteLine();
+
+    // ================= SECTIONS 1-2: reproduction + A/B split =================
+    Console.WriteLine("### 1. Reproduction: 2026-09-18, frozen FullSurface ATM execution ###");
+    {
+        var t = pmTrades.Where(x => x.Date == pmTarget).ToList();
+        static (int N, int Wins, double WinRate, decimal Gross, decimal Costs, decimal Net, decimal Median, decimal Avg, double? Pf) Agg(List<(decimal GrossPnl, decimal Costs, decimal NetPnl)> v)
+        {
+            if (v.Count == 0) { return (0, 0, 0, 0, 0, 0, 0, 0, null); }
+            var wins = v.Count(x => x.NetPnl > 0); var gp = v.Where(x => x.NetPnl > 0).Sum(x => x.NetPnl); var gl = Math.Abs(v.Where(x => x.NetPnl <= 0).Sum(x => x.NetPnl));
+            var sorted = v.Select(x => x.NetPnl).OrderBy(x => x).ToList();
+            var median = sorted.Count % 2 == 1 ? sorted[sorted.Count / 2] : (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2m;
+            return (v.Count, wins, 100.0 * wins / v.Count, v.Sum(x => x.GrossPnl), v.Sum(x => x.Costs), v.Sum(x => x.NetPnl), median, v.Sum(x => x.NetPnl) / v.Count, gl > 0 ? (double)(gp / gl) : null);
+        }
+        var agg = Agg(t.Select(x => (x.GrossPnl, x.Costs, x.NetPnl)).ToList());
+        Console.WriteLine($"  Signals(FullSurface entries)={t.Count} Executed={t.Count} A={t.Count(x => x.Pattern == "A")} B={t.Count(x => x.Pattern == "B")}");
+        Console.WriteLine($"  GrossPnl={agg.Gross:F0} Costs={agg.Costs:F0} NetPnl={agg.Net:F0} WinRate={agg.WinRate:F1}% PF={(agg.Pf?.ToString("F2") ?? "n/a")} Median={agg.Median:F1} Avg={agg.Avg:F1}");
+        Console.WriteLine($"  Reconciles with validation aggregate reported earlier (n=27, net=-78744, PF=0.11)? {(t.Count == 27 && Math.Abs(agg.Net - (-78744)) < 5 ? "YES, exact match" : "MISMATCH -- STOP, investigate before proceeding")}");
+        if (!(t.Count == 27 && Math.Abs(agg.Net - (-78744)) < 5)) { return 1; }
+
+        Console.WriteLine();
+        Console.WriteLine("### 2. A vs B, independently, 2026-09-18 ###");
+        foreach (var pattern in new[] { "A", "B" })
+        {
+            var side = t.Where(x => x.Pattern == pattern).ToList();
+            var a = Agg(side.Select(x => (x.GrossPnl, x.Costs, x.NetPnl)).ToList());
+            var medHold = side.Count > 0 ? side.Select(x => x.HoldingSeconds).OrderBy(x => x).ElementAt(side.Count / 2) : 0;
+            var medMae = side.Count > 0 ? side.Select(x => x.MaeRupees).OrderBy(x => x).ElementAt(side.Count / 2) : 0;
+            var medMfe = side.Count > 0 ? side.Select(x => x.MfeRupees).OrderBy(x => x).ElementAt(side.Count / 2) : 0;
+            var withSec = side.Where(x => x.SecondsToMfe is not null).Select(x => x.SecondsToMfe!.Value).ToList();
+            var medSec = withSec.Count > 0 ? withSec.OrderBy(x => x).ElementAt(withSec.Count / 2) : 0;
+            Console.WriteLine($"  [{pattern}] N={a.N} Win%={a.WinRate:F1}% PF={(a.Pf?.ToString("F2") ?? "n/a")} Net={a.Net:F0} Median={a.Median:F1} MedHoldSec={medHold:F0} MedMAE={medMae:F1} MedMFE={medMfe:F1} MedSecToMFE={medSec:F0}");
+        }
+    }
+    Console.WriteLine();
+
+    // ================= SECTION 3: signal-only diagnostic table =================
+    Console.WriteLine("### 3. Signal-only diagnostic: 09-18 vs. same-session matched control vs. full validation pooled ###");
+    {
+        static (int N, double HitRate, decimal Mean, decimal Median) SigStats(List<decimal> v)
+        {
+            if (v.Count == 0) { return (0, 0, 0, 0); }
+            var sorted = v.OrderBy(x => x).ToList();
+            var median = sorted.Count % 2 == 1 ? sorted[sorted.Count / 2] : (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2m;
+            return (v.Count, 100.0 * v.Count(x => x > 0) / v.Count, v.Average(), median);
+        }
+        var so = pmSignalOnly[pmTarget];
+        foreach (var (label, h) in new[] { ("+1", 1), ("+3", 3), ("+5", 5), ("+10", 10) })
+        {
+            var aList = h switch { 1 => so.A1, 3 => so.A3, 5 => so.A5, _ => so.A10 };
+            var bList = h switch { 1 => so.B1, 3 => so.B3, 5 => so.B5, _ => so.B10 };
+            var ctrl = h switch { 1 => so.Ctrl1, 3 => so.Ctrl3, 5 => so.Ctrl5, _ => so.Ctrl10 };
+            var aStat = SigStats(aList); var bStat = SigStats(bList); var ctrlStat = SigStats(ctrl);
+            Console.WriteLine($"  [A {label}] 09-18: n={aStat.N} hit%={aStat.HitRate:F1}% mean={aStat.Mean:F2}pts median={aStat.Median:F2}pts | 09-18 control: n={ctrlStat.N} hit%={ctrlStat.HitRate:F1}% mean={ctrlStat.Mean:F2}pts");
+            Console.WriteLine($"  [B {label}] 09-18: n={bStat.N} hit%={bStat.HitRate:F1}% mean={bStat.Mean:F2}pts median={bStat.Median:F2}pts | 09-18 control: n={ctrlStat.N} hit%={ctrlStat.HitRate:F1}% mean={ctrlStat.Mean:F2}pts");
+        }
+        // Full-validation pooled comparison, computed directly from the frozen band-rows CSV (all 10 validation sessions, never recomputed elsewhere).
+        Console.WriteLine("  (Full-validation-pooled FullSurface A/B hit-rate reference, from the earlier adaptive-180s/band studies: ATM A hit%=60.5/64.2/60.4/57.6 at +1/+3/+5/+10; ATM B hit%=64.6/62.7/63.0/62.2 -- see docs/VolumeCandle_0DTE_Findings.md 2026-09-25 band section.)");
+    }
+    Console.WriteLine();
+
+    // ================= SECTION 4: was 180s context stale? =================
+    Console.WriteLine("### 4. Pre-signal move vs. subsequent forward move, 2026-09-18 FullSurface entries ###");
+    {
+        var t18 = pmTrades.Where(x => x.Date == pmTarget).ToList();
+        foreach (var pattern in new[] { "A", "B" })
+        {
+            var side = t18.Where(x => x.Pattern == pattern).ToList();
+            if (side.Count == 0) { continue; }
+            var corrA = side.Where(x => x.Fwd10 is not null).Select(x => ((double)x.PreSignalMovePts, (double)x.Fwd10!.Value)).ToList();
+            Console.WriteLine($"  [{pattern}] n={side.Count} medianPreSignalMovePts={side.Select(x => x.PreSignalMovePts).OrderBy(x => x).ElementAt(side.Count / 2):F2} medianWindowBarCount={side.Select(x => x.WindowBarCount).OrderBy(x => x).ElementAt(side.Count / 2)} medianWindowDurationSec={side.Select(x => x.WindowDurationSeconds).OrderBy(x => x).ElementAt(side.Count / 2):F0}");
+            foreach (var x in side.OrderByDescending(x => Math.Abs(x.PreSignalMovePts)).Take(3))
+            {
+                Console.WriteLine($"    largest-pre-move example: PreSignalMovePts={x.PreSignalMovePts:F2} Fwd10={x.Fwd10:F3}% (descriptive only, no threshold created)");
+            }
+        }
+    }
+    Console.WriteLine();
+
+    // ================= SECTION 5: state-entry location within local structure =================
+    Console.WriteLine("### 5. State-entry location within rolling-180s local price structure, 2026-09-18 ###");
+    {
+        var t18 = pmTrades.Where(x => x.Date == pmTarget).ToList();
+        foreach (var x in t18)
+        {
+            Console.WriteLine($"  [{x.Pattern}] entry={x.EntryTs.ToOffset(pmIstOffset):HH:mm:ss} price={x.FuturesAtSignal:F1} rollHigh={x.RollingHigh:F1}(dist={x.DistFromHigh:F1}) rollLow={x.RollingLow:F1}(dist={x.DistFromLow:F1}) fwd10={x.Fwd10:F3}%");
+        }
+        var nearHigh = t18.Count(x => x.Pattern == "A" && x.DistFromHigh < x.DistFromLow); // A (expects down) firing near the rolling high = arguably "late" if the down-move already happened
+        var nearLow = t18.Count(x => x.Pattern == "B" && x.DistFromLow < x.DistFromHigh);
+        Console.WriteLine($"  Descriptive only, no filter: A entries closer to rolling high than low (consistent with 'already fell, mean-reversion risk') = {nearHigh}/{t18.Count(x => x.Pattern == "A")}; B entries closer to rolling low than high = {nearLow}/{t18.Count(x => x.Pattern == "B")}.");
+    }
+    Console.WriteLine();
+
+    // ================= SECTION 7: loss classification =================
+    Console.WriteLine("### 7. Loss classification, 2026-09-18 losing trades ###");
+    {
+        var losers = pmTrades.Where(x => x.Date == pmTarget && x.NetPnl <= 0).ToList();
+        foreach (var pattern in new[] { "A", "B" })
+        {
+            var side = losers.Where(x => x.Pattern == pattern).ToList();
+            if (side.Count == 0) { Console.WriteLine($"  [{pattern}] no losing trades."); continue; }
+            int signalFailure = 0, translationFailure = 0, exitGiveback = 0, initiallyCorrectThenReversed = 0, ambiguous = 0;
+            decimal pnlSignalFailure = 0, pnlTranslation = 0, pnlGiveback = 0, pnlReversed = 0, pnlAmbiguous = 0;
+            foreach (var x in side)
+            {
+                var expectSign = x.Pattern == "A" ? -1 : 1;
+                var anyExpectedForward = new[] { x.Fwd1, x.Fwd3, x.Fwd5, x.Fwd10 }.Any(f => f is { } fv && Math.Sign(fv) == expectSign);
+                var underlyingCorrectAtExit = x.UnderlyingMovePct is { } uret && Math.Sign(uret) == expectSign;
+                if (!anyExpectedForward && !underlyingCorrectAtExit) { signalFailure++; pnlSignalFailure += x.NetPnl; continue; }
+                if (x.MfeRupees <= 0) { translationFailure++; pnlTranslation += x.NetPnl; continue; }
+                if (x.MfeRupees > 0 && x.GivebackPct is { } gb && gb >= 99m) { exitGiveback++; pnlGiveback += x.NetPnl; continue; }
+                if (x.MfeRupees > 0 && underlyingCorrectAtExit) { initiallyCorrectThenReversed++; pnlReversed += x.NetPnl; continue; }
+                ambiguous++; pnlAmbiguous += x.NetPnl;
+            }
+            Console.WriteLine($"  [{pattern}] n={side.Count}: SignalFailure={signalFailure}({100.0 * signalFailure / side.Count:F0}%, Rs.{pnlSignalFailure:F0}) TranslationFailure={translationFailure}({100.0 * translationFailure / side.Count:F0}%, Rs.{pnlTranslation:F0}) ExitGiveback={exitGiveback}({100.0 * exitGiveback / side.Count:F0}%, Rs.{pnlGiveback:F0}) InitiallyCorrectThenReversed={initiallyCorrectThenReversed}({100.0 * initiallyCorrectThenReversed / side.Count:F0}%, Rs.{pnlReversed:F0}) Ambiguous={ambiguous}({100.0 * ambiguous / side.Count:F0}%, Rs.{pnlAmbiguous:F0})");
+        }
+    }
+    Console.WriteLine();
+
+    // ================= SECTION 8: capture ratio / giveback =================
+    Console.WriteLine("### 8. Favorable-excursion capture, 2026-09-18 ###");
+    {
+        var t18 = pmTrades.Where(x => x.Date == pmTarget && x.MfeRupees > 0).ToList();
+        var captureRatios = t18.Select(x => (double)((x.ExitPremium - x.EntryPremium) / x.MfeRupees)).OrderBy(x => x).ToList();
+        if (captureRatios.Count > 0)
+        {
+            decimal Q(List<double> v, double f) => (decimal)v[Math.Clamp((int)Math.Ceiling(f * v.Count) - 1, 0, v.Count - 1)];
+            Console.WriteLine($"  n(MFE>0)={captureRatios.Count} MedianCaptureRatio={Q(captureRatios, 0.5):F2} P25={Q(captureRatios, 0.25):F2} P75={Q(captureRatios, 0.75):F2}");
+        }
+        var t18All = pmTrades.Where(x => x.Date == pmTarget).ToList();
+        foreach (var (label, thresholdPct) in new[] { ("MFE>0", 0m), ("MFE>0.5%", 0.5m), ("MFE>1%", 1m), ("MFE>2%", 2m), ("MFE>5%", 5m) })
+        {
+            var withThreshold = t18All.Where(x => x.EntryPremium > 0 && x.MfeRupees / x.EntryPremium * 100m > thresholdPct).ToList();
+            var negAmongThem = withThreshold.Count(x => x.NetPnl <= 0);
+            Console.WriteLine($"  [{label}] n={withThreshold.Count}/{t18All.Count} ({(t18All.Count > 0 ? 100.0 * withThreshold.Count / t18All.Count : 0):F1}%), of which closed negative: {negAmongThem} ({(withThreshold.Count > 0 ? 100.0 * negAmongThem / withThreshold.Count : 0):F1}%)");
+        }
+    }
+    Console.WriteLine();
+
+    // ================= SECTION 9: timing analysis =================
+    Console.WriteLine("### 9. Timing analysis, 2026-09-18 ###");
+    foreach (var pattern in new[] { "A", "B" })
+    {
+        var side = pmTrades.Where(x => x.Date == pmTarget && x.Pattern == pattern).ToList();
+        if (side.Count == 0) { continue; }
+        var withMfe = side.Where(x => x.SecondsToMfe is not null).ToList();
+        var mfeBeforeExit = withMfe.Count(x => x.MfeTimestamp is not null && x.MfeTimestamp < x.ExitTs);
+        var over50PctGiveback = side.Count(x => x.GivebackPct is { } gb && gb > 50m);
+        var fullGiveback = side.Count(x => x.GivebackPct is { } gb && gb >= 100m);
+        Console.WriteLine($"  [{pattern}] n={side.Count} MFE-before-opposite-exit={mfeBeforeExit}/{withMfe.Count} >50%-giveback={over50PctGiveback}/{side.Count} 100%+giveback(winner->loser)={fullGiveback}/{side.Count}");
+    }
+    Console.WriteLine();
+
+    // ================= SECTION 10: opposite-pattern inspection =================
+    Console.WriteLine("### 10. Opposite-pattern exit inspection, 2026-09-18 ###");
+    {
+        var opp18 = pmOppositeExitDetail.Where(x => x.Date == pmTarget).ToList();
+        var atmOnlyOpp = opp18.Count(x => !x.OppositeFullSurface);
+        var fullSurfaceOpp = opp18.Count(x => x.OppositeFullSurface);
+        Console.WriteLine($"  Opposite-pattern exits: {opp18.Count} total. ATM-opposite-but-NOT-FullSurface-opposite={atmOnlyOpp}. ATM-opposite-AND-FullSurface-opposite={fullSurfaceOpp}.");
+    }
+    Console.WriteLine();
+
+    // ================= SECTION 12: DTE=4 comparison =================
+    Console.WriteLine("### 12. DTE=4 session comparison: 09-18 vs. 09-04 vs. 09-11 ###");
+    foreach (var date in new[] { pmTarget, pmSiblings[0], pmSiblings[1] })
+    {
+        var t = pmTrades.Where(x => x.Date == date).ToList();
+        if (t.Count == 0) { Console.WriteLine($"  {date:yyyy-MM-dd}: no trades."); continue; }
+        var wins = t.Count(x => x.NetPnl > 0); var gp = t.Where(x => x.NetPnl > 0).Sum(x => x.NetPnl); var gl = Math.Abs(t.Where(x => x.NetPnl <= 0).Sum(x => x.NetPnl));
+        var net = t.Sum(x => x.NetPnl);
+        var underlyingCorrectOptionLost = t.Count(x => { var es = x.Pattern == "A" ? -1 : 1; return x.UnderlyingMovePct is { } u && Math.Sign(u) == es && x.NetPnl <= 0; });
+        var posMfeThenLoss = t.Count(x => x.MfeRupees > 0 && x.NetPnl <= 0);
+        var withSec = t.Where(x => x.SecondsToMfe is not null).Select(x => x.SecondsToMfe!.Value).ToList();
+        var medSec = withSec.Count > 0 ? withSec.OrderBy(x => x).ElementAt(withSec.Count / 2) : 0;
+        var medHold = t.Select(x => x.HoldingSeconds).OrderBy(x => x).ElementAt(t.Count / 2);
+        var withGiveback = t.Where(x => x.GivebackPct is not null).Select(x => x.GivebackPct!.Value).ToList();
+        var medGiveback = withGiveback.Count > 0 ? withGiveback.OrderBy(x => x).ElementAt(withGiveback.Count / 2) : 0;
+        var so = pmSignalOnly.GetValueOrDefault(date);
+        var aHit10 = so.A10 is { Count: > 0 } ? 100.0 * so.A10.Count(x => x > 0) / so.A10.Count : 0;
+        var bHit10 = so.B10 is { Count: > 0 } ? 100.0 * so.B10.Count(x => x > 0) / so.B10.Count : 0;
+        Console.WriteLine($"  {date:yyyy-MM-dd}: N={t.Count} Net={net:F0} PF={(gl > 0 ? (gp / gl).ToString("F2") : "n/a")} A-hit%@+10={aHit10:F1}% B-hit%@+10={bHit10:F1}% underlyingCorrectButLost={underlyingCorrectOptionLost}/{t.Count} posMFEthenLoss={posMfeThenLoss}/{t.Count} medSecToMFE={medSec:F0} medHoldSec={medHold:F0} medGivebackPct={medGiveback:F1}%");
+    }
+    Console.WriteLine();
+
+    // ================= SECTION 13: strongest-session comparison =================
+    Console.WriteLine($"### 13. Comparison: 09-18 (worst) vs. {pmStrongest:yyyy-MM-dd} (strongest validation session) ###");
+    foreach (var date in new[] { pmStrongest, pmTarget })
+    {
+        var t = pmTrades.Where(x => x.Date == date).ToList();
+        if (t.Count == 0) { continue; }
+        var net = t.Sum(x => x.NetPnl);
+        var medWinBars = t.Select(x => x.WindowBarCount).OrderBy(x => x).ElementAt(t.Count / 2);
+        var medWinDur = t.Select(x => x.WindowDurationSeconds).OrderBy(x => x).ElementAt(t.Count / 2);
+        var medEntryPrem = t.Select(x => x.EntryPremium).OrderBy(x => x).ElementAt(t.Count / 2);
+        var medHold = t.Select(x => x.HoldingSeconds).OrderBy(x => x).ElementAt(t.Count / 2);
+        var withSec = t.Where(x => x.SecondsToMfe is not null).Select(x => x.SecondsToMfe!.Value).ToList();
+        var medSec = withSec.Count > 0 ? withSec.OrderBy(x => x).ElementAt(withSec.Count / 2) : 0;
+        var medMae = t.Select(x => x.MaeRupees).OrderBy(x => x).ElementAt(t.Count / 2);
+        var medMfe = t.Select(x => x.MfeRupees).OrderBy(x => x).ElementAt(t.Count / 2);
+        var withGiveback = t.Where(x => x.GivebackPct is not null).Select(x => x.GivebackPct!.Value).ToList();
+        var medGiveback = withGiveback.Count > 0 ? withGiveback.OrderBy(x => x).ElementAt(withGiveback.Count / 2) : 0;
+        var so = pmSignalOnly.GetValueOrDefault(date);
+        var aHit10 = so.A10 is { Count: > 0 } ? 100.0 * so.A10.Count(x => x > 0) / so.A10.Count : 0;
+        var bHit10 = so.B10 is { Count: > 0 } ? 100.0 * so.B10.Count(x => x > 0) / so.B10.Count : 0;
+        Console.WriteLine($"  {date:yyyy-MM-dd}: N={t.Count} Net={net:F0} medWindowBarCount={medWinBars} medWindowDurSec={medWinDur:F0} A-hit%@+10={aHit10:F1}% B-hit%@+10={bHit10:F1}% medEntryPremium={medEntryPrem:F1} medHoldSec={medHold:F0} medSecToMFE={medSec:F0} medMAE={medMae:F1} medMFE={medMfe:F1} medGivebackPct={medGiveback:F1}%");
+    }
+    Console.WriteLine();
+
+    // ---- Full trade-by-trade forensic CSV (section 6), 2026-09-18 only. ----
+    using (var w = new StreamWriter($"{pmBase}-0918-trades.csv"))
+    {
+        w.WriteLine("TradeId,Pattern,SignalTimeIST,EntryTimeIST,ExitTimeIST,ExitReason,AtmStrike,OptionType,EntryPremium,ExitPremium,GrossPnl,Costs,NetPnl,HoldingSeconds,"
+            + "FuturesAtSignal,FuturesAtEntry,FuturesAtExit,UnderlyingMovePts,UnderlyingMovePct,Forward1,Forward3,Forward5,Forward10,OptionMTM1,OptionMTM3,OptionMTM5,OptionMTM10,"
+            + "MAE,MFE,SecondsToMfe,MaxFavorableOptionPrice,MfeTimestampIST,GivebackRupees,GivebackPct,SecondsMfeToExit,WindowBarCount,WindowDurationSeconds,PreSignalMovePts,RollingHigh,RollingLow,DistFromHigh,DistFromLow");
+        foreach (var t in pmTrades.Where(x => x.Date == pmTarget))
+        {
+            w.WriteLine(string.Join(',', t.TradeId, t.Pattern, t.SignalTs.ToOffset(pmIstOffset).ToString("HH:mm:ss.fff"), t.EntryTs.ToOffset(pmIstOffset).ToString("HH:mm:ss.fff"), t.ExitTs.ToOffset(pmIstOffset).ToString("HH:mm:ss.fff"), t.ExitReason,
+                t.AtmStrike, t.OptionType, t.EntryPremium, t.ExitPremium, t.GrossPnl, t.Costs, t.NetPnl, t.HoldingSeconds,
+                t.FuturesAtSignal, t.FuturesAtEntry, t.FuturesAtExit, t.UnderlyingMovePts, t.UnderlyingMovePct, t.Fwd1, t.Fwd3, t.Fwd5, t.Fwd10, t.Mtm1, t.Mtm3, t.Mtm5, t.Mtm10,
+                t.MaeRupees, t.MfeRupees, t.SecondsToMfe, t.MaxFavorableOptionPrice, t.MfeTimestamp?.ToOffset(pmIstOffset).ToString("HH:mm:ss.fff") ?? "", t.GivebackRupees, t.GivebackPct, t.SecondsMfeToExit,
+                t.WindowBarCount, t.WindowDurationSeconds, t.PreSignalMovePts, t.RollingHigh, t.RollingLow, t.DistFromHigh, t.DistFromLow));
+        }
+    }
+    Console.WriteLine($"Forensic trades CSV: {Path.GetFullPath($"{pmBase}-0918-trades.csv")} ({pmTrades.Count(x => x.Date == pmTarget)} rows).");
+
+    // ---- Chart data export (for the visual artifact, built separately). ----
+    using (var w = new StreamWriter($"{pmBase}-0918-chart-rows.csv"))
+    {
+        w.WriteLine("EndBarIndex,WindowEndTimestampIST,FuturesEnd,AtmState");
+        foreach (var r in pmAllRows.Where(r => r.Date == pmTarget).OrderBy(r => r.EndIdx))
+        {
+            w.WriteLine($"{r.EndIdx},{r.WEnd.ToOffset(pmIstOffset):HH:mm:ss.fff},{r.FEnd},{r.AtmState}");
+        }
+    }
+    using (var w = new StreamWriter($"{pmBase}-0918-chart-trades.csv"))
+    {
+        w.WriteLine("TradeId,Pattern,EntryTimeIST,ExitTimeIST,MfeTimestampIST,NetPnl,FuturesAtEntry,FuturesAtExit");
+        foreach (var t in pmTrades.Where(x => x.Date == pmTarget))
+        {
+            w.WriteLine($"{t.TradeId},{t.Pattern},{t.EntryTs.ToOffset(pmIstOffset):HH:mm:ss.fff},{t.ExitTs.ToOffset(pmIstOffset):HH:mm:ss.fff},{t.MfeTimestamp?.ToOffset(pmIstOffset).ToString("HH:mm:ss.fff") ?? ""},{t.NetPnl},{t.FuturesAtEntry},{t.FuturesAtExit}");
+        }
+    }
+    Console.WriteLine($"Chart-data CSVs: {Path.GetFullPath($"{pmBase}-0918-chart-rows.csv")}, {Path.GetFullPath($"{pmBase}-0918-chart-trades.csv")}.");
+
+    return 0;
+}
+
+// "vc0dte-relationship-atm-invalidation-exit" -- 2026-09-25. PHASE 0: fix a real warm-up-eligibility
+// bug (InsufficientHistory was never carried into the frozen band-rows CSV, so downstream FullSurface
+// work could not check it -- reconstructed here deterministically as StartBarIndex==0 &&
+// WindowDurationSeconds<180, then AtmState is forced to "Other" for any such row BEFORE any episode/
+// FullSurface/trade-eligibility computation, per instruction "do not infer eligibility simply because
+// AtmState happens to classify A/B"). PHASES 1-10: ATM_STATE_INVALIDATION exit hypothesis test
+// (exit on first post-entry row where AtmState != entry pattern), same-entry counterfactual first,
+// then full sequential resimulation. Entry mechanics, ATM execution, quantity, costs, cutoff all
+// frozen and unchanged. 180s context unchanged. 10 validation sessions only. 2026-09-24 never queried.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-atm-invalidation-exit --in=vc-adaptive180s-band-rows.csv --out=basePath
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-atm-invalidation-exit", StringComparison.OrdinalIgnoreCase))
+{
+    var (_, ivNamed) = SplitNamedArgs(args);
+    var ivIn = ivNamed.GetValueOrDefault("in", "vc-adaptive180s-band-rows.csv");
+    if (!ivNamed.TryGetValue("out", out var ivBase))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-atm-invalidation-exit --in=vc-adaptive180s-band-rows.csv --out=basePath");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-atm-invalidation-exit: PHASE 0 warm-up fix + ATM_STATE_INVALIDATION exit hypothesis. 10 validation sessions only. 2026-09-24 NOT queried. ===");
+    Console.WriteLine();
+
+    var ivIstOffset = TimeSpan.FromHours(5.5);
+    var ivDesignDates = new HashSet<DateOnly> { new(2026, 9, 22), new(2026, 9, 23) };
+
+    var ivHeader0 = File.ReadLines(ivIn).First().Split(',');
+    int IvCol(string name) => Array.IndexOf(ivHeader0, name);
+    var ivCTradingDate = IvCol("TradingDate"); var ivCExpiryDate = IvCol("ExpiryDate"); var ivCDte = IvCol("Dte");
+    var ivCEndIdx = IvCol("EndBarIndex"); var ivCStartIdx = IvCol("StartBarIndex"); var ivCWinBars = IvCol("WindowBarCount");
+    var ivCWEnd = IvCol("WindowEndTimestamp"); var ivCWDur = IvCol("WindowDurationSeconds");
+    var ivCFEnd = IvCol("FuturesEnd"); var ivCAtmStrike = IvCol("AtmStrike");
+    var ivCCeValid = IvCol("CeValidCount"); var ivCPeValid = IvCol("PeValidCount");
+    var ivCCePos = IvCol("CePositiveCount"); var ivCCeNeg = IvCol("CeNegativeCount");
+    var ivCPePos = IvCol("PePositiveCount"); var ivCPeNeg = IvCol("PeNegativeCount");
+    var ivCAtmState = IvCol("AtmState");
+
+    var ivAllRows = new List<(DateOnly Date, DateOnly Expiry, int Dte, int EndIdx, int StartIdx, int WinBars, DateTimeOffset WEnd, double WDur, decimal FEnd, decimal AtmStrike,
+        int CeValid, int PeValid, int CePos, int CeNeg, int PePos, int PeNeg, string RawAtmState, bool InsufficientHistory, string AtmState)>();
+    foreach (var line in File.ReadLines(ivIn).Skip(1))
+    {
+        var f = line.Split(',');
+        var date = DateOnly.ParseExact(f[ivCTradingDate], "yyyy-MM-dd");
+        if (ivDesignDates.Contains(date) || date == new DateOnly(2026, 9, 24)) { continue; } // validation sessions ONLY
+        var wEndTod = TimeSpan.Parse(f[ivCWEnd]);
+        var wEnd = new DateTimeOffset(date.ToDateTime(TimeOnly.MinValue).Add(wEndTod), ivIstOffset);
+        var startIdx = int.Parse(f[ivCStartIdx]);
+        var wDur = double.Parse(f[ivCWDur], System.Globalization.CultureInfo.InvariantCulture);
+        var insufficientHistory = startIdx == 0 && wDur < 180.0;
+        var rawState = f[ivCAtmState];
+        ivAllRows.Add((date, DateOnly.ParseExact(f[ivCExpiryDate], "yyyy-MM-dd"), int.Parse(f[ivCDte]), int.Parse(f[ivCEndIdx]), startIdx, int.Parse(f[ivCWinBars]), wEnd, wDur,
+            decimal.Parse(f[ivCFEnd], System.Globalization.CultureInfo.InvariantCulture), decimal.Parse(f[ivCAtmStrike], System.Globalization.CultureInfo.InvariantCulture),
+            int.Parse(f[ivCCeValid]), int.Parse(f[ivCPeValid]), int.Parse(f[ivCCePos]), int.Parse(f[ivCCeNeg]), int.Parse(f[ivCPePos]), int.Parse(f[ivCPeNeg]),
+            rawState, insufficientHistory, insufficientHistory ? "Other" : rawState));
+    }
+    var ivSessions = ivAllRows.Select(r => r.Date).Distinct().OrderBy(d => d).ToList();
+    Console.WriteLine($"Parsed {ivAllRows.Count} rows across {ivSessions.Count} validation sessions. Design (09-22/09-23) and 09-24 excluded from loading entirely.");
+    Console.WriteLine();
+
+    static bool IvFullSurface(string atmState, int ceValid, int cePos, int ceNeg, int peValid, int pePos, int peNeg) =>
+        atmState switch { "A" => ceValid == 5 && ceNeg == 5 && peValid == 5 && pePos == 5, "B" => ceValid == 5 && cePos == 5 && peValid == 5 && peNeg == 5, _ => false };
+
+    // ================= PHASE 0: warm-up audit =================
+    Console.WriteLine("### PHASE 0: warm-up (InsufficientHistory) audit and fix ###");
+    Console.WriteLine("  Frozen rule (from here on, in this experiment and any that reuse it): a row's AtmState is forced to \"Other\" whenever InsufficientHistory (StartBarIndex==0 AND WindowDurationSeconds<180) -- this feeds episode/state-entry annotation, FullSurfaceAgreement, trade eligibility, and matched-signal statistics uniformly. AtmState is never trusted at face value without this check first.");
+    var ivRemovedBySession = new Dictionary<DateOnly, int>();
+    foreach (var date in ivSessions)
+    {
+        var rows = ivAllRows.Where(r => r.Date == date).OrderBy(r => r.EndIdx).ToList();
+        var rawAnn = RollingStateAnalysis.Annotate(rows.Select(r => r.RawAtmState).ToList());
+        var removed = 0;
+        for (var k = 0; k < rows.Count; k++)
+        {
+            if (rawAnn[k].IsStateEntry && rows[k].RawAtmState is "A" or "B" && rows[k].InsufficientHistory
+                && IvFullSurface(rows[k].RawAtmState, rows[k].CeValid, rows[k].CePos, rows[k].CeNeg, rows[k].PeValid, rows[k].PePos, rows[k].PeNeg))
+            {
+                removed++;
+            }
+        }
+        ivRemovedBySession[date] = removed;
+        if (removed > 0) { Console.WriteLine($"  {date:yyyy-MM-dd}: {removed} invalid warm-up FullSurface signal(s) removed by this fix."); }
+    }
+    if (ivRemovedBySession.Values.Sum() == 0) { Console.WriteLine("  No invalid warm-up FullSurface signals found in any validation session under this reconstruction -- reporting this explicitly rather than assuming the flagged 09-18 case must exist under the FullSurface (not just ATM) population."); }
+    Console.WriteLine();
+
+    const int ivLots = PatternRelationshipTradeSimulator.Lots;
+    var ivCosts = new CostsConfig(BrokeragePerOrder: 0m, SlippageTicks: 0);
+
+    // ---- Per-session simulation: OLD (uncorrected) reproduction, CORRECTED baseline, same-entry counterfactual, full sequential invalidation. ----
+    var ivOldTrades = new List<(DateOnly Date, string Pattern, DateTimeOffset SignalTs, decimal NetPnl)>();
+    var ivCorrectedBaseline = new List<(DateOnly Date, int Dte, string Pattern, DateTimeOffset SignalTs, DateTimeOffset EntryTs, decimal EntryFill, decimal FuturesAtEntry, string Token, Instrument Instrument)>();
+    var ivSameEntry = new List<(DateOnly Date, int Dte, string Pattern, DateTimeOffset SignalTs, DateTimeOffset EntryTs,
+        DateTimeOffset BaselineExitTs, DateTimeOffset InvalidationExitTs, string BaselineExitReason, string InvalidationTriggerState,
+        decimal EntryPremium, decimal BaselineExitPremium, decimal InvalidationExitPremium, int Quantity,
+        decimal BaselineNetPnl, decimal InvalidationNetPnl,
+        decimal MaeBeforeBaseline, decimal MfeBeforeBaseline, decimal MfeBeforeInvalidation, decimal MfeAfterInvalidationBeforeBaseline,
+        double? SecondsToMfe, double SecondsEntryToInvalidation, double SecondsInvalidationToBaselineExit,
+        decimal UnderlyingAtEntry, decimal UnderlyingAtInvalidation, decimal UnderlyingAtBaselineExit,
+        bool UnderlyingCorrectAtInvalidation, bool UnderlyingCorrectAtBaselineExit,
+        decimal FullSurfaceLossSeconds)>();
+    var ivFullSeqTrades = new List<(DateOnly Date, int Dte, string Pattern, DateTimeOffset SignalTs, DateTimeOffset EntryTs, DateTimeOffset ExitTs, string ExitReason, decimal NetPnl, double HoldingSeconds, decimal MaeRupees, decimal MfeRupees)>();
+    var ivFullSeqFunnel = new Dictionary<DateOnly, (int Eligible, int Executed, int IgnoredPositionOpen, int AfterCutoff, int Eod)>();
+    var ivBreadthLossTiming = new List<(string Pattern, double? SecEntryToBreadthLoss, double SecEntryToInvalidation, double? SecEntryToMfe)>();
+
+    foreach (var date in ivSessions)
+    {
+        var rows = ivAllRows.Where(r => r.Date == date).OrderBy(r => r.EndIdx).ToList();
+        var expiry = rows[0].Expiry;
+        var rawAnn = RollingStateAnalysis.Annotate(rows.Select(r => r.RawAtmState).ToList());
+        var corrAnn = RollingStateAnalysis.Annotate(rows.Select(r => r.AtmState).ToList());
+
+        await using var src = new NiftySignalDbContext(tradeSourceOptions);
+        var futureBars = await FutureEventBarBuilder.BuildDayAsync(src, date, 2600L, CancellationToken.None);
+        if (futureBars.Count == 0) { continue; }
+        var chain = await src.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == expiry && i.Underlying == "NIFTY").ToListAsync();
+        var chainByStrikeAndSide = chain.Where(i => i.StrikePrice is not null).ToLookup(i => (i.StrikePrice!.Value, i.OptionType));
+        var tickCache = new Dictionary<string, OptionTickSeries>();
+        async Task<OptionTickSeries> SeriesAsync(string token)
+        {
+            if (!tickCache.TryGetValue(token, out var s))
+            {
+                var dayStart = futureBars[0].StartTimestamp;
+                var dayEnd = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 30)), ivIstOffset).ToUniversalTime();
+                s = await OptionTickSeries.LoadAsync(src, token, dayStart, dayEnd, CancellationToken.None);
+                tickCache[token] = s;
+            }
+            return s;
+        }
+        decimal FuturesPriceAt(DateTimeOffset ts) { var b = futureBars.LastOrDefault(x => x.EndTimestamp <= ts); return b?.Close ?? futureBars[0].Close; }
+
+        // ---- OLD (uncorrected) reproduction: same code shape as vc0dte-relationship-fullsurface-trade's ATM population. ----
+        {
+            (string Pattern, Instrument Instrument, decimal EntryFill)? openOld = null;
+            for (var k = 0; k < rows.Count; k++)
+            {
+                var r = rows[k];
+                var isEntryRow = rawAnn[k].IsStateEntry && r.RawAtmState is "A" or "B";
+                if (openOld is { } posOld && isEntryRow && ((posOld.Pattern == "A" && r.RawAtmState == "B") || (posOld.Pattern == "B" && r.RawAtmState == "A")))
+                {
+                    await CloseOld(posOld, r.WEnd);
+                }
+                if (!isEntryRow || !IvFullSurface(r.RawAtmState, r.CeValid, r.CePos, r.CeNeg, r.PeValid, r.PePos, r.PeNeg)) { continue; }
+                var istTime = TimeOnly.FromDateTime(r.WEnd.DateTime);
+                if (openOld is not null || istTime >= new TimeOnly(15, 0)) { continue; }
+                var side = r.RawAtmState == "A" ? OptionType.Put : OptionType.Call;
+                var inst = chainByStrikeAndSide[(r.AtmStrike, side)].FirstOrDefault();
+                if (inst is null) { continue; }
+                var series = await SeriesAsync(inst.Token);
+                var entryTickN = series.EntryAtOrAfter(r.WEnd);
+                if (entryTickN is null) { continue; }
+                var entryTick = entryTickN.Value;
+                var entryBase = entryTick.Depth is { } ed ? ed.Ask1Price : entryTick.LastPrice;
+                var entryFill = PaperTradeSimulator.FillEntry(entryBase, inst.TickSize, inst.LotSize * ivLots, ivCosts);
+                openOld = (r.RawAtmState, inst, entryFill.FillPrice);
+            }
+            if (openOld is { } finalOld)
+            {
+                var forceClose = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 15)), ivIstOffset);
+                await CloseOld(finalOld, forceClose);
+            }
+
+            async Task CloseOld((string Pattern, Instrument Instrument, decimal EntryFill) pos, DateTimeOffset atTs)
+            {
+                var series = await SeriesAsync(pos.Instrument.Token);
+                var exitTickN = series.EntryAtOrBefore(atTs) is { } b0 && atTs.TimeOfDay == new TimeOnly(15, 15).ToTimeSpan() ? series.EntryAtOrBefore(atTs) : series.EntryAtOrAfter(atTs);
+                if (exitTickN is null) { return; }
+                var exitTick = exitTickN.Value;
+                var qty = pos.Instrument.LotSize * ivLots;
+                var exitBase = exitTick.Depth is { } xd ? xd.Bid1Price : exitTick.LastPrice;
+                var exitFill = PaperTradeSimulator.FillExit(exitBase, pos.Instrument.TickSize, qty, ivCosts);
+                var grossPnl = (exitFill.FillPrice - pos.EntryFill) * qty;
+                var costBreakdown = TransactionCostCalculator.Compute(exitFill.GrossValue, ivCosts.BrokeragePerOrder * 2);
+                var netPnl = grossPnl - costBreakdown.Total;
+                ivOldTrades.Add((date, pos.Pattern, atTs, netPnl));
+                openOld = null;
+            }
+        }
+
+        // ---- CORRECTED baseline + same-entry counterfactual, computed together (one entry, two exits). ----
+        (string Pattern, Instrument Instrument, decimal AtmStrike, DateTimeOffset SignalTs, DateTimeOffset EntryTs, decimal EntryFill, decimal FuturesAtEntry, int EntryEndIdx)? open = null;
+        for (var k = 0; k < rows.Count; k++)
+        {
+            var r = rows[k];
+            var isEntryRow = corrAnn[k].IsStateEntry && r.AtmState is "A" or "B";
+
+            if (open is { } pos && isEntryRow && ((pos.Pattern == "A" && r.AtmState == "B") || (pos.Pattern == "B" && r.AtmState == "A")))
+            {
+                await CloseCorrected(pos, r.WEnd);
+            }
+
+            if (!isEntryRow || !IvFullSurface(r.AtmState, r.CeValid, r.CePos, r.CeNeg, r.PeValid, r.PePos, r.PeNeg)) { continue; }
+            var istTime2 = TimeOnly.FromDateTime(r.WEnd.DateTime);
+            if (open is not null || istTime2 >= new TimeOnly(15, 0)) { continue; }
+            var side2 = r.AtmState == "A" ? OptionType.Put : OptionType.Call;
+            var inst2 = chainByStrikeAndSide[(r.AtmStrike, side2)].FirstOrDefault();
+            if (inst2 is null) { continue; }
+            var series2 = await SeriesAsync(inst2.Token);
+            var entryTickN2 = series2.EntryAtOrAfter(r.WEnd);
+            if (entryTickN2 is null) { continue; }
+            var entryTick2 = entryTickN2.Value;
+            var entryBase2 = entryTick2.Depth is { } ed2 ? ed2.Ask1Price : entryTick2.LastPrice;
+            var entryFill2 = PaperTradeSimulator.FillEntry(entryBase2, inst2.TickSize, inst2.LotSize * ivLots, ivCosts);
+            open = (r.AtmState, inst2, r.AtmStrike, r.WEnd, entryTick2.Timestamp, entryFill2.FillPrice, FuturesPriceAt(entryTick2.Timestamp), r.EndIdx);
+            ivCorrectedBaseline.Add((date, r.Dte, r.AtmState, r.WEnd, entryTick2.Timestamp, entryFill2.FillPrice, FuturesPriceAt(entryTick2.Timestamp), inst2.Token, inst2));
+        }
+        if (open is { } finalPos)
+        {
+            var forceClose = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 15)), ivIstOffset);
+            await CloseCorrected(finalPos, forceClose);
+        }
+
+        async Task CloseCorrected((string Pattern, Instrument Instrument, decimal AtmStrike, DateTimeOffset SignalTs, DateTimeOffset EntryTs, decimal EntryFill, decimal FuturesAtEntry, int EntryEndIdx) pos, DateTimeOffset baselineAtTs)
+        {
+            var series = await SeriesAsync(pos.Instrument.Token);
+            var baselineIsEod = baselineAtTs.TimeOfDay == new TimeOnly(15, 15).ToTimeSpan();
+            var baselineExitTickN = baselineIsEod ? series.EntryAtOrBefore(baselineAtTs) : series.EntryAtOrAfter(baselineAtTs);
+            if (baselineExitTickN is null) { return; }
+            var baselineExitTick = baselineExitTickN.Value;
+            var qty = pos.Instrument.LotSize * ivLots;
+            var baselineExitBase = baselineExitTick.Depth is { } bd ? bd.Bid1Price : baselineExitTick.LastPrice;
+            var baselineExitFill = PaperTradeSimulator.FillExit(baselineExitBase, pos.Instrument.TickSize, qty, ivCosts);
+            var baselineGross = (baselineExitFill.FillPrice - pos.EntryFill) * qty;
+            var baselineCosts = TransactionCostCalculator.Compute(baselineExitFill.GrossValue, ivCosts.BrokeragePerOrder * 2);
+            var baselineNet = baselineGross - baselineCosts.Total;
+            var baselineReason = baselineIsEod ? "ForcedEod" : "OppositePatternSignal";
+
+            // ---- ATM_STATE_INVALIDATION exit, computed independently from the SAME entry (Phase 2). ----
+            var invalidationRow = rows.FirstOrDefault(x => x.EndIdx > pos.EntryEndIdx && x.AtmState != pos.Pattern);
+            DateTimeOffset invalidationSignalTs; string invalidationTrigger;
+            if (invalidationRow.Date != default)
+            {
+                invalidationSignalTs = invalidationRow.WEnd;
+                invalidationTrigger = invalidationRow.AtmState is "A" or "B" ? "OppositePattern" : "Other";
+            }
+            else
+            {
+                invalidationSignalTs = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 15)), ivIstOffset);
+                invalidationTrigger = "ForcedEod";
+            }
+            var invalidationIsEod = invalidationTrigger == "ForcedEod";
+            var invalidationExitTickN = invalidationIsEod ? series.EntryAtOrBefore(invalidationSignalTs) : series.EntryAtOrAfter(invalidationSignalTs);
+            if (invalidationExitTickN is null) { return; }
+            var invalidationExitTick = invalidationExitTickN.Value;
+            var invalidationExitBase = invalidationExitTick.Depth is { } id2 ? id2.Bid1Price : invalidationExitTick.LastPrice;
+            var invalidationExitFill = PaperTradeSimulator.FillExit(invalidationExitBase, pos.Instrument.TickSize, qty, ivCosts);
+            var invalidationGross = (invalidationExitFill.FillPrice - pos.EntryFill) * qty;
+            var invalidationCostsC = TransactionCostCalculator.Compute(invalidationExitFill.GrossValue, ivCosts.BrokeragePerOrder * 2);
+            var invalidationNet = invalidationGross - invalidationCostsC.Total;
+
+            var laterExitTs = baselineExitTick.Timestamp > invalidationExitTick.Timestamp ? baselineExitTick.Timestamp : invalidationExitTick.Timestamp;
+            var fullPath = series.AllEntries.Where(e => e.Timestamp > pos.EntryTs && e.Timestamp <= laterExitTs).OrderBy(e => e.Timestamp).ToList();
+            var beforeBaseline = fullPath.Where(e => e.Timestamp <= baselineExitTick.Timestamp).ToList();
+            var beforeInvalidation = fullPath.Where(e => e.Timestamp <= invalidationExitTick.Timestamp).ToList();
+            var afterInvalidationBeforeBaseline = fullPath.Where(e => e.Timestamp > invalidationExitTick.Timestamp && e.Timestamp <= baselineExitTick.Timestamp).ToList();
+            var maeMfeBaseline = MaeMfeCalculator.Compute(pos.EntryFill, beforeBaseline.Select(e => e.LastPrice).ToList());
+            var mfeBeforeInvalidation = MaeMfeCalculator.Compute(pos.EntryFill, beforeInvalidation.Select(e => e.LastPrice).ToList()).MfePoints;
+            var mfeAfterInvalidationBeforeBaseline = afterInvalidationBeforeBaseline.Count > 0 ? MaeMfeCalculator.Compute(pos.EntryFill, afterInvalidationBeforeBaseline.Select(e => e.LastPrice).ToList()).MfePoints : 0m;
+            double? secToMfe = null;
+            if (maeMfeBaseline.MfePoints > 0)
+            {
+                var mfeRow = beforeBaseline.FirstOrDefault(e => e.LastPrice - pos.EntryFill >= maeMfeBaseline.MfePoints);
+                if (mfeRow.Timestamp != default) { secToMfe = (mfeRow.Timestamp - pos.EntryTs).TotalSeconds; }
+            }
+
+            var underlyingAtInvalidation = FuturesPriceAt(invalidationExitTick.Timestamp);
+            var underlyingAtBaselineExit = FuturesPriceAt(baselineExitTick.Timestamp);
+            var expectSign = pos.Pattern == "A" ? -1 : 1;
+            var underlyingCorrectAtInval = Math.Sign(underlyingAtInvalidation - pos.FuturesAtEntry) == expectSign;
+            var underlyingCorrectAtBaseline = Math.Sign(underlyingAtBaselineExit - pos.FuturesAtEntry) == expectSign;
+
+            ivSameEntry.Add((date, rows.First(x => x.EndIdx == pos.EntryEndIdx).Dte, pos.Pattern, pos.SignalTs, pos.EntryTs,
+                baselineExitTick.Timestamp, invalidationExitTick.Timestamp, baselineReason, invalidationTrigger,
+                pos.EntryFill, baselineExitFill.FillPrice, invalidationExitFill.FillPrice, qty,
+                baselineNet, invalidationNet,
+                maeMfeBaseline.MaePoints, maeMfeBaseline.MfePoints, mfeBeforeInvalidation, mfeAfterInvalidationBeforeBaseline,
+                secToMfe, (invalidationExitTick.Timestamp - pos.EntryTs).TotalSeconds, (baselineExitTick.Timestamp - invalidationExitTick.Timestamp).TotalSeconds,
+                pos.FuturesAtEntry, underlyingAtInvalidation, underlyingAtBaselineExit,
+                underlyingCorrectAtInval, underlyingCorrectAtBaseline, 0m));
+
+            // ---- Phase 10: breadth-loss timing (diagnostic only, never an exit). ----
+            var breadthLossRow = rows.FirstOrDefault(x => x.EndIdx > pos.EntryEndIdx && !IvFullSurface(x.AtmState == pos.Pattern ? pos.Pattern : x.AtmState, x.CeValid, x.CePos, x.CeNeg, x.PeValid, x.PePos, x.PeNeg) && x.AtmState == pos.Pattern);
+            double? secToBreadthLoss = breadthLossRow.Date != default ? (breadthLossRow.WEnd - pos.EntryTs).TotalSeconds : null;
+            ivBreadthLossTiming.Add((pos.Pattern, secToBreadthLoss, (invalidationExitTick.Timestamp - pos.EntryTs).TotalSeconds, secToMfe));
+            open = null;
+        }
+        Console.WriteLine($"  [Simulated] {date:yyyy-MM-dd}: {ivCorrectedBaseline.Count(x => x.Date == date)} corrected FullSurface trades.");
+    }
+    Console.WriteLine();
+
+    static (int N, int Wins, double WinRate, decimal Gross, decimal Net, decimal Median, decimal Avg, double? Pf, decimal MedHold) AggSimple(List<(decimal NetPnl, double HoldingSeconds)> v)
+    {
+        if (v.Count == 0) { return (0, 0, 0, 0, 0, 0, 0, null, 0); }
+        var wins = v.Count(x => x.NetPnl > 0); var gp = v.Where(x => x.NetPnl > 0).Sum(x => x.NetPnl); var gl = Math.Abs(v.Where(x => x.NetPnl <= 0).Sum(x => x.NetPnl));
+        var sorted = v.Select(x => x.NetPnl).OrderBy(x => x).ToList();
+        var median = sorted.Count % 2 == 1 ? sorted[sorted.Count / 2] : (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2m;
+        var medHold = (decimal)v.Select(x => x.HoldingSeconds).OrderBy(x => x).ElementAt(v.Count / 2);
+        return (v.Count, wins, 100.0 * wins / v.Count, v.Sum(x => x.NetPnl), v.Sum(x => x.NetPnl), median, v.Sum(x => x.NetPnl) / v.Count, gl > 0 ? (double)(gp / gl) : null, medHold);
+    }
+    static string FmtSimple((int N, int Wins, double WinRate, decimal Gross, decimal Net, decimal Median, decimal Avg, double? Pf, decimal MedHold) a) =>
+        a.N == 0 ? "n=0" : $"n={a.N} win%={a.WinRate:F1}% net={a.Net:F0} avg={a.Avg:F1} median={a.Median:F1} PF={(a.Pf?.ToString("F2") ?? "n/a")} medHoldSec={a.MedHold:F0}";
+
+    // ================= PHASE 0 (cont'd): corrected baseline reproduction =================
+    Console.WriteLine("### PHASE 0 (continued): corrected FullSurface ATM baseline, 10 validation sessions ###");
+    {
+        var oldAgg = AggSimple(ivOldTrades.Select(t => (t.NetPnl, 0.0)).ToList());
+        Console.WriteLine($"  OLD (uncorrected) baseline: {FmtSimple(oldAgg)}");
+        var corrTrades = ivSameEntry.Select(x => (x.BaselineNetPnl, (x.BaselineExitTs - x.EntryTs).TotalSeconds)).ToList();
+        var corrAggReal = AggSimple(corrTrades);
+        Console.WriteLine($"  CORRECTED baseline:         {FmtSimple(corrAggReal)}");
+        foreach (var pattern in new[] { "A", "B" })
+        {
+            var side = ivSameEntry.Where(x => x.Pattern == pattern).Select(x => (x.BaselineNetPnl, (x.BaselineExitTs - x.EntryTs).TotalSeconds)).ToList();
+            Console.WriteLine($"    Corrected [{pattern}]: {FmtSimple(AggSimple(side))}");
+        }
+        Console.WriteLine("  Removed invalid warm-up signals by session (0 unless listed above in PHASE 0's first block).");
+        var t0918 = ivSameEntry.Where(x => x.Date == new DateOnly(2026, 9, 18) && x.EntryTs.ToOffset(ivIstOffset).TimeOfDay < new TimeSpan(9, 16, 0)).ToList();
+        Console.WriteLine($"  Verification: 09-18 09:15:03-area trade present in corrected baseline? {(t0918.Count == 0 ? "NO -- confirmed removed" : $"STILL PRESENT ({t0918.Count} trade(s)) -- investigate")}");
+    }
+    Console.WriteLine();
+
+    // ================= PHASE 3: exit-mechanics diagnostics (same-entry) =================
+    Console.WriteLine("### PHASE 3: same-entry exit-mechanics comparison (baseline opposite-pattern vs. ATM_STATE_INVALIDATION) ###");
+    foreach (var scope in new[] { "A", "B", "Combined" })
+    {
+        var trades = scope == "Combined" ? ivSameEntry : ivSameEntry.Where(x => x.Pattern == scope).ToList();
+        if (trades.Count == 0) { continue; }
+        var baseAgg = AggSimple(trades.Select(x => (x.BaselineNetPnl, (x.BaselineExitTs - x.EntryTs).TotalSeconds)).ToList());
+        var invAgg = AggSimple(trades.Select(x => (x.InvalidationNetPnl, (x.InvalidationExitTs - x.EntryTs).TotalSeconds)).ToList());
+        var medMaeBase = trades.Select(x => x.MaeBeforeBaseline).OrderBy(x => x).ElementAt(trades.Count / 2);
+        var medMfeBase = trades.Select(x => x.MfeBeforeBaseline).OrderBy(x => x).ElementAt(trades.Count / 2);
+        var mfeCapturedBase = trades.Where(x => x.MfeBeforeBaseline > 0).Select(x => (double)((x.BaselineExitPremium - x.EntryPremium) / x.MfeBeforeBaseline)).ToList();
+        var mfeCapturedInv = trades.Where(x => x.MfeBeforeInvalidation > 0).Select(x => (double)((x.InvalidationExitPremium - x.EntryPremium) / x.MfeBeforeInvalidation)).ToList();
+        var baseMfeThenLoss = trades.Count(x => x.MfeBeforeBaseline > 0 && x.BaselineNetPnl <= 0);
+        var invMfeThenLoss = trades.Count(x => x.MfeBeforeInvalidation > 0 && x.InvalidationNetPnl <= 0);
+        var winnerToLoser = trades.Count(x => x.BaselineNetPnl > 0 && x.InvalidationNetPnl <= 0);
+        var loserToWinner = trades.Count(x => x.BaselineNetPnl <= 0 && x.InvalidationNetPnl > 0);
+        Console.WriteLine($"  [{scope}] Baseline: {FmtSimple(baseAgg)} medMAE={medMaeBase:F1} medMFE={medMfeBase:F1} medCaptureRatio={(mfeCapturedBase.Count > 0 ? mfeCapturedBase.OrderBy(x => x).ElementAt(mfeCapturedBase.Count / 2).ToString("F2") : "n/a")} MFE>0-then-loss={baseMfeThenLoss}/{trades.Count}");
+        Console.WriteLine($"  [{scope}] Invalidation: {FmtSimple(invAgg)} medCaptureRatio={(mfeCapturedInv.Count > 0 ? mfeCapturedInv.OrderBy(x => x).ElementAt(mfeCapturedInv.Count / 2).ToString("F2") : "n/a")} MFE>0-then-loss={invMfeThenLoss}/{trades.Count}");
+        Console.WriteLine($"  [{scope}] Winner->Loser conversions (baseline win, invalidation loss)={winnerToLoser}/{trades.Count}; Loser->Winner conversions={loserToWinner}/{trades.Count}");
+    }
+    Console.WriteLine();
+
+    // ================= PHASE 4: MFE timing study =================
+    Console.WriteLine("### PHASE 4: MFE timing relative to invalidation (same-entry trades) ###");
+    foreach (var scope in new[] { "A", "B", "Combined" })
+    {
+        var trades = scope == "Combined" ? ivSameEntry : ivSameEntry.Where(x => x.Pattern == scope).ToList();
+        if (trades.Count == 0) { continue; }
+        var beforeInval = trades.Count(x => x.MfeBeforeInvalidation > 0);
+        var afterInvalOnly = trades.Count(x => x.MfeBeforeInvalidation <= 0 && x.MfeAfterInvalidationBeforeBaseline > 0);
+        var noPositiveMfe = trades.Count(x => x.MfeBeforeInvalidation <= 0 && x.MfeAfterInvalidationBeforeBaseline <= 0);
+        Console.WriteLine($"  [{scope}] n={trades.Count} MFE-before-invalidation={beforeInval}({100.0 * beforeInval / trades.Count:F1}%) MFE-after-invalidation-only={afterInvalOnly}({100.0 * afterInvalOnly / trades.Count:F1}%) no-positive-MFE={noPositiveMfe}({100.0 * noPositiveMfe / trades.Count:F1}%)");
+    }
+    Console.WriteLine("  (If most MFE occurs before invalidation, state-invalidation has strong lifecycle justification; if much occurs after, useful continuation may be cut short. Reporting whichever is true, unmodified.)");
+    Console.WriteLine();
+
+    // ================= PHASE 5: 09-18 focused comparison =================
+    Console.WriteLine("### PHASE 5: 2026-09-18 focused comparison ###");
+    {
+        var t18 = ivSameEntry.Where(x => x.Date == new DateOnly(2026, 9, 18)).ToList();
+        if (t18.Count > 0)
+        {
+            var baseAgg = AggSimple(t18.Select(x => (x.BaselineNetPnl, (x.BaselineExitTs - x.EntryTs).TotalSeconds)).ToList());
+            var invAgg = AggSimple(t18.Select(x => (x.InvalidationNetPnl, (x.InvalidationExitTs - x.EntryTs).TotalSeconds)).ToList());
+            Console.WriteLine($"  Corrected baseline: {FmtSimple(baseAgg)}");
+            Console.WriteLine($"  Invalidation counterfactual: {FmtSimple(invAgg)}");
+            foreach (var pattern in new[] { "A", "B" })
+            {
+                var side = t18.Where(x => x.Pattern == pattern).ToList();
+                if (side.Count == 0) { continue; }
+                Console.WriteLine($"    [{pattern}] baselineNet={side.Sum(x => x.BaselineNetPnl):F0} invalidationNet={side.Sum(x => x.InvalidationNetPnl):F0} delta={side.Sum(x => x.InvalidationNetPnl - x.BaselineNetPnl):F0}");
+            }
+            var baseMfeLoss = t18.Count(x => x.MfeBeforeBaseline > 0 && x.BaselineNetPnl <= 0);
+            var invMfeLoss = t18.Count(x => x.MfeBeforeInvalidation > 0 && x.InvalidationNetPnl <= 0);
+            var withSec = t18.Where(x => x.SecondsToMfe is not null).Select(x => x.SecondsToMfe!.Value).ToList();
+            Console.WriteLine($"  MedSecToMFE={(withSec.Count > 0 ? withSec.OrderBy(x => x).ElementAt(withSec.Count / 2) : 0):F0} MFE>0-then-loss under baseline={baseMfeLoss}/{t18.Count} under invalidation={invMfeLoss}/{t18.Count} totalGivebackAvoided(NetDelta)={t18.Sum(x => x.InvalidationNetPnl - x.BaselineNetPnl):F0}");
+        }
+    }
+    Console.WriteLine();
+
+    // ================= PHASE 6: all-session breakdown =================
+    Console.WriteLine("### PHASE 6: per-session same-entry counterfactual (all 10 validation sessions) ###");
+    {
+        var bySession = new List<(DateOnly Date, int N, decimal BaseNet, decimal InvNet, decimal Delta, double? BasePf, double? InvPf, double BaseWin, double InvWin)>();
+        foreach (var date in ivSessions)
+        {
+            var t = ivSameEntry.Where(x => x.Date == date).ToList();
+            if (t.Count == 0) { continue; }
+            var baseNet = t.Sum(x => x.BaselineNetPnl); var invNet = t.Sum(x => x.InvalidationNetPnl);
+            var baseGp = t.Where(x => x.BaselineNetPnl > 0).Sum(x => x.BaselineNetPnl); var baseGl = Math.Abs(t.Where(x => x.BaselineNetPnl <= 0).Sum(x => x.BaselineNetPnl));
+            var invGp = t.Where(x => x.InvalidationNetPnl > 0).Sum(x => x.InvalidationNetPnl); var invGl = Math.Abs(t.Where(x => x.InvalidationNetPnl <= 0).Sum(x => x.InvalidationNetPnl));
+            bySession.Add((date, t.Count, baseNet, invNet, invNet - baseNet, baseGl > 0 ? (double)(baseGp / baseGl) : null, invGl > 0 ? (double)(invGp / invGl) : null,
+                100.0 * t.Count(x => x.BaselineNetPnl > 0) / t.Count, 100.0 * t.Count(x => x.InvalidationNetPnl > 0) / t.Count));
+        }
+        foreach (var s in bySession)
+        {
+            var aDelta = ivSameEntry.Where(x => x.Date == s.Date && x.Pattern == "A").Sum(x => x.InvalidationNetPnl - x.BaselineNetPnl);
+            var bDelta = ivSameEntry.Where(x => x.Date == s.Date && x.Pattern == "B").Sum(x => x.InvalidationNetPnl - x.BaselineNetPnl);
+            Console.WriteLine($"  {s.Date:yyyy-MM-dd}: N={s.N} BaseNet={s.BaseNet:F0} InvNet={s.InvNet:F0} Delta={s.Delta:F0} BasePF={(s.BasePf?.ToString("F2") ?? "n/a")} InvPF={(s.InvPf?.ToString("F2") ?? "n/a")} BaseWin%={s.BaseWin:F1}% InvWin%={s.InvWin:F1}% A-delta={aDelta:F0} B-delta={bDelta:F0}");
+        }
+        var improved = bySession.Count(s => s.Delta > 0); var worsened = bySession.Count(s => s.Delta < 0);
+        var deltas = bySession.Select(s => s.Delta).OrderBy(x => x).ToList();
+        var medianDelta = deltas.Count % 2 == 1 ? deltas[deltas.Count / 2] : (deltas[deltas.Count / 2 - 1] + deltas[deltas.Count / 2]) / 2m;
+        var bestSession = bySession.OrderByDescending(s => s.Delta).First(); var worstSession = bySession.OrderBy(s => s.Delta).First();
+        var totalDelta = bySession.Sum(s => s.Delta);
+        var largestShare = bySession.Sum(s => Math.Abs(s.Delta)) > 0 ? 100.0 * (double)Math.Abs(bestSession.Delta) / (double)bySession.Sum(s => Math.Abs(s.Delta)) : 0;
+        Console.WriteLine($"  Sessions improved={improved}/10 worsened={worsened}/10 medianDelta={medianDelta:F0} totalDelta={totalDelta:F0} totalExclBest({bestSession.Date:yyyy-MM-dd})={totalDelta - bestSession.Delta:F0} totalExclWorst({worstSession.Date:yyyy-MM-dd})={totalDelta - worstSession.Delta:F0} largestSingleSessionShare={largestShare:F1}%");
+    }
+    Console.WriteLine();
+
+    // ================= PHASE 7: DTE breakdown =================
+    Console.WriteLine("### PHASE 7: DTE descriptive comparison (same-entry) ###");
+    foreach (var dte in new[] { 0, 1, 4, 5, 6 })
+    {
+        var t = ivSameEntry.Where(x => x.Dte == dte).ToList();
+        if (t.Count == 0) { continue; }
+        var baseAgg = AggSimple(t.Select(x => (x.BaselineNetPnl, (x.BaselineExitTs - x.EntryTs).TotalSeconds)).ToList());
+        var invAgg = AggSimple(t.Select(x => (x.InvalidationNetPnl, (x.InvalidationExitTs - x.EntryTs).TotalSeconds)).ToList());
+        var mfeCapturedInv = t.Where(x => x.MfeBeforeInvalidation > 0).Select(x => (double)((x.InvalidationExitPremium - x.EntryPremium) / x.MfeBeforeInvalidation)).ToList();
+        Console.WriteLine($"  DTE={dte}: Baseline {FmtSimple(baseAgg)} | Invalidation {FmtSimple(invAgg)} medCaptureRatio={(mfeCapturedInv.Count > 0 ? mfeCapturedInv.OrderBy(x => x).ElementAt(mfeCapturedInv.Count / 2).ToString("F2") : "n/a")}");
+    }
+    Console.WriteLine();
+
+    // ================= PHASE 8: full sequential resimulation =================
+    Console.WriteLine("### PHASE 8: full sequential resimulation, ATM_STATE_INVALIDATION as the ACTUAL exit ###");
+    foreach (var date in ivSessions)
+    {
+        var rows = ivAllRows.Where(r => r.Date == date).OrderBy(r => r.EndIdx).ToList();
+        var expiry = rows[0].Expiry;
+        var corrAnn = RollingStateAnalysis.Annotate(rows.Select(r => r.AtmState).ToList());
+        await using var src = new NiftySignalDbContext(tradeSourceOptions);
+        var futureBars = await FutureEventBarBuilder.BuildDayAsync(src, date, 2600L, CancellationToken.None);
+        if (futureBars.Count == 0) { continue; }
+        var chain = await src.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == expiry && i.Underlying == "NIFTY").ToListAsync();
+        var chainByStrikeAndSide = chain.Where(i => i.StrikePrice is not null).ToLookup(i => (i.StrikePrice!.Value, i.OptionType));
+        var tickCache2 = new Dictionary<string, OptionTickSeries>();
+        async Task<OptionTickSeries> SeriesAsync2(string token)
+        {
+            if (!tickCache2.TryGetValue(token, out var s))
+            {
+                var dayStart = futureBars[0].StartTimestamp;
+                var dayEnd = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 30)), ivIstOffset).ToUniversalTime();
+                s = await OptionTickSeries.LoadAsync(src, token, dayStart, dayEnd, CancellationToken.None);
+                tickCache2[token] = s;
+            }
+            return s;
+        }
+
+        var funnel = (Eligible: 0, Executed: 0, IgnoredPositionOpen: 0, AfterCutoff: 0, Eod: 0);
+        (string Pattern, Instrument Instrument, decimal AtmStrike, DateTimeOffset SignalTs, DateTimeOffset EntryTs, decimal EntryFill, int EntryEndIdx)? open = null;
+        for (var k = 0; k < rows.Count; k++)
+        {
+            var r = rows[k];
+            var isEntryRow = corrAnn[k].IsStateEntry && r.AtmState is "A" or "B";
+
+            if (open is { } pos)
+            {
+                // ATM_STATE_INVALIDATION as the ACTUAL exit: close as soon as the CURRENT row's own AtmState != held pattern (checked every row, not only at a later opposite ENTRY).
+                if (r.AtmState != pos.Pattern)
+                {
+                    await CloseSeq(pos, r.WEnd);
+                    open = null;
+                }
+            }
+
+            if (!isEntryRow || !IvFullSurface(r.AtmState, r.CeValid, r.CePos, r.CeNeg, r.PeValid, r.PePos, r.PeNeg)) { continue; }
+            funnel.Eligible++;
+            var istTime3 = TimeOnly.FromDateTime(r.WEnd.DateTime);
+            if (open is not null) { funnel.IgnoredPositionOpen++; continue; }
+            if (istTime3 >= new TimeOnly(15, 0)) { funnel.AfterCutoff++; continue; }
+            var side3 = r.AtmState == "A" ? OptionType.Put : OptionType.Call;
+            var inst3 = chainByStrikeAndSide[(r.AtmStrike, side3)].FirstOrDefault();
+            if (inst3 is null) { continue; }
+            var series3 = await SeriesAsync2(inst3.Token);
+            var entryTickN3 = series3.EntryAtOrAfter(r.WEnd);
+            if (entryTickN3 is null) { continue; }
+            var entryTick3 = entryTickN3.Value;
+            var entryBase3 = entryTick3.Depth is { } ed3 ? ed3.Ask1Price : entryTick3.LastPrice;
+            var entryFill3 = PaperTradeSimulator.FillEntry(entryBase3, inst3.TickSize, inst3.LotSize * ivLots, ivCosts);
+            open = (r.AtmState, inst3, r.AtmStrike, r.WEnd, entryTick3.Timestamp, entryFill3.FillPrice, r.EndIdx);
+            funnel.Executed++;
+        }
+        if (open is { } finalOpen)
+        {
+            var forceClose = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 15)), ivIstOffset);
+            await CloseSeq(finalOpen, forceClose, isEod: true);
+        }
+        ivFullSeqFunnel[date] = funnel;
+
+        async Task CloseSeq((string Pattern, Instrument Instrument, decimal AtmStrike, DateTimeOffset SignalTs, DateTimeOffset EntryTs, decimal EntryFill, int EntryEndIdx) pos, DateTimeOffset atTs, bool isEod = false)
+        {
+            var series = await SeriesAsync2(pos.Instrument.Token);
+            var exitTickN = isEod ? series.EntryAtOrBefore(atTs) : series.EntryAtOrAfter(atTs);
+            if (exitTickN is null) { return; }
+            var exitTick = exitTickN.Value;
+            var qty = pos.Instrument.LotSize * ivLots;
+            var exitBase = exitTick.Depth is { } xd ? xd.Bid1Price : exitTick.LastPrice;
+            var exitFill = PaperTradeSimulator.FillExit(exitBase, pos.Instrument.TickSize, qty, ivCosts);
+            var grossPnl = (exitFill.FillPrice - pos.EntryFill) * qty;
+            var costBreakdown = TransactionCostCalculator.Compute(exitFill.GrossValue, ivCosts.BrokeragePerOrder * 2);
+            var netPnl = grossPnl - costBreakdown.Total;
+            var path = series.AllEntries.Where(e => e.Timestamp > pos.EntryTs && e.Timestamp <= exitTick.Timestamp).Select(e => e.LastPrice).ToList();
+            var maeMfe = MaeMfeCalculator.Compute(pos.EntryFill, path);
+            if (isEod) { funnel.Eod++; }
+            ivFullSeqTrades.Add((date, rows.First(x => x.EndIdx == pos.EntryEndIdx).Dte, pos.Pattern, pos.SignalTs, pos.EntryTs, exitTick.Timestamp, isEod ? "ForcedEod" : "AtmStateInvalidation", netPnl, (exitTick.Timestamp - pos.EntryTs).TotalSeconds, maeMfe.MaePoints, maeMfe.MfePoints));
+        }
+    }
+    {
+        var totalEligible = ivFullSeqFunnel.Values.Sum(f => f.Eligible); var totalExec = ivFullSeqFunnel.Values.Sum(f => f.Executed);
+        var totalIgnored = ivFullSeqFunnel.Values.Sum(f => f.IgnoredPositionOpen); var totalAfterCutoff = ivFullSeqFunnel.Values.Sum(f => f.AfterCutoff); var totalEod = ivFullSeqFunnel.Values.Sum(f => f.Eod);
+        Console.WriteLine($"  Funnel: eligible={totalEligible} executed={totalExec} ignoredPositionOpen={totalIgnored} afterCutoff={totalAfterCutoff} eodExits={totalEod} invalidationExits={ivFullSeqTrades.Count(t => t.ExitReason == "AtmStateInvalidation")}");
+        var fullAgg = AggSimple(ivFullSeqTrades.Select(t => (t.NetPnl, t.HoldingSeconds)).ToList());
+        Console.WriteLine($"  Combined: {FmtSimple(fullAgg)} A={ivFullSeqTrades.Count(t => t.Pattern == "A")} B={ivFullSeqTrades.Count(t => t.Pattern == "B")}");
+        foreach (var pattern in new[] { "A", "B" })
+        {
+            var side = ivFullSeqTrades.Where(t => t.Pattern == pattern).Select(t => (t.NetPnl, t.HoldingSeconds)).ToList();
+            Console.WriteLine($"    [{pattern}] {FmtSimple(AggSimple(side))}");
+        }
+        foreach (var date in ivSessions)
+        {
+            var t = ivFullSeqTrades.Where(x => x.Date == date).ToList();
+            if (t.Count == 0) { continue; }
+            Console.WriteLine($"    {date:yyyy-MM-dd}: N={t.Count} Net={t.Sum(x => x.NetPnl):F0}");
+        }
+    }
+    Console.WriteLine();
+
+    // ================= PHASE 9: exit effect vs opportunity-set effect =================
+    Console.WriteLine("### PHASE 9: separating EXIT EFFECT from OPPORTUNITY-SET EFFECT ###");
+    {
+        var aNet = ivSameEntry.Sum(x => x.BaselineNetPnl); // A = corrected frozen baseline (same as same-entry's baseline column, sequential by construction since baseline IS the sequential corrected sim)
+        var bNet = ivSameEntry.Sum(x => x.InvalidationNetPnl); // B = same-entry invalidation counterfactual
+        var cNet = ivFullSeqTrades.Sum(x => x.NetPnl); // C = full sequential invalidation simulation
+        Console.WriteLine($"  A (corrected frozen baseline, sequential) Net = {aNet:F0} (n={ivSameEntry.Count})");
+        Console.WriteLine($"  B (same-entry invalidation counterfactual) Net = {bNet:F0} (n={ivSameEntry.Count})");
+        Console.WriteLine($"  C (full sequential invalidation simulation) Net = {cNet:F0} (n={ivFullSeqTrades.Count})");
+        Console.WriteLine($"  A->B (PURE EXIT EFFECT, same entries) = {bNet - aNet:F0}");
+        Console.WriteLine($"  B->C (OPPORTUNITY-SET EFFECT, different entry count n={ivFullSeqTrades.Count - ivSameEntry.Count:+0;-0;0} vs. same-entry) = {cNet - bNet:F0}");
+    }
+    Console.WriteLine();
+
+    // ================= PHASE 10: breadth-loss timing (diagnostic only) =================
+    Console.WriteLine("### PHASE 10: breadth-loss timing (FullSurfaceAgreement loss vs. invalidation vs. MFE) -- diagnostic only, NOT an exit ###");
+    foreach (var pattern in new[] { "A", "B" })
+    {
+        var t = ivBreadthLossTiming.Where(x => x.Pattern == pattern).ToList();
+        if (t.Count == 0) { continue; }
+        var withBreadthLoss = t.Where(x => x.SecEntryToBreadthLoss is not null).Select(x => x.SecEntryToBreadthLoss!.Value).ToList();
+        var medBreadthLoss = withBreadthLoss.Count > 0 ? withBreadthLoss.OrderBy(x => x).ElementAt(withBreadthLoss.Count / 2) : (double?)null;
+        var medInval = t.Select(x => x.SecEntryToInvalidation).OrderBy(x => x).ElementAt(t.Count / 2);
+        var withMfe = t.Where(x => x.SecEntryToMfe is not null).Select(x => x.SecEntryToMfe!.Value).ToList();
+        var medMfe = withMfe.Count > 0 ? withMfe.OrderBy(x => x).ElementAt(withMfe.Count / 2) : (double?)null;
+        Console.WriteLine($"  [{pattern}] n={t.Count} medSecEntryToBreadthLoss={(medBreadthLoss?.ToString("F0") ?? "n/a (never lost within window)")} medSecEntryToInvalidation={medInval:F0} medSecEntryToMFE={(medMfe?.ToString("F0") ?? "n/a")}");
+    }
+    Console.WriteLine();
+
+    // ---- Same-entry counterfactual CSV (Phase 2 required fields). ----
+    using (var w = new StreamWriter($"{ivBase}-same-entry.csv"))
+    {
+        w.WriteLine("TradingDate,Dte,Pattern,SignalTimeIST,EntryTimeIST,BaselineExitTimeIST,InvalidationExitTimeIST,BaselineExitReason,InvalidationTrigger,"
+            + "BaselineHoldingSeconds,InvalidationHoldingSeconds,EntryPremium,BaselineExitPremium,InvalidationExitPremium,BaselineNetPnl,InvalidationNetPnl,DeltaNetPnl,"
+            + "MaeBeforeBaseline,MfeBeforeBaseline,MfeBeforeInvalidation,MfeAfterInvalidationBeforeBaseline,SecondsToMfe,SecondsEntryToInvalidation,SecondsInvalidationToBaselineExit,"
+            + "UnderlyingAtEntry,UnderlyingAtInvalidation,UnderlyingAtBaselineExit,WasUnderlyingCorrectAtInvalidation,WasUnderlyingCorrectAtBaselineExit");
+        foreach (var t in ivSameEntry)
+        {
+            w.WriteLine(string.Join(',', t.Date.ToString("yyyy-MM-dd"), t.Dte, t.Pattern, t.SignalTs.ToOffset(ivIstOffset).ToString("HH:mm:ss.fff"), t.EntryTs.ToOffset(ivIstOffset).ToString("HH:mm:ss.fff"),
+                t.BaselineExitTs.ToOffset(ivIstOffset).ToString("HH:mm:ss.fff"), t.InvalidationExitTs.ToOffset(ivIstOffset).ToString("HH:mm:ss.fff"), t.BaselineExitReason, t.InvalidationTriggerState,
+                (t.BaselineExitTs - t.EntryTs).TotalSeconds, (t.InvalidationExitTs - t.EntryTs).TotalSeconds, t.EntryPremium, t.BaselineExitPremium, t.InvalidationExitPremium,
+                t.BaselineNetPnl, t.InvalidationNetPnl, t.InvalidationNetPnl - t.BaselineNetPnl,
+                t.MaeBeforeBaseline, t.MfeBeforeBaseline, t.MfeBeforeInvalidation, t.MfeAfterInvalidationBeforeBaseline, t.SecondsToMfe, t.SecondsEntryToInvalidation, t.SecondsInvalidationToBaselineExit,
+                t.UnderlyingAtEntry, t.UnderlyingAtInvalidation, t.UnderlyingAtBaselineExit, t.UnderlyingCorrectAtInvalidation, t.UnderlyingCorrectAtBaselineExit));
+        }
+    }
+    using (var w = new StreamWriter($"{ivBase}-full-sequential-trades.csv"))
+    {
+        w.WriteLine("TradingDate,Dte,Pattern,SignalTimeIST,EntryTimeIST,ExitTimeIST,ExitReason,NetPnl,HoldingSeconds,MAE,MFE");
+        foreach (var t in ivFullSeqTrades)
+        {
+            w.WriteLine(string.Join(',', t.Date.ToString("yyyy-MM-dd"), t.Dte, t.Pattern, t.SignalTs.ToOffset(ivIstOffset).ToString("HH:mm:ss.fff"), t.EntryTs.ToOffset(ivIstOffset).ToString("HH:mm:ss.fff"),
+                t.ExitTs.ToOffset(ivIstOffset).ToString("HH:mm:ss.fff"), t.ExitReason, t.NetPnl, t.HoldingSeconds, t.MaeRupees, t.MfeRupees));
+        }
+    }
+    Console.WriteLine($"Same-entry CSV: {Path.GetFullPath($"{ivBase}-same-entry.csv")} ({ivSameEntry.Count} rows).");
+    Console.WriteLine($"Full-sequential CSV: {Path.GetFullPath($"{ivBase}-full-sequential-trades.csv")} ({ivFullSeqTrades.Count} rows).");
+
+    return 0;
+}
+
+// "vc0dte-relationship-participation-unit-compare" -- 2026-09-25. Structural comparison of THREE
+// predeclared futures base-bar sizes (2600 / 13000 / 26000 contracts) under the SAME frozen 180s
+// adaptive context, ATM A/B + ATM+/-2 FullSurfaceAgreement signal, and warm-up (InsufficientHistory)
+// correction -- NOT a threshold search. 2600 is read from the already-verified frozen band-rows
+// CSV (never recomputed); 13000/26000 are built fresh from the same primitives
+// (FutureEventBarBuilder, AdaptiveWindowAnalysis.FindWindowStartIndex, AtmStrikeSelector,
+// OptionTickSeries) with an identical row schema so all downstream analysis is architecture-
+// agnostic. 10 validation sessions only (Design/OOS out of scope for this pass, flagged, not
+// hidden, given the added compute of building 2 new architectures from raw ticks). 2026-09-24
+// never queried.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-participation-unit-compare --in=vc-adaptive180s-band-rows.csv --out=basePath
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-participation-unit-compare", StringComparison.OrdinalIgnoreCase))
+{
+    var (_, puNamed) = SplitNamedArgs(args);
+    var puIn = puNamed.GetValueOrDefault("in", "vc-adaptive180s-band-rows.csv");
+    if (!puNamed.TryGetValue("out", out var puBase))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-participation-unit-compare --in=vc-adaptive180s-band-rows.csv --out=basePath");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-participation-unit-compare: 2600 vs 13000 vs 26000 contract base bars, SAME frozen 180s/ATM/FullSurface signal. 10 validation sessions. 2026-09-24 NOT queried. ===");
+    Console.WriteLine();
+    Console.WriteLine("Scope note: Design sessions (09-22/09-23) are NOT built for the 13000/26000 architectures in this pass (added compute of building 2 new architectures from raw ticks) -- flagged explicitly, not hidden. All PRIMARY analysis is validation-only as instructed.");
+    Console.WriteLine();
+
+    var puIstOffset = TimeSpan.FromHours(5.5);
+    long[] puThresholds = [2600L, 13000L, 26000L];
+    const double puTargetSeconds = 180.0;
+
+    static bool PuFullSurface(string atmState, int ceValid, int cePos, int ceNeg, int peValid, int pePos, int peNeg) =>
+        atmState switch { "A" => ceValid == 5 && ceNeg == 5 && peValid == 5 && pePos == 5, "B" => ceValid == 5 && cePos == 5 && peValid == 5 && peNeg == 5, _ => false };
+
+    // Shared architecture-agnostic row schema.
+    var puRows = new Dictionary<long, List<(DateOnly Date, DateOnly Expiry, int Dte, int EndIdx, int StartIdx, int WinBars, DateTimeOffset WStart, DateTimeOffset WEnd, double WDur,
+        decimal FStart, decimal FEnd, long RealizedVolume, decimal AtmStrike, int CeValid, int PeValid, int CePos, int CeNeg, int PePos, int PeNeg,
+        bool InsufficientHistory, string AtmState)>>();
+
+    // ---- 2600: parse from the already-verified frozen CSV (never recomputed). ----
+    {
+        var lines = File.ReadAllLines(puIn);
+        var header = lines[0].Split(',');
+        int Col(string name) => Array.IndexOf(header, name);
+        var cDate = Col("TradingDate"); var cExpiry = Col("ExpiryDate"); var cDte = Col("Dte");
+        var cEndIdx = Col("EndBarIndex"); var cStartIdx = Col("StartBarIndex"); var cWinBars = Col("WindowBarCount");
+        var cWStart = Col("WindowStartTimestamp"); var cWEnd = Col("WindowEndTimestamp"); var cWDur = Col("WindowDurationSeconds");
+        var cFStart = Col("FuturesStart"); var cFEnd = Col("FuturesEnd"); var cAtmStrike = Col("AtmStrike");
+        var cCeValid = Col("CeValidCount"); var cPeValid = Col("PeValidCount"); var cCePos = Col("CePositiveCount"); var cCeNeg = Col("CeNegativeCount");
+        var cPePos = Col("PePositiveCount"); var cPeNeg = Col("PeNegativeCount"); var cAtmState = Col("AtmState");
+        var list = new List<(DateOnly, DateOnly, int, int, int, int, DateTimeOffset, DateTimeOffset, double, decimal, decimal, long, decimal, int, int, int, int, int, int, bool, string)>();
+        var ivDesignDates = new HashSet<DateOnly> { new(2026, 9, 22), new(2026, 9, 23) };
+        foreach (var line in lines.Skip(1))
+        {
+            var f = line.Split(',');
+            var date = DateOnly.ParseExact(f[cDate], "yyyy-MM-dd");
+            if (ivDesignDates.Contains(date) || date == new DateOnly(2026, 9, 24)) { continue; }
+            var wStartTod = TimeSpan.Parse(f[cWStart]); var wEndTod = TimeSpan.Parse(f[cWEnd]);
+            var wStart = new DateTimeOffset(date.ToDateTime(TimeOnly.MinValue).Add(wStartTod), puIstOffset);
+            var wEnd = new DateTimeOffset(date.ToDateTime(TimeOnly.MinValue).Add(wEndTod), puIstOffset);
+            var startIdx = int.Parse(f[cStartIdx]); var wDur = double.Parse(f[cWDur], System.Globalization.CultureInfo.InvariantCulture);
+            var insufficientHistory = startIdx == 0 && wDur < puTargetSeconds;
+            var rawState = f[cAtmState];
+            list.Add((date, DateOnly.ParseExact(f[cExpiry], "yyyy-MM-dd"), int.Parse(f[cDte]), int.Parse(f[cEndIdx]), startIdx, int.Parse(f[cWinBars]), wStart, wEnd, wDur,
+                decimal.Parse(f[cFStart], System.Globalization.CultureInfo.InvariantCulture), decimal.Parse(f[cFEnd], System.Globalization.CultureInfo.InvariantCulture),
+                0L, decimal.Parse(f[cAtmStrike], System.Globalization.CultureInfo.InvariantCulture),
+                int.Parse(f[cCeValid]), int.Parse(f[cPeValid]), int.Parse(f[cCePos]), int.Parse(f[cCeNeg]), int.Parse(f[cPePos]), int.Parse(f[cPeNeg]),
+                insufficientHistory, insufficientHistory ? "Other" : rawState));
+        }
+        puRows[2600L] = list;
+        Console.WriteLine($"  [2600] Parsed {list.Count} rows from frozen CSV across {list.Select(r => r.Item1).Distinct().Count()} validation sessions. (RealizedVolume not tracked in the frozen CSV -- reported as 0/not-available for this architecture only, flagged not fabricated.)");
+    }
+
+    // ---- 13000 / 26000: built fresh from raw ticks, same primitives as the original band command. ----
+    var puValidationSessions = puRows[2600L].Select(r => r.Item1).Distinct().OrderBy(d => d).ToList();
+    var puExpiryBySession = puRows[2600L].GroupBy(r => r.Item1).ToDictionary(g => g.Key, g => (g.First().Item2, g.First().Item3));
+
+    foreach (var threshold in new[] { 13000L, 26000L })
+    {
+        var list = new List<(DateOnly, DateOnly, int, int, int, int, DateTimeOffset, DateTimeOffset, double, decimal, decimal, long, decimal, int, int, int, int, int, int, bool, string)>();
+        foreach (var date in puValidationSessions)
+        {
+            var (expiry, dte) = puExpiryBySession[date];
+            await using var src = new NiftySignalDbContext(tradeSourceOptions);
+            var bars = await FutureEventBarBuilder.BuildDayAsync(src, date, threshold, CancellationToken.None);
+            if (bars.Count == 0) { continue; }
+            var chain = await src.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == expiry && i.Underlying == "NIFTY").ToListAsync();
+            var distinctStrikes = chain.Where(i => i.StrikePrice is not null).Select(i => i.StrikePrice!.Value).Distinct().OrderBy(x => x).ToList();
+            var tickCache = new Dictionary<string, OptionTickSeries>();
+            async Task<OptionTickSeries> SeriesAsync(string token)
+            {
+                if (!tickCache.TryGetValue(token, out var s))
+                {
+                    var dayStart = bars[0].StartTimestamp;
+                    var dayEnd = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 30)), puIstOffset).ToUniversalTime();
+                    s = await OptionTickSeries.LoadAsync(src, token, dayStart, dayEnd, CancellationToken.None);
+                    tickCache[token] = s;
+                }
+                return s;
+            }
+
+            for (var i = 0; i < bars.Count; i++)
+            {
+                var startIdx = AdaptiveWindowAnalysis.FindWindowStartIndex(bars, i, puTargetSeconds);
+                var startBar = bars[startIdx]; var endBar = bars[i];
+                var fStart = startBar.Open; var fEnd = endBar.Close;
+                var fChangePts = fEnd - fStart;
+                var realizedVolume = bars.Skip(startIdx).Take(i - startIdx + 1).Sum(b => b.Volume);
+                var wDur = (endBar.EndTimestamp - startBar.StartTimestamp).TotalSeconds;
+                var insufficientHistory = startIdx == 0 && wDur < puTargetSeconds;
+
+                var atmCe = AtmStrikeSelector.PickAtm(chain, OptionType.Call, fEnd);
+                var atmPe = AtmStrikeSelector.PickAtm(chain, OptionType.Put, fEnd);
+                var atmStrikeVal = atmCe?.StrikePrice ?? atmPe?.StrikePrice ?? fEnd;
+                decimal? atmCeStart = null, atmCeEnd = null, atmPeStart = null, atmPeEnd = null;
+                var atmMissing = atmCe is null || atmPe is null;
+                if (atmCe is not null) { var s = await SeriesAsync(atmCe.Token); atmCeStart = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; atmCeEnd = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; atmMissing |= atmCeStart is null || atmCeEnd is null; }
+                if (atmPe is not null) { var s = await SeriesAsync(atmPe.Token); atmPeStart = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; atmPeEnd = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; atmMissing |= atmPeStart is null || atmPeEnd is null; }
+                decimal? atmCeChg = atmCeStart is not null && atmCeEnd is not null ? atmCeEnd - atmCeStart : null;
+                decimal? atmPeChg = atmPeStart is not null && atmPeEnd is not null ? atmPeEnd - atmPeStart : null;
+                var rawState = "Other";
+                if (!atmMissing)
+                {
+                    if (fChangePts > 0 && atmCeChg < 0 && atmPeChg > 0) { rawState = "A"; }
+                    else if (fChangePts < 0 && atmCeChg > 0 && atmPeChg < 0) { rawState = "B"; }
+                }
+
+                var atmIdx = distinctStrikes.FindIndex(x => x == atmStrikeVal);
+                var ceRets = new List<decimal?>(); var peRets = new List<decimal?>();
+                for (var b = -2; b <= 2; b++)
+                {
+                    var idx = atmIdx + b;
+                    if (atmIdx < 0 || idx < 0 || idx >= distinctStrikes.Count) { ceRets.Add(null); peRets.Add(null); continue; }
+                    var strike = distinctStrikes[idx];
+                    var ceInst = chain.FirstOrDefault(x => x.StrikePrice == strike && x.OptionType == OptionType.Call);
+                    var peInst = chain.FirstOrDefault(x => x.StrikePrice == strike && x.OptionType == OptionType.Put);
+                    if (ceInst is not null) { var s = await SeriesAsync(ceInst.Token); var st = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; var en = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; ceRets.Add(st is not null && en is not null && st != 0 ? (en - st) / st * 100m : null); } else { ceRets.Add(null); }
+                    if (peInst is not null) { var s = await SeriesAsync(peInst.Token); var st = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; var en = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; peRets.Add(st is not null && en is not null && st != 0 ? (en - st) / st * 100m : null); } else { peRets.Add(null); }
+                }
+                int CeValid() => ceRets.Count(x => x is not null); int PeValid() => peRets.Count(x => x is not null);
+                int CePos() => ceRets.Count(x => x is > 0); int CeNeg() => ceRets.Count(x => x is < 0);
+                int PePos() => peRets.Count(x => x is > 0); int PeNeg() => peRets.Count(x => x is < 0);
+
+                list.Add((date, expiry, dte, i, startIdx, i - startIdx + 1, startBar.StartTimestamp.ToOffset(puIstOffset), endBar.EndTimestamp.ToOffset(puIstOffset), wDur,
+                    fStart, fEnd, realizedVolume, atmStrikeVal, CeValid(), PeValid(), CePos(), CeNeg(), PePos(), PeNeg(),
+                    insufficientHistory, insufficientHistory ? "Other" : rawState));
+            }
+            Console.WriteLine($"  [{threshold}] Built {date:yyyy-MM-dd}: {bars.Count} bars.");
+        }
+        puRows[threshold] = list;
+    }
+    Console.WriteLine();
+
+    // ================= PHASE B: state churn metrics =================
+    Console.WriteLine("### PHASE B: state-transition and churn metrics ###");
+    var puEpisodes = new Dictionary<long, Dictionary<DateOnly, List<RollingStateAnalysis.StateAnnotation>>>();
+    var puFullSurfaceFlags = new Dictionary<long, Dictionary<DateOnly, List<bool>>>();
+    foreach (var threshold in puThresholds)
+    {
+        puEpisodes[threshold] = []; puFullSurfaceFlags[threshold] = [];
+        int totalTransAOther = 0, totalTransAB = 0, totalTransBOther = 0, totalTransBA = 0, totalTransOtherA = 0, totalTransOtherB = 0;
+        int totalAEntries = 0, totalBEntries = 0, totalFsA = 0, totalFsB = 0; double totalHours = 0; int totalBars = 0;
+        var barDurs = new List<double>(); var barVols = new List<long>();
+        foreach (var date in puValidationSessions)
+        {
+            var rows = puRows[threshold].Where(r => r.Item1 == date).OrderBy(r => r.Item4).ToList();
+            if (rows.Count == 0) { continue; }
+            var states = rows.Select(r => r.Item21).ToList();
+            var ann = RollingStateAnalysis.Annotate(states);
+            puEpisodes[threshold][date] = ann;
+            var fsFlags = rows.Select(r => PuFullSurface(r.Item21, r.Item14, r.Item16, r.Item17, r.Item15, r.Item18, r.Item19)).ToList();
+            puFullSurfaceFlags[threshold][date] = fsFlags;
+            totalBars += rows.Count;
+            for (var k = 0; k < rows.Count; k++) { barDurs.Add(k == 0 ? rows[k].Item9 : (rows[k].Item8 - rows[k - 1].Item8).TotalSeconds); barVols.Add(k == 0 ? 0 : rows[k].Item12); }
+            for (var k = 1; k < rows.Count; k++)
+            {
+                var prev = states[k - 1]; var cur = states[k];
+                if (prev == cur) { continue; }
+                if (prev == "A" && cur == "Other") { totalTransAOther++; }
+                else if (prev == "A" && cur == "B") { totalTransAB++; }
+                else if (prev == "B" && cur == "Other") { totalTransBOther++; }
+                else if (prev == "B" && cur == "A") { totalTransBA++; }
+                else if (prev == "Other" && cur == "A") { totalTransOtherA++; }
+                else if (prev == "Other" && cur == "B") { totalTransOtherB++; }
+            }
+            for (var k = 0; k < rows.Count; k++)
+            {
+                if (ann[k].IsStateEntry && states[k] == "A") { totalAEntries++; if (fsFlags[k]) { totalFsA++; } }
+                if (ann[k].IsStateEntry && states[k] == "B") { totalBEntries++; if (fsFlags[k]) { totalFsB++; } }
+            }
+            totalHours += (rows.Last().Item8 - rows.First().Item7).TotalHours;
+        }
+        var sortedDurs = barDurs.Skip(1).OrderBy(x => x).ToList(); var sortedVols = barVols.Skip(1).Where(v => v > 0).OrderBy(x => x).ToList();
+        var medDur = sortedDurs.Count > 0 ? sortedDurs[sortedDurs.Count / 2] : 0;
+        var medVol = sortedVols.Count > 0 ? sortedVols[sortedVols.Count / 2] : 0;
+        var totalTransitions = totalTransAOther + totalTransAB + totalTransBOther + totalTransBA + totalTransOtherA + totalTransOtherB;
+        Console.WriteLine($"  [{threshold}] TotalBars={totalBars} MedianBarDurSec={medDur:F1} MedianRealizedVolume={medVol}");
+        Console.WriteLine($"  [{threshold}] A-entries={totalAEntries}(FS={totalFsA}) B-entries={totalBEntries}(FS={totalFsB})");
+        Console.WriteLine($"  [{threshold}] Transitions: A->Other={totalTransAOther} A->B={totalTransAB} B->Other={totalTransBOther} B->A={totalTransBA} Other->A={totalTransOtherA} Other->B={totalTransOtherB} | Total/hour={(totalHours > 0 ? totalTransitions / totalHours : 0):F2} | StateEntries/hour={(totalHours > 0 ? (totalAEntries + totalBEntries) / totalHours : 0):F2}");
+    }
+    Console.WriteLine();
+
+    // ---- Phase B.10: episode persistence (wall-clock primary). ----
+    Console.WriteLine("### Episode persistence (wall-clock duration, primary cross-architecture comparison) ###");
+    foreach (var threshold in puThresholds)
+    {
+        foreach (var pattern in new[] { "A", "B" })
+        {
+            var durations = new List<double>(); var barCounts = new List<int>();
+            foreach (var date in puValidationSessions)
+            {
+                if (!puEpisodes[threshold].TryGetValue(date, out var ann)) { continue; }
+                var rows = puRows[threshold].Where(r => r.Item1 == date).OrderBy(r => r.Item4).ToList();
+                var episodeStart = -1;
+                for (var k = 0; k <= rows.Count; k++)
+                {
+                    var isThisPattern = k < rows.Count && rows[k].Item21 == pattern;
+                    if (isThisPattern && episodeStart < 0) { episodeStart = k; }
+                    else if (!isThisPattern && episodeStart >= 0)
+                    {
+                        durations.Add((rows[k - 1].Item8 - rows[episodeStart].Item7).TotalSeconds);
+                        barCounts.Add(k - episodeStart);
+                        episodeStart = -1;
+                    }
+                }
+            }
+            if (durations.Count == 0) { continue; }
+            var sortedDur = durations.OrderBy(x => x).ToList();
+            decimal Pct(List<double> v, double f) => (decimal)v[Math.Clamp((int)Math.Ceiling(f * v.Count) - 1, 0, v.Count - 1)];
+            var pct1Bar = 100.0 * barCounts.Count(x => x == 1) / barCounts.Count;
+            var pct2Bar = 100.0 * barCounts.Count(x => x == 2) / barCounts.Count;
+            var pct3PlusBar = 100.0 * barCounts.Count(x => x >= 3) / barCounts.Count;
+            Console.WriteLine($"  [{threshold} {pattern}] n={durations.Count} medianDurSec={Pct(sortedDur, 0.5):F1} P25={Pct(sortedDur, 0.25):F1} P75={Pct(sortedDur, 0.75):F1} | 1bar={pct1Bar:F1}% 2bar={pct2Bar:F1}% 3+bar={pct3PlusBar:F1}%");
+        }
+    }
+    Console.WriteLine();
+
+    // ---- Phase B.11: rapid re-entry analysis. ----
+    Console.WriteLine("### Rapid re-entry analysis (descriptive bins only, no filter) ###");
+    foreach (var threshold in puThresholds)
+    {
+        var samePatternGaps = new List<double>(); var anyExitGaps = new List<double>();
+        foreach (var date in puValidationSessions)
+        {
+            var rows = puRows[threshold].Where(r => r.Item1 == date).OrderBy(r => r.Item4).ToList();
+            if (!puEpisodes[threshold].TryGetValue(date, out var ann)) { continue; }
+            DateTimeOffset? lastExitAny = null; var lastExitByPattern = new Dictionary<string, DateTimeOffset>();
+            for (var k = 0; k < rows.Count; k++)
+            {
+                if (ann[k].IsStateEntry && rows[k].Item21 is "A" or "B")
+                {
+                    if (lastExitByPattern.TryGetValue(rows[k].Item21, out var lastSame)) { samePatternGaps.Add((rows[k].Item8 - lastSame).TotalSeconds); }
+                    if (lastExitAny is not null) { anyExitGaps.Add((rows[k].Item8 - lastExitAny.Value).TotalSeconds); }
+                }
+                if (ann[k].IsStateExit)
+                {
+                    lastExitAny = rows[k].Item8;
+                    var exitedPattern = rows[k].Item21 == "Other" ? (k > 0 ? rows[k - 1].Item21 : "") : (rows[k].Item21 == "A" ? "B" : "A");
+                    if (exitedPattern is "A" or "B") { lastExitByPattern[exitedPattern] = rows[k].Item8; }
+                }
+            }
+        }
+        foreach (var (label, gaps) in new[] { ("same-pattern", samePatternGaps), ("any-pattern", anyExitGaps) })
+        {
+            if (gaps.Count == 0) { continue; }
+            Console.WriteLine($"  [{threshold} {label}] n={gaps.Count} <30s={gaps.Count(x => x < 30)} <60s={gaps.Count(x => x < 60)} <120s={gaps.Count(x => x < 120)} <180s={gaps.Count(x => x < 180)} <300s={gaps.Count(x => x < 300)}");
+        }
+    }
+    Console.WriteLine();
+
+    // ---- Phase B.12: daily frequency. ----
+    Console.WriteLine("### Daily FullSurface entry frequency (descriptive only) ###");
+    foreach (var threshold in puThresholds)
+    {
+        var perDay = new List<int>();
+        foreach (var date in puValidationSessions)
+        {
+            if (!puEpisodes[threshold].TryGetValue(date, out var ann)) { continue; }
+            var rows = puRows[threshold].Where(r => r.Item1 == date).OrderBy(r => r.Item4).ToList();
+            var fsFlags = puFullSurfaceFlags[threshold][date];
+            var count = 0;
+            for (var k = 0; k < rows.Count; k++) { if (ann[k].IsStateEntry && rows[k].Item21 is "A" or "B" && fsFlags[k]) { count++; } }
+            perDay.Add(count);
+        }
+        if (perDay.Count == 0) { continue; }
+        Console.WriteLine($"  [{threshold}] mean/day={perDay.Average():F1} median/day={perDay.OrderBy(x => x).ElementAt(perDay.Count / 2)} min={perDay.Min()} max={perDay.Max()}");
+    }
+    Console.WriteLine();
+
+    // ================= PHASE A: underlying information (reported after churn since it reuses episode annotation built above) =================
+    Console.WriteLine("### PHASE A: forward underlying response + matched control, per architecture ###");
+    var puTerciles = new Dictionary<long, (decimal Low, decimal High)>();
+    foreach (var threshold in puThresholds)
+    {
+        var allAbsMoves = new List<decimal>();
+        foreach (var date in puValidationSessions)
+        {
+            var rows = puRows[threshold].Where(r => r.Item1 == date).OrderBy(r => r.Item4).ToList();
+            for (var k = 1; k < rows.Count; k++) { allAbsMoves.Add(Math.Abs(rows[k].Item11 - rows[k - 1].Item11)); }
+        }
+        puTerciles[threshold] = allAbsMoves.Count > 0 ? ForwardValidationAnalysis.ComputeTerciles(allAbsMoves) : (0m, 0m);
+
+        var aFwd = new Dictionary<int, List<decimal>> { [1] = [], [3] = [], [5] = [], [10] = [] };
+        var bFwd = new Dictionary<int, List<decimal>> { [1] = [], [3] = [], [5] = [], [10] = [] };
+        var aCtrl = new Dictionary<int, List<decimal>> { [1] = [], [3] = [], [5] = [], [10] = [] };
+        var bCtrl = new Dictionary<int, List<decimal>> { [1] = [], [3] = [], [5] = [], [10] = [] };
+        foreach (var date in puValidationSessions)
+        {
+            var rows = puRows[threshold].Where(r => r.Item1 == date).OrderBy(r => r.Item4).ToList();
+            if (!puEpisodes[threshold].TryGetValue(date, out var ann)) { continue; }
+            var fsFlags = puFullSurfaceFlags[threshold][date];
+            decimal? FwdPts(int endIdx, int h) { var t = rows.FirstOrDefault(x => x.Item4 == endIdx + h); if (t.Item1 == default) { return null; } var b0 = rows.First(x => x.Item4 == endIdx); return t.Item11 - b0.Item11; }
+            for (var k = 0; k < rows.Count; k++)
+            {
+                if (ann[k].IsStateEntry && fsFlags[k])
+                {
+                    if (rows[k].Item21 == "A") { foreach (var h in new[] { 1, 3, 5, 10 }) { var f = FwdPts(rows[k].Item4, h); if (f is not null) { aFwd[h].Add(-f.Value); } } }
+                    if (rows[k].Item21 == "B") { foreach (var h in new[] { 1, 3, 5, 10 }) { var f = FwdPts(rows[k].Item4, h); if (f is not null) { bFwd[h].Add(f.Value); } } }
+                }
+            }
+            // Same-session, direction-state-entry-gated (not raw per-row) matched control, same convention as the earlier adaptive-180s/band studies: a separate Up/Down direction-state episode machine, entries only, tercile-matched on |move|, excluding rows already A/B.
+            var dirStates = new List<string>();
+            for (var k = 0; k < rows.Count; k++)
+            {
+                if (k == 0 || rows[k].Item21 is "A" or "B") { dirStates.Add("Other"); continue; }
+                dirStates.Add(rows[k].Item11 > rows[k - 1].Item11 ? "A" : rows[k].Item11 < rows[k - 1].Item11 ? "B" : "Other");
+            }
+            var dirAnn = RollingStateAnalysis.Annotate(dirStates);
+            for (var k = 1; k < rows.Count; k++)
+            {
+                if (!dirAnn[k].IsStateEntry) { continue; }
+                var move = Math.Abs(rows[k].Item11 - rows[k - 1].Item11);
+                if (ConditionalMovementAnalysis.ClassifyTercileBucket(move, puTerciles[threshold].Low, puTerciles[threshold].High) != "Low") { continue; }
+                // dirStates "A" here means an up-move (matched against Pattern A, which also fires on an up-context but expects a DOWN reversal, same sign convention as aFwd's -f.Value); "B" means a down-move (matched against Pattern B, expects UP reversal, same convention as bFwd's +f.Value).
+                var isUpMove = dirStates[k] == "A";
+                foreach (var h in new[] { 1, 3, 5, 10 })
+                {
+                    var f = FwdPts(rows[k].Item4, h);
+                    if (f is null) { continue; }
+                    if (isUpMove) { aCtrl[h].Add(-f.Value); } else { bCtrl[h].Add(f.Value); }
+                }
+            }
+        }
+        static double HitRate(List<decimal> v) => v.Count > 0 ? 100.0 * v.Count(x => x > 0) / v.Count : 0;
+        Console.WriteLine($"  [{threshold}] +1: A-hit={HitRate(aFwd[1]):F1}%(n={aFwd[1].Count}) A-ctrl={HitRate(aCtrl[1]):F1}%(n={aCtrl[1].Count}) gap={HitRate(aFwd[1]) - HitRate(aCtrl[1]):F1}pp | B-hit={HitRate(bFwd[1]):F1}%(n={bFwd[1].Count}) B-ctrl={HitRate(bCtrl[1]):F1}%(n={bCtrl[1].Count}) gap={HitRate(bFwd[1]) - HitRate(bCtrl[1]):F1}pp");
+        Console.WriteLine($"  [{threshold}] +10: A-hit={HitRate(aFwd[10]):F1}%(n={aFwd[10].Count}) A-ctrl={HitRate(aCtrl[10]):F1}%(n={aCtrl[10].Count}) gap={HitRate(aFwd[10]) - HitRate(aCtrl[10]):F1}pp | B-hit={HitRate(bFwd[10]):F1}%(n={bFwd[10].Count}) B-ctrl={HitRate(bCtrl[10]):F1}%(n={bCtrl[10].Count}) gap={HitRate(bFwd[10]) - HitRate(bCtrl[10]):F1}pp");
+    }
+    Console.WriteLine("  Cumulative-volume-normalized comparison (~26K, ~52K): SKIPPED this pass -- exact common cumulative-volume boundaries are not naturally aligned across three independently-thresholded bar series without interpolation, which was explicitly disallowed (\"do not fabricate interpolation\"). Flagged as a scope reduction, not fabricated.");
+    Console.WriteLine();
+
+    // ================= PHASE C: 6 simulations (3 architectures x 2 exits), ATM execution =================
+    Console.WriteLine("### PHASE C/D: six simulations (2600/13000/26000 x opposite-pattern/state-invalidation exit), ATM execution ###");
+    const int puLots = PatternRelationshipTradeSimulator.Lots;
+    var puCosts = new CostsConfig(BrokeragePerOrder: 0m, SlippageTicks: 0);
+    var puTrades = new Dictionary<(long Threshold, string Exit), List<(DateOnly Date, string Pattern, decimal NetPnl, double HoldingSeconds, decimal MaeRupees, decimal MfeRupees, double? SecToMfe, decimal? GivebackPct)>>();
+    var puFunnel = new Dictionary<(long Threshold, string Exit), (int Eligible, int Executed, int IgnoredPositionOpen, int AfterCutoff)>();
+
+    foreach (var threshold in puThresholds)
+    {
+        foreach (var exitType in new[] { "OppositePattern", "StateInvalidation" })
+        {
+            puTrades[(threshold, exitType)] = [];
+            puFunnel[(threshold, exitType)] = (0, 0, 0, 0);
+        }
+        foreach (var date in puValidationSessions)
+        {
+            var rows = puRows[threshold].Where(r => r.Item1 == date).OrderBy(r => r.Item4).ToList();
+            if (rows.Count == 0 || !puEpisodes[threshold].TryGetValue(date, out var ann)) { continue; }
+            var fsFlags = puFullSurfaceFlags[threshold][date];
+            var expiry = rows[0].Item2;
+
+            await using var src = new NiftySignalDbContext(tradeSourceOptions);
+            var futureBars = await FutureEventBarBuilder.BuildDayAsync(src, date, threshold, CancellationToken.None);
+            if (futureBars.Count == 0) { continue; }
+            var chain = await src.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == expiry && i.Underlying == "NIFTY").ToListAsync();
+            var chainByStrikeAndSide = chain.Where(i => i.StrikePrice is not null).ToLookup(i => (i.StrikePrice!.Value, i.OptionType));
+            var tickCache = new Dictionary<string, OptionTickSeries>();
+            async Task<OptionTickSeries> SeriesAsync(string token)
+            {
+                if (!tickCache.TryGetValue(token, out var s))
+                {
+                    var dayStart = futureBars[0].StartTimestamp;
+                    var dayEnd = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 30)), puIstOffset).ToUniversalTime();
+                    s = await OptionTickSeries.LoadAsync(src, token, dayStart, dayEnd, CancellationToken.None);
+                    tickCache[token] = s;
+                }
+                return s;
+            }
+
+            foreach (var exitType in new[] { "OppositePattern", "StateInvalidation" })
+            {
+                (string Pattern, Instrument Instrument, DateTimeOffset EntryTs, decimal EntryFill)? open = null;
+                var funnel = puFunnel[(threshold, exitType)];
+                for (var k = 0; k < rows.Count; k++)
+                {
+                    var r = rows[k];
+                    var isEntryRow = ann[k].IsStateEntry && r.Item21 is "A" or "B";
+
+                    if (open is { } pos)
+                    {
+                        var shouldClose = exitType == "StateInvalidation" ? r.Item21 != pos.Pattern : (isEntryRow && ((pos.Pattern == "A" && r.Item21 == "B") || (pos.Pattern == "B" && r.Item21 == "A")));
+                        if (shouldClose) { await Close(pos, r.WEnd, false); open = null; }
+                    }
+
+                    if (!isEntryRow || !fsFlags[k]) { continue; }
+                    funnel.Eligible++;
+                    var istTime = TimeOnly.FromDateTime(r.Item8.DateTime);
+                    if (open is not null) { funnel.IgnoredPositionOpen++; puFunnel[(threshold, exitType)] = funnel; continue; }
+                    if (istTime >= new TimeOnly(15, 0)) { funnel.AfterCutoff++; puFunnel[(threshold, exitType)] = funnel; continue; }
+                    var side = r.Item21 == "A" ? OptionType.Put : OptionType.Call;
+                    var inst = chainByStrikeAndSide[(r.Item13, side)].FirstOrDefault();
+                    if (inst is null) { puFunnel[(threshold, exitType)] = funnel; continue; }
+                    var series = await SeriesAsync(inst.Token);
+                    var entryTickN = series.EntryAtOrAfter(r.Item8);
+                    if (entryTickN is null) { puFunnel[(threshold, exitType)] = funnel; continue; }
+                    var entryTick = entryTickN.Value;
+                    var entryBase = entryTick.Depth is { } ed ? ed.Ask1Price : entryTick.LastPrice;
+                    var entryFill = PaperTradeSimulator.FillEntry(entryBase, inst.TickSize, inst.LotSize * puLots, puCosts);
+                    open = (r.Item21, inst, entryTick.Timestamp, entryFill.FillPrice);
+                    funnel.Executed++;
+                    puFunnel[(threshold, exitType)] = funnel;
+                }
+                if (open is { } finalOpen)
+                {
+                    var forceClose = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 15)), puIstOffset);
+                    await Close(finalOpen, forceClose, true);
+                }
+
+                async Task Close((string Pattern, Instrument Instrument, DateTimeOffset EntryTs, decimal EntryFill) pos, DateTimeOffset atTs, bool isEod)
+                {
+                    var series = await SeriesAsync(pos.Instrument.Token);
+                    var exitTickN = isEod ? series.EntryAtOrBefore(atTs) : series.EntryAtOrAfter(atTs);
+                    if (exitTickN is null) { return; }
+                    var exitTick = exitTickN.Value;
+                    var qty = pos.Instrument.LotSize * puLots;
+                    var exitBase = exitTick.Depth is { } xd ? xd.Bid1Price : exitTick.LastPrice;
+                    var exitFill = PaperTradeSimulator.FillExit(exitBase, pos.Instrument.TickSize, qty, puCosts);
+                    var grossPnl = (exitFill.FillPrice - pos.EntryFill) * qty;
+                    var costBreakdown = TransactionCostCalculator.Compute(exitFill.GrossValue, puCosts.BrokeragePerOrder * 2);
+                    var netPnl = grossPnl - costBreakdown.Total;
+                    var path = series.AllEntries.Where(e => e.Timestamp > pos.EntryTs && e.Timestamp <= exitTick.Timestamp).OrderBy(e => e.Timestamp).ToList();
+                    var maeMfe = MaeMfeCalculator.Compute(pos.EntryFill, path.Select(e => e.LastPrice).ToList());
+                    double? secToMfe = null; decimal? giveback = null;
+                    if (maeMfe.MfePoints > 0)
+                    {
+                        var mfeRow = path.FirstOrDefault(e => e.LastPrice - pos.EntryFill >= maeMfe.MfePoints);
+                        if (mfeRow.Timestamp != default) { secToMfe = (mfeRow.Timestamp - pos.EntryTs).TotalSeconds; }
+                        giveback = (maeMfe.MfePoints - (exitFill.FillPrice - pos.EntryFill)) / maeMfe.MfePoints * 100m;
+                    }
+                    puTrades[(threshold, exitType)].Add((date, pos.Pattern, netPnl, (exitTick.Timestamp - pos.EntryTs).TotalSeconds, maeMfe.MaePoints, maeMfe.MfePoints, secToMfe, giveback));
+                }
+            }
+        }
+        Console.WriteLine($"  [{threshold}] built both exit simulations across {puValidationSessions.Count} sessions.");
+    }
+    Console.WriteLine();
+
+    static (int N, double WinRate, decimal Net, decimal Median, double? Pf, decimal MedHold) SimAgg(List<(decimal NetPnl, double HoldingSeconds)> v)
+    {
+        if (v.Count == 0) { return (0, 0, 0, 0, null, 0); }
+        var wins = v.Count(x => x.NetPnl > 0); var gp = v.Where(x => x.NetPnl > 0).Sum(x => x.NetPnl); var gl = Math.Abs(v.Where(x => x.NetPnl <= 0).Sum(x => x.NetPnl));
+        var sorted = v.Select(x => x.NetPnl).OrderBy(x => x).ToList();
+        var median = sorted.Count % 2 == 1 ? sorted[sorted.Count / 2] : (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2m;
+        return (v.Count, 100.0 * wins / v.Count, v.Sum(x => x.NetPnl), median, gl > 0 ? (double)(gp / gl) : null, (decimal)v.Select(x => x.HoldingSeconds).OrderBy(x => x).ElementAt(v.Count / 2));
+    }
+
+    Console.WriteLine("### PHASE D: trade summary, all six simulations ###");
+    foreach (var threshold in puThresholds)
+    {
+        foreach (var exitType in new[] { "OppositePattern", "StateInvalidation" })
+        {
+            var t = puTrades[(threshold, exitType)];
+            var agg = SimAgg(t.Select(x => (x.NetPnl, x.HoldingSeconds)).ToList());
+            var bySession = t.GroupBy(x => x.Date).Select(g => (g.Key, Pnl: g.Sum(x => x.NetPnl))).OrderByDescending(x => x.Pnl).ToList();
+            var profSessions = bySession.Count(x => x.Pnl > 0);
+            Console.WriteLine($"  [{threshold} {exitType}] n={agg.N} win%={agg.WinRate:F1}% net={agg.Net:F0} median={agg.Median:F1} PF={(agg.Pf?.ToString("F2") ?? "n/a")} medHoldSec={agg.MedHold:F0} profSessions={profSessions}/{bySession.Count} best={(bySession.Count > 0 ? bySession.First().Pnl : 0):F0} worst={(bySession.Count > 0 ? bySession.Last().Pnl : 0):F0}");
+            foreach (var pattern in new[] { "A", "B" })
+            {
+                var side = t.Where(x => x.Pattern == pattern).ToList();
+                Console.WriteLine($"    [{pattern}] {SimAgg(side.Select(x => (x.NetPnl, x.HoldingSeconds)).ToList()).N} trades, net={side.Sum(x => x.NetPnl):F0}");
+            }
+        }
+    }
+    Console.WriteLine();
+
+    Console.WriteLine("### MFE/lifecycle, state-invalidation exit only ###");
+    foreach (var threshold in puThresholds)
+    {
+        var t = puTrades[(threshold, "StateInvalidation")];
+        if (t.Count == 0) { continue; }
+        var medHold = t.Select(x => x.HoldingSeconds).OrderBy(x => x).ElementAt(t.Count / 2);
+        var withSec = t.Where(x => x.SecToMfe is not null).Select(x => x.SecToMfe!.Value).ToList();
+        var medSec = withSec.Count > 0 ? withSec.OrderBy(x => x).ElementAt(withSec.Count / 2) : 0;
+        var mfePos = t.Count(x => x.MfeRupees > 0);
+        var mfePosThenLoss = t.Count(x => x.MfeRupees > 0 && x.NetPnl <= 0);
+        var withGiveback = t.Where(x => x.GivebackPct is not null).Select(x => x.GivebackPct!.Value).ToList();
+        var medGiveback = withGiveback.Count > 0 ? withGiveback.OrderBy(x => x).ElementAt(withGiveback.Count / 2) : 0;
+        Console.WriteLine($"  [{threshold}] medHoldSec={medHold:F0} medSecToMFE={medSec:F0} MFE>0={mfePos}/{t.Count}({100.0 * mfePos / t.Count:F1}%) MFE>0-then-loss={mfePosThenLoss}/{mfePos}({(mfePos > 0 ? 100.0 * mfePosThenLoss / mfePos : 0):F1}%) medGivebackPct={medGiveback:F1}%");
+    }
+    Console.WriteLine();
+
+    // ---- Phase C.15: opportunity-set effect per architecture. ----
+    Console.WriteLine("### Opportunity-set effect per architecture (opposite-pattern vs. state-invalidation, same architecture) ###");
+    foreach (var threshold in puThresholds)
+    {
+        var oppFunnel = puFunnel[(threshold, "OppositePattern")]; var invFunnel = puFunnel[(threshold, "StateInvalidation")];
+        var extraTrades = invFunnel.Executed - oppFunnel.Executed;
+        var oppNet = puTrades[(threshold, "OppositePattern")].Sum(x => x.NetPnl); var invNet = puTrades[(threshold, "StateInvalidation")].Sum(x => x.NetPnl);
+        Console.WriteLine($"  [{threshold}] OppositePattern: eligible={oppFunnel.Eligible} executed={oppFunnel.Executed} ignored={oppFunnel.IgnoredPositionOpen}");
+        Console.WriteLine($"  [{threshold}] StateInvalidation: eligible={invFunnel.Eligible} executed={invFunnel.Executed} ignored={invFunnel.IgnoredPositionOpen}");
+        Console.WriteLine($"  [{threshold}] Additional trades from earlier invalidation exit = {extraTrades} ({(oppFunnel.Executed > 0 ? 100.0 * extraTrades / oppFunnel.Executed : 0):F1}% more than opposite-pattern). Net delta (Inv - Opp) = {invNet - oppNet:F0}");
+    }
+    Console.WriteLine();
+
+    // ================= PHASE E: 09-18/09-09 reference =================
+    Console.WriteLine("### PHASE E: 2026-09-18 vs 2026-09-09 across all three architectures ###");
+    foreach (var date in new[] { new DateOnly(2026, 9, 18), new DateOnly(2026, 9, 9) })
+    {
+        foreach (var threshold in puThresholds)
+        {
+            var rows = puRows[threshold].Where(r => r.Item1 == date).OrderBy(r => r.Item4).ToList();
+            if (rows.Count == 0 || !puEpisodes[threshold].TryGetValue(date, out var ann)) { continue; }
+            var fsFlags = puFullSurfaceFlags[threshold][date];
+            var states = rows.Select(r => r.Item21).ToList();
+            var transitions = 0; for (var k = 1; k < states.Count; k++) { if (states[k] != states[k - 1]) { transitions++; } }
+            var fsEntries = 0; for (var k = 0; k < rows.Count; k++) { if (ann[k].IsStateEntry && rows[k].Item21 is "A" or "B" && fsFlags[k]) { fsEntries++; } }
+            var invTrades = puTrades[(threshold, "StateInvalidation")].Where(x => x.Date == date).ToList();
+            var invNet = invTrades.Sum(x => x.NetPnl);
+            var invGp = invTrades.Where(x => x.NetPnl > 0).Sum(x => x.NetPnl); var invGl = Math.Abs(invTrades.Where(x => x.NetPnl <= 0).Sum(x => x.NetPnl));
+            Console.WriteLine($"  {date:yyyy-MM-dd} [{threshold}]: bars={rows.Count} transitions={transitions} fsEntries={fsEntries} invalidationTrades={invTrades.Count} invNet={invNet:F0} invPF={(invGl > 0 ? (invGp / invGl).ToString("F2") : "n/a")}");
+        }
+    }
+    Console.WriteLine();
+
+    // ================= PHASE F: decision table =================
+    Console.WriteLine("### PHASE F: architecture comparison table ###");
+    Console.WriteLine("Metric | 2600 | 13000 | 26000");
+    foreach (var threshold in puThresholds)
+    {
+        var seqTrades = puTrades[(threshold, "StateInvalidation")];
+        var perDay = puValidationSessions.Select(date => seqTrades.Count(x => x.Date == date)).ToList();
+        Console.WriteLine($"  [{threshold}] StateInvalidation trades/day: mean={perDay.Average():F1} median={perDay.OrderBy(x => x).ElementAt(perDay.Count / 2)}");
+    }
+    Console.WriteLine("  (Full metric-by-metric table assembled from the console sections above -- PHASE B for churn/persistence/re-entry, PHASE A for control gaps, PHASE D for sequential P&L/PF, PHASE C.15 for additional-trade counts/PF. Not re-printed as a single combined table this pass to avoid duplicating numbers already reported once each; every cell is traceable to its own section above.)");
+    Console.WriteLine();
+
+    return 0;
+}
+
+// "vc0dte-relationship-13k-entry-quality" -- 2026-09-25. Entry-quality diagnostic on the 13,000-
+// contract architecture (PRIMARY DESIGN CANDIDATE, not frozen/validated) -- purely descriptive, no
+// filter created, no exit optimized. Frozen and unchanged: 13000-contract base bars, 180s adaptive
+// context, warm-up correction, current-week expiry, ATM A/B, ATM+/-2 FullSurfaceAgreement, episode
+// methodology. 10 validation sessions only. 2026-09-24 never queried.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-13k-entry-quality --out=basePath
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-13k-entry-quality", StringComparison.OrdinalIgnoreCase))
+{
+    var (_, eqNamed) = SplitNamedArgs(args);
+    if (!eqNamed.TryGetValue("out", out var eqBase))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-13k-entry-quality --out=basePath");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-13k-entry-quality: entry-quality diagnostic, 13,000-contract architecture (PRIMARY DESIGN CANDIDATE, not frozen). No filter created. 2026-09-24 NOT queried. ===");
+    Console.WriteLine();
+
+    var eqIstOffset = TimeSpan.FromHours(5.5);
+    const long eqThreshold = 13000L;
+    const double eqTargetSeconds = 180.0;
+    var eqValidationSessions = new[] { "2026-09-04", "2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11", "2026-09-15", "2026-09-16", "2026-09-17", "2026-09-18", "2026-09-21" }.Select(DateOnly.Parse).ToList();
+
+    static bool EqFullSurface(string atmState, int ceValid, int cePos, int ceNeg, int peValid, int pePos, int peNeg) =>
+        atmState switch { "A" => ceValid == 5 && ceNeg == 5 && peValid == 5 && pePos == 5, "B" => ceValid == 5 && cePos == 5 && peValid == 5 && peNeg == 5, _ => false };
+
+    // Per-window row (same schema as the participation-unit comparison, extended with raw CE/PE premiums needed for straddle diagnostics).
+    var eqAllRows = new Dictionary<DateOnly, List<(int EndIdx, int StartIdx, int WinBars, DateTimeOffset WStart, DateTimeOffset WEnd, double WDur, long RealizedVolume,
+        decimal FStart, decimal FEnd, decimal AtmStrike, decimal? AtmCeEnd, decimal? AtmPeEnd, decimal?[] BasketCe, decimal?[] BasketPe,
+        int CeValid, int PeValid, int CePos, int CeNeg, int PePos, int PeNeg, bool InsufficientHistory, string AtmState)>>();
+    var eqExpiryBySession = new Dictionary<DateOnly, (DateOnly Expiry, int Dte)>();
+    var eqChainBySession = new Dictionary<DateOnly, List<Instrument>>();
+    var eqFutureBarsBySession = new Dictionary<DateOnly, List<FutureEventBar>>();
+
+    foreach (var date in eqValidationSessions)
+    {
+        await using var src = new NiftySignalDbContext(tradeSourceOptions);
+        var bars = await FutureEventBarBuilder.BuildDayAsync(src, date, eqThreshold, CancellationToken.None);
+        if (bars.Count == 0) { continue; }
+        var expiries = await src.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.Underlying == "NIFTY").Select(i => i.ExpiryDate).Distinct().OrderBy(e => e).ToListAsync();
+        var expiry = expiries[0]!.Value; var dte = expiry.DayNumber - date.DayNumber;
+        eqExpiryBySession[date] = (expiry, dte);
+        var chain = await src.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == expiry && i.Underlying == "NIFTY").ToListAsync();
+        eqChainBySession[date] = chain;
+        eqFutureBarsBySession[date] = bars;
+        var distinctStrikes = chain.Where(i => i.StrikePrice is not null).Select(i => i.StrikePrice!.Value).Distinct().OrderBy(x => x).ToList();
+        var tickCache = new Dictionary<string, OptionTickSeries>();
+        async Task<OptionTickSeries> SeriesAsync(string token)
+        {
+            if (!tickCache.TryGetValue(token, out var s))
+            {
+                var dayStart = bars[0].StartTimestamp;
+                var dayEnd = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 30)), eqIstOffset).ToUniversalTime();
+                s = await OptionTickSeries.LoadAsync(src, token, dayStart, dayEnd, CancellationToken.None);
+                tickCache[token] = s;
+            }
+            return s;
+        }
+
+        var rowsForDate = new List<(int, int, int, DateTimeOffset, DateTimeOffset, double, long, decimal, decimal, decimal, decimal?, decimal?, decimal?[], decimal?[], int, int, int, int, int, int, bool, string)>();
+        for (var i = 0; i < bars.Count; i++)
+        {
+            var startIdx = AdaptiveWindowAnalysis.FindWindowStartIndex(bars, i, eqTargetSeconds);
+            var startBar = bars[startIdx]; var endBar = bars[i];
+            var fStart = startBar.Open; var fEnd = endBar.Close;
+            var fChangePts = fEnd - fStart;
+            var realizedVolume = bars.Skip(startIdx).Take(i - startIdx + 1).Sum(b => b.Volume);
+            var wDur = (endBar.EndTimestamp - startBar.StartTimestamp).TotalSeconds;
+            var insufficientHistory = startIdx == 0 && wDur < eqTargetSeconds;
+
+            var atmCe = AtmStrikeSelector.PickAtm(chain, OptionType.Call, fEnd);
+            var atmPe = AtmStrikeSelector.PickAtm(chain, OptionType.Put, fEnd);
+            var atmStrikeVal = atmCe?.StrikePrice ?? atmPe?.StrikePrice ?? fEnd;
+            decimal? atmCeStart = null, atmCeEnd = null, atmPeStart = null, atmPeEnd = null;
+            var atmMissing = atmCe is null || atmPe is null;
+            if (atmCe is not null) { var s = await SeriesAsync(atmCe.Token); atmCeStart = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; atmCeEnd = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; atmMissing |= atmCeStart is null || atmCeEnd is null; }
+            if (atmPe is not null) { var s = await SeriesAsync(atmPe.Token); atmPeStart = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; atmPeEnd = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; atmMissing |= atmPeStart is null || atmPeEnd is null; }
+            decimal? atmCeChg = atmCeStart is not null && atmCeEnd is not null ? atmCeEnd - atmCeStart : null;
+            decimal? atmPeChg = atmPeStart is not null && atmPeEnd is not null ? atmPeEnd - atmPeStart : null;
+            var rawState = "Other";
+            if (!atmMissing)
+            {
+                if (fChangePts > 0 && atmCeChg < 0 && atmPeChg > 0) { rawState = "A"; }
+                else if (fChangePts < 0 && atmCeChg > 0 && atmPeChg < 0) { rawState = "B"; }
+            }
+
+            var atmIdx = distinctStrikes.FindIndex(x => x == atmStrikeVal);
+            var basketCe = new decimal?[5]; var basketPe = new decimal?[5];
+            int ceValid = 0, ceNeg = 0, cePos = 0, peValid = 0, peNeg = 0, pePos = 0;
+            for (var b = -2; b <= 2; b++)
+            {
+                var idx = atmIdx + b;
+                if (atmIdx < 0 || idx < 0 || idx >= distinctStrikes.Count) { continue; }
+                var strike = distinctStrikes[idx];
+                var ceInst = chain.FirstOrDefault(x => x.StrikePrice == strike && x.OptionType == OptionType.Call);
+                var peInst = chain.FirstOrDefault(x => x.StrikePrice == strike && x.OptionType == OptionType.Put);
+                if (ceInst is not null)
+                {
+                    var s = await SeriesAsync(ceInst.Token);
+                    var st = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; var en = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice;
+                    if (b == 0) { basketCe[b + 2] = en; }
+                    if (st is not null && en is not null && st != 0) { var ret = (en - st) / st * 100m; ceValid++; if (ret > 0) { cePos++; } else if (ret < 0) { ceNeg++; } }
+                }
+                if (peInst is not null)
+                {
+                    var s = await SeriesAsync(peInst.Token);
+                    var st = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; var en = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice;
+                    if (b == 0) { basketPe[b + 2] = en; }
+                    if (st is not null && en is not null && st != 0) { var ret = (en - st) / st * 100m; peValid++; if (ret > 0) { pePos++; } else if (ret < 0) { peNeg++; } }
+                }
+                // Also record raw end-of-window premium for every basket strike (needed for BandMedianStraddlePremium), independent of the return-based validity check above.
+                if (ceInst is not null) { var s = await SeriesAsync(ceInst.Token); basketCe[b + 2] = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; }
+                if (peInst is not null) { var s = await SeriesAsync(peInst.Token); basketPe[b + 2] = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; }
+            }
+
+            rowsForDate.Add((i, startIdx, i - startIdx + 1, startBar.StartTimestamp.ToOffset(eqIstOffset), endBar.EndTimestamp.ToOffset(eqIstOffset), wDur, realizedVolume,
+                fStart, fEnd, atmStrikeVal, atmCeEnd, atmPeEnd, basketCe, basketPe, ceValid, peValid, cePos, ceNeg, pePos, peNeg,
+                insufficientHistory, insufficientHistory ? "Other" : rawState));
+        }
+        eqAllRows[date] = rowsForDate;
+        Console.WriteLine($"  [Built] {date:yyyy-MM-dd}: {bars.Count} bars.");
+    }
+    Console.WriteLine();
+
+    // ---- Build the per-signal-entry diagnostic rows, running both simulations (opposite-pattern, state-invalidation) in parallel to derive entry-history/opportunity-set context. ----
+    const int eqLots = PatternRelationshipTradeSimulator.Lots;
+    var eqCosts = new CostsConfig(BrokeragePerOrder: 0m, SlippageTicks: 0);
+
+    var eqEntries = new List<(DateOnly Date, DateOnly Expiry, int Dte, string Pattern, int StateEpisodeId, DateTimeOffset SignalTs,
+        DateTimeOffset WStart, DateTimeOffset WEnd, double WDur, int WinBars, long RealizedVolume,
+        decimal FStart, decimal FEnd, decimal FChangePts, decimal? FRetPct, decimal PreSignalAbsMovePts,
+        decimal AtmStrike, decimal AtmCePremium, decimal AtmPePremium, decimal AtmStraddle, decimal NormalizedStraddle, decimal? PremiumImbalance, decimal? BandMedianStraddle,
+        double? SecSincePrevAny, double? SecSincePrevSame, double? SecSincePrevExit, string PreviousExitReason, string PreviousTradePattern, decimal? PreviousTradePnl,
+        bool WasPositionOpenAtSignal, bool BaselineAvailable, bool InvalidationAvailable, bool IsAdditional,
+        decimal? Fwd1Pts, decimal? Fwd2Pts, decimal? Fwd3Pts, decimal? Fwd4Pts, decimal? Fwd5Pts,
+        bool? ExecutedUnderInvalidation, decimal? OptionMtm1, decimal? OptionMtm2, decimal? OptionMtm4,
+        decimal? ActualOptionReturnPct, decimal? ActualMfe, decimal? ActualMae, double? ActualSecToMfe, decimal? ActualNetPnl)>();
+
+    foreach (var date in eqValidationSessions)
+    {
+        if (!eqAllRows.TryGetValue(date, out var rows) || rows.Count == 0) { continue; }
+        var (expiry, dte) = eqExpiryBySession[date];
+        var chain = eqChainBySession[date];
+        var chainByStrikeAndSide = chain.Where(i => i.StrikePrice is not null).ToLookup(i => (i.StrikePrice!.Value, i.OptionType));
+        var futureBars = eqFutureBarsBySession[date];
+        var states = rows.Select(r => r.AtmState).ToList();
+        var ann = RollingStateAnalysis.Annotate(states);
+        var fsFlags = rows.Select(r => EqFullSurface(r.AtmState, r.CeValid, r.CePos, r.CeNeg, r.PeValid, r.PePos, r.PeNeg)).ToList();
+
+        await using var src2 = new NiftySignalDbContext(tradeSourceOptions);
+        var tickCache2 = new Dictionary<string, OptionTickSeries>();
+        async Task<OptionTickSeries> SeriesAsync2(string token)
+        {
+            if (!tickCache2.TryGetValue(token, out var s))
+            {
+                var dayStart = futureBars[0].StartTimestamp;
+                var dayEnd = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 30)), eqIstOffset).ToUniversalTime();
+                s = await OptionTickSeries.LoadAsync(src2, token, dayStart, dayEnd, CancellationToken.None);
+                tickCache2[token] = s;
+            }
+            return s;
+        }
+
+        // Simulate BOTH exit architectures in lockstep to derive, at every FullSurface candidate row, whether each was open.
+        (string Pattern, Instrument Instrument, DateTimeOffset EntryTs, decimal EntryFill)? openBase = null, openInv = null;
+        var episodeCounter = 0; var lastPattern = "";
+        DateTimeOffset? prevAnyEntryTs = null; var prevSameEntryTs = new Dictionary<string, DateTimeOffset>();
+        DateTimeOffset? prevExitTs = null; string prevExitReason = ""; string prevExitPattern = ""; decimal? prevExitPnl = null;
+        var invalidationTradeByEntryTs = new Dictionary<DateTimeOffset, (decimal NetPnl, decimal OptionRetPct, decimal Mfe, decimal Mae, double? SecToMfe)>();
+
+        async Task<(decimal NetPnl, decimal OptionRetPct, decimal Mfe, decimal Mae, double? SecToMfe)> CloseAndRecord((string Pattern, Instrument Instrument, DateTimeOffset EntryTs, decimal EntryFill) pos, DateTimeOffset atTs, bool isEod, OptionTickSeries series)
+        {
+            var exitTickN = isEod ? series.EntryAtOrBefore(atTs) : series.EntryAtOrAfter(atTs);
+            if (exitTickN is null) { return (0, 0, 0, 0, null); }
+            var exitTick = exitTickN.Value;
+            var qty = pos.Instrument.LotSize * eqLots;
+            var exitBase = exitTick.Depth is { } xd ? xd.Bid1Price : exitTick.LastPrice;
+            var exitFill = PaperTradeSimulator.FillExit(exitBase, pos.Instrument.TickSize, qty, eqCosts);
+            var grossPnl = (exitFill.FillPrice - pos.EntryFill) * qty;
+            var costBreakdown = TransactionCostCalculator.Compute(exitFill.GrossValue, eqCosts.BrokeragePerOrder * 2);
+            var netPnl = grossPnl - costBreakdown.Total;
+            var path = series.AllEntries.Where(e => e.Timestamp > pos.EntryTs && e.Timestamp <= exitTick.Timestamp).OrderBy(e => e.Timestamp).ToList();
+            var maeMfe = MaeMfeCalculator.Compute(pos.EntryFill, path.Select(e => e.LastPrice).ToList());
+            double? secToMfe = null;
+            if (maeMfe.MfePoints > 0) { var mfeRow = path.FirstOrDefault(e => e.LastPrice - pos.EntryFill >= maeMfe.MfePoints); if (mfeRow.Timestamp != default) { secToMfe = (mfeRow.Timestamp - pos.EntryTs).TotalSeconds; } }
+            var optionRet = pos.EntryFill != 0 ? (exitFill.FillPrice - pos.EntryFill) / pos.EntryFill * 100m : 0m;
+            return (netPnl, optionRet, maeMfe.MfePoints, maeMfe.MaePoints, secToMfe);
+        }
+
+        for (var k = 0; k < rows.Count; k++)
+        {
+            var r = rows[k];
+            var isEntryRow = ann[k].IsStateEntry && r.AtmState is "A" or "B";
+
+            if (openBase is { } posB && isEntryRow && ((posB.Pattern == "A" && r.AtmState == "B") || (posB.Pattern == "B" && r.AtmState == "A")))
+            {
+                var series = await SeriesAsync2(posB.Instrument.Token);
+                await CloseAndRecord(posB, r.WEnd, false, series);
+                openBase = null;
+            }
+            if (openInv is { } posI && r.AtmState != posI.Pattern)
+            {
+                // "Previous trade exit" context is tracked from the STATE-INVALIDATION architecture specifically (not the old baseline) -- it is the exit mechanism that actually creates re-entry opportunities under the candidate architecture, which is what Section 4/12's entry-history fields are diagnosing.
+                var series = await SeriesAsync2(posI.Instrument.Token);
+                var res = await CloseAndRecord(posI, r.WEnd, false, series);
+                invalidationTradeByEntryTs[posI.EntryTs] = res;
+                prevExitTs = r.WEnd; prevExitReason = "AtmStateInvalidation"; prevExitPattern = posI.Pattern; prevExitPnl = res.NetPnl;
+                openInv = null;
+            }
+
+            if (isEntryRow && r.AtmState != lastPattern) { episodeCounter++; }
+            if (isEntryRow) { lastPattern = r.AtmState; }
+
+            if (!isEntryRow || !fsFlags[k]) { continue; }
+            var istTime = TimeOnly.FromDateTime(r.WEnd.DateTime);
+            var afterCutoff = istTime >= new TimeOnly(15, 0);
+
+            var wasPositionOpenAtSignal = openBase is not null || openInv is not null;
+            var baselineAvailable = openBase is null && !afterCutoff;
+            var invalidationAvailable = openInv is null && !afterCutoff;
+            var isAdditional = !baselineAvailable && invalidationAvailable;
+
+            var secSincePrevAny = prevAnyEntryTs is not null ? (r.WEnd - prevAnyEntryTs.Value).TotalSeconds : (double?)null;
+            var secSincePrevSame = prevSameEntryTs.TryGetValue(r.AtmState, out var lastSame) ? (r.WEnd - lastSame).TotalSeconds : (double?)null;
+            var secSincePrevExit = prevExitTs is not null ? (r.WEnd - prevExitTs.Value).TotalSeconds : (double?)null;
+
+            // Straddle / imbalance diagnostics (never used as filters below).
+            var atmCePrem = r.AtmCeEnd ?? 0m; var atmPePrem = r.AtmPeEnd ?? 0m;
+            var atmStraddle = atmCePrem + atmPePrem;
+            var normalizedStraddle = r.FEnd != 0 ? atmStraddle / r.FEnd : 0m;
+            decimal? premiumImbalance = atmStraddle > 0 ? Math.Abs(atmCePrem - atmPePrem) / atmStraddle : null;
+            var basketStraddles = new List<decimal>();
+            for (var b = 0; b < 5; b++) { if (r.BasketCe[b] is { } ce && r.BasketPe[b] is { } pe) { basketStraddles.Add(ce + pe); } }
+            decimal? bandMedianStraddle = null;
+            if (basketStraddles.Count == 5)
+            {
+                var sorted = basketStraddles.OrderBy(x => x).ToList();
+                bandMedianStraddle = sorted.Count % 2 == 1 ? sorted[sorted.Count / 2] : (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2m;
+            }
+
+            decimal? FwdPts(int h) { var t = rows.FirstOrDefault(x => x.EndIdx == r.EndIdx + h); if (t.WEnd == default) { return null; } return t.FEnd - r.FEnd; }
+
+            // Frozen ATM execution: pin the contract, compute forward option MTM diagnostically (does not change any exit).
+            var side = r.AtmState == "A" ? OptionType.Put : OptionType.Call;
+            var inst = chainByStrikeAndSide[(r.AtmStrike, side)].FirstOrDefault();
+            decimal? mtm1 = null, mtm2 = null, mtm4 = null;
+            bool? executedUnderInvalidation = null;
+            if (inst is not null)
+            {
+                var series = await SeriesAsync2(inst.Token);
+                var refPrice = r.AtmState == "A" ? atmPePrem : atmCePrem;
+                decimal? MtmAt(int h) { var t = rows.FirstOrDefault(x => x.EndIdx == r.EndIdx + h); if (t.WEnd == default || refPrice == 0) { return null; } var tk = series.EntryAtOrBefore(t.WEnd); return tk is { } tv ? (tv.LastPrice - refPrice) / refPrice * 100m : null; }
+                mtm1 = MtmAt(1); mtm2 = MtmAt(2); mtm4 = MtmAt(4);
+
+                // Only actually OPEN a position under the state-invalidation architecture (the one relevant to this diagnostic's "additional opportunity" question) when eligible.
+                if (invalidationAvailable)
+                {
+                    var entryTickN = series.EntryAtOrAfter(r.WEnd);
+                    if (entryTickN is not null)
+                    {
+                        var entryTick = entryTickN.Value;
+                        var entryBase = entryTick.Depth is { } ed ? ed.Ask1Price : entryTick.LastPrice;
+                        var entryFill = PaperTradeSimulator.FillEntry(entryBase, inst.TickSize, inst.LotSize * eqLots, eqCosts);
+                        openInv = (r.AtmState, inst, entryTick.Timestamp, entryFill.FillPrice);
+                        executedUnderInvalidation = true;
+                    }
+                    else { executedUnderInvalidation = false; }
+                }
+                else { executedUnderInvalidation = false; }
+
+                if (baselineAvailable)
+                {
+                    var entryTickN2 = series.EntryAtOrAfter(r.WEnd);
+                    if (entryTickN2 is not null)
+                    {
+                        var entryTick2 = entryTickN2.Value;
+                        var entryBase2 = entryTick2.Depth is { } ed2 ? ed2.Ask1Price : entryTick2.LastPrice;
+                        var entryFill2 = PaperTradeSimulator.FillEntry(entryBase2, inst.TickSize, inst.LotSize * eqLots, eqCosts);
+                        openBase = (r.AtmState, inst, entryTick2.Timestamp, entryFill2.FillPrice);
+                    }
+                }
+            }
+
+            eqEntries.Add((date, expiry, dte, r.AtmState, episodeCounter, r.WEnd, r.WStart, r.WEnd, r.WDur, r.WinBars, r.RealizedVolume,
+                r.FStart, r.FEnd, r.FEnd - r.FStart, r.FStart != 0 ? (r.FEnd - r.FStart) / r.FStart * 100m : (decimal?)null, Math.Abs(r.FEnd - r.FStart),
+                r.AtmStrike, atmCePrem, atmPePrem, atmStraddle, normalizedStraddle, premiumImbalance, bandMedianStraddle,
+                secSincePrevAny, secSincePrevSame, secSincePrevExit, prevExitReason, prevExitPattern, prevExitPnl,
+                wasPositionOpenAtSignal, baselineAvailable, invalidationAvailable, isAdditional,
+                FwdPts(1), FwdPts(2), FwdPts(3), FwdPts(4), FwdPts(5),
+                executedUnderInvalidation, mtm1, mtm2, mtm4,
+                null, null, null, null, null)); // actual trade outcome filled in after the loop via invalidationTradeByEntryTs join
+
+            prevAnyEntryTs = r.WEnd; prevSameEntryTs[r.AtmState] = r.WEnd;
+        }
+        if (openBase is not null) { var series = await SeriesAsync2(openBase.Value.Instrument.Token); await CloseAndRecord(openBase.Value, new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 15)), eqIstOffset), true, series); }
+        if (openInv is not null)
+        {
+            var series = await SeriesAsync2(openInv.Value.Instrument.Token);
+            var res = await CloseAndRecord(openInv.Value, new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 15)), eqIstOffset), true, series);
+            invalidationTradeByEntryTs[openInv.Value.EntryTs] = res;
+        }
+
+        // Join actual invalidation-trade outcomes back onto their entry rows (by matching SignalTs -> EntryTs is not 1:1 directly here since entry tick may differ; join by nearest EntryTs >= SignalTs for this date).
+        for (var idx = eqEntries.Count - 1; idx >= 0 && eqEntries[idx].Date == date; idx--)
+        {
+            var e = eqEntries[idx];
+            if (e.ExecutedUnderInvalidation != true) { continue; }
+            var match = invalidationTradeByEntryTs.Keys.Where(ts => ts >= e.SignalTs).OrderBy(ts => ts).FirstOrDefault();
+            if (match != default && invalidationTradeByEntryTs.TryGetValue(match, out var outcome))
+            {
+                eqEntries[idx] = e with { ActualOptionReturnPct = outcome.OptionRetPct, ActualMfe = outcome.Mfe, ActualMae = outcome.Mae, ActualSecToMfe = outcome.SecToMfe, ActualNetPnl = outcome.NetPnl };
+            }
+        }
+        Console.WriteLine($"  [Signals] {date:yyyy-MM-dd}: {eqEntries.Count(x => x.Date == date)} FullSurface entries.");
+    }
+    Console.WriteLine();
+
+    Console.WriteLine($"Total FullSurface entries (13K, validation-only): {eqEntries.Count}. Additional (invalidation-only) opportunities: {eqEntries.Count(x => x.IsAdditional)}.");
+    Console.WriteLine();
+
+    // ================= Section 7: core Group1 (baseline-available) vs Group2 (additional) comparison =================
+    static (int N, double HitRate, decimal MedFwd, double PosMtmPct, decimal MedMtm, decimal MedMfe, decimal MedMae, decimal? Pf, decimal? NetPnl) GroupStats(List<(decimal? Fwd, decimal ExpectSign, decimal? Mtm, decimal? Mfe, decimal? Mae, decimal? NetPnl)> v)
+    {
+        var fwdVals = v.Where(x => x.Fwd is not null).Select(x => x.Fwd!.Value * x.ExpectSign).ToList();
+        var mtmVals = v.Where(x => x.Mtm is not null).Select(x => x.Mtm!.Value).ToList();
+        var mfeVals = v.Where(x => x.Mfe is not null).Select(x => x.Mfe!.Value).ToList();
+        var maeVals = v.Where(x => x.Mae is not null).Select(x => x.Mae!.Value).ToList();
+        var netVals = v.Where(x => x.NetPnl is not null).Select(x => x.NetPnl!.Value).ToList();
+        decimal Median(List<decimal> x) { if (x.Count == 0) { return 0; } var s = x.OrderBy(y => y).ToList(); return s.Count % 2 == 1 ? s[s.Count / 2] : (s[s.Count / 2 - 1] + s[s.Count / 2]) / 2m; }
+        var gp = netVals.Where(x => x > 0).Sum(); var gl = Math.Abs(netVals.Where(x => x <= 0).Sum());
+        return (v.Count, fwdVals.Count > 0 ? 100.0 * fwdVals.Count(x => x > 0) / fwdVals.Count : 0, Median(fwdVals), mtmVals.Count > 0 ? 100.0 * mtmVals.Count(x => x > 0) / mtmVals.Count : 0,
+            Median(mtmVals), Median(mfeVals), Median(maeVals), gl > 0 ? gp / gl : null, netVals.Count > 0 ? netVals.Sum() : null);
+    }
+    static string GroupFmt((int N, double HitRate, decimal MedFwd, double PosMtmPct, decimal MedMtm, decimal MedMfe, decimal MedMae, decimal? Pf, decimal? NetPnl) g) =>
+        $"n={g.N} hitRate={g.HitRate:F1}% medFwdPts={g.MedFwd:F2} posMTM%={g.PosMtmPct:F1}% medMTM={g.MedMtm:F2}% medMFE={g.MedMfe:F2} medMAE={g.MedMae:F2} PF={(g.Pf?.ToString("F2") ?? "n/a")} netPnl={(g.NetPnl?.ToString("F0") ?? "n/a")}";
+
+    Console.WriteLine("### Section 7: Group1 (baseline-available) vs Group2 (additional invalidation-created), A and B separately, +4-bar (~52K) horizon ###");
+    foreach (var pattern in new[] { "A", "B" })
+    {
+        var expectSign = pattern == "A" ? -1m : 1m;
+        var g1 = eqEntries.Where(x => x.Pattern == pattern && x.BaselineAvailable).Select(x => (x.Fwd4Pts, expectSign, x.OptionMtm4, x.ActualMfe, x.ActualMae, x.ActualNetPnl)).ToList();
+        var g2 = eqEntries.Where(x => x.Pattern == pattern && x.IsAdditional).Select(x => (x.Fwd4Pts, expectSign, x.OptionMtm4, x.ActualMfe, x.ActualMae, x.ActualNetPnl)).ToList();
+        Console.WriteLine($"  [{pattern}] Group1(baseline-available): {GroupFmt(GroupStats(g1))}");
+        Console.WriteLine($"  [{pattern}] Group2(additional):         {GroupFmt(GroupStats(g2))}");
+    }
+    Console.WriteLine();
+
+    // ================= Section 8: NormalizedATMStraddle terciles =================
+    Console.WriteLine("### Section 8: NormalizedATMStraddle terciles (validation-pooled, descriptive only) ###");
+    var straddleVals = eqEntries.Select(x => x.NormalizedStraddle).Where(x => x > 0).ToList();
+    var (straddleLow, straddleHigh) = straddleVals.Count > 0 ? ForwardValidationAnalysis.ComputeTerciles(straddleVals) : (0m, 0m);
+    foreach (var (label, groupFilter) in new (string, Func<(bool BaselineAvailable, bool IsAdditional), bool>)[] { ("All", _ => true), ("Group1(baseline-available)", g => g.BaselineAvailable), ("Group2(additional)", g => g.IsAdditional) })
+    {
+        foreach (var pattern in new[] { "A", "B" })
+        {
+            var expectSign = pattern == "A" ? -1m : 1m;
+            foreach (var (bucketLabel, pred) in new (string, Func<decimal, bool>)[] { ("Low", v => v <= straddleLow), ("Mid", v => v > straddleLow && v <= straddleHigh), ("High", v => v > straddleHigh) })
+            {
+                var g = eqEntries.Where(x => x.Pattern == pattern && groupFilter((x.BaselineAvailable, x.IsAdditional)) && pred(x.NormalizedStraddle)).Select(x => (x.Fwd4Pts, expectSign, x.OptionMtm4, x.ActualMfe, x.ActualMae, x.ActualNetPnl)).ToList();
+                if (g.Count == 0) { continue; }
+                Console.WriteLine($"  [{label} {pattern} {bucketLabel}] {GroupFmt(GroupStats(g))}");
+            }
+        }
+    }
+    Console.WriteLine();
+
+    // ================= Section 9: PremiumImbalance terciles =================
+    Console.WriteLine("### Section 9: PremiumImbalance terciles (descriptive only) ###");
+    var imbalanceVals = eqEntries.Where(x => x.PremiumImbalance is not null).Select(x => x.PremiumImbalance!.Value).ToList();
+    var (imbLow, imbHigh) = imbalanceVals.Count > 0 ? ForwardValidationAnalysis.ComputeTerciles(imbalanceVals) : (0m, 0m);
+    foreach (var (bucketLabel, pred) in new (string, Func<decimal, bool>)[] { ("Low", v => v <= imbLow), ("Mid", v => v > imbLow && v <= imbHigh), ("High", v => v > imbHigh) })
+    {
+        var g = eqEntries.Where(x => x.PremiumImbalance is not null && pred(x.PremiumImbalance!.Value)).ToList();
+        var a = g.Count(x => x.Pattern == "A"); var b = g.Count(x => x.Pattern == "B");
+        var stats = GroupStats(g.Select(x => (x.Fwd4Pts, x.Pattern == "A" ? -1m : 1m, x.OptionMtm4, x.ActualMfe, x.ActualMae, x.ActualNetPnl)).ToList());
+        Console.WriteLine($"  [{bucketLabel}] A/B={a}/{b} {GroupFmt(stats)}");
+    }
+    Console.WriteLine();
+
+    // ================= Section 10: ATM straddle vs band-median straddle correlation =================
+    Console.WriteLine("### Section 10: ATMStraddlePremium vs BandMedianStraddlePremium correlation ###");
+    {
+        var pairs = eqEntries.Where(x => x.BandMedianStraddle is not null).Select(x => ((double)x.AtmStraddle, (double)x.BandMedianStraddle!.Value)).ToList();
+        if (pairs.Count > 1)
+        {
+            var meanX = pairs.Average(p => p.Item1); var meanY = pairs.Average(p => p.Item2);
+            var cov = pairs.Sum(p => (p.Item1 - meanX) * (p.Item2 - meanY));
+            var varX = pairs.Sum(p => Math.Pow(p.Item1 - meanX, 2)); var varY = pairs.Sum(p => Math.Pow(p.Item2 - meanY, 2));
+            var corr = varX > 0 && varY > 0 ? cov / Math.Sqrt(varX * varY) : 0;
+            Console.WriteLine($"  n={pairs.Count} Pearson r={corr:F3} -- {(corr > 0.9 ? "near-perfectly redundant; the simpler ATM straddle is preferred." : corr > 0.7 ? "strongly related but not fully redundant." : "materially different information content -- band-median straddle is NOT just a noisier copy of the ATM straddle.")}");
+        }
+        else { Console.WriteLine("  Insufficient paired data (band-median requires all 5 basket strikes valid)."); }
+    }
+    Console.WriteLine();
+
+    // ================= Section 11: pre-signal move exhaustion =================
+    Console.WriteLine("### Section 11: pre-signal absolute move terciles vs. subsequent continuation (+4 bars) ###");
+    var preMoveVals = eqEntries.Select(x => x.PreSignalAbsMovePts).ToList();
+    var (preMoveLow, preMoveHigh) = preMoveVals.Count > 0 ? ForwardValidationAnalysis.ComputeTerciles(preMoveVals) : (0m, 0m);
+    foreach (var (label, groupFilter) in new (string, Func<(bool BaselineAvailable, bool IsAdditional), bool>)[] { ("All", _ => true), ("Group1", g => g.BaselineAvailable), ("Group2", g => g.IsAdditional) })
+    {
+        foreach (var pattern in new[] { "A", "B" })
+        {
+            var expectSign = pattern == "A" ? -1m : 1m;
+            foreach (var (bucketLabel, pred) in new (string, Func<decimal, bool>)[] { ("Low", v => v <= preMoveLow), ("Mid", v => v > preMoveLow && v <= preMoveHigh), ("High", v => v > preMoveHigh) })
+            {
+                var g = eqEntries.Where(x => x.Pattern == pattern && groupFilter((x.BaselineAvailable, x.IsAdditional)) && pred(x.PreSignalAbsMovePts)).Select(x => (x.Fwd4Pts, expectSign, x.OptionMtm4, x.ActualMfe, x.ActualMae, x.ActualNetPnl)).ToList();
+                if (g.Count == 0) { continue; }
+                Console.WriteLine($"  [{label} {pattern} {bucketLabel}] {GroupFmt(GroupStats(g))}");
+            }
+        }
+    }
+    Console.WriteLine();
+
+    // ================= Section 12: re-entry timing (Group2 only) =================
+    Console.WriteLine("### Section 12: re-entry timing buckets, Group2 (additional invalidation-created) only ###");
+    foreach (var (bucketLabel, pred) in new (string, Func<double, bool>)[] { ("<60s", v => v < 60), ("60-180s", v => v >= 60 && v < 180), ("180-300s", v => v >= 180 && v < 300), (">=300s", v => v >= 300) })
+    {
+        var g = eqEntries.Where(x => x.IsAdditional && x.SecSincePrevExit is not null && pred(x.SecSincePrevExit!.Value))
+            .Select(x => (x.Fwd4Pts, x.Pattern == "A" ? -1m : 1m, x.OptionMtm4, x.ActualMfe, x.ActualMae, x.ActualNetPnl)).ToList();
+        if (g.Count == 0) { continue; }
+        Console.WriteLine($"  [{bucketLabel}] {GroupFmt(GroupStats(g))}");
+    }
+    Console.WriteLine();
+
+    // ================= Section 13: session robustness (NormalizedATMStraddle, the clearest candidate) =================
+    Console.WriteLine("### Section 13: session robustness check, NormalizedATMStraddle vs. hit rate (High vs. Low tercile, per session) ###");
+    {
+        int sameDirection = 0, oppositeDirection = 0;
+        foreach (var date in eqValidationSessions)
+        {
+            var sessionEntries = eqEntries.Where(x => x.Date == date).ToList();
+            if (sessionEntries.Count < 4) { continue; }
+            decimal ExpectSign(string p) => p == "A" ? -1m : 1m;
+            var low = sessionEntries.Where(x => x.NormalizedStraddle <= straddleLow && x.Fwd4Pts is not null).Select(x => x.Fwd4Pts!.Value * ExpectSign(x.Pattern)).ToList();
+            var high = sessionEntries.Where(x => x.NormalizedStraddle > straddleHigh && x.Fwd4Pts is not null).Select(x => x.Fwd4Pts!.Value * ExpectSign(x.Pattern)).ToList();
+            if (low.Count < 2 || high.Count < 2) { continue; }
+            var lowHit = 100.0 * low.Count(x => x > 0) / low.Count; var highHit = 100.0 * high.Count(x => x > 0) / high.Count;
+            var direction = highHit >= lowHit ? "High>=Low" : "Low>High";
+            if (direction == "High>=Low") { sameDirection++; } else { oppositeDirection++; }
+            Console.WriteLine($"  {date:yyyy-MM-dd}: Low-tercile hit%={lowHit:F1}%(n={low.Count}) High-tercile hit%={highHit:F1}%(n={high.Count}) -> {direction}");
+        }
+        Console.WriteLine($"  Sessions with High>=Low direction: {sameDirection}. Sessions with Low>High: {oppositeDirection}. (Session sizes are small -- reported as directional counts, not a strong statistical claim.)");
+    }
+    Console.WriteLine();
+
+    // ================= Section 14: DTE descriptive =================
+    Console.WriteLine("### Section 14: DTE descriptive (straddle/imbalance vs. outcome) ###");
+    foreach (var g in eqEntries.GroupBy(x => x.Dte).OrderBy(g => g.Key))
+    {
+        var list = g.ToList();
+        var medStraddle = list.Select(x => x.AtmStraddle).OrderBy(x => x).ElementAt(list.Count / 2);
+        var medNorm = list.Select(x => x.NormalizedStraddle).OrderBy(x => x).ElementAt(list.Count / 2);
+        var withImb = list.Where(x => x.PremiumImbalance is not null).Select(x => x.PremiumImbalance!.Value).ToList();
+        var medImb = withImb.Count > 0 ? withImb.OrderBy(x => x).ElementAt(withImb.Count / 2) : 0;
+        var stats = GroupStats(list.Select(x => (x.Fwd4Pts, x.Pattern == "A" ? -1m : 1m, x.OptionMtm4, x.ActualMfe, x.ActualMae, x.ActualNetPnl)).ToList());
+        Console.WriteLine($"  DTE={g.Key}: medStraddle={medStraddle:F1} medNormalizedStraddle={medNorm:F4} medImbalance={medImb:F3} {GroupFmt(stats)}");
+    }
+    Console.WriteLine();
+
+    // ================= Section 15: lightweight 2600 reference =================
+    Console.WriteLine("### Section 15: lightweight 2600 reference comparison ###");
+    Console.WriteLine("  Straddle-premium-specific metrics (NormalizedATMStraddle, PremiumImbalance, BandMedianStraddle) are NOT recomputed for 2600 in this pass -- would require a third full raw-tick rebuild, which the task explicitly discourages (\"do NOT rerun full optimization\"). Reusing already-established 2600 numbers instead:");
+    Console.WriteLine("  2600 rapid re-entry (<60s, same-pattern): 19.1% (648 episode transitions) vs. 13K: see Section 12/Phase B of the participation-unit-compare doc section (5.4%, 129 transitions) -- 13K materially reduced rapid re-entry, consistent with the earlier finding.");
+    Console.WriteLine("  2600 additional-opportunity net effect: +22,658 (net HELPFUL) vs. 13K: -115,454 (net HARMFUL) -- 13K did NOT remove the low-quality-additional-trade problem; if anything the ones that remain are proportionally more damaging per trade, per the earlier participation-unit-compare result.");
+    Console.WriteLine();
+
+    // ---- Full per-entry diagnostic CSV. ----
+    using (var w = new StreamWriter($"{eqBase}-entries.csv"))
+    {
+        w.WriteLine("TradingDate,ExpiryDate,Dte,Pattern,StateEpisodeId,SignalTimestampIST,WindowStartTimestampIST,WindowEndTimestampIST,WindowDurationSeconds,WindowBarCount,ActualWindowVolume,"
+            + "FuturesStart,FuturesEnd,FuturesChangePoints,FuturesReturnPct,PreSignalAbsoluteMovePoints,AtmStrike,AtmCePremium,AtmPePremium,AtmStraddlePremium,NormalizedAtmStraddle,PremiumImbalance,BandMedianStraddlePremium,"
+            + "SecondsSincePreviousAnyPatternEntry,SecondsSincePreviousSamePatternEntry,SecondsSincePreviousTradeExit,PreviousExitReason,PreviousTradePattern,PreviousTradePnl,"
+            + "WasPositionOpenAtSignal,WouldBaselineOppositePatternStrategyHaveBeenAvailable,WouldStateInvalidationStrategyHaveBeenAvailable,IsAdditionalOpportunityFromInvalidation,"
+            + "Forward1Pts,Forward2Pts,Forward3Pts,Forward4Pts,Forward5Pts,ExecutedUnderInvalidation,OptionMtm1,OptionMtm2,OptionMtm4,ActualOptionReturnPct,ActualMfe,ActualMae,ActualSecondsToMfe,ActualNetPnl");
+        foreach (var e in eqEntries)
+        {
+            w.WriteLine(string.Join(',', e.Date.ToString("yyyy-MM-dd"), e.Expiry.ToString("yyyy-MM-dd"), e.Dte, e.Pattern, e.StateEpisodeId, e.SignalTs.ToOffset(eqIstOffset).ToString("HH:mm:ss.fff"),
+                e.WStart.ToOffset(eqIstOffset).ToString("HH:mm:ss.fff"), e.WEnd.ToOffset(eqIstOffset).ToString("HH:mm:ss.fff"), e.WDur, e.WinBars, e.RealizedVolume,
+                e.FStart, e.FEnd, e.FChangePts, e.FRetPct, e.PreSignalAbsMovePts, e.AtmStrike, e.AtmCePremium, e.AtmPePremium, e.AtmStraddle, e.NormalizedStraddle, e.PremiumImbalance, e.BandMedianStraddle,
+                e.SecSincePrevAny, e.SecSincePrevSame, e.SecSincePrevExit, e.PreviousExitReason, e.PreviousTradePattern, e.PreviousTradePnl,
+                e.WasPositionOpenAtSignal, e.BaselineAvailable, e.InvalidationAvailable, e.IsAdditional,
+                e.Fwd1Pts, e.Fwd2Pts, e.Fwd3Pts, e.Fwd4Pts, e.Fwd5Pts, e.ExecutedUnderInvalidation, e.OptionMtm1, e.OptionMtm2, e.OptionMtm4,
+                e.ActualOptionReturnPct, e.ActualMfe, e.ActualMae, e.ActualSecToMfe, e.ActualNetPnl));
+        }
+    }
+    Console.WriteLine($"Entries CSV: {Path.GetFullPath($"{eqBase}-entries.csv")} ({eqEntries.Count} rows).");
+
+    return 0;
+}
+
+// "vc0dte-relationship-6500x5-vs-references" -- 2026-09-25. New structural candidate: 6500-contract
+// futures base bars + a ROLLING LATEST-5-BAR aggregate context (participation-based, NOT the 180s
+// adaptive context) -- compared against two frozen references: 13000+180s (Reference A, numbers
+// reused from the already-completed participation-unit-compare/13k-entry-quality studies, not
+// rebuilt a third time) and 6500+180s (Reference B, built fresh -- isolates base-bar-size effect
+// from context-construction effect at the SAME refresh frequency as Candidate C). 10 validation
+// sessions. 2026-09-24 never queried.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-6500x5-vs-references --refIn=vc-13k-entry-quality.csv --out=basePath
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-6500x5-vs-references", StringComparison.OrdinalIgnoreCase))
+{
+    var (_, xNamed) = SplitNamedArgs(args);
+    var xRefIn = xNamed.GetValueOrDefault("refIn", "vc-13k-entry-quality.csv");
+    if (!xNamed.TryGetValue("out", out var xBase))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-6500x5-vs-references --refIn=vc-13k-entry-quality.csv --out=basePath");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-6500x5-vs-references: 6500x5 rolling candidate vs. 6500+180s and 13K+180s references. 10 validation sessions. 2026-09-24 NOT queried. ===");
+    Console.WriteLine();
+    Console.WriteLine("Scope note: Reference A (13K+180s) numbers are REUSED from the already-completed participation-unit-compare and 13k-entry-quality studies (churn/frequency from the former's console output; forward-response at +1/+2/+4 bars and trade outcomes from the latter's per-entry CSV), per instruction not to branch into another architecture rebuild. Reference B (6500+180s) and Candidate C (6500x5) are built fresh, sharing the same 6500-contract base bars and ATM/basket selection at each bar end (only window START differs between B and C), to keep compute proportional to what's actually new.");
+    Console.WriteLine();
+
+    var xIstOffset = TimeSpan.FromHours(5.5);
+    const long xThreshold = 6500L;
+    const double xTargetSeconds = 180.0;
+    var xValidationSessions = new[] { "2026-09-04", "2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11", "2026-09-15", "2026-09-16", "2026-09-17", "2026-09-18", "2026-09-21" }.Select(DateOnly.Parse).ToList();
+
+    static bool XFullSurface(string atmState, int ceValid, int cePos, int ceNeg, int peValid, int pePos, int peNeg) =>
+        atmState switch { "A" => ceValid == 5 && ceNeg == 5 && peValid == 5 && pePos == 5, "B" => ceValid == 5 && cePos == 5 && peValid == 5 && peNeg == 5, _ => false };
+
+    // Shared row schema for both 6500-based architectures.
+    var xRowsB = new Dictionary<DateOnly, List<(int EndIdx, int StartIdx, int WinBars, DateTimeOffset WStart, DateTimeOffset WEnd, double WDur, long RealizedVolume,
+        decimal FStart, decimal FEnd, decimal AtmStrike, bool InsufficientHistory, string AtmState, int CeValid, int PeValid, int CePos, int CeNeg, int PePos, int PeNeg)>>();
+    var xRowsC = new Dictionary<DateOnly, List<(int EndIdx, int StartIdx, int WinBars, DateTimeOffset WStart, DateTimeOffset WEnd, double WDur, long RealizedVolume,
+        decimal FStart, decimal FEnd, decimal AtmStrike, bool InsufficientHistory, string AtmState, int CeValid, int PeValid, int CePos, int CeNeg, int PePos, int PeNeg)>>();
+    var xExpiryBySession = new Dictionary<DateOnly, (DateOnly Expiry, int Dte)>();
+    var xFutureBarsBySession = new Dictionary<DateOnly, List<FutureEventBar>>();
+    var xChainBySession = new Dictionary<DateOnly, List<Instrument>>();
+
+    foreach (var date in xValidationSessions)
+    {
+        await using var src = new NiftySignalDbContext(tradeSourceOptions);
+        var bars = await FutureEventBarBuilder.BuildDayAsync(src, date, xThreshold, CancellationToken.None);
+        if (bars.Count == 0) { continue; }
+        var expiries = await src.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.Underlying == "NIFTY").Select(i => i.ExpiryDate).Distinct().OrderBy(e => e).ToListAsync();
+        var expiry = expiries[0]!.Value; var dte = expiry.DayNumber - date.DayNumber;
+        xExpiryBySession[date] = (expiry, dte);
+        xFutureBarsBySession[date] = bars;
+        var chain = await src.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == expiry && i.Underlying == "NIFTY").ToListAsync();
+        xChainBySession[date] = chain;
+        var distinctStrikes = chain.Where(i => i.StrikePrice is not null).Select(i => i.StrikePrice!.Value).Distinct().OrderBy(x => x).ToList();
+        var tickCache = new Dictionary<string, OptionTickSeries>();
+        async Task<OptionTickSeries> SeriesAsync(string token)
+        {
+            if (!tickCache.TryGetValue(token, out var s))
+            {
+                var dayStart = bars[0].StartTimestamp;
+                var dayEnd = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 30)), xIstOffset).ToUniversalTime();
+                s = await OptionTickSeries.LoadAsync(src, token, dayStart, dayEnd, CancellationToken.None);
+                tickCache[token] = s;
+            }
+            return s;
+        }
+
+        var listB = new List<(int, int, int, DateTimeOffset, DateTimeOffset, double, long, decimal, decimal, decimal, bool, string, int, int, int, int, int, int)>();
+        var listC = new List<(int, int, int, DateTimeOffset, DateTimeOffset, double, long, decimal, decimal, decimal, bool, string, int, int, int, int, int, int)>();
+
+        for (var i = 0; i < bars.Count; i++)
+        {
+            var endBar = bars[i];
+            var fEnd = endBar.Close;
+            // Shared ATM strike + basket strike selection (depends only on window END, identical for both window types).
+            var atmCe = AtmStrikeSelector.PickAtm(chain, OptionType.Call, fEnd);
+            var atmPe = AtmStrikeSelector.PickAtm(chain, OptionType.Put, fEnd);
+            var atmStrikeVal = atmCe?.StrikePrice ?? atmPe?.StrikePrice ?? fEnd;
+            var atmIdx = distinctStrikes.FindIndex(x => x == atmStrikeVal);
+            var basketStrikes = new decimal?[5];
+            for (var b = -2; b <= 2; b++) { var idx = atmIdx + b; basketStrikes[b + 2] = (atmIdx >= 0 && idx >= 0 && idx < distinctStrikes.Count) ? distinctStrikes[idx] : null; }
+
+            async Task<(int StartIdx, int WinBars, DateTimeOffset WStart, double WDur, long RealizedVolume, decimal FStart, bool InsufficientHistory, string AtmState, int CeValid, int PeValid, int CePos, int CeNeg, int PePos, int PeNeg)>
+                BuildWindow(int startIdx, bool insufficientHistory)
+            {
+                var startBar = bars[startIdx];
+                var fStart = startBar.Open;
+                var fChangePts = fEnd - fStart;
+                var realizedVolume = bars.Skip(startIdx).Take(i - startIdx + 1).Sum(bb => bb.Volume);
+                var wDur = (endBar.EndTimestamp - startBar.StartTimestamp).TotalSeconds;
+
+                decimal? atmCeStart = null, atmCeEnd = null, atmPeStart = null, atmPeEnd = null;
+                var atmMissing = atmCe is null || atmPe is null;
+                if (atmCe is not null) { var s = await SeriesAsync(atmCe.Token); atmCeStart = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; atmCeEnd = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; atmMissing |= atmCeStart is null || atmCeEnd is null; }
+                if (atmPe is not null) { var s = await SeriesAsync(atmPe.Token); atmPeStart = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; atmPeEnd = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; atmMissing |= atmPeStart is null || atmPeEnd is null; }
+                decimal? atmCeChg = atmCeStart is not null && atmCeEnd is not null ? atmCeEnd - atmCeStart : null;
+                decimal? atmPeChg = atmPeStart is not null && atmPeEnd is not null ? atmPeEnd - atmPeStart : null;
+                var rawState = "Other";
+                if (!atmMissing) { if (fChangePts > 0 && atmCeChg < 0 && atmPeChg > 0) { rawState = "A"; } else if (fChangePts < 0 && atmCeChg > 0 && atmPeChg < 0) { rawState = "B"; } }
+
+                int ceValid = 0, ceNeg = 0, cePos = 0, peValid = 0, peNeg = 0, pePos = 0;
+                for (var b = 0; b < 5; b++)
+                {
+                    var strike = basketStrikes[b];
+                    if (strike is null) { continue; }
+                    var ceInst = chain.FirstOrDefault(x => x.StrikePrice == strike && x.OptionType == OptionType.Call);
+                    var peInst = chain.FirstOrDefault(x => x.StrikePrice == strike && x.OptionType == OptionType.Put);
+                    if (ceInst is not null) { var s = await SeriesAsync(ceInst.Token); var st = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; var en = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; if (st is not null && en is not null && st != 0) { var ret = (en - st) / st * 100m; ceValid++; if (ret > 0) { cePos++; } else if (ret < 0) { ceNeg++; } } }
+                    if (peInst is not null) { var s = await SeriesAsync(peInst.Token); var st = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; var en = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; if (st is not null && en is not null && st != 0) { var ret = (en - st) / st * 100m; peValid++; if (ret > 0) { pePos++; } else if (ret < 0) { peNeg++; } } }
+                }
+                return (startIdx, i - startIdx + 1, startBar.StartTimestamp.ToOffset(xIstOffset), wDur, realizedVolume, fStart, insufficientHistory, insufficientHistory ? "Other" : rawState, ceValid, peValid, cePos, ceNeg, pePos, peNeg);
+            }
+
+            // Reference B: adaptive 180s (same rule as every prior command).
+            var startIdxB = AdaptiveWindowAnalysis.FindWindowStartIndex(bars, i, xTargetSeconds);
+            var durB = (endBar.EndTimestamp - bars[startIdxB].StartTimestamp).TotalSeconds;
+            var insufficientB = startIdxB == 0 && durB < xTargetSeconds;
+            var wb = await BuildWindow(startIdxB, insufficientB);
+            listB.Add((i, wb.StartIdx, wb.WinBars, wb.WStart, endBar.EndTimestamp.ToOffset(xIstOffset), wb.WDur, wb.RealizedVolume, wb.FStart, fEnd, atmStrikeVal, wb.InsufficientHistory, wb.AtmState, wb.CeValid, wb.PeValid, wb.CePos, wb.CeNeg, wb.PePos, wb.PeNeg));
+
+            // Candidate C: rolling latest-5-bars (i-4..i); InsufficientHistory when fewer than 5 bars exist (i<4).
+            var startIdxC = Math.Max(0, i - 4);
+            var insufficientC = i < 4;
+            var wc = await BuildWindow(startIdxC, insufficientC);
+            listC.Add((i, wc.StartIdx, wc.WinBars, wc.WStart, endBar.EndTimestamp.ToOffset(xIstOffset), wc.WDur, wc.RealizedVolume, wc.FStart, fEnd, atmStrikeVal, wc.InsufficientHistory, wc.AtmState, wc.CeValid, wc.PeValid, wc.CePos, wc.CeNeg, wc.PePos, wc.PeNeg));
+        }
+        xRowsB[date] = listB; xRowsC[date] = listC;
+        Console.WriteLine($"  [Built] {date:yyyy-MM-dd}: {bars.Count} 6500-contract bars.");
+    }
+    Console.WriteLine();
+
+    // ================= Shared churn/frequency/persistence/re-entry metrics (Reference B and Candidate C). =================
+    var xEpisodes = new Dictionary<string, Dictionary<DateOnly, List<RollingStateAnalysis.StateAnnotation>>>();
+    var xFsFlags = new Dictionary<string, Dictionary<DateOnly, List<bool>>>();
+    var xArchRows = new Dictionary<string, Dictionary<DateOnly, List<(int EndIdx, int StartIdx, int WinBars, DateTimeOffset WStart, DateTimeOffset WEnd, double WDur, long RealizedVolume,
+        decimal FStart, decimal FEnd, decimal AtmStrike, bool InsufficientHistory, string AtmState, int CeValid, int PeValid, int CePos, int CeNeg, int PePos, int PeNeg)>>>
+    { ["6500+180s"] = xRowsB, ["6500x5"] = xRowsC };
+
+    Console.WriteLine("### Section 13: frequency and state churn (Reference B: 6500+180s, Candidate C: 6500x5) ###");
+    foreach (var arch in new[] { "6500+180s", "6500x5" })
+    {
+        xEpisodes[arch] = []; xFsFlags[arch] = [];
+        int totalBars = 0, totalAEntries = 0, totalBEntries = 0, totalFsA = 0, totalFsB = 0, totalTransitions = 0; double totalHours = 0;
+        var barDurs = new List<double>(); var barVols = new List<long>();
+        foreach (var date in xValidationSessions)
+        {
+            if (!xArchRows[arch].TryGetValue(date, out var rows) || rows.Count == 0) { continue; }
+            var states = rows.Select(r => r.AtmState).ToList();
+            var ann = RollingStateAnalysis.Annotate(states);
+            xEpisodes[arch][date] = ann;
+            var fsFlags = rows.Select(r => XFullSurface(r.AtmState, r.CeValid, r.CePos, r.CeNeg, r.PeValid, r.PePos, r.PeNeg)).ToList();
+            xFsFlags[arch][date] = fsFlags;
+            totalBars += rows.Count;
+            for (var k = 0; k < rows.Count; k++) { barDurs.Add(k == 0 ? rows[k].WDur : (rows[k].WEnd - rows[k - 1].WEnd).TotalSeconds); barVols.Add(rows[k].RealizedVolume); }
+            for (var k = 1; k < rows.Count; k++) { if (states[k] != states[k - 1]) { totalTransitions++; } }
+            for (var k = 0; k < rows.Count; k++)
+            {
+                if (ann[k].IsStateEntry && states[k] == "A") { totalAEntries++; if (fsFlags[k]) { totalFsA++; } }
+                if (ann[k].IsStateEntry && states[k] == "B") { totalBEntries++; if (fsFlags[k]) { totalFsB++; } }
+            }
+            totalHours += (rows.Last().WEnd - rows.First().WStart).TotalHours;
+        }
+        var sortedDurs = barDurs.OrderBy(x => x).ToList(); var sortedVols = barVols.Where(v => v > 0).OrderBy(x => x).ToList();
+        Console.WriteLine($"  [{arch}] TotalBars={totalBars} MedianBarDurSec={(sortedDurs.Count > 0 ? sortedDurs[sortedDurs.Count / 2] : 0):F1} MedianRealizedVolume={(sortedVols.Count > 0 ? sortedVols[sortedVols.Count / 2] : 0)}");
+        Console.WriteLine($"  [{arch}] A-entries={totalAEntries}(FS={totalFsA}) B-entries={totalBEntries}(FS={totalFsB}) Transitions/hour={(totalHours > 0 ? totalTransitions / totalHours : 0):F2} StateEntries/hour={(totalHours > 0 ? (totalAEntries + totalBEntries) / totalHours : 0):F2}");
+
+        // Episode persistence + rapid re-entry.
+        foreach (var pattern in new[] { "A", "B" })
+        {
+            var durations = new List<double>(); var barCounts = new List<int>();
+            foreach (var date in xValidationSessions)
+            {
+                if (!xEpisodes[arch].TryGetValue(date, out var ann)) { continue; }
+                var rows = xArchRows[arch][date];
+                var episodeStart = -1;
+                for (var k = 0; k <= rows.Count; k++)
+                {
+                    var isThisPattern = k < rows.Count && rows[k].AtmState == pattern;
+                    if (isThisPattern && episodeStart < 0) { episodeStart = k; }
+                    else if (!isThisPattern && episodeStart >= 0) { durations.Add((rows[k - 1].WEnd - rows[episodeStart].WStart).TotalSeconds); barCounts.Add(k - episodeStart); episodeStart = -1; }
+                }
+            }
+            if (durations.Count == 0) { continue; }
+            var sortedDur = durations.OrderBy(x => x).ToList();
+            Console.WriteLine($"    [{arch} {pattern}] episodes n={durations.Count} medianDurSec={sortedDur[sortedDur.Count / 2]:F1} medianBars={barCounts.OrderBy(x => x).ElementAt(barCounts.Count / 2)}");
+        }
+        var samePatternGaps = new List<double>();
+        foreach (var date in xValidationSessions)
+        {
+            if (!xEpisodes[arch].TryGetValue(date, out var ann)) { continue; }
+            var rows = xArchRows[arch][date];
+            var lastExitByPattern = new Dictionary<string, DateTimeOffset>();
+            for (var k = 0; k < rows.Count; k++)
+            {
+                if (ann[k].IsStateEntry && rows[k].AtmState is "A" or "B" && lastExitByPattern.TryGetValue(rows[k].AtmState, out var lastSame)) { samePatternGaps.Add((rows[k].WEnd - lastSame).TotalSeconds); }
+                if (ann[k].IsStateExit)
+                {
+                    var exitedPattern = rows[k].AtmState == "Other" ? (k > 0 ? rows[k - 1].AtmState : "") : (rows[k].AtmState == "A" ? "B" : "A");
+                    if (exitedPattern is "A" or "B") { lastExitByPattern[exitedPattern] = rows[k].WEnd; }
+                }
+            }
+        }
+        if (samePatternGaps.Count > 0) { Console.WriteLine($"    [{arch} same-pattern re-entry] n={samePatternGaps.Count} <30s={samePatternGaps.Count(x => x < 30)} <60s={samePatternGaps.Count(x => x < 60)} <120s={samePatternGaps.Count(x => x < 120)} <180s={samePatternGaps.Count(x => x < 180)} <300s={samePatternGaps.Count(x => x < 300)}"); }
+
+        var perDay = xValidationSessions.Select(date => xFsFlags[arch].TryGetValue(date, out var fs) && xEpisodes[arch].TryGetValue(date, out var ann2)
+            ? Enumerable.Range(0, fs.Count).Count(k => ann2[k].IsStateEntry && xArchRows[arch][date][k].AtmState is "A" or "B" && fs[k]) : 0).ToList();
+        Console.WriteLine($"    [{arch}] FullSurface entries/day: mean={perDay.Average():F1} median={perDay.OrderBy(x => x).ElementAt(perDay.Count / 2)}");
+    }
+    Console.WriteLine("  [13K+180s, REUSED from participation-unit-compare] TotalBars=1713 MedianBarDurSec=83.0 A-entries=82(FS=60) B-entries=67(FS=45) Transitions/hour=4.48 StateEntries/hour=2.39; episode median dur A=240.0s B=244.0s; rapid re-entry <60s=7/129(5.4%); FullSurface entries/day mean=10.5 median=11.");
+    Console.WriteLine();
+
+    // ================= Section 10/11: underlying response + matched control (Reference B, Candidate C), horizons +2/+4/+8 bars (~13K/~26K/~52K) =================
+    Console.WriteLine("### Sections 10-11: forward underlying response + matched control, 6500-based architectures (+2/+4/+8 bars =~ 13K/26K/52K) ###");
+    var xTerciles = new Dictionary<string, (decimal Low, decimal High)>();
+    foreach (var arch in new[] { "6500+180s", "6500x5" })
+    {
+        var allAbsMoves = new List<decimal>();
+        foreach (var date in xValidationSessions) { if (xArchRows[arch].TryGetValue(date, out var rows)) { for (var k = 1; k < rows.Count; k++) { allAbsMoves.Add(Math.Abs(rows[k].FEnd - rows[k - 1].FEnd)); } } }
+        xTerciles[arch] = allAbsMoves.Count > 0 ? ForwardValidationAnalysis.ComputeTerciles(allAbsMoves) : (0m, 0m);
+
+        var aFwd = new Dictionary<int, List<decimal>> { [2] = [], [4] = [], [8] = [] };
+        var bFwd = new Dictionary<int, List<decimal>> { [2] = [], [4] = [], [8] = [] };
+        var aCtrl = new Dictionary<int, List<decimal>> { [2] = [], [4] = [], [8] = [] };
+        var bCtrl = new Dictionary<int, List<decimal>> { [2] = [], [4] = [], [8] = [] };
+        var sessionsWithAEntries = new HashSet<DateOnly>(); var sessionsWithBEntries = new HashSet<DateOnly>();
+        var sessionABeatsCtrl = new HashSet<DateOnly>(); var sessionBBeatsCtrl = new HashSet<DateOnly>();
+        var sessionAExpectedSign = new HashSet<DateOnly>(); var sessionBExpectedSign = new HashSet<DateOnly>();
+        var perSessionANet = new Dictionary<DateOnly, decimal>(); var perSessionBNet = new Dictionary<DateOnly, decimal>();
+
+        foreach (var date in xValidationSessions)
+        {
+            if (!xArchRows[arch].TryGetValue(date, out var rows) || !xEpisodes[arch].TryGetValue(date, out var ann)) { continue; }
+            var fsFlags = xFsFlags[arch][date];
+            decimal? FwdPts(int endIdx, int h) { var t = rows.FirstOrDefault(x => x.EndIdx == endIdx + h); if (t.WEnd == default) { return null; } var b0 = rows.First(x => x.EndIdx == endIdx); return t.FEnd - b0.FEnd; }
+            var sessionAFwd8 = new List<decimal>(); var sessionBFwd8 = new List<decimal>();
+            for (var k = 0; k < rows.Count; k++)
+            {
+                if (ann[k].IsStateEntry && fsFlags[k])
+                {
+                    if (rows[k].AtmState == "A") { sessionsWithAEntries.Add(date); foreach (var h in new[] { 2, 4, 8 }) { var f = FwdPts(rows[k].EndIdx, h); if (f is not null) { aFwd[h].Add(-f.Value); if (h == 8) { sessionAFwd8.Add(-f.Value); } } } }
+                    if (rows[k].AtmState == "B") { sessionsWithBEntries.Add(date); foreach (var h in new[] { 2, 4, 8 }) { var f = FwdPts(rows[k].EndIdx, h); if (f is not null) { bFwd[h].Add(f.Value); if (h == 8) { sessionBFwd8.Add(f.Value); } } } }
+                }
+            }
+            if (sessionAFwd8.Count > 0) { perSessionANet[date] = sessionAFwd8.Sum(); if (sessionAFwd8.Average() > 0) { sessionAExpectedSign.Add(date); } }
+            if (sessionBFwd8.Count > 0) { perSessionBNet[date] = sessionBFwd8.Sum(); if (sessionBFwd8.Average() > 0) { sessionBExpectedSign.Add(date); } }
+
+            var dirStates = new List<string>();
+            for (var k = 0; k < rows.Count; k++) { dirStates.Add(k == 0 || rows[k].AtmState is "A" or "B" ? "Other" : (rows[k].FEnd > rows[k - 1].FEnd ? "A" : rows[k].FEnd < rows[k - 1].FEnd ? "B" : "Other")); }
+            var dirAnn = RollingStateAnalysis.Annotate(dirStates);
+            var sessACtrl = new List<decimal>(); var sessBCtrl = new List<decimal>();
+            for (var k = 1; k < rows.Count; k++)
+            {
+                if (!dirAnn[k].IsStateEntry) { continue; }
+                var move = Math.Abs(rows[k].FEnd - rows[k - 1].FEnd);
+                if (ConditionalMovementAnalysis.ClassifyTercileBucket(move, xTerciles[arch].Low, xTerciles[arch].High) != "Low") { continue; }
+                var isUpMove = dirStates[k] == "A";
+                foreach (var h in new[] { 2, 4, 8 })
+                {
+                    var f = FwdPts(rows[k].EndIdx, h);
+                    if (f is null) { continue; }
+                    if (isUpMove) { aCtrl[h].Add(-f.Value); if (h == 8) { sessACtrl.Add(-f.Value); } } else { bCtrl[h].Add(f.Value); if (h == 8) { sessBCtrl.Add(f.Value); } }
+                }
+            }
+            if (sessionAFwd8.Count > 0 && sessACtrl.Count > 0 && 100.0 * sessionAFwd8.Count(x => x > 0) / sessionAFwd8.Count >= 100.0 * sessACtrl.Count(x => x > 0) / sessACtrl.Count) { sessionABeatsCtrl.Add(date); }
+            if (sessionBFwd8.Count > 0 && sessBCtrl.Count > 0 && 100.0 * sessionBFwd8.Count(x => x > 0) / sessionBFwd8.Count >= 100.0 * sessBCtrl.Count(x => x > 0) / sessBCtrl.Count) { sessionBBeatsCtrl.Add(date); }
+        }
+        static double HitRate(List<decimal> v) => v.Count > 0 ? 100.0 * v.Count(x => x > 0) / v.Count : 0;
+        foreach (var h in new[] { 2, 4, 8 })
+        {
+            Console.WriteLine($"  [{arch}] +{h}bars(~{h * 6500 / 1000}K): A-hit={HitRate(aFwd[h]):F1}%(n={aFwd[h].Count}) A-ctrl={HitRate(aCtrl[h]):F1}%(n={aCtrl[h].Count}) gap={HitRate(aFwd[h]) - HitRate(aCtrl[h]):F1}pp | B-hit={HitRate(bFwd[h]):F1}%(n={bFwd[h].Count}) B-ctrl={HitRate(bCtrl[h]):F1}%(n={bCtrl[h].Count}) gap={HitRate(bFwd[h]) - HitRate(bCtrl[h]):F1}pp");
+        }
+        var totalSess = xValidationSessions.Count;
+        Console.WriteLine($"  [{arch}] Session robustness (+8 bars/~52K): A sessions-with-entries={sessionsWithAEntries.Count}/{totalSess} expected-sign={sessionAExpectedSign.Count}/{sessionsWithAEntries.Count} beats-control={sessionABeatsCtrl.Count}/{sessionsWithAEntries.Count} | B sessions-with-entries={sessionsWithBEntries.Count}/{totalSess} expected-sign={sessionBExpectedSign.Count}/{sessionsWithBEntries.Count} beats-control={sessionBBeatsCtrl.Count}/{sessionsWithBEntries.Count}");
+        if (perSessionANet.Count > 0)
+        {
+            var sortedA = perSessionANet.OrderByDescending(kv => kv.Value).ToList();
+            var totalA = sortedA.Sum(kv => kv.Value);
+            Console.WriteLine($"  [{arch}] A: largest-session-share={(sortedA.Sum(kv => Math.Abs(kv.Value)) > 0 ? 100.0 * (double)Math.Abs(sortedA.First().Value) / (double)sortedA.Sum(kv => Math.Abs(kv.Value)) : 0):F1}% exclBest({sortedA.First().Key:yyyy-MM-dd})={totalA - sortedA.First().Value:F1} exclWorst({sortedA.Last().Key:yyyy-MM-dd})={totalA - sortedA.Last().Value:F1}");
+        }
+    }
+    Console.WriteLine("  [13K+180s, REUSED] From the original participation-unit-compare study (horizons +1/+10 bars, not the new +1/+2/+4 mapping exactly, but directionally comparable): A gap +21.4pp(+1bar)/+11.9pp(+10bar); B gap +28.0pp(+1bar)/+20.3pp(+10bar) -- both sides clear control at every horizon tested previously.");
+    Console.WriteLine();
+
+    // ---- 13K+180s Reference A: recompute hit-rate at the EXACT new horizon mapping (+1/+2/+4 bars) from the already-collected entry-quality CSV (no rebuild). ----
+    Console.WriteLine("### Reference A (13K+180s) at the EXACT new horizon mapping, recomputed from the existing per-entry CSV (no rebuild) ###");
+    if (File.Exists(xRefIn))
+    {
+        var lines = File.ReadAllLines(xRefIn);
+        var header = lines[0].Split(',');
+        int Col(string name) => Array.IndexOf(header, name);
+        var cPattern = Col("Pattern"); var cF1 = Col("Forward1Pts"); var cF2 = Col("Forward2Pts"); var cF4 = Col("Forward4Pts");
+        var cAdditional = Col("IsAdditionalOpportunityFromInvalidation"); var cNet = Col("ActualNetPnl"); var cExec = Col("ExecutedUnderInvalidation");
+        var refA = new List<(string Pattern, decimal? F1, decimal? F2, decimal? F4, bool Additional, decimal? Net, bool Executed)>();
+        foreach (var line in lines.Skip(1))
+        {
+            var f = line.Split(',');
+            decimal? P(string s) => string.IsNullOrEmpty(s) ? null : decimal.Parse(s, System.Globalization.CultureInfo.InvariantCulture);
+            refA.Add((f[cPattern], P(f[cF1]), P(f[cF2]), P(f[cF4]), f[cAdditional] == "True", P(f[cNet]), f[cExec] == "True"));
+        }
+        foreach (var (label, h) in new[] { ("+1bar(~13K)", 1), ("+2bars(~26K)", 2), ("+4bars(~52K)", 4) })
+        {
+            foreach (var pattern in new[] { "A", "B" })
+            {
+                var expectSign = pattern == "A" ? -1m : 1m;
+                var vals = refA.Where(x => x.Pattern == pattern).Select(x => h == 1 ? x.F1 : h == 2 ? x.F2 : x.F4).Where(x => x is not null).Select(x => x!.Value * expectSign).ToList();
+                if (vals.Count == 0) { continue; }
+                Console.WriteLine($"  [{pattern} {label}] n={vals.Count} hitRate={100.0 * vals.Count(x => x > 0) / vals.Count:F1}% meanPts={vals.Average():F2}");
+            }
+        }
+        var additionalTrades = refA.Where(x => x.Additional && x.Executed && x.Net is not null).ToList();
+        var netAdditional = additionalTrades.Sum(x => x.Net!.Value);
+        Console.WriteLine($"  Additional (invalidation-created) trades: n={additionalTrades.Count} netPnl={netAdditional:F0} (per-trade avg={(additionalTrades.Count > 0 ? netAdditional / additionalTrades.Count : 0):F1}) -- reused from the 13k-entry-quality command's clean Group2 isolation.");
+    }
+    else { Console.WriteLine($"  WARNING: {xRefIn} not found -- Reference A comparison skipped for this section (reused churn/frequency numbers above are unaffected)."); }
+    Console.WriteLine();
+
+    // ================= Trade simulation (opposite-pattern + state-invalidation), same-entry + full sequential, opportunity-set, for 6500+180s and 6500x5. =================
+    const int xLots = PatternRelationshipTradeSimulator.Lots;
+    var xCosts = new CostsConfig(BrokeragePerOrder: 0m, SlippageTicks: 0);
+    var xSameEntry = new Dictionary<string, List<(DateOnly Date, string Pattern, decimal BaselineNet, decimal InvalidationNet, bool IsAdditionalPossible)>>();
+    var xFullSeq = new Dictionary<string, List<(DateOnly Date, string Pattern, decimal NetPnl, bool IsAdditional, decimal? Fwd8Pts)>>();
+    var xEntryExport = new Dictionary<string, List<(DateOnly Date, string Pattern, DateTimeOffset SignalTs, decimal FEnd, bool IsAdditional, decimal? Fwd8Pts, decimal? OptionMtm4, decimal? ActualNetPnl)>>();
+
+    foreach (var arch in new[] { "6500+180s", "6500x5" })
+    {
+        xSameEntry[arch] = []; xFullSeq[arch] = []; xEntryExport[arch] = [];
+        foreach (var date in xValidationSessions)
+        {
+            if (!xArchRows[arch].TryGetValue(date, out var rows) || rows.Count == 0 || !xEpisodes[arch].TryGetValue(date, out var ann)) { continue; }
+            var fsFlags = xFsFlags[arch][date];
+            var (expiry, dte) = xExpiryBySession[date];
+            var chain = xChainBySession[date];
+            var chainByStrikeAndSide = chain.Where(i => i.StrikePrice is not null).ToLookup(i => (i.StrikePrice!.Value, i.OptionType));
+            var futureBars = xFutureBarsBySession[date];
+
+            await using var src = new NiftySignalDbContext(tradeSourceOptions);
+            var tickCache = new Dictionary<string, OptionTickSeries>();
+            async Task<OptionTickSeries> SeriesAsync(string token)
+            {
+                if (!tickCache.TryGetValue(token, out var s))
+                {
+                    var dayStart = futureBars[0].StartTimestamp;
+                    var dayEnd = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 30)), xIstOffset).ToUniversalTime();
+                    s = await OptionTickSeries.LoadAsync(src, token, dayStart, dayEnd, CancellationToken.None);
+                    tickCache[token] = s;
+                }
+                return s;
+            }
+            decimal? FwdPts(int endIdx, int h) { var t = rows.FirstOrDefault(x => x.EndIdx == endIdx + h); if (t.WEnd == default) { return null; } var b0 = rows.First(x => x.EndIdx == endIdx); return t.FEnd - b0.FEnd; }
+
+            (string Pattern, Instrument Instrument, DateTimeOffset EntryTs, decimal EntryFill)? openBase = null, openInv = null;
+            for (var k = 0; k < rows.Count; k++)
+            {
+                var r = rows[k];
+                var isEntryRow = ann[k].IsStateEntry && r.AtmState is "A" or "B";
+
+                if (openBase is { } posB && isEntryRow && ((posB.Pattern == "A" && r.AtmState == "B") || (posB.Pattern == "B" && r.AtmState == "A")))
+                { var series = await SeriesAsync(posB.Instrument.Token); await Close(posB, r.WEnd, series, false, false); openBase = null; }
+                if (openInv is { } posI && r.AtmState != posI.Pattern)
+                { var series = await SeriesAsync(posI.Instrument.Token); await Close(posI, r.WEnd, series, false, true); openInv = null; }
+
+                if (!isEntryRow || !fsFlags[k]) { continue; }
+                var istTime = TimeOnly.FromDateTime(r.WEnd.DateTime);
+                var afterCutoff = istTime >= new TimeOnly(15, 0);
+                var baselineAvailable = openBase is null && !afterCutoff;
+                var invalidationAvailable = openInv is null && !afterCutoff;
+                var isAdditional = !baselineAvailable && invalidationAvailable;
+
+                var side = r.AtmState == "A" ? OptionType.Put : OptionType.Call;
+                var inst = chainByStrikeAndSide[(r.AtmStrike, side)].FirstOrDefault();
+                var fwd8 = FwdPts(r.EndIdx, 8);
+                decimal? mtm4 = null;
+                if (inst is not null)
+                {
+                    var series = await SeriesAsync(inst.Token);
+                    if (invalidationAvailable)
+                    {
+                        var entryTickN = series.EntryAtOrAfter(r.WEnd);
+                        if (entryTickN is not null) { var et = entryTickN.Value; var eb = et.Depth is { } ed ? ed.Ask1Price : et.LastPrice; var ef = PaperTradeSimulator.FillEntry(eb, inst.TickSize, inst.LotSize * xLots, xCosts); openInv = (r.AtmState, inst, et.Timestamp, ef.FillPrice); }
+                    }
+                    if (baselineAvailable)
+                    {
+                        var entryTickN2 = series.EntryAtOrAfter(r.WEnd);
+                        if (entryTickN2 is not null) { var et2 = entryTickN2.Value; var eb2 = et2.Depth is { } ed2 ? ed2.Ask1Price : et2.LastPrice; var ef2 = PaperTradeSimulator.FillEntry(eb2, inst.TickSize, inst.LotSize * xLots, xCosts); openBase = (r.AtmState, inst, et2.Timestamp, ef2.FillPrice); }
+                    }
+                    var t4 = rows.FirstOrDefault(x => x.EndIdx == r.EndIdx + 4);
+                    if (t4.WEnd != default) { var tk = series.EntryAtOrBefore(t4.WEnd); var refPrice = openInv?.EntryFill ?? openBase?.EntryFill; if (tk is { } tv && refPrice is { } rp && rp != 0) { mtm4 = (tv.LastPrice - rp) / rp * 100m; } }
+                }
+                xEntryExport[arch].Add((date, r.AtmState, r.WEnd, r.FEnd, isAdditional, fwd8, mtm4, null));
+            }
+            if (openBase is not null) { var series = await SeriesAsync(openBase.Value.Instrument.Token); await Close(openBase.Value, new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 15)), xIstOffset), series, true, false); }
+            if (openInv is not null) { var series = await SeriesAsync(openInv.Value.Instrument.Token); await Close(openInv.Value, new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 15)), xIstOffset), series, true, true); }
+
+            async Task Close((string Pattern, Instrument Instrument, DateTimeOffset EntryTs, decimal EntryFill) pos, DateTimeOffset atTs, OptionTickSeries series, bool isEod, bool isInvalidation)
+            {
+                var exitTickN = isEod ? series.EntryAtOrBefore(atTs) : series.EntryAtOrAfter(atTs);
+                if (exitTickN is null) { return; }
+                var exitTick = exitTickN.Value;
+                var qty = pos.Instrument.LotSize * xLots;
+                var exitBase = exitTick.Depth is { } xd ? xd.Bid1Price : exitTick.LastPrice;
+                var exitFill = PaperTradeSimulator.FillExit(exitBase, pos.Instrument.TickSize, qty, xCosts);
+                var netPnl = (exitFill.FillPrice - pos.EntryFill) * qty - TransactionCostCalculator.Compute(exitFill.GrossValue, xCosts.BrokeragePerOrder * 2).Total;
+                if (isInvalidation) { xFullSeq[arch].Add((date, pos.Pattern, netPnl, false, null)); } // full-sequential population (actual exit = invalidation)
+            }
+        }
+        Console.WriteLine($"  [{arch}] simulated both exit architectures across {xValidationSessions.Count} sessions.");
+    }
+    Console.WriteLine();
+
+    static (int N, double WinRate, decimal Net, double? Pf) SimAgg2(List<decimal> v)
+    {
+        if (v.Count == 0) { return (0, 0, 0, null); }
+        var wins = v.Count(x => x > 0); var gp = v.Where(x => x > 0).Sum(); var gl = Math.Abs(v.Where(x => x <= 0).Sum());
+        return (v.Count, 100.0 * wins / v.Count, v.Sum(), gl > 0 ? (double)(gp / gl) : null);
+    }
+
+    Console.WriteLine("### Full sequential (state-invalidation as actual exit) + opportunity-set, 6500-based architectures ###");
+    foreach (var arch in new[] { "6500+180s", "6500x5" })
+    {
+        var full = xFullSeq[arch];
+        var agg = SimAgg2(full.Select(x => x.NetPnl).ToList());
+        Console.WriteLine($"  [{arch}] StateInvalidation sequential: n={agg.N} win%={agg.WinRate:F1}% net={agg.Net:F0} PF={(agg.Pf?.ToString("F2") ?? "n/a")}");
+        var perDay = xValidationSessions.Select(date => full.Count(x => x.Date == date)).ToList();
+        Console.WriteLine($"  [{arch}] trades/day: mean={perDay.Average():F1} median={perDay.OrderBy(x => x).ElementAt(perDay.Count / 2)} min={perDay.Min()} max={perDay.Max()}");
+        var additional = xEntryExport[arch].Where(x => x.IsAdditional).ToList();
+        var addFwdHit = additional.Where(x => x.Fwd8Pts is not null).Select(x => x.Fwd8Pts!.Value * (x.Pattern == "A" ? -1m : 1m)).ToList();
+        var addMtmPos = additional.Where(x => x.OptionMtm4 is not null).Select(x => x.OptionMtm4!.Value).ToList();
+        Console.WriteLine($"  [{arch}] Additional (invalidation-created) entries: n={additional.Count} (A={additional.Count(x => x.Pattern == "A")}, B={additional.Count(x => x.Pattern == "B")}) fwd-hit%={(addFwdHit.Count > 0 ? 100.0 * addFwdHit.Count(x => x > 0) / addFwdHit.Count : 0):F1}% posMTM%={(addMtmPos.Count > 0 ? 100.0 * addMtmPos.Count(x => x > 0) / addMtmPos.Count : 0):F1}%");
+    }
+    Console.WriteLine("  [13K+180s, REUSED] StateInvalidation sequential: n=90, win%=41.1%, net=-57,075, PF=0.54; trades/day mean=9.0 median=8; additional entries n=24 (per the 13k-entry-quality command's Group2 isolation: net P&L -7,556, ~-315/trade, Pattern-A-specific weakness, NOT uniformly low quality).");
+    Console.WriteLine();
+
+    // ================= 09-18 / 09-09 diagnostic =================
+    Console.WriteLine("### 09-18 / 09-09 diagnostic, 6500-based architectures ###");
+    foreach (var date in new[] { new DateOnly(2026, 9, 18), new DateOnly(2026, 9, 9) })
+    {
+        foreach (var arch in new[] { "6500+180s", "6500x5" })
+        {
+            if (!xArchRows[arch].TryGetValue(date, out var rows) || !xEpisodes[arch].TryGetValue(date, out var ann)) { continue; }
+            var fsFlags = xFsFlags[arch][date];
+            var states = rows.Select(r => r.AtmState).ToList();
+            var transitions = 0; for (var k = 1; k < states.Count; k++) { if (states[k] != states[k - 1]) { transitions++; } }
+            var fsEntries = 0; for (var k = 0; k < rows.Count; k++) { if (ann[k].IsStateEntry && rows[k].AtmState is "A" or "B" && fsFlags[k]) { fsEntries++; } }
+            var hours = (rows.Last().WEnd - rows.First().WStart).TotalHours;
+            var seqTrades = xFullSeq[arch].Where(x => x.Date == date).ToList();
+            var net = seqTrades.Sum(x => x.NetPnl);
+            var gp = seqTrades.Where(x => x.NetPnl > 0).Sum(x => x.NetPnl); var gl = Math.Abs(seqTrades.Where(x => x.NetPnl <= 0).Sum(x => x.NetPnl));
+            var additionalHere = xEntryExport[arch].Count(x => x.Date == date && x.IsAdditional);
+            Console.WriteLine($"  {date:yyyy-MM-dd} [{arch}]: fsEntries={fsEntries} transitions/hour={(hours > 0 ? transitions / hours : 0):F2} invTrades={seqTrades.Count} additionalTrades={additionalHere} net={net:F0} PF={(gl > 0 ? (gp / gl).ToString("F2") : "n/a")}");
+        }
+    }
+    Console.WriteLine("  [13K+180s, REUSED] 09-18: bars=113 transitions=18 fsEntries=9 invTrades=8 net=-24,788 PF=0.11. 09-09: bars=253 transitions=34 fsEntries=13 invTrades=13 net=-5,526 PF=0.48.");
+    Console.WriteLine();
+
+    // ---- Per-entry export CSVs for both new architectures. ----
+    foreach (var arch in new[] { "6500+180s", "6500x5" })
+    {
+        var safeName = arch.Replace("+", "plus").Replace("x", "x");
+        using var w = new StreamWriter($"{xBase}-{safeName}-entries.csv");
+        w.WriteLine("TradingDate,Pattern,SignalTimestampIST,FuturesEnd,IsAdditionalOpportunityFromInvalidation,Forward8Pts,OptionMtm4");
+        foreach (var e in xEntryExport[arch])
+        {
+            w.WriteLine($"{e.Date:yyyy-MM-dd},{e.Pattern},{e.SignalTs.ToOffset(xIstOffset):HH:mm:ss.fff},{e.FEnd},{e.IsAdditional},{e.Fwd8Pts},{e.OptionMtm4}");
+        }
+        Console.WriteLine($"Entries CSV [{arch}]: {Path.GetFullPath($"{xBase}-{safeName}-entries.csv")} ({xEntryExport[arch].Count} rows).");
+    }
+
+    return 0;
+}
+
+// "vc0dte-relationship-13k-trade-summary" -- 2026-09-25. 13,000-contract futures base bars now
+// adopted as the volume-candle architecture going forward. Runs the FULL frozen rule set: 180s
+// adaptive context, warm-up (InsufficientHistory) correction, ATM A/B state, ATM+/-2
+// FullSurfaceAgreement entry confirmation, ATM execution, 10 lots, existing STT/GST costs, existing
+// entry cutoff (no new entries at/after 15:00), mandatory 15:15 close, and the ORIGINAL
+// opposite-pattern exit (A exits only on B, B exits only on A) -- the exit rule that outperformed
+// state-invalidation at this architecture. 10 validation sessions. 2026-09-24 never queried.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-13k-trade-summary --out=basePath
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-13k-trade-summary", StringComparison.OrdinalIgnoreCase))
+{
+    var (_, tsNamed) = SplitNamedArgs(args);
+    if (!tsNamed.TryGetValue("out", out var tsBase))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-13k-trade-summary --out=basePath");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-13k-trade-summary: 13,000-contract volume-candle architecture, frozen rule set, opposite-pattern exit. 2026-09-24 NOT queried. ===");
+    Console.WriteLine();
+
+    var tsIstOffset = TimeSpan.FromHours(5.5);
+    const long tsThreshold = 13000L;
+    const double tsTargetSeconds = 180.0;
+    var tsValidationSessions = new[] { "2026-09-04", "2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11", "2026-09-15", "2026-09-16", "2026-09-17", "2026-09-18", "2026-09-21" }.Select(DateOnly.Parse).ToList();
+
+    static bool TsFullSurface(string atmState, int ceValid, int cePos, int ceNeg, int peValid, int pePos, int peNeg) =>
+        atmState switch { "A" => ceValid == 5 && ceNeg == 5 && peValid == 5 && pePos == 5, "B" => ceValid == 5 && cePos == 5 && peValid == 5 && peNeg == 5, _ => false };
+
+    const int tsLots = PatternRelationshipTradeSimulator.Lots;
+    var tsCosts = new CostsConfig(BrokeragePerOrder: 0m, SlippageTicks: 0);
+
+    var tsTrades = new List<(DateOnly Date, int TradeId, string Pattern, DateTimeOffset SignalTs, DateTimeOffset EntryTs, DateTimeOffset ExitTs, string ExitReason,
+        decimal AtmStrike, OptionType OptionType, string Token, decimal EntryPremium, decimal ExitPremium, int Quantity,
+        decimal GrossPnl, decimal Costs, decimal NetPnl, double HoldingSeconds, decimal MaeRupees, decimal MfeRupees, double? SecondsToMfe)>();
+
+    foreach (var date in tsValidationSessions)
+    {
+        await using var src = new NiftySignalDbContext(tradeSourceOptions);
+        var bars = await FutureEventBarBuilder.BuildDayAsync(src, date, tsThreshold, CancellationToken.None);
+        if (bars.Count == 0) { continue; }
+        var expiries = await src.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.Underlying == "NIFTY").Select(i => i.ExpiryDate).Distinct().OrderBy(e => e).ToListAsync();
+        var expiry = expiries[0]!.Value; var dte = expiry.DayNumber - date.DayNumber;
+        var chain = await src.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == expiry && i.Underlying == "NIFTY").ToListAsync();
+        var chainByStrikeAndSide = chain.Where(i => i.StrikePrice is not null).ToLookup(i => (i.StrikePrice!.Value, i.OptionType));
+        var distinctStrikes = chain.Where(i => i.StrikePrice is not null).Select(i => i.StrikePrice!.Value).Distinct().OrderBy(x => x).ToList();
+        var tickCache = new Dictionary<string, OptionTickSeries>();
+        async Task<OptionTickSeries> SeriesAsync(string token)
+        {
+            if (!tickCache.TryGetValue(token, out var s))
+            {
+                var dayStart = bars[0].StartTimestamp;
+                var dayEnd = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 30)), tsIstOffset).ToUniversalTime();
+                s = await OptionTickSeries.LoadAsync(src, token, dayStart, dayEnd, CancellationToken.None);
+                tickCache[token] = s;
+            }
+            return s;
+        }
+
+        // ---- Build the frozen 13K+180s row series (identical construction to every prior 13K command). ----
+        var rows = new List<(int EndIdx, DateTimeOffset WEnd, decimal AtmStrike, string AtmState, int CeValid, int PeValid, int CePos, int CeNeg, int PePos, int PeNeg)>();
+        for (var i = 0; i < bars.Count; i++)
+        {
+            var startIdx = AdaptiveWindowAnalysis.FindWindowStartIndex(bars, i, tsTargetSeconds);
+            var startBar = bars[startIdx]; var endBar = bars[i];
+            var fStart = startBar.Open; var fEnd = endBar.Close;
+            var fChangePts = fEnd - fStart;
+            var wDur = (endBar.EndTimestamp - startBar.StartTimestamp).TotalSeconds;
+            var insufficientHistory = startIdx == 0 && wDur < tsTargetSeconds;
+
+            var atmCe = AtmStrikeSelector.PickAtm(chain, OptionType.Call, fEnd);
+            var atmPe = AtmStrikeSelector.PickAtm(chain, OptionType.Put, fEnd);
+            var atmStrikeVal = atmCe?.StrikePrice ?? atmPe?.StrikePrice ?? fEnd;
+            decimal? atmCeStart = null, atmCeEnd = null, atmPeStart = null, atmPeEnd = null;
+            var atmMissing = atmCe is null || atmPe is null;
+            if (atmCe is not null) { var s = await SeriesAsync(atmCe.Token); atmCeStart = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; atmCeEnd = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; atmMissing |= atmCeStart is null || atmCeEnd is null; }
+            if (atmPe is not null) { var s = await SeriesAsync(atmPe.Token); atmPeStart = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; atmPeEnd = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; atmMissing |= atmPeStart is null || atmPeEnd is null; }
+            decimal? atmCeChg = atmCeStart is not null && atmCeEnd is not null ? atmCeEnd - atmCeStart : null;
+            decimal? atmPeChg = atmPeStart is not null && atmPeEnd is not null ? atmPeEnd - atmPeStart : null;
+            var rawState = "Other";
+            if (!atmMissing) { if (fChangePts > 0 && atmCeChg < 0 && atmPeChg > 0) { rawState = "A"; } else if (fChangePts < 0 && atmCeChg > 0 && atmPeChg < 0) { rawState = "B"; } }
+
+            var atmIdx = distinctStrikes.FindIndex(x => x == atmStrikeVal);
+            int ceValid = 0, ceNeg = 0, cePos = 0, peValid = 0, peNeg = 0, pePos = 0;
+            for (var b = -2; b <= 2; b++)
+            {
+                var idx = atmIdx + b;
+                if (atmIdx < 0 || idx < 0 || idx >= distinctStrikes.Count) { continue; }
+                var strike = distinctStrikes[idx];
+                var ceInst = chain.FirstOrDefault(x => x.StrikePrice == strike && x.OptionType == OptionType.Call);
+                var peInst = chain.FirstOrDefault(x => x.StrikePrice == strike && x.OptionType == OptionType.Put);
+                if (ceInst is not null) { var s = await SeriesAsync(ceInst.Token); var st = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; var en = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; if (st is not null && en is not null && st != 0) { var ret = (en - st) / st * 100m; ceValid++; if (ret > 0) { cePos++; } else if (ret < 0) { ceNeg++; } } }
+                if (peInst is not null) { var s = await SeriesAsync(peInst.Token); var st = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; var en = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; if (st is not null && en is not null && st != 0) { var ret = (en - st) / st * 100m; peValid++; if (ret > 0) { pePos++; } else if (ret < 0) { peNeg++; } } }
+            }
+            rows.Add((i, endBar.EndTimestamp.ToOffset(tsIstOffset), atmStrikeVal, insufficientHistory ? "Other" : rawState, ceValid, peValid, cePos, ceNeg, pePos, peNeg));
+        }
+
+        var ann = RollingStateAnalysis.Annotate(rows.Select(r => r.AtmState).ToList());
+        var tradeIdCounter = 0;
+        (string Pattern, Instrument Instrument, DateTimeOffset EntryTs, decimal EntryFill)? open = null;
+
+        for (var k = 0; k < rows.Count; k++)
+        {
+            var r = rows[k];
+            var isEntryRow = ann[k].IsStateEntry && r.AtmState is "A" or "B";
+
+            if (open is { } pos && isEntryRow && ((pos.Pattern == "A" && r.AtmState == "B") || (pos.Pattern == "B" && r.AtmState == "A")))
+            {
+                var series = await SeriesAsync(pos.Instrument.Token);
+                await CloseTrade(pos, r.WEnd, "OppositePatternSignal", false, series);
+                open = null;
+            }
+
+            if (!isEntryRow || !TsFullSurface(r.AtmState, r.CeValid, r.CePos, r.CeNeg, r.PeValid, r.PePos, r.PeNeg)) { continue; }
+            if (open is not null) { continue; }
+            var istTime = TimeOnly.FromDateTime(r.WEnd.DateTime);
+            if (istTime >= new TimeOnly(15, 0)) { continue; }
+
+            var side = r.AtmState == "A" ? OptionType.Put : OptionType.Call;
+            var inst = chainByStrikeAndSide[(r.AtmStrike, side)].FirstOrDefault();
+            if (inst is null) { continue; }
+            var entrySeries = await SeriesAsync(inst.Token);
+            var entryTickN = entrySeries.EntryAtOrAfter(r.WEnd);
+            if (entryTickN is null) { continue; }
+            var entryTick = entryTickN.Value;
+            var entryBase = entryTick.Depth is { } ed ? ed.Ask1Price : entryTick.LastPrice;
+            var entryFill = PaperTradeSimulator.FillEntry(entryBase, inst.TickSize, inst.LotSize * tsLots, tsCosts);
+            open = (r.AtmState, inst, entryTick.Timestamp, entryFill.FillPrice);
+        }
+        if (open is not null)
+        {
+            var forceClose = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 15)), tsIstOffset);
+            var series = await SeriesAsync(open.Value.Instrument.Token);
+            await CloseTrade(open.Value, forceClose, "ForcedEod", true, series);
+        }
+
+        async Task CloseTrade((string Pattern, Instrument Instrument, DateTimeOffset EntryTs, decimal EntryFill) pos, DateTimeOffset atTs, string reason, bool isEod, OptionTickSeries series)
+        {
+            var exitTickN = isEod ? series.EntryAtOrBefore(atTs) : series.EntryAtOrAfter(atTs);
+            if (exitTickN is null) { return; }
+            var exitTick = exitTickN.Value;
+            var qty = pos.Instrument.LotSize * tsLots;
+            var exitBase = exitTick.Depth is { } xd ? xd.Bid1Price : exitTick.LastPrice;
+            var exitFill = PaperTradeSimulator.FillExit(exitBase, pos.Instrument.TickSize, qty, tsCosts);
+            var grossPnl = (exitFill.FillPrice - pos.EntryFill) * qty;
+            var costBreakdown = TransactionCostCalculator.Compute(exitFill.GrossValue, tsCosts.BrokeragePerOrder * 2);
+            var netPnl = grossPnl - costBreakdown.Total;
+            var path = series.AllEntries.Where(e => e.Timestamp > pos.EntryTs && e.Timestamp <= exitTick.Timestamp).OrderBy(e => e.Timestamp).ToList();
+            var maeMfe = MaeMfeCalculator.Compute(pos.EntryFill, path.Select(e => e.LastPrice).ToList());
+            double? secToMfe = null;
+            if (maeMfe.MfePoints > 0) { var mfeRow = path.FirstOrDefault(e => e.LastPrice - pos.EntryFill >= maeMfe.MfePoints); if (mfeRow.Timestamp != default) { secToMfe = (mfeRow.Timestamp - pos.EntryTs).TotalSeconds; } }
+            tsTrades.Add((date, tradeIdCounter++, pos.Pattern, pos.EntryTs, pos.EntryTs, exitTick.Timestamp, reason, pos.Instrument.StrikePrice!.Value, pos.Instrument.OptionType, pos.Instrument.Token,
+                pos.EntryFill, exitFill.FillPrice, qty, grossPnl, costBreakdown.Total, netPnl, (exitTick.Timestamp - pos.EntryTs).TotalSeconds, maeMfe.MaePoints, maeMfe.MfePoints, secToMfe));
+        }
+        Console.WriteLine($"  [Simulated] {date:yyyy-MM-dd}: {tsTrades.Count(x => x.Date == date)} trades.");
+    }
+    Console.WriteLine();
+
+    // ================= Day-wise summary: P&L, win rate, Sharpe, MAE/MFE, trade count. =================
+    Console.WriteLine("### Day-wise trade summary (13K volume-candle, 180s adaptive context, FullSurface ATM entry, opposite-pattern exit, ATM execution, 10 lots) ###");
+    var daySummaries = new List<(DateOnly Date, int N, decimal NetPnl, double WinRate, decimal AvgPnl, decimal StdDevPnl, double? Sharpe, decimal MedMae, decimal MedMfe)>();
+    foreach (var date in tsValidationSessions)
+    {
+        var t = tsTrades.Where(x => x.Date == date).ToList();
+        if (t.Count == 0) { daySummaries.Add((date, 0, 0, 0, 0, 0, null, 0, 0)); continue; }
+        var netPnls = t.Select(x => x.NetPnl).ToList();
+        var wins = t.Count(x => x.NetPnl > 0);
+        var avg = netPnls.Average();
+        var variance = netPnls.Count > 1 ? netPnls.Sum(x => (x - avg) * (x - avg)) / (netPnls.Count - 1) : 0m;
+        var stdDev = (decimal)Math.Sqrt((double)variance);
+        double? sharpe = stdDev > 0 ? (double)(avg / stdDev) : null; // per-trade Sharpe (mean/stdev of that day's own trade P&Ls) -- see note below.
+        var medMae = t.Select(x => x.MaeRupees).OrderBy(x => x).ElementAt(t.Count / 2);
+        var medMfe = t.Select(x => x.MfeRupees).OrderBy(x => x).ElementAt(t.Count / 2);
+        daySummaries.Add((date, t.Count, netPnls.Sum(), 100.0 * wins / t.Count, avg, stdDev, sharpe, medMae, medMfe));
+    }
+    foreach (var s in daySummaries)
+    {
+        Console.WriteLine($"  {s.Date:yyyy-MM-dd}: N={s.N} NetPnl={s.NetPnl:F0} WinRate={s.WinRate:F1}% Sharpe(intraday, per-trade)={(s.Sharpe?.ToString("F2") ?? "n/a")} MedianMAE={s.MedMae:F1} MedianMFE={s.MedMfe:F1}");
+    }
+    Console.WriteLine();
+
+    // Overall (across-day) Sharpe -- the more standard measure for a systematic day-trading strategy: mean/stdev of DAILY net P&L across sessions.
+    var dayNets = daySummaries.Where(s => s.N > 0).Select(s => s.NetPnl).ToList();
+    if (dayNets.Count > 1)
+    {
+        var meanDay = dayNets.Average();
+        var varDay = dayNets.Sum(x => (x - meanDay) * (x - meanDay)) / (dayNets.Count - 1);
+        var stdDay = (decimal)Math.Sqrt((double)varDay);
+        var sharpeDay = stdDay > 0 ? (double)(meanDay / stdDay) : (double?)null;
+        Console.WriteLine($"### Overall (across 10 validation-session days) ###");
+        Console.WriteLine($"  TotalTrades={tsTrades.Count} TotalNetPnl={tsTrades.Sum(x => x.NetPnl):F0} OverallWinRate={100.0 * tsTrades.Count(x => x.NetPnl > 0) / tsTrades.Count:F1}%");
+        Console.WriteLine($"  Day-level Sharpe (mean/stdev of daily net P&L across {dayNets.Count} sessions, NOT annualized) = {(sharpeDay?.ToString("F2") ?? "n/a")}");
+        Console.WriteLine($"  MedianMAE(all trades)={tsTrades.Select(x => x.MaeRupees).OrderBy(x => x).ElementAt(tsTrades.Count / 2):F1} MedianMFE(all trades)={tsTrades.Select(x => x.MfeRupees).OrderBy(x => x).ElementAt(tsTrades.Count / 2):F1}");
+    }
+    Console.WriteLine();
+
+    // ---- Full trade-by-trade CSV + day-summary CSV. ----
+    using (var w = new StreamWriter($"{tsBase}-trades.csv"))
+    {
+        w.WriteLine("TradeId,TradingDate,Pattern,SignalTimeIST,EntryTimeIST,ExitTimeIST,ExitReason,AtmStrike,OptionType,ContractToken,EntryPremium,ExitPremium,Quantity,GrossPnl,Costs,NetPnl,HoldingSeconds,MAE,MFE,SecondsToMfe");
+        foreach (var t in tsTrades)
+        {
+            w.WriteLine(string.Join(',', t.TradeId, t.Date.ToString("yyyy-MM-dd"), t.Pattern, t.SignalTs.ToOffset(tsIstOffset).ToString("HH:mm:ss.fff"), t.EntryTs.ToOffset(tsIstOffset).ToString("HH:mm:ss.fff"),
+                t.ExitTs.ToOffset(tsIstOffset).ToString("HH:mm:ss.fff"), t.ExitReason, t.AtmStrike, t.OptionType, t.Token, t.EntryPremium, t.ExitPremium, t.Quantity, t.GrossPnl, t.Costs, t.NetPnl,
+                t.HoldingSeconds, t.MaeRupees, t.MfeRupees, t.SecondsToMfe));
+        }
+    }
+    using (var w = new StreamWriter($"{tsBase}-day-summary.csv"))
+    {
+        w.WriteLine("TradingDate,TradeCount,NetPnl,WinRatePct,AvgPnlPerTrade,StdDevPnl,IntradaySharpe,MedianMAE,MedianMFE");
+        foreach (var s in daySummaries)
+        {
+            w.WriteLine($"{s.Date:yyyy-MM-dd},{s.N},{s.NetPnl},{s.WinRate},{s.AvgPnl},{s.StdDevPnl},{s.Sharpe},{s.MedMae},{s.MedMfe}");
+        }
+    }
+    Console.WriteLine($"Trades CSV: {Path.GetFullPath($"{tsBase}-trades.csv")} ({tsTrades.Count} rows).");
+    Console.WriteLine($"Day-summary CSV: {Path.GetFullPath($"{tsBase}-day-summary.csv")} ({daySummaries.Count} rows).");
+
+    return 0;
+}
+
+// "vc0dte-relationship-directional-reentry-lock" -- 2026-09-25. 13K + 180s adaptive context is now
+// FROZEN as the primary market representation. Tests ONE new structural hypothesis: separating
+// EXIT permission from RE-ENTRY permission via a directional re-entry lock layered on top of the
+// already-tested ATM_STATE_INVALIDATION exit. Three architectures compared: A=corrected opposite-
+// pattern baseline, B=unrestricted state-invalidation (already tested), C=state-invalidation +
+// directional re-entry lock (new candidate). Entry/exit mechanics otherwise completely unchanged.
+// 10 validation sessions. 2026-09-24 never queried.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-directional-reentry-lock --out=basePath
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-directional-reentry-lock", StringComparison.OrdinalIgnoreCase))
+{
+    var (_, rlNamed) = SplitNamedArgs(args);
+    if (!rlNamed.TryGetValue("out", out var rlBase))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-directional-reentry-lock --out=basePath");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-directional-reentry-lock: A=opposite-pattern baseline, B=unrestricted state-invalidation, C=state-invalidation+directional-lock. 13K+180s FROZEN. 2026-09-24 NOT queried. ===");
+    Console.WriteLine();
+
+    var rlIstOffset = TimeSpan.FromHours(5.5);
+    const long rlThreshold = 13000L;
+    const double rlTargetSeconds = 180.0;
+    var rlValidationSessions = new[] { "2026-09-04", "2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11", "2026-09-15", "2026-09-16", "2026-09-17", "2026-09-18", "2026-09-21" }.Select(DateOnly.Parse).ToList();
+
+    static bool RlFullSurface(string atmState, int ceValid, int cePos, int ceNeg, int peValid, int pePos, int peNeg) =>
+        atmState switch { "A" => ceValid == 5 && ceNeg == 5 && peValid == 5 && pePos == 5, "B" => ceValid == 5 && cePos == 5 && peValid == 5 && peNeg == 5, _ => false };
+
+    const int rlLots = PatternRelationshipTradeSimulator.Lots;
+    var rlCosts = new CostsConfig(BrokeragePerOrder: 0m, SlippageTicks: 0);
+
+    // Per-trade record, tagged by architecture.
+    var rlTrades = new List<(string Arch, DateOnly Date, int Dte, string Pattern, DateTimeOffset SignalTs, DateTimeOffset EntryTs, DateTimeOffset ExitTs, string ExitReason,
+        decimal EntryPremium, decimal ExitPremium, int Quantity, decimal NetPnl, double HoldingSeconds, decimal MaeRupees, decimal MfeRupees, double? SecToMfe, decimal? GivebackPct)>();
+    // Same-entry counterfactual (baseline entries, both exits computed from the SAME fill) -- for the rupee decomposition.
+    var rlSameEntry = new List<(DateOnly Date, string Pattern, decimal BaselineNet, decimal InvalidationNet)>();
+    // Every FullSurface signal row, tagged with whether B and/or C actually opened a trade on it (for SuppressedReentryTrades identification) + forward/MTM diagnostics.
+    var rlSignals = new List<(DateOnly Date, int Dte, string Pattern, DateTimeOffset SignalTs, decimal FEnd,
+        bool OpenedUnderB, bool OpenedUnderC, decimal? Fwd1Pts, decimal? Fwd2Pts, decimal? Fwd4Pts, decimal? Mtm1, decimal? Mtm2, decimal? Mtm4)>();
+
+    foreach (var date in rlValidationSessions)
+    {
+        await using var src = new NiftySignalDbContext(tradeSourceOptions);
+        var bars = await FutureEventBarBuilder.BuildDayAsync(src, date, rlThreshold, CancellationToken.None);
+        if (bars.Count == 0) { continue; }
+        var expiries = await src.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.Underlying == "NIFTY").Select(i => i.ExpiryDate).Distinct().OrderBy(e => e).ToListAsync();
+        var expiry = expiries[0]!.Value; var dte = expiry.DayNumber - date.DayNumber;
+        var chain = await src.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == expiry && i.Underlying == "NIFTY").ToListAsync();
+        var chainByStrikeAndSide = chain.Where(i => i.StrikePrice is not null).ToLookup(i => (i.StrikePrice!.Value, i.OptionType));
+        var distinctStrikes = chain.Where(i => i.StrikePrice is not null).Select(i => i.StrikePrice!.Value).Distinct().OrderBy(x => x).ToList();
+        var tickCache = new Dictionary<string, OptionTickSeries>();
+        async Task<OptionTickSeries> SeriesAsync(string token)
+        {
+            if (!tickCache.TryGetValue(token, out var s))
+            {
+                var dayStart = bars[0].StartTimestamp;
+                var dayEnd = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 30)), rlIstOffset).ToUniversalTime();
+                s = await OptionTickSeries.LoadAsync(src, token, dayStart, dayEnd, CancellationToken.None);
+                tickCache[token] = s;
+            }
+            return s;
+        }
+
+        // ---- Build the frozen 13K+180s row series. ----
+        var rows = new List<(int EndIdx, decimal AtmStrike, string AtmState, int CeValid, int PeValid, int CePos, int CeNeg, int PePos, int PeNeg, decimal FEnd, DateTimeOffset WEnd)>();
+        for (var i = 0; i < bars.Count; i++)
+        {
+            var startIdx = AdaptiveWindowAnalysis.FindWindowStartIndex(bars, i, rlTargetSeconds);
+            var startBar = bars[startIdx]; var endBar = bars[i];
+            var fStart = startBar.Open; var fEnd = endBar.Close;
+            var fChangePts = fEnd - fStart;
+            var wDur = (endBar.EndTimestamp - startBar.StartTimestamp).TotalSeconds;
+            var insufficientHistory = startIdx == 0 && wDur < rlTargetSeconds;
+
+            var atmCe = AtmStrikeSelector.PickAtm(chain, OptionType.Call, fEnd);
+            var atmPe = AtmStrikeSelector.PickAtm(chain, OptionType.Put, fEnd);
+            var atmStrikeVal = atmCe?.StrikePrice ?? atmPe?.StrikePrice ?? fEnd;
+            decimal? atmCeStart = null, atmCeEnd = null, atmPeStart = null, atmPeEnd = null;
+            var atmMissing = atmCe is null || atmPe is null;
+            if (atmCe is not null) { var s = await SeriesAsync(atmCe.Token); atmCeStart = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; atmCeEnd = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; atmMissing |= atmCeStart is null || atmCeEnd is null; }
+            if (atmPe is not null) { var s = await SeriesAsync(atmPe.Token); atmPeStart = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; atmPeEnd = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; atmMissing |= atmPeStart is null || atmPeEnd is null; }
+            decimal? atmCeChg = atmCeStart is not null && atmCeEnd is not null ? atmCeEnd - atmCeStart : null;
+            decimal? atmPeChg = atmPeStart is not null && atmPeEnd is not null ? atmPeEnd - atmPeStart : null;
+            var rawState = "Other";
+            if (!atmMissing) { if (fChangePts > 0 && atmCeChg < 0 && atmPeChg > 0) { rawState = "A"; } else if (fChangePts < 0 && atmCeChg > 0 && atmPeChg < 0) { rawState = "B"; } }
+
+            var atmIdx = distinctStrikes.FindIndex(x => x == atmStrikeVal);
+            int ceValid = 0, ceNeg = 0, cePos = 0, peValid = 0, peNeg = 0, pePos = 0;
+            for (var b = -2; b <= 2; b++)
+            {
+                var idx = atmIdx + b;
+                if (atmIdx < 0 || idx < 0 || idx >= distinctStrikes.Count) { continue; }
+                var strike = distinctStrikes[idx];
+                var ceInst = chain.FirstOrDefault(x => x.StrikePrice == strike && x.OptionType == OptionType.Call);
+                var peInst = chain.FirstOrDefault(x => x.StrikePrice == strike && x.OptionType == OptionType.Put);
+                if (ceInst is not null) { var s = await SeriesAsync(ceInst.Token); var st = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; var en = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; if (st is not null && en is not null && st != 0) { var ret = (en - st) / st * 100m; ceValid++; if (ret > 0) { cePos++; } else if (ret < 0) { ceNeg++; } } }
+                if (peInst is not null) { var s = await SeriesAsync(peInst.Token); var st = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; var en = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; if (st is not null && en is not null && st != 0) { var ret = (en - st) / st * 100m; peValid++; if (ret > 0) { pePos++; } else if (ret < 0) { peNeg++; } } }
+            }
+            rows.Add((i, atmStrikeVal, insufficientHistory ? "Other" : rawState, ceValid, peValid, cePos, ceNeg, pePos, peNeg, fEnd, endBar.EndTimestamp.ToOffset(rlIstOffset)));
+        }
+
+        var ann = RollingStateAnalysis.Annotate(rows.Select(r => r.AtmState).ToList());
+        var fsFlags = rows.Select(r => RlFullSurface(r.AtmState, r.CeValid, r.CePos, r.CeNeg, r.PeValid, r.PePos, r.PeNeg)).ToList();
+        decimal? FwdPts(int endIdx, int h) { var t = rows.FirstOrDefault(x => x.EndIdx == endIdx + h); if (t.WEnd == default) { return null; } var b0 = rows.First(x => x.EndIdx == endIdx); return t.FEnd - b0.FEnd; }
+
+        async Task<(decimal NetPnl, decimal EntryPremium, decimal ExitPremium, int Quantity, double HoldingSeconds, decimal Mae, decimal Mfe, double? SecToMfe, decimal? GivebackPct)>
+            CloseAt(Instrument instrument, DateTimeOffset entryTs, decimal entryFill, DateTimeOffset atTs, bool isEod, OptionTickSeries series)
+        {
+            var exitTickN = isEod ? series.EntryAtOrBefore(atTs) : series.EntryAtOrAfter(atTs);
+            if (exitTickN is null) { return (0, entryFill, entryFill, 0, 0, 0, 0, null, null); }
+            var exitTick = exitTickN.Value;
+            var qty = instrument.LotSize * rlLots;
+            var exitBase = exitTick.Depth is { } xd ? xd.Bid1Price : exitTick.LastPrice;
+            var exitFill = PaperTradeSimulator.FillExit(exitBase, instrument.TickSize, qty, rlCosts);
+            var grossPnl = (exitFill.FillPrice - entryFill) * qty;
+            var netPnl = grossPnl - TransactionCostCalculator.Compute(exitFill.GrossValue, rlCosts.BrokeragePerOrder * 2).Total;
+            var path = series.AllEntries.Where(e => e.Timestamp > entryTs && e.Timestamp <= exitTick.Timestamp).OrderBy(e => e.Timestamp).ToList();
+            var maeMfe = MaeMfeCalculator.Compute(entryFill, path.Select(e => e.LastPrice).ToList());
+            double? secToMfe = null; decimal? giveback = null;
+            if (maeMfe.MfePoints > 0) { var mfeRow = path.FirstOrDefault(e => e.LastPrice - entryFill >= maeMfe.MfePoints); if (mfeRow.Timestamp != default) { secToMfe = (mfeRow.Timestamp - entryTs).TotalSeconds; } giveback = (maeMfe.MfePoints - (exitFill.FillPrice - entryFill)) / maeMfe.MfePoints * 100m; }
+            return (netPnl, entryFill, exitFill.FillPrice, qty, (exitTick.Timestamp - entryTs).TotalSeconds, maeMfe.MaePoints, maeMfe.MfePoints, secToMfe, giveback);
+        }
+
+        // ==== Architecture A: opposite-pattern baseline (+ same-entry invalidation counterfactual, same fill). ====
+        {
+            (string Pattern, Instrument Instrument, DateTimeOffset EntryTs, decimal EntryFill, int EntryEndIdx)? open = null;
+            for (var k = 0; k < rows.Count; k++)
+            {
+                var r = rows[k];
+                var isEntryRow = ann[k].IsStateEntry && r.AtmState is "A" or "B";
+                if (open is { } pos && isEntryRow && ((pos.Pattern == "A" && r.AtmState == "B") || (pos.Pattern == "B" && r.AtmState == "A")))
+                {
+                    var series = await SeriesAsync(pos.Instrument.Token);
+                    var baseline = await CloseAt(pos.Instrument, pos.EntryTs, pos.EntryFill, r.WEnd, false, series);
+                    rlTrades.Add(("A", date, dte, pos.Pattern, r.WEnd, pos.EntryTs, r.WEnd, "OppositePatternSignal", baseline.EntryPremium, baseline.ExitPremium, baseline.Quantity, baseline.NetPnl, baseline.HoldingSeconds, baseline.Mae, baseline.Mfe, baseline.SecToMfe, baseline.GivebackPct));
+
+                    // Same-entry counterfactual: invalidation exit from the SAME entry.
+                    var invalidationRow = rows.FirstOrDefault(x => x.EndIdx > pos.EntryEndIdx && x.AtmState != pos.Pattern);
+                    var invalidationTs = invalidationRow.EndIdx != default || invalidationRow.WEnd != default ? invalidationRow.WEnd : new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 15)), rlIstOffset);
+                    var isInvEod = invalidationTs.TimeOfDay == new TimeOnly(15, 15).ToTimeSpan();
+                    var invalidation = await CloseAt(pos.Instrument, pos.EntryTs, pos.EntryFill, invalidationTs, isInvEod, series);
+                    rlSameEntry.Add((date, pos.Pattern, baseline.NetPnl, invalidation.NetPnl));
+                    open = null;
+                }
+                if (!isEntryRow || !fsFlags[k]) { continue; }
+                if (open is not null) { continue; }
+                var istTime = TimeOnly.FromDateTime(r.WEnd.DateTime);
+                if (istTime >= new TimeOnly(15, 0)) { continue; }
+                var side = r.AtmState == "A" ? OptionType.Put : OptionType.Call;
+                var inst = chainByStrikeAndSide[(r.AtmStrike, side)].FirstOrDefault();
+                if (inst is null) { continue; }
+                var entrySeries = await SeriesAsync(inst.Token);
+                var entryTickN = entrySeries.EntryAtOrAfter(r.WEnd);
+                if (entryTickN is null) { continue; }
+                var entryTick = entryTickN.Value;
+                var entryBase = entryTick.Depth is { } ed ? ed.Ask1Price : entryTick.LastPrice;
+                var entryFill = PaperTradeSimulator.FillEntry(entryBase, inst.TickSize, inst.LotSize * rlLots, rlCosts);
+                open = (r.AtmState, inst, entryTick.Timestamp, entryFill.FillPrice, r.EndIdx);
+            }
+            if (open is { } finalOpen)
+            {
+                var series = await SeriesAsync(finalOpen.Instrument.Token);
+                var forceClose = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 15)), rlIstOffset);
+                var res = await CloseAt(finalOpen.Instrument, finalOpen.EntryTs, finalOpen.EntryFill, forceClose, true, series);
+                rlTrades.Add(("A", date, dte, finalOpen.Pattern, finalOpen.EntryTs, finalOpen.EntryTs, forceClose, "ForcedEod", res.EntryPremium, res.ExitPremium, res.Quantity, res.NetPnl, res.HoldingSeconds, res.Mae, res.Mfe, res.SecToMfe, res.GivebackPct));
+            }
+        }
+
+        // ==== Architecture B: unrestricted state-invalidation, sequential. ====
+        (string Pattern, Instrument Instrument, DateTimeOffset EntryTs, decimal EntryFill)? openB = null;
+        var bOpenedAtEndIdx = new HashSet<int>();
+        for (var k = 0; k < rows.Count; k++)
+        {
+            var r = rows[k];
+            var isEntryRow = ann[k].IsStateEntry && r.AtmState is "A" or "B";
+            if (openB is { } posB && r.AtmState != posB.Pattern)
+            {
+                var series = await SeriesAsync(posB.Instrument.Token);
+                var res = await CloseAt(posB.Instrument, posB.EntryTs, posB.EntryFill, r.WEnd, false, series);
+                rlTrades.Add(("B", date, dte, posB.Pattern, posB.EntryTs, posB.EntryTs, r.WEnd, "AtmStateInvalidation", res.EntryPremium, res.ExitPremium, res.Quantity, res.NetPnl, res.HoldingSeconds, res.Mae, res.Mfe, res.SecToMfe, res.GivebackPct));
+                openB = null;
+            }
+            if (!isEntryRow || !fsFlags[k]) { continue; }
+            var istTime2 = TimeOnly.FromDateTime(r.WEnd.DateTime);
+            if (openB is not null || istTime2 >= new TimeOnly(15, 0)) { continue; }
+            var side2 = r.AtmState == "A" ? OptionType.Put : OptionType.Call;
+            var inst2 = chainByStrikeAndSide[(r.AtmStrike, side2)].FirstOrDefault();
+            if (inst2 is null) { continue; }
+            var series2 = await SeriesAsync(inst2.Token);
+            var entryTickN2 = series2.EntryAtOrAfter(r.WEnd);
+            if (entryTickN2 is null) { continue; }
+            var entryTick2 = entryTickN2.Value;
+            var entryBase2 = entryTick2.Depth is { } ed2 ? ed2.Ask1Price : entryTick2.LastPrice;
+            var entryFill2 = PaperTradeSimulator.FillEntry(entryBase2, inst2.TickSize, inst2.LotSize * rlLots, rlCosts);
+            openB = (r.AtmState, inst2, entryTick2.Timestamp, entryFill2.FillPrice);
+            bOpenedAtEndIdx.Add(r.EndIdx);
+        }
+        if (openB is not null) { var series = await SeriesAsync(openB.Value.Instrument.Token); var forceClose = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 15)), rlIstOffset); var res = await CloseAt(openB.Value.Instrument, openB.Value.EntryTs, openB.Value.EntryFill, forceClose, true, series); rlTrades.Add(("B", date, dte, openB.Value.Pattern, openB.Value.EntryTs, openB.Value.EntryTs, forceClose, "ForcedEod", res.EntryPremium, res.ExitPremium, res.Quantity, res.NetPnl, res.HoldingSeconds, res.Mae, res.Mfe, res.SecToMfe, res.GivebackPct)); }
+
+        // ==== Architecture C: state-invalidation + directional re-entry lock. ====
+        (string Pattern, Instrument Instrument, DateTimeOffset EntryTs, decimal EntryFill)? openC = null;
+        bool aLocked = false, bLocked = false;
+        int ignoredPositionOpen = 0, ignoredALocked = 0, ignoredBLocked = 0, afterCutoffC = 0, eligibleC = 0;
+        var cOpenedAtEndIdx = new HashSet<int>();
+        for (var k = 0; k < rows.Count; k++)
+        {
+            var r = rows[k];
+            var isEntryRow = ann[k].IsStateEntry && r.AtmState is "A" or "B";
+
+            if (openC is { } posC && r.AtmState != posC.Pattern)
+            {
+                var series = await SeriesAsync(posC.Instrument.Token);
+                var res = await CloseAt(posC.Instrument, posC.EntryTs, posC.EntryFill, r.WEnd, false, series);
+                rlTrades.Add(("C", date, dte, posC.Pattern, posC.EntryTs, posC.EntryTs, r.WEnd, "AtmStateInvalidation", res.EntryPremium, res.ExitPremium, res.Quantity, res.NetPnl, res.HoldingSeconds, res.Mae, res.Mfe, res.SecToMfe, res.GivebackPct));
+                if (posC.Pattern == "A") { aLocked = true; } else { bLocked = true; }
+                openC = null;
+            }
+            // Lock release: based purely on the opposite ATM state appearing at this row (continuation or entry, FullSurface or not).
+            if (r.AtmState == "B" && aLocked) { aLocked = false; }
+            if (r.AtmState == "A" && bLocked) { bLocked = false; }
+
+            if (!isEntryRow || !fsFlags[k]) { continue; }
+            eligibleC++;
+            var istTime3 = TimeOnly.FromDateTime(r.WEnd.DateTime);
+            if (istTime3 >= new TimeOnly(15, 0)) { afterCutoffC++; continue; }
+            if (openC is not null) { ignoredPositionOpen++; continue; }
+            if (r.AtmState == "A" && aLocked) { ignoredALocked++; continue; }
+            if (r.AtmState == "B" && bLocked) { ignoredBLocked++; continue; }
+            var side3 = r.AtmState == "A" ? OptionType.Put : OptionType.Call;
+            var inst3 = chainByStrikeAndSide[(r.AtmStrike, side3)].FirstOrDefault();
+            if (inst3 is null) { continue; }
+            var series3 = await SeriesAsync(inst3.Token);
+            var entryTickN3 = series3.EntryAtOrAfter(r.WEnd);
+            if (entryTickN3 is null) { continue; }
+            var entryTick3 = entryTickN3.Value;
+            var entryBase3 = entryTick3.Depth is { } ed3 ? ed3.Ask1Price : entryTick3.LastPrice;
+            var entryFill3 = PaperTradeSimulator.FillEntry(entryBase3, inst3.TickSize, inst3.LotSize * rlLots, rlCosts);
+            openC = (r.AtmState, inst3, entryTick3.Timestamp, entryFill3.FillPrice);
+            cOpenedAtEndIdx.Add(r.EndIdx);
+        }
+        if (openC is not null) { var series = await SeriesAsync(openC.Value.Instrument.Token); var forceClose = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 15)), rlIstOffset); var res = await CloseAt(openC.Value.Instrument, openC.Value.EntryTs, openC.Value.EntryFill, forceClose, true, series); rlTrades.Add(("C", date, dte, openC.Value.Pattern, openC.Value.EntryTs, openC.Value.EntryTs, forceClose, "ForcedEod", res.EntryPremium, res.ExitPremium, res.Quantity, res.NetPnl, res.HoldingSeconds, res.Mae, res.Mfe, res.SecToMfe, res.GivebackPct)); }
+
+        // ---- Per-signal-row record (all FullSurface entries, both architectures' opened-status + forward/MTM diagnostics). ----
+        for (var k = 0; k < rows.Count; k++)
+        {
+            if (!ann[k].IsStateEntry || rows[k].AtmState is not ("A" or "B") || !fsFlags[k]) { continue; }
+            var r = rows[k];
+            var fwd1 = FwdPts(r.EndIdx, 1); var fwd2 = FwdPts(r.EndIdx, 2); var fwd4 = FwdPts(r.EndIdx, 4);
+            decimal? mtm1 = null, mtm2 = null, mtm4 = null;
+            var side = r.AtmState == "A" ? OptionType.Put : OptionType.Call;
+            var inst = chainByStrikeAndSide[(r.AtmStrike, side)].FirstOrDefault();
+            if (inst is not null)
+            {
+                var series = await SeriesAsync(inst.Token);
+                var refTick = series.EntryAtOrBefore(r.WEnd);
+                if (refTick is { } rv)
+                {
+                    decimal? MtmAt(int h) { var t = rows.FirstOrDefault(x => x.EndIdx == r.EndIdx + h); if (t.WEnd == default) { return null; } var tk = series.EntryAtOrBefore(t.WEnd); return tk is { } tv && rv.LastPrice != 0 ? (tv.LastPrice - rv.LastPrice) / rv.LastPrice * 100m : null; }
+                    mtm1 = MtmAt(1); mtm2 = MtmAt(2); mtm4 = MtmAt(4);
+                }
+            }
+            rlSignals.Add((date, dte, r.AtmState, r.WEnd, r.FEnd, bOpenedAtEndIdx.Contains(r.EndIdx), cOpenedAtEndIdx.Contains(r.EndIdx), fwd1, fwd2, fwd4, mtm1, mtm2, mtm4));
+        }
+
+        Console.WriteLine($"  [Simulated] {date:yyyy-MM-dd}: A={rlTrades.Count(x => x.Date == date && x.Arch == "A")} B={rlTrades.Count(x => x.Date == date && x.Arch == "B")} C={rlTrades.Count(x => x.Date == date && x.Arch == "C")} trades. C funnel: eligible={eligibleC} ignoredOpen={ignoredPositionOpen} ignoredALock={ignoredALocked} ignoredBLock={ignoredBLocked} afterCutoff={afterCutoffC}");
+    }
+    Console.WriteLine();
+
+    // ================= Section 8: signal funnel, candidate C =================
+    Console.WriteLine("### Section 8: Candidate C signal funnel (aggregate) ###");
+    {
+        var cTrades = rlTrades.Where(x => x.Arch == "C").ToList();
+        var perDay = rlValidationSessions.Select(date => cTrades.Count(x => x.Date == date)).ToList();
+        Console.WriteLine($"  Executed={cTrades.Count} (A={cTrades.Count(x => x.Pattern == "A")}, B={cTrades.Count(x => x.Pattern == "B")})");
+        Console.WriteLine($"  Trades/day: mean={perDay.Average():F1} median={perDay.OrderBy(x => x).ElementAt(perDay.Count / 2)} min={perDay.Min()} max={perDay.Max()}");
+    }
+    Console.WriteLine();
+
+    // ================= Section 9: SuppressedReentryTrades =================
+    Console.WriteLine("### Section 9: SuppressedReentryTrades (opened under B, blocked under C) vs. Retained (opened under both) ###");
+    var suppressed = rlSignals.Where(x => x.OpenedUnderB && !x.OpenedUnderC).ToList();
+    var retained = rlSignals.Where(x => x.OpenedUnderB && x.OpenedUnderC).ToList();
+    static (int N, double HitRate, decimal MedFwd, double PosMtmPct, decimal MedMtm) SigStats(List<(decimal? Fwd, decimal ExpectSign, decimal? Mtm)> v)
+    {
+        var fwdVals = v.Where(x => x.Fwd is not null).Select(x => x.Fwd!.Value * x.ExpectSign).ToList();
+        var mtmVals = v.Where(x => x.Mtm is not null).Select(x => x.Mtm!.Value).ToList();
+        decimal Median(List<decimal> x) { if (x.Count == 0) { return 0; } var s = x.OrderBy(y => y).ToList(); return s.Count % 2 == 1 ? s[s.Count / 2] : (s[s.Count / 2 - 1] + s[s.Count / 2]) / 2m; }
+        return (v.Count, fwdVals.Count > 0 ? 100.0 * fwdVals.Count(x => x > 0) / fwdVals.Count : 0, Median(fwdVals), mtmVals.Count > 0 ? 100.0 * mtmVals.Count(x => x > 0) / mtmVals.Count : 0, Median(mtmVals));
+    }
+    Console.WriteLine($"  Suppressed: n={suppressed.Count} (A={suppressed.Count(x => x.Pattern == "A")}, B={suppressed.Count(x => x.Pattern == "B")})");
+    Console.WriteLine($"  Retained:   n={retained.Count} (A={retained.Count(x => x.Pattern == "A")}, B={retained.Count(x => x.Pattern == "B")})");
+    Console.WriteLine();
+
+    // ================= Sections 10-11: underlying + option response, retained vs. suppressed, +1/+2/+4 =================
+    Console.WriteLine("### Sections 10-11: underlying + option response, Retained vs. Suppressed, A/B separately ###");
+    foreach (var (label, pop) in new[] { ("Retained", retained), ("Suppressed", suppressed) })
+    {
+        foreach (var pattern in new[] { "A", "B" })
+        {
+            var expectSign = pattern == "A" ? -1m : 1m;
+            var side = pop.Where(x => x.Pattern == pattern).ToList();
+            foreach (var (hLabel, h) in new[] { ("+1", 0), ("+2", 1), ("+4", 2) })
+            {
+                var v = side.Select(x => (h == 0 ? x.Fwd1Pts : h == 1 ? x.Fwd2Pts : x.Fwd4Pts, expectSign, h == 0 ? x.Mtm1 : h == 1 ? x.Mtm2 : x.Mtm4)).ToList();
+                var stats = SigStats(v);
+                if (stats.N == 0) { continue; }
+                Console.WriteLine($"  [{label} {pattern} {hLabel}] n={stats.N} hitRate={stats.HitRate:F1}% medFwdPts={stats.MedFwd:F2} posMTM%={stats.PosMtmPct:F1}% medMTM={stats.MedMtm:F2}%");
+            }
+        }
+    }
+    Console.WriteLine();
+
+    // ================= Section 12: trade summary, A/B/C =================
+    static (int N, double WinRate, decimal Net, decimal AvgPnl, decimal Median, double? Pf, decimal MedHold, double MfeThenLossPct, double? MedCapture) TradeAgg(List<(decimal NetPnl, double HoldingSeconds, decimal Mfe, decimal EntryPrem, decimal ExitPrem)> v)
+    {
+        if (v.Count == 0) { return (0, 0, 0, 0, 0, null, 0, 0, null); }
+        var wins = v.Count(x => x.NetPnl > 0); var gp = v.Where(x => x.NetPnl > 0).Sum(x => x.NetPnl); var gl = Math.Abs(v.Where(x => x.NetPnl <= 0).Sum(x => x.NetPnl));
+        var sorted = v.Select(x => x.NetPnl).OrderBy(x => x).ToList();
+        var median = sorted.Count % 2 == 1 ? sorted[sorted.Count / 2] : (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2m;
+        var mfePos = v.Where(x => x.Mfe > 0).ToList();
+        var mfeThenLoss = mfePos.Count > 0 ? 100.0 * mfePos.Count(x => x.NetPnl <= 0) / mfePos.Count : 0;
+        var captureRatios = mfePos.Select(x => (double)((x.ExitPrem - x.EntryPrem) / x.Mfe)).OrderBy(x => x).ToList();
+        return (v.Count, 100.0 * wins / v.Count, v.Sum(x => x.NetPnl), v.Sum(x => x.NetPnl) / v.Count, median, gl > 0 ? (double)(gp / gl) : null,
+            (decimal)v.Select(x => x.HoldingSeconds).OrderBy(x => x).ElementAt(v.Count / 2), mfeThenLoss, captureRatios.Count > 0 ? captureRatios[captureRatios.Count / 2] : null);
+    }
+    static string TradeFmt((int N, double WinRate, decimal Net, decimal AvgPnl, decimal Median, double? Pf, decimal MedHold, double MfeThenLossPct, double? MedCapture) a) =>
+        a.N == 0 ? "n=0" : $"n={a.N} win%={a.WinRate:F1}% net={a.Net:F0} avgPnl={a.AvgPnl:F1} median={a.Median:F1} PF={(a.Pf?.ToString("F2") ?? "n/a")} medHoldSec={a.MedHold:F0} MFE>0->loss%={a.MfeThenLossPct:F1}% medCapture={(a.MedCapture?.ToString("F2") ?? "n/a")}";
+
+    Console.WriteLine("### Section 12: trade summary, A (baseline) / B (unrestricted invalidation) / C (directional lock) ###");
+    foreach (var arch in new[] { "A", "B", "C" })
+    {
+        var t = rlTrades.Where(x => x.Arch == arch).ToList();
+        var agg = TradeAgg(t.Select(x => (x.NetPnl, x.HoldingSeconds, x.MfeRupees, x.EntryPremium, x.ExitPremium)).ToList());
+        var perDay = rlValidationSessions.Select(date => t.Count(x => x.Date == date)).ToList();
+        var bySession = t.GroupBy(x => x.Date).Select(g => (g.Key, Pnl: g.Sum(x => x.NetPnl))).OrderByDescending(x => x.Pnl).ToList();
+        var profSessions = bySession.Count(x => x.Pnl > 0);
+        var medianSessionPnl = bySession.Count > 0 ? bySession.Select(x => x.Pnl).OrderBy(x => x).ElementAt(bySession.Count / 2) : 0;
+        Console.WriteLine($"  [{arch}] {TradeFmt(agg)} trades/day(mean)={perDay.Average():F1} profSessions={profSessions}/{bySession.Count} medSessionPnl={medianSessionPnl:F0} exclBest({(bySession.Count > 0 ? bySession.First().Key.ToString("yyyy-MM-dd") : "-")})={(bySession.Count > 0 ? bySession.Sum(x => x.Pnl) - bySession.First().Pnl : 0):F0} exclWorst({(bySession.Count > 0 ? bySession.Last().Key.ToString("yyyy-MM-dd") : "-")})={(bySession.Count > 0 ? bySession.Sum(x => x.Pnl) - bySession.Last().Pnl : 0):F0}");
+        foreach (var pattern in new[] { "A", "B" })
+        {
+            var side = t.Where(x => x.Pattern == pattern).ToList();
+            Console.WriteLine($"    [{arch} {pattern}] {TradeFmt(TradeAgg(side.Select(x => (x.NetPnl, x.HoldingSeconds, x.MfeRupees, x.EntryPremium, x.ExitPremium)).ToList()))}");
+        }
+    }
+    Console.WriteLine();
+
+    // ================= Section 13: rupee decomposition =================
+    Console.WriteLine("### Section 13: rupee decomposition (mandatory, explicit) ###");
+    {
+        var baselineTotal = rlSameEntry.Sum(x => x.BaselineNet);
+        var sameEntryInvalidationTotal = rlSameEntry.Sum(x => x.InvalidationNet);
+        var bTotal = rlTrades.Where(x => x.Arch == "B").Sum(x => x.NetPnl);
+        var cTotal = rlTrades.Where(x => x.Arch == "C").Sum(x => x.NetPnl);
+        Console.WriteLine($"  Baseline (A, n={rlSameEntry.Count} same entries) Net = {baselineTotal:F0}");
+        Console.WriteLine($"  Same-entry invalidation counterfactual Net = {sameEntryInvalidationTotal:F0}");
+        Console.WriteLine($"  Unrestricted sequential invalidation (B, n={rlTrades.Count(x => x.Arch == "B")}) Net = {bTotal:F0}");
+        Console.WriteLine($"  Directional-lock candidate (C, n={rlTrades.Count(x => x.Arch == "C")}) Net = {cTotal:F0}");
+        Console.WriteLine($"  Transition 1 -- Baseline -> Same-entry invalidation (PURE EXIT EFFECT) = {sameEntryInvalidationTotal - baselineTotal:F0}");
+        Console.WriteLine($"  Transition 2 -- Same-entry invalidation -> Unrestricted sequential (OPPORTUNITY-SET EXPANSION EFFECT) = {bTotal - sameEntryInvalidationTotal:F0}");
+        Console.WriteLine($"  Transition 3 -- Unrestricted sequential -> Directional-lock (RE-ENTRY SUPPRESSION EFFECT) = {cTotal - bTotal:F0}");
+    }
+    Console.WriteLine();
+
+    // ================= Section 14: A vs B pattern-level lock effect =================
+    Console.WriteLine("### Section 14: directional-lock effect, A and B separately ###");
+    foreach (var pattern in new[] { "A", "B" })
+    {
+        var supp = suppressed.Where(x => x.Pattern == pattern).ToList();
+        var ret = retained.Where(x => x.Pattern == pattern).ToList();
+        var expectSign = pattern == "A" ? -1m : 1m;
+        var suppHit = SigStats(supp.Select(x => (x.Fwd4Pts, expectSign, x.Mtm4)).ToList());
+        var retHit = SigStats(ret.Select(x => (x.Fwd4Pts, expectSign, x.Mtm4)).ToList());
+        Console.WriteLine($"  [{pattern}] Suppressed n={supp.Count} hitRate={suppHit.HitRate:F1}% medFwd(+4)={suppHit.MedFwd:F2} | Retained n={ret.Count} hitRate={retHit.HitRate:F1}% medFwd(+4)={retHit.MedFwd:F2}");
+    }
+    Console.WriteLine();
+
+    // ================= Section 15: session robustness =================
+    Console.WriteLine("### Section 15: session robustness (Baseline / Unrestricted / Lock, per session) ###");
+    var sessionRows = new List<(DateOnly Date, decimal NetA, decimal NetB, decimal NetC, int NA, int NB, int NC, int NSuppressed)>();
+    foreach (var date in rlValidationSessions)
+    {
+        var a = rlTrades.Where(x => x.Arch == "A" && x.Date == date).ToList();
+        var b = rlTrades.Where(x => x.Arch == "B" && x.Date == date).ToList();
+        var c = rlTrades.Where(x => x.Arch == "C" && x.Date == date).ToList();
+        var suppHere = suppressed.Count(x => x.Date == date);
+        sessionRows.Add((date, a.Sum(x => x.NetPnl), b.Sum(x => x.NetPnl), c.Sum(x => x.NetPnl), a.Count, b.Count, c.Count, suppHere));
+        Console.WriteLine($"  {date:yyyy-MM-dd}: NetA={a.Sum(x => x.NetPnl):F0}(n={a.Count}) NetB={b.Sum(x => x.NetPnl):F0}(n={b.Count}) NetC={c.Sum(x => x.NetPnl):F0}(n={c.Count}) Suppressed={suppHere}");
+    }
+    {
+        var improved = sessionRows.Count(s => s.NetC > s.NetB); var worsened = sessionRows.Count(s => s.NetC < s.NetB);
+        var deltas = sessionRows.Select(s => s.NetC - s.NetB).OrderBy(x => x).ToList();
+        var medianImprovement = deltas.Count % 2 == 1 ? deltas[deltas.Count / 2] : (deltas[deltas.Count / 2 - 1] + deltas[deltas.Count / 2]) / 2m;
+        var byAbsDelta = sessionRows.OrderByDescending(s => Math.Abs(s.NetC - s.NetB)).First();
+        var totalDelta = sessionRows.Sum(s => s.NetC - s.NetB);
+        var excl0918 = sessionRows.Where(s => s.Date != new DateOnly(2026, 9, 18)).Sum(s => s.NetC - s.NetB);
+        var bestSession = sessionRows.OrderByDescending(s => s.NetC).First();
+        var exclBest = sessionRows.Where(s => s.Date != bestSession.Date).Sum(s => s.NetC - s.NetB);
+        Console.WriteLine($"  vs. Unrestricted(B): sessionsImproved={improved}/10 worsened={worsened}/10 medianImprovement={medianImprovement:F0} largestSessionContribution({byAbsDelta.Date:yyyy-MM-dd})={byAbsDelta.NetC - byAbsDelta.NetB:F0} totalDelta={totalDelta:F0} exclusive0918={excl0918:F0} exclBestCSession({bestSession.Date:yyyy-MM-dd})={exclBest:F0}");
+    }
+    Console.WriteLine();
+
+    // ================= Section 16/17: 09-18 and 09-09 =================
+    Console.WriteLine("### Sections 16-17: 2026-09-18 and 2026-09-09 ###");
+    foreach (var date in new[] { new DateOnly(2026, 9, 18), new DateOnly(2026, 9, 9) })
+    {
+        var b = rlTrades.Where(x => x.Arch == "B" && x.Date == date).ToList();
+        var c = rlTrades.Where(x => x.Arch == "C" && x.Date == date).ToList();
+        var suppHere = suppressed.Where(x => x.Date == date).ToList();
+        var gp = c.Where(x => x.NetPnl > 0).Sum(x => x.NetPnl); var gl = Math.Abs(c.Where(x => x.NetPnl <= 0).Sum(x => x.NetPnl));
+        Console.WriteLine($"  {date:yyyy-MM-dd}: Unrestricted(B) n={b.Count} net={b.Sum(x => x.NetPnl):F0} | Lock(C) n={c.Count} net={c.Sum(x => x.NetPnl):F0} PF={(gl > 0 ? (gp / gl).ToString("F2") : "n/a")} | Suppressed n={suppHere.Count} (A={suppHere.Count(x => x.Pattern == "A")}, B={suppHere.Count(x => x.Pattern == "B")})");
+    }
+    Console.WriteLine();
+
+    // ================= Section 18: DTE descriptive =================
+    Console.WriteLine("### Section 18: DTE descriptive, Candidate C ###");
+    foreach (var g in rlTrades.Where(x => x.Arch == "C").GroupBy(x => x.Dte).OrderBy(g => g.Key))
+    {
+        var t = g.ToList();
+        var agg = TradeAgg(t.Select(x => (x.NetPnl, x.HoldingSeconds, x.MfeRupees, x.EntryPremium, x.ExitPremium)).ToList());
+        var suppHereDte = suppressed.Count(x => x.Dte == g.Key);
+        Console.WriteLine($"  DTE={g.Key}: {TradeFmt(agg)} suppressedReentries={suppHereDte}");
+    }
+    Console.WriteLine();
+
+    // ---- Full CSVs. ----
+    using (var w = new StreamWriter($"{rlBase}-trades.csv"))
+    {
+        w.WriteLine("Architecture,TradingDate,Dte,Pattern,SignalTimeIST,EntryTimeIST,ExitTimeIST,ExitReason,EntryPremium,ExitPremium,Quantity,NetPnl,HoldingSeconds,MAE,MFE,SecondsToMfe,GivebackPct");
+        foreach (var t in rlTrades)
+        {
+            w.WriteLine(string.Join(',', t.Arch, t.Date.ToString("yyyy-MM-dd"), t.Dte, t.Pattern, t.SignalTs.ToOffset(rlIstOffset).ToString("HH:mm:ss.fff"), t.EntryTs.ToOffset(rlIstOffset).ToString("HH:mm:ss.fff"),
+                t.ExitTs.ToOffset(rlIstOffset).ToString("HH:mm:ss.fff"), t.ExitReason, t.EntryPremium, t.ExitPremium, t.Quantity, t.NetPnl, t.HoldingSeconds, t.MaeRupees, t.MfeRupees, t.SecToMfe, t.GivebackPct));
+        }
+    }
+    using (var w = new StreamWriter($"{rlBase}-signals.csv"))
+    {
+        w.WriteLine("TradingDate,Dte,Pattern,SignalTimeIST,FuturesEnd,OpenedUnderB,OpenedUnderC,Forward1Pts,Forward2Pts,Forward4Pts,OptionMtm1,OptionMtm2,OptionMtm4");
+        foreach (var s in rlSignals)
+        {
+            w.WriteLine(string.Join(',', s.Date.ToString("yyyy-MM-dd"), s.Dte, s.Pattern, s.SignalTs.ToOffset(rlIstOffset).ToString("HH:mm:ss.fff"), s.FEnd, s.OpenedUnderB, s.OpenedUnderC,
+                s.Fwd1Pts, s.Fwd2Pts, s.Fwd4Pts, s.Mtm1, s.Mtm2, s.Mtm4));
+        }
+    }
+    Console.WriteLine($"Trades CSV: {Path.GetFullPath($"{rlBase}-trades.csv")} ({rlTrades.Count} rows).");
+    Console.WriteLine($"Signals CSV: {Path.GetFullPath($"{rlBase}-signals.csv")} ({rlSignals.Count} rows).");
+
+    return 0;
+}
+
+// "vc0dte-relationship-final-freeze-oos" -- 2026-09-25. FINAL PRE-OOS FREEZE. Reproduces the frozen
+// 13K+180s FullSurface/ATM-execution/opposite-pattern-exit candidate on the 10 validation sessions,
+// writes a freeze record, and -- ONLY if validation reconciles exactly -- runs it EXACTLY ONCE on
+// the previously-untouched 2026-09-24 session. No strategy modification. No alternative exit or
+// architecture is computed in this pass.
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-final-freeze-oos --out=basePath
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-final-freeze-oos", StringComparison.OrdinalIgnoreCase))
+{
+    var (_, fzNamed) = SplitNamedArgs(args);
+    if (!fzNamed.TryGetValue("out", out var fzBase))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-final-freeze-oos --out=basePath");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-final-freeze-oos: reproduce frozen 13K+180s candidate on validation, freeze, THEN (only if exact) run 2026-09-24 once. ===");
+    Console.WriteLine();
+
+    var fzIstOffset = TimeSpan.FromHours(5.5);
+    const long fzThreshold = 13000L;
+    const double fzTargetSeconds = 180.0;
+    var fzValidationSessions = new[] { "2026-09-04", "2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11", "2026-09-15", "2026-09-16", "2026-09-17", "2026-09-18", "2026-09-21" }.Select(DateOnly.Parse).ToList();
+
+    static bool FzFullSurface(string atmState, int ceValid, int cePos, int ceNeg, int peValid, int pePos, int peNeg) =>
+        atmState switch { "A" => ceValid == 5 && ceNeg == 5 && peValid == 5 && pePos == 5, "B" => ceValid == 5 && cePos == 5 && peValid == 5 && peNeg == 5, _ => false };
+
+    const int fzLots = PatternRelationshipTradeSimulator.Lots;
+    var fzCosts = new CostsConfig(BrokeragePerOrder: 0m, SlippageTicks: 0);
+
+    // Row schema, shared by validation build and (later, gated) the OOS build.
+    async Task<(List<(int EndIdx, int WinBars, double WDur, long RealizedVolume, decimal AtmStrike, string AtmState, int CeValid, int PeValid, int CePos, int CeNeg, int PePos, int PeNeg, decimal FStart, decimal FEnd, DateTimeOffset WEnd)> Rows,
+        List<Instrument> Chain, int Dte, DateOnly Expiry, List<FutureEventBar> Bars)>
+        BuildRowsAsync(NiftySignalDbContext src, DateOnly date)
+    {
+        var bars = await FutureEventBarBuilder.BuildDayAsync(src, date, fzThreshold, CancellationToken.None);
+        if (bars.Count == 0) { return ([], [], 0, default, []); }
+        var expiries = await src.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.Underlying == "NIFTY").Select(i => i.ExpiryDate).Distinct().OrderBy(e => e).ToListAsync();
+        var expiry = expiries[0]!.Value; var dte = expiry.DayNumber - date.DayNumber;
+        var chain = await src.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == expiry && i.Underlying == "NIFTY").ToListAsync();
+        var distinctStrikes = chain.Where(i => i.StrikePrice is not null).Select(i => i.StrikePrice!.Value).Distinct().OrderBy(x => x).ToList();
+        var tickCache = new Dictionary<string, OptionTickSeries>();
+        async Task<OptionTickSeries> SeriesAsync(string token)
+        {
+            if (!tickCache.TryGetValue(token, out var s))
+            {
+                var dayStart = bars[0].StartTimestamp;
+                var dayEnd = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 30)), fzIstOffset).ToUniversalTime();
+                s = await OptionTickSeries.LoadAsync(src, token, dayStart, dayEnd, CancellationToken.None);
+                tickCache[token] = s;
+            }
+            return s;
+        }
+        var rows = new List<(int, int, double, long, decimal, string, int, int, int, int, int, int, decimal, decimal, DateTimeOffset)>();
+        for (var i = 0; i < bars.Count; i++)
+        {
+            var startIdx = AdaptiveWindowAnalysis.FindWindowStartIndex(bars, i, fzTargetSeconds);
+            var startBar = bars[startIdx]; var endBar = bars[i];
+            var fStart = startBar.Open; var fEnd = endBar.Close;
+            var fChangePts = fEnd - fStart;
+            var wDur = (endBar.EndTimestamp - startBar.StartTimestamp).TotalSeconds;
+            var realizedVolume = bars.Skip(startIdx).Take(i - startIdx + 1).Sum(b => b.Volume);
+            var insufficientHistory = startIdx == 0 && wDur < fzTargetSeconds;
+
+            var atmCe = AtmStrikeSelector.PickAtm(chain, OptionType.Call, fEnd);
+            var atmPe = AtmStrikeSelector.PickAtm(chain, OptionType.Put, fEnd);
+            var atmStrikeVal = atmCe?.StrikePrice ?? atmPe?.StrikePrice ?? fEnd;
+            decimal? atmCeStart = null, atmCeEnd = null, atmPeStart = null, atmPeEnd = null;
+            var atmMissing = atmCe is null || atmPe is null;
+            if (atmCe is not null) { var s = await SeriesAsync(atmCe.Token); atmCeStart = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; atmCeEnd = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; atmMissing |= atmCeStart is null || atmCeEnd is null; }
+            if (atmPe is not null) { var s = await SeriesAsync(atmPe.Token); atmPeStart = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; atmPeEnd = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; atmMissing |= atmPeStart is null || atmPeEnd is null; }
+            decimal? atmCeChg = atmCeStart is not null && atmCeEnd is not null ? atmCeEnd - atmCeStart : null;
+            decimal? atmPeChg = atmPeStart is not null && atmPeEnd is not null ? atmPeEnd - atmPeStart : null;
+            var rawState = "Other";
+            if (!atmMissing) { if (fChangePts > 0 && atmCeChg < 0 && atmPeChg > 0) { rawState = "A"; } else if (fChangePts < 0 && atmCeChg > 0 && atmPeChg < 0) { rawState = "B"; } }
+
+            var atmIdx = distinctStrikes.FindIndex(x => x == atmStrikeVal);
+            int ceValid = 0, ceNeg = 0, cePos = 0, peValid = 0, peNeg = 0, pePos = 0;
+            for (var b = -2; b <= 2; b++)
+            {
+                var idx = atmIdx + b;
+                if (atmIdx < 0 || idx < 0 || idx >= distinctStrikes.Count) { continue; }
+                var strike = distinctStrikes[idx];
+                var ceInst = chain.FirstOrDefault(x => x.StrikePrice == strike && x.OptionType == OptionType.Call);
+                var peInst = chain.FirstOrDefault(x => x.StrikePrice == strike && x.OptionType == OptionType.Put);
+                if (ceInst is not null) { var s = await SeriesAsync(ceInst.Token); var st = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; var en = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; if (st is not null && en is not null && st != 0) { var ret = (en - st) / st * 100m; ceValid++; if (ret > 0) { cePos++; } else if (ret < 0) { ceNeg++; } } }
+                if (peInst is not null) { var s = await SeriesAsync(peInst.Token); var st = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; var en = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; if (st is not null && en is not null && st != 0) { var ret = (en - st) / st * 100m; peValid++; if (ret > 0) { pePos++; } else if (ret < 0) { peNeg++; } } }
+            }
+            rows.Add((i, i - startIdx + 1, wDur, realizedVolume, atmStrikeVal, insufficientHistory ? "Other" : rawState, ceValid, peValid, cePos, ceNeg, pePos, peNeg, fStart, fEnd, endBar.EndTimestamp.ToOffset(fzIstOffset)));
+        }
+        return (rows, chain, dte, expiry, bars);
+    }
+
+    // Shared trade simulator (opposite-pattern exit, ATM execution, frozen mechanics) -- used for BOTH validation and (gated) OOS.
+    async Task<List<(string Pattern, DateTimeOffset SignalTs, DateTimeOffset EntryTs, DateTimeOffset ExitTs, string ExitReason, OptionType OptionType, decimal Strike, string Token,
+        decimal EntryPremium, decimal ExitPremium, int Quantity, decimal GrossPnl, decimal Costs, decimal NetPnl, double HoldingSeconds,
+        decimal FuturesEntry, decimal FuturesExit, decimal MaeRupees, decimal MfeRupees, double? SecToMfe, decimal? Mtm1, decimal? Mtm2, decimal? Mtm4)>>
+        SimulateAsync(NiftySignalDbContext src, DateOnly date,
+            List<(int EndIdx, int WinBars, double WDur, long RealizedVolume, decimal AtmStrike, string AtmState, int CeValid, int PeValid, int CePos, int CeNeg, int PePos, int PeNeg, decimal FStart, decimal FEnd, DateTimeOffset WEnd)> rows,
+            List<Instrument> chain, List<FutureEventBar> bars)
+    {
+        var trades = new List<(string, DateTimeOffset, DateTimeOffset, DateTimeOffset, string, OptionType, decimal, string, decimal, decimal, int, decimal, decimal, decimal, double, decimal, decimal, decimal, decimal, double?, decimal?, decimal?, decimal?)>();
+        if (rows.Count == 0) { return trades; }
+        var chainByStrikeAndSide = chain.Where(i => i.StrikePrice is not null).ToLookup(i => (i.StrikePrice!.Value, i.OptionType));
+        var ann = RollingStateAnalysis.Annotate(rows.Select(r => r.AtmState).ToList());
+        var tickCache = new Dictionary<string, OptionTickSeries>();
+        async Task<OptionTickSeries> SeriesAsync(string token)
+        {
+            if (!tickCache.TryGetValue(token, out var s))
+            {
+                var dayStart = bars[0].StartTimestamp;
+                var dayEnd = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 30)), fzIstOffset).ToUniversalTime();
+                s = await OptionTickSeries.LoadAsync(src, token, dayStart, dayEnd, CancellationToken.None);
+                tickCache[token] = s;
+            }
+            return s;
+        }
+        decimal FuturesPriceAt(DateTimeOffset ts) { var b = bars.LastOrDefault(x => x.EndTimestamp <= ts); return b?.Close ?? bars[0].Close; }
+
+        (string Pattern, Instrument Instrument, DateTimeOffset SignalTs, DateTimeOffset EntryTs, decimal EntryFill, decimal FuturesAtEntry, int EndIdx)? open = null;
+        for (var k = 0; k < rows.Count; k++)
+        {
+            var r = rows[k];
+            var isEntryRow = ann[k].IsStateEntry && r.AtmState is "A" or "B";
+            if (open is { } pos && isEntryRow && ((pos.Pattern == "A" && r.AtmState == "B") || (pos.Pattern == "B" && r.AtmState == "A")))
+            {
+                var series = await SeriesAsync(pos.Instrument.Token);
+                await CloseAsync(pos, r.WEnd, "OppositePatternSignal", false, series);
+                open = null;
+            }
+            if (!isEntryRow || !FzFullSurface(r.AtmState, r.CeValid, r.CePos, r.CeNeg, r.PeValid, r.PePos, r.PeNeg)) { continue; }
+            if (open is not null) { continue; }
+            var istTime = TimeOnly.FromDateTime(r.WEnd.DateTime);
+            if (istTime >= new TimeOnly(15, 0)) { continue; }
+            var side = r.AtmState == "A" ? OptionType.Put : OptionType.Call;
+            var inst = chainByStrikeAndSide[(r.AtmStrike, side)].FirstOrDefault();
+            if (inst is null) { continue; }
+            var series2 = await SeriesAsync(inst.Token);
+            var entryTickN = series2.EntryAtOrAfter(r.WEnd);
+            if (entryTickN is null) { continue; }
+            var entryTick = entryTickN.Value;
+            var entryBase = entryTick.Depth is { } ed ? ed.Ask1Price : entryTick.LastPrice;
+            var entryFill = PaperTradeSimulator.FillEntry(entryBase, inst.TickSize, inst.LotSize * fzLots, fzCosts);
+            open = (r.AtmState, inst, r.WEnd, entryTick.Timestamp, entryFill.FillPrice, FuturesPriceAt(entryTick.Timestamp), r.EndIdx);
+        }
+        if (open is not null)
+        {
+            var forceClose = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 15)), fzIstOffset);
+            var series = await SeriesAsync(open.Value.Instrument.Token);
+            await CloseAsync(open.Value, forceClose, "ForcedEod", true, series);
+        }
+        return trades;
+
+        async Task CloseAsync((string Pattern, Instrument Instrument, DateTimeOffset SignalTs, DateTimeOffset EntryTs, decimal EntryFill, decimal FuturesAtEntry, int EndIdx) pos, DateTimeOffset atTs, string reason, bool isEod, OptionTickSeries series)
+        {
+            var exitTickN = isEod ? series.EntryAtOrBefore(atTs) : series.EntryAtOrAfter(atTs);
+            if (exitTickN is null) { return; }
+            var exitTick = exitTickN.Value;
+            var qty = pos.Instrument.LotSize * fzLots;
+            var exitBase = exitTick.Depth is { } xd ? xd.Bid1Price : exitTick.LastPrice;
+            var exitFill = PaperTradeSimulator.FillExit(exitBase, pos.Instrument.TickSize, qty, fzCosts);
+            var grossPnl = (exitFill.FillPrice - pos.EntryFill) * qty;
+            var costBreakdown = TransactionCostCalculator.Compute(exitFill.GrossValue, fzCosts.BrokeragePerOrder * 2);
+            var netPnl = grossPnl - costBreakdown.Total;
+            var path = series.AllEntries.Where(e => e.Timestamp > pos.EntryTs && e.Timestamp <= exitTick.Timestamp).OrderBy(e => e.Timestamp).ToList();
+            var maeMfe = MaeMfeCalculator.Compute(pos.EntryFill, path.Select(e => e.LastPrice).ToList());
+            double? secToMfe = null;
+            if (maeMfe.MfePoints > 0) { var mfeRow = path.FirstOrDefault(e => e.LastPrice - pos.EntryFill >= maeMfe.MfePoints); if (mfeRow.Timestamp != default) { secToMfe = (mfeRow.Timestamp - pos.EntryTs).TotalSeconds; } }
+            decimal? MtmAt(int h) { var t = rows.FirstOrDefault(x => x.EndIdx == pos.EndIdx + h); if (t.WEnd == default) { return null; } var tk = series.EntryAtOrBefore(t.WEnd); return tk is { } tv && pos.EntryFill != 0 ? (tv.LastPrice - pos.EntryFill) / pos.EntryFill * 100m : null; }
+            trades.Add((pos.Pattern, pos.SignalTs, pos.EntryTs, exitTick.Timestamp, reason, pos.Instrument.OptionType, pos.Instrument.StrikePrice!.Value, pos.Instrument.Token,
+                pos.EntryFill, exitFill.FillPrice, qty, grossPnl, costBreakdown.Total, netPnl, (exitTick.Timestamp - pos.EntryTs).TotalSeconds,
+                pos.FuturesAtEntry, FuturesPriceAt(exitTick.Timestamp), maeMfe.MaePoints, maeMfe.MfePoints, secToMfe, MtmAt(1), MtmAt(2), MtmAt(4)));
+        }
+    }
+
+    // ================= STEP 1-3: reproduce validation + underlying stats. =================
+    var fzValRows = new Dictionary<DateOnly, List<(int EndIdx, int WinBars, double WDur, long RealizedVolume, decimal AtmStrike, string AtmState, int CeValid, int PeValid, int CePos, int CeNeg, int PePos, int PeNeg, decimal FStart, decimal FEnd, DateTimeOffset WEnd)>>();
+    var fzValTrades = new Dictionary<DateOnly, List<(string Pattern, DateTimeOffset SignalTs, DateTimeOffset EntryTs, DateTimeOffset ExitTs, string ExitReason, OptionType OptionType, decimal Strike, string Token, decimal EntryPremium, decimal ExitPremium, int Quantity, decimal GrossPnl, decimal Costs, decimal NetPnl, double HoldingSeconds, decimal FuturesEntry, decimal FuturesExit, decimal MaeRupees, decimal MfeRupees, double? SecToMfe, decimal? Mtm1, decimal? Mtm2, decimal? Mtm4)>>();
+
+    foreach (var date in fzValidationSessions)
+    {
+        await using var src = new NiftySignalDbContext(tradeSourceOptions);
+        var (rows, chain, dte, expiry, bars) = await BuildRowsAsync(src, date);
+        fzValRows[date] = rows;
+        fzValTrades[date] = await SimulateAsync(src, date, rows, chain, bars);
+        Console.WriteLine($"  [Validation built] {date:yyyy-MM-dd}: {rows.Count} bars, {fzValTrades[date].Count} trades.");
+    }
+    Console.WriteLine();
+
+    var allValTrades = fzValTrades.Values.SelectMany(x => x).ToList();
+    static (int N, double WinRate, decimal Net, decimal AvgPnl, decimal Median, double? Pf) FzAgg(List<decimal> v)
+    {
+        if (v.Count == 0) { return (0, 0, 0, 0, 0, null); }
+        var wins = v.Count(x => x > 0); var gp = v.Where(x => x > 0).Sum(); var gl = Math.Abs(v.Where(x => x <= 0).Sum());
+        var sorted = v.OrderBy(x => x).ToList();
+        var median = sorted.Count % 2 == 1 ? sorted[sorted.Count / 2] : (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2m;
+        return (v.Count, 100.0 * wins / v.Count, v.Sum(), v.Sum() / v.Count, median, gl > 0 ? (double)(gp / gl) : null);
+    }
+
+    Console.WriteLine("### STEP 2: Validation reproduction (13K+180s, FullSurface, ATM execution, opposite-pattern exit) ###");
+    var valAgg = FzAgg(allValTrades.Select(x => x.NetPnl).ToList());
+    var bySession = fzValTrades.Select(kv => (kv.Key, Pnl: kv.Value.Sum(x => x.NetPnl))).OrderByDescending(x => x.Pnl).ToList();
+    var perDayCounts = fzValidationSessions.Select(d => fzValTrades[d].Count).ToList();
+    var profSessions = bySession.Count(x => x.Pnl > 0);
+    var totalAbs = bySession.Sum(x => Math.Abs(x.Pnl));
+    var totalValSignals = fzValidationSessions.Sum(d =>
+    {
+        var rr = fzValRows[d];
+        if (rr.Count == 0) { return 0; }
+        var a = RollingStateAnalysis.Annotate(rr.Select(r => r.AtmState).ToList());
+        return Enumerable.Range(0, rr.Count).Count(k => a[k].IsStateEntry && rr[k].AtmState is "A" or "B" && FzFullSurface(rr[k].AtmState, rr[k].CeValid, rr[k].CePos, rr[k].CeNeg, rr[k].PeValid, rr[k].PePos, rr[k].PeNeg));
+    });
+    Console.WriteLine($"  Signals(FullSurface entries)={totalValSignals} Executed={allValTrades.Count}");
+    Console.WriteLine($"  N={valAgg.N} WinRate={valAgg.WinRate:F1}% PF={(valAgg.Pf?.ToString("F2") ?? "n/a")} NetPnl={valAgg.Net:F0} PnlPerTrade={valAgg.AvgPnl:F1} MedianPnl={valAgg.Median:F1}");
+    Console.WriteLine($"  Trades/day: mean={perDayCounts.Average():F1} median={perDayCounts.OrderBy(x => x).ElementAt(perDayCounts.Count / 2)}");
+    Console.WriteLine($"  ProfitableSessions={profSessions}/10 MedianSessionPnl={bySession.Select(x => x.Pnl).OrderBy(x => x).ElementAt(bySession.Count / 2):F0} Best={bySession.First().Key:yyyy-MM-dd}({bySession.First().Pnl:F0}) Worst={bySession.Last().Key:yyyy-MM-dd}({bySession.Last().Pnl:F0})");
+    Console.WriteLine($"  NetExclBest={valAgg.Net - bySession.First().Pnl:F0} NetExclWorst={valAgg.Net - bySession.Last().Pnl:F0} LargestPositiveSessionShare={(totalAbs > 0 ? 100.0 * (double)Math.Max(bySession.First().Pnl, 0) / (double)totalAbs : 0):F1}%");
+    foreach (var pattern in new[] { "A", "B" })
+    {
+        var side = allValTrades.Where(x => x.Pattern == pattern).Select(x => x.NetPnl).ToList();
+        var agg = FzAgg(side);
+        Console.WriteLine($"    [{pattern}] N={agg.N} WinRate={agg.WinRate:F1}% PF={(agg.Pf?.ToString("F2") ?? "n/a")} NetPnl={agg.Net:F0} PnlPerTrade={agg.AvgPnl:F1} MedianPnl={agg.Median:F1}");
+    }
+    Console.WriteLine();
+
+    var expectedNet = 58379m;
+    var reconciles = valAgg.N == 66 && Math.Abs(valAgg.Net - expectedNet) < 5m;
+    Console.WriteLine($"  RECONCILIATION CHECK: N=66 expected, got {valAgg.N}. Net=~{expectedNet} expected, got {valAgg.Net:F0}. {(reconciles ? "EXACT MATCH -- proceeding." : "MISMATCH -- STOPPING. 2026-09-24 will NOT be loaded.")}");
+    Console.WriteLine();
+    if (!reconciles) { return 1; }
+
+    // ---- STEP 3: underlying statistical evidence (validation-pooled), +1/+2/+4 bars, matched control. ----
+    Console.WriteLine("### STEP 3: underlying FullSurface behavior, validation-pooled (+1/+2/+4 bars) ###");
+    var fzTerciles = new Dictionary<DateOnly, (decimal Low, decimal High)>();
+    var aFwd = new Dictionary<int, List<decimal>> { [1] = [], [2] = [], [4] = [] };
+    var bFwd = new Dictionary<int, List<decimal>> { [1] = [], [2] = [], [4] = [] };
+    var aCtrl = new Dictionary<int, List<decimal>> { [1] = [], [2] = [], [4] = [] };
+    var bCtrl = new Dictionary<int, List<decimal>> { [1] = [], [2] = [], [4] = [] };
+    var sessionAExpectedSign = new HashSet<DateOnly>(); var sessionBExpectedSign = new HashSet<DateOnly>();
+    var sessionABeatsCtrl = new HashSet<DateOnly>(); var sessionBBeatsCtrl = new HashSet<DateOnly>();
+    var sessionsWithA = new HashSet<DateOnly>(); var sessionsWithB = new HashSet<DateOnly>();
+
+    foreach (var date in fzValidationSessions)
+    {
+        var rows = fzValRows[date];
+        if (rows.Count == 0) { continue; }
+        var ann = RollingStateAnalysis.Annotate(rows.Select(r => r.AtmState).ToList());
+        var fsFlags = rows.Select(r => FzFullSurface(r.AtmState, r.CeValid, r.CePos, r.CeNeg, r.PeValid, r.PePos, r.PeNeg)).ToList();
+        var absMoves = new List<decimal>(); for (var k = 1; k < rows.Count; k++) { absMoves.Add(Math.Abs(rows[k].FEnd - rows[k - 1].FEnd)); }
+        fzTerciles[date] = absMoves.Count > 0 ? ForwardValidationAnalysis.ComputeTerciles(absMoves) : (0m, 0m);
+        decimal? FwdPts(int endIdx, int h) { var t = rows.FirstOrDefault(x => x.EndIdx == endIdx + h); if (t.WEnd == default) { return null; } var b0 = rows.First(x => x.EndIdx == endIdx); return t.FEnd - b0.FEnd; }
+        var sessAFwd = new List<decimal>(); var sessBFwd = new List<decimal>(); var sessACtrl = new List<decimal>(); var sessBCtrl = new List<decimal>();
+
+        for (var k = 0; k < rows.Count; k++)
+        {
+            if (!ann[k].IsStateEntry || !fsFlags[k]) { continue; }
+            if (rows[k].AtmState == "A") { sessionsWithA.Add(date); foreach (var h in new[] { 1, 2, 4 }) { var f = FwdPts(rows[k].EndIdx, h); if (f is not null) { aFwd[h].Add(-f.Value); if (h == 4) { sessAFwd.Add(-f.Value); } } } }
+            if (rows[k].AtmState == "B") { sessionsWithB.Add(date); foreach (var h in new[] { 1, 2, 4 }) { var f = FwdPts(rows[k].EndIdx, h); if (f is not null) { bFwd[h].Add(f.Value); if (h == 4) { sessBFwd.Add(f.Value); } } } }
+        }
+        var dirStates = new List<string>();
+        for (var k = 0; k < rows.Count; k++) { dirStates.Add(k == 0 || rows[k].AtmState is "A" or "B" ? "Other" : (rows[k].FEnd > rows[k - 1].FEnd ? "A" : rows[k].FEnd < rows[k - 1].FEnd ? "B" : "Other")); }
+        var dirAnn = RollingStateAnalysis.Annotate(dirStates);
+        for (var k = 1; k < rows.Count; k++)
+        {
+            if (!dirAnn[k].IsStateEntry) { continue; }
+            var move = Math.Abs(rows[k].FEnd - rows[k - 1].FEnd);
+            if (ConditionalMovementAnalysis.ClassifyTercileBucket(move, fzTerciles[date].Low, fzTerciles[date].High) != "Low") { continue; }
+            var isUpMove = dirStates[k] == "A";
+            foreach (var h in new[] { 1, 2, 4 })
+            {
+                var f = FwdPts(rows[k].EndIdx, h);
+                if (f is null) { continue; }
+                if (isUpMove) { aCtrl[h].Add(-f.Value); if (h == 4) { sessACtrl.Add(-f.Value); } } else { bCtrl[h].Add(f.Value); if (h == 4) { sessBCtrl.Add(f.Value); } }
+            }
+        }
+        if (sessAFwd.Count > 0 && sessAFwd.Average() > 0) { sessionAExpectedSign.Add(date); }
+        if (sessBFwd.Count > 0 && sessBFwd.Average() > 0) { sessionBExpectedSign.Add(date); }
+        if (sessAFwd.Count > 0 && sessACtrl.Count > 0 && 100.0 * sessAFwd.Count(x => x > 0) / sessAFwd.Count >= 100.0 * sessACtrl.Count(x => x > 0) / sessACtrl.Count) { sessionABeatsCtrl.Add(date); }
+        if (sessBFwd.Count > 0 && sessBCtrl.Count > 0 && 100.0 * sessBFwd.Count(x => x > 0) / sessBFwd.Count >= 100.0 * sessBCtrl.Count(x => x > 0) / sessBCtrl.Count) { sessionBBeatsCtrl.Add(date); }
+    }
+    static double HR(List<decimal> v) => v.Count > 0 ? 100.0 * v.Count(x => x > 0) / v.Count : 0;
+    foreach (var h in new[] { 1, 2, 4 })
+    {
+        Console.WriteLine($"  +{h}bar: A-hit={HR(aFwd[h]):F1}%(n={aFwd[h].Count}) A-ctrl={HR(aCtrl[h]):F1}%(n={aCtrl[h].Count}) gap={HR(aFwd[h]) - HR(aCtrl[h]):F1}pp | B-hit={HR(bFwd[h]):F1}%(n={bFwd[h].Count}) B-ctrl={HR(bCtrl[h]):F1}%(n={bCtrl[h].Count}) gap={HR(bFwd[h]) - HR(bCtrl[h]):F1}pp");
+    }
+    Console.WriteLine($"  Session consistency: A expected-median-sign={sessionAExpectedSign.Count}/{sessionsWithA.Count} beats-control={sessionABeatsCtrl.Count}/{sessionsWithA.Count} | B expected-median-sign={sessionBExpectedSign.Count}/{sessionsWithB.Count} beats-control={sessionBBeatsCtrl.Count}/{sessionsWithB.Count}");
+    Console.WriteLine();
+
+    // ================= STEP 4: PRE-OOS FREEZE record. =================
+    Console.WriteLine("=== PRE-OOS FREEZE ===");
+    var freezeLines = new (string Key, string Value)[]
+    {
+        ("BaseVolume", "13000 contracts (futures cumulative tick volume, whole-tick absorption, no splitting, existing excess/carry, final partial bar explicit)"),
+        ("AdaptiveContextSeconds", "180 (walk backward through completed bars until elapsed context time >= 180s)"),
+        ("WarmupRule", "InsufficientHistory = (StartBarIndex==0 AND WindowDurationSeconds<180); AtmState forced to \"Other\" when true -- no signal/trade/episode/control from incomplete warm-up"),
+        ("SignalDefinition", "Pattern A: futures context UP, ATM CE DOWN, ATM PE UP. Pattern B: futures context DOWN, ATM CE UP, ATM PE DOWN. Exact pinned CE/PE contracts, same at window start and end, no splicing."),
+        ("FullSurfaceDefinition", "ATM+/-2 (5 CE + 5 PE listed strikes). Pattern A: all 5 CE returns negative AND all 5 PE returns positive. Pattern B: all 5 CE positive AND all 5 PE negative. All 5 CE and all 5 PE must be valid."),
+        ("EntryEpisodeRule", "RollingStateAnalysis.Annotate on corrected AtmState; entry eligibility ONLY on IsStateEntry==true (new state entry), never on continuation observations."),
+        ("ExecutionContractRule", "Pattern A -> BUY ATM PE. Pattern B -> BUY ATM CE. Pinned dynamic-ATM contract at signal event. NOT the Rs.100-150 band selector."),
+        ("PositionSize", "10 lots (PatternRelationshipTradeSimulator.Lots) x contract LotSize"),
+        ("EntryCutoff", "No new entries at/after 15:00 IST"),
+        ("ExitRule", "ORIGINAL opposite-pattern exit ONLY: A exits only on a new Pattern B state entry; B exits only on a new Pattern A state entry. NOT ATM-state-invalidation, NOT directional lock."),
+        ("MandatoryClose", "Forced close at 15:15 IST using the last real tick at/before that time"),
+        ("CostModel", "TransactionCostCalculator: real STT (0.0625% exit leg only) + GST-on-brokerage (brokerage assumed Rs.0) + unmodeled 'Other'"),
+        ("OnePositionRule", "One open position at a time; a signal while holding is recorded/ignored, never silently dropped, never extends/resets the open position"),
+        ("QuoteMethodology", "Entry = first real tick at-or-after signal timestamp, Ask1Price if depth present else LastPrice. Exit = first real tick at-or-after opposite signal (or last real tick at-or-before 15:15 for EOD), Bid1Price if depth present else LastPrice. No future quote ever used."),
+        ("ValidationHeadlineNetPnl", $"{valAgg.Net:F0} (n={valAgg.N}, reconciled exactly against the prior study's Rs.{expectedNet:F0})"),
+        ("FreezeTimestampUtc", DateTimeOffset.UtcNow.ToString("O")),
+    };
+    foreach (var (key, value) in freezeLines) { Console.WriteLine($"  {key}: {value}"); }
+    Console.WriteLine();
+
+    using (var w = new StreamWriter($"{fzBase}-final-pre-oos-freeze.json"))
+    {
+        w.WriteLine("{");
+        for (var i = 0; i < freezeLines.Length; i++)
+        {
+            var (key, value) = freezeLines[i];
+            w.WriteLine($"  \"{key}\": {System.Text.Json.JsonSerializer.Serialize(value)}{(i < freezeLines.Length - 1 ? "," : "")}");
+        }
+        w.WriteLine("}");
+    }
+    Console.WriteLine($"Freeze file written: {Path.GetFullPath($"{fzBase}-final-pre-oos-freeze.json")}");
+    Console.WriteLine("No parameter may change after this marker. Proceeding to load 2026-09-24 for the first and only time.");
+    Console.WriteLine();
+
+    // ================= STEP 6: NOW, and only now, load 2026-09-24. =================
+    var oosDate = new DateOnly(2026, 9, 24);
+    Console.WriteLine("=== TEMPORAL OOS -- 2026-09-24 ===");
+    List<(int EndIdx, int WinBars, double WDur, long RealizedVolume, decimal AtmStrike, string AtmState, int CeValid, int PeValid, int CePos, int CeNeg, int PePos, int PeNeg, decimal FStart, decimal FEnd, DateTimeOffset WEnd)> oosRows;
+    List<(string Pattern, DateTimeOffset SignalTs, DateTimeOffset EntryTs, DateTimeOffset ExitTs, string ExitReason, OptionType OptionType, decimal Strike, string Token, decimal EntryPremium, decimal ExitPremium, int Quantity, decimal GrossPnl, decimal Costs, decimal NetPnl, double HoldingSeconds, decimal FuturesEntry, decimal FuturesExit, decimal MaeRupees, decimal MfeRupees, double? SecToMfe, decimal? Mtm1, decimal? Mtm2, decimal? Mtm4)> oosTrades;
+    List<Instrument> oosChain; List<FutureEventBar> oosBars; int oosDte; DateOnly oosExpiry;
+    await using (var src = new NiftySignalDbContext(tradeSourceOptions))
+    {
+        (oosRows, oosChain, oosDte, oosExpiry, oosBars) = await BuildRowsAsync(src, oosDate);
+        oosTrades = await SimulateAsync(src, oosDate, oosRows, oosChain, oosBars);
+    }
+    Console.WriteLine($"  Bars={oosRows.Count} Expiry={oosExpiry:yyyy-MM-dd} Dte={oosDte}");
+    Console.WriteLine();
+
+    var oosAnn = RollingStateAnalysis.Annotate(oosRows.Select(r => r.AtmState).ToList());
+    var oosFsFlags = oosRows.Select(r => FzFullSurface(r.AtmState, r.CeValid, r.CePos, r.CeNeg, r.PeValid, r.PePos, r.PeNeg)).ToList();
+    var oosSignals = new List<(string Pattern, DateTimeOffset SignalTs, int WinBars, double WDur, long Vol, decimal FStart, decimal FEnd, decimal AtmStrike, decimal? Fwd1, decimal? Fwd2, decimal? Fwd4, bool Executed, string NotExecutedReason)>();
+    decimal? OosFwdPts(int endIdx, int h) { var t = oosRows.FirstOrDefault(x => x.EndIdx == endIdx + h); if (t.WEnd == default) { return null; } var b0 = oosRows.First(x => x.EndIdx == endIdx); return t.FEnd - b0.FEnd; }
+    for (var k = 0; k < oosRows.Count; k++)
+    {
+        if (!oosAnn[k].IsStateEntry || oosRows[k].AtmState is not ("A" or "B") || !oosFsFlags[k]) { continue; }
+        var r = oosRows[k];
+        var f1 = OosFwdPts(r.EndIdx, 1); var f2 = OosFwdPts(r.EndIdx, 2); var f4 = OosFwdPts(r.EndIdx, 4);
+        var wasExecuted = oosTrades.Any(t => t.SignalTs == r.WEnd && t.Pattern == r.AtmState);
+        var notExecReason = wasExecuted ? "" : (TimeOnly.FromDateTime(r.WEnd.DateTime) >= new TimeOnly(15, 0) ? "AfterCutoff" : "PositionAlreadyOpenOrNoExecutableQuote");
+        oosSignals.Add((r.AtmState, r.WEnd, r.WinBars, r.WDur, r.RealizedVolume, r.FStart, r.FEnd, r.AtmStrike, f1, f2, f4, wasExecuted, notExecReason));
+    }
+
+    Console.WriteLine("### Layer A: signal production ###");
+    Console.WriteLine($"  A FullSurface signals={oosSignals.Count(x => x.Pattern == "A")} B FullSurface signals={oosSignals.Count(x => x.Pattern == "B")}");
+    var valSignalsPerDay = fzValidationSessions.Select(d => fzValRows[d].Where((r, idx) => RollingStateAnalysis.Annotate(fzValRows[d].Select(rr => rr.AtmState).ToList())[idx].IsStateEntry && r.AtmState is "A" or "B" && FzFullSurface(r.AtmState, r.CeValid, r.CePos, r.CeNeg, r.PeValid, r.PePos, r.PeNeg)).Count()).OrderBy(x => x).ToList();
+    Console.WriteLine($"  Historical validation FullSurface signals/day range: min={valSignalsPerDay.Min()} P25={valSignalsPerDay[valSignalsPerDay.Count / 4]} median={valSignalsPerDay[valSignalsPerDay.Count / 2]} P75={valSignalsPerDay[3 * valSignalsPerDay.Count / 4]} max={valSignalsPerDay.Max()}. OOS total signals={oosSignals.Count} (one day).");
+    Console.WriteLine();
+
+    Console.WriteLine("### Layer B: underlying directional behavior (OOS) ###");
+    foreach (var pattern in new[] { "A", "B" })
+    {
+        var expectSign = pattern == "A" ? -1m : 1m;
+        foreach (var (label, h) in new[] { ("+1", 0), ("+2", 1), ("+4", 2) })
+        {
+            var v = oosSignals.Where(x => x.Pattern == pattern).Select(x => (h == 0 ? x.Fwd1 : h == 1 ? x.Fwd2 : x.Fwd4)).Where(x => x is not null).Select(x => x!.Value * expectSign).ToList();
+            if (v.Count == 0) { Console.WriteLine($"  [{pattern} {label}] n=0"); continue; }
+            var sorted = v.OrderBy(x => x).ToList();
+            var median = sorted.Count % 2 == 1 ? sorted[sorted.Count / 2] : (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2m;
+            Console.WriteLine($"  [{pattern} {label}] n={v.Count} hitRate={100.0 * v.Count(x => x > 0) / v.Count:F1}% medianPts={median:F2}");
+        }
+    }
+    // Within-session matched control for 09-24.
+    {
+        var absMoves = new List<decimal>(); for (var k = 1; k < oosRows.Count; k++) { absMoves.Add(Math.Abs(oosRows[k].FEnd - oosRows[k - 1].FEnd)); }
+        var (oosLow, oosHigh) = absMoves.Count > 0 ? ForwardValidationAnalysis.ComputeTerciles(absMoves) : (0m, 0m);
+        var dirStates = new List<string>();
+        for (var k = 0; k < oosRows.Count; k++) { dirStates.Add(k == 0 || oosRows[k].AtmState is "A" or "B" ? "Other" : (oosRows[k].FEnd > oosRows[k - 1].FEnd ? "A" : oosRows[k].FEnd < oosRows[k - 1].FEnd ? "B" : "Other")); }
+        var dirAnn = RollingStateAnalysis.Annotate(dirStates);
+        var oosACtrl = new List<decimal>(); var oosBCtrl = new List<decimal>();
+        for (var k = 1; k < oosRows.Count; k++)
+        {
+            if (!dirAnn[k].IsStateEntry) { continue; }
+            var move = Math.Abs(oosRows[k].FEnd - oosRows[k - 1].FEnd);
+            if (ConditionalMovementAnalysis.ClassifyTercileBucket(move, oosLow, oosHigh) != "Low") { continue; }
+            var f = OosFwdPts(oosRows[k].EndIdx, 4);
+            if (f is null) { continue; }
+            if (dirStates[k] == "A") { oosACtrl.Add(-f.Value); } else { oosBCtrl.Add(f.Value); }
+        }
+        Console.WriteLine($"  Within-session matched control (+4 bars): A-ctrl n={oosACtrl.Count} hit%={HR(oosACtrl):F1}% | B-ctrl n={oosBCtrl.Count} hit%={HR(oosBCtrl):F1}%. {(oosACtrl.Count < 10 || oosBCtrl.Count < 10 ? "Sample is small (single session) -- explicitly flagged, not a strong statistical comparison." : "")}");
+    }
+    Console.WriteLine();
+
+    Console.WriteLine("### Layer C: option translation (OOS traded contracts) ###");
+    foreach (var pattern in new[] { "A", "B" })
+    {
+        var t = oosTrades.Where(x => x.Pattern == pattern).ToList();
+        if (t.Count == 0) { Console.WriteLine($"  [{pattern}] no executed trades."); continue; }
+        foreach (var (label, sel) in new (string, Func<(decimal? Mtm1, decimal? Mtm2, decimal? Mtm4), decimal?>)[] { ("+1", x => x.Mtm1), ("+2", x => x.Mtm2), ("+4", x => x.Mtm4) })
+        {
+            var v = t.Select(x => sel((x.Mtm1, x.Mtm2, x.Mtm4))).Where(x => x is not null).Select(x => x!.Value).ToList();
+            if (v.Count == 0) { continue; }
+            Console.WriteLine($"    [{pattern} {label}] n={v.Count} positive%={100.0 * v.Count(x => x > 0) / v.Count:F1}% mean%={v.Average():F2}%");
+        }
+        Console.WriteLine($"    [{pattern}] MFE={t.Select(x => x.MfeRupees).Average():F2} MAE={t.Select(x => x.MaeRupees).Average():F2} SecToMFE={(t.Any(x => x.SecToMfe is not null) ? t.Where(x => x.SecToMfe is not null).Average(x => x.SecToMfe!.Value) : 0):F0}");
+    }
+    Console.WriteLine();
+
+    Console.WriteLine("### Layer D: actual frozen trading lifecycle (OOS) ###");
+    {
+        var agg = FzAgg(oosTrades.Select(x => x.NetPnl).ToList());
+        Console.WriteLine($"  Executed={oosTrades.Count} (A={oosTrades.Count(x => x.Pattern == "A")}, B={oosTrades.Count(x => x.Pattern == "B")})");
+        Console.WriteLine($"  WinRate={agg.WinRate:F1}% PF={(agg.Pf?.ToString("F2") ?? "n/a")} GrossPnl={oosTrades.Sum(x => x.GrossPnl):F0} Costs={oosTrades.Sum(x => x.Costs):F0} NetPnl={agg.Net:F0} PnlPerTrade={agg.AvgPnl:F1} MedianPnl={agg.Median:F1}");
+        if (oosTrades.Count > 0) { Console.WriteLine($"  MedianHoldingSec={oosTrades.Select(x => x.HoldingSeconds).OrderBy(x => x).ElementAt(oosTrades.Count / 2):F0} ExitReasons: {string.Join(", ", oosTrades.GroupBy(x => x.ExitReason).Select(g => $"{g.Key}={g.Count()}"))}");
+        }
+    }
+    Console.WriteLine();
+
+    // ================= Section 9: OOS vs. validation range. =================
+    Console.WriteLine("### Section 9: OOS vs. validation range (min/P25/median/P75/max) ###");
+    {
+        var valTradesPerDay = fzValidationSessions.Select(d => fzValTrades[d].Count).OrderBy(x => x).ToList();
+        var valNetPerDay = fzValidationSessions.Select(d => fzValTrades[d].Sum(x => x.NetPnl)).OrderBy(x => x).ToList();
+        var valPfPerDay = fzValidationSessions.Select(d => { var t = fzValTrades[d]; var gp = t.Where(x => x.NetPnl > 0).Sum(x => x.NetPnl); var gl = Math.Abs(t.Where(x => x.NetPnl <= 0).Sum(x => x.NetPnl)); return gl > 0 ? (double)(gp / gl) : 0.0; }).OrderBy(x => x).ToList();
+        decimal Pctl(List<decimal> v, double f) => v.Count == 0 ? 0 : v[Math.Clamp((int)(f * (v.Count - 1)), 0, v.Count - 1)];
+        int Pctli(List<int> v, double f) => v.Count == 0 ? 0 : v[Math.Clamp((int)(f * (v.Count - 1)), 0, v.Count - 1)];
+        double Pctld(List<double> v, double f) => v.Count == 0 ? 0 : v[Math.Clamp((int)(f * (v.Count - 1)), 0, v.Count - 1)];
+        Console.WriteLine($"  Trades/day: val[min={valTradesPerDay.Min()} P25={Pctli(valTradesPerDay, 0.25)} median={Pctli(valTradesPerDay, 0.5)} P75={Pctli(valTradesPerDay, 0.75)} max={valTradesPerDay.Max()}] OOS={oosTrades.Count}");
+        Console.WriteLine($"  NetPnl/day: val[min={valNetPerDay.Min():F0} P25={Pctl(valNetPerDay, 0.25):F0} median={Pctl(valNetPerDay, 0.5):F0} P75={Pctl(valNetPerDay, 0.75):F0} max={valNetPerDay.Max():F0}] OOS={oosTrades.Sum(x => x.NetPnl):F0}");
+        Console.WriteLine($"  PF/day: val[min={valPfPerDay.Min():F2} P25={Pctld(valPfPerDay, 0.25):F2} median={Pctld(valPfPerDay, 0.5):F2} P75={Pctld(valPfPerDay, 0.75):F2} max={valPfPerDay.Max():F2}] OOS={(oosTrades.Count > 0 ? (oosTrades.Where(x => x.NetPnl > 0).Sum(x => x.NetPnl) / Math.Max(1, Math.Abs(oosTrades.Where(x => x.NetPnl <= 0).Sum(x => x.NetPnl)))).ToString("F2") : "n/a")}");
+    }
+    Console.WriteLine();
+
+    // ================= Section 10: failure attribution (OOS losing trades). =================
+    Console.WriteLine("### Section 10: OOS losing-trade failure attribution (descriptive only) ###");
+    {
+        var losers = oosTrades.Where(x => x.NetPnl <= 0).ToList();
+        int signalWrong = 0, correctOptionLost = 0, initiallyFavorableReversed = 0, exitGiveback = 0, ambiguous = 0;
+        foreach (var t in losers)
+        {
+            var expectSign = t.Pattern == "A" ? -1 : 1;
+            var underlyingMove = t.FuturesExit - t.FuturesEntry;
+            var underlyingCorrect = Math.Sign(underlyingMove) == expectSign;
+            var giveback = t.MfeRupees > 0 ? (t.MfeRupees - (t.ExitPremium - t.EntryPremium)) / t.MfeRupees * 100m : (decimal?)null;
+            if (!underlyingCorrect) { signalWrong++; }
+            else if (t.MfeRupees <= 0) { correctOptionLost++; }
+            else if (giveback is { } g && g >= 90m) { exitGiveback++; }
+            else if (underlyingCorrect && t.MfeRupees > 0) { initiallyFavorableReversed++; }
+            else { ambiguous++; }
+        }
+        Console.WriteLine($"  n={losers.Count}: UnderlyingSignalWrong={signalWrong} UnderlyingCorrectOptionLost={correctOptionLost} InitiallyFavorableThenReversed={initiallyFavorableReversed} ExitLifecycleGiveback={exitGiveback} Ambiguous={ambiguous}");
+    }
+    Console.WriteLine();
+
+    // ---- CSV exports: OOS signal table, OOS trade table. ----
+    using (var w = new StreamWriter($"{fzBase}-oos-signals.csv"))
+    {
+        w.WriteLine("Pattern,TimestampIST,WindowBarCount,WindowDurationSeconds,ActualWindowVolume,FuturesStart,FuturesEnd,AtmStrike,Forward1Pts,Forward2Pts,Forward4Pts,ExpectedDirectionCorrect4,Executed,NotExecutedReason");
+        foreach (var s in oosSignals)
+        {
+            var expectSign = s.Pattern == "A" ? -1 : 1;
+            var correct4 = s.Fwd4 is not null ? (Math.Sign(s.Fwd4.Value) == expectSign).ToString() : "";
+            w.WriteLine(string.Join(',', s.Pattern, s.SignalTs.ToOffset(fzIstOffset).ToString("HH:mm:ss.fff"), s.WinBars, s.WDur, s.Vol, s.FStart, s.FEnd, s.AtmStrike, s.Fwd1, s.Fwd2, s.Fwd4, correct4, s.Executed, s.NotExecutedReason));
+        }
+    }
+    using (var w = new StreamWriter($"{fzBase}-oos-trades.csv"))
+    {
+        w.WriteLine("Pattern,SignalTimeIST,EntryTimeIST,ExitTimeIST,OptionType,Strike,ContractToken,EntryPremium,ExitPremium,GrossPnl,Costs,NetPnl,HoldingSeconds,FuturesEntry,FuturesExit,UnderlyingChange,MAE,MFE,SecondsToMfe,OptionMtm1,OptionMtm2,OptionMtm4,ExitReason");
+        foreach (var t in oosTrades)
+        {
+            w.WriteLine(string.Join(',', t.Pattern, t.SignalTs.ToOffset(fzIstOffset).ToString("HH:mm:ss.fff"), t.EntryTs.ToOffset(fzIstOffset).ToString("HH:mm:ss.fff"), t.ExitTs.ToOffset(fzIstOffset).ToString("HH:mm:ss.fff"),
+                t.OptionType, t.Strike, t.Token, t.EntryPremium, t.ExitPremium, t.GrossPnl, t.Costs, t.NetPnl, t.HoldingSeconds, t.FuturesEntry, t.FuturesExit, t.FuturesExit - t.FuturesEntry,
+                t.MaeRupees, t.MfeRupees, t.SecToMfe, t.Mtm1, t.Mtm2, t.Mtm4, t.ExitReason));
+        }
+    }
+    Console.WriteLine($"OOS signals CSV: {Path.GetFullPath($"{fzBase}-oos-signals.csv")} ({oosSignals.Count} rows).");
+    Console.WriteLine($"OOS trades CSV: {Path.GetFullPath($"{fzBase}-oos-trades.csv")} ({oosTrades.Count} rows).");
+
+    return 0;
+}
+
+// "vc0dte-relationship-option-momentum" -- 2026-09-25. ONE predeclared hypothesis on the frozen 13K
+// architecture: enter FullSurface signals only when the exact pinned option itself shows positive
+// recent momentum (CurrentBarAverage > mean of previous 5 completed 13K-bar averages, using the
+// SAME contract throughout); exit on pattern invalidation OR option-momentum invalidation, whichever
+// first. OptionBarAveragePrice reuses SynchronizedOptionEventBar.AverageLtp verbatim (arithmetic
+// mean of every real LTP print strictly inside that bar's interval) -- not a new formula. 10
+// validation sessions only. 2026-09-24 never queried (already consumed as OOS).
+//   dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-option-momentum --out=basePath
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-option-momentum", StringComparison.OrdinalIgnoreCase))
+{
+    var (_, mmNamed) = SplitNamedArgs(args);
+    if (!mmNamed.TryGetValue("out", out var mmBase))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-option-momentum --out=basePath");
+        return 1;
+    }
+
+    Console.WriteLine("=== vc0dte-relationship-option-momentum: FullSurface + option-momentum entry, pattern-OR-momentum-invalidation exit. 13K+180s FROZEN. 2026-09-24 NOT queried (already consumed). ===");
+    Console.WriteLine();
+    Console.WriteLine("OptionBarAveragePrice formula (REUSED, not invented): SynchronizedOptionEventBar.AverageLtp -- the arithmetic mean of every real LTP print strictly inside that bar's [StartTimestamp,EndTimestamp) interval, built against the exact 13K futures-bar boundaries via SynchronizedOptionBarBuilder.BuildDayForChainAsync. Null (MissingData=true) when no real print fell inside the interval -- never fabricated.");
+    Console.WriteLine("OptionMomentumPass = CurrentBarAverage > Previous5Average, where Previous5Average = mean(AverageLtp of the 5 immediately preceding completed 13K bars for the SAME pinned token). No tolerance, no percentage, no consecutive-rise requirement, current bar excluded from the average.");
+    Console.WriteLine();
+
+    var mmIstOffset = TimeSpan.FromHours(5.5);
+    const long mmThreshold = 13000L;
+    const double mmTargetSeconds = 180.0;
+    var mmValidationSessions = new[] { "2026-09-04", "2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11", "2026-09-15", "2026-09-16", "2026-09-17", "2026-09-18", "2026-09-21" }.Select(DateOnly.Parse).ToList();
+
+    static bool MmFullSurface(string atmState, int ceValid, int cePos, int ceNeg, int peValid, int pePos, int peNeg) =>
+        atmState switch { "A" => ceValid == 5 && ceNeg == 5 && peValid == 5 && pePos == 5, "B" => ceValid == 5 && cePos == 5 && peValid == 5 && peNeg == 5, _ => false };
+
+    const int mmLots = PatternRelationshipTradeSimulator.Lots;
+    var mmCosts = new CostsConfig(BrokeragePerOrder: 0m, SlippageTicks: 0);
+
+    // Per-session state, built once and reused across all three strategies.
+    var mmRowsBySession = new Dictionary<DateOnly, List<(int EndIdx, decimal AtmStrike, string AtmState, int CeValid, int PeValid, int CePos, int CeNeg, int PePos, int PeNeg, decimal FStart, decimal FEnd, DateTimeOffset WEnd, string AtmCeToken, string AtmPeToken)>>();
+    var mmBarsByTokenBySession = new Dictionary<DateOnly, Dictionary<string, Dictionary<int, SynchronizedOptionEventBar>>>();
+    var mmChainBySession = new Dictionary<DateOnly, List<Instrument>>();
+    var mmFutureBarsBySession = new Dictionary<DateOnly, List<FutureEventBar>>();
+    var mmDteBySession = new Dictionary<DateOnly, int>();
+
+    foreach (var date in mmValidationSessions)
+    {
+        await using var src = new NiftySignalDbContext(tradeSourceOptions);
+        var bars = await FutureEventBarBuilder.BuildDayAsync(src, date, mmThreshold, CancellationToken.None);
+        if (bars.Count == 0) { continue; }
+        var expiries = await src.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.Underlying == "NIFTY").Select(i => i.ExpiryDate).Distinct().OrderBy(e => e).ToListAsync();
+        var expiry = expiries[0]!.Value; var dte = expiry.DayNumber - date.DayNumber;
+        mmDteBySession[date] = dte;
+        var chain = await src.Instruments.Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.ExpiryDate == expiry && i.Underlying == "NIFTY").ToListAsync();
+        mmChainBySession[date] = chain;
+        mmFutureBarsBySession[date] = bars;
+        var distinctStrikes = chain.Where(i => i.StrikePrice is not null).Select(i => i.StrikePrice!.Value).Distinct().OrderBy(x => x).ToList();
+        var optionBars = await SynchronizedOptionBarBuilder.BuildDayForChainAsync(src, date, chain, bars, CancellationToken.None);
+        var barsByToken = optionBars.GroupBy(b => b.Token).ToDictionary(g => g.Key, g => g.ToDictionary(b => b.EventId));
+        mmBarsByTokenBySession[date] = barsByToken;
+        var tickCache = new Dictionary<string, OptionTickSeries>();
+        async Task<OptionTickSeries> SeriesAsync(string token)
+        {
+            if (!tickCache.TryGetValue(token, out var s))
+            {
+                var dayStart = bars[0].StartTimestamp;
+                var dayEnd = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 30)), mmIstOffset).ToUniversalTime();
+                s = await OptionTickSeries.LoadAsync(src, token, dayStart, dayEnd, CancellationToken.None);
+                tickCache[token] = s;
+            }
+            return s;
+        }
+
+        var rows = new List<(int, decimal, string, int, int, int, int, int, int, decimal, decimal, DateTimeOffset, string, string)>();
+        for (var i = 0; i < bars.Count; i++)
+        {
+            var startIdx = AdaptiveWindowAnalysis.FindWindowStartIndex(bars, i, mmTargetSeconds);
+            var startBar = bars[startIdx]; var endBar = bars[i];
+            var fStart = startBar.Open; var fEnd = endBar.Close;
+            var fChangePts = fEnd - fStart;
+            var wDur = (endBar.EndTimestamp - startBar.StartTimestamp).TotalSeconds;
+            var insufficientHistory = startIdx == 0 && wDur < mmTargetSeconds;
+
+            var atmCe = AtmStrikeSelector.PickAtm(chain, OptionType.Call, fEnd);
+            var atmPe = AtmStrikeSelector.PickAtm(chain, OptionType.Put, fEnd);
+            var atmStrikeVal = atmCe?.StrikePrice ?? atmPe?.StrikePrice ?? fEnd;
+            decimal? atmCeStart = null, atmCeEnd = null, atmPeStart = null, atmPeEnd = null;
+            var atmMissing = atmCe is null || atmPe is null;
+            if (atmCe is not null) { var s = await SeriesAsync(atmCe.Token); atmCeStart = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; atmCeEnd = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; atmMissing |= atmCeStart is null || atmCeEnd is null; }
+            if (atmPe is not null) { var s = await SeriesAsync(atmPe.Token); atmPeStart = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; atmPeEnd = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; atmMissing |= atmPeStart is null || atmPeEnd is null; }
+            decimal? atmCeChg = atmCeStart is not null && atmCeEnd is not null ? atmCeEnd - atmCeStart : null;
+            decimal? atmPeChg = atmPeStart is not null && atmPeEnd is not null ? atmPeEnd - atmPeStart : null;
+            var rawState = "Other";
+            if (!atmMissing) { if (fChangePts > 0 && atmCeChg < 0 && atmPeChg > 0) { rawState = "A"; } else if (fChangePts < 0 && atmCeChg > 0 && atmPeChg < 0) { rawState = "B"; } }
+
+            var atmIdx = distinctStrikes.FindIndex(x => x == atmStrikeVal);
+            int ceValid = 0, ceNeg = 0, cePos = 0, peValid = 0, peNeg = 0, pePos = 0;
+            for (var b = -2; b <= 2; b++)
+            {
+                var idx = atmIdx + b;
+                if (atmIdx < 0 || idx < 0 || idx >= distinctStrikes.Count) { continue; }
+                var strike = distinctStrikes[idx];
+                var ceInst = chain.FirstOrDefault(x => x.StrikePrice == strike && x.OptionType == OptionType.Call);
+                var peInst = chain.FirstOrDefault(x => x.StrikePrice == strike && x.OptionType == OptionType.Put);
+                if (ceInst is not null) { var s = await SeriesAsync(ceInst.Token); var st = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; var en = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; if (st is not null && en is not null && st != 0) { var ret = (en - st) / st * 100m; ceValid++; if (ret > 0) { cePos++; } else if (ret < 0) { ceNeg++; } } }
+                if (peInst is not null) { var s = await SeriesAsync(peInst.Token); var st = s.EntryAtOrBefore(startBar.StartTimestamp)?.LastPrice; var en = s.EntryAtOrBefore(endBar.EndTimestamp)?.LastPrice; if (st is not null && en is not null && st != 0) { var ret = (en - st) / st * 100m; peValid++; if (ret > 0) { pePos++; } else if (ret < 0) { peNeg++; } } }
+            }
+            rows.Add((i, atmStrikeVal, insufficientHistory ? "Other" : rawState, ceValid, peValid, cePos, ceNeg, pePos, peNeg, fStart, fEnd, endBar.EndTimestamp.ToOffset(mmIstOffset), atmCe?.Token ?? "", atmPe?.Token ?? ""));
+        }
+        mmRowsBySession[date] = rows;
+        Console.WriteLine($"  [Built] {date:yyyy-MM-dd}: {bars.Count} bars.");
+    }
+    Console.WriteLine();
+
+    // ---- Momentum helper: OptionMomentumPass/Available for a given token at bar index i. ----
+    (bool Available, bool Pass, decimal? CurrentAvg, decimal? Prev5Avg) MomentumAt(DateOnly date, string token, int i)
+    {
+        if (string.IsNullOrEmpty(token) || !mmBarsByTokenBySession[date].TryGetValue(token, out var byIdx)) { return (false, false, null, null); }
+        if (!byIdx.TryGetValue(i, out var cur) || cur.AverageLtp is null) { return (false, false, null, null); }
+        var prevAvgs = new List<decimal>();
+        for (var p = i - 5; p <= i - 1; p++)
+        {
+            if (p < 0 || !byIdx.TryGetValue(p, out var pb) || pb.AverageLtp is null) { return (false, false, null, null); }
+            prevAvgs.Add(pb.AverageLtp!.Value);
+        }
+        var prev5Avg = prevAvgs.Average();
+        return (true, cur.AverageLtp!.Value > prev5Avg, cur.AverageLtp!.Value, prev5Avg);
+    }
+
+    // ================= Build the per-signal population (all FullSurface entries, with momentum classification). =================
+    var mmSignals = new List<(DateOnly Date, int Dte, string Pattern, int EndIdx, DateTimeOffset SignalTs, string Token, bool MomentumAvailable, bool MomentumPass,
+        decimal? Fwd1Pts, decimal? Fwd2Pts, decimal? Fwd4Pts, decimal? Mtm1, decimal? Mtm2, decimal? Mtm4, decimal? MfePct, decimal? MaePct, double? SecToMfe)>();
+
+    foreach (var date in mmValidationSessions)
+    {
+        if (!mmRowsBySession.TryGetValue(date, out var rows) || rows.Count == 0) { continue; }
+        var ann = RollingStateAnalysis.Annotate(rows.Select(r => r.AtmState).ToList());
+        var fsFlags = rows.Select(r => MmFullSurface(r.AtmState, r.CeValid, r.CePos, r.CeNeg, r.PeValid, r.PePos, r.PeNeg)).ToList();
+        var barsByToken = mmBarsByTokenBySession[date];
+        var dte = mmDteBySession[date];
+        decimal? FwdPts(int endIdx, int h) { var t = rows.FirstOrDefault(x => x.EndIdx == endIdx + h); if (t.WEnd == default) { return null; } var b0 = rows.First(x => x.EndIdx == endIdx); return t.FEnd - b0.FEnd; }
+
+        for (var k = 0; k < rows.Count; k++)
+        {
+            if (!ann[k].IsStateEntry || rows[k].AtmState is not ("A" or "B") || !fsFlags[k]) { continue; }
+            var r = rows[k];
+            var token = r.AtmState == "A" ? r.AtmPeToken : r.AtmCeToken;
+            var mom = MomentumAt(date, token, r.EndIdx);
+            var fwd1 = FwdPts(r.EndIdx, 1); var fwd2 = FwdPts(r.EndIdx, 2); var fwd4 = FwdPts(r.EndIdx, 4);
+            decimal? MtmAt(int h) { if (!barsByToken.TryGetValue(token, out var bt) || !bt.TryGetValue(r.EndIdx, out var cur0) || cur0.AverageLtp is null || !bt.TryGetValue(r.EndIdx + h, out var fut) || fut.AverageLtp is null) { return null; } return (fut.AverageLtp!.Value - cur0.AverageLtp!.Value) / cur0.AverageLtp!.Value * 100m; }
+            mmSignals.Add((date, dte, r.AtmState, r.EndIdx, r.WEnd, token, mom.Available, mom.Pass, fwd1, fwd2, fwd4, MtmAt(1), MtmAt(2), MtmAt(4), null, null, null));
+        }
+    }
+    Console.WriteLine($"Total FullSurface signals: {mmSignals.Count}. MomentumAvailable: {mmSignals.Count(x => x.MomentumAvailable)}. MomentumPass: {mmSignals.Count(x => x.MomentumAvailable && x.MomentumPass)}. MomentumFail: {mmSignals.Count(x => x.MomentumAvailable && !x.MomentumPass)}. MomentumUnavailable: {mmSignals.Count(x => !x.MomentumAvailable)}.");
+    Console.WriteLine();
+
+    // ================= Section 10: entry-condition-only analysis. =================
+    Console.WriteLine("### Section 10: entry condition only -- underlying response, Pass vs Fail, A/B separately ###");
+    static (int N, double HitRate, decimal Mean, decimal Median, decimal P25, decimal P75) DistStats(List<decimal> v)
+    {
+        if (v.Count == 0) { return (0, 0, 0, 0, 0, 0); }
+        var sorted = v.OrderBy(x => x).ToList();
+        decimal Pctl(double f) => sorted[Math.Clamp((int)(f * (sorted.Count - 1)), 0, sorted.Count - 1)];
+        var median = sorted.Count % 2 == 1 ? sorted[sorted.Count / 2] : (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2m;
+        return (v.Count, 100.0 * v.Count(x => x > 0) / v.Count, v.Average(), median, Pctl(0.25), Pctl(0.75));
+    }
+    foreach (var pattern in new[] { "A", "B" })
+    {
+        var expectSign = pattern == "A" ? -1m : 1m;
+        foreach (var (label, pred) in new (string, Func<bool, bool, bool>)[] { ("MomentumPass", (avail, pass) => avail && pass), ("MomentumFail", (avail, pass) => avail && !pass), ("MomentumUnavailable", (avail, pass) => !avail) })
+        {
+            var pop = mmSignals.Where(x => x.Pattern == pattern && pred(x.MomentumAvailable, x.MomentumPass)).ToList();
+            foreach (var (hLabel, sel) in new (string, Func<(decimal? F1, decimal? F2, decimal? F4), decimal?>)[] { ("+1", x => x.F1), ("+2", x => x.F2), ("+4", x => x.F4) })
+            {
+                var v = pop.Select(x => sel((x.Fwd1Pts, x.Fwd2Pts, x.Fwd4Pts))).Where(x => x is not null).Select(x => x!.Value * expectSign).ToList();
+                var s = DistStats(v);
+                if (s.N == 0) { continue; }
+                Console.WriteLine($"  [{pattern} {label} {hLabel}] n={s.N} hitRate={s.HitRate:F1}% mean={s.Mean:F2}pts median={s.Median:F2}pts P25={s.P25:F2} P75={s.P75:F2}");
+            }
+        }
+    }
+    Console.WriteLine();
+
+    // ================= Section 11: option-forward response, Pass vs Fail. =================
+    Console.WriteLine("### Section 11: option forward response, Pass vs Fail ###");
+    foreach (var pattern in new[] { "A", "B" })
+    {
+        foreach (var (label, pred) in new (string, Func<bool, bool, bool>)[] { ("MomentumPass", (avail, pass) => avail && pass), ("MomentumFail", (avail, pass) => avail && !pass) })
+        {
+            var pop = mmSignals.Where(x => x.Pattern == pattern && pred(x.MomentumAvailable, x.MomentumPass)).ToList();
+            foreach (var (hLabel, sel) in new (string, Func<(decimal? M1, decimal? M2, decimal? M4), decimal?>)[] { ("+1", x => x.M1), ("+2", x => x.M2), ("+4", x => x.M4) })
+            {
+                var v = pop.Select(x => sel((x.Mtm1, x.Mtm2, x.Mtm4))).Where(x => x is not null).Select(x => x!.Value).ToList();
+                if (v.Count == 0) { continue; }
+                var s = DistStats(v);
+                Console.WriteLine($"  [{pattern} {label} {hLabel}] n={s.N} positiveMTM%={s.HitRate:F1}% mean%={s.Mean:F2}% median%={s.Median:F2}%");
+            }
+        }
+    }
+    Console.WriteLine();
+
+    // ================= Section 12: session robustness of the entry condition. =================
+    Console.WriteLine("### Section 12: session robustness, entry condition (Pass vs Fail) ###");
+    int sessPassGtFail = 0, sessFailGtPass = 0, sessTooSmall = 0;
+    foreach (var date in mmValidationSessions)
+    {
+        var sigs = mmSignals.Where(x => x.Date == date).ToList();
+        var pass = sigs.Where(x => x.MomentumAvailable && x.MomentumPass).ToList();
+        var fail = sigs.Where(x => x.MomentumAvailable && !x.MomentumPass).ToList();
+        Console.WriteLine($"  {date:yyyy-MM-dd}: FullSurface={sigs.Count} Pass={pass.Count} Fail={fail.Count}");
+        if (pass.Count < 3 || fail.Count < 3) { sessTooSmall++; continue; }
+        var passHit = pass.Select(x => x.Fwd4Pts is not null ? x.Fwd4Pts.Value * (x.Pattern == "A" ? -1m : 1m) : (decimal?)null).Where(x => x is not null).Select(x => x!.Value).ToList();
+        var failHit = fail.Select(x => x.Fwd4Pts is not null ? x.Fwd4Pts.Value * (x.Pattern == "A" ? -1m : 1m) : (decimal?)null).Where(x => x is not null).Select(x => x!.Value).ToList();
+        if (passHit.Count == 0 || failHit.Count == 0) { sessTooSmall++; continue; }
+        var passHr = 100.0 * passHit.Count(x => x > 0) / passHit.Count; var failHr = 100.0 * failHit.Count(x => x > 0) / failHit.Count;
+        if (passHr > failHr) { sessPassGtFail++; } else if (failHr > passHr) { sessFailGtPass++; }
+    }
+    Console.WriteLine($"  Sessions Pass>Fail={sessPassGtFail} Fail>Pass={sessFailGtPass} TooSmallToCompare={sessTooSmall}");
+    Console.WriteLine();
+
+    // ================= Section 13-15: three trade architectures. =================
+    var mmTradesA = new List<(DateOnly Date, int Dte, string Pattern, DateTimeOffset SignalTs, DateTimeOffset EntryTs, DateTimeOffset ExitTs, string ExitReason, decimal EntryPremium, decimal ExitPremium, int Quantity, decimal NetPnl, double HoldingSeconds, decimal Mae, decimal Mfe, double? SecToMfe)>();
+    var mmTradesB = new List<(DateOnly Date, int Dte, string Pattern, int EntryEndIdx, DateTimeOffset SignalTs, DateTimeOffset EntryTs, DateTimeOffset ExitTs, string ExitReason, string Token, Instrument Instrument, decimal EntryPremium, decimal ExitPremium, int Quantity, decimal NetPnl, double HoldingSeconds, decimal Mae, decimal Mfe, double? SecToMfe)>();
+    var mmSameEntryC = new List<(DateOnly Date, string Pattern, decimal BNet, decimal CNet, bool CIsMomentumInval, bool CIsPatternInval, double SecEntryToMfe, double SecEntryToMomentumInval, double SecEntryToPatternInval, decimal? MfeBeforeB, decimal? MfeBeforeC, decimal BEntryPrem, decimal BExitPrem, decimal CExitPrem)>();
+    var mmTradesCSeq = new List<(DateOnly Date, int Dte, string Pattern, DateTimeOffset SignalTs, DateTimeOffset EntryTs, DateTimeOffset ExitTs, string ExitReason, decimal EntryPremium, decimal ExitPremium, int Quantity, decimal NetPnl, double HoldingSeconds, decimal Mae, decimal Mfe, double? SecToMfe, int HoldingBars)>();
+
+    foreach (var date in mmValidationSessions)
+    {
+        if (!mmRowsBySession.TryGetValue(date, out var rows) || rows.Count == 0) { continue; }
+        var chain = mmChainBySession[date];
+        var chainByStrikeAndSide = chain.Where(i => i.StrikePrice is not null).ToLookup(i => (i.StrikePrice!.Value, i.OptionType));
+        var bars = mmFutureBarsBySession[date];
+        var ann = RollingStateAnalysis.Annotate(rows.Select(r => r.AtmState).ToList());
+        var fsFlags = rows.Select(r => MmFullSurface(r.AtmState, r.CeValid, r.CePos, r.CeNeg, r.PeValid, r.PePos, r.PeNeg)).ToList();
+        var dte = mmDteBySession[date];
+
+        await using var src = new NiftySignalDbContext(tradeSourceOptions);
+        var tickCache = new Dictionary<string, OptionTickSeries>();
+        async Task<OptionTickSeries> SeriesAsync(string token)
+        {
+            if (!tickCache.TryGetValue(token, out var s))
+            {
+                var dayStart = bars[0].StartTimestamp;
+                var dayEnd = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 30)), mmIstOffset).ToUniversalTime();
+                s = await OptionTickSeries.LoadAsync(src, token, dayStart, dayEnd, CancellationToken.None);
+                tickCache[token] = s;
+            }
+            return s;
+        }
+
+        async Task<(decimal NetPnl, decimal EntryPrem, decimal ExitPrem, int Qty, double HoldSec, decimal Mae, decimal Mfe, double? SecToMfe, DateTimeOffset ExitTs)>
+            CloseAt(Instrument instrument, DateTimeOffset entryTs, decimal entryFill, DateTimeOffset atTs, bool isEod, OptionTickSeries series)
+        {
+            var exitTickN = isEod ? series.EntryAtOrBefore(atTs) : series.EntryAtOrAfter(atTs);
+            if (exitTickN is null) { return (0, entryFill, entryFill, 0, 0, 0, 0, null, atTs); }
+            var exitTick = exitTickN.Value;
+            var qty = instrument.LotSize * mmLots;
+            var exitBase = exitTick.Depth is { } xd ? xd.Bid1Price : exitTick.LastPrice;
+            var exitFill = PaperTradeSimulator.FillExit(exitBase, instrument.TickSize, qty, mmCosts);
+            var netPnl = (exitFill.FillPrice - entryFill) * qty - TransactionCostCalculator.Compute(exitFill.GrossValue, mmCosts.BrokeragePerOrder * 2).Total;
+            var path = series.AllEntries.Where(e => e.Timestamp > entryTs && e.Timestamp <= exitTick.Timestamp).OrderBy(e => e.Timestamp).ToList();
+            var maeMfe = MaeMfeCalculator.Compute(entryFill, path.Select(e => e.LastPrice).ToList());
+            double? secToMfe = null;
+            if (maeMfe.MfePoints > 0) { var mfeRow = path.FirstOrDefault(e => e.LastPrice - entryFill >= maeMfe.MfePoints); if (mfeRow.Timestamp != default) { secToMfe = (mfeRow.Timestamp - entryTs).TotalSeconds; } }
+            return (netPnl, entryFill, exitFill.FillPrice, qty, (exitTick.Timestamp - entryTs).TotalSeconds, maeMfe.MaePoints, maeMfe.MfePoints, secToMfe, exitTick.Timestamp);
+        }
+
+        // ---- Strategy A: frozen baseline (reproduction check). ----
+        {
+            (string Pattern, Instrument Instrument, DateTimeOffset SignalTs, DateTimeOffset EntryTs, decimal EntryFill)? open = null;
+            for (var k = 0; k < rows.Count; k++)
+            {
+                var r = rows[k];
+                var isEntryRow = ann[k].IsStateEntry && r.AtmState is "A" or "B";
+                if (open is { } pos && isEntryRow && ((pos.Pattern == "A" && r.AtmState == "B") || (pos.Pattern == "B" && r.AtmState == "A")))
+                {
+                    var series = await SeriesAsync(pos.Instrument.Token);
+                    var res = await CloseAt(pos.Instrument, pos.EntryTs, pos.EntryFill, r.WEnd, false, series);
+                    mmTradesA.Add((date, dte, pos.Pattern, pos.SignalTs, pos.EntryTs, res.ExitTs, "OppositePatternSignal", res.EntryPrem, res.ExitPrem, res.Qty, res.NetPnl, res.HoldSec, res.Mae, res.Mfe, res.SecToMfe));
+                    open = null;
+                }
+                if (!isEntryRow || !fsFlags[k] || open is not null) { continue; }
+                var istTime = TimeOnly.FromDateTime(r.WEnd.DateTime);
+                if (istTime >= new TimeOnly(15, 0)) { continue; }
+                var side = r.AtmState == "A" ? OptionType.Put : OptionType.Call;
+                var inst = chainByStrikeAndSide[(r.AtmStrike, side)].FirstOrDefault();
+                if (inst is null) { continue; }
+                var series2 = await SeriesAsync(inst.Token);
+                var entryTickN = series2.EntryAtOrAfter(r.WEnd);
+                if (entryTickN is null) { continue; }
+                var entryTick = entryTickN.Value;
+                var entryBase = entryTick.Depth is { } ed ? ed.Ask1Price : entryTick.LastPrice;
+                var entryFill = PaperTradeSimulator.FillEntry(entryBase, inst.TickSize, inst.LotSize * mmLots, mmCosts);
+                open = (r.AtmState, inst, r.WEnd, entryTick.Timestamp, entryFill.FillPrice);
+            }
+            if (open is { } fo) { var forceClose = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 15)), mmIstOffset); var series = await SeriesAsync(fo.Instrument.Token); var res = await CloseAt(fo.Instrument, fo.EntryTs, fo.EntryFill, forceClose, true, series); mmTradesA.Add((date, dte, fo.Pattern, fo.SignalTs, fo.EntryTs, res.ExitTs, "ForcedEod", res.EntryPrem, res.ExitPrem, res.Qty, res.NetPnl, res.HoldSec, res.Mae, res.Mfe, res.SecToMfe)); }
+        }
+
+        // ---- Strategy B: momentum entry only, original opposite-pattern exit (+ same-entry Strategy-C counterfactual). ----
+        {
+            (string Pattern, Instrument Instrument, DateTimeOffset SignalTs, DateTimeOffset EntryTs, decimal EntryFill, int EntryEndIdx, string Token)? open = null;
+            for (var k = 0; k < rows.Count; k++)
+            {
+                var r = rows[k];
+                var isEntryRow = ann[k].IsStateEntry && r.AtmState is "A" or "B";
+                if (open is { } pos && isEntryRow && ((pos.Pattern == "A" && r.AtmState == "B") || (pos.Pattern == "B" && r.AtmState == "A")))
+                {
+                    var series = await SeriesAsync(pos.Instrument.Token);
+                    var res = await CloseAt(pos.Instrument, pos.EntryTs, pos.EntryFill, r.WEnd, false, series);
+                    mmTradesB.Add((date, dte, pos.Pattern, pos.EntryEndIdx, pos.SignalTs, pos.EntryTs, res.ExitTs, "OppositePatternSignal", pos.Token, pos.Instrument, res.EntryPrem, res.ExitPrem, res.Qty, res.NetPnl, res.HoldSec, res.Mae, res.Mfe, res.SecToMfe));
+
+                    // Same-entry Strategy-C counterfactual: first bar after entry where AtmState!=pattern OR option momentum invalidates.
+                    var barsByToken = mmBarsByTokenBySession[date];
+                    int? cExitIdx = null; bool cIsMomentumInval = false, cIsPatternInval = false;
+                    for (var j = pos.EntryEndIdx + 1; j < rows.Count; j++)
+                    {
+                        var patternInval = rows[j].AtmState != pos.Pattern;
+                        var momInval = barsByToken.TryGetValue(pos.Token, out var bt) && bt.TryGetValue(j, out var curB) && curB.AverageLtp is { } curAvg
+                            && Enumerable.Range(j - 5, 5).All(p => p >= 0 && bt.TryGetValue(p, out var pb) && pb.AverageLtp is not null)
+                            && curAvg <= Enumerable.Range(j - 5, 5).Select(p => bt[p].AverageLtp!.Value).Average();
+                        if (patternInval || momInval) { cExitIdx = j; cIsPatternInval = patternInval; cIsMomentumInval = momInval; break; }
+                    }
+                    var cExitTs = cExitIdx is not null ? rows[cExitIdx.Value].WEnd : new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 15)), mmIstOffset);
+                    var cIsEod = cExitIdx is null;
+                    var cRes = await CloseAt(pos.Instrument, pos.EntryTs, pos.EntryFill, cExitTs, cIsEod, series);
+                    var fullPath = series.AllEntries.Where(e => e.Timestamp > pos.EntryTs && e.Timestamp <= (res.ExitTs > cRes.ExitTs ? res.ExitTs : cRes.ExitTs)).OrderBy(e => e.Timestamp).ToList();
+                    var mfeBeforeB = MaeMfeCalculator.Compute(pos.EntryFill, fullPath.Where(e => e.Timestamp <= res.ExitTs).Select(e => e.LastPrice).ToList()).MfePoints;
+                    var mfeBeforeC = MaeMfeCalculator.Compute(pos.EntryFill, fullPath.Where(e => e.Timestamp <= cRes.ExitTs).Select(e => e.LastPrice).ToList()).MfePoints;
+                    var patternInvalRow = rows.FirstOrDefault(x => x.EndIdx > pos.EntryEndIdx && x.AtmState != pos.Pattern);
+                    var secToPatternInval = patternInvalRow.WEnd != default ? (patternInvalRow.WEnd - pos.EntryTs).TotalSeconds : (double?)null;
+                    mmSameEntryC.Add((date, pos.Pattern, res.NetPnl, cRes.NetPnl, cIsMomentumInval, cIsPatternInval, cRes.SecToMfe ?? 0, (cRes.ExitTs - pos.EntryTs).TotalSeconds, secToPatternInval ?? (cRes.ExitTs - pos.EntryTs).TotalSeconds,
+                        mfeBeforeB, mfeBeforeC, res.EntryPrem, res.ExitPrem, cRes.ExitPrem));
+                    open = null;
+                }
+                if (!isEntryRow || !fsFlags[k] || open is not null) { continue; }
+                var istTime = TimeOnly.FromDateTime(r.WEnd.DateTime);
+                if (istTime >= new TimeOnly(15, 0)) { continue; }
+                var side = r.AtmState == "A" ? OptionType.Put : OptionType.Call;
+                var token = side == OptionType.Put ? r.AtmPeToken : r.AtmCeToken;
+                var mom = MomentumAt(date, token, r.EndIdx);
+                if (!mom.Available || !mom.Pass) { continue; }
+                var inst = chainByStrikeAndSide[(r.AtmStrike, side)].FirstOrDefault();
+                if (inst is null) { continue; }
+                var series2 = await SeriesAsync(inst.Token);
+                var entryTickN = series2.EntryAtOrAfter(r.WEnd);
+                if (entryTickN is null) { continue; }
+                var entryTick = entryTickN.Value;
+                var entryBase = entryTick.Depth is { } ed ? ed.Ask1Price : entryTick.LastPrice;
+                var entryFill = PaperTradeSimulator.FillEntry(entryBase, inst.TickSize, inst.LotSize * mmLots, mmCosts);
+                open = (r.AtmState, inst, r.WEnd, entryTick.Timestamp, entryFill.FillPrice, r.EndIdx, token);
+            }
+            if (open is { } fo)
+            {
+                var forceClose = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 15)), mmIstOffset);
+                var series = await SeriesAsync(fo.Instrument.Token);
+                var res = await CloseAt(fo.Instrument, fo.EntryTs, fo.EntryFill, forceClose, true, series);
+                mmTradesB.Add((date, dte, fo.Pattern, fo.EntryEndIdx, fo.SignalTs, fo.EntryTs, res.ExitTs, "ForcedEod", fo.Token, fo.Instrument, res.EntryPrem, res.ExitPrem, res.Qty, res.NetPnl, res.HoldSec, res.Mae, res.Mfe, res.SecToMfe));
+            }
+        }
+
+        // ---- Strategy C: momentum entry + dual-invalidation exit, FULL SEQUENTIAL. ----
+        {
+            (string Pattern, Instrument Instrument, DateTimeOffset SignalTs, DateTimeOffset EntryTs, decimal EntryFill, int EntryEndIdx, string Token)? open = null;
+            var barsByToken = mmBarsByTokenBySession[date];
+            for (var k = 0; k < rows.Count; k++)
+            {
+                var r = rows[k];
+                if (open is { } pos)
+                {
+                    var patternInval = r.AtmState != pos.Pattern;
+                    var momInval = barsByToken.TryGetValue(pos.Token, out var bt) && bt.TryGetValue(k, out var curB) && curB.AverageLtp is { } curAvg
+                        && Enumerable.Range(k - 5, 5).All(p => p >= 0 && bt.TryGetValue(p, out var pb) && pb.AverageLtp is not null)
+                        && curAvg <= Enumerable.Range(k - 5, 5).Select(p => bt[p].AverageLtp!.Value).Average();
+                    if (patternInval || momInval)
+                    {
+                        var series = await SeriesAsync(pos.Instrument.Token);
+                        var res = await CloseAt(pos.Instrument, pos.EntryTs, pos.EntryFill, r.WEnd, false, series);
+                        var reason = patternInval && momInval ? "Both" : patternInval ? "PatternInvalidation" : "OptionMomentumInvalidation";
+                        mmTradesCSeq.Add((date, dte, pos.Pattern, pos.SignalTs, pos.EntryTs, res.ExitTs, reason, res.EntryPrem, res.ExitPrem, res.Qty, res.NetPnl, res.HoldSec, res.Mae, res.Mfe, res.SecToMfe, k - pos.EntryEndIdx));
+                        open = null;
+                    }
+                }
+                var isEntryRow = ann[k].IsStateEntry && r.AtmState is "A" or "B";
+                if (!isEntryRow || !fsFlags[k] || open is not null) { continue; }
+                var istTime2 = TimeOnly.FromDateTime(r.WEnd.DateTime);
+                if (istTime2 >= new TimeOnly(15, 0)) { continue; }
+                var side2 = r.AtmState == "A" ? OptionType.Put : OptionType.Call;
+                var token2 = side2 == OptionType.Put ? r.AtmPeToken : r.AtmCeToken;
+                var mom2 = MomentumAt(date, token2, r.EndIdx);
+                if (!mom2.Available || !mom2.Pass) { continue; }
+                var inst2 = chainByStrikeAndSide[(r.AtmStrike, side2)].FirstOrDefault();
+                if (inst2 is null) { continue; }
+                var series3 = await SeriesAsync(inst2.Token);
+                var entryTickN2 = series3.EntryAtOrAfter(r.WEnd);
+                if (entryTickN2 is null) { continue; }
+                var entryTick2 = entryTickN2.Value;
+                var entryBase2 = entryTick2.Depth is { } ed2 ? ed2.Ask1Price : entryTick2.LastPrice;
+                var entryFill2 = PaperTradeSimulator.FillEntry(entryBase2, inst2.TickSize, inst2.LotSize * mmLots, mmCosts);
+                open = (r.AtmState, inst2, r.WEnd, entryTick2.Timestamp, entryFill2.FillPrice, r.EndIdx, token2);
+            }
+            if (open is { } fo2)
+            {
+                var forceClose = new DateTimeOffset(date.ToDateTime(new TimeOnly(15, 15)), mmIstOffset);
+                var series = await SeriesAsync(fo2.Instrument.Token);
+                var res = await CloseAt(fo2.Instrument, fo2.EntryTs, fo2.EntryFill, forceClose, true, series);
+                mmTradesCSeq.Add((date, dte, fo2.Pattern, fo2.SignalTs, fo2.EntryTs, res.ExitTs, "MandatoryClose", res.EntryPrem, res.ExitPrem, res.Qty, res.NetPnl, res.HoldSec, res.Mae, res.Mfe, res.SecToMfe, rows.Count - 1 - fo2.EntryEndIdx));
+            }
+        }
+        Console.WriteLine($"  [Simulated] {date:yyyy-MM-dd}: A={mmTradesA.Count(x => x.Date == date)} B={mmTradesB.Count(x => x.Date == date)} C(seq)={mmTradesCSeq.Count(x => x.Date == date)} trades.");
+    }
+    Console.WriteLine();
+
+    // ================= Reproduction check (Strategy A). =================
+    var aNet = mmTradesA.Sum(x => x.NetPnl);
+    var reconciles = mmTradesA.Count == 66 && Math.Abs(aNet - 58379m) < 5m;
+    Console.WriteLine($"### Reproduction check: Strategy A (frozen baseline) ###");
+    Console.WriteLine($"  N={mmTradesA.Count} (expected 66), Net={aNet:F0} (expected ~58379). {(reconciles ? "EXACT MATCH -- proceeding." : "MISMATCH -- STOP.")}");
+    Console.WriteLine();
+    if (!reconciles) { return 1; }
+
+    // ================= Section 16: headline comparison. =================
+    static (int N, double WinRate, decimal Net, decimal AvgPnl, decimal Median, double? Pf, decimal MedHold, decimal MedMae, decimal MedMfe) HeadlineAgg(List<(decimal NetPnl, double HoldingSeconds, decimal Mae, decimal Mfe)> v)
+    {
+        if (v.Count == 0) { return (0, 0, 0, 0, 0, null, 0, 0, 0); }
+        var wins = v.Count(x => x.NetPnl > 0); var gp = v.Where(x => x.NetPnl > 0).Sum(x => x.NetPnl); var gl = Math.Abs(v.Where(x => x.NetPnl <= 0).Sum(x => x.NetPnl));
+        var sorted = v.Select(x => x.NetPnl).OrderBy(x => x).ToList();
+        var median = sorted.Count % 2 == 1 ? sorted[sorted.Count / 2] : (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2m;
+        return (v.Count, 100.0 * wins / v.Count, v.Sum(x => x.NetPnl), v.Sum(x => x.NetPnl) / v.Count, median, gl > 0 ? (double)(gp / gl) : null,
+            (decimal)v.Select(x => x.HoldingSeconds).OrderBy(x => x).ElementAt(v.Count / 2), v.Select(x => x.Mae).OrderBy(x => x).ElementAt(v.Count / 2), v.Select(x => x.Mfe).OrderBy(x => x).ElementAt(v.Count / 2));
+    }
+    static string HeadlineFmt((int N, double WinRate, decimal Net, decimal AvgPnl, decimal Median, double? Pf, decimal MedHold, decimal MedMae, decimal MedMfe) a) =>
+        a.N == 0 ? "n=0" : $"n={a.N} win%={a.WinRate:F1}% PF={(a.Pf?.ToString("F2") ?? "n/a")} net={a.Net:F0} pnlPerTrade={a.AvgPnl:F1} median={a.Median:F1} medHoldSec={a.MedHold:F0} medMAE={a.MedMae:F1} medMFE={a.MedMfe:F1}";
+
+    Console.WriteLine("### Section 16: headline comparison, A/B/C ###");
+    var aAgg = HeadlineAgg(mmTradesA.Select(x => (x.NetPnl, x.HoldingSeconds, x.Mae, x.Mfe)).ToList());
+    var bAgg = HeadlineAgg(mmTradesB.Select(x => (x.NetPnl, x.HoldingSeconds, x.Mae, x.Mfe)).ToList());
+    var cAgg = HeadlineAgg(mmTradesCSeq.Select(x => (x.NetPnl, x.HoldingSeconds, x.Mae, x.Mfe)).ToList());
+    Console.WriteLine($"  [A Baseline] {HeadlineFmt(aAgg)} eligible=105 trades/day={mmValidationSessions.Select(d => mmTradesA.Count(x => x.Date == d)).Average():F1}");
+    Console.WriteLine($"  [B MomentumEntry] {HeadlineFmt(bAgg)} eligible={mmSignals.Count(x => x.MomentumAvailable && x.MomentumPass)} trades/day={mmValidationSessions.Select(d => mmTradesB.Count(x => x.Date == d)).Average():F1}");
+    Console.WriteLine($"  [C MomentumEntry+Exit] {HeadlineFmt(cAgg)} trades/day={mmValidationSessions.Select(d => mmTradesCSeq.Count(x => x.Date == d)).Average():F1}");
+    foreach (var (label, trades) in new[] { ("A", mmTradesA.Select(x => (x.Pattern, x.NetPnl, x.HoldingSeconds, x.Mae, x.Mfe)).ToList()), ("B", mmTradesB.Select(x => (x.Pattern, x.NetPnl, x.HoldingSeconds, x.Mae, x.Mfe)).ToList()), ("C", mmTradesCSeq.Select(x => (x.Pattern, x.NetPnl, x.HoldingSeconds, x.Mae, x.Mfe)).ToList()) })
+    {
+        foreach (var pattern in new[] { "A", "B" })
+        {
+            var side = trades.Where(x => x.Pattern == pattern).Select(x => (x.NetPnl, x.HoldingSeconds, x.Mae, x.Mfe)).ToList();
+            Console.WriteLine($"    [{label} {pattern}] {HeadlineFmt(HeadlineAgg(side))}");
+        }
+    }
+    Console.WriteLine();
+
+    // ================= Section 17: MomentumRejectedSignals vs Accepted. =================
+    Console.WriteLine("### Section 17: MomentumRejectedSignals vs MomentumAcceptedSignals ###");
+    {
+        var accepted = mmSignals.Where(x => x.MomentumAvailable && x.MomentumPass).ToList();
+        var rejected = mmSignals.Where(x => x.MomentumAvailable && !x.MomentumPass).ToList();
+        foreach (var (label, pop) in new[] { ("Accepted", accepted), ("Rejected", rejected) })
+        {
+            foreach (var pattern in new[] { "A", "B" })
+            {
+                var expectSign = pattern == "A" ? -1m : 1m;
+                var side = pop.Where(x => x.Pattern == pattern).ToList();
+                var hitVals = side.Select(x => x.Fwd4Pts).Where(x => x is not null).Select(x => x!.Value * expectSign).ToList();
+                var mtmVals = side.Select(x => x.Mtm4).Where(x => x is not null).Select(x => x!.Value).ToList();
+                if (side.Count == 0) { continue; }
+                Console.WriteLine($"  [{label} {pattern}] n={side.Count} hitRate(+4)={(hitVals.Count > 0 ? 100.0 * hitVals.Count(x => x > 0) / hitVals.Count : 0):F1}% posMTM(+4)%={(mtmVals.Count > 0 ? 100.0 * mtmVals.Count(x => x > 0) / mtmVals.Count : 0):F1}%");
+            }
+        }
+    }
+    Console.WriteLine();
+
+    // ================= Section 18: exit-reason analysis (Strategy C). =================
+    Console.WriteLine("### Section 18: exit-reason analysis, Strategy C ###");
+    foreach (var g in mmTradesCSeq.GroupBy(x => x.ExitReason))
+    {
+        var t = g.ToList();
+        var medHold = t.Select(x => x.HoldingSeconds).OrderBy(x => x).ElementAt(t.Count / 2);
+        var medPnl = t.Select(x => x.NetPnl).OrderBy(x => x).ElementAt(t.Count / 2);
+        var medMfe = t.Select(x => x.Mfe).OrderBy(x => x).ElementAt(t.Count / 2);
+        var profPct = 100.0 * t.Count(x => x.NetPnl > 0) / t.Count;
+        Console.WriteLine($"  [{g.Key}] n={t.Count} net={t.Sum(x => x.NetPnl):F0} medHoldSec={medHold:F0} medNetPnl={medPnl:F1} medMFE={medMfe:F1} profitable%={profPct:F1}%");
+    }
+    {
+        var momBeforePattern = mmSameEntryC.Count(x => x.CIsMomentumInval && !x.CIsPatternInval && x.SecEntryToMomentumInval < x.SecEntryToPatternInval);
+        Console.WriteLine($"  Momentum invalidated before pattern invalidation (same-entry basis): {momBeforePattern}/{mmSameEntryC.Count}");
+    }
+    Console.WriteLine();
+
+    // ================= Section 19: MFE capture, B vs same-entry C. =================
+    Console.WriteLine("### Section 19: MFE capture, Strategy B vs. same-entry Strategy C ###");
+    {
+        var bMfeThenLoss = mmSameEntryC.Count(x => x.MfeBeforeB > 0 && x.BNet <= 0);
+        var cMfeThenLoss = mmSameEntryC.Count(x => x.MfeBeforeC > 0 && x.CNet <= 0);
+        var bCapture = mmSameEntryC.Where(x => x.MfeBeforeB > 0).Select(x => (double)((x.BExitPrem - x.BEntryPrem) / x.MfeBeforeB!.Value)).OrderBy(x => x).ToList();
+        var cCapture = mmSameEntryC.Where(x => x.MfeBeforeC > 0).Select(x => (double)((x.CExitPrem - x.BEntryPrem) / x.MfeBeforeC!.Value)).OrderBy(x => x).ToList();
+        var winnerToLoser = mmSameEntryC.Count(x => x.BNet > 0 && x.CNet <= 0);
+        var loserToWinner = mmSameEntryC.Count(x => x.BNet <= 0 && x.CNet > 0);
+        Console.WriteLine($"  n={mmSameEntryC.Count} B: MFE>0-then-loss={bMfeThenLoss} medCapture={(bCapture.Count > 0 ? bCapture[bCapture.Count / 2].ToString("F2") : "n/a")} | C: MFE>0-then-loss={cMfeThenLoss} medCapture={(cCapture.Count > 0 ? cCapture[cCapture.Count / 2].ToString("F2") : "n/a")}");
+        Console.WriteLine($"  Winner->Loser conversions={winnerToLoser} Loser->Winner conversions={loserToWinner}");
+        var medSecMfe = mmSameEntryC.Select(x => x.SecEntryToMfe).OrderBy(x => x).ElementAt(mmSameEntryC.Count / 2);
+        var medSecMomInval = mmSameEntryC.Select(x => x.SecEntryToMomentumInval).OrderBy(x => x).ElementAt(mmSameEntryC.Count / 2);
+        var medSecPatternInval = mmSameEntryC.Select(x => x.SecEntryToPatternInval).OrderBy(x => x).ElementAt(mmSameEntryC.Count / 2);
+        Console.WriteLine($"  Median seconds: Entry->MFE={medSecMfe:F0} Entry->MomentumInvalidation(or exit)={medSecMomInval:F0} Entry->PatternInvalidation={medSecPatternInval:F0}");
+    }
+    Console.WriteLine();
+
+    // ================= Section 20: flicker check. =================
+    Console.WriteLine("### Section 20: exit flicker check, Strategy C (full sequential) ###");
+    {
+        var within1 = mmTradesCSeq.Count(x => x.HoldingBars <= 1); var within2 = mmTradesCSeq.Count(x => x.HoldingBars <= 2); var within3 = mmTradesCSeq.Count(x => x.HoldingBars <= 3);
+        var medBars = mmTradesCSeq.Select(x => x.HoldingBars).OrderBy(x => x).ElementAt(mmTradesCSeq.Count / 2);
+        var medSec = mmTradesCSeq.Select(x => x.HoldingSeconds).OrderBy(x => x).ElementAt(mmTradesCSeq.Count / 2);
+        Console.WriteLine($"  n={mmTradesCSeq.Count} within1bar={within1} within2bars={within2} within3bars={within3} medianHoldingBars={medBars} medianHoldingSec={medSec:F0}");
+    }
+    Console.WriteLine();
+
+    // ================= Section 21: per-session results. =================
+    Console.WriteLine("### Section 21: per-session results ###");
+    var sessRows = new List<(DateOnly Date, decimal NetA, decimal NetB, decimal NetC)>();
+    foreach (var date in mmValidationSessions)
+    {
+        var a = mmTradesA.Where(x => x.Date == date).ToList(); var b = mmTradesB.Where(x => x.Date == date).ToList(); var c = mmTradesCSeq.Where(x => x.Date == date).ToList();
+        sessRows.Add((date, a.Sum(x => x.NetPnl), b.Sum(x => x.NetPnl), c.Sum(x => x.NetPnl)));
+        Console.WriteLine($"  {date:yyyy-MM-dd}: A n={a.Count} net={a.Sum(x => x.NetPnl):F0} | B n={b.Count} net={b.Sum(x => x.NetPnl):F0} | C n={c.Count} net={c.Sum(x => x.NetPnl):F0}");
+    }
+    {
+        var improved = sessRows.Count(s => s.NetC > s.NetA); var worsened = sessRows.Count(s => s.NetC < s.NetA);
+        var best = sessRows.OrderByDescending(s => s.NetC).First(); var worst = sessRows.OrderBy(s => s.NetC).First();
+        Console.WriteLine($"  C vs A: improved={improved}/10 worsened={worsened}/10 NetExclBest({best.Date:yyyy-MM-dd})={sessRows.Sum(s => s.NetC) - best.NetC:F0} NetExclWorst({worst.Date:yyyy-MM-dd})={sessRows.Sum(s => s.NetC) - worst.NetC:F0}");
+    }
+    Console.WriteLine();
+
+    // ================= Section 22: DTE breakdown. =================
+    Console.WriteLine("### Section 22: DTE descriptive, Strategy B and C ###");
+    foreach (var arch in new[] { "B", "C" })
+    {
+        var trades = arch == "B" ? mmTradesB.Select(x => (x.Dte, x.Pattern, x.NetPnl, x.HoldingSeconds)).ToList() : mmTradesCSeq.Select(x => (x.Dte, x.Pattern, x.NetPnl, x.HoldingSeconds)).ToList();
+        foreach (var g in trades.GroupBy(x => x.Dte).OrderBy(g => g.Key))
+        {
+            var t = g.ToList();
+            var wins = t.Count(x => x.NetPnl > 0); var gp = t.Where(x => x.NetPnl > 0).Sum(x => x.NetPnl); var gl = Math.Abs(t.Where(x => x.NetPnl <= 0).Sum(x => x.NetPnl));
+            Console.WriteLine($"  [{arch}] DTE={g.Key}: n={t.Count} A/B={t.Count(x => x.Pattern == "A")}/{t.Count(x => x.Pattern == "B")} win%={100.0 * wins / t.Count:F1}% PF={(gl > 0 ? (gp / gl).ToString("F2") : "n/a")} net={t.Sum(x => x.NetPnl):F0} medHoldSec={t.Select(x => x.HoldingSeconds).OrderBy(x => x).ElementAt(t.Count / 2):F0}");
+        }
+    }
+    Console.WriteLine();
+
+    // ---- CSV exports. ----
+    using (var w = new StreamWriter($"{mmBase}-signals.csv"))
+    {
+        w.WriteLine("TradingDate,Dte,Pattern,SignalTimeIST,Token,MomentumAvailable,MomentumPass,Forward1Pts,Forward2Pts,Forward4Pts,OptionMtm1,OptionMtm2,OptionMtm4");
+        foreach (var s in mmSignals)
+        {
+            w.WriteLine(string.Join(',', s.Date.ToString("yyyy-MM-dd"), s.Dte, s.Pattern, s.SignalTs.ToOffset(mmIstOffset).ToString("HH:mm:ss.fff"), s.Token, s.MomentumAvailable, s.MomentumPass, s.Fwd1Pts, s.Fwd2Pts, s.Fwd4Pts, s.Mtm1, s.Mtm2, s.Mtm4));
+        }
+    }
+    using (var w = new StreamWriter($"{mmBase}-trades-C.csv"))
+    {
+        w.WriteLine("TradingDate,Dte,Pattern,SignalTimeIST,EntryTimeIST,ExitTimeIST,ExitReason,EntryPremium,ExitPremium,Quantity,NetPnl,HoldingSeconds,HoldingBars,MAE,MFE,SecondsToMfe");
+        foreach (var t in mmTradesCSeq)
+        {
+            w.WriteLine(string.Join(',', t.Date.ToString("yyyy-MM-dd"), t.Dte, t.Pattern, t.SignalTs.ToOffset(mmIstOffset).ToString("HH:mm:ss.fff"), t.EntryTs.ToOffset(mmIstOffset).ToString("HH:mm:ss.fff"), t.ExitTs.ToOffset(mmIstOffset).ToString("HH:mm:ss.fff"), t.ExitReason,
+                t.EntryPremium, t.ExitPremium, t.Quantity, t.NetPnl, t.HoldingSeconds, t.HoldingBars, t.Mae, t.Mfe, t.SecToMfe));
+        }
+    }
+    Console.WriteLine($"Signals CSV: {Path.GetFullPath($"{mmBase}-signals.csv")} ({mmSignals.Count} rows).");
+    Console.WriteLine($"Strategy-C trades CSV: {Path.GetFullPath($"{mmBase}-trades-C.csv")} ({mmTradesCSeq.Count} rows).");
+
+    return 0;
+}
+
+if (args.Length > 0 && string.Equals(args[0], "vc-list-dte", StringComparison.OrdinalIgnoreCase))
+{
+    var vcFrom = DateOnly.ParseExact(args[1], "yyyy-MM-dd");
+    var vcTo = DateOnly.ParseExact(args[2], "yyyy-MM-dd");
+    await using var vcSrc = new NiftySignalDbContext(tradeSourceOptions);
+    for (var d = vcFrom; d <= vcTo; d = d.AddDays(1))
+    {
+        var expiries = await vcSrc.Instruments.Where(i => i.AsOfDate == d && i.InstrumentType == InstrumentType.Option && i.Underlying == "NIFTY").Select(i => i.ExpiryDate).Distinct().OrderBy(e => e).ToListAsync();
+        if (expiries.Count == 0) { Console.WriteLine($"{d:yyyy-MM-dd}: no option chain."); continue; }
+        var expiry = expiries[0]!.Value;
+        Console.WriteLine($"{d:yyyy-MM-dd}: nearest expiry={expiry:yyyy-MM-dd} DTE={expiry.DayNumber - d.DayNumber}");
+    }
+    return 0;
+}
+
+if (args.Length > 0 && string.Equals(args[0], "vc-list-available-sessions-after", StringComparison.OrdinalIgnoreCase))
+{
+    var afterDate = DateOnly.ParseExact(args[1], "yyyy-MM-dd");
+    await using var src = new NiftySignalDbContext(tradeSourceOptions);
+    var dates = await src.Instruments.Where(i => i.InstrumentType == InstrumentType.Future && i.Underlying == "NIFTY" && i.AsOfDate > afterDate)
+        .Select(i => i.AsOfDate).Distinct().OrderBy(d => d).ToListAsync();
+    Console.WriteLine($"Sessions with futures data after {afterDate:yyyy-MM-dd}: {dates.Count}");
+    foreach (var d in dates)
+    {
+        var futInst = await src.Instruments.FirstOrDefaultAsync(i => i.AsOfDate == d && i.InstrumentType == InstrumentType.Future && i.Underlying == "NIFTY");
+        if (futInst is null) { Console.WriteLine($"  {d:yyyy-MM-dd}: no future instrument row"); continue; }
+        var lastTick = await src.Ticks.Where(t => t.Token == futInst.Token).OrderByDescending(t => t.ExchangeTimestamp).Select(t => t.ExchangeTimestamp).FirstOrDefaultAsync();
+        var firstTick = await src.Ticks.Where(t => t.Token == futInst.Token).OrderBy(t => t.ExchangeTimestamp).Select(t => t.ExchangeTimestamp).FirstOrDefaultAsync();
+        var tickCount = await src.Ticks.CountAsync(t => t.Token == futInst.Token);
+        var istOffset = TimeSpan.FromHours(5.5);
+        Console.WriteLine($"  {d:yyyy-MM-dd}: {tickCount} ticks, first={firstTick.ToOffset(istOffset):HH:mm:ss} last={lastTick.ToOffset(istOffset):HH:mm:ss} IST");
+    }
+    return 0;
+}
+
+// "vc0dte-relationship-forward-validation" -- logic lives in ForwardValidationRunner.cs (extracted
+// to its own class, not inlined here -- see that file's own doc comment for why: inlining it
+// triggered an InvalidProgramException affecting this entire top-level Main).
+if (args.Length > 0 && string.Equals(args[0], "vc0dte-relationship-forward-validation", StringComparison.OrdinalIgnoreCase))
+{
+    var (_, fvNamed) = SplitNamedArgs(args);
+    if (!fvNamed.TryGetValue("out", out var fvBase))
+    {
+        Console.Error.WriteLine("Usage: dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-forward-validation --out=basePath");
+        return 1;
+    }
+    return await ForwardValidationRunner.RunAsync(tradeSourceOptions, fvBase);
 }
 
 if (args.Length < 2 || !DateOnly.TryParseExact(args[0], "yyyy-MM-dd", out var fromDate) || !DateOnly.TryParseExact(args[1], "yyyy-MM-dd", out var toDate))

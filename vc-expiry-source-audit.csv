@@ -1,0 +1,25 @@
+TradingDate,ExpiryDate,Dte,DteBucket,Classification,RankAmongAvailable,AvailableCount,SelectedExpiryReason,ExpiryDayOfWeek,OptionInstrumentCount,CeInstrumentCount,PeInstrumentCount,CeTickCount,PeTickCount
+2026-09-04,2026-09-08,4,4-6,CURRENT_WEEK,0,2,"Rank 0 of 2 distinct expiries available for this TradingDate (0 = nearest)",Tuesday,40,20,20,1044084,1118577
+2026-09-04,2026-09-15,11,11-13,NEXT_WEEK,1,2,"Rank 1 of 2 distinct expiries available for this TradingDate (0 = nearest)",Tuesday,40,20,20,694684,710261
+2026-09-08,2026-09-08,0,0,CURRENT_WEEK,0,2,"Rank 0 of 2 distinct expiries available for this TradingDate (0 = nearest)",Tuesday,41,20,21,1141807,1098795
+2026-09-08,2026-09-15,7,7-8,NEXT_WEEK,1,2,"Rank 1 of 2 distinct expiries available for this TradingDate (0 = nearest)",Tuesday,40,20,20,895015,871093
+2026-09-09,2026-09-15,6,4-6,CURRENT_WEEK,0,2,"Rank 0 of 2 distinct expiries available for this TradingDate (0 = nearest)",Tuesday,41,20,21,1167073,1152212
+2026-09-09,2026-09-22,13,11-13,NEXT_WEEK,1,2,"Rank 1 of 2 distinct expiries available for this TradingDate (0 = nearest)",Tuesday,40,20,20,694172,665048
+2026-09-10,2026-09-15,5,4-6,CURRENT_WEEK,0,2,"Rank 0 of 2 distinct expiries available for this TradingDate (0 = nearest)",Tuesday,40,20,20,1096820,1161925
+2026-09-10,2026-09-22,12,11-13,NEXT_WEEK,1,2,"Rank 1 of 2 distinct expiries available for this TradingDate (0 = nearest)",Tuesday,40,20,20,685841,693593
+2026-09-11,2026-09-15,4,4-6,CURRENT_WEEK,0,2,"Rank 0 of 2 distinct expiries available for this TradingDate (0 = nearest)",Tuesday,40,20,20,1259732,1139733
+2026-09-11,2026-09-22,11,11-13,NEXT_WEEK,1,2,"Rank 1 of 2 distinct expiries available for this TradingDate (0 = nearest)",Tuesday,40,20,20,824643,756338
+2026-09-15,2026-09-15,0,0,CURRENT_WEEK,0,2,"Rank 0 of 2 distinct expiries available for this TradingDate (0 = nearest)",Tuesday,40,20,20,1207181,1203734
+2026-09-15,2026-09-22,7,7-8,NEXT_WEEK,1,2,"Rank 1 of 2 distinct expiries available for this TradingDate (0 = nearest)",Tuesday,40,20,20,954742,955098
+2026-09-16,2026-09-22,6,4-6,CURRENT_WEEK,0,2,"Rank 0 of 2 distinct expiries available for this TradingDate (0 = nearest)",Tuesday,40,20,20,1067199,1230321
+2026-09-16,2026-09-29,13,11-13,NEXT_WEEK,1,2,"Rank 1 of 2 distinct expiries available for this TradingDate (0 = nearest)",Tuesday,40,20,20,716699,756724
+2026-09-17,2026-09-22,5,4-6,CURRENT_WEEK,0,2,"Rank 0 of 2 distinct expiries available for this TradingDate (0 = nearest)",Tuesday,40,20,20,1120196,1198099
+2026-09-17,2026-09-29,12,11-13,NEXT_WEEK,1,2,"Rank 1 of 2 distinct expiries available for this TradingDate (0 = nearest)",Tuesday,40,20,20,782397,783030
+2026-09-18,2026-09-22,4,4-6,CURRENT_WEEK,0,2,"Rank 0 of 2 distinct expiries available for this TradingDate (0 = nearest)",Tuesday,40,20,20,1123571,1188698
+2026-09-18,2026-09-29,11,11-13,NEXT_WEEK,1,2,"Rank 1 of 2 distinct expiries available for this TradingDate (0 = nearest)",Tuesday,40,20,20,769455,781466
+2026-09-21,2026-09-22,1,1,CURRENT_WEEK,0,2,"Rank 0 of 2 distinct expiries available for this TradingDate (0 = nearest)",Tuesday,40,20,20,1110395,1164537
+2026-09-21,2026-09-29,8,7-8,NEXT_WEEK,1,2,"Rank 1 of 2 distinct expiries available for this TradingDate (0 = nearest)",Tuesday,40,20,20,832227,841710
+2026-09-22,2026-09-22,0,0,CURRENT_WEEK,0,2,"Rank 0 of 2 distinct expiries available for this TradingDate (0 = nearest)",Tuesday,40,20,20,1182335,1151826
+2026-09-22,2026-09-29,7,7-8,NEXT_WEEK,1,2,"Rank 1 of 2 distinct expiries available for this TradingDate (0 = nearest)",Tuesday,40,20,20,986234,963411
+2026-09-23,2026-09-29,6,4-6,CURRENT_WEEK,0,2,"Rank 0 of 2 distinct expiries available for this TradingDate (0 = nearest)",Tuesday,40,20,20,1087489,1161306
+2026-09-23,2026-10-06,13,11-13,NEXT_WEEK,1,2,"Rank 1 of 2 distinct expiries available for this TradingDate (0 = nearest)",Tuesday,40,20,20,667204,693692

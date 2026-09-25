@@ -4417,3 +4417,3053 @@ or something else.
 ```
 dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-crossover-trade-test 2026-09-01 2026-09-23 --out=vc-a-crossover-trade-test.csv
 ```
+
+## Methodology Audit: Current-Week vs. Next-Week Expiry Pooling (2026-09-24)
+
+**STOP-AND-INVESTIGATE audit, requested before any new hypothesis work.** Every prior
+`vc0dte-relationship-a-*`/`vc0dte-relationship-ab-*` command in this document enumerates DTE
+buckets 0/1/4-6/7-8/11-13 as if they described one option contract's behavior across its life.
+This audit checks whether that is true, or whether some buckets are actually a *different*
+weekly-expiry contract entirely.
+
+### Code-path trace (done first, no implementation change)
+
+Every command from `vc0dte-relationship` through `vc0dte-relationship-a-crossover-trade-test`
+(9 call sites, confirmed by direct grep) uses the **identical inline pattern**, never a shared
+helper:
+```csharp
+var expiries = await source.Instruments
+    .Where(i => i.AsOfDate == date && i.InstrumentType == InstrumentType.Option && i.Underlying == "NIFTY")
+    .Select(i => i.ExpiryDate).Distinct().OrderBy(e => e).ToListAsync();
+foreach (var expiry in expiries)
+{
+    var dte = expiry.Value.DayNumber - date.DayNumber;
+    var bucket = DteBucketClassifier.Classify(dte);
+    if (bucket != DteBucketClassifier.Other) { pairs.Add((date, expiry.Value, dte, bucket)); }
+}
+```
+**Every distinct `ExpiryDate` present in that day's option chain is added as its own independent
+(date, expiry) pair, with no current-week/next-week distinction anywhere.** `DteBucketClassifier`
+(`DteBucketClassifier.cs`) only maps a raw DTE integer to a bucket label — it has no concept of
+"which weekly contract this is." Path: raw `Instruments` table → this per-command inline
+enumeration → `SynchronizedOptionBarBuilder.BuildDayForChainAsync(date, chain, ...)` →
+`UnderlyingOptionRelationshipRecorder.RecordAsync` → Pattern A/B classification. The selected
+expiry is never filtered by "nearest" or "current" anywhere in this path — both chains a
+TradingDate has reach the Pattern A/B analysis, unlabeled.
+
+### Audit data (new, read-only `vc0dte-expiry-source-audit` command, no bar-building, no Pattern
+A/B calculation — full table in `vc-expiry-source-audit.csv`)
+
+Ran 2026-09-01 to 2026-09-23 (the discovery range used by every prior command; 2026-09-24 excluded
+as it remains the OOS holdout). Classification is by **rank** (nearest available expiry = rank 0 =
+CURRENT_WEEK, next = rank 1 = NEXT_WEEK), not an assumed day-of-week — the Tuesday convention was
+then checked against the data, not assumed.
+
+**All sanity checks passed:**
+- Every one of 12 TradingDates has **exactly 2** distinct expiries available — no week-after-next
+  data present in this range at all.
+- All 12 CURRENT_WEEK (rank-0) rows have DTE <= 6 (min 0, max 6).
+- Every CURRENT_WEEK row's `ExpiryDate` falls on a **Tuesday** — confirms the stated weekly-expiry
+  convention empirically, from the actual dates, not by assumption.
+- No TradingDate has more than one CURRENT_WEEK mapping (no duplicates).
+
+**The direct answer to the key question — cross-referencing every `DteBucketClassifier` bucket
+against actual (TradingDate, ExpiryDate, rank):**
+
+| DteBucket | n | Classification | Example rows |
+|---|---|---|---|
+| 0 | 3 | **100% CURRENT_WEEK** | 2026-09-08→2026-09-08, 2026-09-15→2026-09-15, 2026-09-22→2026-09-22 |
+| 1 | 1 | **100% CURRENT_WEEK** | 2026-09-21→2026-09-22 |
+| 4-6 | 8 | **100% CURRENT_WEEK** | 2026-09-04→2026-09-08 (DTE4), 2026-09-09→2026-09-15 (DTE6), 2026-09-16→2026-09-22 (DTE6), 2026-09-23→2026-09-29 (DTE6) |
+| 7-8 | 4 | **100% NEXT_WEEK** | 2026-09-08→**2026-09-15** (DTE7), 2026-09-15→**2026-09-22** (DTE7), 2026-09-21→**2026-09-29** (DTE8), 2026-09-22→**2026-09-29** (DTE7) |
+| 11-13 | 8 | **100% NEXT_WEEK** | 2026-09-04→**2026-09-15** (DTE11), 2026-09-09→**2026-09-22** (DTE13), 2026-09-16→**2026-09-29** (DTE13), 2026-09-23→**2026-10-06** (DTE13) |
+
+**Confirmed: the DTE 7-8 and DTE 11-13 buckets reported throughout every prior experiment in this
+document (crossover-trade-test, divergence-maturity, temporal-context, DTE-validation,
+DTE-expansion, selectivity calibration, and the trade-level P&L calibration) were 100% next-week
+expiry data, never current-week.** Every one of the 12 TradingDates in this range contributed
+*two* different weekly contracts (its own current week's Tuesday expiry, and the *following*
+week's Tuesday expiry) as two separate, equally-weighted (date, expiry) pairs — both feeding the
+same aggregate "Baseline A trades"/"12 independent sessions" pool without distinction. Any report
+in this document that broke results out "by DTE bucket" as though showing one contract's behavior
+across its life was actually comparing two structurally different weekly contracts (different
+absolute premium levels, different extrinsic-decay dynamics) side by side, unlabeled as such.
+
+### CURRENT_WEEK_ONLY dataset (satisfies the task's Section 4 checklist, ready for the next phase)
+
+- Total TradingDates: **12** (2026-09-04, 08, 09, 10, 11, 15, 16, 17, 18, 21, 22, 23)
+- Current-week ExpiryDate per TradingDate: each date's own nearest Tuesday (see CSV)
+- Min DTE = 0, Max DTE = 6
+- DTE distribution: DTE0 n=3, DTE1 n=1, DTE4 n=3, DTE5 n=2, DTE6 n=3
+- **No** TradingDate has DTE > 6
+- **No** duplicate TradingDate/current-week-expiry mapping
+
+### Reproduction
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-expiry-source-audit 2026-09-01 2026-09-23 --out=vc-expiry-source-audit.csv
+```
+
+### Status: audit complete, stopping here per instruction
+
+Per the task's explicit rule ("Do not automatically proceed to another experiment. FIRST show the
+complete expiry audit."), this section stops at the audit. The rolling A/B majority-vote
+hypothesis, the 5-consecutive-same-pattern hypothesis, and the phase-collapse analysis (Sections
+6-13 of the task) have **not** been built yet, and will run only against the now-verified
+CURRENT_WEEK_ONLY dataset above, pending confirmation to proceed.
+
+## Rolling A/B Vote and N-Consecutive-Run Hypothesis Test (2026-09-24)
+
+Tests the two hypotheses the earlier A/B Temporal Context Diagnostic did not actually implement
+(that diagnostic only described local A/B dominance descriptively; this experiment implements the
+causal rolling vote and the run-trigger mechanism themselves). Runs on CURRENT_WEEK_ONLY (rank-0
+expiry per TradingDate) as the primary dataset, per the expiry-source audit above; NEXT_WEEK_ONLY
+(rank-1) is reported separately as a secondary, never-pooled comparison. New pure calculators in
+`RollingVoteAndRunAnalysis.cs` (8 unit tests), wired via a new
+`vc0dte-relationship-a-vote-and-run-analysis` command. No SL/TP/cooldown/exit-delay/filter/
+optimization of any kind -- forward directional information only, using the existing frozen
+`UnderlyingOptionRelationshipSummary.ComputeFuturesChange` for forward returns (+1/+3/+5/+10
+events, no look-ahead).
+
+### A. Dataset confirmation
+
+12 TradingDates, same set as the expiry audit. CURRENT_WEEK: DTE range 0-6, no anomalies (no
+DTE > 6 encountered). NEXT_WEEK: DTE range 7-13, no anomalies. Total events: 20,539 both sides
+(same futures event-bar sequence underlies both option-chain views of a date). Raw Pattern A/B
+counts: CURRENT_WEEK A=1,867/B=1,820; NEXT_WEEK A=1,635/B=1,619.
+
+### B. Rolling A/B majority vote (causal, backward-only, current event excluded)
+
+CURRENT_WEEK_ONLY, forward futures % change by vote Winner (all 5 windows, all 4 horizons):
+
+| Window | Winner | n | +1 mean | +10 mean | +10 pos% | +10 neg% |
+|---|---|---|---|---|---|---|
+| 1 min | A-majority | 5,746 | -0.0008% | -0.0023% | 45.9% | 50.3% |
+| 1 min | B-majority | 5,143 | +0.0006% | +0.0005% | 47.7% | 49.1% |
+| 1 min | TIE | 9,650 | 0.0000% | +0.0001% | 48.1% | 48.5% |
+| 5 min | A-majority | 8,193 | -0.0003% | -0.0007% | 47.1% | 49.1% |
+| 5 min | B-majority | 7,670 | +0.0004% | +0.0010% | 49.3% | 47.3% |
+| 15 min | A-majority | 8,977 | -0.0002% | -0.0010% | 47.3% | 49.2% |
+| 15 min | B-majority | 8,863 | +0.0001% | +0.0002% | 48.0% | 48.8% |
+
+Reference baselines: unconditional (all events) +1 mean=-0.0000%, +10 mean=-0.0005%. Raw Pattern A
+(unconditioned) +1 mean=-0.0082%, +10 mean=-0.0128%. Raw Pattern B (unconditioned) +1
+mean=+0.0076%, +10 mean=+0.0099%.
+
+A-majority is negative and B-majority is positive at every single one of the 5 windows x 4
+horizons (20/20 combinations, no sign flip anywhere) -- a genuinely consistent directional tilt,
+never contradicted. But the magnitude is 5-15x weaker than the raw, unconditioned Pattern A/B
+signal itself (e.g. A-majority +10 mean ranges -0.0002% to -0.0023% across windows, vs. raw
+Pattern A's own -0.0128%). The vote smooths/dilutes the raw signal rather than adding to it --
+consistent with the vote being evaluated at every event (most of which are not themselves a
+Pattern A/B event), not just at qualifying pattern events. NEXT_WEEK_ONLY reproduces the identical
+sign pattern and similar magnitudes (not tabulated in full here; see CSV) -- this is not a
+current-week-specific artifact.
+
+### C. Vote strength (descriptive, not threshold-optimized)
+
+Dominance buckets (>=25%/50%/75%) were computed pooling BOTH A-majority and B-majority together
+(per the task's literal spec) -- this partially cancels the two winners' opposite-signed returns,
+which limits how cleanly this table alone can show "does stronger dominance -> stronger
+direction" (a genuine limitation worth flagging, not papered over). The %positive/%negative split
+does drift with dominance at some windows (e.g. Window 15 min, Dominance>=75%, +10: pos=55.1%
+vs. Any-majority's 47.6%, n=408) but this is not consistent across every window/horizon and the
+sample shrinks fast at higher dominance + longer window (n=408 at the most extreme cell). Full
+table in the CSV; no threshold was selected or optimized.
+
+### D. N-consecutive-same-pattern run analysis
+
+The primary 5-consecutive-event hypothesis cannot be evaluated: zero runs of length >=5 occurred
+in either dataset, across all 12 sessions and 20,539+ events.
+
+Completed-run final-length distribution (CURRENT_WEEK, each run counted once):
+
+| Final length | n | A | B |
+|---|---|---|---|
+| 1 | 3,162 | -- | -- |
+| 2 | 242 | -- | -- |
+| 3 | 11 | -- | -- |
+| 4 | 2 | -- | -- |
+| 5+ | 0 | -- | -- |
+
+(NEXT_WEEK: 2,822 / 205 / 6 / 1 / 0 -- same shape.) Forward return at the event a run reaches
+length L (CURRENT_WEEK; A/B breakdown recomputed directly from the CSV after finding and fixing a
+console-only display bug -- see Operational Note):
+
+| Reached L | n | A | B | +1 mean | +10 mean |
+|---|---|---|---|---|---|
+| 1 | 3,417 | 1,731 | 1,686 | -0.0005% | -0.0019% |
+| 2 | 255 | 126 | 129 | +0.0020% | +0.0022% |
+| 3 | 13 | 9 | 4 | -0.0112% | +0.0039% |
+| 4 | 2 | 1 | 1 | -0.0242% | -0.0339% |
+| 5 | 0 | -- | -- | n/a | n/a |
+
+The market's Pattern A/B condition essentially never persists past 1-2 consecutive event bars --
+consistent with, and now confirmed at finer resolution than, the earlier Episode-Level Validation
+finding (episode length overwhelmingly 1 event). Reached=3/4 samples (n=13, n=2) are far too small
+to draw any conclusion; Reached=1 (n=3,417) simply reproduces the raw Pattern A/B baseline.
+
+### Operational note: display-only bug found and fixed
+
+The console report's "A=/B=" breakdown counts printed 0/0 for every run-length row (comparing the
+recorded RelationshipCategory string against the literal "A"/"B" instead of
+RollingVoteAndRunAnalysis.PatternA/PatternB). This did not affect any of the forward-return
+statistics (means/medians/%pos/%neg were computed correctly over the right groups) -- it only
+affected the auxiliary A-vs-B split display. Fixed in code; the A/B counts in the tables above were
+recovered directly from the CSV (which stores the real category string) rather than requiring a
+rerun.
+
+### E. Opportunity frequency (occurrences/day, CURRENT_WEEK_ONLY)
+
+| Approach | Mean/day | Median/day | P25 | P75 | Min | Max |
+|---|---|---|---|---|---|---|
+| A. Raw Pattern A/B | 307.2 | 271.0 | 236.0 | 387.0 | 203 | 469 |
+| B. Vote state changes (1 min) | 354.9 | 332.0 | 285.0 | 415.0 | 230 | 492 |
+| B. Vote state changes (3 min) | 261.1 | 250.5 | 215.0 | 303.0 | 202 | 347 |
+| B. Vote state changes (5 min) | 212.0 | 206.0 | 193.0 | 227.0 | 171 | 253 |
+| B. Vote state changes (10 min) | 157.4 | 158.0 | 144.0 | 163.0 | 113 | 195 |
+| B. Vote state changes (15 min) | 124.4 | 126.0 | 110.0 | 135.0 | 99 | 147 |
+| C. >=5-consecutive-run signals | 0.0 | 0.0 | 0.0 | 0.0 | 0 | 0 |
+
+None of the three approaches naturally lands anywhere near the 5-20/day practical target -- even
+the longest tested vote window (15 min) still produces ~124 state changes/day, roughly 6-25x too
+frequent, and the run-based approach produces zero signals at its specified threshold.
+NEXT_WEEK_ONLY is nearly identical (raw A/B mean=271.2/day, vote states 127-355/day depending on
+window, 0 five-runs/day).
+
+### F. NEXT_WEEK_ONLY comparison
+
+Kept completely separate throughout (never pooled with CURRENT_WEEK). Every qualitative finding
+above reproduces on NEXT_WEEK_ONLY: A-majority/B-majority sign consistency holds, magnitudes are
+similarly weak relative to raw Pattern A/B, runs of length >=5 never occur (0/12 sessions), and
+opportunity frequency is similarly far above the practical target at every window. This is not a
+current-week-specific phenomenon.
+
+### G. Interpretation (descriptive classification, not ranked)
+
+- Rolling A/B majority vote: classification B -- directional information genuinely exists (sign
+  never flips across 5 windows x 4 horizons, on both CURRENT_WEEK and NEXT_WEEK), but the resulting
+  states are far too frequent even at the longest tested window (15 min: ~124-127 states/day vs.
+  the 5-20/day target), and the effect size is 5-15x weaker than simply trading the raw,
+  unconditioned Pattern A/B signal directly.
+- 5-consecutive-same-pattern run: classification D -- no meaningful directional information is
+  testable, because the specified trigger (a run reaching 5 consecutive events) never occurs at
+  all in this 12-session, 20,539-event sample. This is itself a real, informative negative finding
+  (not an inconclusive one): the underlying condition simply does not persist that long.
+
+Per the task's explicit instruction: not ranked against each other, and no further experiment or
+trade-simulation mapping proceeds without your direction.
+
+### Reproduction
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-a-vote-and-run-analysis 2026-09-01 2026-09-23 --out=vc-vote-and-run-analysis.csv
+```
+
+### Addendum: Reached=2 instead of Reached=5 (2026-09-24, same run, no rerun needed)
+
+The run-length data above was already collected for every ReachedLength 1-6 in a single pass, so
+this addendum re-centers the same completed run's own data on ReachedLength=2 (i.e. "2 consecutive
+same-pattern events") instead of 5, per your follow-up. **This surfaces something the original
+Section D missed: the original Reached=L forward-return tables pooled A-runs and B-runs together,
+which partially cancels their opposite-signed returns (the same sign-mixing limitation already
+flagged in Section C) -- splitting by pattern direction, which is the scientifically valid
+comparison, changes the picture substantially.**
+
+**CURRENT_WEEK_ONLY, Reached=2, split by pattern (vs. the raw, unconditioned Pattern A/B baseline
+from Section B):**
+
+| | n | +1 mean | +10 mean | +10 pos% | +10 neg% |
+|---|---|---|---|---|---|
+| Raw Pattern A (baseline) | 1,867 | -0.0082% | -0.0128% | 36.2% | 61.4% |
+| **2-consecutive A** | 126 | **-0.0093%** | **-0.0150%** | 37.3% | 61.9% |
+| Raw Pattern B (baseline) | 1,820 | +0.0076% | +0.0099% | 58.9% | 39.0% |
+| **2-consecutive B** | 129 | **+0.0130%** | **+0.0191%** | 60.9% | 36.7% |
+
+**Both directions strengthen versus their own raw baseline at every horizon** -- Pattern A's
+signal is about 13-17% stronger at +1/+10, and Pattern B's is roughly 70-95% stronger (nearly
+double at +1). **NEXT_WEEK_ONLY reproduces the same shape**: 2-consecutive A (n=107) +1
+mean=-0.0103%/+10 mean=-0.0152% vs. raw A's -0.0080%/-0.0126%; 2-consecutive B (n=105) +1
+mean=+0.0119%/+10 mean=+0.0170% vs. raw B's +0.0077%/+0.0096%.
+
+**Not driven by one session or one DTE bucket:** per-session trigger counts spread across all 12
+sessions for both patterns (CURRENT_WEEK A: 3-20 per session, n=126 total; B: 5-19 per session,
+n=129 total -- no session exceeds 16% of either pattern's count). The largest single-session share
+of the +10 forward-return sum is 22-31% across all four (rank, pattern) groups -- moderate
+concentration, but well short of being dominated by one session. DTE distribution (CURRENT_WEEK):
+DTE0=75, DTE1=17, DTE4=64, DTE5=38, DTE6=61 -- the largest bucket (DTE0) is 29.4% of the total, not
+a majority.
+
+**Opportunity frequency (>=2-consecutive-run signals/day, both patterns combined):**
+
+| | Mean | Median | P25 | P75 | Min | Max |
+|---|---|---|---|---|---|---|
+| CURRENT_WEEK | 21.2 | **19.0** | **15** | 27 | 13 | 32 |
+| NEXT_WEEK | 17.7 | 16.0 | 12 | 20 | 8 | 30 |
+
+**This is, by a wide margin, the closest any approach tested in this research thread has come to
+the practical 5-20/day target** -- median and P25 sit inside the band; P75/max run somewhat above
+it. Compare: raw Pattern A/B ~307/day, rolling-vote states 124-355/day depending on window,
+5-consecutive-run 0/day (untestable).
+
+**Revised interpretation for the run-length hypothesis, evaluated at L=2 instead of L=5:
+classification A** -- useful directional information (a real, consistent strengthening over the
+raw baseline, in both directions, reproduced on NEXT_WEEK_ONLY, not driven by one session or DTE
+bucket) **and** a naturally practical state frequency (median ~19/day, current-week). This is the
+first candidate in this research thread to land in both categories at once. Still one 12-session
+sample -- a data point, not a verdict -- and still purely a directional-information finding, not a
+trade simulation; no SL/TP/optimization has been added.
+
+## Two-Consecutive-Pattern Controlled Option Trade Simulation (2026-09-25)
+
+The first controlled OPTION trade simulation of the 2-consecutive-event finding above. Signal:
+Pattern A occurring on two consecutive futures events triggers on the 2nd A (A A -> BUY PE);
+Pattern B symmetrically (B B -> BUY CE). Reuses the completely frozen
+`PatternRelationshipTradeSimulator.SimulateDayAsync` unchanged (its existing `patternAEntryFilter`
+plus a new, symmetric, additive `patternBEntryFilter` -- 4 new unit tests, all 1,059 pre-existing
+tests pass unchanged) and the completely frozen `RollingVoteAndRunAnalysis.ComputeRunLengthTriggers`
+(`Reached==2`) for signal detection -- no new entry/exit/cost/strike/size/price-source rule, no
+SL/TP/cooldown/optimization. CURRENT_WEEK_ONLY (rank-0 expiry) is primary; NEXT_WEEK_ONLY (rank-1)
+is a separate, never-pooled secondary validation. `--out=vc-two-consecutive-trade-simulation.csv`.
+
+### Baseline-reproduction sanity check (required before interpreting anything)
+
+| | Historical (crossover-trade-test, DTE=0 bucket) | This run (2026-09-08/15/22 only) | |
+|---|---|---|---|
+| Pattern A | n=299, netPnl=79,398.60 | n=299, netPnl=79,398.64 | **MATCH** |
+| Pattern B | n=297, netPnl=-54,091.46 | n=297, netPnl=-54,091.46 | **MATCH** |
+
+Exact match (4-paisa difference is float/decimal display rounding only). The simulator reproduces
+the already-recorded baseline precisely -- safe to proceed to interpretation.
+
+### Required trade results
+
+**CURRENT_WEEK_ONLY (primary):**
+
+| Group | Trades | Win% | Gross Profit | Gross Loss | Net P&L | PF | Avg P&L/trade | Median P&L/trade | Largest Win | Largest Loss |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Baseline (raw A/B) | 1,879 | 39.1% | 1,474,134.82 | -1,688,482.69 | -214,347.87 | 0.87 | -114.08 | -315.05 | 33,145.82 | -14,599.83 |
+| &nbsp;&nbsp;Pattern A -> PE | 942 | 41.0% | 847,188.60 | -966,046.51 | -118,857.91 | 0.88 | -126.18 | -380.90 | 15,742.23 | -14,599.83 |
+| &nbsp;&nbsp;Pattern B -> CE | 937 | 37.2% | 626,946.22 | -722,436.18 | -95,489.96 | 0.87 | -101.91 | -299.85 | 33,145.82 | -8,114.70 |
+| **Candidate (2-consec A+B)** | 211 | 37.9% | 195,488.42 | -170,957.41 | **+24,531.01** | **1.14** | +116.26 | -364.22 | 29,473.32 | -8,774.41 |
+| &nbsp;&nbsp;2-consec A -> PE | 97 | 36.1% | 61,989.65 | -105,902.39 | **-43,912.74** | **0.59** | -452.71 | -615.25 | 6,432.56 | -8,774.41 |
+| &nbsp;&nbsp;2-consec B -> CE | 114 | 39.5% | 133,498.77 | -65,055.02 | **+68,443.75** | **2.05** | +600.38 | -238.56 | 29,473.32 | -3,292.33 |
+| Diag: A-only 2-consec | 97 | (identical to candidate's A row -- disabling B entries does not change A's own signals/exits) | | | | | | | | |
+| Diag: B-only 2-consec | 114 | (identical to candidate's B row) | | | | | | | | |
+
+MAE/MFE/holding time (not tabulated above for space; full detail in the CSV and console log):
+Baseline avg MAE/MFE% 2.6-3.5% both patterns; 2-consec avg MAE/MFE% 2.5-5.0%, broadly similar shape.
+Holding time ~2 minutes average, ~1:10-1:16 median, essentially unchanged by the filter.
+
+**NEXT_WEEK_ONLY (secondary, never pooled with current-week):**
+
+| Group | Trades | Win% | Net P&L | PF | Avg P&L/trade |
+|---|---|---|---|---|---|
+| Baseline (raw A/B) | 1,680 | 34.4% | -588,760.63 | 0.67 | -350.45 |
+| &nbsp;&nbsp;Pattern A -> PE | 841 | 35.6% | -286,334.04 | 0.69 | -340.47 |
+| &nbsp;&nbsp;Pattern B -> CE | 839 | 33.3% | -302,426.59 | 0.66 | -360.46 |
+| **Candidate (2-consec A+B)** | 187 | 32.1% | **-69,113.31** | **0.65** | -369.59 |
+| &nbsp;&nbsp;2-consec A -> PE | 95 | 27.4% | -63,936.19 | **0.42** | -673.01 |
+| &nbsp;&nbsp;2-consec B -> CE | 92 | 37.0% | -5,177.12 | **0.94** | -56.27 |
+
+**The aggregate flip-to-profitable seen on CURRENT_WEEK does NOT reproduce on NEXT_WEEK_ONLY** --
+the candidate stays net-negative there. The *direction* of the A-vs-B asymmetry does reproduce
+(B's profit factor nearly doubles, 0.66->0.94, while A's profit factor gets worse, 0.69->0.42) --
+just not far enough to cross into profitability on this secondary dataset.
+
+### Per-session stability (CURRENT_WEEK_ONLY, 2-consecutive candidate)
+
+| TradingDate | A2 trades | A2 P&L | B2 trades | B2 P&L | Combined trades | Combined P&L |
+|---|---|---|---|---|---|---|
+| 2026-09-04 | 5 | +414.61 | 6 | -684.74 | 11 | -270.13 |
+| 2026-09-08 | 3 | -856.53 | 13 | -1,746.05 | 16 | -2,602.58 |
+| 2026-09-09 | 7 | -6,250.10 | 12 | **+27,768.69** | 19 | +21,518.59 |
+| 2026-09-10 | 3 | -3,028.80 | 7 | +368.30 | 10 | -2,660.50 |
+| 2026-09-11 | 17 | +2,447.49 | 10 | -8,838.50 | 27 | -6,391.01 |
+| 2026-09-15 | 10 | +2,948.67 | 15 | -5,593.91 | 25 | -2,645.24 |
+| 2026-09-16 | 9 | -13,940.85 | 4 | **+26,134.47** | 13 | +12,193.62 |
+| 2026-09-17 | 8 | -12,424.19 | 12 | +5,583.06 | 20 | -6,841.13 |
+| 2026-09-18 | 6 | -6,448.07 | 6 | +722.29 | 12 | -5,725.78 |
+| 2026-09-21 | 9 | -4,708.36 | 7 | -2,490.11 | 16 | -7,198.47 |
+| 2026-09-22 | 13 | +1,415.19 | 14 | **+35,085.02** | 27 | +36,500.21 |
+| 2026-09-23 | 7 | -3,481.80 | 8 | -7,864.77 | 15 | -11,346.57 |
+
+Positive sessions=3, Negative sessions=9. Largest single-session |P&L| share of total |P&L|=31.5%
+(the automated statistic) -- **but the more important read is direct**: the 3 positive sessions
+(09-09, 09-16, 09-22) contribute +70,212.42 combined; the other 9 sessions net -45,681.41
+combined. Removing the single largest session (09-22, +36,500.21) alone would flip the whole
+CURRENT_WEEK candidate result negative (+24,531.01 -> -11,969.20). B2's own +68,443.75 is
+similarly concentrated: the same three sessions contribute +89,988.18 to B2 alone, exceeding B2's
+own total (the other 9 sessions' B2 P&L nets negative). **The aggregate positive result is real in
+this sample but fragile -- it depends on a minority (3 of 12) of sessions, not a broad, evenly
+distributed edge.**
+
+### Trade frequency (item 8 -- does the relationship-level frequency translate to real trades?)
+
+| | Mean/day | Median/day | P25 | P75 | Min | Max |
+|---|---|---|---|---|---|---|
+| CURRENT_WEEK Raw Pattern A/B | 156.6 | 145.0 | 114.0 | 192.0 | 94 | 242 |
+| CURRENT_WEEK 2-consecutive (A+B) | 17.6 | **16.0** | 12.0 | 20.0 | 10 | 27 |
+| NEXT_WEEK Raw Pattern A/B | 140.0 | 132.5 | 105.0 | 157.0 | 89 | 210 |
+| NEXT_WEEK 2-consecutive (A+B) | 15.6 | 14.0 | 12.0 | 17.0 | 5 | 28 |
+
+**Confirmed: the relationship-level frequency finding (median ~19/day) translates well into real
+executed trades (median 16/day)** -- slightly lower, as expected, since some relationship-level
+triggers get skipped by the "already in position" rule, but still comfortably inside the practical
+5-20/day target on both datasets. Frequency reduction is the one dimension this experiment
+succeeds at cleanly and unambiguously.
+
+### Interpretation -- the 7 explicit questions, answered directly (not declared a win by default)
+
+1. **Does 2x improve actual option P&L?** Mixed. CURRENT_WEEK aggregate flips from -214,347.87 to
+   +24,531.01 -- but this does NOT reproduce on NEXT_WEEK_ONLY (stays at -69,113.31), and the
+   CURRENT_WEEK improvement is itself driven by Pattern B alone (Pattern A gets worse).
+2. **Does it improve P&L/trade?** Only for B (CURRENT_WEEK: -101.91 -> +600.38; NEXT_WEEK: -360.46
+   -> -56.27, less bad but still negative). For A it gets WORSE on both datasets (CURRENT_WEEK:
+   -126.18 -> -452.71; NEXT_WEEK: -340.47 -> -673.01).
+3. **Does it improve profit factor?** Only for B (0.87 -> 2.05 CURRENT_WEEK; 0.66 -> 0.94
+   NEXT_WEEK). For A it gets WORSE on both (0.88 -> 0.59 CURRENT_WEEK; 0.69 -> 0.42 NEXT_WEEK).
+4. **Does it preserve reasonable trade frequency?** Yes, clearly and consistently -- median
+   ~14-16/day on both datasets, squarely inside the 5-20/day practical target. The one unambiguous
+   success.
+5. **Does the improvement occur on multiple sessions?** Not really. The CURRENT_WEEK positive
+   result depends on 3 of 12 sessions; removing the single largest session alone flips the
+   aggregate negative. This is a real fragility, not a broad, session-independent edge.
+6. **Does A x2 behave differently from B x2?** Yes, decisively, and consistently across both
+   datasets -- B x2 improves materially, A x2 gets worse. This confirms, now at the real option-P&L
+   level (not just the futures-forward-return level), the entire research thread's recurring
+   finding that Pattern A -> BUY PE structurally underperforms Pattern B -> BUY CE.
+7. **Does the option layer preserve the underlying directional improvement?** Only partially. The
+   relationship-level study found BOTH A and B strengthen at Reached=2 (A ~13-17% stronger, B
+   ~70-95% stronger). At the option layer, B's stronger underlying signal DOES translate into a
+   real P&L improvement -- but A's stronger underlying signal does NOT translate; it makes the
+   option outcome worse. A stronger underlying directional move is not sufficient by itself to
+   guarantee a better option-trading outcome.
+
+### Bottom line
+
+The underlying improvement does **not** disappear entirely at the option layer, but it survives
+cleanly only for Pattern B -> BUY CE, and even there the CURRENT_WEEK result is concentrated in a
+minority of sessions and does not reproduce on NEXT_WEEK_ONLY. Pattern A -> BUY PE's option-layer
+result is worse than the raw baseline, not better -- the underlying-level improvement for A does
+not carry through. The combined "A+B 2-consecutive" candidate as originally specified is not a
+clean result: it bundles a losing component (A) with a winning one (B). Per the task's own
+framing, this is not yet "a serious candidate for subsequent OOS validation" as specified (the
+combined form); a version isolating Pattern B -> BUY CE alone would be the more defensible next
+question, but that is a new decision for you to make, not something this report resolves on its
+own. No further experiment has been started.
+
+### Reproduction
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-two-consecutive-trade-simulation 2026-09-01 2026-09-23 --out=vc-two-consecutive-trade-simulation.csv
+```
+
+## One-Day Exploratory Visual Discovery: 650-Contract Bars / 3-Consecutive Trigger (2026-09-25)
+
+Deliberately different from every prior experiment: a one-day, visual-inspection-only discovery
+pass, not a strategy test. Halves the futures event-bar threshold (1300 -> 650 contracts, same
+frozen construction rule -- cumulative volume, excess carried forward, explicit final partial bar,
+no tick splitting) and raises the run-length requirement (2 -> 3 consecutive same-pattern events),
+on **2026-09-22 only** (current-week, DTE=0 -- chosen because it is the one day an exact 1300/2
+comparison could be pulled from the already-completed controlled trade simulation). New read-only
+command `vc0dte-relationship-650-3consec-oneday`; reuses the completely frozen
+`FutureEventBarBuilder`/`SynchronizedOptionBarBuilder`/`UnderlyingOptionRelationshipRecorder`
+pipeline (only the threshold argument changes), `RollingVoteAndRunAnalysis.ComputeRunLengthTriggers`
+(`Reached==3`), and `PatternRelationshipTradeSimulator.SimulateDayAsync` unchanged. No SL/TP/
+cooldown/filter/optimization; no multi-day run; no profitability claim.
+
+### Configuration
+
+TradingDate 2026-09-22, ExpiryDate 2026-09-22, DTE 0, event bar size 650 contracts, consecutive
+requirement 3.
+
+### Event-bar construction verification
+
+- 4,245 bars built (vs. 2,123 at 1300-contract threshold on this same day -- almost exactly double,
+  consistent with a roughly linear threshold-to-bar-count relationship at constant total volume).
+- Average bar duration 5.0s, median 1.0s, min 0.0s, max 90.0s.
+- Average futures volume/bar 2,488.8 (bar volume includes any threshold-crossing tick's full delta
+  plus carried-in excess from the prior bar, so it exceeds the raw 650 threshold on average).
+- **Volume-not-split confirmed**: 4,244/4,244 non-final bars have Volume >= threshold (0 violations).
+- 1 final partial bar (the session's own last, necessarily-partial bar).
+- **Strictly ordered, no look-ahead**: PASS (EndTimestamp[i] <= StartTimestamp[i+1] for every i).
+
+### A×3 / B×3 triggers
+
+Only **2** qualifying sequences all session -- both Pattern A, **zero Pattern B**:
+
+| Trigger | Time (IST) | Sequence | Futures at each event | Cumulative futures return | Duration | Contracts |
+|---|---|---|---|---|---|---|
+| A×3 #1 | 09:16:25 | A,A,A | 23458.00, 23460.00, 23464.00 | +0.0256% | 12s | 2,665 |
+| A×3 #2 | 11:09:51 | A,A,A | 23390.00, 23395.10, 23396.40 | +0.0274% | 20s | 2,535 |
+
+Both occurred in the morning session (09:xx and 11:xx IST); 0.32 triggers/hour. Full per-event
+sequence detail (CE/PE direction, per-event returns) in the console log and `-events.csv`.
+
+### Full per-event CSV
+
+`vc-650-3consec-2026-09-22-events.csv` -- every one of the 4,245 events this day, none downsampled
+or removed, with Pattern/CurrentRunPattern/CurrentRunLength/A3Trigger/B3Trigger columns.
+
+### Trade-by-trade simulation (one day, exploratory evidence only)
+
+| | Signals | Trades | Win% | Net P&L | PF |
+|---|---|---|---|---|---|
+| A x3 -> PE | 2 | 2 | 0.0% | -1,474.18 | 0.00 |
+| B x3 -> CE | 0 | 0 | -- | -- | -- |
+| Combined | 2 | 2 | 0.0% | -1,474.18 | 0.00 |
+
+Both trades lost; n=2 is far too small to read as anything beyond "this is what happened this one
+day" -- explicitly **not** a validated edge. Full trade-by-trade table in
+`vc-650-3consec-2026-09-22-trades.csv`.
+
+### Comparison with 1300/2 (same day, descriptive only)
+
+| | A triggers | B triggers | A-side trades | B-side trades | Net P&L |
+|---|---|---|---|---|---|
+| 650/3 | 2 | 0 | 2 | 0 | -1,474.18 |
+| 1300/2 (recorded) | 13 | 14 | 13 (+1,415.19) | 14 (+35,085.02) | +36,500.21 |
+
+Tightening both the bar resolution and the run-length requirement compounds into a far more
+selective (and far rarer) signal on this day -- not an optimization comparison, purely descriptive.
+
+### Visual inspection package
+
+Published as an interactive artifact: **[Pattern Trace 650/3](https://claude.ai/artifact/LMUStHi9FyAHChFaeGn4wy)**
+-- full-session futures price chart (every event plotted, none downsampled) with a synchronized
+Pattern A/B/Other band beneath it and both A×3 trigger locations marked, plus two zoomed
+event-index "trigger inspector" charts (±25 events) with the 3-event A,A,A sequence annotated
+directly on the chart. No visual interpretation is asserted beyond the factual observations
+below -- inspect the chart directly.
+
+### Implementation/data-quality concerns
+
+None found. Event construction verified clean (no volume splitting, strict ordering, exactly one
+final partial bar). No reproduction issue encountered.
+
+### Factual visual observations (descriptive only, no strategy proposed)
+
+- Only 2 qualifying 3-consecutive sequences occurred all session (both Pattern A) vs. 13 A / 14 B
+  at 1300/2 on the same day.
+- Zero B×3 sequences occurred at all.
+- Both A×3 triggers occurred in the morning half of the session, roughly two hours apart.
+- Halving the volume threshold almost exactly doubled the bar count on this day.
+- Both trigger sequences show a small, same-direction cumulative futures move across their own
+  3-event span (+0.026%, +0.027%) -- visible in the trigger-inspector charts; further
+  interpretation (reversal vs. continuation vs. consolidation) is left to direct visual inspection,
+  not asserted here.
+
+### Reproduction
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-650-3consec-oneday 2026-09-22 --out=vc-650-3consec-2026-09-22
+```
+
+## One-Day Exploratory Visual Discovery: 650-Contract Bars / 2-Consecutive Trigger (2026-09-25)
+
+Same day, same 650-contract bars, run-length requirement relaxed back to 2 (matching the
+already-completed 1300/2 controlled trade simulation, for a direct same-day comparison). Generalized
+the `vc0dte-relationship-650-3consec-oneday` command with `--threshold=`/`--consecutive=` named
+arguments (defaults 650/3 preserve the original invocation unchanged) rather than duplicating the
+block -- no new logic, same frozen pipeline.
+
+### Trigger counts
+
+**41 total triggers** (23 A×2, 18 B×2) -- vs. only 2 at 650/3, and vs. 27 at 1300/2 (13 A + 14 B).
+Relaxing 3->2 restores a much higher, more usable count, as expected.
+
+### Trade summary and the key finding: the P&L split by pattern REVERSES
+
+| Configuration | A trades | A NetPnl | B trades | B NetPnl | Combined NetPnl |
+|---|---|---|---|---|---|
+| 650/2 (this run) | 21 | **+16,442.54** (61.9% win, PF 4.64) | 17 | **-9,988.49** (11.8% win, PF 0.20) | +6,454.05 |
+| 1300/2 (recorded) | 13 | +1,415.19 | 14 | **+35,085.02** | +36,500.21 |
+
+**On the exact same trading day, Pattern A dominates the P&L at 650/2 while Pattern B dominates at
+1300/2** -- not just a magnitude change, a reversal of which side of the signal looks stronger.
+This is a genuinely new, descriptive structural observation: event-bar resolution changes which
+pattern appears to carry the tradeable information, at least on this one day. Not an optimization
+claim, not a validated edge -- one day, one data point.
+
+### Visual inspection package
+
+Published as an interactive artifact: **[Pattern Trace 650/2](https://claude.ai/artifact/62qwtSBy79E2qBsUQ8NLYV)**
+-- full-session chart with all 41 trigger locations marked, the same-day 650/2-vs-1300/2 comparison
+table, and 6 representative trigger-inspector charts (first/mid/last of each pattern; showing all
+41 individually was impractical). Checked rendering (chart, comparison table, trigger cards) before
+sending the link.
+
+### Full CSVs
+
+`vc-650-2consec-2026-09-22-events.csv` (all 4,245 events, none downsampled) and
+`vc-650-2consec-2026-09-22-trades.csv` (38 trades, full trade-by-trade detail).
+
+### Factual observations
+
+- 41 triggers vs. 2 at 650/3 and 27 at 1300/2 -- relaxing the run-length requirement has a much
+  larger effect on count than halving the bar threshold alone did.
+- The A-vs-B P&L dominance reverses between 650/2 and 1300/2 on this same day (see above) -- the
+  single most notable finding of this pass.
+- Triggers cluster in the morning and early-afternoon; the 12:00-13:00 hour is comparatively quiet.
+
+### Reproduction
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-650-3consec-oneday 2026-09-22 --out=vc-650-2consec-2026-09-22 --consecutive=2
+```
+
+## Resolution Ladder: 2600/1 and 3250/1, Same Session (2026-09-25)
+
+Extends the one-day command with a new "underlying forward-return analysis" section (reuses the
+same frozen `ComputeFuturesChange`, +1/+3/+5/+10 events, no look-ahead) and generalizes it further
+via the already-added `--threshold=`/`--consecutive=` flags -- 2600-contract and 3250-contract
+bars, both at 1-consecutive (2-consecutive produced too few triggers to be usable at these coarser
+thresholds on a single day). Same session throughout: 2026-09-22, current-week, DTE=0. No other
+configuration tested.
+
+### Resolution ladder -- side-by-side (caveat stated plainly)
+
+650 and 1300 use a 2-consecutive trigger; 2600 and 3250 use 1-consecutive -- this mixes the
+bar-size effect with a run-length effect for the last two rows, not a clean single-variable sweep.
+
+| Config | Bars | Avg bar dur. | Triggers (A+B) | A trades | A NetPnl | B trades | B NetPnl | Combined NetPnl | Combined PF |
+|---|---|---|---|---|---|---|---|---|---|
+| 650 / 2-consec | 4,245 | 5.0s | 41 (23+18) | 21 | +16,442.54 | 17 | -9,988.49 | +6,454.05 | 1.38 |
+| 1300 / 2-consec | 2,123 | ~10s | 27 (13+14) | 13 | +1,415.19 | 14 | +35,085.02 | +36,500.21 | -- |
+| **2600 / 1-consec** | 1,062 | 21.1s | 214 (107+107) | 63 | +32,385.44 | 62 | +4,666.87 | **+37,052.31** | 1.33 |
+| **3250 / 1-consec** | 849 | 26.4s | 171 (90+81) | 51 | +5,883.80 | 50 | -22,017.87 | **-16,134.07** | 0.87 |
+
+**Combined day P&L is not monotonic across the ladder**: +6,454 -> +36,500 -> +37,052 -> -16,134.
+It rises then falls, peaking somewhere between 1300 and 2600 contracts on this one day. Which
+pattern dominates the P&L also keeps flipping: A>B at 650, B>>A at 1300, roughly balanced at 2600,
+A>B (B sharply negative) at 3250 -- no two adjacent rungs show the same qualitative shape.
+
+### Event-bar construction verification (both new configs)
+
+- 2600/1: 1,062 bars (1,061/1,061 non-final bars >= threshold, 1 final partial, strictly ordered
+  PASS). Avg duration 21.1s, median 14.0s, min 0.0s, max 200.0s. Avg volume/bar 3,895.8.
+- 3250/1: 849 bars (848/848 non-final bars >= threshold, 1 final partial, strictly ordered PASS).
+  Avg duration 26.4s, median 18.0s, min 0.0s, max 206.0s. Avg volume/bar 4,547.6.
+
+### Underlying forward-return analysis
+
+| Config / side | n | +1 mean | +3 mean | +5 mean | +10 mean | +10 pos% | +10 neg% |
+|---|---|---|---|---|---|---|---|
+| 2600/1 -- A | 107 | -0.0132% | -0.0188% | -0.0147% | -0.0217% | 31.4% | 68.6% |
+| 2600/1 -- B | 107 | +0.0102% | +0.0112% | +0.0089% | +0.0092% | 53.3% | 46.7% |
+| 3250/1 -- A | 90 | -0.0144% | -0.0200% | -0.0211% | -0.0201% | 37.1% | 62.9% |
+| 3250/1 -- B | 81 | +0.0101% | +0.0074% | +0.0058% | -0.0002% | 45.7% | 54.3% |
+
+Pattern A's forward-return sign is consistent (negative, matching BUY PE) across all 4 horizons at
+both configurations. Pattern B's forward return weakens with coarser bars and longer horizons,
+turning marginally negative at 3250/+10 -- the same kind of directional fade seen intermittently
+elsewhere in this research.
+
+### Trade summary
+
+| | Signals | Trades | Win% | Net P&L | PF |
+|---|---|---|---|---|---|
+| 2600/1: A x1 -> PE | 107 | 63 | 46.0% | +32,385.44 | 1.70 |
+| 2600/1: B x1 -> CE | 107 | 62 | 40.3% | +4,666.87 | 1.07 |
+| 2600/1: Combined | 214 | 125 | 43.2% | +37,052.31 | 1.33 |
+| 3250/1: A x1 -> PE | 90 | 51 | 45.1% | +5,883.80 | 1.10 |
+| 3250/1: B x1 -> CE | 81 | 50 | 30.0% | -22,017.87 | 0.65 |
+| 3250/1: Combined | 171 | 101 | 37.6% | -16,134.07 | 0.87 |
+
+### Visual inspection package
+
+Published as an interactive artifact: **[Resolution Ladder 2026-09-22](https://claude.ai/artifact/JbnwJWf8KA9aicnjNiy1M2)**
+-- the full ladder comparison table, full-session charts for both new configurations (every event
+plotted, none downsampled, all triggers marked), 4 representative trigger-inspector cards per
+configuration (out of 214 and 171 respectively -- too many to show individually), and the
+forward-return table above. Checked rendering (both charts, all cards, both tables) before sending
+the link.
+
+### Full CSVs
+
+`vc-2600-1consec-2026-09-22-events.csv` / `-trades.csv` and
+`vc-3250-1consec-2026-09-22-events.csv` / `-trades.csv` -- full per-event and per-trade detail,
+none downsampled.
+
+### Factual observations
+
+- Combined P&L across the 4-rung ladder is non-monotonic -- rises from 650 to a peak around
+  1300-2600, then falls sharply at 3250. No simple "finer is better" or "coarser is better" story
+  is visible in this one day's data.
+- Trigger count scales roughly inversely with bar size as expected (4,245->2,123->1,062->849 bars
+  as threshold rises), but trigger count does not track P&L in any obvious way (214 triggers at
+  2600 nets +37,052; 171 at 3250 nets -16,134).
+- Which pattern (A or B) carries the P&L keeps changing across the ladder -- no configuration
+  reproduces its neighbor's qualitative shape.
+- This is one trading day across 4 configurations -- a data point about how sensitive this whole
+  line of research is to the bar-construction parameter, not a verdict about any one resolution.
+
+### Reproduction
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-650-3consec-oneday 2026-09-22 --out=vc-2600-1consec-2026-09-22 --threshold=2600 --consecutive=1
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-650-3consec-oneday 2026-09-22 --out=vc-3250-1consec-2026-09-22 --threshold=3250 --consecutive=1
+```
+
+## Resolution Ladder: 2600/2 and 3250/2 with [100,150] Strike Band (2026-09-25)
+
+Adds the `--minEntryPrice=`/`--maxEntryPrice=` flags to the one-day command, reusing the existing
+(already-used elsewhere in this project) `[100,150]` band strike-selection rule built into
+`PatternRelationshipTradeSimulator.SimulateDayAsync` -- entry walks the chain outward from the
+dynamic-ATM strike and picks the first contract whose own live premium at the signal event falls
+in the band, instead of the pinned dynamic-ATM contract. Same session throughout: 2026-09-22,
+current-week, DTE=0. **Only these two configurations tested.**
+
+### Full 6-configuration resolution ladder
+
+**Caveat stated plainly**: 650/1300 use pinned dynamic-ATM strike selection (no band, matching
+their own earlier runs); only 2600/2 and 3250/2 use the new `[100,150]` band. This mixes the
+strike-selection rule across rows, on top of the bar-size/run-length differences already
+flagged in the prior section -- not a clean single-variable sweep.
+
+| Config | Strike rule | Triggers (A+B) | Trades | A NetPnl | B NetPnl | Combined NetPnl | PF |
+|---|---|---|---|---|---|---|---|
+| 650 / 2-consec | Pinned ATM | 41 | 38 | +16,442.54 | -9,988.49 | +6,454.05 | 1.38 |
+| 1300 / 2-consec | Pinned ATM | 27 | 27 | +1,415.19 | +35,085.02 | +36,500.21 | -- |
+| 2600 / 1-consec | Pinned ATM | 214 | 125 | +32,385.44 | +4,666.87 | +37,052.31 | 1.33 |
+| 3250 / 1-consec | Pinned ATM | 171 | 101 | +5,883.80 | -22,017.87 | -16,134.07 | 0.87 |
+| **2600 / 2-consec** | **[100,150] band** | 12 | 11 | +9,702.73 | -6,621.02 | +3,081.71 | 1.25 |
+| **3250 / 2-consec** | **[100,150] band** | 10 | 10 | -15,974.84 | -5,803.75 | -21,778.59 | 0.13 |
+
+Moving from 1-consecutive to 2-consecutive at the SAME bar sizes collapses the trigger count
+dramatically (2600: 214->12; 3250: 171->10) -- the run-length requirement matters far more than
+the bar-size change at these coarser thresholds. Sample sizes at 2600/2 and 3250/2 are very small
+(n=11, n=10) -- far too few trades to draw any conclusion from the P&L alone.
+
+### Event-bar construction (unchanged from the 1-consecutive runs -- only consecutive requirement and strike rule changed)
+
+- 2600/2: 1,062 bars, avg duration 21.1s, median 14.0s (identical bar construction to 2600/1).
+- 3250/2: 849 bars, avg duration 26.4s, median 18.0s (identical bar construction to 3250/1).
+
+### Underlying forward-return analysis
+
+| Config / side | n | +1 mean | +3 mean | +5 mean | +10 mean |
+|---|---|---|---|---|---|
+| 2600/2 -- A | 8 | -0.0153% | -0.0297% | -0.0356% | -0.0423% |
+| 2600/2 -- B | 4 | +0.0387% | +0.0391% | +0.0081% | +0.0006% |
+| 3250/2 -- A | 6 | -0.0152% | -0.0220% | -0.0375% | -0.0185% |
+| 3250/2 -- B | 4 | +0.0120% | +0.0070% | -0.0063% | -0.0197% |
+
+n is tiny (4-8) -- illustrative, not statistically meaningful on its own. Pattern A's sign stays
+negative at every horizon in both configs -- the most consistent finding across the entire ladder
+so far. Pattern B's forward-return strength keeps fading and turns negative by +10 events in
+every coarse-bar configuration tested (2600/1, 3250/1, 2600/2, 3250/2).
+
+### Trade summary
+
+| | Signals | Trades | Win% | Net P&L | PF |
+|---|---|---|---|---|---|
+| 2600/2: A x2 -> PE | 8 | 7 | 57.1% | +9,702.73 | 2.71 |
+| 2600/2: B x2 -> CE | 4 | 4 | 25.0% | -6,621.02 | 0.04 |
+| 2600/2: Combined | 12 | 11 | 45.5% | +3,081.71 | 1.25 |
+| 3250/2: A x2 -> PE | 6 | 6 | 0.0% | -15,974.84 | 0.00 |
+| 3250/2: B x2 -> CE | 4 | 4 | 50.0% | -5,803.75 | 0.36 |
+| 3250/2: Combined | 10 | 10 | 20.0% | -21,778.59 | 0.13 |
+
+### Visual inspection package
+
+Published as an interactive artifact: **[Resolution Ladder 2/6](https://claude.ai/artifact/MxMzdWZMM3rRXuBqXNxfqK)**
+-- the full 6-row ladder table, full-session charts for both new configurations, and **all**
+trigger-inspector cards this time (12 and 10 respectively -- small enough to show individually,
+unlike the 1-consecutive runs). Checked rendering (both charts, all 22 cards, both tables) before
+sending the link.
+
+### Full CSVs
+
+`vc-2600-2consec-2026-09-22-events.csv` / `-trades.csv` and
+`vc-3250-2consec-2026-09-22-events.csv` / `-trades.csv`.
+
+### Factual observations
+
+- Run-length requirement dominates trigger frequency far more than bar size at these coarser
+  thresholds: 2->1 consecutive multiplied the trigger count by roughly 17-18x at both 2600 and
+  3250 contracts.
+- With the [100,150] band active, 2600/2 stays net positive; 3250/2 is clearly negative -- but
+  n=11/n=10 is too small to read as anything beyond this specific day's arithmetic.
+- Pattern A's underlying forward-return sign is negative at every horizon in every configuration
+  tested across the entire ladder so far -- the single most robust finding in this whole pass.
+- Pattern B's forward-return strength fades with coarser bars/longer horizons and turns negative
+  by +10 events in all four coarse-bar configurations (2600/1, 3250/1, 2600/2, 3250/2) -- a
+  pattern worth keeping in mind for any future work on Pattern B specifically.
+
+### Reproduction
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-650-3consec-oneday 2026-09-22 --out=vc-2600-2consec-2026-09-22 --threshold=2600 --consecutive=2 --minEntryPrice=100 --maxEntryPrice=150
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-650-3consec-oneday 2026-09-22 --out=vc-3250-2consec-2026-09-22 --threshold=3250 --consecutive=2 --minEntryPrice=100 --maxEntryPrice=150
+```
+
+## Resolution Ladder: Same 6 Configurations, Second Session 2026-09-23 (2026-09-25)
+
+Repeats all 6 configurations (650/2, 1300/2, 2600/1, 3250/1, 2600/2-band, 3250/2-band) on
+2026-09-23. **Important difference from the prior pass**: 2026-09-23's current-week expiry is
+2026-09-29, DTE=6 -- not a 0-DTE session like 2026-09-22. 1300/2 was not rerun; its numbers were
+already recorded in the completed 12-day controlled trade simulation and cross-checked directly
+from that CSV (A: 7 trades/-3,481.80; B: 8 trades/-7,864.77) plus the 12-day vote-and-run-analysis
+CSV for trigger counts (10 A / 9 B at Reached=2).
+
+### Cross-day comparison -- all 6 configurations, both sessions
+
+| Config | Day | Triggers (A+B) | Trades | A NetPnl | B NetPnl | Combined NetPnl | PF |
+|---|---|---|---|---|---|---|---|
+| 650/2, Pinned ATM | 09-22 | 41 | 38 | +16,442.54 | -9,988.49 | +6,454.05 | 1.38 |
+| 650/2, Pinned ATM | **09-23** | 27 | 24 | -1,385.71 | -1,161.86 | -2,547.57 | 0.84 |
+| 1300/2, Pinned ATM | 09-22 | 27 | 27 | +1,415.19 | +35,085.02 | +36,500.21 | -- |
+| 1300/2, Pinned ATM | **09-23** | 19 | 15 | -3,481.80 | -7,864.77 | -11,346.57 | -- |
+| 2600/1, Pinned ATM | 09-22 | 214 | 125 | +32,385.44 | +4,666.87 | +37,052.31 | 1.33 |
+| 2600/1, Pinned ATM | **09-23** | 124 | 74 | -7,515.19 | +16,634.77 | +9,119.58 | 1.11 |
+| 3250/1, Pinned ATM | 09-22 | 171 | 101 | +5,883.80 | -22,017.87 | -16,134.07 | 0.87 |
+| 3250/1, Pinned ATM | **09-23** | 118 | 66 | -25,443.14 | -6,702.48 | -32,145.62 | 0.68 |
+| 2600/2, [100,150] band | 09-22 | 12 | 11 | +9,702.73 | -6,621.02 | +3,081.71 | 1.25 |
+| 2600/2, [100,150] band | **09-23** | 5 | 4 | -697.57 | +1,222.79 | +525.22 | 1.18 |
+| 3250/2, [100,150] band | 09-22 | 10 | 10 | -15,974.84 | -5,803.75 | -21,778.59 | 0.13 |
+| 3250/2, [100,150] band | **09-23** | 9 | 8 | -1,775.82 | +33.47 | -1,742.35 | 0.69 |
+
+**Sign persistence across both days**: 2600/1 stays positive on both days (the only configuration
+to do so cleanly). 3250/1 stays negative on both days. 3250/2(band) stays negative on both days.
+2600/2(band) stays positive on both days, but on tiny samples (n=11 then n=4). **650/2 and 1300/2
+both flip from positive (09-22) to negative (09-23).** So 3 of 6 configurations keep the same sign
+across both sessions; 2 flip; 1 (2600/2) stays the same sign but on samples too small to trust.
+
+4 of 6 configurations are net-negative on 09-23, versus only 2 of 6 on 09-22 -- 09-23 was simply a
+worse day for these strategies overall, independent of which configuration was used. Trigger
+counts shrink at every matching configuration on 09-23 relative to 09-22 (e.g. 2600/1: 214->124;
+3250/1: 171->118), consistent with typically lower activity further from a 0-DTE session.
+
+### Visual inspection package
+
+Published as an interactive artifact: **[Resolution Ladder 2026-09-23](https://claude.ai/artifact/6kGodd1nVw96KHSnajqBNT)**
+-- the full 12-row cross-day table, a full-session chart for 650/2, and two "overlay" charts for
+2600 and 3250 (same underlying bars, both the 1-consecutive and 2-consecutive/banded trigger sets
+marked together, distinguished by ring size/shade) -- plus all 9 trigger-inspector cards for the
+two sparse [100,150]-band configs (2600/2: 5, 3250/2: 4 shown). Verified via direct DOM inspection
+(element counts, bounding rects, no console errors) after the local preview pane's screenshot tool
+repeatedly timed out on this heavier page (3 charts, thousands of SVG nodes) -- confirmed correct
+rendering via targeted zoom captures once the pane caught up.
+
+### Full CSVs
+
+`vc-650-2consec-2026-09-23-*.csv`, `vc-2600-1consec-2026-09-23-*.csv`,
+`vc-3250-1consec-2026-09-23-*.csv`, `vc-2600-2consec-2026-09-23-*.csv`,
+`vc-3250-2consec-2026-09-23-*.csv` (events + trades each).
+
+### Factual observations
+
+- Two data points now exist per configuration -- still far short of a validated result, but a
+  first look at cross-session consistency: 2600/1 and 3250/1 (both pinned-ATM, 1-consecutive) are
+  the most sign-stable so far.
+- 650/2 and 1300/2 (both 2-consecutive, pinned-ATM) are the least sign-stable -- both flipped.
+- No conclusion is drawn about which configuration is "correct" from two days of data.
+
+### Reproduction
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-650-3consec-oneday 2026-09-23 --out=vc-650-2consec-2026-09-23 --threshold=650 --consecutive=2
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-650-3consec-oneday 2026-09-23 --out=vc-2600-1consec-2026-09-23 --threshold=2600 --consecutive=1
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-650-3consec-oneday 2026-09-23 --out=vc-3250-1consec-2026-09-23 --threshold=3250 --consecutive=1
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-650-3consec-oneday 2026-09-23 --out=vc-2600-2consec-2026-09-23 --threshold=2600 --consecutive=2 --minEntryPrice=100 --maxEntryPrice=150
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-650-3consec-oneday 2026-09-23 --out=vc-3250-2consec-2026-09-23 --threshold=3250 --consecutive=2 --minEntryPrice=100 --maxEntryPrice=150
+```
+
+## Rolling 2600×5 Contextual-Window State Hypothesis (2026-09-25)
+
+A structurally different hypothesis test, not a parameter sweep: fixed 2,600-contract futures
+event bars, but the A/B relationship is evaluated over a **rolling 5-bar window** (~13,000
+contracts, updating every 2,600), classified from the whole window's start-to-end relationship
+(sign only, no majority vote, no magnitude threshold), and treated as a persistent **state**
+(entry/continuation/exit/age/episode), not an independent signal on every overlapping window.
+New pure state-machine (`RollingStateAnalysis.cs`, 6 unit tests) plus a new
+`vc0dte-relationship-2600x5-rolling-state` command. Reuses frozen `FutureEventBarBuilder`/
+`SynchronizedOptionBarBuilder`/`UnderlyingOptionRelationshipRecorder` (base-bar construction and
+descriptive per-bar context only), `AtmStrikeSelector`/`OptionTickSeries` (one exact pinned CE/PE
+contract per window, sampled at window-start/end from its own real tick series -- never spliced
+across contracts), and `PaperTradeSimulator`/`TransactionCostCalculator`/`MaeMfeCalculator` for the
+secondary trade diagnostic. Both 2026-09-22 (DTE=0) and 2026-09-23 (DTE=6) tested; no other day.
+
+### Wiring conflict, reported as instructed rather than silently resolved
+
+The existing frozen `PatternRelationshipTradeSimulator` could **not** be reused for the trade
+simulation step: its `patternAEntryFilter`/`patternBEntryFilter` are only ever consulted when a
+row's own **per-base-bar** `RelationshipCategory` already equals PatternA/PatternB -- but the
+rolling classification is a different, coarser signal that frequently fires on bars whose own
+per-bar category is "Other" (confirmed directly: section J below). A new, minimal trade loop was
+used instead, applying the **identical** rules (one position, pinned contract, fixed 10 lots, no
+SL/TP, no entry after 15:00, mandatory 15:15 close, the same cost/MAE-MFE calculators) -- not a new
+exit system, just a different entry-signal wire-up, made explicit rather than forced through.
+
+### A. Configuration
+
+| | 2026-09-22 | 2026-09-23 |
+|---|---|---|
+| ExpiryDate | 2026-09-22 | 2026-09-29 |
+| DTE | 0 | 6 |
+| Base volume | 2,600 | 2,600 |
+| Rolling window | 5 bars (~13,000 contracts) | 5 bars (~13,000 contracts) |
+
+### B. Base-bar integrity (both days pass every check)
+
+| | 09-22 | 09-23 |
+|---|---|---|
+| Bars | 1,062 | 675 |
+| Avg/median duration | 21.1s / 14.0s | 33.3s / 24.0s |
+| P25/P75 duration | 3.0s / 31.0s | 10.0s / 48.0s |
+| Volume-not-split | 1,061/1,061 OK | 674/674 OK |
+| Final partial bars | 1 | 1 |
+| Strictly ordered / no dup boundaries | PASS / PASS | PASS / PASS |
+
+### C. Rolling-state population
+
+| | 09-22 | 09-23 |
+|---|---|---|
+| Completed windows | 1,058 | 671 |
+| Other / A / B windows | 868 / 109 / 81 | 571 / 57 / 43 |
+| State entries (=episodes) | 151 (83 A, 68 B) | 78 (45 A, 33 B) |
+| A median/avg episode duration | 83s / 124s | 112s / 129s |
+| B median/avg episode duration | 113s / 121s | 162s / 185s |
+| A survive >=2 / >=3 / >=5 updates | 23% / 6% / 1% | 20% / 4% / 0% |
+| B survive >=2 / >=3 / >=5 updates | 16% / 3% / 0% | 21% / 6% / 0% |
+| Transitions | Other->B=65, B->Other=66, Other->A=81, A->Other=80, A->B=3, B->A=2 | Other->A=44, A->Other=42, A->B=3, B->Other=32, Other->B=30, B->A=1 |
+
+Episodes are almost always brief (median max-age 1 rolling update, i.e. the state usually persists
+for only one bar beyond its own entry) on both days -- consistent with every other episode-length
+finding across this whole research thread. State transitions mostly pass through "Other" rather
+than flipping directly A<->B (only 5 and 4 direct flips respectively).
+
+### D. Underlying directional result -- PRIMARY, and the strongest result in this research thread
+
+| Day | Side | +1 | +3 | +5 | +10 |
+|---|---|---|---|---|---|
+| 09-22 | A (expects negative) | 71.1% | 74.7% | 71.1% | 71.1% |
+| 09-22 | B (expects positive) | 61.8% | 57.4% | 61.8% | 48.5% |
+| 09-23 | A (expects negative) | 66.7% | 66.7% | 62.2% | 63.6% |
+| 09-23 | B (expects positive) | 66.7% | 56.2% | 64.5% | 63.3% |
+
+**Pattern A's rolling-state hit rate (62-75%) is materially higher than any single-event or
+2/3-consecutive formulation tested anywhere else in this project (typically 58-62%), and it
+reproduces on both independent days.** Pattern B is directionally positive but weaker and fades at
++10 on 09-22 (48.5%, essentially coin-flip) while holding up better on 09-23 (63.3%).
+
+### E. State-age result
+
+Age 1 vs Age 2 are broadly similar for both patterns on both days (A: 71-75% at age 1 vs 63-74% at
+age 2 on 09-22; 62-67% vs 56-67% on 09-23) -- **no clear decay as the state ages**, within the
+achievable sample size. Age >=3 samples are too small (n=2-5) to read reliably. No evidence that
+continuation strengthens the signal either; it looks roughly flat where measurable.
+
+### F. Option response -- the critical divergence from the underlying result
+
+| Day | Side | +1 | +3 | +5 | +10 |
+|---|---|---|---|---|---|
+| 09-22 | A -> PE | 49.4% | 48.2% | 48.2% | 56.6% |
+| 09-22 | B -> CE | 51.5% | 45.6% | 41.2% | 38.2% |
+| 09-23 | A -> PE | 48.9% | 44.4% | 42.2% | 50.0% |
+| 09-23 | B -> CE | 48.5% | 46.9% | 51.6% | 46.7% |
+
+**Despite the underlying signal being real and reproducing at 62-75% for Pattern A, the pinned
+PE's own forward price response is consistently near coin-flip (42-57%) on both days -- the
+directional information is not translating into the option's own price response.** This is the
+same underlying-vs-option-translation gap found in the 2-consecutive-pattern trade simulation
+earlier in this document, now confirmed a third and fourth time (two more days, a different signal
+architecture).
+
+### G. Trade simulation (secondary diagnostic)
+
+| Day | Trades (A/B) | Win% | NetPnl | PF |
+|---|---|---|---|---|
+| 09-22 | 74 (37/37) | 31.1% | -15,415.97 | 0.86 |
+| 09-23 | 35 (18/17) | 37.1% | +26,768.52 | 1.69 |
+
+P&L flips sign between days -- consistent with the option-response finding: if the option layer
+carries no real edge, day-to-day P&L sign is expected to be noise-dominated even when the
+underlying signal itself is real.
+
+### H. Visual observations
+
+Published as an interactive artifact: **[Rolling 2600×5 State](https://claude.ai/artifact/LUhhG5wsk6TXvNvn7V3qit)**
+-- full-session, episode-shaded charts for both days (every completed window's futures price
+plotted, A/B episode durations shaded, new-state-entry points marked; continuations never marked
+as separate triggers), the underlying-vs-option-response comparison table, and the trade-P&L
+table. Verified rendering (both charts, both tables) before sending the link. Episodes render as
+thin, closely-spaced shaded bands rather than broad sustained regions, consistent with section C's
+short-episode finding; no systematic visual clustering near turns vs. mid-trend is asserted --
+inspect directly.
+
+### I. Comparison with existing reference architectures (same days, no unnecessary reruns)
+
+| Config | Day | A entries | B entries | Underlying A hit-rate (+1) | Trades | NetPnl |
+|---|---|---|---|---|---|---|
+| 650/2 | 09-22 | 21 | 17 | n/a (raw pattern, not measured this way) | 38 | +6,454.05 |
+| 1300/2 | 09-22 | 13 | 14 | n/a | 27 | +36,500.21 |
+| 2600/1 | 09-22 | 63 | 62 | n/a | 125 | +37,052.31 |
+| **2600x5 rolling** | 09-22 | 83 | 68 | **71.1%** | 74 | -15,415.97 |
+| 650/2 | 09-23 | 12 | 15 | n/a | 24 | -2,547.57 |
+| 1300/2 | 09-23 | 7 | 8 | n/a | 15 | -11,346.57 |
+| 2600/1 | 09-23 | 37 | 37 | n/a | 74 | +9,119.58 |
+| **2600x5 rolling** | 09-23 | 45 | 33 | **66.7%** | 35 | +26,768.52 |
+
+No configuration is ranked "best." The rolling architecture is the only one of these with a
+directly comparable, explicitly-measured underlying directional hit-rate above 70% on either day --
+none of the single-event/consecutive-pattern formulations were evaluated on this exact "expected
+direction %" metric, so this row is not directly comparable to the others' raw trade counts alone.
+
+### J. Data-quality / methodology concerns
+
+- Confirmed directly: many rolling A/B state entries occur on bars whose own per-bar
+  `RelationshipCategory` is "Other" (this is the whole point of section 10's window-composition
+  design, and the direct cause of the wiring conflict above) -- the rolling state genuinely
+  captures something the per-bar classification does not.
+- No look-ahead: the ATM strike and both option prices for a window are always resolved using only
+  data at or before that window's own end timestamp.
+- No option-contract splicing: exactly one CE and one PE token per window, sampled from that same
+  token's own tick series at both window boundaries.
+- The literal-13,000-volume-bar reference (spec item 17) was **skipped** this pass -- while
+  mechanically trivial (same frozen pipeline, threshold=13000), fully wiring its own comparable
+  reporting into this already-large command was judged not worth the additional scope for a
+  secondary/optional reference; flagged here rather than silently omitted.
+
+### K. Deliverables
+
+- `vc-rolling2600x5-2026-09-22-rolling-state.csv` / `-episodes.csv` / `-trades.csv`
+- `vc-rolling2600x5-2026-09-23-rolling-state.csv` / `-episodes.csv` / `-trades.csv`
+- Artifact: https://claude.ai/artifact/LUhhG5wsk6TXvNvn7V3qit
+
+### L. Bottom-line research classification
+
+1. **Does the rolling 2600x5 state contain directional information?** Yes, clearly, for Pattern A
+   (62-75% expected-direction across both days and all four horizons) -- the strongest underlying
+   result in this entire research thread. Pattern B is directionally positive but weaker and less
+   consistent (48.5-67%).
+2. **Stronger, weaker, or different from single-event/consecutive-pattern formulations?**
+   Stronger for Pattern A specifically, on the underlying-return metric -- no other formulation in
+   this project reached 70%+ expected-direction this consistently.
+3. **Fresh at state entry, or stale/lagging?** Fresh, not decaying -- age-1 and age-2 observations
+   show similar hit rates; no evidence the window has already "caught up" by the time it fires.
+4. **Does the option layer preserve the underlying directional information?** No. Option response
+   is consistently near coin-flip (42-57%) on both days despite the underlying's 62-75% hit rate --
+   the clearest underlying-vs-option-translation gap found anywhere in this project.
+5. **Is one day's (now two days') evidence strong enough to justify a pre-specified multi-day
+   robustness test?** The underlying result (D) reproduces cleanly across both available days and
+   is worth that next step for Pattern A specifically. The option-layer result (F) also reproduces
+   (consistently weak) across both days, which is itself informative and should temper expectations
+   for what a multi-day robustness test on the OPTION side would find, even if the underlying
+   passes. No filter, score, SL, TP, or optimized parameter has been proposed or implemented.
+
+### Reproduction
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-2600x5-rolling-state 2026-09-22 --out=vc-rolling2600x5-2026-09-22
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-2600x5-rolling-state 2026-09-23 --out=vc-rolling2600x5-2026-09-23
+```
+
+## Rolling 2600×10 Window-Size Follow-Up (2026-09-25)
+
+Same hypothesis, same base 2,600-contract bars, only the rolling-window length changed: 5 bars
+(~13,000 contracts) -> 10 bars (~26,000 contracts). Generalized the command with a `--window=`
+flag (default 5, preserving the original invocation unchanged) rather than duplicating the block.
+Both days rerun; no other change.
+
+| Day | Window | A entries | Underlying A hit-rate (+1/+3/+5/+10) | Option A->PE hit-rate (+1/+3/+5/+10) | Trades | NetPnl |
+|---|---|---|---|---|---|---|
+| 09-22 | 5 bars | 83 | 71/75/71/71 | 49/48/48/57 | 74 | -15,415.97 |
+| 09-22 | **10 bars** | 61 | 77/67/71/70 | 56/49/56/56 | 42 | +36,612.99 |
+| 09-23 | 5 bars | 45 | 67/67/62/64 | 49/44/42/50 | 35 | +26,768.52 |
+| 09-23 | **10 bars** | 21 | 67/62/76/71 | 57/52/52/57 | 26 | -5,772.58 |
+
+**The underlying result reproduces well at 10 bars too** -- 67-77% for Pattern A, if anything
+marginally stronger than 5 bars on some horizons. Doubling the rolling window did not weaken the
+core finding at all. **The option response stays weak either way** (49-57%, still no consistent
+edge over the coin-flip baseline). **Trade P&L sign flips again when only the window length
+changes** (09-22: negative->positive; 09-23: positive->negative) -- the same two days, the same
+underlying signal, opposite trade outcomes purely from doubling the window length. This is a
+strong independent confirmation, from a completely different angle than the earlier 650-vs-1300-
+vs-2600-vs-3250 bar-resolution ladder, that trade-level P&L here is dominated by option-layer
+noise, not a property of picking the "right" window length.
+
+Added as a new section to the same artifact (republished in place, same URL):
+**[Rolling 2600×5 State](https://claude.ai/artifact/LUhhG5wsk6TXvNvn7V3qit)** -- verified rendering
+of the new comparison table before considering this complete.
+
+Full CSVs: `vc-rolling2600x10-2026-09-22-rolling-state.csv` / `-episodes.csv` / `-trades.csv` and
+`vc-rolling2600x10-2026-09-23-rolling-state.csv` / `-episodes.csv` / `-trades.csv`.
+
+### Reproduction
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-2600x5-rolling-state 2026-09-22 --out=vc-rolling2600x10-2026-09-22 --window=10
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-2600x5-rolling-state 2026-09-23 --out=vc-rolling2600x10-2026-09-23 --window=10
+```
+
+## Adaptive 180-Second Rolling Context (2026-09-25)
+
+A structurally new hypothesis, not a parameter sweep of the 2600x5/2600x10 experiments: instead of
+a fixed bar count, the rolling window's own bar count is chosen so its ELAPSED REAL TIME reaches a
+pre-specified, frozen target -- **180 seconds, declared before running, never swept, never tuned
+after seeing results.** New pure function `AdaptiveWindowAnalysis.FindWindowStartIndex` (4 unit
+tests, including an explicit no-look-ahead test), a new `vc0dte-relationship-adaptive-180s-context`
+command. Reuses every frozen primitive already established (`FutureEventBarBuilder`/
+`SynchronizedOptionBarBuilder`/`UnderlyingOptionRelationshipRecorder`/`AtmStrikeSelector`/
+`OptionTickSeries`/`RollingStateAnalysis`) plus, for the first time, this project's own established
+matched-control design (`ForwardValidationAnalysis.ComputeTerciles` +
+`ConditionalMovementAnalysis.ClassifyTercileBucket`, same convention as the "Conditional Analysis"
+section) -- direction-held, movement-magnitude-tercile-matched controls, exactly as requested. No
+trade simulation, no SL/TP/filters/optimization.
+
+### Design/Validation/OOS split (printed before any outcome analysis)
+
+12 current-week sessions found 2026-09-01..2026-09-23. **2026-09-22 and 2026-09-23 are Design
+sessions** (used to formulate this hypothesis, excluded from primary validation). **The remaining
+10 are the Validation set**: 2026-09-04, 08, 09, 10, 11, 15, 16, 17, 18, 21 (DTE 4/0/6/5/4/0/6/5/4/1
+respectively). **2026-09-24 remains untouched OOS, never queried.**
+
+### Operational note: a real bug found and fixed before trusting any result
+
+The first run produced **zero** control candidates for both patterns. Root cause: `RollingStateAnalysis
+.Annotate` hardcodes the "A"/"B" state-label vocabulary for its entry/episode detection -- the
+Up/Down direction-state sequence built for the control population used literal "Up"/"Down" labels,
+which never matched, so `IsStateEntry` was structurally always false. Fixed by relabeling
+Up->"A"/Down->"B" only for that internal `Annotate` call (the direction labels used everywhere else
+for reporting were untouched). Rebuilt (0 warnings), full suite passed (1,069 tests), reran to
+completion, and explicitly verified the fix (Up/Down-control candidate counts nonzero: 544/556 for
+the primary validation-only scheme) before reading or trusting any downstream number.
+
+### PRIMARY result: A/B vs. matched Up/Down-direction control (validation sessions only)
+
+| Horizon | A hit% | A-ctrl hit% | A gap | B hit% | B-ctrl hit% | B gap |
+|---|---|---|---|---|---|---|
+| +1 | 60.5% | 46.8% | **+13.7pp** | 64.6% | 42.6% | **+22.0pp** |
+| +3 | 64.2% | 52.1% | **+12.0pp** | 62.7% | 44.7% | **+18.0pp** |
+| +5 | 60.4% | 53.0% | **+7.5pp** | 63.0% | 45.8% | **+17.2pp** |
+| +10 | 57.6% | 53.0% | **+4.6pp** | 62.2% | 47.9% | **+14.3pp** |
+
+347 A entries, 325 B entries. **A real, positive incremental separation over the matched control at
+every horizon, for both patterns.** A entries occur in all 10/10 validation sessions; 8/10 show the
+expected (negative) median +5 forward return (wrong sign on 2026-09-04, 2026-09-17); largest single
+session (2026-09-15) is only 17.0% of all A entries -- not driven by one day.
+
+### Does the window adapt to activity, or to DTE? (the core mechanical question)
+
+| Session | DTE | Class | Median bar duration | Median WindowBarCount |
+|---|---|---|---|---|
+| 2026-09-09 | 6 | Validation | 8.0s | **18** |
+| 2026-09-15 | 0 | Validation | 9.0s | 15 |
+| 2026-09-11 | 4 | Validation | 10.0s | 13 |
+| 2026-09-22 | 0 | Design | 14.0s | 10 |
+| 2026-09-16 | 6 | Validation | 16.0s | 8 |
+| 2026-09-08 | 0 | Validation | 18.0s | 9 |
+| 2026-09-10 | 5 | Validation | 20.0s | 8 |
+| 2026-09-04 | 4 | Validation | 23.0s | 7 |
+| 2026-09-17 | 5 | Validation | 23.0s | 7 |
+| 2026-09-18 | 4 | Validation | 23.0s | 7 |
+| 2026-09-23 | 6 | Design | 24.0s | **6** |
+| 2026-09-21 | 1 | Validation | 26.0s | 7 |
+
+**A clean, exception-free inverse relationship between bar duration and window size.** The single
+LARGEST WindowBarCount session (2026-09-09, median 18) is a 6-DTE day, not 0-DTE -- direct,
+unambiguous proof that market activity, not DTE, drives the selection (item 13's questions 3-5, all
+answered: 0-DTE does NOT uniformly select large windows, e.g. 09-08 selects only 9; non-0-DTE
+periods DO select large windows when active, e.g. 09-09 at 18 and 09-11 at 13). **2026-09-22
+(0-DTE, high activity) lands almost exactly on 10 bars; 2026-09-23 (6-DTE, lower activity) lands on
+6** -- matching the pre-registered expectation from the 2600x5/2600x10 experiments precisely,
+without DTE ever being supplied to the algorithm. This did not need to be forced; it fell out
+naturally.
+
+### Reference-only comparison: adaptive vs. fixed x5 vs. fixed x10 (same validation sessions)
+
+| Scheme | Median WBC | A hit% (+1/+3/+5/+10) | A gap | B gap | Sessions correct sign (A) | Largest session share |
+|---|---|---|---|---|---|---|
+| **Dynamic 180s** | 10 | 60/64/60/58% | 13.7/12.0/7.5/4.6 | 22.0/18.0/17.2/14.3 | 8/10 | **17.0%** |
+| Fixed x5 | 5 | 62/66/62/62% | 14.8/13.3/11.1/11.3 | 17.3/16.8/9.0/10.3 | 8/10 | 21.3% |
+| Fixed x10 | 10 | 57/66/59/62% | 12.4/15.1/6.0/9.2 | 14.9/15.9/16.3/19.2 | **10/10** | 22.7% |
+
+**Not a clean win for the adaptive scheme, reported honestly.** All three land in a similar, real
+but modest range. Fixed x10 actually shows the BEST session-level sign-consistency (10/10 vs. 8/10
+for both Dynamic and Fixed x5). The adaptive scheme's one clear advantage is the lowest
+single-session concentration (17.0% vs. 21-23%) -- its result depends least on any one day, but it
+does not dominate the fixed schemes on hit-rate or session-consistency.
+
+### Design-session descriptive check (09-22, 09-23 included -- NOT validation evidence)
+
+All-session (12/12) pooled: A gap 14.8/12.7/9.6/5.7pp, B gap 20.3/14.5/14.3/13.2pp -- essentially
+the same shape as validation-only. 10/12 sessions show the expected sign (the same two
+validation-set exceptions, plus both design sessions showing expected sign). Largest session share
+shifts to 2026-09-22 (14.4%) but remains well short of dominating.
+
+### Option response (diagnostic only, validation sessions)
+
+| Side | +1 | +3 | +5 | +10 |
+|---|---|---|---|---|
+| A -> PE | 46.4% | 46.2% | 46.8% | 46.5% |
+| B -> CE | 46.5% | 45.7% | 43.8% | 50.5% |
+
+Near coin-flip on every horizon, both sides -- the same underlying-vs-option-translation gap found
+in every prior architecture tested in this project (2-consecutive, 2600x5, 2600x10). A real,
+positive underlying signal (with a genuine matched-control gap, for the first time in this research
+thread) still does not translate into the option's own price response here either.
+
+### Visual inspection package
+
+Published as an interactive artifact: **[Adaptive 180s Context](https://claude.ai/artifact/DzcAAWnK6ctVqWqNViKBNM)**
+-- the primary matched-control table, the activity-vs-DTE table, full-session episode-shaded price
+chart + WindowBarCount-over-time + bar-duration-over-time for one representative validation session
+(2026-09-15), and the fixed-scheme reference comparison. Verified rendering (all tables, all three
+session charts) before sending the link.
+
+### Data-quality / methodology concerns and scope decisions
+
+- The real bug above (control candidates silently zero) was found and fixed before any result was
+  trusted -- see Operational Note.
+- Of the 7 requested CSVs, only 2 were materialized this pass (`-basebars.csv`, `-windows.csv`,
+  covering all 3 schemes with a Classification column) -- the other 5 (episodes/forward-underlying/
+  controls/option-response/session-summary) are fully reproducible from `-windows.csv`
+  (RollingState + timestamps are sufficient to re-derive everything via
+  `RollingStateAnalysis.Annotate`) but were not separately materialized as files, given the size of
+  this task. Flagged explicitly rather than silently omitted.
+- Chart 4's per-session breakdown (adaptive vs. x5 vs. x10, per individual session) was scoped down
+  to the pooled comparison already shown above, for the same reason.
+
+### Full CSVs
+
+`vc-adaptive180s-basebars.csv`, `vc-adaptive180s-windows.csv` (all 3 schemes, 30,666 window rows).
+
+### Reproduction
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-adaptive-180s-context --out=vc-adaptive180s
+```
+
+### Final research questions (answered only these, as instructed)
+
+1. **Does dynamic activity-normalized context preserve the A directional relationship on
+   validation sessions not used to invent it?** Yes -- 60-64% hit rate across all 4 horizons, on
+   the 10 validation sessions never used to formulate the 180-second target.
+2. **Does A still beat same-direction/movement-matched controls?** Yes -- +4.6pp to +13.7pp gap
+   across all 4 horizons, positive at every one.
+3. **Does Pattern B contain meaningful incremental information?** Yes, and here more so than A --
+   +14.3pp to +22.0pp gap over its own matched control, the largest gaps in this entire table.
+4. **Does dynamic WindowBarCount behave as intended (faster clock -> more bars, slower -> fewer)?**
+   Yes, cleanly and without exception across all 12 sessions tested.
+5. **Does the algorithm naturally account for the observed 0-DTE vs. 6-DTE difference without
+   using DTE itself?** Yes -- confirmed directly: the single largest-window session is a 6-DTE
+   day (2026-09-09), and 2026-09-22/2026-09-23 land almost exactly on the pre-registered
+   expectation (~10 and ~6 bars respectively) purely from their own activity level.
+6. **Is adaptive 180-second context more stable across sessions than fixed x5 and x10?** Not
+   clearly. It has the lowest single-session concentration (17.0%), but Fixed x10 shows better
+   session-level sign-consistency (10/10 vs. 8/10). Mixed, reported as such rather than declaring a
+   winner.
+7. **Does the option response preserve the underlying relationship?** No -- 44-51%, coin-flip,
+   despite the underlying's real and positive matched-control gap.
+8. **Is the evidence strong enough to justify testing the frozen adaptive architecture on the
+   untouched 2026-09-24 temporal OOS session?** The underlying result (questions 1-3) clears the
+   pre-declared bar: correct sign, positive control separation, not one-session-dependent, stable
+   across very different event speeds. That is sufficient to justify an OOS test of this frozen
+   architecture. No filter, score, or trading rule has been proposed or implemented; stopping here
+   per instruction.
+
+## 2026-09-25: ATM +/-2 Listed-Strike Option-Surface Band (incremental-information test)
+
+Frozen, unchanged from the adaptive-180s study: 2600-contract futures base bars, 180-second target
+elapsed context, dynamic backward accumulation, A/B state-machine methodology, state-entry
+definition, forward horizons (+1/+3/+5/+10 bars), current-week expiry selection, the tercile-
+matched-control methodology, and the same 12-session Design(09-22,09-23)/Validation(10 sessions)/
+OOS(09-24, untouched) split. The only experimental change: alongside the existing single-ATM-
+contract CE/PE classification, a second, parallel classification uses the **median % return across
+a 5-listed-strike basket (ATM-2/ATM-1/ATM/ATM+1/ATM+2), computed from actual listed strikes**, not
+an assumed fixed interval. No trade simulation. No strike-width other than +/-2 tested, per
+instruction.
+
+### Pre-step: reproduction and frozen episode-boundary convention
+
+Before any band code was written, the exact convention for how a new A/B episode is detected was
+written down and frozen (see the header comment in the new `vc0dte-relationship-adaptive-180s-band`
+command in `Program.cs`):
+
+- A row's `State` is `"Other"` whenever `Missing=true` (incomplete CE/PE data) OR the sign-only A/B
+  condition (futures direction + both option legs moving the theoretically consistent way) is not
+  met.
+- `InsufficientHistory` (window clipped at bar 0 before reaching 180s) is tracked separately and
+  does not force `Other` -- a short window can still classify normally if its own data is
+  otherwise complete.
+- Episode continuation is raw state-string equality only (`State[k]==State[k-1]` in `{"A","B"}`).
+  `Missing`/`Other` rows always end/prevent an episode and reset `StateAge` to 0.
+
+Running the full 12-session pipeline and reprinting ATM-only A/B state-entry counts (validation
+sessions) reproduced the previously reported headline exactly: 347 A / 325 B. No behavioral change
+from the frozen architecture -- the "minor count ambiguity" flagged before this pass turned out to
+be a one-off transcription mismatch, not a real discrepancy in the underlying pipeline (the
+pipeline's own re-run matches its own prior console output character-for-character).
+
+### Band construction
+
+For each window, the local strike basket is the 5 actual listed strikes nearest the ATM strike used
+by the existing `AtmStrikeSelector`-based ATM classification (2 below, ATM, 2 above), read from the
+day's real option chain -- never an assumed fixed spacing. CE and PE percentage returns are computed
+independently for each of the 5 strikes (never aggregated in rupee terms, never summed across
+strikes). The primary band aggregate is the median % return across the side's valid strikes (frozen
+per instruction -- mean/weighted-mean/vega/delta/premium weighting were not compared). A minimum of
+3 valid strikes per side is required for classification; below that, `BandState="Missing"`. Breadth
+(`CE/PEPositiveCount/NegativeCount/ZeroCount/ValidCount`) and dispersion (`CE/PEBandIQRReturnPct`,
+min/max) are reported as diagnostics only -- neither is used to gate or filter the classification,
+per instruction.
+
+`BandState` is classified by the same futures-sign rule as `AtmState`, substituting the band median
+CE/PE returns for the single-ATM CE/PE returns, with no additional magnitude/breadth/dispersion
+threshold. `AtmState` and `BandState` are maintained in parallel throughout, neither overwriting the
+other, each with its own independent `RollingStateAnalysis.Annotate`-based episode machine.
+
+### Agreement group population (validation sessions)
+
+| | ATM entries | Band entries | Both | ATM-only | Band-only |
+|---|---|---|---|---|---|
+| A | 347 | 349 | 339 | 8 | 14 |
+| B | 325 | 327 | 314 | 11 | 14 |
+
+Direction-held, movement-tercile-matched controls: 537 Up-control candidates, 551 Down-control
+candidates (excluding anything already in an ATM or Band A/B group).
+
+The two classifications agree on the overwhelming majority of state entries (339/347 ATM-A entries
+are also Band-A, 314/325 ATM-B entries are also Band-B) -- disagreement populations (ATM-only,
+Band-only) are small, single-digit-to-low-teens per side.
+
+### Forward-direction comparison (validation sessions, all horizons, N shown for every number)
+
+| Group | +1 N/Hit% | +3 N/Hit% | +5 N/Hit% | +10 N/Hit% |
+|---|---|---|---|---|
+| ATM A | 347 / 60.5% | 346 / 64.2% | 346 / 60.4% | 344 / 57.6% |
+| Band A | 349 / 59.9% | 348 / 64.7% | 348 / 60.6% | 346 / 58.4% |
+| BothA | 339 / 60.2% | 338 / 63.9% | 338 / 60.9% | 336 / 58.0% |
+| ATMOnlyA | 8 / 75.0% | 8 / 75.0% | 8 / 37.5% | 8 / 37.5% |
+| BandOnlyA | 14 / 42.9% | 14 / 64.3% | 14 / 64.3% | 14 / 64.3% |
+| A-control | 536 / 46.5% | 536 / 52.1% | 535 / 53.1% | 531 / 52.5% |
+| ATM B | 325 / 64.6% | 324 / 62.7% | 324 / 63.0% | 323 / 62.2% |
+| Band B | 326 / 64.7% | 325 / 63.1% | 325 / 63.4% | 324 / 62.3% |
+| BothB | 314 / 65.0% | 313 / 62.6% | 313 / 63.3% | 312 / 62.5% |
+| ATMOnlyB | 11 / 54.5% | 11 / 63.6% | 11 / 54.5% | 11 / 54.5% |
+| BandOnlyB | 13 / 53.8% | 13 / 53.8% | 13 / 46.2% | 13 / 46.2% |
+| B-control | 551 / 42.3% | 550 / 44.5% | 548 / 45.6% | 542 / 48.0% |
+
+ATM, Band, BothA/B all clear their matched controls comfortably and consistently at every horizon
+(gaps of roughly +10pp to +20pp). ATMOnlyA/BandOnlyA/ATMOnlyB/BandOnlyB cells (n=8-14) swing widely
+across horizons (e.g. ATMOnlyA: 75%/75%/37.5%/37.5%) -- with samples this small, that instability is
+expected noise, not a real reversal, and is reported as such rather than as evidence either way.
+
+### Breadth diagnostic (Band A entries, naturally-occurring CE/PE expected-sign-count pairs)
+
+CE 5/5 + PE 5/5 dominates (272 of 349, ~78%); the remaining combinations (3/5-4/5 on one or both
+sides) each have n<=21. Per instruction, these smaller combinations were reported as counts only --
+sample sizes are too small to report forward returns by breadth combination reliably, and no
+categories were merged to manufacture a larger sample.
+
+### Dispersion diagnostic (CE-band-IQR quartile vs. +5 forward return, Band A entries, descriptive only)
+
+Low-IQR (tightest strike agreement): n=88, hit%=58.0%. Mid: n=174, hit%=61.5%. High-IQR (widest
+strike disagreement): n=87, hit%=61.6%. No monotonic relationship between dispersion and forward
+hit rate -- flat-to-slightly-higher at high dispersion, opposite of a "tighter agreement is more
+reliable" story. Exploratory only; no filter created.
+
+### Session-level robustness (+5 horizon, A side)
+
+ATM A: 10/10 sessions with entries, 8/10 expected-median-sign, largest single-session share 17.0%.
+Band A: 10/10 sessions with entries, 8/10 expected-median-sign, largest single-session share 16.6%.
+Materially identical robustness profile between the two representations.
+
+### Option response (single pinned tradable ATM contract, diagnostic only, not the 5-strike basket)
+
+| Group | +1 | +3 | +5 | +10 |
+|---|---|---|---|---|
+| BothA (PE) | 45.7% | 45.3% | 47.3% | 46.7% |
+| ATMOnlyA (PE, n=8) | 75.0% | 87.5% | 25.0% | 37.5% |
+| BandOnlyA (PE, n=14) | 50.0% | 42.9% | 57.1% | 42.9% |
+| BothB (CE) | 46.5% | 45.7% | 44.1% | 50.6% |
+| ATMOnlyB (CE, n=11) | 45.5% | 45.5% | 36.4% | 45.5% |
+| BandOnlyB (CE, n=13) | 53.8% | 38.5% | 38.5% | 23.1% |
+
+As with the underlying-only adaptive-180s study, the single pinned tradable contract's own forward
+response stays near coin-flip (~44-54%) for the dominant BothA/BothB populations, regardless of
+whether the ATM-only or band-median classification is used -- surface agreement does not improve
+translation into the actually-tradable contract's own price. The small ATMOnly/BandOnly cells swing
+widely (n=8-14) and are not read as a real effect either way.
+
+### Interpretation against the 5 pre-declared possible outcomes
+
+The result is closest to outcome (c): ATM already captures the signal; band adds little --
+BothA/BothB (the 97%+ overlap population) perform essentially identically to ATM-only and Band-only
+pooled populations at every horizon, and the small disagreement populations (ATMOnly/BandOnly) are
+too noisy (n=8-14) to support either "BandOnly is meaningfully useful" or "ATM is hiding broader
+surface behavior." Nearby strikes largely move in lockstep with the ATM contract in this 0-DTE
+setting (breadth diagnostic: ~78% of Band-A entries have full 5/5 CE and PE agreement), so a
+median-of-5 representation mostly re-derives what the single ATM contract already showed, rather
+than surfacing new information the ATM contract missed.
+
+### Full CSV
+
+`vc-adaptive180s-band-rows.csv` (10,274 rows, all 12 sessions, both classifications, full field
+list per the required schema: timestamps, futures, all 5 labeled strikes, per-strike CE/PE returns,
+valid counts, band median/IQR, breadth counts, AtmState, BandState).
+
+### Visual inspection package
+
+Published as an interactive artifact: **[ATM +/-2 Band Study](https://claude.ai/artifact/VCq9qM1HvY6x31zA2LA8CJ)**
+-- futures price with dual ATM/Band episode-shaded rows and Both/ATMOnly/BandOnly entry markers, for
+two representative validation sessions (2026-09-15, busiest; 2026-09-18, quietest). Verified
+rendering (both session charts, both SVGs populated) before sending the link.
+
+### Reproduction
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-adaptive-180s-band --out=vc-adaptive180s-band
+```
+
+### Final research questions (answered only these, as instructed)
+
+1. **Does the ATM +/-2 band reproduce the previously-reported adaptive-window statistics with no
+   behavioral change?** Yes -- ATM-only A/B state-entry counts reproduced exactly (347/325).
+2. **Is the episode-boundary convention now frozen and documented?** Yes -- written above and in
+   the command's own header comment before any band result was computed.
+3. **Does BothA outperform ATM-only, and does BandOnlyA contain information ATM missed?** No --
+   BothA (339) and ATMOnlyA (8) show no consistent separation across horizons (ATMOnlyA is higher
+   at +1/+3, lower at +5/+10, on n=8); BandOnlyA (14) does not show a reliably stronger or weaker
+   signal than BothA either.
+4. **Are ATM-only signals weaker when surrounding strikes disagree?** Not clearly -- the ATMOnly
+   population is too small (n=8) and too unstable across horizons to support this.
+5. **Do the naturally-occurring breadth combinations (3/5, 4/5, 5/5 agreement) show a forward-
+   return gradient?** Sample sizes below full 5/5 agreement are too small (n<=21 per combination)
+   to report reliably; reported as counts only, per instruction, and stopped there.
+6. **Does band dispersion (IQR) relate to forward response strength?** No monotonic relationship
+   found; low/mid/high-IQR terciles show materially similar hit rates (58.0%/61.5%/61.6%).
+7. **Is ATM and Band session-level robustness materially different?** No -- both show 10/10
+   sessions with entries, 8/10 expected-sign sessions, and near-identical largest-session
+   concentration (17.0% vs. 16.6%).
+8. **Does surface confirmation (Both vs. ATM-only/Band-only) improve translation into the single
+   tradable contract's own forward price response?** No -- the dominant BothA/BothB populations
+   stay near coin-flip (44-51%) in the pinned contract's own response, same as the underlying-only
+   adaptive-180s study already found for ATM alone.
+9. **Which of the 5 pre-declared outcomes occurred?** Outcome (c): ATM already captures the
+   real information; the +/-2 band adds little beyond what the single ATM contract already shows,
+   in this 0-DTE, current-week-expiry setting.
+10. **Is there a case for testing a wider or narrower band next?** Not being answered here per
+    instruction -- no bandwidth other than +/-2 was tested, and none is being proposed. Stopping
+    here.
+
+## 2026-09-25: FullSurfaceAgreement Trade-Translation Diagnostic (in-sample, not validation)
+
+Explicitly an **in-sample trade-translation diagnostic**, not a validation study -- run on all 12
+sessions already used to formulate the hypothesis (Design + Validation from the adaptive-180s/band
+work). 2026-09-24 was never loaded, queried, or previewed. Frozen and unchanged: futures base bar
+(2600 contracts), 180-second adaptive elapsed context, dynamic backward-window construction, ATM
+A/B sign-rule definitions and episode/state-entry methodology, current-week expiry selection, and
+the ATM+/-2 listed-strike basket -- all read directly from the already-published, already-verified
+`vc-adaptive180s-band-rows.csv` (never recomputed from ticks), so the signal architecture cannot
+have silently drifted between studies.
+
+**FullSurfaceAgreement** (a boolean overlay at ordinary ATM state entries, not a new episode
+machine): for Pattern A, `AtmState=="A"` AND all 5 CE strikes have negative window return AND all
+5 PE strikes have positive window return (`CeValidCount==5 && CeNegativeCount==5 && PeValidCount==5
+&& PePositiveCount==5`); symmetric for Pattern B. The median-band (`BandState`) is explicitly not
+used as a trading signal here.
+
+### Integrity audit (before any P&L was computed)
+
+Every ATM A/B state entry with 5/5 CE + 5/5 PE valid data (1,190 rows across 12 sessions) was
+re-checked against real ticks: each of the 5 CE and 5 PE contracts' price at window start and
+window end, using the same look-ahead-safe `EntryAtOrBefore` lookup the whole adaptive architecture
+already relies on. **0 of 1,190 failed** (no null/zero prices, no missing contracts misclassified
+as complete). No material data-quality issue was found, so P&L interpretation proceeded per
+instruction.
+
+### Existing frozen trade mechanics (verbatim, unchanged across all 3 populations)
+
+Reused directly from `PatternRelationshipTradeSimulator`'s own established conventions, translated
+to adaptive-window ATM state entries (that simulator's own per-bar `RelationshipCategory` signal
+source is architecturally incompatible with rolling/window state entries, the same documented
+wiring conflict noted in the earlier rolling-state work -- so a new minimal loop reproduces its
+mechanics exactly rather than reusing its code path):
+
+- Option selection: the pinned dynamic-ATM CE/PE contract at the signal event (same contract used
+  for `AtmState` classification) -- never the 5-strike basket, never a premium-band search.
+- Entry: first real tick at-or-after the signal timestamp; fill = Ask1Price if depth present, else
+  LastPrice.
+- Exit: opposite-pattern exit = first real tick at-or-after the opposite signal's timestamp;
+  forced-EOD = last real tick at-or-before 15:15 IST. Fill = Bid1Price if depth present, else
+  LastPrice.
+- Quantity: LotSize x 10 lots. Costs: real STT (exit leg) + GST-on-brokerage (brokerage assumed
+  Rs.0) + unmodeled "Other", same `TransactionCostCalculator` used throughout this project.
+- One position at a time; a signal while holding is recorded, never silently dropped.
+- No new entries at/after 15:00 IST. Mandatory close at 15:15 IST.
+- **Opposite-pattern exit fires on ANY new opposite-direction ATM state entry, regardless of that
+  entry's own FullSurfaceAgreement value** -- identical and unfiltered across all 3 populations, so
+  only entry eligibility differs between them, per instruction.
+- Same-direction signals while holding: ignored.
+
+### Signal-to-trade funnel
+
+| Population | Signals | Before cutoff | After cutoff | Already in position | Executed | A | B |
+|---|---|---|---|---|---|---|---|
+| ATM | 822 | 372 | 100 | 350 | 372 | 188 | 184 |
+| FullSurface | 822 | 414 | 102 | 306 | 321 | 163 | 158 |
+| PartialSurface | 822 | 581 | 103 | 138 | 128 | 62 | 66 |
+
+(All 3 populations are evaluated over the identical 822 ATM state-entry signals -- eligibility,
+not the signal count, differs.) Selection-bias check: all-signal population n=2,188 (pooled across
+horizons) vs. executed-only n=821 -- underlying expected-direction hit rates for executed-only
+trades were not materially different from the full signal population (both regimes summarized
+in the funnel and headline tables below), so the one-position rule was not found to introduce an
+obvious directional selection bias.
+
+### Headline comparison
+
+| Metric | ATM baseline | FullSurface | PartialSurface |
+|---|---:|---:|---:|
+| Signals | 822 | 822 | 822 |
+| Executed trades | 372 | 321 | 128 |
+| Win rate | 36.3% | 36.8% | 31.2% |
+| Profit factor | 0.96 | 0.96 | 0.77 |
+| Net P&L | Rs.-25,758 | Rs.-20,957 | Rs.-55,054 |
+| P&L/trade | Rs.-69.2 | Rs.-65.3 | Rs.-430.1 |
+| Median P&L | Rs.-865.0 | Rs.-785.0 | Rs.-846.6 |
+| Median MAE | 3.3 | 3.3 | 3.1 |
+| Median MFE | 3.3 | 3.7 | 2.7 |
+| Profitable sessions | 5/12 | 5/12 | 3/12 |
+| Largest session share | 6.7% | 7.0% | 7.6% |
+
+A -> PE / B -> CE, separately:
+
+| Population/Side | N | Win% | Net P&L | Avg P&L | Median P&L | PF |
+|---|---:|---:|---:|---:|---:|---:|
+| ATM A | 188 | 39.4% | -12,703 | -67.6 | -834.0 | 0.96 |
+| ATM B | 184 | 33.2% | -13,056 | -71.0 | -883.2 | 0.96 |
+| FullSurface A | 163 | 38.7% | -20,419 | -125.3 | -806.3 | 0.94 |
+| FullSurface B | 158 | 34.8% | -538 | -3.4 | -783.0 | 1.00 |
+| PartialSurface A | 62 | 38.7% | -18,308 | -295.3 | -605.8 | 0.87 |
+| PartialSurface B | 66 | 24.2% | -36,746 | -556.8 | -886.2 | 0.65 |
+
+All three populations, and both sides, lose money under this frozen exit rule -- FullSurface loses
+less than ATM baseline overall, and its B (CE) side is close to breakeven (PF 1.00), but it is not
+profitable in an absolute sense on this 12-session in-sample pool.
+
+### Session-level robustness (FullSurface)
+
+Profitable sessions: 5/12. Losing: 7/12. Median session P&L: Rs.-892. Largest positive session:
+2026-09-22 (Rs.+58,807). Largest negative session: 2026-09-18 (Rs.-78,744). Total P&L Rs.-20,957;
+excluding the best session, Rs.-79,763 (much worse); excluding the worst session, Rs.+57,787
+(would flip to profitable). The result is highly concentrated in two opposite-signed sessions, not
+broadly distributed.
+
+### Winner concentration
+
+FullSurface: top-1 winner = Rs.43,410 (7.8% of gross profit); top-10 winners = Rs.227,207 (41.1% of
+gross profit). Net P&L excluding the top-10 winners = Rs.-248,164 -- the already-negative headline
+result is not an artifact of removing a few lucky trades; the losses are broad-based, but the
+gains are concentrated in relatively few large winners, consistent with a typical long-option-premium
+payoff shape rather than evidence the strategy is secretly working.
+
+### FullSurface vs PartialSurface, direct comparison
+
+| | N | Win% | Net P&L | PF |
+|---|---:|---:|---:|---:|
+| A FullSurface | 163 | 38.7% | -20,419 | 0.94 |
+| A PartialSurface | 62 | 38.7% | -18,308 | 0.87 |
+| B FullSurface | 158 | 34.8% | -538 | 1.00 |
+| B PartialSurface | 66 | 24.2% | -36,746 | 0.65 |
+
+FullSurface clearly outperforms PartialSurface on the B (CE) side (PF 1.00 vs. 0.65, near-breakeven
+vs. a large loss) but is roughly the same or marginally worse on the A (PE) side (PF 0.94 vs. 0.87).
+The statistically stronger underlying separation found earlier does **partially** survive into the
+trading layer, but only for one side.
+
+### Losing-trade diagnostic categorization (FullSurface, n=203 losers)
+
+Case 1 (underlying moved correctly, option lost): 125 (61.6%). Case 2 (underlying itself moved
+against the prediction): 57 (28.1%). Case 3 (underlying eventually correct but exited before that
+happened): 19 (9.4%). Case 4 (option reversed before exit): 0. Ambiguous: 2. The dominant failure
+mode by far is Case 1 -- the underlying direction call was right, but that did not translate into
+option profit under this exit rule, pointing at option-translation/exit-timing mechanics rather
+than signal direction as the primary source of loss.
+
+### Entry-to-MFE timing (FullSurface)
+
+A (PE): n=154, mean 370s / median 166s to MFE. B (CE): n=147, mean 274s / median 131s to MFE. MFE
+typically arrives within a few minutes of entry on both sides -- consistent with the Case-1 finding
+above that the exit rule (opposite-pattern signal or 15:15 close) is not capturing option gains
+that occur early and then fade.
+
+### Fixed-horizon MTM diagnostic (same pinned option, does not change actual exits)
+
+| | +1 | +3 | +5 | +10 |
+|---|---|---|---|---|
+| FullSurface positive% | 48.9% | 53.6% | 49.5% | 50.8% |
+| FullSurface mean% | 0.03% | 0.09% | -0.09% | -0.28% |
+| PartialSurface positive% | 50.8% | 42.2% | 42.2% | 50.0% |
+| PartialSurface mean% | -0.23% | -0.88% | -0.83% | -0.83% |
+
+FullSurface's pinned option holds up better at fixed horizons than PartialSurface's (less negative
+or mildly positive mean returns vs. consistently negative), even though FullSurface's actual traded
+P&L is still net negative under the existing exit rule -- this is consistent with "the exit lifecycle
+is destroying some of what the signal captures" rather than "the signal itself does not translate."
+
+### DTE breakdown (FullSurface, descriptive only, no DTE rule created)
+
+| DTE | N | Win% | Net P&L | PF | Median hold (s) |
+|---|---:|---:|---:|---:|---:|
+| 0 | 95 | 36.8% | +71,341 | 1.54 | 360 |
+| 1 | 26 | 34.6% | -11,068 | 0.68 | 599 |
+| 4 | 89 | 27.0% | -96,770 | 0.53 | 416 |
+| 5 | 39 | 35.9% | -38,384 | 0.62 | 663 |
+| 6 | 72 | 50.0% | +53,923 | 1.54 | 551 |
+
+Materially different by DTE -- 0-DTE and 6-DTE are profitable, mid-range DTE (4-5) drives the bulk
+of the loss. No DTE-specific rule was created; this is reported descriptively per instruction.
+
+### Full CSVs
+
+`vc-fullsurface-trades.csv` (821 executed trades, all 3 populations, full required field list),
+`vc-fullsurface-integrity-audit.csv` (1,190 rows, 0 failures), `vc-fullsurface-session-summary.csv`
+(36 rows, 3 populations x 12 sessions).
+
+### Reproduction
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-fullsurface-trade --in=vc-adaptive180s-band-rows.csv --out=vc-fullsurface
+```
+
+### Final research questions (answered only these, as instructed)
+
+1. **Does FullSurfaceAgreement improve actual trade outcomes versus ordinary ATM signals?**
+   Partially -- net P&L improves (Rs.-20,957 vs. Rs.-25,758) and P&L/trade improves (Rs.-65.3 vs.
+   Rs.-69.2), but FullSurface remains net negative in absolute terms; this is a smaller loss, not a
+   profitable strategy.
+2. **Does FullSurface outperform PartialSurface at the trade level?** Yes, clearly on the B (CE)
+   side (PF 1.00 vs. 0.65); roughly flat to marginally worse on the A (PE) side (PF 0.94 vs. 0.87).
+3. **Is any improvement present for both A->PE and B->CE, or only one side?** Only one side (B/CE)
+   shows a clear, material improvement; A/PE does not.
+4. **Is profitability broad across sessions or concentrated in a few days/trades?** Concentrated --
+   5/12 sessions profitable, and the overall result flips from -Rs.20,957 to +Rs.57,787 by simply
+   excluding the single worst session (2026-09-18). Winner concentration is also material (top-10
+   winners = 41.1% of gross profit) though removing them does not flip the sign.
+5. **When FullSurface trades lose, is the main problem wrong direction, option translation,
+   premature exit, or execution?** Primarily option translation/exit timing -- 61.6% of losers are
+   Case 1 (underlying moved correctly, option still lost), only 28.1% are Case 2 (underlying itself
+   wrong), and MFE typically arrives within a few minutes of entry, well before the opposite-signal
+   or 15:15 exit.
+6. **Does the pinned option show useful MTM at +1/+3/+5/+10 even when the frozen simulator loses?**
+   Yes -- FullSurface's fixed-horizon MTM is materially less negative (and briefly positive at +3)
+   than PartialSurface's, even though both populations' actual simulated trades lose money under
+   the existing exit rule.
+7. **Does DTE materially affect option translation?** Yes -- 0-DTE and 6-DTE are net profitable,
+   DTE 1/4/5 are net losses, with DTE=4 driving the largest loss (Rs.-96,770).
+8. **Is there any implementation/data-quality concern that invalidates the simulation?** No --
+   the integrity audit found 0 failures across all 1,190 checked 5/5+5/5 entries; no material bug
+   was found.
+9. **Based only on this diagnostic, are the signal definition and existing trade mechanics
+   sufficiently frozen to justify spending the untouched 2026-09-24 OOS session?** Not on P&L
+   grounds -- both ATM and FullSurface populations are net losers under the existing exit rule on
+   this in-sample pool, and the improvement FullSurface offers is real but partial (one side only,
+   concentrated in one session). The signal architecture and trade mechanics are themselves frozen,
+   stable, and free of data-quality problems, but this diagnostic does not by itself provide a
+   profitability case for spending the OOS session. 2026-09-24 was not run.
+
+## 2026-09-25: Execution-Contract Diagnostic -- ATM vs. Existing Rs.100-150 Premium Band
+
+Signal architecture completely frozen and unchanged (read from the same `vc-adaptive180s-band-rows.csv`,
+never recomputed): 2600-contract futures base bars, 180s adaptive context, ATM A/B, ATM+/-2
+`FullSurfaceAgreement`, episode/state-entry methodology, current-week expiry, Pattern A -> BUY PE /
+Pattern B -> BUY CE. The only experimental change is the option contract used for **execution**:
+Simulation A pins the ATM contract (the reproduced baseline); Simulation B uses the project's
+existing, pre-dating-this-experiment Rs.100-150 premium-band selector, reused verbatim from
+`PatternRelationshipTradeSimulator.SelectBandStrike`/`Vc0DteTradeSimulator.TryEnterAsync` -- not
+invented for this pass. Primary results = the 10 validation sessions only; 09-22/09-23 = design
+appendix (not combined); 2026-09-24 was never queried.
+
+### Existing frozen selector (documented before running, per instruction)
+
+Candidate enumeration: that side's own option-type chain only (Call chain for B/CE, Put chain for
+A/PE). Ordering: ascending absolute strike distance from ATM (nearest-to-ATM first). Selection:
+first candidate whose `SynchronizedOptionEventBar.Close`, at the exact same bar/EventId as the
+signal, falls within [100,150] inclusive -- never a later bar, never raw LTP/bid/ask. Multiple
+in-range contracts: nearest-to-ATM wins (a consequence of ordering). None in range: rejected
+(`NoStrikeInBand`), never falls back to ATM. Stale/missing contracts (no bar for that exact
+EventId) are excluded from candidacy entirely. No-look-ahead was explicitly verified by
+construction: all 626 candidate signals' band lookups used the signal's own bar EventId.
+
+### Baseline reproduction (validation-only, before changing execution)
+
+| | N | Net P&L | PF |
+|---|---:|---:|---:|
+| ATM (reproduced) | 270 | Rs.-80,244 | 0.84 |
+| A | 137 | Rs.-57,982 | 0.80 |
+| B | 133 | Rs.-22,262 | 0.90 |
+
+Matches the expected reference exactly (270 trades, ~Rs.-80.2K, A 137/~-58.0K/PF~0.80, B
+133/~-22.3K/PF~0.90) -- no discrepancy to explain.
+
+### Signal-to-trade funnel (validation + design pooled)
+
+| Execution | Signals | Before cutoff | After cutoff | Already in position | No eligible contract | Executed | A | B |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| ATM | 626 | 321 | 62 | 243 | 0 | 321 | 163 | 158 |
+| Rs.100-150 | 626 | 321 | 62 | 243 | 1 | 320 | 163 | 157 |
+
+Almost every candidate had an eligible Rs.100-150 contract (only 1 of 321 rejected) -- the band is
+not a materially binding constraint on trade count.
+
+### Primary validation comparison (10 sessions)
+
+| Metric | ATM execution | Rs.100-150 execution |
+|---|---:|---:|
+| Signals | 626 | 626 |
+| Executed trades | 270 | 269 |
+| Win rate | 35.2% | 35.3% |
+| Net P&L | Rs.-80,244 | Rs.-132,978 |
+| P&L/trade | Rs.-297.2 | Rs.-494.3 |
+| Median P&L | Rs.-843.4 | Rs.-1,123.1 |
+| Profit factor | 0.84 | 0.78 |
+| Median holding time | 478s | 478s |
+| Median MAE | 3.3 | 4.2 |
+| Median MFE | 3.6 | 4.3 |
+| Profitable sessions | 3/10 | 3/10 |
+
+A -> PE / B -> CE, separately:
+
+| | N | Win% | Net P&L | PF |
+|---|---:|---:|---:|---:|
+| ATM A | 137 | 36.5% | -57,982 | 0.80 |
+| ATM B | 133 | 33.8% | -22,262 | 0.90 |
+| Rs.100-150 A | 137 | 38.0% | -51,115 | 0.83 |
+| Rs.100-150 B | 132 | 32.6% | -81,863 | 0.74 |
+
+Rs.100-150 execution is **worse overall** (net P&L nearly 66% more negative, PF 0.78 vs. 0.84).
+The A/PE side actually improves modestly (net -51,115 vs. -57,982, PF 0.83 vs. 0.80); the B/CE side
+gets materially worse (net -81,863 vs. -22,262, PF 0.74 vs. 0.90) -- confirming the user's own
+observation that Pattern B previously traded much cheaper CE contracts under ATM execution, and
+forcing those into the Rs.100-150 band picks a different, worse-performing strike.
+
+### Per-session comparison (validation-only)
+
+| Session | ATM Net | Rs.100-150 Net | Direction |
+|---|---:|---:|---|
+| 2026-09-04 | -17,042 | -20,496 | worse |
+| 2026-09-08 | -892 | -20,662 | much worse |
+| 2026-09-09 | +46,273 | +42,841 | slightly worse |
+| 2026-09-10 | -17,678 | -19,332 | worse |
+| 2026-09-11 | -985 | +7,540 | better (flips positive) |
+| 2026-09-15 | +13,427 | -17,025 | much worse (flips negative) |
+| 2026-09-16 | +7,170 | +7,848 | slightly better |
+| 2026-09-17 | -20,706 | -19,916 | slightly better |
+| 2026-09-18 | -78,744 | -83,746 | worse |
+| 2026-09-21 | -11,068 | -10,030 | slightly better |
+
+4 of 10 sessions improve, 6 worsen -- not session-robust. `Total P&L excluding worst session
+(09-18)`: ATM = Rs.-1,500 (essentially breakeven once the single worst day is removed) vs.
+Rs.100-150 = Rs.-49,232 (still substantially negative). ATM's poor headline result is almost
+entirely one session's doing; Rs.100-150's is not -- it is worse across a broader set of sessions,
+not just concentrated in 09-18.
+
+### DTE breakdown, Rs.100-150 execution (validation-only, descriptive only)
+
+| DTE | N | Win% | Net P&L | PF | Median entry premium |
+|---|---:|---:|---:|---:|---:|
+| 0 | 63 | 34.9% | -37,687 | 0.78 | 125.4 |
+| 1 | 26 | 30.8% | -10,030 | 0.77 | 118.1 |
+| 4 | 89 | 27.0% | -96,702 | 0.56 | 120.8 |
+| 5 | 39 | 35.9% | -39,248 | 0.62 | 124.1 |
+| 6 | 52 | 51.9% | +50,689 | 1.69 | 134.6 |
+
+Materially different by DTE, same pattern direction as the earlier ATM-execution study (DTE=6
+strongly profitable) but with one notable difference: DTE=0 is net **negative** here
+(validation-only), whereas the earlier command's DTE=0 figure was net positive -- that earlier
+figure pooled Design sessions in with Validation, so it is not a like-for-like comparison; this
+validation-only figure is the more reliable one.
+
+### Signal-vs-option diagnostic, losing Rs.100-150 trades (validation-only, n=174)
+
+- (A) Underlying correct at exit, option still lost: 107 (61.5%).
+- (B) Underlying itself moved against the signal: 67 (38.5%).
+- (C) Predicted direction shown at some horizon despite the loss: 47 (27.0%).
+- (D) Positive MFE at some point, but exited negative: **157 (90.2%)**.
+
+The dominant finding is (D): the overwhelming majority of losing trades did move favorably at some
+point before losing money by exit -- reinforcing, with a much larger and more direct measurement
+than before, that the exit rule (opposite-pattern signal or forced 15:15 close) is giving back
+option gains rather than the signal simply failing to move favorably.
+
+### MFE timing (validation-only)
+
+| | N | Median hold (s) | Median sec-to-MFE | Median MFE % of premium | Losers w/ MFE>0 | >0.5% | >1% | >2% |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| ATM A | 137 | 475 | 166 | 3.7% | 90.8% | 75.9% | 65.5% | 49.4% |
+| ATM B | 133 | 478 | 115 | 4.0% | 90.9% | 78.4% | 64.8% | 51.1% |
+| Rs.100-150 A | 137 | 475 | 166 | 3.7% | 89.4% | 76.5% | 65.9% | 47.1% |
+| Rs.100-150 B | 132 | 479 | 131 | 3.1% | 91.0% | 80.9% | 66.3% | 42.7% |
+
+MFE timing is essentially unchanged between execution methods (same underlying path drives it) --
+roughly half of all losing trades had MFE exceeding 2% of entry premium at some point.
+
+### Fixed-horizon MTM, Rs.100-150 execution (validation-only, diagnostic only)
+
+| | +1 | +3 | +5 | +10 |
+|---|---|---|---|---|
+| A positive% / mean% | 54.0% / 0.14% | 55.5% / 0.43% | 52.6% / 0.39% | 49.6% / 0.13% |
+| B positive% / mean% | 51.5% / 0.15% | 49.2% / -0.31% | 47.7% / -0.44% | 53.0% / -0.61% |
+
+### Design-day appendix (09-22/09-23) -- NOT validation, not combined with totals above
+
+| | N | Win% | Net P&L | PF |
+|---|---:|---:|---:|---:|
+| ATM | 51 | 45.1% | +59,287 | 1.85 |
+| Rs.100-150 | 51 | 49.0% | +81,202 | 1.82 |
+
+(Design sessions are profitable under both executions -- consistent with these being the sessions
+the FullSurface hypothesis was originally noticed on; this is exactly why they are excluded from
+the validation headline.)
+
+### Full CSVs
+
+`vc-execcompare-trades.csv` (641 trades, both executions, validation+design),
+`vc-execcompare-entry-contract-diagnostics.csv` (641 rows: ATM strike, signal ATM premium,
+execution strike/premium, strike distance, moneyness, per trade).
+
+### Reproduction
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-fullsurface-execution-compare --in=vc-adaptive180s-band-rows.csv --out=vc-execcompare
+```
+
+### Final research questions (answered only these, as instructed)
+
+1. **Does using the intended Rs.100-150 execution contract materially improve FullSurface trade
+   translation vs. ATM execution?** No -- it is materially worse overall (net P&L -Rs.132,978 vs.
+   -Rs.80,244; PF 0.78 vs. 0.84).
+2. **Does improvement occur for A->PE, B->CE, both, or neither?** Only A->PE improves modestly
+   (PF 0.83 vs. 0.80); B->CE gets substantially worse (PF 0.74 vs. 0.90).
+3. **Is improvement session-robust?** No -- 4 of 10 sessions improve, 6 worsen, and the worsening
+   sessions have larger absolute swings than the improving ones.
+4. **Does it reduce the large underlying-correct/option-losing mismatch?** No -- the proportion is
+   essentially unchanged (61.5% here vs. ~61.6% in the earlier ATM-only diagnostic).
+5. **Does it change MAE/MFE behavior or time-to-MFE?** Only marginally -- median seconds-to-MFE
+   and the MFE-threshold percentages are close to identical between the two executions; MAE/MFE in
+   rupee terms are somewhat larger under Rs.100-150 execution (different contract, different Greeks),
+   but the underlying timing pattern is unchanged.
+6. **Does DTE still show materially different option translation?** Yes -- DTE=6 remains strongly
+   profitable (PF 1.69) and DTE=4 remains the largest loss driver (PF 0.56), matching the earlier
+   pattern; DTE=0 is net negative on a validation-only basis (differs from the earlier pooled figure,
+   which included Design sessions).
+7. **Are validation-session results still dominated by 09-09 and/or 09-18?** Partially -- 09-18
+   remains the single worst session for both executions, and removing it makes ATM's total nearly
+   breakeven (-Rs.1,500), but Rs.100-150's total remains substantially negative even excluding it
+   (-Rs.49,232) -- so Rs.100-150's poor result is not just one session's doing.
+8. **Is the opposite-pattern exit still clearly giving back favorable option movement?** Yes, more
+   clearly than before -- 90.2% of losing Rs.100-150 trades had a positive MFE at some point before
+   exiting negative.
+9. **Based on this experiment, should the next investigation focus on execution contract, exit
+   lifecycle, or abandoning this path?** Exit lifecycle. Changing the execution contract did not
+   improve translation (it worsened it overall), while the MFE-timing and Case-D findings point
+   squarely at the exit rule (opposite-pattern signal / forced 15:15 close) discarding gains that
+   the option contract already captured, regardless of which contract is traded. No next
+   investigation was implemented, per instruction.
+
+## 2026-09-25: 2026-09-18 Forensic Postmortem (no strategy change)
+
+Forensic postmortem of the single validation session (2026-09-18, DTE=4) driving almost the entire
+FullSurface ATM-execution validation loss. No signal or trade-mechanics change of any kind -- reads
+the frozen `vc-adaptive180s-band-rows.csv` unchanged and reruns the same frozen ATM-execution
+mechanics, adding only read-only forensic instrumentation (MFE timestamp, giveback, rolling-180s
+high/low, opposite-pattern classification). 2026-09-24 never queried.
+
+**Operational note (a real bug found and fixed before trusting section 3's control column):** the
+first run's same-session matched-control population was silently empty (n=0) because the tercile-
+bucket check compared against the literal string `"Low33"`, but `ConditionalMovementAnalysis.ClassifyTercileBucket`
+actually returns `"Low"`/`"Mid"`/`"High"` -- a one-character naming mismatch, same category of bug
+as the earlier Up/Down-label incident this session. Fixed, rebuilt (0 warnings), reran the full
+test suite (1075/1075 passing), reran this command, and confirmed nonzero control candidates
+(n=44 for 09-18) before trusting or reporting section 3's numbers. Every other section was
+unaffected by this bug (they don't depend on the control population) and its numbers are unchanged
+across both runs.
+
+### 1-2. Reproduction and A/B split
+
+09-18 reproduced exactly: 27 signals, 27 executed (A=14, B=13), GrossPnl=Rs.-77,675, Costs=Rs.1,069,
+NetPnl=**Rs.-78,744**, WinRate=22.2%, PF=0.11 -- an exact match to the validation aggregate already
+reported. Rs.100-150 reference reproduction (from the earlier execution-compare study):
+NetPnl=Rs.-83,746, PF=0.11 -- also heavily negative, as expected.
+
+A (PE): N=14, Win%=14.3%, PF=0.11, Net=Rs.-50,683. B (CE): N=13, Win%=30.8%, PF=0.12, Net=Rs.-28,061.
+Both sides lost heavily -- this was not a one-side problem.
+
+### 3. Was the underlying signal itself unusually weak on 09-18? No.
+
+| Horizon | 09-18 A hit% | 09-18 control hit% | 09-18 B hit% | Full-validation A hit% | Full-validation B hit% |
+|---|---:|---:|---:|---:|---:|
+| +1 | 57.1% | 31.8% | 73.9% | 60.5% | 64.6% |
+| +3 | 57.1% | 50.0% | 60.9% | 64.2% | 62.7% |
+| +5 | 53.6% | 43.2% | 69.6% | 60.4% | 63.0% |
+| +10 | 64.3% | 59.1% | 87.0% | 57.6% | 62.2% |
+
+09-18's underlying A/B hit rates clear the same-session matched control at every horizon, and are
+**not weaker** than the full-validation pooled reference -- if anything, B is materially stronger
+on 09-18 (87.0% at +10 vs. 62.2% pooled). **The underlying directional signal was not the problem.**
+
+### 4-5. Pre-signal move / local structure (descriptive, no filter created)
+
+Median pre-signal move: A = 3.20pts (median window 3 bars / 358s), B = -3.30pts (median window 3
+bars / 384s) -- both directionally consistent with the pattern (A after an up-move, B after a
+down-move), and no consistent weakening of Fwd10 at the largest pre-signal moves. Entry-location
+check: 10/14 A entries closer to the rolling-180s high than the low (consistent with "already
+moved"), 9/13 B entries closer to the rolling low -- descriptive only, not used as a filter.
+
+### 6-9. Trade-level forensics
+
+Full 27-row trade-by-trade CSV delivered (see below). Key aggregate findings:
+
+- **Loss classification** (12 A losers, 9 B losers): ExitGiveback dominates overwhelmingly --
+  A: 10/12 (83%, Rs.-46,954); B: 8/9 (89%, Rs.-18,140). SignalFailure and TranslationFailure are
+  each 0-1 trades per side. **This was almost entirely an exit-timing problem, not a signal or
+  translation problem.**
+- **Favorable-excursion capture**: median CaptureRatio across all MFE>0 trades = **-1.45** (P25=-6.80,
+  P75=-0.29) -- realized P&L was typically over 100% worse than the favorable excursion already
+  achieved. 92.6% of trades had MFE>0 at some point; of those, 76.0% still closed negative.
+- **Timing**: MFE occurred before the opposite-pattern exit in essentially every case where MFE
+  was positive (A: 13/13, B: 12/12). Over 50% of MFE was given back in 13/14 A trades and 11/13 B
+  trades; 11/14 A trades and 8/13 B trades gave back 100%+ (a winner turned into a loser).
+- **Opposite-pattern inspection**: of 27 opposite-pattern exits, 25 were themselves also
+  FullSurfaceAgreement-confirmed opposite entries (only 2 were "ordinary ATM opposite, not
+  FullSurface") -- the exits triggering these losses were not noise-driven whipsaws on unconfirmed
+  signals; they were themselves high-quality opposite signals arriving too soon after entry.
+
+### 12. DTE=4 sibling comparison: is 09-18 isolated or is DTE=4 systemic?
+
+| Session | N | Net P&L | PF | A-hit%@+10 | B-hit%@+10 | Underlying-correct-but-lost | Median giveback% |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 2026-09-18 | 27 | -78,744 | 0.11 | 64.3% | 87.0% | 13/27 | 245.5% |
+| 2026-09-04 | 21 | -17,042 | 0.60 | 45.0% | 52.4% | 9/21 | 134.6% |
+| 2026-09-11 | 41 | -985 | 0.99 | 60.5% | 65.8% | 21/41 | 136.4% |
+
+All three DTE=4 sessions lose money, but 09-18's magnitude (PF 0.11, median giveback 245.5%) is
+far worse than 09-04 (PF 0.60) or 09-11 (near-breakeven, PF 0.99). **DTE=4 is a consistently weak
+DTE across all three sessions (never profitable), but 09-18 is also unusually severe even within
+that already-weak group** -- both things are true at once.
+
+### 13. Comparison against the strongest validation session (2026-09-09)
+
+| | 09-09 (strongest) | 09-18 (worst) |
+|---|---:|---:|
+| Net P&L | +46,273 | -78,744 |
+| Median WindowBarCount | 9 | **3** |
+| Median window duration | 354s | 358s |
+| Median entry premium | 113.2 | 100.4 |
+| Median holding time | 440s | 527s |
+| Median SecondsToMFE | 186s | 84s |
+| Median MAE | 2.0 | 5.6 |
+| Median MFE | 4.3 | 3.1 |
+| Median giveback% | 107.6% | 245.5% |
+
+Same target elapsed time (~354-358s) produced a **3x difference in median WindowBarCount** (9 vs.
+3) -- 09-18 was a much faster-ticking market, reaching the same 180s target in far fewer, larger
+bars. 09-18 also had much higher MAE (more adverse excursion before any favorable move) and MFE
+arrived far sooner (84s vs. 186s) yet gave back far more (245.5% vs. 107.6%) -- consistent with a
+faster, choppier regime where reversals arrive quickly relative to the same wall-clock exit rule.
+
+### 14. 180-second-specific diagnostic
+
+A. Was the underlying signal itself poor? **No** (section 3). B. Was matched-control separation
+weaker than normal? **No** -- 09-18 clears its own control at every horizon. C. Did signals appear
+after unusually large pre-entry moves? **No consistent pattern** (section 4). D. Was context
+duration materially different? **Bar count yes (median 3 vs. 9 on the best session), wall-clock
+duration essentially no** (~355-360s on both) -- the 180s target itself was hit consistently; what
+differed was how many bars it took, a direct, expected consequence of the activity-based design
+working as intended on a fast day. E. Evidence the signal was stale from context length? **No** --
+if anything, the faster market (fewer bars) means LESS elapsed information lag, not more.
+
+### 15. Decision tree
+
+**EXIT_PROBLEM** -- the dominant, best-supported classification. Options frequently became
+favorable (92.6% MFE>0) but the opposite-pattern exit gave back the move (median giveback 245.5%,
+76% of MFE>0 trades still closed negative) before the position could realize it.
+**SESSION_REGIME_PROBLEM** -- secondary, contributing factor. 09-18 was a measurably faster/choppier
+regime (3x smaller median WindowBarCount than the best session, higher MAE, faster-arriving-but-
+more-quickly-reversed MFE) than both its DTE=4 siblings and the strongest validation session, which
+plausibly explains why the SAME exit rule failed far more severely here than elsewhere.
+SIGNAL_PROBLEM and OPTION_TRANSLATION_PROBLEM are explicitly **not** supported by this evidence.
+
+### Full CSVs and artifact
+
+`vc-0918pm-0918-trades.csv` (27-row trade-by-trade forensic export, full required field list).
+Visual artifact: **[0918 Forensic Postmortem](https://claude.ai/artifact/7WvcJfaXjP5xSz5wgMeCFQ)**
+-- full-session futures chart with A/B episode shading and win/loss/MFE trade markers, plus a table
+of the 10 largest losing trades. Scope note: full per-trade option-price-path mini-inspectors were
+not built as separate panels this pass (flagged explicitly in the artifact itself) -- every one of
+those 10 trades is fully described by the table and locatable on the main chart via its own
+entry/exit/MFE timestamps.
+
+### Reproduction
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-0918-postmortem --in=vc-adaptive180s-band-rows.csv --out=vc-0918pm
+```
+
+### Final answers (answered only these, as instructed)
+
+1. **Why did 09-18 lose approximately as much as it did?** The underlying signal correctly called
+   direction (clearing its own same-session control at every horizon); the options frequently moved
+   favorably (92.6% had MFE>0); but the opposite-pattern exit rule gave back the large majority of
+   that favorable movement before the position closed (median giveback 245.5% of MFE) -- a
+   fast-ticking, choppier-than-usual session made this exit-timing problem far worse than on other
+   sessions using the identical rule.
+2. **Was the primary failure signal, option translation, exit, or a mixture?** Overwhelmingly exit
+   (83-89% of losing trades classified ExitGiveback on both sides); signal and translation failures
+   were each 0-1 trades per side.
+3. **Is DTE=4 itself implicated, or is 09-18 unusual among DTE=4 sessions?** Both -- DTE=4 never
+   made money across any of its three validation sessions (systemically weak), but 09-18's severity
+   (PF 0.11 vs. 0.60/0.99) is unusual even within that group.
+4. **Is there actual evidence against the fixed 180-second target?** No direct evidence against the
+   time target itself -- wall-clock window duration was essentially unchanged (~355-360s) across
+   good and bad sessions; what changed was bar count (3 vs. 9), which is the architecture correctly
+   adapting to a faster market, not a sign of staleness.
+5. **Should 180-second context be revisited next?** No, not on this evidence -- the signal and
+   context construction were not implicated; the problem is downstream of the signal.
+6. **If not, which layer should be investigated next?** The exit lifecycle (opposite-pattern exit
+   timing), consistent with the prior execution-contract diagnostic's own conclusion, now confirmed
+   directly and in detail on the specific session that was assumed to be the main problem.
+7. **What evidence would have to change before spending 2026-09-24 OOS?** A demonstrated fix (or at
+   least a clearly diagnosed alternative) to the exit-giveback problem -- ideally showing that a
+   revised exit lifecycle reduces the median giveback percentage and the fraction of MFE>0 trades
+   that still close negative, tested on the existing validation sessions, before any OOS session is
+   spent. No such change was implemented in this pass, per instruction.
+
+## 2026-09-25: ATM_STATE_INVALIDATION Exit Hypothesis (Phases 0-10)
+
+### Phase 0: warm-up (InsufficientHistory) bug fixed
+
+The frozen band-rows CSV never carried `InsufficientHistory` forward from the original adaptive-
+180s-context command, so every downstream FullSurface command since (band, fullsurface-trade,
+execution-compare, 0918-postmortem) was silently unable to check it. Reconstructed deterministically
+from already-present columns (`InsufficientHistory = StartBarIndex==0 AND WindowDurationSeconds<180`)
+and frozen as a rule from here on: **`AtmState` is forced to `"Other"` whenever `InsufficientHistory`,
+before any episode/FullSurface/trade-eligibility/matched-control computation** -- never inferred as
+eligible merely because the raw label happened to read A/B.
+
+Two invalid warm-up FullSurface signals were found and removed: one on 2026-09-15, one on 2026-09-18
+(confirmed to be exactly the flagged 09:15:03 trade -- the largest single loser in the entire 09-18
+postmortem, NetPnl Rs.-13,807). **Corrected baseline reproduction, 10 validation sessions: n=268
+(down from 270), NetPnl=Rs.-89,883 (vs. Rs.-80,244 uncorrected)** -- counterintuitively slightly
+*worse* after the fix, because the 09-15 removed signal happened to be a net winner that more than
+offset 09-18's improvement. A: n=136, Rs.-81,428, PF 0.72. B: n=132, Rs.-8,455, PF 0.96.
+
+**Operational note (a real bug found and fixed mid-run, before trusting any Phase 1+ result):** the
+first run produced an obviously wrong result (net P&L in the millions, ~330 trades instead of ~270,
+median holding time of 3.4 hours) -- root cause: the local `CloseCorrected`/`CloseOld` functions
+never reset the captured `open` position variable to `null` after closing (every other simulator in
+this codebase does this; these two, freshly written for this command, did not). With `open` never
+cleared, every subsequent opposite-signal row re-closed the *same* original entry against an ever-
+later timestamp, producing spurious duplicate rows and blocking all further entries for the rest of
+the session. Fixed (added the missing `open = null;`/`openOld = null;`), rebuilt (0 warnings), reran
+the full test suite (1075/1075 passing), reran this command, and verified the OLD reproduction now
+matches the established reference exactly (n=270, Rs.-80,244, PF 0.84) before trusting anything
+downstream.
+
+### Phases 1-2: exit hypothesis and same-entry counterfactual
+
+`ATM_STATE_INVALIDATION`: exit on the first completed adaptive observation after entry where
+`AtmState != <entry pattern>` (either -> Other or -> opposite pattern invalidates), using the first
+valid executable exit quote under the existing frozen quote/execution methodology; forced EOD close
+if no invalidation occurs first. Entry mechanics (ATM execution, quantity, costs, cutoff,
+FullSurfaceAgreement-as-entry-confirmation-only) are completely unchanged. Computed as a pure
+counterfactual first: every corrected-baseline trade's SAME entry (signal, timestamp, contract,
+premium, quantity) gets two independently-computed exits, never generating additional trades yet.
+
+### Phase 3: exit-mechanics comparison (same entries, n=268)
+
+| | N | Win% | Net P&L | PF | Med hold (s) | Med CaptureRatio | MFE>0-then-loss |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Baseline (opposite-pattern) | 268 | 35.1% | -89,883 | 0.82 | 478 | -0.37 | 159/268 (59.3%) |
+| Invalidation | 268 | 43.7% | -9,658 | 0.93 | 42 | 0.04 | 118/268 (44.0%) |
+
+A-side: baseline Rs.-81,428 (PF 0.72) -> invalidation Rs.-1,008 (PF 0.99). B-side: baseline
+Rs.-8,455 (PF 0.96) -> invalidation Rs.-8,650 (PF 0.86, essentially flat/slightly worse). Winner->
+loser conversions = 32/268 (12%); loser->winner conversions = 55/268 (21%) -- more trades flip from
+loser to winner than the reverse.
+
+### Phase 4: MFE timing (the central lifecycle question)
+
+MFE occurred **before** invalidation in 87.7% of same-entry trades (A: 87.5%, B: 87.9%); only 6.7%
+had MFE arrive after invalidation but before the baseline exit; 5.6% never had positive MFE at all.
+**Most of the favorable excursion already existed by the time the state invalidated** -- this
+supports state-invalidation as a lifecycle-justified exit rather than one that cuts off useful
+continuation. Reported as found, not adjusted after seeing the result.
+
+### Phase 5: 2026-09-18 focused
+
+Corrected baseline: n=26, Rs.-64,937, PF 0.13. Invalidation counterfactual: n=26, Rs.-5,564, PF
+0.75. A delta=+39,983, B delta=+19,390. MFE>0-then-loss: 19/26 (baseline) -> 13/26 (invalidation).
+**Total giveback avoided on 09-18 alone = Rs.+59,373** -- this is the single largest session
+contribution to the whole 10-session improvement (Rs.+80,225), consistent with 09-18 being the
+session where the baseline exit-giveback problem was most severe.
+
+### Phase 6: per-session breakdown (all 10 validation sessions)
+
+| Session | N | Base Net | Inv Net | Delta |
+|---|---:|---:|---:|---:|
+| 2026-09-04 | 21 | -17,042 | 3,485 | +20,527 |
+| 2026-09-08 | 26 | -892 | -1,055 | -162 |
+| 2026-09-09 | 30 | 46,273 | 2,068 | **-44,205** |
+| 2026-09-10 | 24 | -17,678 | 2,492 | +20,170 |
+| 2026-09-11 | 41 | -985 | -3,940 | -2,956 |
+| 2026-09-15 | 37 | -10,019 | 16,679 | +26,698 |
+| 2026-09-16 | 22 | 7,170 | -16,215 | **-23,385** |
+| 2026-09-17 | 15 | -20,706 | -471 | +20,235 |
+| 2026-09-18 | 26 | -64,937 | -5,564 | +59,373 |
+| 2026-09-21 | 26 | -11,068 | -7,138 | +3,930 |
+
+**Sessions improved: 6/10. Worsened: 4/10.** Median session delta = Rs.+12,050. Total delta =
+Rs.+80,225. Total excluding the best session (09-18) = Rs.+20,852 -- most of the total improvement
+is concentrated in 09-18, but a real, smaller improvement remains even without it. Total excluding
+the worst session (09-09, the previously-strongest session, now hurt by early exit) = Rs.+124,430.
+Largest single-session share = 26.8%.
+
+### Phase 7: DTE descriptive comparison (same-entry)
+
+| DTE | Baseline Net/PF | Invalidation Net/PF |
+|---|---|---|
+| 0 | -10,911 / 0.88 | +15,624 / 1.58 |
+| 1 | -11,068 / 0.68 | -7,138 / 0.49 |
+| 4 | -82,963 / 0.57 | -6,019 / 0.88 |
+| 5 | -38,384 / 0.62 | +2,021 / 1.09 |
+| 6 | +53,443 / 1.72 | -14,148 / 0.59 |
+
+DTE=0/4/5 improve materially; DTE=1 is roughly flat-to-slightly-worse; **DTE=6 gets substantially
+worse** -- consistent with 09-09 (DTE=6, the best baseline session) being hurt by exiting early on
+a session where the trend continued to run in the position's favor.
+
+### Phase 8: full sequential resimulation (invalidation as the actual exit)
+
+Funnel: 516 eligible FullSurface entries, 459 executed (0 ignored while a position was open --
+positions now free up fast enough that this never binds), 57 after cutoff, 0 ForcedEod, 459
+invalidation exits. Combined: n=459, win%=41.6%, Net=Rs.-67,226, PF=0.76. A: n=243, Rs.-51,991,
+PF 0.71. B: n=216, Rs.-15,235, PF 0.85. Per-session net: 6 of 10 sessions positive-or-near-flat,
+09-16 (-25,626) and 09-11 (-16,584) the largest remaining losses.
+
+### Phase 9: exit effect vs. opportunity-set effect (mandatory separation)
+
+- A (corrected frozen baseline, sequential): Net = Rs.-89,883 (n=268).
+- B (same-entry invalidation counterfactual): Net = Rs.-9,658 (n=268).
+- C (full sequential invalidation simulation): Net = Rs.-67,226 (n=459).
+- **A->B, pure exit effect (same 268 entries) = Rs.+80,225.**
+- **B->C, opportunity-set effect (191 additional trades from earlier position availability) =
+  Rs.-57,567.**
+
+The exit change itself is strongly positive in isolation; roughly 72% of that gain is given back
+once the strategy is allowed to take the extra trades that earlier position availability creates.
+Net effect from original baseline to full sequential = Rs.+22,657 -- a real but much smaller
+improvement than the same-entry counterfactual alone would suggest.
+
+### Phase 10: breadth-loss timing (diagnostic only, no exit rule)
+
+Median seconds from entry to FullSurfaceAgreement breadth loss: A=2,332s, B=2,072s -- far later than
+median seconds to invalidation (A=39s, B=45s) or to MFE (A=166s, B=115s). **Breadth agreement is
+persistent, not merely an entry-instant coincidence** -- it typically remains true long after both
+the state invalidates and MFE is reached, meaning it does not naturally track the exit-relevant
+part of the trade's lifecycle. Descriptive only; no FullSurface-loss exit was tested.
+
+### Full CSVs
+
+`vc-invalidation-same-entry.csv` (268 rows, full required field list), `vc-invalidation-full-sequential-trades.csv` (459 rows).
+
+### Reproduction
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-atm-invalidation-exit --in=vc-adaptive180s-band-rows.csv --out=vc-invalidation
+```
+
+### Final answers (answered only these, as instructed)
+
+1. **After enforcing sufficient 180-second history, how did the corrected baseline change?** Trade
+   count dropped from 270 to 268 (2 invalid warm-up signals removed, including 09-18's single
+   largest loser); net P&L moved from Rs.-80,244 to Rs.-89,883 -- slightly worse in aggregate,
+   because the other removed signal (09-15) happened to be a net winner.
+2. **Does ATM-state invalidation materially improve trade outcomes on identical entries?** Yes --
+   Net P&L improves from Rs.-89,883 to Rs.-9,658 (PF 0.82 -> 0.93), though it remains net negative.
+3. **Is improvement present for A, B, both, or neither?** Predominantly A (Rs.-81,428 ->
+   Rs.-1,008, essentially breakeven). B is roughly flat (Rs.-8,455 -> Rs.-8,650, marginally worse).
+4. **Does it materially reduce MFE>0->loss conversions and giveback?** Yes -- 59.3% -> 44.0% of
+   MFE>0 trades still closing negative; median CaptureRatio improves from -0.37 to +0.04.
+5. **Does MFE generally occur before or after state invalidation?** Before -- 87.7% of same-entry
+   trades had their MFE arrive before invalidation, supporting the exit as lifecycle-justified.
+6. **Does the improvement reproduce across sessions or is it driven by 09-18?** Mixed -- 6/10
+   sessions improve, 4/10 worsen. 09-18 is the single largest positive contributor (accounts for
+   ~74% of the total delta), but a real (smaller) net improvement (Rs.+20,852) remains even
+   excluding it. The previously-best session (09-09) is the largest single session hurt.
+7. **Does DTE materially alter effectiveness?** Yes -- DTE 0/4/5 improve materially; DTE=6 gets
+   substantially worse (the same session/DTE that benefited most from letting winners run under
+   the old exit).
+8. **In the full sequential simulation, does earlier position availability help or hurt relative to
+   the same-entry counterfactual?** Hurts -- Rs.-57,567 of the Rs.+80,225 same-entry exit-effect
+   gain is given back once additional trades from earlier position availability are included
+   (net effect vs. original baseline: Rs.+22,657, real but much smaller).
+9. **Is ATM-state invalidation strong enough to freeze as the exit architecture?** Not yet -- the
+   isolated exit effect is real and well-supported (Phase 4's MFE timing result is the strongest
+   evidence), but the full sequential result is still net negative (Rs.-67,226) and the improvement
+   is not uniformly session-robust (DTE=6 and 09-09 get materially worse).
+10. **If not, what specifically failed?** Primarily the opportunity-set effect (Phase 9) --
+    earlier position availability lets the strategy take additional, lower-quality trades that
+    erode most of the pure exit-timing gain. Secondarily, DTE=6/trending sessions show the exit can
+    now be too early (cutting off continuation that the old exit captured). Option translation and
+    state flicker/noise were not implicated by this evidence (breadth stays persistent, not noisy;
+    the earlier postmortem already ruled out signal/translation failure as the dominant cause).
+    No new exit was implemented; 2026-09-24 was not used.
+
+## 2026-09-25: Participation-Unit (Base-Bar Size) Structural Comparison
+
+Three predeclared futures base-bar sizes compared under the identical frozen 180s adaptive
+context, ATM A/B + ATM+/-2 FullSurfaceAgreement signal, and InsufficientHistory warm-up correction:
+**2600** (existing baseline, read from the frozen CSV), **13000** (5x), **26000** (10x). Not a
+threshold search -- no other values tested. 10 validation sessions only; scope note: Design
+sessions (09-22/09-23) were not built for the 13000/26000 architectures given the added compute of
+building two new architectures from raw ticks (flagged, not hidden). 2026-09-24 never queried.
+
+### Phase B: state churn (the primary purpose of this experiment)
+
+| Metric | 2600 | 13000 | 26000 |
+|---|---:|---:|---:|
+| Total bars (10 sessions) | 8,537 | 1,713 | 859 |
+| Median bar duration | 15.0s | 83.0s | 180.0s |
+| Median realized volume | n/a (not tracked in frozen CSV) | 33,280 | 32,370 |
+| A/B entries | 345/323 | 82/67 | 41/30 |
+| Transitions/hour | 20.70 | 4.48 | 2.17 |
+| State-entries/hour | 10.72 | 2.39 | 1.14 |
+
+State churn drops sharply and monotonically as the participation unit grows -- roughly a 5x and
+10x reduction in transitions/hour, tracking the 5x/10x threshold increase almost proportionally.
+
+**Episode persistence** (wall-clock, primary cross-architecture measure): median episode duration
+increases 198s (A, 2600) -> 240s (13000) -> 319s (26000); 1-bar (immediately-exiting) episodes rise
+from 75.4% to 81.7% to 85.4% -- i.e. episodes get *longer in wall-clock time* even though they are
+increasingly likely to be a single (much larger) bar.
+
+**Rapid re-entry** (<60s, same-pattern): 124/648 (19.1%) at 2600 -> 7/129 (5.4%) at 13000 -> 1/51
+(2.0%) at 26000 -- a clear, large reduction.
+
+**Daily FullSurface entry frequency**: mean/day 51.6 -> 10.5 -> 4.7.
+
+### Phase A: does the underlying relationship survive?
+
+| | 2600 A gap | 2600 B gap | 13000 A gap | 13000 B gap | 26000 A gap | 26000 B gap |
+|---|---:|---:|---:|---:|---:|---:|
+| +1 | 21.4pp | 28.0pp | 23.3pp | 22.2pp | 15.6pp | 35.6pp |
+| +10 | 11.9pp | 20.3pp | 19.7pp | 12.2pp | -2.4pp (n=24/46, small) | 10.4pp |
+
+The matched-control gap is preserved (and at +1, comparable-to-larger) at both 13000 and 26000 --
+**the underlying A/B relationship does survive the larger participation units**, with one caveat:
+26000's A-side +10 gap goes slightly negative, but on a small sample (n=24 FullSurface entries, 46
+control) -- reported honestly as weak/inconclusive rather than a clean failure. Cumulative-volume-
+normalized comparison (~26K/~52K) was skipped -- exact common cumulative-volume boundaries are not
+naturally aligned across three independently-thresholded bar series without interpolation, which
+was explicitly disallowed; flagged as a scope reduction, not fabricated.
+
+### Phase C/D: six simulations (3 architectures x 2 exits), ATM execution
+
+| Architecture | Exit | N | Net P&L | PF | Med hold |
+|---|---|---:|---:|---:|---:|
+| 2600 | OppositePattern | 268 | -89,883 | 0.82 | 478s |
+| 2600 | StateInvalidation | 459 | -67,226 | 0.76 | 39s |
+| 13000 | OppositePattern | 66 | **+58,379** | 1.27 | 1,549s |
+| 13000 | StateInvalidation | 90 | -57,075 | 0.54 | 179s |
+| 26000 | OppositePattern | 28 | **+32,098** | 1.32 | 3,913s |
+| 26000 | StateInvalidation | 39 | +11,154 | 1.26 | 302s |
+
+**A structurally important reversal**: at 2600, StateInvalidation beat OppositePattern (per the
+prior experiment). At **13000 and 26000, OppositePattern outperforms StateInvalidation** -- the
+exit-timing improvement found at 2600 does not generalize to larger participation units; if
+anything, both raw architectures (13000, 26000) are net *profitable* under the ORIGINAL
+opposite-pattern exit, on this in-sample validation pool.
+
+### Opportunity-set effect, per architecture (Phase C.15)
+
+| | Additional trades (Inv - Opp) | Net delta (Inv - Opp) |
+|---|---:|---:|
+| 2600 | +191 (+71.3%) | **+22,658** |
+| 13000 | +24 (+36.4%) | **-115,454** |
+| 26000 | +11 (+39.3%) | **-20,943** |
+
+At 2600, the extra trades created by earlier invalidation exit were net *helpful*. **At 13000 and
+26000, the extra trades are net harmful** -- confirming, directly, that the additional trades
+created by early exit remain (or become) low quality at larger participation units, not merely
+fewer in count.
+
+### MFE/lifecycle, state-invalidation exit only
+
+| | Med hold | Med SecToMFE | MFE>0 % | MFE>0-then-loss % | Med giveback% |
+|---|---:|---:|---:|---:|---:|
+| 2600 | 39s | 18s | 85.8% | 51.5% | 100.0% |
+| 13000 | 179s | 49s | 93.3% | 56.0% | 117.6% |
+| 26000 | 302s | 132s | 94.9% | **35.1%** | **57.6%** |
+
+26000's own state-invalidation trades show real lifecycle improvement (lower MFE>0-then-loss%,
+lower giveback%) even though, per the table above, the *original* opposite-pattern exit still
+outperforms it on this architecture -- both things are true at once.
+
+### Phase E: 09-18 vs. 09-09 across architectures
+
+| Session | Architecture | Bars | Transitions | FS entries | Inv trades | Inv Net | Inv PF |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 09-18 | 2600 | 561 | 116 | 50 | 43 | -13,701 | 0.62 |
+| 09-18 | 13000 | 113 | 18 | 9 | 8 | -24,788 | 0.11 |
+| 09-18 | 26000 | 57 | 6 | 2 | 2 | +4,313 | n/a (n=2) |
+| 09-09 | 2600 | 1,263 | 147 | 60 | 56 | -5,031 | 0.79 |
+| 09-09 | 13000 | 253 | 34 | 13 | 13 | -5,526 | 0.48 |
+| 09-09 | 26000 | 127 | 16 | 6 | 6 | +1,641 | 1.44 |
+
+Mixed, not a clean story either way: 09-18 gets *worse* at 13000 before turning (thinly) positive at
+26000 (n=2, weak evidence); 09-09 stays negative under state-invalidation at both 2600 and 13000,
+only turning positive at 26000 (also a small sample, n=6).
+
+### Full CSVs
+
+None exported this pass -- every required output in this task's spec was phrased as "report," not
+"export," and console output above covers every requested table.
+
+### Reproduction
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-participation-unit-compare --in=vc-adaptive180s-band-rows.csv --out=vc-participation
+```
+
+### Final answers (answered only these, as instructed)
+
+1. **Does increasing the base participation unit reduce A/B state churn?** Yes, clearly and
+   monotonically -- transitions/hour: 20.70 (2600) -> 4.48 (13000) -> 2.17 (26000).
+2. **Does it materially reduce rapid re-entry and extra opportunity-set trades?** Rapid re-entry
+   yes (<60s same-pattern: 19.1% -> 5.4% -> 2.0%). Extra opportunity-set trades: fewer in absolute
+   count (191 -> 24 -> 11), but not proportionally less impactful -- their *effect* actually flips
+   from net-helpful (2600) to net-harmful (13000, 26000).
+3. **Does the A/B + FullSurface relationship survive at 13K and 26K?** Yes, largely -- matched-
+   control gaps are preserved or comparable at both horizons and both architectures, with one
+   small-sample exception (26000 A-side at +10).
+4. **Which architecture preserves matched-control separation most consistently?** 13000 -- positive
+   gaps at both +1 and +10 for both A and B, with reasonable sample sizes; 26000's gaps are larger
+   at +1 but the +10 A-side result is weak/inconclusive on a small sample.
+5. **Does lower signal frequency come from cleaner states or coarser observation?** Both, and they
+   are not separable in this design -- fewer, longer episodes are consistent with genuinely cleaner
+   state persistence (Phase B), but larger bars also mechanically observe the market less often, so
+   some of the reduction is coarser observation by construction, not purely "noise removed."
+6. **Does 09-18 improve structurally under larger units?** Not cleanly -- it worsens at 13000 before
+   a thin (n=2), inconclusive improvement at 26000. No clean, monotonic fix.
+7. **Does the strong 09-09 session survive, or are useful trends cut short?** Neither cleanly --
+   09-09 remains negative under state-invalidation at 2600 and 13000, only turning modestly positive
+   at 26000 (n=6). The previously-strong session is not simply "preserved" by a bigger bar.
+8. **Trades/day under state-invalidation, per architecture?** 2600: mean 45.9/day. 13000: mean
+   9.0/day. 26000: mean 3.9/day.
+9. **Do the additional trades from early exit remain low quality at larger thresholds?** Yes --
+   their net contribution flips from helpful (+22,658 at 2600) to harmful (-115,454 at 13000,
+   -20,943 at 26000), even though there are fewer of them.
+10. **Enough evidence to freeze one participation architecture before the entry-quality/CE-PE
+    premium analysis?** Not yet, on a single-metric basis -- each architecture is genuinely better
+    on a different axis (2600: highest churn but exit-invalidation helps; 13000: best matched-control
+    consistency but state-invalidation actively hurts it; 26000: cleanest lifecycle metrics and
+    lowest churn but thinnest samples on the two reference sessions). Per instruction, no composite
+    ranking or single winner is declared here -- the per-metric picture above is reported as-is for
+    a separate decision. No new filter, premium analysis, or OOS test was run.
+
+## 2026-09-25: 13K Entry-Quality Diagnostic (Group1 vs. Group2)
+
+13,000-contract architecture treated as the PRIMARY DESIGN CANDIDATE (not frozen/validated) --
+purely descriptive entry-quality diagnostic, no filter created, no exit optimized. Signal
+construction completely unchanged: 13000-contract base bars, 180s adaptive context, warm-up
+correction, current-week expiry, ATM A/B, ATM+/-2 FullSurfaceAgreement, episode methodology. 10
+validation sessions, 105 total FullSurface entries (matches the earlier participation-unit-compare's
+mean 10.5/day exactly). 2026-09-24 never queried.
+
+### Cross-check against the prior command
+
+**24 additional (invalidation-only) opportunities** found here matches the earlier
+participation-unit-compare command's independently-computed count exactly (24) -- strong
+cross-validation that both commands' eligibility/opportunity-set logic agree.
+
+### Section 7: Group1 (baseline-available) vs. Group2 (additional invalidation-created) -- the primary comparison, +4-bar (~52K) horizon
+
+| | N | Hit rate | Med fwd pts | Pos-MTM% | Med MTM% | PF | Net P&L |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| A Group1 | 36 | 72.2% | 8.25 | 61.1% | +1.58% | 0.40 | -41,538 |
+| A Group2 | 17 | 64.7% | 6.20 | 47.1% | -0.03% | 0.70 | -5,300 |
+| B Group1 | 30 | 60.0% | 2.70 | 36.7% | -1.38% | 0.74 | -7,982 |
+| B Group2 | 7 | 71.4% | 4.70 | 71.4% | +2.95% | 0.47 | -2,256 |
+
+**Important correction to the earlier participation-unit-compare characterization**: that command's
+"Net delta (Inv-Opp) = -115,454" for 13000 mixed two different effects together (the exit-timing
+effect on trades both architectures could have taken, AND the pure additional-trade effect) -- it
+is *not* a clean measure of "additional trades' own quality." This command isolates Group2 cleanly:
+Group2's own total net P&L is -7,556 (17+7=24 trades, ~-315/trade) versus Group1's -49,520 (66
+trades, ~-750/trade) -- **on raw per-trade P&L, Group2 is not obviously worse than Group1**, and on
+the B side Group2 actually shows a *higher* hit rate (71.4% vs. 60.0%) and *better* median option MTM
+(+2.95% vs. -1.38%). The clearest, most consistent weakness is specifically **Pattern A's additional
+trades**: lower hit rate (64.7% vs. 72.2%), lower positive-MTM% (47.1% vs. 61.1%), and near-zero
+median MTM (-0.03% vs. +1.58%) -- a real but narrower effect than "all additional trades are bad."
+
+### Section 8: NormalizedATMStraddle terciles
+
+Pooled: no clean monotonic relationship between straddle tercile and hit rate/PF for either side
+(A: Low 75.0%/Mid 61.1%/High 66.7% hit rate; PF 0.59/0.88/0.27 -- not monotonic). Within Group2
+specifically, sample sizes collapse to 1-7 per bucket -- too small to draw a reliable conclusion;
+reported as such rather than forcing an interpretation.
+
+### Section 9: PremiumImbalance terciles
+
+Pooled: Mid-imbalance is the only profitable bucket (PF 1.73, net +12,294); Low and High imbalance
+are both net losers (PF 0.27 and 0.50). Not a simple "balanced is better" or "imbalanced is better"
+story -- the relationship (if real) looks non-monotonic, and is reported as found.
+
+### Section 10: ATM straddle vs. band-median straddle
+
+**Pearson r = 0.998** -- near-perfectly redundant. The simpler ATM straddle is preferred; the
+band-median straddle does not provide materially different ranking information in this dataset.
+
+### Section 11: pre-signal move exhaustion
+
+No clean, consistent "already-moved -> weaker continuation" pattern across both sides and both
+groups -- e.g. All-A-Mid shows the highest hit rate (78.9%) while All-A-High is lower (61.1%,
+consistent with the exhaustion hypothesis), but All-B-High is the *highest* B bucket (78.6%,
+inconsistent with it). Mixed; not a clean structural finding either way.
+
+### Section 12: re-entry timing (Group2 only)
+
+n=24 total split thinly across buckets (4/1/2/17) -- the vast majority of additional entries occur
+>=300s after the freeing exit, not in a rapid-re-entry window. **Additional/low-quality entries are
+NOT primarily rapid re-entries** -- most occur well after 5 minutes, so the problem (to the extent
+one exists on the A side) persists even with a substantial gap, not just immediately after an early
+exit.
+
+### Section 13: session robustness
+
+**No session met the minimum sample bar** (>=2 entries in both the Low and High straddle terciles)
+for a per-session directional check -- with only ~10.5 FullSurface entries/session, splitting into
+3 terciles leaves too few per session per bucket. Reported honestly as inconclusive due to sample
+size, not treated as a null result.
+
+### Section 14: DTE descriptive
+
+Straddle premium rises monotonically with DTE (median Rs.111 at DTE=0 up to Rs.263 at DTE=6) -- an
+expected, mechanical relationship (more time value = more premium), not a surprising finding.
+Premium imbalance does not track DTE monotonically (highest at DTE=0 at 0.532, then falls). Hit
+rate and PF do not track DTE cleanly either. No evidence that the straddle/imbalance results above
+are simply a disguised DTE effect, but the sample per DTE bucket (11-30) is too small for a strong
+claim either way.
+
+### Section 15: lightweight 2600 reference
+
+Straddle-specific metrics were not recomputed for 2600 (would require a third full raw-tick
+rebuild, explicitly discouraged by "do not rerun full optimization"). Reused already-established
+2600 numbers: rapid re-entry <60s dropped from 19.1% (2600) to 5.4% (13K) -- a real structural
+improvement in churn. The whole-simulation P&L delta comparison from the prior command
+(2600: net helpful; 13K: net harmful) is noted but, per the correction above, should not be read as
+a clean "additional trades got worse" claim without the Group1/Group2 isolation this pass adds.
+
+### Full CSV
+
+`vc-13k-entry-quality.csv` (105 rows, full required field list: straddle/imbalance diagnostics,
+entry-history context including `IsAdditionalOpportunityFromInvalidation`, forward underlying +
+option MTM at +1/+2/+3/+4/+5 bars, actual trade outcome where executed under state-invalidation).
+
+### Reproduction
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-13k-entry-quality --out=vc-13k-eq
+```
+
+### Final answers (answered only these, as instructed)
+
+1. **Why are the additional 13K trades created by state-invalidation lower quality?** Narrower than
+   assumed -- Group2 is not obviously worse than Group1 on raw per-trade P&L overall (in fact B-side
+   Group2 looks somewhat *better*). The real, consistent weakness is specifically Pattern A's
+   additional trades: lower hit rate, lower positive-MTM%, near-zero median option MTM.
+2. **Does ATM straddle premium meaningfully separate good and bad entries?** Not cleanly -- no
+   monotonic relationship pooled, and Group2-specific buckets are too small (n=1-7) to trust.
+3. **Does normalized straddle outperform raw straddle?** Not tested as a head-to-head comparison in
+   this pass (Section 10 tested ATM-vs-band-median instead, per the task's own request), but
+   normalized straddle itself showed no cleaner relationship than raw premium would be expected to.
+4. **Does premium imbalance contain incremental information?** Possibly, but non-monotonically --
+   Mid-imbalance was the only profitable bucket pooled; not a simple "balanced/imbalanced" story.
+5. **Is band-median straddle materially different from ATM straddle?** No -- Pearson r=0.998,
+   near-perfectly redundant. The simpler ATM straddle is preferred.
+6. **Are bad entries primarily rapid re-entries?** No -- the large majority of additional entries
+   (17/24) occur >=300 seconds after the freeing exit, not in a rapid window.
+7. **Are they primarily entries after too much futures movement has already occurred?** No clean
+   evidence either way -- the pre-signal-move-tercile pattern is inconsistent between A and B.
+8. **Are any apparent premium relationships actually DTE effects?** No clear evidence of this, but
+   sample sizes per DTE bucket (11-30) are too small to rule it out confidently.
+9. **Which one or two entry variables have the strongest session-robust relationship?** None could
+   be confirmed session-robust in this pass -- Section 13's per-session check could not run at all
+   due to sample size (no session had enough entries in both extreme terciles). This is the
+   single most important limitation of this diagnostic: **the sample (105 entries, 24 additional)
+   is too small to establish session-robust entry-quality variables with confidence.**
+10. **Is there enough evidence to justify a pre-specified entry-gate experiment next?** Not yet, on
+    this evidence -- the one clean, redundant-variable finding (ATM straddle ~= band-median
+    straddle) simplifies future work, but no candidate variable cleared the session-robustness bar
+    Section 13 was designed to enforce. The Pattern-A-specific weakness in Group2 (Section 7) is
+    the most concrete lead, but on n=17 it is not yet strong enough to specify a gate. No gate was
+    implemented; no threshold proposed; 2026-09-24 was not used.
+
+## 2026-09-25: 6500x5 Rolling Candidate vs. 6500+180s and 13K+180s References
+
+New structural candidate: **6500-contract futures base bars + a rolling latest-5-bar aggregate
+context** (participation-based, not the 180s adaptive context), compared against **6500+180s**
+(isolates base-bar-size effect at the same refresh frequency as the candidate) and **13K+180s**
+(current primary reference, numbers reused from the already-completed participation-unit-compare
+and 13k-entry-quality studies -- not rebuilt a third time, per instruction). 10 validation sessions.
+2026-09-24 never queried.
+
+### Section 13: frequency and churn
+
+| | 6500+180s | 6500x5 | 13K+180s (reused) |
+|---|---:|---:|---:|
+| Total bars | 3,418 | 3,418 | 1,713 |
+| Median bar duration | 40.0s | 40.0s | 83.0s |
+| Transitions/hour | 9.74 | 10.43 | 4.48 |
+| Rapid re-entry <60s | 27/298 (9.1%) | 42/317 (13.2%) | 7/129 (5.4%) |
+| FullSurface entries/day (mean) | 24.5 | 24.5 | 10.5 |
+
+**Both 6500 variants have materially higher churn than 13K+180s -- refresh frequency (base-bar
+size), not context construction, is the dominant driver of churn.** Within the 6500 base size,
+the rolling-5 candidate is *not* cleaner than the adaptive-180s reference -- it has slightly
+*higher* transitions/hour (10.43 vs. 9.74) and *worse* rapid re-entry (13.2% vs. 9.1%).
+
+### Sections 10-11: forward response + matched control (+2/+4/+8 bars =~ 13K/26K/52K)
+
+| | 6500+180s A gap | 6500+180s B gap | 6500x5 A gap | 6500x5 B gap |
+|---|---:|---:|---:|---:|
+| ~13K (+2 bars) | 15.7pp | 16.9pp | 9.3pp | 9.2pp |
+| ~26K (+4 bars) | 17.1pp | 12.8pp | 10.2pp | 9.7pp |
+| ~52K (+8 bars) | 12.7pp | 18.2pp | 8.4pp | 10.7pp |
+
+Session robustness (+8 bars): 6500+180s A expected-sign 9/10, beats-control 8/10; B 8/10, 8/10.
+**6500x5: A expected-sign only 6/10, beats-control 6/10** -- visibly weaker and less
+session-consistent than both 6500+180s and the 13K+180s reference (whose earlier-measured gaps
+were 21.4pp/28.0pp at +1 bar and 11.9pp/20.3pp at +10 bars).
+
+**The rolling-5-bar candidate shows the weakest underlying separation of the three architectures
+tested to date** -- smaller gaps at every horizon and materially worse session consistency.
+
+### Trade simulation (state-invalidation as actual exit, sequential)
+
+| | N | Win% | Net P&L | PF | Trades/day |
+|---|---:|---:|---:|---:|---:|
+| 6500+180s | 214 | 44.4% | -71,750 | 0.65 | mean 21.4 |
+| 6500x5 | 200 | 46.5% | **+2,603** | **1.02** | mean 20.0 |
+| 13K+180s (reused) | 90 | 41.1% | -57,075 | 0.54 | mean 9.0 |
+
+6500x5 is the only architecture near breakeven on this metric, despite showing the weakest
+underlying matched-control separation above -- P&L and underlying robustness point in different
+directions here, consistent with this task's own warning not to judge by P&L alone.
+
+Additional (invalidation-created) entries: 6500+180s n=80 (fwd-hit 53.8%, posMTM 46.2%); 6500x5
+n=76 (fwd-hit 52.6%, posMTM 40.8%) -- both close to coin-flip, neither clearly better than the
+other, and both weaker than 13K's Group2 (whose B-side additional trades actually outperformed).
+
+### 09-18 / 09-09 diagnostic
+
+| Session | Architecture | FS entries | Transitions/hr | Inv trades | Additional | Net | PF |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 09-18 | 6500+180s | 20 | 7.20 | 16 | 7 | -6,640 | 0.67 |
+| 09-18 | 6500x5 | 11 | 5.44 | 9 | 4 | **+3,140** | **1.41** |
+| 09-18 | 13K+180s (reused) | 9 | -- | 8 | -- | -24,788 | 0.11 |
+| 09-09 | 6500+180s | 28 | 11.04 | 26 | 12 | +2,194 | 1.15 |
+| 09-09 | 6500x5 | 41 | 17.92 | 32 | 11 | **-6,406** | **0.69** |
+| 09-09 | 13K+180s (reused) | 13 | -- | 13 | -- | -5,526 | 0.48 |
+
+**09-18 does improve materially at 6500x5** (the only architecture where 09-18 turns net positive).
+But **09-09 gets worse at 6500x5** (the previously-strong session flips to a loss) -- exactly the
+trade-off this task's own framing anticipated: fixing 09-18's lifecycle problem does not come for
+free, and here it appears to cost useful continuation on 09-09.
+
+### Full CSVs
+
+`vc-6500plus180s-entries.csv`, `vc-6500x5-entries.csv` (245 rows each: TradingDate, Pattern,
+SignalTimestamp, FuturesEnd, IsAdditionalOpportunityFromInvalidation, Forward8Pts, OptionMtm4).
+
+### Reproduction
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-6500x5-vs-references --refIn=vc-13k-entry-quality.csv --out=vc-6500x5
+```
+
+### Final answers (answered only these, as instructed)
+
+1. **Does 6500x5 preserve the underlying FullSurface A/B relationship?** Weakly -- gaps are
+   positive at every horizon (8.4-10.7pp) but smaller than both references, and this is the
+   weakest underlying separation of any architecture tested to date.
+2. **Does it beat matched controls consistently across sessions?** Not as consistently as the
+   others -- A: 6/10 sessions expected-sign, 6/10 beat control (vs. 9/10 and 8/10 for 6500+180s).
+3. **Does 6500x5 materially reduce churn relative to 6500+180s?** No -- it is slightly *worse* on
+   both transitions/hour (10.43 vs. 9.74) and rapid re-entry (13.2% vs. 9.1%).
+4. **More useful opportunities than 13K+180s without 2600-style overtrading?** More opportunities,
+   yes (24.5/day vs. 10.5/day), but this is much closer to 2600's churn profile than to 13K's --
+   not a clean middle ground.
+5. **State-invalidation trades/day?** Mean 20.0/day, median 16/day (min 8, max 42).
+6. **Are rapid same-pattern re-entries materially reduced?** No -- worse than 6500+180s, and both
+   6500 variants are far above 13K+180s's 5.4%.
+7. **Higher or lower quality additional trades than 13K?** Similar-to-slightly-lower -- both 6500
+   variants' additional entries sit near coin-flip (52-54% forward hit, 41-46% positive MTM),
+   without 13K's B-side strength.
+8. **Does 09-18 improve structurally?** Yes, materially -- the only architecture where 09-18 turns
+   net positive (+3,140, PF 1.41).
+9. **Does 09-09 remain viable?** No -- it flips to a loss under 6500x5 (-6,406, PF 0.69), the
+   trade-off this task's framing anticipated.
+10. **Is the 6500x5 vs. 6500+180s difference attributable to participation-based context rather
+    than refresh frequency?** The comparison isolates exactly this, and the answer is: participation-
+    based (rolling-5) context is not cleaner than adaptive-180s context at the same refresh
+    frequency -- if anything it is measurably noisier (higher churn, weaker control gaps, worse
+    session consistency). The 6500-vs-13K difference (both far larger than the B-vs-C difference)
+    is overwhelmingly a refresh-frequency effect, not a context-construction effect.
+11. **Strong enough to replace 13K+180s as primary?** No -- on the criteria this task specified
+    (underlying robustness, churn, opportunity quality, session consistency, not P&L alone), 6500x5
+    is weaker than 13K+180s on every one of those axes except raw opportunity count, and it trades
+    09-18 improvement for 09-09 degradation rather than a clean win. 13K+180s remains the stronger
+    reference on non-P&L grounds despite 6500x5's better sequential P&L. No further architecture
+    was tested; 2026-09-24 was not used.
+
+## 2026-09-25: Directional Re-Entry Lock (13K+180s, Frozen)
+
+13K + 180s adaptive context now frozen as the primary market representation. Tests separating EXIT
+permission from RE-ENTRY permission: after an A trade exits via ATM-state invalidation, `AReentryLocked`
+blocks new A entries until an ATM Pattern B state is observed (any occurrence, not necessarily a new
+state entry or FullSurface-confirmed); symmetric for B. Three architectures on the SAME 10 validation
+sessions: **A** = corrected opposite-pattern baseline, **B** = unrestricted state-invalidation
+(already tested), **C** = state-invalidation + directional re-entry lock (new candidate). 2026-09-24
+never queried.
+
+### Reproduction check
+
+A: n=66, net=Rs.+58,379, PF=1.27 -- exact match to the 13k-trade-summary command. B: n=90,
+net=Rs.-57,075, PF=0.54 -- exact match to the earlier participation-unit-compare/atm-invalidation
+studies. Both reconcile exactly before trusting anything new.
+
+### Important correction to this task's own framing
+
+**09-09 was established as "the strongest validation session" for the 2600-contract architecture
+earlier in this project -- that does NOT carry over to 13K.** At 13K, under the original
+opposite-pattern baseline (A), 09-09 is actually the **worst** session (Rs.-55,473) -- the opposite
+of what the 2600-based framing assumed. This is reported directly rather than forced to fit the
+premise; it affects how Section 17's question is answered below.
+
+### Section 13: rupee decomposition (the central, most consequential finding)
+
+| Transition | Rupee effect |
+|---|---:|
+| Baseline (A) -> Same-entry invalidation counterfactual (**PURE EXIT EFFECT**) | **-110,593** |
+| Same-entry invalidation -> Unrestricted sequential (B) (**OPPORTUNITY-SET EXPANSION EFFECT**) | -9,731 |
+| Unrestricted sequential (B) -> Directional-lock (C) (**RE-ENTRY SUPPRESSION EFFECT**) | +7,556 |
+
+**This directly contradicts the premise this task was built on.** The task assumed "earlier exits
+make additional lower-quality trades available and those additional trades destroy much of the
+improvement" -- but at 13K, the pure exit-timing effect (-110,593) is more than 11x larger than the
+opportunity-set expansion effect (-9,731). Switching from opposite-pattern to state-invalidation
+exit is bad at 13K almost entirely because of the EXIT RULE ITSELF on the SAME entries, not because
+of the extra trades it enables. The directional lock recovers only Rs.+7,556 -- a real, positive,
+but small effect relative to the Rs.-110,593 pure exit-effect problem it does not touch.
+
+### Section 8-9: funnel and Suppressed vs. Retained
+
+Candidate C: 66 executed trades (A=36, B=30), mean 6.6/day. SuppressedReentryTrades: n=24 (A=17,
+B=7) -- and by construction, Retained (n=66) + Suppressed (n=24) = B's total (n=90) exactly.
+
+### Section 14: Pattern A vs. B -- the lock is NOT symmetric in effect despite being a symmetric rule
+
+| | Suppressed hit rate (+4) | Retained hit rate (+4) |
+|---|---:|---:|
+| A | 64.7% (n=17) | 72.2% (n=36) |
+| B | 71.4% (n=7) | 60.0% (n=30) |
+
+**For Pattern A, the lock cleanly removes weaker signals** (suppressed hit rate below retained).
+**For Pattern B, the opposite is true** -- suppressed trades actually have a *higher* hit rate than
+retained (71.4% vs. 60.0%, n=7 admittedly small). The symmetric rule does not produce a symmetric
+quality separation; it works as intended for A and may be mildly counterproductive for B.
+
+### Section 12: trade summary, A/B/C
+
+| | N | Win% | Net P&L | PF | Trades/day | Profitable sessions |
+|---|---:|---:|---:|---:|---:|---:|
+| A (baseline) | 66 | 40.9% | +58,379 | 1.27 | 6.6 | 5/10 |
+| B (unrestricted invalidation) | 90 | 41.1% | -57,075 | 0.54 | 9.0 | 2/10 |
+| C (directional lock) | 66 | 39.4% | -49,519 | 0.51 | 6.6 | 1/10 |
+
+C's trade count (66) exactly equals A's (both are the Retained population's cardinality, though
+NOT the same trades) -- coincidental given how many were suppressed. C remains deeply negative and
+is still far worse than simply keeping the original baseline.
+
+### Sections 15-17: session robustness, 09-18, 09-09
+
+vs. Unrestricted(B): 6/10 sessions improved, 3/10 worsened, 1/10 flat (09-08, delta exactly 0).
+Median improvement Rs.+641. Total delta Rs.+7,556 (matches Section 13's Transition 3 exactly).
+
+09-18: B net=-24,788 -> C net=-23,371 (PF 0.12) -- only a marginal nudge, not a fix; 2 trades
+suppressed. 09-09: B net=-5,526 -> C net=-4,578 (PF 0.53) -- also only a marginal nudge, and (per
+the correction above) 09-09 is not "the good session" at 13K to begin with -- it is negative under
+all three architectures tested.
+
+### Full CSVs
+
+`vc-reentry-lock-trades.csv` (222 rows, A/B/C tagged), `vc-reentry-lock-signals.csv` (105 rows,
+Retained/Suppressed flags, forward returns, option MTM).
+
+### Reproduction
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-directional-reentry-lock --out=vc-reentry-lock
+```
+
+### Final answers (answered only these, as instructed)
+
+1. **Does directional re-entry locking materially reduce the harmful opportunity-set expansion?**
+   Yes, in direction -- it recovers Rs.+7,556, all of which comes from removing net-loss-making
+   suppressed trades. But this is a small fraction of the total gap vs. baseline (Rs.-110,593 pure
+   exit effect dwarfs it).
+2. **Are the suppressed trades genuinely weaker?** For Pattern A, yes (64.7% vs. 72.2% hit rate).
+   For Pattern B, no -- suppressed trades actually show a *higher* hit rate than retained (71.4%
+   vs. 60.0%, small sample).
+3. **Does the candidate preserve most of the pure exit benefit of ATM-state invalidation?** There
+   is no "benefit" to preserve at 13K -- the pure exit effect itself is strongly negative
+   (-110,593), unlike at 2600 where it was strongly positive. The lock cannot fix this because it
+   only touches opportunity-set/re-entry, not the exit rule itself.
+4. **Trade frequency/day?** Mean 6.6/day, median 7/day (min 2, max 11).
+5. **Does the candidate improve both A and B, or predominantly one side?** Predominantly A -- the
+   suppression is quality-selective for A but not clearly so for B.
+6. **Is improvement session-robust?** Reasonably -- 6/10 improved, 3/10 worsened, 1/10 flat vs.
+   unrestricted invalidation. But "improved" here means less-bad, not profitable.
+7. **Does it preserve 09-09's good behavior while improving 09-18?** The premise does not hold at
+   13K -- 09-09 is not a good session here (it is the worst under the original baseline, net
+   -55,473). Under the invalidation-based architectures, both 09-18 and 09-09 are only marginally
+   nudged toward less-negative by the lock, neither meaningfully fixed.
+8. **Does DTE materially change the effect?** DTE=4 is the largest loss driver under Candidate C
+   (net -31,286, PF 0.26, 11 suppressed re-entries -- the most of any DTE bucket); DTE=5 is the
+   only profitable DTE bucket (net +3,494, PF 1.27).
+9. **Is the structural reset rule superior to unrestricted immediate re-entry, without a numerical
+   threshold?** Yes, on its own narrow terms -- it improves on unrestricted invalidation by
+   Rs.+7,556 using only the existing ATM state (no threshold). But it does not make
+   state-invalidation competitive with the original baseline at 13K.
+10. **Sufficiently stable to freeze before OOS?** No -- Candidate C remains net negative
+    (-49,519) and clearly worse than the original opposite-pattern baseline (+58,379) at this
+    architecture. The dominant problem (the pure exit-timing effect) is not addressed by this
+    rule. No further rule was implemented; 2026-09-24 was not used.
+
+## 2026-09-25: FINAL PRE-OOS FREEZE and Temporal OOS -- 2026-09-24
+
+Formal freeze of the final pre-OOS candidate: 13,000-contract futures base bars, 180s adaptive
+context, InsufficientHistory warm-up correction, ATM A/B state, ATM+/-2 FullSurfaceAgreement entry
+confirmation, ATM execution (10 lots), existing costs/entry cutoff/mandatory close, and the
+**ORIGINAL opposite-pattern exit** (not ATM-state-invalidation, not the directional lock). Freeze
+record written to `vc-13k-final-pre-oos-freeze.json` **before** 2026-09-24 was loaded. Only after
+exact reconciliation against the established validation result did the command proceed to load
+2026-09-24 -- the first and only time in this project's history that session has been queried.
+
+### Validation reproduction (exact reconciliation, gate passed)
+
+N=66, WinRate=40.9%, PF=1.27, NetPnl=Rs.58,379 -- **exact match** to the established reference.
+105 total FullSurface signals, 66 executed (39 blocked by the one-position rule or after-cutoff).
+A: N=36, NetPnl=Rs.52,654, PF=1.40. B: N=30, NetPnl=Rs.5,725, PF=1.07. Profitable sessions 5/10;
+best=2026-09-15 (+89,214); worst=2026-09-09 (-55,473).
+
+### Underlying statistical evidence (not P&L-driven freeze justification)
+
++1/+2/+4-bar matched-control gaps: A 24.1pp/18.1pp/22.6pp; B 22.4pp/20.6pp/14.0pp -- all six
+positive. Session consistency: A expected-median-sign 8/10, beats-control **10/10**; B
+expected-median-sign 7/10, beats-control 6/10.
+
+### TEMPORAL OOS -- 2026-09-24 (Expiry 2026-09-29, DTE=5, 328 bars)
+
+**Layer A (signal production):** 11 A signals + 7 B signals = 18 total. Historical validation
+signals/day range: min=6, P25=8, median=11, P75=13, max=16. **OOS (18) sits above the historical
+max** -- reported directly, not treated as disqualifying per instruction ("do not reject merely
+because count differs").
+
+**Layer B (underlying directional behavior):** A hit rates +1/+2/+4 = 54.5%/36.4%/63.6% (median
+pts 0.70/-0.30/4.00). B hit rates = 57.1%/42.9%/57.1% (median pts 0.80/-0.10/6.00). The +2 horizon
+dips below 50% for both patterns -- a real, reported weak spot, not smoothed over. Within-session
+matched control (+4 bars): A-ctrl hit%=64.3% (n=28) -- essentially equal to A's own 63.6%, i.e. **A
+does not clearly beat its own same-session control on this one day**. B-ctrl hit%=43.3% (n=30) --
+B's 57.1% clearly beats this, a positive gap similar in direction to validation.
+
+**Layer C (option translation):** A: 50% positive MTM at all three horizons (mean% -0.16/-1.37/+0.41),
+MFE=27.41, MAE=14.40. B: 40% positive MTM at all three horizons, all three means negative
+(-1.59/-1.91/-1.77), MFE=4.01, MAE=7.59 -- weaker translation on the B side specifically.
+
+**Layer D (actual frozen trading lifecycle):** 11 executed (A=6, B=5). WinRate=27.3% (most trades
+individually lost), but PF=1.66 and **NetPnl=Rs.+26,640** -- a classic skewed long-option payoff
+(few large winners offsetting many small losers), consistent with the strategy's own established
+character rather than a new pattern. Median holding 1,674s. All 11 exits were OppositePatternSignal
+(no ForcedEod) -- the exit rule always found a valid opposite signal before the 15:15 cutoff.
+
+### Section 9: OOS vs. validation range
+
+| Metric | Val min | P25 | Median | P75 | Val max | OOS |
+|---|---:|---:|---:|---:|---:|---:|
+| Trades/day | 2 | 4 | 6 | 8 | 11 | **11** (=max) |
+| NetPnl/day | -55,473 | -8,169 | -765 | 21,709 | 89,214 | **+26,640** (between P75 and max) |
+| PF/day | 0.00 | 0.27 | 0.72 | 2.66 | 12.56 | **1.66** (between median and P75) |
+
+OOS trade count sits exactly at the historical maximum; Net P&L and PF both land comfortably
+within the historical range, on the healthier side of it (above median, below max).
+
+### Section 10: failure attribution (8 OOS losers)
+
+UnderlyingSignalWrong=4, UnderlyingCorrectOptionLost=0, InitiallyFavorableThenReversed=0,
+ExitLifecycleGiveback=4, Ambiguous=0. An even split between signal failure and exit-lifecycle
+giveback -- no single dominant failure mode on this one day.
+
+### Interpretation category: MIXED
+
+Most layers are broadly consistent with validation behavior (trade lifecycle P&L/PF within range,
+B's control-beat consistent with validation, signal count at-but-not-wildly-outside the historical
+edge). But one layer materially diverges: **A does not clearly beat its own same-session matched
+control on this single day** (63.6% vs. 64.3%, essentially flat), unlike the strong, consistent
+10/10 session beat-rate seen across the 10 validation sessions. This is not evidence the underlying
+A/B relationship is *contradictory* (nothing points the opposite direction), but it is a real,
+single-layer divergence significant enough that this observation is placed in **MIXED**, not
+CONSISTENT_WITH_VALIDATION.
+
+### Full CSVs and freeze record
+
+`vc-13k-final-pre-oos-freeze.json` (the freeze record, written before 09-24 was loaded),
+`vc-oos-0924-signals.csv` (18 rows), `vc-oos-0924-trades.csv` (11 rows).
+
+### Reproduction
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-final-freeze-oos --out=vc-final-freeze
+```
+
+**Per the task's own rule: 2026-09-24 is now consumed. It must not be reused as validation for any
+future modified strategy -- any future change must be assessed on later, still-unseen sessions.**
+
+### Final answers (answered only these, as instructed)
+
+1. **Did the final frozen validation baseline reproduce exactly?** Yes -- N=66, NetPnl=Rs.58,379,
+   PF=1.27, exact match, before 09-24 was ever loaded.
+2. **What exactly was frozen before OOS?** 13,000-contract base bars; 180s adaptive context;
+   InsufficientHistory warm-up correction; ATM A/B signal definition; ATM+/-2 FullSurfaceAgreement
+   (5/5 CE and 5/5 PE required); state-entry-only episode eligibility; ATM execution (10 lots);
+   existing quote/cost/cutoff/close mechanics; the ORIGINAL opposite-pattern exit (explicitly not
+   state-invalidation, not the directional lock) -- full record in the freeze JSON.
+3. **How many FullSurface A/B state entries occurred on 09-24?** 11 A + 7 B = 18 total.
+4. **Did their underlying directional behavior resemble the validation distribution?** Partially --
+   hit rates were positive at +1 and +4 for both sides but dipped below 50% at +2 for both; broadly
+   in the same direction as validation but noisier on this single day.
+5. **Did they beat same-session matched controls, where measurable?** B did clearly (57.1% vs.
+   43.3%). A did not clearly (63.6% vs. 64.3%, essentially flat) -- the single most notable
+   divergence from validation, where A beat its control in 10/10 sessions.
+6. **How well did the signal translate into the pinned ATM options?** Weakly-to-mixed -- 50%
+   (A) and 40% (B) positive MTM across horizons, with B's mean MTM negative at all three horizons.
+7. **What were the exact frozen trade results?** 11 trades (A=6, B=5), WinRate=27.3%, PF=1.66,
+   GrossPnl=Rs.27,203, Costs=Rs.563, NetPnl=Rs.26,640, median holding 1,674s, all exits via
+   OppositePatternSignal.
+8. **Were losses primarily signal, translation, or lifecycle failures?** Evenly split -- 4 of 8
+   losers were UnderlyingSignalWrong, 4 were ExitLifecycleGiveback; zero were pure translation
+   failures or favorable-then-reversed.
+9. **CONSISTENT_WITH_VALIDATION, MIXED, or CONTRADICTORY?** **MIXED** -- trade lifecycle P&L/PF
+   and B's control-beat are consistent with validation; A's failure to clearly beat its own
+   same-session control is a real, single-layer divergence that keeps this from being a clean
+   CONSISTENT_WITH_VALIDATION call. Nothing here is CONTRADICTORY (no layer shows the underlying
+   relationship running opposite to validation evidence).
+10. **What to investigate next, without modifying or retesting 09-24?** Whether Pattern A's
+    matched-control separation is reliably weaker at short/medium horizons specifically (the +2
+    dip and the flat same-session control result both point at A, not B) -- using only the
+    existing validation sessions and any future unseen sessions, never 09-24 again. This is an
+    observation to carry forward, not a strategy change made now.
+
+## 2026-09-25: Option-Momentum Entry/Exit Hypothesis (13K+180s, Frozen)
+
+One predeclared hypothesis on the frozen 13K architecture (2026-09-24 not used -- already consumed
+as OOS): enter FullSurface A/B signals only when the exact pinned option itself shows positive
+momentum (`CurrentBarAverage > mean of the previous 5 completed 13K-bar averages`, same token
+throughout); exit on pattern invalidation OR option-momentum invalidation, whichever fires first.
+`OptionBarAveragePrice` reuses `SynchronizedOptionEventBar.AverageLtp` verbatim (arithmetic mean of
+every real LTP print strictly inside that bar's interval) -- not a new formula, confirmed by
+inspecting the codebase first as instructed. 10 validation sessions only.
+
+### Reproduction check
+
+Strategy A (frozen baseline): N=66, Net=Rs.58,379 -- exact match, confirmed before trusting B/C.
+
+### Section 10-11: entry condition, Pass vs. Fail
+
+Momentum classification: 60 Pass, 42 Fail, 3 Unavailable (of 105 total signals). **The entry
+condition does not cleanly select stronger signals.** For Pattern A, MomentumFail actually matches
+or *beats* MomentumPass at every horizon on both underlying hit rate (+2: 67.9% vs. 50.0%; +4:
+66.7% vs. 70.0%, roughly tied) and option translation (positive-MTM% at +4: 74.1% Fail vs. 50.0%
+Pass -- Fail is materially *better*). For Pattern B, Pass is modestly ahead of Fail on underlying
+hit rate at +1/+2 but Pass's own option translation weakens at +4 (41.4% positive-MTM vs. Fail's
+50.0%). Session robustness: 4/10 sessions show Pass>Fail, 2/10 show Fail>Pass, 3/10 too small.
+
+### Section 16: headline comparison
+
+| | N | Win% | PF | Net P&L | Trades/day |
+|---|---:|---:|---:|---:|---:|
+| A (Baseline) | 66 | 40.9% | 1.27 | +58,379 | 6.6 |
+| B (Momentum entry only) | 45 | 31.1% | 1.12 | +19,591 | 4.5 |
+| C (Momentum entry + dual-invalidation exit) | 52 | 34.6% | **0.40** | **-45,150** | 5.2 |
+
+Momentum entry alone (B) already gives up more than half the baseline's Net P&L. Adding the
+dual-invalidation exit (C) is far worse -- deeply net negative, despite momentum entry filtering
+supposedly removing weaker signals.
+
+### Section 18: exit-reason analysis -- the central finding
+
+| Exit reason | N | Net P&L | Profitable% |
+|---|---:|---:|---:|
+| PatternInvalidation | 40 | -3,440 | 42.5% |
+| OptionMomentumInvalidation (alone) | 1 | -1,661 | 0.0% |
+| **Both (same bar)** | **11** | **-40,048** | **9.1%** |
+
+**Momentum invalidated before pattern invalidation in only 1 of 44 same-entry cases.** Option
+momentum essentially never provides an independent, earlier warning -- it almost always fires
+exactly when the pattern itself invalidates, and in the rare cases both conditions agree
+simultaneously ("Both"), that population is catastrophically bad (net -40,048, only 9.1%
+profitable) -- accounting for the overwhelming majority of Strategy C's total loss.
+
+### Section 19: MFE capture
+
+Median CaptureRatio: B=-0.52, C=**-0.67** (worse, not better). Median seconds Entry->MFE=**28s**,
+vs. Entry->MomentumInvalidation=149s and Entry->PatternInvalidation=149s (identical, confirming
+Section 18's finding that they coincide). **The favorable excursion typically occurs and fades
+within 28 seconds of entry -- both exit conditions arrive far too late (149s) to capture it,** and
+the dual-condition exit does not improve on this at all.
+
+### Section 20: exit flicker -- confirmed and severe
+
+**41 of 52 Strategy C trades (79%) exited within 1 base bar of entry.** 100% exited within 2 bars.
+Median holding: 1 bar / 156 seconds. This is exactly the "excessive flicker" pattern the task asked
+to watch for, and it is severe -- the option-average condition is highly unstable immediately after
+entry, consistent with why the dual-invalidation exit performs so poorly.
+
+### Section 21: per-session robustness
+
+C vs. A: improved in 4/10 sessions, worsened in 6/10. Net excluding the best session (09-11, the
+only large positive contributor) = -48,886 (even worse). Net excluding the worst session (09-18)
+= -30,656 (still deeply negative). Not a session-level artifact -- broadly bad.
+
+### Section 22: DTE descriptive
+
+Strategy C is net negative at **every single DTE bucket** (0, 1, 4, 5, 6) -- no DTE-level silver
+lining. Strategy B (entry-only) is strongly positive at DTE=0 (PF 8.59, n=13) and DTE=4 (PF 2.16,
+n=12) but catastrophic at DTE=6 (PF 0.24, net -67,440, n=14) -- descriptive only, no rule created.
+
+### Full CSVs
+
+`vc-option-momentum-signals.csv` (105 rows), `vc-option-momentum-trades-C.csv` (52 rows).
+
+### Reproduction
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-option-momentum --out=vc-option-momentum
+```
+
+### Final answers (answered only these, as instructed)
+
+1. **Does OptionMomentumPass select stronger underlying A/B signals than MomentumFail?** No, not
+   cleanly -- for Pattern A, Fail matches or beats Pass at every horizon; for Pattern B, Pass is
+   modestly ahead only at short horizons.
+2. **Does it materially improve the forward behavior of the exact option purchased?** No -- for
+   Pattern A, Fail's positive-MTM% is materially *better* than Pass's (74.1% vs. 50.0% at +4).
+3. **Is the improvement present for both A->PE and B->CE?** No improvement is clearly present for
+   either side; if anything the effect runs backward for A.
+4. **Does the entry condition reduce trade count without destroying session robustness?** It
+   reduces trade count (66->45) but at real cost -- Net P&L drops by more than half even before
+   the exit change, and only 4/10 sessions showed Pass beating Fail.
+5. **How does Momentum Entry-only compare with the frozen baseline?** Worse -- Net P&L Rs.19,591
+   vs. Rs.58,379, PF 1.12 vs. 1.27, on fewer trades.
+6. **On identical MomentumPass entries, does the dual-invalidation exit improve outcomes?** No --
+   median CaptureRatio worsens (-0.52 to -0.67) and the exit-reason breakdown shows the "Both"
+   population is severely damaging.
+7. **Does option-momentum invalidation normally occur before pattern invalidation?** No --
+   essentially never (1 of 44 same-entry cases). It almost always coincides with pattern
+   invalidation rather than providing an independent earlier signal.
+8. **Does the new exit reduce MFE giveback, or exit too early because of flicker?** The latter --
+   79% of trades exited within a single base bar, and MFE itself typically occurs at just 28
+   seconds post-entry while both exit conditions lag to ~149 seconds -- far too late to capture it,
+   and the dual condition does not fix this.
+9. **In the full sequential candidate, does earlier position availability help or hurt?** It
+   creates more trades (52 vs. 45) but the added volume compounds an already-losing exit rule
+   rather than offsetting it -- net effect strongly negative.
+10. **Is the complete hypothesis strong and robust enough to freeze for future unseen-session
+    testing?** No -- it underperforms the frozen baseline on entry alone, and the exit
+    specifically is dominated by severe same-bar flicker and a catastrophic "Both" population.
+    Not implemented as a rule change; the frozen 13K baseline (opposite-pattern exit) remains the
+    reference. No parameter of this rule was modified after seeing the results; 2026-09-24 was
+    not used.
+
+## 2026-09-25: Forward-Validation Framework (Strategy Version 13K_180S_FULLSURFACE_V1)
+
+Strategy-development experiments on the historical validation sessions are now stopped. Built a
+deterministic, idempotent, reusable forward-validation workflow for the FROZEN strategy version
+**`13K_180S_FULLSURFACE_V1`** (13,000-contract base bars, 180s adaptive context, warm-up
+correction, ATM A/B, ATM+/-2 FullSurfaceAgreement, state-entry-only eligibility, ATM execution, 10
+lots, existing costs/cutoff/close, ORIGINAL opposite-pattern exit, one position) -- no parameter
+differs from the pre-OOS freeze. 2026-04 through 2026-09-24 remain research/OOS data, never
+reprocessed here.
+
+### Operational note: a real compiler/runtime bug found and fixed before this command could run
+
+The first attempt to add this workflow inline (as every other command in `Program.cs` has been
+added all session) produced `System.InvalidProgramException: Common Language Runtime detected an
+invalid program` at startup -- and critically, this broke **every** command in the file, not just
+the new one (confirmed: even the simple session-discovery command that worked minutes earlier
+crashed the same way immediately after the addition, and a clean `obj`/`bin` rebuild did not fix
+it). Root cause: `Program.cs`'s entire top-level-statements file compiles into a single, enormous
+`Main` method (18,000+ lines, dozens of async local functions accumulated across this session's
+many commands) -- adding one more large async-closure-heavy block apparently crossed a real
+Roslyn/CLR code-generation limit for that one method. Fixed by extracting the new workflow into its
+own class (`ForwardValidationRunner.cs`, a `public static async Task<int> RunAsync(...)` method),
+matching this project's existing convention of extracting standalone logic into its own file, with
+only a 10-line dispatch stub left in `Program.cs`. Rebuilt clean (0 warnings), reran the full test
+suite (1075/1075 passing), and explicitly reverified the previously-broken command now works again
+before trusting the new one.
+
+### Framework behavior (idempotency verified)
+
+- Strategy version freeze: `vc-forward-v1-13K_180S_FULLSURFACE_V1-freeze.json` written by reusing
+  `vc-13k-final-pre-oos-freeze.json`'s content verbatim (content-equality confirmed, not
+  re-derived) plus a `StrategyVersion` tag. Immutable -- a second run confirmed it is detected as
+  already existing and not rewritten.
+- Session discovery: queries the DB for futures data strictly after 2026-09-24, excludes the 13
+  known research/OOS dates, and excludes any date already present in the accumulated signals CSV.
+  A second run with no new sessions correctly reported "0 newly available, unprocessed sessions"
+  and took no action -- idempotency confirmed directly, not assumed.
+- Signals/trades CSVs are strictly append-only; the cumulative summary (win rate, PF, equity,
+  drawdown) is fully recomputed from the accumulated file on every run, never itself appended to.
+
+### First forward session: 2026-09-25 (1 of 10 target sessions)
+
+Only one new session was available today. **Data-quality caveat, reported directly**: the
+session's last-tick timestamp was observed to move non-monotonically across three checks during
+this same working session (15:35 -> 09:57 -> 11:24 IST), consistent with today's feed still being
+actively ingested/reprocessed rather than a stable, closed trading day. This result should be
+treated as provisional until the session is confirmed settled; it is NOT proposed as a reason to
+discard or rerun it (per instruction, results are recorded regardless of how they look).
+
+FullSurface signals: A=1, B=6 (7 total). Executed: A=1, B=3 (4 total). WinRate=75.0%, PF=157.26,
+NetPnl=Rs.+27,423. A hit rate 100% (n=1, trivially small). B hit rate 66.7-83.3% across horizons
+(n=6), but B's own same-session matched control shows only 33.3% (n=9) -- a wide gap in B's favor
+on this one day, though a single session proves nothing statistically. 1 loser, classified
+UnderlyingSignalWrong. Cumulative equity: final=peak=Rs.27,423, maxDrawdown=Rs.176 (rupee terms
+only -- no initial capital figure has been frozen for this project, so a percentage drawdown was
+not computed, per instruction not to invent one).
+
+### Full CSVs and freeze record
+
+`vc-forward-v1-13K_180S_FULLSURFACE_V1-freeze.json`, `vc-forward-v1-signals.csv` (7 rows),
+`vc-forward-v1-trades.csv` (4 rows). All three are append-only/immutable going forward and will
+grow as more sessions become available.
+
+### Reproduction (safe to rerun daily -- automatically skips already-processed sessions)
+
+```
+dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-forward-validation --out=vc-forward-v1
+```
+
+### Status
+
+1 of 10 target forward sessions collected. The end-of-10-session review (comparing historical
+validation, the 2026-09-24 OOS observation, and this forward set as three separate, never-pooled
+populations) is explicitly deferred until all 10 are available, per instruction. No strategy
+parameter was modified. 2026-09-24 was not touched by this command.

@@ -12,6 +12,10 @@ re-deriving them.
 - [`docs/REVIEW_FINDINGS.md`](docs/REVIEW_FINDINGS.md) — the external-review tracker: findings
   from any outside review (a person, a friend, an AI), checked against actual current code
   before being trusted, with fixed/open status kept current.
+- [`docs/BACKTEST_RULES.md`](docs/BACKTEST_RULES.md) — the 15 rules that apply to every backtest,
+  research experiment and trade simulation (one-hypothesis-at-a-time, no look-ahead, same-entry
+  vs. opportunity-set separation, OOS integrity, etc.). Apply this alongside the quant/scoring
+  principles below whenever running or designing a backtest.
 
 ## The one rule everything else follows
 

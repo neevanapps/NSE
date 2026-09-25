@@ -8006,3 +8006,335 @@ touched.
 > 2026-09-23 onward: further option-PRICE crossover work (EMA/SMA comparison, entry-premium-band
 > fix, and all subsequent price-only strategy experiments) moved to `docs/Price_Based_Findings.md`
 > to keep this session's price-based track separate and easy to read start to finish.
+
+## Out-of-sample check, 2026-09-21 to 2026-09-24 -- futures composite crossover (2026-09-25)
+
+Revisiting the **locked futures composite score crossover** (8 fast / 40 slow / 5-point threshold,
+2600 bars, `SessionGatedDepthDurationConfirmed` metric, adopted "for continued tracking" back on
+2026-09-18) -- not touched since. Ran the exact same `crossover` CLI command with the identical
+locked parameters (no retuning) across the four sessions since the last check: 2026-09-21 through
+2026-09-24. `TradeSimulator.SimulateCrossoverDayAsync` unchanged; entry/exit mechanics unchanged.
+
+**Data note**: 09-23 and 09-24 were not yet populated in the `niftysignal_volume_bars` database at
+threshold=2600 (first run of the command produced silent zero-trade output for those two days,
+which would have been misread as a real finding) -- populated them first (544 and 1290 bars
+respectively), then reran cleanly. Flagging this explicitly since an unpopulated day and a
+genuinely quiet day look identical in the command's own output otherwise.
+
+| Date | Trades | Win Rate | Net (pts) |
+|---|---:|---:|---:|
+| 2026-09-21 | 10 | 30.0% | -12.50 |
+| 2026-09-22 | 16 | 25.0% | +4.90 |
+| 2026-09-23 | 13 | 38.5% | -29.40 |
+| 2026-09-24 | 29 | 37.9% | +12.00 |
+| **Total** | **68** | **33.8%** | **-25.00** |
+
+**Materially worse than the locked backtest expectation** (52.7% win rate, +241.45 net over 74
+trades / 10.6 trades-per-day, established 2026-09-18): win rate is now well below a coin flip on
+every one of these 4 days (25.0-38.5% vs. the expected ~53%), and the pooled 4-day net is negative
+(-25.00 vs. an expectation of roughly +138 pro-rated for 4 days at the backtested per-trade rate).
+Trade frequency is also elevated -- 17.0 trades/day pooled, and 09-24 alone fired 29 trades in one
+session, well above both the original 7-20/day target band and the 10.6/day the locked combo was
+chosen partly for. This is the same over-firing failure mode the very first (4/12/2) sweep showed
+back on 2026-09-18, now reappearing at the "confirmed" 8/40/5 combo on a specific day.
+
+**Verdict: the "PROMISING, still not fully confirmed" status from 2026-09-18 is not holding up.**
+One single out-of-sample day (6 trades) was never enough to confirm this combo by the project's own
+stated standard, and this second, larger out-of-sample check (4 days, 68 trades) now shows a
+materially worse win rate and a negative pooled net. Per the project's backtest-rules discipline
+(`docs/BACKTEST_RULES.md` rule 15: accept negative results without repeatedly retuning until
+history turns positive) -- **no parameter was changed in response to this result.** The locked
+8/40/5/2600 config is not re-tuned here; if this strategy is to be revisited, it needs a fresh
+hypothesis (why win rate collapsed, whether 09-24's 29-trade day reflects an unusual regime) rather
+than another parameter sweep chasing this specific 4-day window.
+
+### Same 4-day OOS check, the OTHER locked live strategy: `OptionsScoreThreeWaySwitchMaxPainConfirmed` @ 2600/90, band=5
+
+This is the options-side percentile-threshold strategy (NOT the crossover mechanism -- the
+crossover variant of this same metric was already swept and explicitly **NOT ADOPTED**, see above).
+Run via the `trade` command (not `crossover`), exact locked parameters, no retuning: `trade
+<fromDate> <toDate> OptionsScoreThreeWaySwitchMaxPainConfirmed 90 15 2600 --band=5`.
+
+**Same data-population gap found again**: this metric additionally needs `populate-options-depth`
+(band=5) and `populate-options-maxpain` data, neither of which existed yet for 09-23/09-24 either
+-- populated both (544 and 1290 rows each) before trusting the "0 trades" result those two days
+initially showed.
+
+| Date | Trades | Win Rate | Net (pts) |
+|---|---:|---:|---:|
+| 2026-09-21 | 7 | 71.4% | -5.10 |
+| 2026-09-22 | 19 | 36.8% | +10.15 |
+| 2026-09-23 | 2 | 100.0% | +25.60 |
+| 2026-09-24 | 2 | 0.0% | -14.10 |
+| **Total** | **30** | **46.7%** | **+16.55** |
+
+Trade frequency: 7.5 trades/day, close to the locked backtest's own 9.33/day (112 trades / 12
+days). Win rate (46.7%) is well below the locked backtest's 64.3%, but **unlike the futures
+crossover strategy, this one stayed net POSITIVE** over the same 4 days (+16.55 pts vs. the futures
+crossover's -25.00). Notably thin sample on the last two days specifically (2 trades each) --
+09-23's own win rate (100%, n=2) and 09-24's (0%, n=2) are both far too small individually to read
+into; only the pooled 30-trade total is worth weighing at all.
+
+**Side-by-side, same 4 OOS days:**
+
+| Strategy | Trades | Win Rate | Net (pts) | Locked backtest win rate |
+|---|---:|---:|---:|---:|
+| Futures crossover (8/40/5, 2600) | 68 | 33.8% | -25.00 | 52.7% |
+| Options score (2600/90, band=5) | 30 | 46.7% | +16.55 | 64.3% |
+
+Both strategies show a win-rate decline from their own locked backtests on this window, but the
+futures crossover's decline is far more severe (-18.9pp vs. -17.6pp is similar in points, but the
+futures side also turned net-negative while the options side did not). Per Rule 15, **no parameter
+of either strategy was changed in response to this result** -- both remain exactly as locked.
+
+## Full confirmed-candidate OOS sweep, 2026-09-21 to 2026-09-25 (2026-09-25)
+
+Extends the two checks above to all 11 other individually-confirmed standalone metrics per
+`docs/VOLUME_BAR_METRICS_GUIDE.md`, each run **separately** (not pooled) at its own locked
+config, and extends the two switches above (futures crossover, options-score switch) to also
+include 2026-09-25, which synced with full data today. Per `docs/BACKTEST_RULES.md` Rule 15, no
+parameter of any strategy below was changed in response to these results -- every config is
+exactly as previously locked.
+
+**Data-population gap found before running anything**: 2026-09-21 and 2026-09-22 had base volume
+bars from earlier work, but had **never** had `populate-options-atm`, `populate-options-band-flow`,
+`populate-options-oi`, or `populate-options-skew25delta` run against them at all (these came back
+"Populated," not "AlreadyPopulated," on first attempt). Populated all of the following across all
+5 sessions before trusting any result: base volume bars @ 650/1300/2600, `populate-options-atm`
+@1300, `populate-options-band-flow` @1300/band=3, `populate-options-oi` @650/band=3,
+`populate-options-skew25delta` @1300, `populate-options-depth` @2600/band=5 and @1300/band=3, and
+`populate-options-maxpain` @2600 (only 09-25 needed the last three; 09-21..09-24 already had them
+from the two prior checks above).
+
+**DTE check** (`vc-list-dte`): 09-21 DTE=1, **09-22 DTE=0 (expiry day)**, 09-23 DTE=6, 09-24 DTE=5,
+09-25 DTE=4. Per this project's established convention, `AtmIvChangeRaw`, `NotionalCallPutVolumeDelta`,
+and `NotionalOiDelta` are DTE-gated (0-DTE normally excluded from their backtests) -- 09-22's row is
+reported below but should be read as the excluded/flagged day for those three metrics specifically,
+not pooled into a "should count" total.
+
+### Futures-side confirmed metrics
+
+**DepthImbalance @ 650/93, stop=30%**
+
+| Date | Trades | Win Rate | Net (pts) |
+|---|---:|---:|---:|
+| 2026-09-21 | 5 | 60.0% | -3.40 |
+| 2026-09-22 | 17 | 41.2% | +7.15 |
+| 2026-09-23 | 5 | 80.0% | +51.45 |
+| 2026-09-24 | 12 | 58.3% | +27.45 |
+| 2026-09-25 | 6 | 50.0% | +59.40 |
+| **Total** | **45** | **53.3%** | **+142.05** |
+
+Net positive every day but one, positive total. Consistent with its status as one of "the two
+strongest standalone futures metrics" per the metrics guide.
+
+**BarDurationUrgency @ 2600/90**
+
+| Date | Trades | Win Rate | Net (pts) |
+|---|---:|---:|---:|
+| 2026-09-21 | 8 | 50.0% | -10.10 |
+| 2026-09-22 | 27 | 55.6% | +7.35 |
+| 2026-09-23 | 11 | 36.4% | -25.15 |
+| 2026-09-24 | 23 | 43.5% | +41.85 |
+| 2026-09-25 | 29 | 37.9% | -18.10 |
+| **Total** | **98** | **44.9%** | **-4.15** |
+
+Roughly flat/net-flat over this window -- 3 losing days out of 5, total net essentially breakeven
+despite being the other "strongest standalone futures metric" in the guide. High trade count
+(98 over 5 days, ~19.6/day) is well above the project's 5-10 trades/day strategy target -- this is
+a standalone-metric diagnostic run, not the production cadence.
+
+**TopOfBookImbalance @ 2600/80**
+
+| Date | Trades | Win Rate | Net (pts) |
+|---|---:|---:|---:|
+| 2026-09-21 | 11 | 54.5% | +5.45 |
+| 2026-09-22 | 15 | 40.0% | +23.90 |
+| 2026-09-23 | 10 | 60.0% | +26.05 |
+| 2026-09-24 | 42 | 59.5% | +60.20 |
+| 2026-09-25 | 26 | 53.8% | +77.45 |
+| **Total** | **104** | **54.8%** | **+193.05** |
+
+Net positive every single day, the strongest result of the whole sweep (both futures- and
+options-side). Trade count (104 over 5 days) is also well above the 5-10/day target band.
+
+**SessionGatedDepthDurationConfirmed @ 2600/90 (percentile-threshold mode, not the crossover)**
+
+| Date | Trades | Win Rate | Net (pts) |
+|---|---:|---:|---:|
+| 2026-09-21 | 7 | 57.1% | +5.85 |
+| 2026-09-22 | 27 | 59.3% | +21.90 |
+| 2026-09-23 | 10 | 40.0% | -1.35 |
+| 2026-09-24 | 23 | 43.5% | +40.65 |
+| 2026-09-25 | 23 | 39.1% | -1.65 |
+| **Total** | **90** | **47.8%** | **+65.40** |
+
+Net positive total, 3 of 5 days positive. Note this is the locked switch's own percentile-mode
+entry (`trade` command), a **different entry mechanism** from the crossover-mode result reported
+in the section above (`crossover` command, dual-MA) -- the two are not directly comparable despite
+sharing the same underlying metric.
+
+**Futures crossover (8/40/5, 2600) -- extended to include 09-25**
+
+| Date | Trades | Win Rate | Net (pts) |
+|---|---:|---:|---:|
+| 2026-09-21 | 10 | 30.0% | -12.50 |
+| 2026-09-22 | 16 | 25.0% | +4.90 |
+| 2026-09-23 | 13 | 38.5% | -29.40 |
+| 2026-09-24 | 29 | 37.9% | +12.00 |
+| 2026-09-25 | 21 | 23.8% | -73.65 |
+| **Total** | **89** | **31.5%** | **-98.65** |
+
+Adding 09-25 makes the crossover result markedly worse than the 4-day check above (-25.00 -> now
+-98.65 over 5 days), driven by a particularly bad 09-25 (23.8% win rate, -73.65 pts on 21 trades).
+Reinforces the prior verdict: the crossover's "PROMISING, still not fully confirmed" status from
+2026-09-18 does not hold up on this OOS window.
+
+### Options-side confirmed metrics
+
+**AtmIvChangeRaw @ 1300/97 (DTE-gated -- 09-22 flagged, not pooled into the gated total)**
+
+| Date | Trades | Win Rate | Net (pts) |
+|---|---:|---:|---:|
+| 2026-09-21 | 2 | 100.0% | +23.25 |
+| 2026-09-22 (DTE=0, flagged) | 22 | 72.7% | +43.60 |
+| 2026-09-23 | 15 | 93.3% | -2.65 |
+| 2026-09-24 | 32 | 81.2% | -4.40 |
+| 2026-09-25 | 8 | 62.5% | +2.60 |
+| **Total incl. 09-22** | **79** | **79.7%** | **+62.40** |
+| **Total excl. 09-22 (DTE-gated)** | **57** | **81.4%** | **+18.80** |
+
+Very high win rate throughout (81.4% ex-09-22), modest net positive. Note 09-22 alone (0-DTE,
+normally excluded) contributed the largest single-day net (+43.60) despite having the most trades
+-- consistent with why this metric's own convention excludes 0-DTE days rather than reading them
+as representative.
+
+**AtmIvChangePriceSigned @ 1300/97 (no DTE gate)**
+
+| Date | Trades | Win Rate | Net (pts) |
+|---|---:|---:|---:|
+| 2026-09-21 | 2 | 100.0% | +18.35 |
+| 2026-09-22 | 12 | 66.7% | -3.15 |
+| 2026-09-23 | 8 | 75.0% | +23.40 |
+| 2026-09-24 | 12 | 33.3% | -8.05 |
+| 2026-09-25 | 2 | 100.0% | +45.10 |
+| **Total** | **36** | **61.1%** | **+75.65** |
+
+Net positive, thin trade count on the best days (2 trades each on 09-21/09-25) -- same caveat as
+elsewhere in this doc about reading small-n days individually.
+
+**NotionalCallPutVolumeDelta @ 1300/95 (DTE-gated -- 09-22 flagged)**
+
+| Date | Trades | Win Rate | Net (pts) |
+|---|---:|---:|---:|
+| 2026-09-21 | 3 | 33.3% | -16.20 |
+| 2026-09-22 (DTE=0, flagged) | 3 | 33.3% | -40.00 |
+| 2026-09-23 | 6 | 83.3% | +53.15 |
+| 2026-09-24 | 5 | 20.0% | -60.90 |
+| 2026-09-25 | 6 | 83.3% | -10.85 |
+| **Total incl. 09-22** | **23** | **56.5%** | **-74.80** |
+| **Total excl. 09-22 (DTE-gated)** | **20** | **60.0%** | **-34.80** |
+
+Net negative even excluding the flagged 0-DTE day, driven by one large losing day (09-24, -60.90).
+Weakest options-side result in this sweep.
+
+**NotionalOiDelta @ 650/80 (DTE-gated -- 09-22 flagged)**
+
+| Date | Trades | Win Rate | Net (pts) |
+|---|---:|---:|---:|
+| 2026-09-21 | 7 | 42.9% | -2.85 |
+| 2026-09-22 (DTE=0, flagged) | 10 | 40.0% | -38.90 |
+| 2026-09-23 | 11 | 36.4% | +8.65 |
+| 2026-09-24 | 5 | 40.0% | -13.40 |
+| 2026-09-25 | 15 | 53.3% | +63.35 |
+| **Total incl. 09-22** | **48** | **43.8%** | **+16.85** |
+| **Total excl. 09-22 (DTE-gated)** | **38** | **45.4%** | **+55.75** |
+
+Net positive excluding the flagged 0-DTE day, driven almost entirely by 09-25 (+63.35). Win rate
+stays under 50% throughout.
+
+**Skew25DeltaChangeRaw @ 1300/97, stop=30%**
+
+| Date | Trades | Win Rate | Net (pts) |
+|---|---:|---:|---:|
+| 2026-09-21 | 10 | 80.0% | -14.55 |
+| 2026-09-22 | 17 | 58.8% | -48.00 |
+| 2026-09-23 | 6 | 50.0% | -12.30 |
+| 2026-09-24 | 14 | 64.3% | +3.85 |
+| 2026-09-25 | 24 | 83.3% | +70.45 |
+| **Total** | **71** | **70.4%** | **-0.55** |
+
+High win rate (70.4%) but essentially breakeven net -- the classic "high win rate, poor
+risk:reward" shape (many small losses/wins, net washed out by size). Locked config's own prior
+71.7% win rate (post-stop) roughly reproduces here (70.4%), but net is flat rather than positive
+on this window.
+
+**AtmComplexDepthImbalance @ 2600/80, band=5, stop=30%**
+
+| Date | Trades | Win Rate | Net (pts) |
+|---|---:|---:|---:|
+| 2026-09-21 | 8 | 37.5% | -21.15 |
+| 2026-09-22 | 16 | 75.0% | +108.35 |
+| 2026-09-23 | 17 | 41.2% | -7.20 |
+| 2026-09-24 | 41 | 22.0% | -5.50 |
+| 2026-09-25 | 35 | 48.6% | +25.50 |
+| **Total** | **117** | **41.0%** | **+100.00** |
+
+Net positive total, but almost entirely carried by a single day (09-22, +108.35) -- excluding that
+one day this metric would be net negative (-8.35) over the other 4 days. Low overall win rate
+(41.0%) with high trade count (117 over 5 days, ~23.4/day).
+
+**AtmComplexTobDepthDivergence @ 1300/95, band=3**
+
+| Date | Trades | Win Rate | Net (pts) |
+|---|---:|---:|---:|
+| 2026-09-21 | 6 | 66.7% | -0.05 |
+| 2026-09-22 | 14 | 35.7% | -58.70 |
+| 2026-09-23 | 11 | 36.4% | -39.35 |
+| 2026-09-24 | 21 | 38.1% | +13.40 |
+| 2026-09-25 | 16 | 56.2% | +104.05 |
+| **Total** | **68** | **44.1%** | **+19.35** |
+
+Net positive total, but again concentrated in one day (09-25, +104.05) -- the other 4 days sum to
+-84.70. Two clearly bad days (09-22, 09-23) bracket the whole window.
+
+**OptionsScoreThreeWaySwitchMaxPainConfirmed @ 2600/90, band=5 -- extended to include 09-25**
+
+| Date | Trades | Win Rate | Net (pts) |
+|---|---:|---:|---:|
+| 2026-09-21 | 7 | 71.4% | -5.10 |
+| 2026-09-22 | 19 | 36.8% | +10.15 |
+| 2026-09-23 | 2 | 100.0% | +25.60 |
+| 2026-09-24 | 2 | 0.0% | -14.10 |
+| 2026-09-25 | 2 | 50.0% | +28.65 |
+| **Total** | **32** | **46.9%** | **+45.20** |
+
+Adding 09-25 keeps this switch net positive (+16.55 -> +45.20 over 5 days), on the same very thin
+last-3-days trade count (2 trades/day each) already flagged in the section above -- still not
+enough to read individually.
+
+### Summary across all candidates, this window (2026-09-21 to 09-25)
+
+| Metric | Trades | Win Rate | Net (pts) |
+|---|---:|---:|---:|
+| TopOfBookImbalance | 104 | 54.8% | +193.05 |
+| DepthImbalance | 45 | 53.3% | +142.05 |
+| AtmComplexDepthImbalance | 117 | 41.0% | +100.00 (day-concentrated) |
+| AtmIvChangePriceSigned | 36 | 61.1% | +75.65 |
+| SessionGatedDepthDurationConfirmed (percentile) | 90 | 47.8% | +65.40 |
+| OptionsScoreThreeWaySwitchMaxPainConfirmed | 32 | 46.9% | +45.20 |
+| NotionalOiDelta (ex-0DTE) | 38 | 45.4% | +55.75 |
+| AtmIvChangeRaw (ex-0DTE) | 57 | 81.4% | +18.80 |
+| AtmComplexTobDepthDivergence | 68 | 44.1% | +19.35 (day-concentrated) |
+| Skew25DeltaChangeRaw | 71 | 70.4% | -0.55 |
+| BarDurationUrgency | 98 | 44.9% | -4.15 |
+| NotionalCallPutVolumeDelta (ex-0DTE) | 20 | 60.0% | -34.80 |
+| Futures crossover (SessionGatedDepthDurationConfirmed, dual-MA) | 89 | 31.5% | -98.65 |
+
+Per `docs/BACKTEST_RULES.md` Rule 15: this is one more data point in an accumulating series
+(per `CLAUDE.md`'s "backtesting is a long-term process" rule), not a verdict on any metric, and no
+parameter above was retuned in response to these numbers. `TopOfBookImbalance` and `DepthImbalance`
+are the only two metrics net positive on every individual day in this window; several others
+(`AtmComplexDepthImbalance`, `AtmComplexTobDepthDivergence`, `OptionsScoreThreeWaySwitchMaxPainConfirmed`)
+owe their net-positive total to one strong day, which is worth tracking across future runs rather
+than treating as confirmed strength.

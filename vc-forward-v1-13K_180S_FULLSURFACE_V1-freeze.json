@@ -1,0 +1,19 @@
+{
+  "BaseVolume": "13000 contracts (futures cumulative tick volume, whole-tick absorption, no splitting, existing excess/carry, final partial bar explicit)",
+  "AdaptiveContextSeconds": "180 (walk backward through completed bars until elapsed context time \u003E= 180s)",
+  "WarmupRule": "InsufficientHistory = (StartBarIndex==0 AND WindowDurationSeconds\u003C180); AtmState forced to \u0022Other\u0022 when true -- no signal/trade/episode/control from incomplete warm-up",
+  "SignalDefinition": "Pattern A: futures context UP, ATM CE DOWN, ATM PE UP. Pattern B: futures context DOWN, ATM CE UP, ATM PE DOWN. Exact pinned CE/PE contracts, same at window start and end, no splicing.",
+  "FullSurfaceDefinition": "ATM\u002B/-2 (5 CE \u002B 5 PE listed strikes). Pattern A: all 5 CE returns negative AND all 5 PE returns positive. Pattern B: all 5 CE positive AND all 5 PE negative. All 5 CE and all 5 PE must be valid.",
+  "EntryEpisodeRule": "RollingStateAnalysis.Annotate on corrected AtmState; entry eligibility ONLY on IsStateEntry==true (new state entry), never on continuation observations.",
+  "ExecutionContractRule": "Pattern A -\u003E BUY ATM PE. Pattern B -\u003E BUY ATM CE. Pinned dynamic-ATM contract at signal event. NOT the Rs.100-150 band selector.",
+  "PositionSize": "10 lots (PatternRelationshipTradeSimulator.Lots) x contract LotSize",
+  "EntryCutoff": "No new entries at/after 15:00 IST",
+  "ExitRule": "ORIGINAL opposite-pattern exit ONLY: A exits only on a new Pattern B state entry; B exits only on a new Pattern A state entry. NOT ATM-state-invalidation, NOT directional lock.",
+  "MandatoryClose": "Forced close at 15:15 IST using the last real tick at/before that time",
+  "CostModel": "TransactionCostCalculator: real STT (0.0625% exit leg only) \u002B GST-on-brokerage (brokerage assumed Rs.0) \u002B unmodeled \u0027Other\u0027",
+  "OnePositionRule": "One open position at a time; a signal while holding is recorded/ignored, never silently dropped, never extends/resets the open position",
+  "QuoteMethodology": "Entry = first real tick at-or-after signal timestamp, Ask1Price if depth present else LastPrice. Exit = first real tick at-or-after opposite signal (or last real tick at-or-before 15:15 for EOD), Bid1Price if depth present else LastPrice. No future quote ever used.",
+  "ValidationHeadlineNetPnl": "58379 (n=66, reconciled exactly against the prior study\u0027s Rs.58379)",
+  "FreezeTimestampUtc": "2026-09-25T10:39:57.3402189\u002B00:00",
+  "StrategyVersion": "13K_180S_FULLSURFACE_V1"
+}
