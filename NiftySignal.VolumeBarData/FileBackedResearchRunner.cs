@@ -55,6 +55,13 @@ public static class FileBackedResearchRunner
             await File.WriteAllTextAsync(path, JsonSerializer.Serialize(report, jsonOpts));
             daily.Add(new { Date = date, report.Dte, Reports = path });
             Console.WriteLine($"Saved {path}; A/B full-surface state entries={report.patternRows.Count(r => r.StateEntry && r.Full)}.");
+
+            // EF Core's InMemory provider keeps each named database's data in a process-wide store
+            // that outlives DbContext disposal -- across many multi-million-tick days in one process,
+            // that accumulates until the process runs out of memory (confirmed: OOM'd on day 4 of a
+            // 10-day batch). EnsureDeletedAsync explicitly tears down this day's store before the
+            // next iteration allocates a new one.
+            await db.Database.EnsureDeletedAsync();
         }
         await File.WriteAllTextAsync(Path.Combine(outDir, "manifest.json"), JsonSerializer.Serialize(daily, jsonOpts));
         return 0;
