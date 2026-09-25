@@ -46,6 +46,8 @@ public static class FileBackedResearchRunner
             await using var db = new NiftySignalDbContext(new DbContextOptionsBuilder<NiftySignalDbContext>()
                 .UseInMemoryDatabase($"reversal-file-{date:yyyyMMdd}-{Guid.NewGuid()}").Options);
             var tickCount = await SeedDayAsync(db, dayDir, date);
+            db.ChangeTracker.Clear();
+            db.ChangeTracker.QueryTrackingBehavior = QueryTrackingBehavior.NoTracking;
             Console.WriteLine($"  seeded {tickCount:N0} ticks into in-memory DB.");
 
             var report = await ReversalResearch.BuildDayReportAsync(db, date);
@@ -100,9 +102,13 @@ public static class FileBackedResearchRunner
                         : new MarketDepth(bid, bidQty, 0, 0, 0, 0, 0, 0, 0, 0, ask, askQty, 0, 0, 0, 0, 0, 0, 0, 0)
                 });
                 total++;
-                if (batch.Count == 8192) { db.Ticks.AddRange(batch); await db.SaveChangesAsync(); batch.Clear(); }
+                // ChangeTracker.Clear() after each batch -- without it, EF Core keeps every
+                // previously-inserted tick tracked, and change detection cost grows with the
+                // total tracked count, making later batches (and every later read query) progressively
+                // slower across a multi-million-row day. See the seeding stall this fixed.
+                if (batch.Count == 8192) { db.Ticks.AddRange(batch); await db.SaveChangesAsync(); db.ChangeTracker.Clear(); batch.Clear(); }
             }
-            if (batch.Count > 0) { db.Ticks.AddRange(batch); await db.SaveChangesAsync(); }
+            if (batch.Count > 0) { db.Ticks.AddRange(batch); await db.SaveChangesAsync(); db.ChangeTracker.Clear(); }
         }
         return total;
     }
