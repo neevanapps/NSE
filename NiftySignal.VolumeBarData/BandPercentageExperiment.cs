@@ -24,7 +24,16 @@ namespace NiftySignal.VolumeBarData;
 /// </summary>
 public static class BandPercentageExperiment
 {
-    static readonly HashSet<DateOnly> AllowedSessions = [new(2026, 9, 22), new(2026, 9, 23)];
+    // 2026-09-26: expanded from the original 2-session discovery set to the 10-session primary
+    // robustness set (user's own explicit spec) -- 09-22/09-23 stay allowed too, kept as a separate
+    // "discovery reference" comparison, never pooled into the primary cross-session results.
+    // Still hard-refuses 09-24/09-25/anything later: those are forward/OOS sessions.
+    static readonly HashSet<DateOnly> AllowedSessions =
+    [
+        new(2026, 9, 4), new(2026, 9, 8), new(2026, 9, 9), new(2026, 9, 10), new(2026, 9, 11),
+        new(2026, 9, 15), new(2026, 9, 16), new(2026, 9, 17), new(2026, 9, 18), new(2026, 9, 21),
+        new(2026, 9, 22), new(2026, 9, 23),
+    ];
 
     public sealed record BandRow(
         DateTimeOffset Time, int Index, string ExistingAtmState, bool ExistingStateEntry, bool ExistingFullSurfaceState,
