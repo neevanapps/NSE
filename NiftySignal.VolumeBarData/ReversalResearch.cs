@@ -152,26 +152,32 @@ public static class ReversalResearch
     }
 
     /// <summary>
-    /// Hypothesis (2026-09-25): P0/P1's only exit is waiting for the full opposite-pattern
-    /// confirmation (or scheduled close) -- at DTE 0/4 this pools' own MFE/MAE ratio (~2x) shows a
-    /// real favorable move is usually available, but win rate is only ~50%, so the wait-for-reversal
-    /// exit is giving back an already-earned move rather than locking any of it in. Exits the instant
-    /// the position has cleared its own round-trip cost (so trailing never triggers on noise smaller
-    /// than what it costs to trade) and then given back half of its own peak favorable excursion since
-    /// entry -- whichever of (giveback, opposite-pattern, scheduled close) comes first. The 50%
-    /// fraction is a first, simple, stated-as-such starting choice, not fit to this data -- not swept.
+    /// Hypothesis v1 (2026-09-25), REJECTED -- kept in the record, not deleted. P0/P1's only exit is
+    /// waiting for the full opposite-pattern confirmation (or scheduled close) -- at DTE 0/4 this
+    /// pool's own MFE/MAE ratio (~2x) shows a real favorable move is usually available, but win rate
+    /// is only ~50%. v1 exited once the position cleared its own bare round-trip cost, then gave back
+    /// 50% of peak. Result (all 12 validated days, same-entry comparison via
+    /// SimulateGivebackFixedEntries): win rate at DTE 0/4 got WORSE (47.6%->38.1%, 50.0%->0.0%), and
+    /// MFE collapsed from ~16% to ~2% across every DTE -- the bare-cost floor (~0.3 points) is
+    /// negligible next to real favorable moves (~15-20 points), so it fired on noise almost
+    /// immediately instead of after a real move. Rejected as tested, per its own stated failure
+    /// criteria ("fails if it mainly cuts winners short before they fully develop").
+    /// Hypothesis v2 (2026-09-26): same mechanism, but the floor scales with the position's own
+    /// premium instead of bare cost -- <paramref name="minPeakFraction"/> of the buy price (or the
+    /// bare cost floor, whichever is larger) must be cleared before trailing can trigger. 5% reuses
+    /// this project's own established threshold convention from the price-crossover track
+    /// (Price_Based_Findings.md) rather than inventing a new number; it is still a first,
+    /// stated-as-such starting choice, not fit to this data. Same expected/failure criteria as v1.
     /// IMPORTANT (caught empirically, not assumed): this re-runs the SAME signal-selection/busyUntil
     /// loop as Simulate, so a faster exit frees capital sooner and lets MORE signals become trades --
     /// this measures the exit change AND the opportunity-set effect together (BACKTEST_RULES rule 14's
     /// "complete sequential simulation" step), confirmed directly here (trade count nearly doubled vs
-    /// P0/P1 at every DTE on first run). It is NOT a same-entry comparison by itself --
+    /// P0/P1 at every DTE on the v1 first run). It is NOT a same-entry comparison by itself --
     /// SimulateGivebackFixedEntries is the same-entry-only counterpart; report both, never just this one.
-    /// Expected if the hypothesis holds: win rate rises at DTE 0/4 without a worse MAE. Fails if it
-    /// mainly cuts winners short before they fully develop (net roughly unchanged or worse despite a
-    /// higher win rate), or degrades MAE/frequency.
     /// </summary>
     public static Simulation SimulateGiveback(DateOnly date, List<Signal> signals, Dictionary<string, Instrument> instruments,
-        Dictionary<string, List<Print>> ticks, Func<Signal, IEnumerable<DateTimeOffset>> exitTimes, decimal givebackFraction)
+        Dictionary<string, List<Print>> ticks, Func<Signal, IEnumerable<DateTimeOffset>> exitTimes, decimal givebackFraction,
+        decimal minPeakFraction = 0.05m)
     {
         var trades = new List<Trade>(); var decisions = new List<ActionRow>();
         var busyUntil = DateTimeOffset.MinValue; int unresolved = 0;
@@ -187,7 +193,7 @@ public static class ReversalResearch
             if (entry is null || entry.Time >= At(date, 15, 0))
             { decisions.Add(new(selected.Time, "WAIT", selected.Token, "No timely valid entry quote")); continue; }
             var buy = entry.Ask + inst.TickSize;
-            var minPeak = Fees(buy, buy, inst.LotSize) / inst.LotSize + inst.TickSize;
+            var minPeak = Math.Max(Fees(buy, buy, inst.LotSize) / inst.LotSize + inst.TickSize, minPeakFraction * buy);
             var scheduledClose = At(date, 15, 15);
             var oppositeTime = exitTimes(selected).Where(t => t > entry.Time && t < scheduledClose).Append(scheduledClose).Min();
 
@@ -229,7 +235,8 @@ public static class ReversalResearch
     /// comparison on fixed entries, not a standalone tradeable simulation.
     /// </summary>
     public static Simulation SimulateGivebackFixedEntries(DateOnly date, List<Trade> baseline, Dictionary<string, Instrument> instruments,
-        Dictionary<string, List<Print>> ticks, Func<Signal, IEnumerable<DateTimeOffset>> exitTimes, decimal givebackFraction)
+        Dictionary<string, List<Print>> ticks, Func<Signal, IEnumerable<DateTimeOffset>> exitTimes, decimal givebackFraction,
+        decimal minPeakFraction = 0.05m)
     {
         var trades = new List<Trade>(); var decisions = new List<ActionRow>();
         var scheduledClose = At(date, 15, 15);
@@ -238,7 +245,7 @@ public static class ReversalResearch
             var inst = instruments[b.Token];
             var series = ticks[b.Token];
             var buy = b.Buy;
-            var minPeak = Fees(buy, buy, inst.LotSize) / inst.LotSize + inst.TickSize;
+            var minPeak = Math.Max(Fees(buy, buy, inst.LotSize) / inst.LotSize + inst.TickSize, minPeakFraction * buy);
             var pseudoSignal = new Signal(b.Decision, b.Side, b.Token, "SameEntry", 0);
             var oppositeTime = exitTimes(pseudoSignal).Where(t => t > b.Entry && t < scheduledClose).Append(scheduledClose).Min();
 
