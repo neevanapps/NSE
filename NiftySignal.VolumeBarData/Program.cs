@@ -496,8 +496,16 @@ if (args.Length > 0 && string.Equals(args[0], "gamma-filter", StringComparison.O
     return await GammaFilterAnalysis.RunAsync(args);
 }
 
+// Exports the exact Cadences() fast/slow-MA series feeding C0/C1/C2, before Simulate turns it
+// into trades -- so the option-price-crossover dataset can be inspected directly. See DumpCadences.cs.
+//   dotnet run --project NiftySignal.VolumeBarData -- dump-cadences <date:yyyy-MM-dd> [token] [--fast=8] [--slow=40] [--bucket=15] [--in=research-ticks] [--out=cadence-dump.csv]
+if (args.Length > 0 && string.Equals(args[0], "dump-cadences", StringComparison.OrdinalIgnoreCase))
+{
+    return await DumpCadences.RunAsync(args);
+}
+
 Console.WriteLine($"Unknown command '{(args.Length > 0 ? args[0] : "(none)")}'. Known commands while " +
-    "RESEARCH_LEGACY_COMMANDS is undefined: reversal-research, export-ticks, research-from-files, gamma-filter.");
+    "RESEARCH_LEGACY_COMMANDS is undefined: reversal-research, export-ticks, research-from-files, gamma-filter, dump-cadences.");
 return 1;
 
 // TEMPORARILY DISABLED (2026-09-25, build-speed) -- see the matching #if above these three commands.
