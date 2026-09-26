@@ -489,8 +489,15 @@ if (args.Length > 0 && string.Equals(args[0], "research-from-files", StringCompa
     return await FileBackedResearchRunner.RunAsync(args);
 }
 
+// Real delta/gamma per Pattern A/B signal, off already-exported files. See GammaFilterAnalysis.cs.
+//   dotnet run --project NiftySignal.VolumeBarData -- gamma-filter <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [--in=research-ticks] [--runs=research-file-run] [--out=gamma-filter.json]
+if (args.Length > 0 && string.Equals(args[0], "gamma-filter", StringComparison.OrdinalIgnoreCase))
+{
+    return await GammaFilterAnalysis.RunAsync(args);
+}
+
 Console.WriteLine($"Unknown command '{(args.Length > 0 ? args[0] : "(none)")}'. Known commands while " +
-    "RESEARCH_LEGACY_COMMANDS is undefined: reversal-research, export-ticks, research-from-files.");
+    "RESEARCH_LEGACY_COMMANDS is undefined: reversal-research, export-ticks, research-from-files, gamma-filter.");
 return 1;
 
 // TEMPORARILY DISABLED (2026-09-25, build-speed) -- see the matching #if above these three commands.
