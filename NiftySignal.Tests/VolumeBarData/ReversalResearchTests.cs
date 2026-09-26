@@ -112,6 +112,72 @@ public sealed class ReversalResearchTests
     }
 
     [Fact]
+    public void BollingerBands_PopulationStdDevAndBandsMatchHandComputedValues()
+    {
+        var ticks = new[] { Print(15, 100), Print(30, 100), Print(45, 104), Print(60, 104) };
+        var bars = ReversalResearch.BollingerBands(ticks, Start, Start.AddSeconds(60), period: 2, k: 2m, bucketSeconds: 15);
+        Assert.Null(bars[0].Mean);
+        Assert.Equal(100m, bars[1].Mean); Assert.Equal(0m, bars[1].StdDev);
+        Assert.Equal(102m, bars[2].Mean); Assert.Equal(2m, bars[2].StdDev);
+        Assert.Equal(106m, bars[2].Upper); Assert.Equal(98m, bars[2].Lower);
+        Assert.Equal(104m, bars[3].Mean); Assert.Equal(0m, bars[3].StdDev);
+    }
+
+    [Fact]
+    public void BollingerBreakoutSignals_FiresOnlyOnTheCrossAboveUpperBand()
+    {
+        var inst = Instrument("a", 24000);
+        var rows = new List<ReversalResearch.BollingerReading>
+        {
+            new(Start.AddSeconds(15), 100, 1, 100, 2, 105, 95),
+            new(Start.AddSeconds(30), 110, 1, 101, 2, 106, 96),
+            new(Start.AddSeconds(45), 111, 1, 102, 2, 107, 97), // stays above -- must not re-fire
+        };
+        var prints = new[] { Print(15), Print(30), Print(45) };
+        var signal = Assert.Single(ReversalResearch.BollingerBreakoutSignals(inst, prints, rows));
+        Assert.Equal(Start.AddSeconds(30), signal.Time);
+        Assert.Equal("B0", signal.Reason);
+    }
+
+    [Fact]
+    public void BollingerMidCrossDownTimes_FiresWhenAverageFallsBackThroughMean()
+    {
+        var rows = new List<ReversalResearch.BollingerReading>
+        {
+            new(Start.AddSeconds(15), 105, 1, 100, 2, 105, 95),
+            new(Start.AddSeconds(30), 95, 1, 102, 2, 106, 96),
+        };
+        Assert.Equal([Start.AddSeconds(30)], ReversalResearch.BollingerMidCrossDownTimes(rows));
+    }
+
+    [Fact]
+    public void BollingerReversionSignals_RequiresConfirmedBounceBackAboveLowerBand()
+    {
+        var inst = Instrument("a", 24000);
+        var rows = new List<ReversalResearch.BollingerReading>
+        {
+            new(Start.AddSeconds(15), 90, 1, 100, 2, 105, 95), // below lower -- armed, no fire yet
+            new(Start.AddSeconds(30), 97, 1, 100, 2, 105, 95), // confirmed bounce back above lower
+            new(Start.AddSeconds(45), 98, 1, 100, 2, 105, 95), // still above -- must not re-fire
+        };
+        var prints = new[] { Print(15), Print(30), Print(45) };
+        var signal = Assert.Single(ReversalResearch.BollingerReversionSignals(inst, prints, rows));
+        Assert.Equal(Start.AddSeconds(30), signal.Time);
+        Assert.Equal("B1", signal.Reason);
+    }
+
+    [Fact]
+    public void BollingerMidCrossUpTimes_FiresWhenAverageRisesBackThroughMean()
+    {
+        var rows = new List<ReversalResearch.BollingerReading>
+        {
+            new(Start.AddSeconds(15), 95, 1, 100, 2, 105, 95),
+            new(Start.AddSeconds(30), 105, 1, 102, 2, 106, 96),
+        };
+        Assert.Equal([Start.AddSeconds(30)], ReversalResearch.BollingerMidCrossUpTimes(rows));
+    }
+
+    [Fact]
     public async Task PerStrikeCadence_EntryInFirstStrike_DoesNotSkipSecondStrikeObservation()
     {
         await using var db = new NiftySignalDbContext(new DbContextOptionsBuilder<NiftySignalDbContext>()

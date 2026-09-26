@@ -18,6 +18,7 @@ public static class ReversalResearch
         decimal? Slow, decimal? Gap, bool Up, bool Down);
     public sealed record Signal(DateTimeOffset Time, string Side, string Token, string Reason, decimal Gap,
         bool Extended = false, decimal? Forward1 = null, decimal? Forward2 = null, decimal? Forward5 = null);
+    public sealed record BollingerReading(DateTimeOffset End, decimal? Average, int Count, decimal? Mean, decimal? StdDev, decimal? Upper, decimal? Lower);
     public sealed record Trade(string Side, string Token, DateTimeOffset Decision, DateTimeOffset Entry,
         DateTimeOffset ExitDecision, DateTimeOffset Exit, decimal Buy, decimal Sell, int Quantity,
         decimal Gross, decimal Fees, decimal Net, decimal Mfe, decimal Mae, double Seconds, string Reason, long EntryId, long ExitId);
@@ -201,6 +202,129 @@ public static class ReversalResearch
         {
             var r = readings[b]; var prior = readings[b - lookback];
             if (r.Average is not null && prior.Average is not null && r.Average < prior.Average) { times.Add(r.End); }
+        }
+        return times;
+    }
+
+    /// <summary>
+    /// 2026-09-26, user-specified: "Bollinger Band on the options price of call and put." Same
+    /// causal 15-second average-price bucketing Cadences() already uses (never raw ticks), with a
+    /// rolling mean and population standard deviation over the trailing <paramref name="period"/>
+    /// buckets, then Upper/Lower = Mean +/- <paramref name="k"/> * StdDev. 20 buckets (5 minutes at
+    /// the default 15s bucket) and k=2 are the textbook Bollinger Band defaults (Bollinger's own
+    /// published convention), not a number fit to this data -- a first, stated-as-such starting
+    /// choice, same discipline as every other constant in this file.
+    /// </summary>
+    public static List<BollingerReading> BollingerBands(IReadOnlyList<Print> ticks, DateTimeOffset start,
+        DateTimeOffset end, int period = 20, decimal k = 2m, int bucketSeconds = 15)
+    {
+        var result = new List<BollingerReading>();
+        var window = new Queue<decimal>();
+        var cursor = 0;
+        var bucket = TimeSpan.FromSeconds(bucketSeconds);
+        for (var left = start; left < end; left += bucket)
+        {
+            var right = left + bucket;
+            decimal sum = 0; int count = 0;
+            while (cursor < ticks.Count && ticks[cursor].Time <= right)
+            {
+                var tick = ticks[cursor++];
+                if (tick.Time > left && tick.Price > 0 && tick.Received <= right) { sum += tick.Price; count++; }
+            }
+            if (count == 0)
+            {
+                window.Clear();
+                result.Add(new(right, null, 0, null, null, null, null));
+                continue;
+            }
+            var avg = sum / count;
+            window.Enqueue(avg);
+            if (window.Count > period) { window.Dequeue(); }
+            if (window.Count < period)
+            {
+                result.Add(new(right, avg, count, null, null, null, null));
+                continue;
+            }
+            var mean = window.Average();
+            var variance = window.Sum(v => (v - mean) * (v - mean)) / period;
+            var std = (decimal)Math.Sqrt((double)variance);
+            result.Add(new(right, avg, count, mean, std, mean + k * std, mean - k * std));
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Breakout entry: the option's own price closes above its own upper Bollinger Band -- an
+    /// "unusually large" up-move sized by the option's OWN recent volatility (not a fixed rupee
+    /// magnitude), fired only on the cross (previous bar at/below its band) so it doesn't re-fire
+    /// every bar while price stays extended. Same liquidity/Rs.100-150 band gate as every other
+    /// signal here; entry price ("fair price") is the prevailing ask.
+    /// </summary>
+    public static List<Signal> BollingerBreakoutSignals(Instrument instrument, IReadOnlyList<Print> ticks, IReadOnlyList<BollingerReading> bands)
+    {
+        var signals = new List<Signal>();
+        for (var b = 1; b < bands.Count; b++)
+        {
+            var r = bands[b]; var prev = bands[b - 1];
+            if (r.Average is null || r.Upper is null || prev.Average is null || prev.Upper is null) { continue; }
+            if (!(prev.Average <= prev.Upper && r.Average > r.Upper)) { continue; }
+            var p = Before(ticks, r.End);
+            if (!Fresh(p, r.End) || !Valid(p!, instrument.LotSize)) { continue; }
+            if (p!.Ask < 100 || p.Ask > 150) { continue; }
+            signals.Add(new(r.End, instrument.OptionType.ToString(), instrument.Token, "B0", r.Average.Value - r.Mean!.Value));
+        }
+        return signals;
+    }
+
+    /// <summary>
+    /// Mean-reversion entry: the option's own price, having closed below its lower band (an
+    /// unusually large down-move), closes back ABOVE the lower band on a later bar -- a confirmed
+    /// bounce, not a falling-knife catch (same "confirm after the extreme, don't just catch it"
+    /// discipline as CrossSignals' C2 mode). Opposite hypothesis from B0: bets the extreme move
+    /// reverts toward the mean instead of continuing.
+    /// </summary>
+    public static List<Signal> BollingerReversionSignals(Instrument instrument, IReadOnlyList<Print> ticks, IReadOnlyList<BollingerReading> bands)
+    {
+        var signals = new List<Signal>();
+        var wasBelow = false;
+        foreach (var r in bands)
+        {
+            if (r.Average is null || r.Lower is null || r.Mean is null) { wasBelow = false; continue; }
+            if (wasBelow && r.Average > r.Lower)
+            {
+                var p = Before(ticks, r.End);
+                if (Fresh(p, r.End) && Valid(p!, instrument.LotSize) && p!.Ask >= 100 && p.Ask <= 150)
+                {
+                    signals.Add(new(r.End, instrument.OptionType.ToString(), instrument.Token, "B1", r.Mean.Value - r.Average.Value));
+                }
+            }
+            wasBelow = r.Average <= r.Lower;
+        }
+        return signals;
+    }
+
+    /// <summary>Exit for B0 (breakout/continuation): the move has stopped extending -- price falls back through the mean.</summary>
+    public static List<DateTimeOffset> BollingerMidCrossDownTimes(IReadOnlyList<BollingerReading> bands)
+    {
+        var times = new List<DateTimeOffset>();
+        for (var b = 1; b < bands.Count; b++)
+        {
+            var r = bands[b]; var prev = bands[b - 1];
+            if (r.Average is null || r.Mean is null || prev.Average is null || prev.Mean is null) { continue; }
+            if (prev.Average >= prev.Mean && r.Average < r.Mean) { times.Add(r.End); }
+        }
+        return times;
+    }
+
+    /// <summary>Exit for B1 (mean-reversion): the reversion target is reached -- price rises back through the mean.</summary>
+    public static List<DateTimeOffset> BollingerMidCrossUpTimes(IReadOnlyList<BollingerReading> bands)
+    {
+        var times = new List<DateTimeOffset>();
+        for (var b = 1; b < bands.Count; b++)
+        {
+            var r = bands[b]; var prev = bands[b - 1];
+            if (r.Average is null || r.Mean is null || prev.Average is null || prev.Mean is null) { continue; }
+            if (prev.Average <= prev.Mean && r.Average > r.Mean) { times.Add(r.End); }
         }
         return times;
     }
@@ -520,6 +644,28 @@ public static class ReversalResearch
                     var simulation = Simulate(date, signals, chain, ticks,
                         s => MomentumDownTimes(readings[s.Token]));
                     experiments[$"M0-{side}"] = new { Summary = Summary(simulation.Trades), simulation, signals };
+                }
+                // B0/B1: 2026-09-26 user-specified Bollinger Band rule on each option's own price
+                // (see BollingerBands/BollingerBreakoutSignals/BollingerReversionSignals' own doc
+                // comments) -- 20-bucket (5min)/2-std textbook defaults, tested both as a breakout
+                // (continuation) and mean-reversion (bounce) hypothesis, since they're opposite bets.
+                var bands = chain.Values.Where(i => i.OptionType == side)
+                    .ToDictionary(i => i.Token, i => BollingerBands(ticks[i.Token], start, end));
+                {
+                    var signals = chain.Values.Where(i => i.OptionType == side)
+                        .SelectMany(i => BollingerBreakoutSignals(i, ticks[i.Token], bands[i.Token])).ToList();
+                    signals = signals.Select(s => Forward(s, ticks[s.Token])).ToList();
+                    var simulation = Simulate(date, signals, chain, ticks,
+                        s => BollingerMidCrossDownTimes(bands[s.Token]));
+                    experiments[$"B0-{side}"] = new { Summary = Summary(simulation.Trades), simulation, signals };
+                }
+                {
+                    var signals = chain.Values.Where(i => i.OptionType == side)
+                        .SelectMany(i => BollingerReversionSignals(i, ticks[i.Token], bands[i.Token])).ToList();
+                    signals = signals.Select(s => Forward(s, ticks[s.Token])).ToList();
+                    var simulation = Simulate(date, signals, chain, ticks,
+                        s => BollingerMidCrossUpTimes(bands[s.Token]));
+                    experiments[$"B1-{side}"] = new { Summary = Summary(simulation.Trades), simulation, signals };
                 }
             }
             var future = await db.Instruments.Where(i => i.AsOfDate == date && i.Underlying == "NIFTY" && i.InstrumentType == InstrumentType.Future)
