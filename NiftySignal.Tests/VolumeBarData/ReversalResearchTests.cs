@@ -263,6 +263,87 @@ public sealed class ReversalResearchTests
     }
 
     [Fact]
+    public void SimulateAlternatingFixedExit_ExitsOnFiveRupeeTakeProfit()
+    {
+        var inst = Instrument("a", 24000);
+        var instruments = new Dictionary<string, Instrument> { ["a"] = inst };
+        var prints = new[]
+        {
+            Print(0),
+            Print(1, price: 121, bid: 119, ask: 121),        // entry fill: buy = 121.05
+            Print(15, price: 126.1m, bid: 125, ask: 126),    // touches buy+5 = 126.05 -- TP trigger
+            Print(30, price: 126.1m, bid: 125.5m, ask: 126.5m), // exit fill (>=1s after trigger)
+        };
+        var signals = new List<ReversalResearch.Signal> { new(Start, "A", "a", "PatternA", 0) };
+        var ticks = new Dictionary<string, List<ReversalResearch.Print>> { ["a"] = prints.ToList() };
+
+        var sim = ReversalResearch.SimulateAlternatingFixedExit(Date, signals, instruments, ticks);
+
+        var trade = Assert.Single(sim.Trades);
+        Assert.Equal("TakeProfit5pt", trade.Reason);
+        Assert.Equal(Start.AddSeconds(15), trade.ExitDecision);
+    }
+
+    [Fact]
+    public void SimulateAlternatingFixedExit_ExitsOnFiveRupeeStopLoss()
+    {
+        var inst = Instrument("a", 24000);
+        var instruments = new Dictionary<string, Instrument> { ["a"] = inst };
+        var prints = new[]
+        {
+            Print(0),
+            Print(1, price: 121, bid: 119, ask: 121),      // entry fill: buy = 121.05
+            Print(15, price: 116.0m, bid: 115, ask: 116),  // touches buy-5 = 116.05 -- SL trigger
+            Print(30, price: 116.0m, bid: 115.5m, ask: 116.5m), // exit fill
+        };
+        var signals = new List<ReversalResearch.Signal> { new(Start, "A", "a", "PatternA", 0) };
+        var ticks = new Dictionary<string, List<ReversalResearch.Print>> { ["a"] = prints.ToList() };
+
+        var sim = ReversalResearch.SimulateAlternatingFixedExit(Date, signals, instruments, ticks);
+
+        var trade = Assert.Single(sim.Trades);
+        Assert.Equal("StopLoss5pt", trade.Reason);
+        Assert.Equal(Start.AddSeconds(15), trade.ExitDecision);
+    }
+
+    [Fact]
+    public void SimulateAlternatingFixedExit_SkipsSameSideSignal_UntilOppositeSideFires()
+    {
+        var call = Instrument("a", 24000);
+        var put = Instrument("b", 24100);
+        put.OptionType = OptionType.Put;
+        var instruments = new Dictionary<string, Instrument> { ["a"] = call, ["b"] = put };
+        var printsA = new[]
+        {
+            Print(0),
+            Print(1, price: 121, bid: 119, ask: 121),
+            Print(15, price: 126.1m, bid: 125, ask: 126),
+            Print(30, price: 126.1m, bid: 125.5m, ask: 126.5m),
+        };
+        var printsB = new[]
+        {
+            Print(119, price: 100, bid: 99, ask: 100),
+            Print(121, price: 101, bid: 100, ask: 101),         // entry fill: buy = 101.05
+            Print(200, price: 106.1m, bid: 105, ask: 106),      // touches buy+5 = 106.05
+            Print(215, price: 106.1m, bid: 105.5m, ask: 106.5m),
+        };
+        var signals = new List<ReversalResearch.Signal>
+        {
+            new(Start, "A", "a", "PatternA", 0),
+            new(Start.AddSeconds(60), "A", "a", "PatternA", 0), // same side as the just-closed trade -- must be skipped
+            new(Start.AddSeconds(120), "B", "b", "PatternB", 0), // opposite side -- must fire
+        };
+        var ticks = new Dictionary<string, List<ReversalResearch.Print>> { ["a"] = printsA.ToList(), ["b"] = printsB.ToList() };
+
+        var sim = ReversalResearch.SimulateAlternatingFixedExit(Date, signals, instruments, ticks);
+
+        Assert.Equal(2, sim.Trades.Count);
+        Assert.Equal("a", sim.Trades[0].Token);
+        Assert.Equal("b", sim.Trades[1].Token);
+        Assert.Contains(sim.Decisions, d => d.Time == Start.AddSeconds(60) && d.Action == "WAIT" && d.Reason.Contains("alternation"));
+    }
+
+    [Fact]
     public void SimulateGivebackFixedEntries_ReusesBaselineEntryVerbatim_OnlyExitChanges()
     {
         var inst = Instrument("a", 24000);

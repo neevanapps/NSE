@@ -369,6 +369,64 @@ public static class ReversalResearch
     }
 
     /// <summary>
+    /// 2026-09-26, user-specified variant on Pattern A/B: same entry signals (patternSignals from
+    /// BuildPatternPopulation), two changes only. (1) Exit is a fixed +/-<paramref name="points"/>
+    /// rupee move on the option's OWN premium (measured off the same last-traded-price convention
+    /// already used for every Mfe/Mae figure in this file, not bid/ask), checked tick-by-tick from
+    /// the entry fill -- not the wait-for-opposite-pattern exit P0/P1 use. (2) Once a trade closes
+    /// (win or loss), the next trade must be the OPPOSITE side (Pattern A only ever trades Puts,
+    /// Pattern B only ever trades Calls in this codebase, so alternating Signal.Side ("A"/"B") is
+    /// exactly alternating Call/Put) -- any same-side signal that fires before an opposite-side one
+    /// does is skipped outright, not queued; the very first trade of the day is unconstrained. The
+    /// Rs.100-150 strike/liquidity band is unchanged -- BuildPatternPopulation's own eligibility
+    /// selection already enforces it.
+    /// </summary>
+    public static Simulation SimulateAlternatingFixedExit(DateOnly date, List<Signal> signals,
+        Dictionary<string, Instrument> instruments, Dictionary<string, List<Print>> ticks, decimal points = 5m)
+    {
+        var trades = new List<Trade>(); var decisions = new List<ActionRow>();
+        var busyUntil = DateTimeOffset.MinValue; int unresolved = 0; string? lastSide = null;
+        foreach (var group in signals.GroupBy(s => s.Time).OrderBy(g => g.Key))
+        {
+            if (group.Key >= At(date, 15, 0)) { decisions.Add(new(group.Key, "WAIT", "", "Entry cutoff")); continue; }
+            if (group.Key <= busyUntil) { decisions.Add(new(group.Key, "WAIT", "", "Position or exit order active")); continue; }
+            var candidates = group.Where(s => lastSide is null || s.Side != lastSide).ToList();
+            if (candidates.Count == 0)
+            { decisions.Add(new(group.Key, "WAIT", "", "Same side as previous trade; alternation rule")); continue; }
+            var selected = candidates.OrderBy(s => { var p = Before(ticks[s.Token], s.Time)!; return (p.Ask - p.Bid) / p.Ask; })
+                .ThenBy(s => s.Token, StringComparer.Ordinal).First();
+            var inst = instruments[selected.Token];
+            var series = ticks[selected.Token];
+            var entry = Fill(series, selected.Time, inst.LotSize, true);
+            if (entry is null || entry.Time >= At(date, 15, 0))
+            { decisions.Add(new(selected.Time, "WAIT", selected.Token, "No timely valid entry quote")); continue; }
+            var buy = entry.Ask + inst.TickSize;
+            var scheduledClose = At(date, 15, 15);
+            var trigger = series.FirstOrDefault(p => p.Time > entry.Time && p.Time < scheduledClose && p.Price > 0
+                && (p.Price >= buy + points || p.Price <= buy - points));
+            var exitDecision = trigger?.Time ?? scheduledClose;
+            var exit = Fill(series, exitDecision, inst.LotSize, false);
+            if (exit is null)
+            {
+                unresolved++; busyUntil = At(date, 15, 30);
+                decisions.Add(new(exitDecision, "UNRESOLVED", inst.Token, "No valid quote after exit order; P&L unknown")); continue;
+            }
+            var sell = exit.Bid - inst.TickSize;
+            var path = series.Where(p => p.Time >= entry.Time && p.Time <= exit.Time).ToList();
+            var gross = (sell - buy) * inst.LotSize;
+            var fees = Fees(buy, sell, inst.LotSize);
+            var reason = trigger is null ? "ScheduledClose" : trigger.Price >= buy + points ? $"TakeProfit{points}pt" : $"StopLoss{points}pt";
+            trades.Add(new(selected.Side, inst.Token, selected.Time, entry.Time, exitDecision, exit.Time, buy, sell,
+                inst.LotSize, gross, fees, gross - fees, Math.Max(0, path.Max(p => p.Price) - buy),
+                Math.Max(0, buy - path.Min(p => p.Price)), (exit.Time - entry.Time).TotalSeconds, reason, entry.Id, exit.Id));
+            decisions.Add(new(selected.Time, "BUY", inst.Token, $"{selected.Reason}; fill {entry.Time:O}; ask+tick {buy}"));
+            decisions.Add(new(exitDecision, "EXIT", inst.Token, $"{reason}; fill {exit.Time:O}; bid-tick {sell}"));
+            busyUntil = exit.Time; lastSide = selected.Side;
+        }
+        return new(trades, decisions, unresolved);
+    }
+
+    /// <summary>
     /// Hypothesis v1 (2026-09-25), REJECTED -- kept in the record, not deleted. P0/P1's only exit is
     /// waiting for the full opposite-pattern confirmation (or scheduled close) -- at DTE 0/4 this
     /// pool's own MFE/MAE ratio (~2x) shows a real favorable move is usually available, but win rate
@@ -705,6 +763,14 @@ public static class ReversalResearch
                 baselineSims[mode] = sim;
                 experiments[mode] = new { Summary = Summary(sim.Trades), simulation = sim, signals,
                     BySide = sim.Trades.GroupBy(t => t.Side).ToDictionary(g => g.Key, g => Summary(g)) };
+            }
+            // P6: 2026-09-26 user-specified variant -- same P0 entry population, fixed +/-5-rupee
+            // TP/SL exit instead of wait-for-opposite-pattern, and a forced Call/Put alternation
+            // (see SimulateAlternatingFixedExit's own doc comment for exactly what changed and why).
+            {
+                var sim6 = SimulateAlternatingFixedExit(date, patternSignals, chain, ticks);
+                experiments["P6"] = new { Summary = Summary(sim6.Trades), simulation = sim6, signals = patternSignals,
+                    BySide = sim6.Trades.GroupBy(t => t.Side).ToDictionary(g => g.Key, g => Summary(g)) };
             }
             // P4: entry-side filter only, exit UNCHANGED from P0 (both exit redesigns tried
             // earlier -- SimulateGiveback v1/v2 -- failed; the wait-for-opposite-pattern exit
