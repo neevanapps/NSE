@@ -1,5 +1,22 @@
 # 0-DTE Volume-Candle Findings
 
+## 2026-09-25/26: corrected Pattern A/B executable-option audit — underlying relationship remains suggestive; trade method rejected
+
+The complete audit/results are in `docs/REVERSAL_RESEARCH_2026-09-25.md` and
+`research-reversal-run03/REPORT.md`. Corrected receipt/freshness handling changes some episode
+boundaries, so this is a separate research variant and does not alter the frozen
+`13K_180S_FULLSURFACE_V1` records. Exchange-clock reference signals independently reproduce the
+existing saved signal records on every historical validation date; frozen artifact hashes are
+unchanged.
+
+Pattern A (70 corrected entries) and B (63) still show expected +4-bar futures behavior in
+68.6% and 61.9% of observations respectively, but the exact Rs100-150 option response is weak
+and inconsistent. Executable A: 31 trades, Rs+1,976/PF 1.15, Rs-6,079 without best day.
+Executable B: 25 trades, Rs+546/PF 1.06, Rs-5,435 without best day. The predeclared option-
+overextension filter does not improve robustness. **Option-buying verdict: rejected.** The
+underlying reversal relationship itself remains **promising but unproven**, with no independent
+forward evidence under this corrected methodology.
+
 **Scope of this file**: the futures-volume-event-bar research track from the user's own 52-section
 spec ("0-DTE Nifty Options Volume-Candle Research & Simulation Specification"), implemented per
 the approved plan "0-DTE Volume-Candle Research Framework -- Phase 1 / Experiment 1"

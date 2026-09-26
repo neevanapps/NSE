@@ -1,5 +1,21 @@
 # Price-Based Findings
 
+## 2026-09-25/26: corrected independent-token 15-second crossover — Calls rejected, one Put hypothesis retained for forward observation
+
+The full audit/results are in `docs/REVERSAL_RESEARCH_2026-09-25.md` and
+`research-reversal-run03/REPORT.md`. This pass uses every token's own (start,end] 15-second
+snapshot-weighted LTP mean, 8/40 readings, resets on empty intervals, honors receipt time,
+selects an eligible contract at decision time and holds that token. It found and fixed F63
+(later tokens skipped whenever an earlier strike entered), and records F65/F66 limitations.
+
+Plain Call and Put crossings and delayed confirmation fail after costs or trade far too often.
+Calls are rejected. The only retained idea is Put C1: require the gap on the actual crossing
+observation to exceed contemporaneous spread + two ticks + modeled fees. On 12 already-inspected
+sessions it had 17 trades, Rs+4,814, PF 3.30, six positive days; Rs+1,315 excluding the best day.
+This is **promising but unproven**, not validated: only 17 trades, inconsistent DTE buckets,
+right-tail-dependent option response, and zero unseen sessions. Freeze unchanged for future
+settled sessions; do not tune or deploy it from these results.
+
 **Scope of this file**: everything from the 2026-09-23-onward "this session is completely based on
 Price" work -- the option-price fast/slow crossover engine (`PriceCrossoverEngine`/
 `TradeSimulator.SimulatePriceCrossoverDayAsync`, CLI: `price-crossover`/`price-crossover-calibrate`/

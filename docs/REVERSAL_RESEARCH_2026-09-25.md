@@ -120,3 +120,57 @@ Sources: [NSE STT](https://www.nseindia.com/static/products-services/equity-deri
    wait until every contributing future tick has arrived. These corrections can change
    episode boundaries. P0/P1 are therefore explicitly research variants, not new frozen
    forward-validation results. September 25 receives metadata checks only.
+
+## Complete results and verdicts (run03)
+
+The complete session/DTE tables, exact-token forward response, trade statistics, controls,
+suppression counterfactuals and raw decision traces are in
+`research-reversal-run03/REPORT.md`. The source reports are the twelve dated JSON files in that
+directory. `scripts/summarize-reversal-research.ps1` regenerates and audits the report.
+
+Pattern A produced 70 corrected FullSurface state entries. Expected-direction futures hit
+rates were 64.3%/61.4%/68.6% at +1/+2/+4 bars and mean +4 reversal was 5.81 points. Pattern B
+produced 63 entries: 69.8%/68.3%/61.9%, mean +3.91 points. Day tables show important failures
+and control reversals, especially September 9/17/18/23; this is suggestive relationship evidence,
+not universal behavior.
+
+The purchasable option weakens the case. A-selected PE mean return was -0.15%/-0.13%/+0.70%
+at +1/+2/+5 minutes; B-selected CE was +0.21%/-0.37%/+0.78%. At the executable lifecycle,
+A had 31 trades, Rs+1,976, PF 1.15, 45.2% wins and 6/12 positive days; without its best day,
+Rs-6,079. B had 25 trades, Rs+546, PF 1.06, 28.0% wins and 3/12 positive days; without its
+best day, Rs-5,435. The overextension filter did not rescue this: combined P1 Rs+995/PF 1.04,
+and it suppressed a Rs+4,463 winner. **Verdict for A and B as option-buying methods: rejected
+at present.** Their underlying reversal relationship is **promising but unproven**, and neither
+has independent forward support under the corrected receipt/freshness/execution methodology.
+
+Option-only Calls: baseline C0 lost Rs9,548 on 268 trades (22.3/day, PF .82); delayed C2 lost
+Rs6,072 on 216 (18/day, PF .87). The friction-clearing C1 reduced this to 17 trades and showed
+Rs+1,969/PF 1.48, but the exact-token candidate response was negative at 1/2/5 minutes and the
+result becomes Rs-1,925 without its best day. **All Call variants rejected.**
+
+Option-only Puts: baseline C0 was essentially flat after modeled costs (Rs-98, 263 trades,
+PF 1.00), while delayed C2 was Rs+6,182/PF 1.17 on 211 trades but becomes Rs-2,820 without
+its best day and still averages 17.6 trades/day. **C0 and C2 rejected.** C1 (gap must cover
+current spread, two ticks and fees on the actual crossing observation) produced 17 trades,
+Rs+4,814, PF 3.30, 47.1% wins, six positive days, one no-trade day, max closed-trade drawdown
+Rs636 and Rs+1,315 after removing its best day. Mean exact-token return was +1.81%/+2.35%/
++0.65% at +1/+2/+5 minutes, but only 46.4% were positive at +5: a few right-tail moves drive
+the mean. DTE is inconsistent (positive for DTE 0/5/6, negative DTE 1/4), sample sizes are tiny,
+and every date was already research data. **C1 Put verdict: promising but unproven.** It is the
+only hypothesis worth freezing unchanged for future settled sessions; no historical tuning,
+production change or independent-evidence claim is justified.
+
+September 25 metadata was sampled twice 162 seconds apart: both snapshots were byte-equivalent
+by token metadata (83 tokens, 4,361,772 ticks, 09:15-15:30 coverage). It now looks stable at that
+metadata level, but remains excluded exactly as predeclared and is not independent validation.
+All four frozen artifact hashes remained unchanged.
+
+Reproduction:
+
+```powershell
+dotnet build NiftySignal.slnx --no-restore -v minimal
+dotnet test NiftySignal.slnx --no-restore -v minimal
+dotnet NiftySignal.VolumeBarData/bin/Debug/net10.0/NiftySignal.VolumeBarData.dll reversal-research research-reversal-run03
+./scripts/summarize-reversal-research.ps1 -RunDirectory research-reversal-run03
+dotnet NiftySignal.VolumeBarData/bin/Debug/net10.0/NiftySignal.VolumeBarData.dll reversal-research research-stability-check --snapshot25
+```
