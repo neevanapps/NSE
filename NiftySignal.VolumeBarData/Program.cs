@@ -504,8 +504,16 @@ if (args.Length > 0 && string.Equals(args[0], "dump-cadences", StringComparison.
     return await DumpCadences.RunAsync(args);
 }
 
+// 2026-09-26 exploratory market-structure experiment (parallel to, never modifying, Pattern A/B).
+// See BandPercentageExperiment.cs. Restricted to 2026-09-22/23 (Design sessions) by the command itself.
+//   dotnet run --project NiftySignal.VolumeBarData -- band-pct-experiment <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [--in=research-ticks] [--out=band-pct-experiment.json]
+if (args.Length > 0 && string.Equals(args[0], "band-pct-experiment", StringComparison.OrdinalIgnoreCase))
+{
+    return await BandPercentageExperiment.RunAsync(args);
+}
+
 Console.WriteLine($"Unknown command '{(args.Length > 0 ? args[0] : "(none)")}'. Known commands while " +
-    "RESEARCH_LEGACY_COMMANDS is undefined: reversal-research, export-ticks, research-from-files, gamma-filter, dump-cadences.");
+    "RESEARCH_LEGACY_COMMANDS is undefined: reversal-research, export-ticks, research-from-files, gamma-filter, dump-cadences, band-pct-experiment.");
 return 1;
 
 // TEMPORARILY DISABLED (2026-09-25, build-speed) -- see the matching #if above these three commands.
