@@ -160,6 +160,51 @@ public static class ReversalResearch
         return signals;
     }
 
+    /// <summary>
+    /// 2026-09-26, user-specified rule -- deliberately independent of Pattern A/B and the
+    /// C0/C1/C2 crossover hurdles: "Everyday there will be move in nifty... If ce is moving we
+    /// will make buy trade. We will buy PE if its price is moving up." No moving-average
+    /// smoothing, no cost hurdle, no confirmation delay -- fires whenever a bucket's own raw
+    /// average price (Reading.Average, the same causal cadence Cadences() already builds) is
+    /// higher than it was <paramref name="lookback"/> buckets earlier (default 8 buckets = 2
+    /// minutes at the default 15s bucket width, reusing this project's own established short
+    /// lookback -- e.g. CrossSignals' C2 "armed" window is also 8 buckets -- not a newly invented
+    /// number). Entry price ("fair price," left to my judgment per the user's own instruction) is
+    /// the prevailing ask, gated by the same liquidity/Rs.100-150 band every other signal here uses.
+    /// </summary>
+    public static List<Signal> MomentumSignals(Instrument instrument, IReadOnlyList<Print> ticks,
+        IReadOnlyList<Reading> readings, int lookback = 8)
+    {
+        var signals = new List<Signal>();
+        for (var b = lookback; b < readings.Count; b++)
+        {
+            var r = readings[b]; var prior = readings[b - lookback];
+            if (r.Average is null || prior.Average is null || r.Average <= prior.Average) { continue; }
+            var p = Before(ticks, r.End);
+            if (!Fresh(p, r.End) || !Valid(p!, instrument.LotSize)) { continue; }
+            if (p!.Ask < 100 || p.Ask > 150) { continue; }
+            signals.Add(new(r.End, instrument.OptionType.ToString(), instrument.Token, "M0", r.Average.Value - prior.Average.Value));
+        }
+        return signals;
+    }
+
+    /// <summary>
+    /// Exit side of the same rule, mirrored: once the option's own price stops moving up (its raw
+    /// average is no longer above where it was <paramref name="lookback"/> buckets earlier), exit.
+    /// Symmetric with MomentumSignals' entry condition rather than reusing an unrelated mechanism
+    /// (the gap-based Up/Down used by CrossSignals is a different, MA-crossover-based rule).
+    /// </summary>
+    public static List<DateTimeOffset> MomentumDownTimes(IReadOnlyList<Reading> readings, int lookback = 8)
+    {
+        var times = new List<DateTimeOffset>();
+        for (var b = lookback; b < readings.Count; b++)
+        {
+            var r = readings[b]; var prior = readings[b - lookback];
+            if (r.Average is not null && prior.Average is not null && r.Average < prior.Average) { times.Add(r.End); }
+        }
+        return times;
+    }
+
     public static Simulation Simulate(DateOnly date, List<Signal> signals, Dictionary<string, Instrument> instruments,
         Dictionary<string, List<Print>> ticks, Func<Signal, IEnumerable<DateTimeOffset>> exitTimes)
     {
@@ -464,6 +509,17 @@ public static class ReversalResearch
                     var simulation = Simulate(date, signals, chain, ticks,
                         s => readingsV[s.Token].Where(r => r.Down).Select(r => r.End));
                     experiments[$"{mode}V-{side}"] = new { Summary = Summary(simulation.Trades), simulation, signals };
+                }
+                // M0: 2026-09-26 user-specified simple momentum rule (see MomentumSignals'
+                // own doc comment) -- own-price-moving-up entry, own-price-stops-moving-up exit,
+                // no MA smoothing/hurdle/confirmation. Independent of Pattern A/B and C0/C1/C2.
+                {
+                    var signals = chain.Values.Where(i => i.OptionType == side)
+                        .SelectMany(i => MomentumSignals(i, ticks[i.Token], readings[i.Token])).ToList();
+                    signals = signals.Select(s => Forward(s, ticks[s.Token])).ToList();
+                    var simulation = Simulate(date, signals, chain, ticks,
+                        s => MomentumDownTimes(readings[s.Token]));
+                    experiments[$"M0-{side}"] = new { Summary = Summary(simulation.Trades), simulation, signals };
                 }
             }
             var future = await db.Instruments.Where(i => i.AsOfDate == date && i.Underlying == "NIFTY" && i.InstrumentType == InstrumentType.Future)

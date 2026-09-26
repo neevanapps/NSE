@@ -64,6 +64,54 @@ public sealed class ReversalResearchTests
     }
 
     [Fact]
+    public void MomentumSignals_FiresOnBareTwoMinuteLookback_NoMaOrHurdle()
+    {
+        var inst = Instrument("a", 24000);
+        // 8-bucket lookback: bar[8].Average (125) > bar[0].Average (120) -> fires at bar[8]'s End.
+        // bar[9].Average (125) == bar[1].Average (125) -> not strictly greater, does not fire.
+        var rows = new List<ReversalResearch.Reading>();
+        for (var i = 0; i <= 9; i++)
+        {
+            var avg = i == 0 ? 120m : 125m;
+            rows.Add(new(Start.AddSeconds((i + 1) * 15), avg, 1, avg, null, null, false, false));
+        }
+        var prints = Enumerable.Range(0, 10).Select(i => Print((i + 1) * 15)).ToArray();
+        var signals = ReversalResearch.MomentumSignals(inst, prints, rows);
+        var signal = Assert.Single(signals);
+        Assert.Equal(Start.AddSeconds(9 * 15), signal.Time);
+        Assert.Equal("Call", signal.Side);
+    }
+
+    [Fact]
+    public void MomentumSignals_SkipsStaleOrIlliquidQuotes_AndOutOfBandPrice()
+    {
+        var inst = Instrument("a", 24000);
+        var rows = new List<ReversalResearch.Reading>
+        {
+            new(Start.AddSeconds(15), 100, 1, null, null, null, false, false),
+            new(Start.AddSeconds(135), 200, 1, null, null, null, false, false),
+        };
+        var stale = new[] { Print(15) };
+        Assert.Empty(ReversalResearch.MomentumSignals(inst, stale, rows, lookback: 1));
+
+        var outOfBand = new[] { Print(15, ask: 200), Print(135, ask: 200) };
+        Assert.Empty(ReversalResearch.MomentumSignals(inst, outOfBand, rows, lookback: 1));
+    }
+
+    [Fact]
+    public void MomentumDownTimes_MirrorsEntryCondition_FiresWhenAverageDropsBelowLookback()
+    {
+        var rows = new List<ReversalResearch.Reading>
+        {
+            new(Start.AddSeconds(15), 120, 1, null, null, null, false, false),
+            new(Start.AddSeconds(30), 110, 1, null, null, null, false, false),
+            new(Start.AddSeconds(45), 130, 1, null, null, null, false, false),
+        };
+        var times = ReversalResearch.MomentumDownTimes(rows, lookback: 1);
+        Assert.Equal([Start.AddSeconds(30)], times);
+    }
+
+    [Fact]
     public async Task PerStrikeCadence_EntryInFirstStrike_DoesNotSkipSecondStrikeObservation()
     {
         await using var db = new NiftySignalDbContext(new DbContextOptionsBuilder<NiftySignalDbContext>()
