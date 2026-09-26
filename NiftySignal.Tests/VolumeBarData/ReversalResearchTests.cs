@@ -12,6 +12,8 @@ public sealed class ReversalResearchTests
     static readonly DateTimeOffset Start = ReversalResearch.At(Date, 9, 15);
     static ReversalResearch.Print Print(int seconds, decimal price = 120, decimal bid = 119, decimal ask = 121) =>
         new(seconds, Start.AddSeconds(seconds), Start.AddSeconds(seconds), price, bid, ask, 650, 650);
+    static ReversalResearch.Print PrintV(int seconds, decimal price, long cumulativeVolume, decimal bid = 119, decimal ask = 121) =>
+        new(seconds, Start.AddSeconds(seconds), Start.AddSeconds(seconds), price, bid, ask, 650, 650, cumulativeVolume);
 
     [Fact]
     public void Cadences_BoundariesAndEmptyInterval_DoNotCarryHistory()
@@ -177,6 +179,47 @@ public sealed class ReversalResearchTests
         Assert.Equal(baseline[0].EntryId, trade.EntryId);
         Assert.Equal("GivebackExit", trade.Reason);
         Assert.Equal(Start.AddSeconds(30), trade.ExitDecision);
+    }
+
+    [Fact]
+    public void OptionVolumeBars_ClosesExactlyWhenCumulativeVolumeReachesThreshold()
+    {
+        // Cumulative volume: 100 -> 100 (no delta) -> 400 (+300) -> 700 (+300, crosses 600 here).
+        var ticks = new[] { PrintV(0, 100, 100), PrintV(1, 105, 100), PrintV(2, 110, 400), PrintV(3, 115, 700) };
+        var bars = ReversalResearch.OptionVolumeBars(ticks, threshold: 600);
+        var bar = Assert.Single(bars);
+        Assert.Equal(115m, bar.ClosePrice);
+        Assert.True(bar.Volume >= 600);
+    }
+
+    [Fact]
+    public void OptionVolumeBars_BelowThreshold_ProducesNoBar()
+    {
+        var ticks = new[] { PrintV(0, 100, 100), PrintV(1, 105, 300) };
+        Assert.Empty(ReversalResearch.OptionVolumeBars(ticks, threshold: 600));
+    }
+
+    [Fact]
+    public void BuildTimeBasedFutureBars_SkipsEmptyBucket_NeverFabricatesABar()
+    {
+        var ticks = new[] { Print(0, 100), Print(1, 110), Print(65, 200) }; // bucket [30,60) has no ticks
+        var bars = ReversalResearch.BuildTimeBasedFutureBars(ticks.ToList(), Start, Start.AddSeconds(90), bucketSeconds: 30);
+        Assert.Equal(2, bars.Count);
+        Assert.Equal(110m, bars[0].Close);
+        Assert.Equal(200m, bars[1].Close);
+    }
+
+    [Fact]
+    public void ReadingsFromBars_SameFastSlowGapSemanticsAsCadences()
+    {
+        var bars = Enumerable.Range(1, 3).Select(i =>
+            new NiftySignal.Features.VolumeBar(Start.AddSeconds(i), Start.AddSeconds(i + 1), 100 + i, 100 + i, 100 + i, 100 + i,
+                600, null, null, null, null, null, null, 1)).ToList();
+        var readings = ReversalResearch.ReadingsFromBars(bars, fast: 1, slow: 2);
+        Assert.Equal(101m, readings[0].Fast); // only 1 bar so far, fast(1)=that bar's close
+        Assert.Null(readings[0].Slow); // needs 2 bars
+        Assert.Equal(102m, readings[1].Fast);
+        Assert.Equal(101.5m, readings[1].Slow); // avg of bars 1-2
     }
 
     static Instrument Instrument(string token, decimal strike) => new()

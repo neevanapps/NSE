@@ -3,6 +3,8 @@ using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using NiftySignal.Domain.Entities;
 using NiftySignal.Domain.Enums;
+using NiftySignal.Domain.ValueObjects;
+using NiftySignal.Features;
 using NiftySignal.Persistence;
 
 namespace NiftySignal.VolumeBarData;
@@ -11,7 +13,7 @@ namespace NiftySignal.VolumeBarData;
 public static class ReversalResearch
 {
     public sealed record Print(long Id, DateTimeOffset Time, DateTimeOffset Received, decimal Price,
-        decimal Bid, decimal Ask, long BidQty, long AskQty);
+        decimal Bid, decimal Ask, long BidQty, long AskQty, long Volume = 0);
     public sealed record Reading(DateTimeOffset End, decimal? Average, int Count, decimal? Fast,
         decimal? Slow, decimal? Gap, bool Up, bool Down);
     public sealed record Signal(DateTimeOffset Time, string Side, string Token, string Reason, decimal Gap,
@@ -28,15 +30,16 @@ public static class ReversalResearch
     public static DateTimeOffset At(DateOnly date, int hour, int minute) => new(date.ToDateTime(new TimeOnly(hour, minute)), Ist);
 
     public static List<Reading> Cadences(IReadOnlyList<Print> ticks, DateTimeOffset start, DateTimeOffset end,
-        int fast = 8, int slow = 40)
+        int fast = 8, int slow = 40, int bucketSeconds = 15)
     {
         var result = new List<Reading>();
         var window = new Queue<decimal>();
         decimal? previous = null;
         var cursor = 0;
-        for (var left = start; left < end; left += TimeSpan.FromSeconds(15))
+        var bucket = TimeSpan.FromSeconds(bucketSeconds);
+        for (var left = start; left < end; left += bucket)
         {
-            var right = left.AddSeconds(15);
+            var right = left + bucket;
             decimal sum = 0; int count = 0;
             while (cursor < ticks.Count && ticks[cursor].Time <= right)
             {
@@ -56,6 +59,51 @@ public static class ReversalResearch
             decimal? s = window.Count == slow ? window.Average() : null;
             decimal? gap = f - s;
             result.Add(new(right, avg, count, f, s, gap, previous <= 0 && gap > 0, previous >= 0 && gap < 0));
+            previous = gap;
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// 2026-09-26: option price crossover using volume-threshold bars instead of a fixed time
+    /// cadence -- reuses NiftySignal.Features.VolumeBarBuilder directly (it's already generic over
+    /// whatever token's ticks it's fed; nothing about it is future-specific) rather than writing a
+    /// second bar builder. 650 reuses this project's own already-established option-side volume-bar
+    /// magnitude (Price_Based_Findings.md's populate-call-depth-imbalance/cvd-proxy defaults), not
+    /// a newly-invented number -- a single option token typically trades ~95,000 contracts/session,
+    /// so 650 yields roughly 100-150 bars/day for a liquid strike.
+    /// </summary>
+    public static List<VolumeBar> OptionVolumeBars(IReadOnlyList<Print> ticks, long threshold)
+    {
+        var builder = new VolumeBarBuilder(threshold);
+        var bars = new List<VolumeBar>();
+        foreach (var t in ticks)
+        {
+            var depth = t.Bid > 0 || t.Ask > 0 ? new MarketDepth(t.Bid, t.BidQty, 0, 0, 0, 0, 0, 0, 0, 0, t.Ask, t.AskQty, 0, 0, 0, 0, 0, 0, 0, 0) : null;
+            var bar = builder.ApplyTick(t.Time, t.Price, t.Volume, depth, null);
+            if (bar is not null) { bars.Add(bar); }
+        }
+        return bars;
+    }
+
+    /// <summary>
+    /// Same fast/slow/gap moving-average-crossover math as Cadences, sourced from already-formed
+    /// bars (volume bars here) instead of raw ticks bucketed by time -- lets CrossSignals/Simulate
+    /// run completely unchanged regardless of which bar construction produced the series.
+    /// </summary>
+    public static List<Reading> ReadingsFromBars(IReadOnlyList<VolumeBar> bars, int fast, int slow)
+    {
+        var result = new List<Reading>();
+        var window = new Queue<decimal>();
+        decimal? previous = null;
+        foreach (var bar in bars)
+        {
+            window.Enqueue(bar.ClosePrice);
+            if (window.Count > slow) { window.Dequeue(); }
+            decimal? f = window.Count >= fast ? window.TakeLast(fast).Average() : null;
+            decimal? s = window.Count == slow ? window.Average() : null;
+            decimal? gap = f - s;
+            result.Add(new(bar.EndTimestamp, bar.ClosePrice, bar.TickCount, f, s, gap, previous <= 0 && gap > 0, previous >= 0 && gap < 0));
             previous = gap;
         }
         return result;
@@ -347,6 +395,13 @@ public static class ReversalResearch
             var chain = chainAll.Where(i => i.ExpiryDate == expiry).OrderBy(i => i.Token).ToDictionary(i => i.Token);
             var start = At(date, 9, 15).ToUniversalTime(); var end = At(date, 15, 30).ToUniversalTime();
             var ticks = new Dictionary<string, List<Print>>(); var readings = new Dictionary<string, List<Reading>>();
+            // 2026-09-26: a second, wider time cadence (30s buckets, fast=10 readings=5min,
+            // slow=40 readings=20min) requested alongside the original 15s/8-40 (2min/10min) one,
+            // to compare against volume-bar-based construction on equal footing. Same fast:slow
+            // ratio family, just a different cadence -- applied identically across every DTE, no
+            // per-DTE tuning, per instruction. A first, stated-as-such starting choice at the low
+            // end of the requested 5-10min/20-30min ranges, not fit to this data.
+            var readingsT = new Dictionary<string, List<Reading>>();
             var coverage = new List<object>(); var samples = new List<object>();
             foreach (var inst in chain.Values)
             {
@@ -355,8 +410,9 @@ public static class ReversalResearch
                     .OrderBy(t => t.ExchangeTimestamp).ThenBy(t => t.Id)
                     .Select(t => new Print(t.Id, t.ExchangeTimestamp, t.ReceivedAt, t.LastPrice,
                         t.Depth == null ? 0 : t.Depth.Bid1Price, t.Depth == null ? 0 : t.Depth.Ask1Price,
-                        t.Depth == null ? 0 : t.Depth.Bid1Qty, t.Depth == null ? 0 : t.Depth.Ask1Qty)).ToListAsync();
+                        t.Depth == null ? 0 : t.Depth.Bid1Qty, t.Depth == null ? 0 : t.Depth.Ask1Qty, t.Volume)).ToListAsync();
                 ticks[token] = list; var bars = Cadences(list, start, end); readings[token] = bars;
+                readingsT[token] = Cadences(list, start, end, fast: 10, slow: 40, bucketSeconds: 30);
                 coverage.Add(new { token, inst.OptionType, inst.StrikePrice, inst.LotSize, Count = list.Count,
                     First = list.FirstOrDefault()?.Time, Last = list.LastOrDefault()?.Time,
                     Empty = bars.Count(b => b.Count == 0), Warm = bars.Count(b => b.Gap is not null),
@@ -385,34 +441,61 @@ public static class ReversalResearch
                         s => readings[s.Token].Where(r => r.Down).Select(r => r.End));
                     experiments[$"{mode}-{side}"] = new { Summary = Summary(simulation.Trades), simulation, signals };
                 }
+                // Same C0/C1/C2 logic, wider 30s/5min/20min cadence (readingsT) instead of the
+                // original 15s/2min/10min (readings) -- "CT" = Cadence-Time-variant.
+                foreach (var mode in new[] { "C0", "C1", "C2" })
+                {
+                    var signals = chain.Values.Where(i => i.OptionType == side)
+                        .SelectMany(i => CrossSignals(i, ticks[i.Token], readingsT[i.Token], mode)).ToList();
+                    signals = signals.Select(s => Forward(s, ticks[s.Token])).ToList();
+                    var simulation = Simulate(date, signals, chain, ticks,
+                        s => readingsT[s.Token].Where(r => r.Down).Select(r => r.End));
+                    experiments[$"{mode}T-{side}"] = new { Summary = Summary(simulation.Trades), simulation, signals };
+                }
+                // Same C0/C1/C2 logic again, this time on each token's own volume-threshold bars
+                // (650, see OptionVolumeBars) instead of any time cadence -- "V" = Volume-bar variant.
+                var readingsV = chain.Values.Where(i => i.OptionType == side)
+                    .ToDictionary(i => i.Token, i => ReadingsFromBars(OptionVolumeBars(ticks[i.Token], 650), fast: 8, slow: 40));
+                foreach (var mode in new[] { "C0", "C1", "C2" })
+                {
+                    var signals = chain.Values.Where(i => i.OptionType == side)
+                        .SelectMany(i => CrossSignals(i, ticks[i.Token], readingsV[i.Token], mode)).ToList();
+                    signals = signals.Select(s => Forward(s, ticks[s.Token])).ToList();
+                    var simulation = Simulate(date, signals, chain, ticks,
+                        s => readingsV[s.Token].Where(r => r.Down).Select(r => r.End));
+                    experiments[$"{mode}V-{side}"] = new { Summary = Summary(simulation.Trades), simulation, signals };
+                }
             }
-            var futureBars = await FutureEventBarBuilder.BuildDayAsync(db, date, 13000, CancellationToken.None);
             var future = await db.Instruments.Where(i => i.AsOfDate == date && i.Underlying == "NIFTY" && i.InstrumentType == InstrumentType.Future)
                 .OrderBy(i => i.ExpiryDate).FirstAsync();
             var futureReceipts = await db.Ticks.Where(t => t.Token == future.Token && t.ExchangeTimestamp >= start && t.ExchangeTimestamp <= end)
                 .OrderBy(t => t.ExchangeTimestamp).ThenBy(t => t.Id).Select(t => new { t.ExchangeTimestamp, t.ReceivedAt }).ToListAsync();
-            var available = new List<DateTimeOffset>(); var latestReceipt = start; var fc = 0;
-            foreach (var bar in futureBars)
-            {
-                while (fc < futureReceipts.Count && futureReceipts[fc].ExchangeTimestamp <= bar.EndTimestamp)
-                { latestReceipt = latestReceipt > futureReceipts[fc].ReceivedAt ? latestReceipt : futureReceipts[fc].ReceivedAt; fc++; }
-                available.Add(latestReceipt > bar.EndTimestamp ? latestReceipt : bar.EndTimestamp);
-            }
-            var patternRows = Patterns(chain, ticks, futureBars, available);
-            var referencePatterns = Patterns(chain, ticks, futureBars, futureBars.Select(b => b.EndTimestamp).ToList(), false);
-            var patternSignals = new List<Signal>();
-            foreach (var row in patternRows.Where(r => r.StateEntry && r.Full))
-            {
-                var side = row.State == "A" ? OptionType.Put : OptionType.Call;
-                var eligible = chain.Values.Where(i => i.OptionType == side).Select(i => (i, p: Before(ticks[i.Token], row.Time)))
-                    .Where(x => Fresh(x.p, row.Time) && Valid(x.p!, x.i.LotSize) && x.p!.Ask >= 100 && x.p.Ask <= 150)
-                    .OrderBy(x => (x.p!.Ask - x.p.Bid) / x.p.Ask).ThenBy(x => x.i.Token, StringComparer.Ordinal).FirstOrDefault();
-                if (eligible.i is null) { continue; }
-                var history = readings[eligible.i.Token].Where(r => r.End <= row.Time && r.Slow is not null && r.Average is not null).TakeLast(41).ToList();
-                var extended = history.Count < 41 || eligible.p!.Price - history[^1].Slow!.Value > history.Take(40).Max(r => r.Average!.Value - r.Slow!.Value);
-                patternSignals.Add(Forward(new(row.Time, row.State, eligible.i.Token, "Pattern" + row.State, 0, extended), ticks[eligible.i.Token]));
-            }
+
+            var futureBars = await FutureEventBarBuilder.BuildDayAsync(db, date, 13000, CancellationToken.None);
+            var available = ComputeAvailability(futureBars, futureReceipts.Select(r => (r.ExchangeTimestamp, r.ReceivedAt)).ToList(), start);
+            var (patternRows, referencePatterns, patternSignals) = BuildPatternPopulation(chain, ticks, readings, futureBars, available);
+
+            // 2026-09-26: same Pattern A/B detection logic, but the underlying future "bars" are
+            // built on a fixed 30-second wall-clock interval instead of the 13,000-contract volume
+            // threshold -- comparing bar CONSTRUCTION method, signal/eligibility logic unchanged.
+            // Patterns()'s own 180-second window is real-time-based already, so bar granularity here
+            // only affects price-sampling resolution within that window, not the window length.
+            var futureTicks = await db.Ticks.Where(t => t.Token == future.Token && t.ExchangeTimestamp >= start && t.ExchangeTimestamp <= end && t.LastPrice > 0)
+                .OrderBy(t => t.ExchangeTimestamp).ThenBy(t => t.Id)
+                .Select(t => new Print(t.Id, t.ExchangeTimestamp, t.ReceivedAt, t.LastPrice,
+                    t.Depth == null ? 0 : t.Depth.Bid1Price, t.Depth == null ? 0 : t.Depth.Ask1Price,
+                    t.Depth == null ? 0 : t.Depth.Bid1Qty, t.Depth == null ? 0 : t.Depth.Ask1Qty)).ToListAsync();
+            var futureBarsT = BuildTimeBasedFutureBars(futureTicks, start, end, bucketSeconds: 30);
+            var availableT = ComputeAvailability(futureBarsT, futureReceipts.Select(r => (r.ExchangeTimestamp, r.ReceivedAt)).ToList(), start);
+            var (patternRowsT, referencePatternsT, patternSignalsT) = BuildPatternPopulation(chain, ticks, readings, futureBarsT, availableT);
             var baselineSims = new Dictionary<string, Simulation>();
+            foreach (var mode in new[] { "PT0", "PT1" })
+            {
+                var signals = patternSignalsT.Where(s => mode == "PT0" || !s.Extended).ToList();
+                var sim = Simulate(date, signals, chain, ticks, s => patternRowsT.Where(r => r.StateEntry && r.State is "A" or "B" && r.State != s.Side).Select(r => r.Time));
+                experiments[mode] = new { Summary = Summary(sim.Trades), simulation = sim, signals,
+                    BySide = sim.Trades.GroupBy(t => t.Side).ToDictionary(g => g.Key, g => Summary(g)) };
+            }
             foreach (var mode in new[] { "P0", "P1" })
             {
                 var signals = patternSignals.Where(s => mode == "P0" || !s.Extended).ToList();
@@ -464,6 +547,85 @@ public static class ReversalResearch
             return Fresh(q, at) && p is not null && p.Price > 0 ? (q!.Price / p.Price - 1) * 100 : null;
         }
         return s with { Forward1 = Return(1), Forward2 = Return(2), Forward5 = Return(5) };
+    }
+
+    /// <summary>
+    /// Causal "when could this bar's close actually have been acted on" timestamps -- the later of
+    /// the bar's own end and the latest receipt time among all future ticks up to that end. Shared
+    /// by both the volume-threshold and time-based bar constructions; the logic itself doesn't care
+    /// how a bar was built, only that it has an EndTimestamp.
+    /// </summary>
+    static List<DateTimeOffset> ComputeAvailability(List<FutureEventBar> bars, List<(DateTimeOffset ExchangeTimestamp, DateTimeOffset ReceivedAt)> futureReceipts, DateTimeOffset start)
+    {
+        var available = new List<DateTimeOffset>(); var latestReceipt = start; var fc = 0;
+        foreach (var bar in bars)
+        {
+            while (fc < futureReceipts.Count && futureReceipts[fc].ExchangeTimestamp <= bar.EndTimestamp)
+            { latestReceipt = latestReceipt > futureReceipts[fc].ReceivedAt ? latestReceipt : futureReceipts[fc].ReceivedAt; fc++; }
+            available.Add(latestReceipt > bar.EndTimestamp ? latestReceipt : bar.EndTimestamp);
+        }
+        return available;
+    }
+
+    /// <summary>
+    /// Fixed 30-second (or whatever bucketSeconds is) wall-clock future bars -- the time-based
+    /// counterpart to FutureEventBarBuilder's 13,000-contract volume threshold, for comparing bar
+    /// CONSTRUCTION method on Pattern A/B. A self-contained builder (not a shared/tested class
+    /// reused elsewhere) so this doesn't risk FutureEventBarBuilder/TimeBasedBarBuilder's own
+    /// existing callers. A bucket with zero ticks is skipped entirely, never fabricated -- same
+    /// discipline as Cadences().
+    /// </summary>
+    internal static List<FutureEventBar> BuildTimeBasedFutureBars(List<Print> futureTicks, DateTimeOffset start, DateTimeOffset end, int bucketSeconds)
+    {
+        var bars = new List<FutureEventBar>();
+        var bucket = TimeSpan.FromSeconds(bucketSeconds);
+        var cursor = 0; var eventId = 0;
+        for (var left = start; left < end; left += bucket)
+        {
+            var right = left + bucket;
+            decimal? open = null, high = null, low = null, close = null; long volume = 0; var count = 0;
+            while (cursor < futureTicks.Count && futureTicks[cursor].Time <= right)
+            {
+                var t = futureTicks[cursor++];
+                if (t.Time <= left) { continue; }
+                open ??= t.Price;
+                high = high is { } h ? Math.Max(h, t.Price) : t.Price;
+                low = low is { } l ? Math.Min(l, t.Price) : t.Price;
+                close = t.Price;
+                count++;
+            }
+            if (count == 0) { continue; }
+            bars.Add(new(eventId++, DateOnly.FromDateTime(start.Date), left, right, open!.Value, high!.Value, low!.Value, close!.Value,
+                volume, null, null, count, false));
+        }
+        return bars;
+    }
+
+    /// <summary>
+    /// The full Pattern A/B population (rows, non-causal reference rows, and the eligible tradeable
+    /// signals with the exhaustion/extended flag) for one bar series -- shared by both the
+    /// volume-threshold and time-based constructions so the signal/eligibility logic itself is
+    /// never duplicated between them.
+    /// </summary>
+    static (List<PatternRow> Rows, List<PatternRow> Reference, List<Signal> Signals) BuildPatternPopulation(
+        Dictionary<string, Instrument> chain, Dictionary<string, List<Print>> ticks, Dictionary<string, List<Reading>> readings,
+        List<FutureEventBar> bars, List<DateTimeOffset> available)
+    {
+        var patternRows = Patterns(chain, ticks, bars, available);
+        var referencePatterns = Patterns(chain, ticks, bars, bars.Select(b => b.EndTimestamp).ToList(), false);
+        var patternSignals = new List<Signal>();
+        foreach (var row in patternRows.Where(r => r.StateEntry && r.Full))
+        {
+            var side = row.State == "A" ? OptionType.Put : OptionType.Call;
+            var eligible = chain.Values.Where(i => i.OptionType == side).Select(i => (i, p: Before(ticks[i.Token], row.Time)))
+                .Where(x => Fresh(x.p, row.Time) && Valid(x.p!, x.i.LotSize) && x.p!.Ask >= 100 && x.p.Ask <= 150)
+                .OrderBy(x => (x.p!.Ask - x.p.Bid) / x.p.Ask).ThenBy(x => x.i.Token, StringComparer.Ordinal).FirstOrDefault();
+            if (eligible.i is null) { continue; }
+            var history = readings[eligible.i.Token].Where(r => r.End <= row.Time && r.Slow is not null && r.Average is not null).TakeLast(41).ToList();
+            var extended = history.Count < 41 || eligible.p!.Price - history[^1].Slow!.Value > history.Take(40).Max(r => r.Average!.Value - r.Slow!.Value);
+            patternSignals.Add(Forward(new(row.Time, row.State, eligible.i.Token, "Pattern" + row.State, 0, extended), ticks[eligible.i.Token]));
+        }
+        return (patternRows, referencePatterns, patternSignals);
     }
 
     static List<PatternRow> Patterns(Dictionary<string, Instrument> chain, Dictionary<string, List<Print>> ticks, List<FutureEventBar> bars, List<DateTimeOffset> available, bool causal = true)
