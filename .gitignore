@@ -48,3 +48,7 @@ deploy-vm/
 # validated it gets promoted into a properly-named, append-only research-reversal-runNN/ directory
 # instead, matching the existing convention.
 research-file-run/
+
+# Same reasoning: gamma-filter's own output is cheaply regenerable from research-ticks/ +
+# research-file-run/ + current code.
+gamma-filter.json
