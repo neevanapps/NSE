@@ -504,6 +504,20 @@ public static class ReversalResearch
                 experiments[mode] = new { Summary = Summary(sim.Trades), simulation = sim, signals,
                     BySide = sim.Trades.GroupBy(t => t.Side).ToDictionary(g => g.Key, g => Summary(g)) };
             }
+            // P4: entry-side filter only, exit UNCHANGED from P0 (both exit redesigns tried
+            // earlier -- SimulateGiveback v1/v2 -- failed; the wait-for-opposite-pattern exit
+            // remains the best one found). Keeps only signals whose relative-move ratio (Signal.Gap,
+            // see BuildPatternPopulation's own comment) clears 0.35 -- the median split from the
+            // event-study work on this exact 12-day set landed at 0.23 (A/DTE=0) and 0.44 (B/DTE=4);
+            // 0.35 sits between them, applied identically to every DTE/side, not tuned per group.
+            // NOT an independently pre-registered threshold -- it's the final packaging of an
+            // exploratory lead found on this same data, not a blind validation. Report it as such.
+            {
+                var signals = patternSignals.Where(s => s.Gap >= 0.35m).ToList();
+                var sim = Simulate(date, signals, chain, ticks, s => patternRows.Where(r => r.StateEntry && r.State is "A" or "B" && r.State != s.Side).Select(r => r.Time));
+                experiments["P4"] = new { Summary = Summary(sim.Trades), simulation = sim, signals,
+                    BySide = sim.Trades.GroupBy(t => t.Side).ToDictionary(g => g.Key, g => Summary(g)) };
+            }
             // P0G/P1G: TRUE same-entry comparison (BACKTEST_RULES rule 14, first step) -- P0/P1's
             // own already-fixed entries, only the exit changes. Trade count is identical to the
             // paired baseline by construction; this isolates the pure exit effect.
@@ -613,6 +627,7 @@ public static class ReversalResearch
     {
         var patternRows = Patterns(chain, ticks, bars, available);
         var referencePatterns = Patterns(chain, ticks, bars, bars.Select(b => b.EndTimestamp).ToList(), false);
+        var moveByIndex = patternRows.ToDictionary(r => r.Index, r => Math.Abs(r.Move));
         var patternSignals = new List<Signal>();
         foreach (var row in patternRows.Where(r => r.StateEntry && r.Full))
         {
@@ -623,7 +638,14 @@ public static class ReversalResearch
             if (eligible.i is null) { continue; }
             var history = readings[eligible.i.Token].Where(r => r.End <= row.Time && r.Slow is not null && r.Average is not null).TakeLast(41).ToList();
             var extended = history.Count < 41 || eligible.p!.Price - history[^1].Slow!.Value > history.Take(40).Max(r => r.Average!.Value - r.Slow!.Value);
-            patternSignals.Add(Forward(new(row.Time, row.State, eligible.i.Token, "Pattern" + row.State, 0, extended), ticks[eligible.i.Token]));
+            // 2026-09-26: relative-move ratio (this event's own |Move| divided by the trailing
+            // 20-bar average |Move| strictly before it, causal) -- stored in Signal.Gap (otherwise
+            // unused for pattern signals) so a candidate rule can filter on it without changing the
+            // Signal shape. Exploratory lead from the earlier event-study work on this exact 12-day
+            // set, not an independently pre-registered threshold -- see P4/P5's own doc comment.
+            var trail = Enumerable.Range(Math.Max(0, row.Index - 20), Math.Min(20, row.Index)).Where(moveByIndex.ContainsKey).Select(i => moveByIndex[i]).ToList();
+            var ratio = trail.Count >= 5 && trail.Average() > 0 ? Math.Abs(row.Move) / trail.Average() : 0;
+            patternSignals.Add(Forward(new(row.Time, row.State, eligible.i.Token, "Pattern" + row.State, ratio, extended), ticks[eligible.i.Token]));
         }
         return (patternRows, referencePatterns, patternSignals);
     }
