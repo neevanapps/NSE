@@ -1,0 +1,12 @@
+{
+  "Date": "2026-09-04",
+  "Underlying": "NIFTY",
+  "NearestExpiry": "2026-09-08",
+  "InstrumentCount": 41,
+  "TotalTicks": 2137591,
+  "TicksWithDepthBeyondLevel1": 2136765,
+  "ExportedAtUtc": "2026-09-27T09:49:12.7041512+00:00",
+  "SchemaVersion": "v2",
+  "Schema": "[id, exchangeTimestamp, receivedAt, lastPrice, bid1Price, bid1Qty, bid2Price, bid2Qty, bid3Price, bid3Qty, bid4Price, bid4Qty, bid5Price, bid5Qty, ask1Price, ask1Qty, ask2Price, ask2Qty, ask3Price, ask3Qty, ask4Price, ask4Qty, ask5Price, ask5Qty, volume, openInterest]",
+  "Ordering": "ORDER BY ExchangeTimestamp, Id (deterministic tie-break on Id)"
+}
