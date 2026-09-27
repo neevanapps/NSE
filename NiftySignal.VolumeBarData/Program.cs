@@ -520,8 +520,16 @@ if (args.Length > 0 && string.Equals(args[0], "relative-strength-viz", StringCom
     return await RelativeStrengthVisualization.RunAsync(args);
 }
 
+// 2026-09-27 V2: separates non-overlapping incremental returns (chained into the cumulative index)
+// from overlapping multi-horizon rolling returns (never compounded). See RelativeStrengthVisualizationV2.cs.
+//   dotnet run --project NiftySignal.VolumeBarData -- relative-strength-viz-v2 <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [--in=research-ticks] [--out=.]
+if (args.Length > 0 && string.Equals(args[0], "relative-strength-viz-v2", StringComparison.OrdinalIgnoreCase))
+{
+    return await RelativeStrengthVisualizationV2.RunAsync(args);
+}
+
 Console.WriteLine($"Unknown command '{(args.Length > 0 ? args[0] : "(none)")}'. Known commands while " +
-    "RESEARCH_LEGACY_COMMANDS is undefined: reversal-research, export-ticks, research-from-files, gamma-filter, dump-cadences, band-pct-experiment, relative-strength-viz.");
+    "RESEARCH_LEGACY_COMMANDS is undefined: reversal-research, export-ticks, research-from-files, gamma-filter, dump-cadences, band-pct-experiment, relative-strength-viz, relative-strength-viz-v2.");
 return 1;
 
 // TEMPORARILY DISABLED (2026-09-25, build-speed) -- see the matching #if above these three commands.
