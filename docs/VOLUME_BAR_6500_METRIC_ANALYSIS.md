@@ -204,3 +204,19 @@ No option-buying or tradeable-candidate status is assigned in this phase.
 A metric should proceed to option translation only if its raw Futures relationship is coherent
 across horizons, not dominated by one session, not obviously explained only by current-bar price
 movement, and not dependent on the predeclared extreme-volume tail.
+
+
+## Frozen duration follow-up
+
+The first-pass output showed that 'BarDurationUrgency' had a repeatable reversal-shaped relationship
+but was also strongly related to the signal bar's own price change.
+
+Before any option translation, the follow-up
+'docs/VOLUME_BAR_6500_DURATION_INCREMENTAL.md' is run automatically by the same revalidation
+command. It tests whether duration adds reversal information after matching signal bars on:
+
+- direction (UP / DOWN), and
+- absolute close-minus-open move-magnitude quintile.
+
+This follow-up was frozen before its result was inspected. It must not be replaced by a search over
+alternative duration thresholds or magnitude buckets after seeing the output.

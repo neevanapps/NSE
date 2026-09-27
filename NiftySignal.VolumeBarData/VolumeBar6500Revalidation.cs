@@ -668,8 +668,9 @@ public static class VolumeBar6500RevalidationRunner
         await WriteBarsCsvAsync(Path.Combine(outputDirectory, "bars-6500.csv"), allBars);
         await WriteObservationsCsvAsync(Path.Combine(outputDirectory, "observations-6500.csv"), allObservations);
         await VolumeBar6500MetricAnalysis.WriteReportsAsync(allObservations, outputDirectory);
+        await VolumeBar6500DurationIncrementalAnalysis.WriteReportsAsync(allObservations, outputDirectory);
 
-        Console.WriteLine($"6500 raw-feed-update revalidation + metric analysis complete -> {outputDirectory}");
+        Console.WriteLine($"6500 raw-feed-update revalidation + metric analyses complete -> {outputDirectory}");
         return 0;
     }
 

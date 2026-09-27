@@ -229,6 +229,10 @@ The output directory contains:
 - 'metric-quintiles.csv'
 - 'metric-dte.csv'
 - 'metric-leave-one-session-out.csv'
+- 'duration-incremental-summary.csv'
+- 'duration-incremental-cells.csv'
+- 'duration-incremental-sessions.csv'
+- 'duration-incremental-leave-one-session-out.csv'
 
 The directory is regenerable and is ignored by git. Do not commit these CSVs as source.
 
