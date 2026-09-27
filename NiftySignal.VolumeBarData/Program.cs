@@ -481,6 +481,15 @@ if (args.Length > 0 && string.Equals(args[0], "export-ticks", StringComparison.O
     return await TickExporter.RunAsync(tradeSourceOptions, args);
 }
 
+// 2026-09-27 V2 export: adds full top-5 bid/ask depth (V1 only ever exported Level 1). Brand-new
+// file/command/output directory -- V1 and everything built against `research-ticks/` is
+// unchanged. See TickExporterV2.cs.
+//   dotnet run --project NiftySignal.VolumeBarData -- export-ticks-v2 <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [--out=research-ticks-v2] [--underlying=NIFTY] [--force]
+if (args.Length > 0 && string.Equals(args[0], "export-ticks-v2", StringComparison.OrdinalIgnoreCase))
+{
+    return await TickExporterV2.RunAsync(tradeSourceOptions, args);
+}
+
 // Runs ReversalResearch.BuildDayReportAsync against files export-ticks already produced, no live
 // database connection needed. See FileBackedResearchRunner.cs.
 //   dotnet run --project NiftySignal.VolumeBarData -- research-from-files <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [--in=research-ticks] [--out=research-file-run]
@@ -545,7 +554,7 @@ if (args.Length > 0 && string.Equals(args[0], "confirmation-experiment", StringC
 }
 
 Console.WriteLine($"Unknown command '{(args.Length > 0 ? args[0] : "(none)")}'. Known commands while " +
-    "RESEARCH_LEGACY_COMMANDS is undefined: reversal-research, export-ticks, research-from-files, gamma-filter, dump-cadences, band-pct-experiment, relative-strength-viz, relative-strength-viz-v2, option-futures-dislocation-export, confirmation-experiment.");
+    "RESEARCH_LEGACY_COMMANDS is undefined: reversal-research, export-ticks, export-ticks-v2, research-from-files, gamma-filter, dump-cadences, band-pct-experiment, relative-strength-viz, relative-strength-viz-v2, option-futures-dislocation-export, confirmation-experiment.");
 return 1;
 
 // TEMPORARILY DISABLED (2026-09-25, build-speed) -- see the matching #if above these three commands.
