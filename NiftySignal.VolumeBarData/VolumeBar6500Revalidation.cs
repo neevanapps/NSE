@@ -678,16 +678,18 @@ public static class VolumeBar6500RevalidationRunner
     {
         if (value is null) { return ""; }
 
-        var text = value switch
+        var field = value switch
         {
             IFormattable f => f.ToString(null, CultureInfo.InvariantCulture),
             _ => value.ToString() ?? "",
         };
 
-        return text.IndexOfAny(new[] { ',', '"', '', '
-' }) >= 0
-            ? $""{text.Replace(""", """")}""
-            : text;
+        if (field.IndexOfAny([',', '"', '\r', '\n']) < 0)
+        {
+            return field;
+        }
+
+        return "\"" + field.Replace("\"", "\"\"") + "\"";
     }
 
     static string Iso(DateTimeOffset? value) =>
