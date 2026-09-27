@@ -257,6 +257,13 @@ The output directory contains:
 - 'magnitude-dose-response-sessions.csv'
 - 'magnitude-dose-response-dte.csv'
 - 'magnitude-dose-response-monotonicity.csv'
+- 'episode-state-episodes.csv'
+- 'episode-state-entry-observations.csv'
+- 'episode-state-structure.csv'
+- 'episode-state-entry-summary.csv'
+- 'episode-state-entry-sessions.csv'
+- 'episode-state-entry-dte.csv'
+- 'episode-state-age-summary.csv'
 
 The directory is regenerable and is ignored by git. Do not commit these CSVs as source.
 
@@ -302,3 +309,11 @@ After unconditional option translation, the next frozen diagnostic is documented
 'FutureCvdProxyExhaustion' separate and uses fixed causal expanding-percentile quintiles to test
 whether stronger magnitude produces a monotonic improvement in Futures reversal and weekly-option
 response. It does not choose an entry threshold or create sequential strategy P&L.
+
+## Episode/state-entry follow-up
+
+After the magnitude dose-response diagnostic, the next frozen test is documented in
+'docs/VOLUME_BAR_6500_EPISODE_STATE.md'. It collapses maximal consecutive same-sign price,
+CVD and unweighted price+CVD agreement states into episodes, evaluates only the first bar for the
+primary state-entry comparison, and exports exact continuation-state age separately. No magnitude
+threshold, DTE filter, weighted composite, stop, target or confirmation-age rule is selected.

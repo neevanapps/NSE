@@ -250,3 +250,11 @@ This run does not promote Q4, Q5, or any other percentile as a trading threshold
 
 If a stable dose-response exists, a later step may freeze a threshold or state-transition rule and
 test it sequentially. That later rule must be specified before using new forward sessions.
+
+## Episode/state-entry follow-up
+
+The magnitude run does not promote any quintile threshold. The next frozen diagnostic is
+'docs/VOLUME_BAR_6500_EPISODE_STATE.md': maximal same-sign state episodes for price reversal,
+CVD exhaustion and their unweighted directional agreement. The primary comparison uses only the
+first bar of each episode, while exact state age is reported descriptively without choosing a
+confirmation age.

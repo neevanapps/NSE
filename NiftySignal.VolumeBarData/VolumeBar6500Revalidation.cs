@@ -755,8 +755,10 @@ public static class VolumeBar6500RevalidationRunner
             inputRoot, allObservations, outputDirectory, cancellationToken);
         await VolumeBar6500MagnitudeDoseResponseAnalysis.WriteReportsAsync(
             allObservations, optionTranslation, outputDirectory);
+        await VolumeBar6500EpisodeStateAnalysis.WriteReportsAsync(
+            allObservations, optionTranslation, outputDirectory);
 
-        Console.WriteLine($"6500 raw-feed-update revalidation + metric analyses + option translation + magnitude dose-response complete -> {outputDirectory}");
+        Console.WriteLine($"6500 raw-feed-update revalidation + metric analyses + option translation + magnitude dose-response + episode/state-entry complete -> {outputDirectory}");
         return 0;
     }
 
