@@ -248,6 +248,11 @@ The output directory contains:
 - 'cvd-control-cells.csv'
 - 'cvd-control-sessions.csv'
 - 'cvd-control-leave-one-session-out.csv'
+- 'option-translation-signal-audit.csv'
+- 'option-translation-observations.csv'
+- 'option-translation-summary.csv'
+- 'option-translation-sessions.csv'
+- 'option-translation-dte.csv'
 
 The directory is regenerable and is ignored by git. Do not commit these CSVs as source.
 
@@ -276,3 +281,12 @@ The clean second-batch result for 'FutureCvdProxyNet' is followed by the locked 
 'docs/VOLUME_BAR_6500_CVD_CONTROL.md'. It reuses the same frozen direction x move-magnitude cells
 and asks whether the inverse CVD/future relationship survives contemporaneous CloseLocation,
 TopOfBookImbalance and DepthImbalance controls.
+
+## Option translation follow-up
+
+After the CVD mechanism controls, the fixed Futures-to-weekly-option diagnostic is documented in
+'docs/VOLUME_BAR_6500_OPTION_TRANSLATION.md'. It translates 'CurrentBarReversal' and
+'FutureCvdProxyExhaustion' independently into nearest-expiry Rs100-Rs150 CE/PE observations with
+receipt-time-causal contract selection, same-token pinning, bid/ask fills, fixed one-second latency,
+one-tick adverse slippage and the corrected fee model. Observations may overlap and are not summed
+as strategy P&L.

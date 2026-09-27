@@ -203,3 +203,10 @@ contemporaneous received book state.
 
 If it survives all three, 'CVD-proxy exhaustion/reversal' becomes materially stronger as an
 underlying candidate, while still retaining the explicit sampled-feed-proxy caveat.
+
+## Translation phase
+
+If the CVD relationship survives the frozen price/book controls and sampled-volume sensitivity,
+the next phase is not another historical CVD threshold search. The fixed translation diagnostic is
+'docs/VOLUME_BAR_6500_OPTION_TRANSLATION.md', where CVD exhaustion and simple current-bar reversal
+are translated independently into exact-token weekly-option responses.
