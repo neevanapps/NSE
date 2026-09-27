@@ -41,3 +41,14 @@ deploy/
 # Stale manual VM publish output (was committed by accident -- 132 binaries).
 # Deploys go through deploy.ps1 now, which stages under artifacts/ (already ignored).
 deploy-vm/
+
+# research-from-files' own output: cheaply regenerable from the committed research-ticks/ export
+# plus the current code, so it's disposable scratch during iteration -- unlike research-ticks/
+# and research-reversal-run01/02/03 (both DB-derived and precious), this isn't. Once a run is
+# validated it gets promoted into a properly-named, append-only research-reversal-runNN/ directory
+# instead, matching the existing convention.
+research-file-run/
+
+# Same reasoning: gamma-filter's own output is cheaply regenerable from research-ticks/ +
+# research-file-run/ + current code.
+gamma-filter.json

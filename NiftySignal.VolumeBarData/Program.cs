@@ -12,6 +12,9 @@ using NiftySignal.VolumeBarData;
 using MtmRow = NiftySignal.VolumeBarData.MarkToMarketDiagnostics.MtmRow;
 using ExitAsymmetryRow = NiftySignal.VolumeBarData.MarkToMarketDiagnostics.ExitAsymmetryRow;
 
+// TEMPORARILY DISABLED (2026-09-25, build-speed) -- only used by the legacy commands disabled
+// below; see the matching #if block. Guarded here too so they don't warn as unused (CS8321).
+#if RESEARCH_LEGACY_COMMANDS
 // CadenceContext.Timestamp / VolumeBarRow.StartTimestamp/EndTimestamp are all stored UTC (Npgsql's
 // own requirement) -- same convention NiftySignal.MetricTrials/Program.cs already uses.
 string FormatIst(DateTimeOffset t) => t.ToOffset(TimeSpan.FromHours(5.5)).ToString("HH:mm:ss");
@@ -41,6 +44,7 @@ string FormatIst(DateTimeOffset t) => t.ToOffset(TimeSpan.FromHours(5.5)).ToStri
 
     return (positional.ToArray(), named);
 }
+#endif // RESEARCH_LEGACY_COMMANDS
 
 // 2026-09-17 volume-cadence plan. Usage:
 //   dotnet run --project NiftySignal.VolumeBarData -- <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [barVolumeThreshold] [sourceDatabaseNameOverride]
@@ -116,6 +120,15 @@ var baseConnectionString = configuration.GetConnectionString("NiftySignalDb")
 var volumeBarConnectionString = new NpgsqlConnectionStringBuilder(baseConnectionString) { Database = VolumeBarPopulator.VolumeBarDatabaseName }.ConnectionString;
 var volumeBarOptions = new DbContextOptionsBuilder<VolumeBarDbContext>().UseNpgsql(volumeBarConnectionString).Options;
 
+// TEMPORARILY DISABLED (2026-09-25, build-speed): this project's Program.cs accumulated 60+ CLI
+// commands as one enormous top-level Main, which makes every build of this project slow (~7-8 min
+// in a cold/resource-constrained container). Everything except the three commands the current
+// reversal-contract research needs (reversal-research/export-ticks/research-from-files, just below)
+// is excluded from compilation via #if. Nothing is deleted -- define RESEARCH_LEGACY_COMMANDS
+// (e.g. dotnet build -p:DefineConstants=RESEARCH_LEGACY_COMMANDS) or remove this #if/#endif pair to
+// restore it. IMPORTANT: this is a shared branch -- pulling it elsewhere (e.g. onto the VM) means
+// these commands are unavailable until re-enabled.
+#if RESEARCH_LEGACY_COMMANDS
 if (args.Length > 0 && string.Equals(args[0], "analyze", StringComparison.OrdinalIgnoreCase))
 {
     if (args.Length < 2 || !DateOnly.TryParseExact(args[1], "yyyy-MM-dd", out var analyzeDate))
@@ -451,6 +464,8 @@ if (args.Length > 0 && string.Equals(args[0], "replay-live-futures-crossover-bot
     return await ReplayLiveFuturesCrossoverCommand.RunBothStrategiesAsync(baseConnectionString, fbDate, fbThreshold, CancellationToken.None);
 }
 
+#endif // RESEARCH_LEGACY_COMMANDS (region 1)
+
 var tradeSourceConnectionString = new NpgsqlConnectionStringBuilder(baseConnectionString) { Database = "niftysignal_vm_copy" }.ConnectionString;
 var tradeSourceOptions = new DbContextOptionsBuilder<NiftySignalDbContext>().UseNpgsql(tradeSourceConnectionString).Options;
 if (args.Length > 0 && args[0] == "reversal-research")
@@ -465,6 +480,86 @@ if (args.Length > 0 && string.Equals(args[0], "export-ticks", StringComparison.O
 {
     return await TickExporter.RunAsync(tradeSourceOptions, args);
 }
+
+// 2026-09-27 V2 export: adds full top-5 bid/ask depth (V1 only ever exported Level 1). Brand-new
+// file/command/output directory -- V1 and everything built against `research-ticks/` is
+// unchanged. See TickExporterV2.cs.
+//   dotnet run --project NiftySignal.VolumeBarData -- export-ticks-v2 <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [--out=research-ticks-v2] [--underlying=NIFTY] [--force]
+if (args.Length > 0 && string.Equals(args[0], "export-ticks-v2", StringComparison.OrdinalIgnoreCase))
+{
+    return await TickExporterV2.RunAsync(tradeSourceOptions, args);
+}
+
+// Runs ReversalResearch.BuildDayReportAsync against files export-ticks already produced, no live
+// database connection needed. See FileBackedResearchRunner.cs.
+//   dotnet run --project NiftySignal.VolumeBarData -- research-from-files <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [--in=research-ticks] [--out=research-file-run]
+if (args.Length > 0 && string.Equals(args[0], "research-from-files", StringComparison.OrdinalIgnoreCase))
+{
+    return await FileBackedResearchRunner.RunAsync(args);
+}
+
+// Real delta/gamma per Pattern A/B signal, off already-exported files. See GammaFilterAnalysis.cs.
+//   dotnet run --project NiftySignal.VolumeBarData -- gamma-filter <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [--in=research-ticks] [--runs=research-file-run] [--out=gamma-filter.json]
+if (args.Length > 0 && string.Equals(args[0], "gamma-filter", StringComparison.OrdinalIgnoreCase))
+{
+    return await GammaFilterAnalysis.RunAsync(args);
+}
+
+// Exports the exact Cadences() fast/slow-MA series feeding C0/C1/C2, before Simulate turns it
+// into trades -- so the option-price-crossover dataset can be inspected directly. See DumpCadences.cs.
+//   dotnet run --project NiftySignal.VolumeBarData -- dump-cadences <date:yyyy-MM-dd> [token] [--fast=8] [--slow=40] [--bucket=15] [--in=research-ticks] [--out=cadence-dump.csv]
+if (args.Length > 0 && string.Equals(args[0], "dump-cadences", StringComparison.OrdinalIgnoreCase))
+{
+    return await DumpCadences.RunAsync(args);
+}
+
+// 2026-09-26 exploratory market-structure experiment (parallel to, never modifying, Pattern A/B).
+// See BandPercentageExperiment.cs. Restricted to 2026-09-22/23 (Design sessions) by the command itself.
+//   dotnet run --project NiftySignal.VolumeBarData -- band-pct-experiment <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [--in=research-ticks] [--out=band-pct-experiment.json]
+if (args.Length > 0 && string.Equals(args[0], "band-pct-experiment", StringComparison.OrdinalIgnoreCase))
+{
+    return await BandPercentageExperiment.RunAsync(args);
+}
+
+// 2026-09-27 pure-visualization research tool (never a trading experiment, never modifying
+// Pattern A/B). See RelativeStrengthVisualization.cs. Restricted to 2026-09-22/23 by the command.
+//   dotnet run --project NiftySignal.VolumeBarData -- relative-strength-viz <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [--in=research-ticks] [--out=.]
+if (args.Length > 0 && string.Equals(args[0], "relative-strength-viz", StringComparison.OrdinalIgnoreCase))
+{
+    return await RelativeStrengthVisualization.RunAsync(args);
+}
+
+// 2026-09-27 V2: separates non-overlapping incremental returns (chained into the cumulative index)
+// from overlapping multi-horizon rolling returns (never compounded). See RelativeStrengthVisualizationV2.cs.
+//   dotnet run --project NiftySignal.VolumeBarData -- relative-strength-viz-v2 <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [--in=research-ticks] [--out=.]
+if (args.Length > 0 && string.Equals(args[0], "relative-strength-viz-v2", StringComparison.OrdinalIgnoreCase))
+{
+    return await RelativeStrengthVisualizationV2.RunAsync(args);
+}
+
+// 2026-09-27 raw-data export for the Option-Futures Dislocation experiment -- pure data export,
+// no modeling here (that happens in Python downstream). See OptionFuturesDislocationExport.cs.
+//   dotnet run --project NiftySignal.VolumeBarData -- option-futures-dislocation-export <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [--in=research-ticks] [--out=dislocation-raw.csv]
+if (args.Length > 0 && string.Equals(args[0], "option-futures-dislocation-export", StringComparison.OrdinalIgnoreCase))
+{
+    return await OptionFuturesDislocationExport.RunAsync(args);
+}
+
+// 2026-09-27 confirmation-variable experiment (Structure + OrderFlow families; Basis blocked --
+// see ConfirmationExperiment.cs's own doc comment for why). Never modifies Pattern A/B.
+//   dotnet run --project NiftySignal.VolumeBarData -- confirmation-experiment <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [--in=research-ticks] [--out=confirmation-raw.csv]
+if (args.Length > 0 && string.Equals(args[0], "confirmation-experiment", StringComparison.OrdinalIgnoreCase))
+{
+    return await ConfirmationExperiment.RunAsync(args);
+}
+
+Console.WriteLine($"Unknown command '{(args.Length > 0 ? args[0] : "(none)")}'. Known commands while " +
+    "RESEARCH_LEGACY_COMMANDS is undefined: reversal-research, export-ticks, export-ticks-v2, research-from-files, gamma-filter, dump-cadences, band-pct-experiment, relative-strength-viz, relative-strength-viz-v2, option-futures-dislocation-export, confirmation-experiment.");
+return 1;
+
+// TEMPORARILY DISABLED (2026-09-25, build-speed) -- see the matching #if above these three commands.
+// Everything from here to end-of-file is excluded from compilation the same way.
+#if RESEARCH_LEGACY_COMMANDS
 
 // Phase G (docs/LIVE_PARITY_PLAN.md) performance-review helper: measures, READ-ONLY against the
 // real historical source (niftysignal_vm_copy -- never written to), the wall-clock cost of the
@@ -18053,3 +18148,5 @@ for (var date = fromDate; date <= toDate; date = date.AddDays(1))
 
 Console.WriteLine($"Done. {populatedDays} day(s) populated, {skippedDays} day(s) skipped.");
 return 0;
+
+#endif // RESEARCH_LEGACY_COMMANDS (region 2)

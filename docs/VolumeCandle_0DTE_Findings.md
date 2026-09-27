@@ -7484,3 +7484,122 @@ dotnet run --project NiftySignal.VolumeBarData -- vc0dte-relationship-forward-va
 validation, the 2026-09-24 OOS observation, and this forward set as three separate, never-pooled
 populations) is explicitly deferred until all 10 are available, per instruction. No strategy
 parameter was modified. 2026-09-24 was not touched by this command.
+
+## Option Relative Strength and Confirmation Findings (2026-09-27)
+
+This section consolidates the current state of research across three related experiments run
+against the 10 primary sessions (2026-09-04/08/09/10/11/15/16/17/18/21) plus 2026-09-22/23 as
+discovery-only reference: the ATM±2 band-percentage / relative-strength work, the Huber
+Option-Futures Dislocation experiment, and the Structure/OrderFlow/Basis Confirmation experiment.
+It records conclusions reached so far, not a rewrite of any earlier dated section above. Where an
+earlier section already stated a preliminary version of one of these results, this section is the
+current, more complete word on it.
+
+### A. Pattern A/B remains the primary early-warning relationship
+
+Existing FullSurface Pattern A/B continues to show meaningful forward Nifty directional behavior,
+although matched-control performance is not uniformly positive on every session/horizon (see the
+per-session results throughout the sections above, e.g. the 2026-09-25 forward-validation and
+postmortem sections). Pattern A/B is not described as a guaranteed signal.
+
+### B. CE/PE relative strength via ATM±2 pinned contracts
+
+Using ATM±2 exact pinned contracts and median log returns successfully removes much of the raw-
+premium comparability problem that made naive CE-vs-PE premium comparisons unreliable. The useful
+continuous quantity established is:
+
+```
+BandRelativeShift = median(PELogReturn - CELogReturn)   [across the 5 pinned ATM-2..ATM+2 strikes]
+```
+
+For Pattern A, larger positive relative strength (i.e. larger `DirectionalRelativeStrength`,
+constructed as `+BandRelativeShift` for A) showed a useful forward-downside dose-response,
+particularly away from DTE0. For Pattern B, the symmetric continuous-strength relationship
+(`-BandRelativeShift`) was inconsistent and should NOT be assumed to behave like Pattern A's --
+the two sides are not mirror images of each other in this respect.
+
+### C. DTE awareness is required, not optional
+
+0-DTE option percentage/log-return behavior is structurally much noisier and larger in magnitude
+than DTE4-6. The same raw relative-strength magnitude must not be treated as equivalent across
+DTE -- DTE remains an explicit, mandatory research dimension for every metric built on option
+price/return data, not an optional breakdown added after the fact.
+
+### D. Huber Option-Futures Dislocation V1 -- NOT ADOPTED
+
+The cross-fitted (leave-one-session-out) Huber Dislocation experiment was mathematically valid
+and leak-free (training-fold-only standardization/residual scaling, confirmed via independent
+Python rebuild), but did not improve over the simpler raw `DirectionalRelativeStrength`: pooled
+correlation of `DirectionalDislocation` with `AbsFuturesLogReturn` was 0.497 (not weak -- a red
+flag against the whole premise of "dislocation net of futures move"), and raw
+`DirectionalRelativeStrength` outperformed `DirectionalDislocation` for Pattern A at the +2/+4
+horizons. Dislocation V1 also became materially correlated with the already-completed Futures
+move, undermining its intended purpose as an independent leading quantity.
+
+**Status: NOT ADOPTED.** Do not continue using Dislocation V1 as the preferred strength variable.
+
+### E. Futures Structure confirmation -- too late for entry, possible exit/lifecycle signal
+
+Definition: Pattern A confirms when a subsequent 13K-contract futures bar closes below the
+signal bar's low; Pattern B confirms on the mirror condition (close above the signal bar's high),
+searched within a window bounded by 4 bars, the next opposite-state entry, or the last valid bar.
+
+Structure-confirmed Patterns were highly accurate when outcomes were measured from the ORIGINAL
+Pattern timestamp (e.g. +4 hit rate 90.9% confirmed vs 39.3% not-confirmed for A; 92.3% vs 34.6%
+for B). However, Structure confirmation typically occurred after most of the favorable move had
+already happened -- median 94-96% of the eventual favorable move (per the predeclared +1/+2/+4
+horizons) was already consumed before the confirming bar closed. Measured FROM the Structure
+confirmation timestamp instead of the pattern timestamp, hit rates collapsed to roughly 33-52%
+with negative median forward points at +2/+4 -- i.e. no substantial forward edge remained once
+you actually wait for the confirmation to trigger.
+
+**Interpretation: Structure break is TOO LATE for entry confirmation in its current form.** It is
+kept as a possible future lifecycle / move-maturity / exit-timing research variable, not used as
+a current entry confirmation.
+
+### F. Futures OrderFlow sign confirmation -- not useful as currently defined
+
+Definition: the first subsequent 13K-contract bar whose signed futures order flow
+(`FutureCvdProxyAccumulator.CadenceNet`, reset per bar boundary) is negative for Pattern A /
+positive for Pattern B.
+
+This confirms quickly (fires on 80.3% of A entries and 82.7% of B entries, median 1-bar delay)
+but confirms too many signals and does not distinguish good Patterns from bad ones reliably:
+confirmed-vs-not-confirmed outcomes were similar or reversed, and session-level robustness was
+poor (only 2 of 10 sessions for A, 1 of 10 for B, beat the unconfirmed baseline).
+
+**Status: NOT USEFUL AS CURRENTLY DEFINED.** Simple one-bar signed-flow sign is not used as an
+entry confirmation. Continuous magnitude (rather than a bare sign flip) may be worth revisiting
+separately later, but that has NOT been established by this experiment.
+
+### G. Spot/Futures basis confirmation -- blocked by data availability
+
+Not tested. The Structure/OrderFlow confirmation experiment's third planned family (a
+spot/futures basis confirmation) requires synchronized NIFTY Spot/index ticks, which are
+unavailable in the exported `research-ticks/` dataset used for this experiment --
+`TickExporter.cs` only ever exports `InstrumentType.Option` and `InstrumentType.Future`, never
+`InstrumentType.Index`, and no live-DB access exists in this sandbox to re-export with spot
+included. This family was stopped before any calculation was attempted, per the "do not
+fabricate a substitute" discipline.
+
+**Status: UNKNOWN / BLOCKED BY DATA AVAILABILITY.** This is not recorded as a failed hypothesis --
+it has not been tested at all.
+
+### H. Current research interpretation -- lifecycle framing
+
+Putting A-G together, the current working picture is a lifecycle, not a single confirmation
+event:
+
+- **Option-price relationship (Pattern A/B, CE/PE relative strength)** -- possible early warning,
+  fires first, not guaranteed.
+- **Underlying (futures) Structure break** -- appears closer to move maturity than to entry
+  timing; accurate but arrives after most of the move.
+- **Futures signed order flow** -- fires almost immediately but does not discriminate good from
+  bad Patterns; not currently useful as a confirmation.
+- **Spot/futures basis** -- unknown, blocked by data availability, not yet investigated.
+
+The missing layer this leaves open is whether **options-side order flow** (aggressive trade
+classification and/or top-of-book depth on the option contracts themselves, as distinct from the
+already-tested futures-side order flow in F) provides an earlier and independent confirmation
+than either the option-price relative-strength signal or the futures Structure/OrderFlow results
+above. That is the subject of the next experiment.

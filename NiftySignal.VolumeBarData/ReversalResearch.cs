@@ -3,6 +3,8 @@ using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using NiftySignal.Domain.Entities;
 using NiftySignal.Domain.Enums;
+using NiftySignal.Domain.ValueObjects;
+using NiftySignal.Features;
 using NiftySignal.Persistence;
 
 namespace NiftySignal.VolumeBarData;
@@ -11,11 +13,12 @@ namespace NiftySignal.VolumeBarData;
 public static class ReversalResearch
 {
     public sealed record Print(long Id, DateTimeOffset Time, DateTimeOffset Received, decimal Price,
-        decimal Bid, decimal Ask, long BidQty, long AskQty);
+        decimal Bid, decimal Ask, long BidQty, long AskQty, long Volume = 0);
     public sealed record Reading(DateTimeOffset End, decimal? Average, int Count, decimal? Fast,
         decimal? Slow, decimal? Gap, bool Up, bool Down);
     public sealed record Signal(DateTimeOffset Time, string Side, string Token, string Reason, decimal Gap,
         bool Extended = false, decimal? Forward1 = null, decimal? Forward2 = null, decimal? Forward5 = null);
+    public sealed record BollingerReading(DateTimeOffset End, decimal? Average, int Count, decimal? Mean, decimal? StdDev, decimal? Upper, decimal? Lower);
     public sealed record Trade(string Side, string Token, DateTimeOffset Decision, DateTimeOffset Entry,
         DateTimeOffset ExitDecision, DateTimeOffset Exit, decimal Buy, decimal Sell, int Quantity,
         decimal Gross, decimal Fees, decimal Net, decimal Mfe, decimal Mae, double Seconds, string Reason, long EntryId, long ExitId);
@@ -28,15 +31,16 @@ public static class ReversalResearch
     public static DateTimeOffset At(DateOnly date, int hour, int minute) => new(date.ToDateTime(new TimeOnly(hour, minute)), Ist);
 
     public static List<Reading> Cadences(IReadOnlyList<Print> ticks, DateTimeOffset start, DateTimeOffset end,
-        int fast = 8, int slow = 40)
+        int fast = 8, int slow = 40, int bucketSeconds = 15)
     {
         var result = new List<Reading>();
         var window = new Queue<decimal>();
         decimal? previous = null;
         var cursor = 0;
-        for (var left = start; left < end; left += TimeSpan.FromSeconds(15))
+        var bucket = TimeSpan.FromSeconds(bucketSeconds);
+        for (var left = start; left < end; left += bucket)
         {
-            var right = left.AddSeconds(15);
+            var right = left + bucket;
             decimal sum = 0; int count = 0;
             while (cursor < ticks.Count && ticks[cursor].Time <= right)
             {
@@ -56,6 +60,51 @@ public static class ReversalResearch
             decimal? s = window.Count == slow ? window.Average() : null;
             decimal? gap = f - s;
             result.Add(new(right, avg, count, f, s, gap, previous <= 0 && gap > 0, previous >= 0 && gap < 0));
+            previous = gap;
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// 2026-09-26: option price crossover using volume-threshold bars instead of a fixed time
+    /// cadence -- reuses NiftySignal.Features.VolumeBarBuilder directly (it's already generic over
+    /// whatever token's ticks it's fed; nothing about it is future-specific) rather than writing a
+    /// second bar builder. 650 reuses this project's own already-established option-side volume-bar
+    /// magnitude (Price_Based_Findings.md's populate-call-depth-imbalance/cvd-proxy defaults), not
+    /// a newly-invented number -- a single option token typically trades ~95,000 contracts/session,
+    /// so 650 yields roughly 100-150 bars/day for a liquid strike.
+    /// </summary>
+    public static List<VolumeBar> OptionVolumeBars(IReadOnlyList<Print> ticks, long threshold)
+    {
+        var builder = new VolumeBarBuilder(threshold);
+        var bars = new List<VolumeBar>();
+        foreach (var t in ticks)
+        {
+            var depth = t.Bid > 0 || t.Ask > 0 ? new MarketDepth(t.Bid, t.BidQty, 0, 0, 0, 0, 0, 0, 0, 0, t.Ask, t.AskQty, 0, 0, 0, 0, 0, 0, 0, 0) : null;
+            var bar = builder.ApplyTick(t.Time, t.Price, t.Volume, depth, null);
+            if (bar is not null) { bars.Add(bar); }
+        }
+        return bars;
+    }
+
+    /// <summary>
+    /// Same fast/slow/gap moving-average-crossover math as Cadences, sourced from already-formed
+    /// bars (volume bars here) instead of raw ticks bucketed by time -- lets CrossSignals/Simulate
+    /// run completely unchanged regardless of which bar construction produced the series.
+    /// </summary>
+    public static List<Reading> ReadingsFromBars(IReadOnlyList<VolumeBar> bars, int fast, int slow)
+    {
+        var result = new List<Reading>();
+        var window = new Queue<decimal>();
+        decimal? previous = null;
+        foreach (var bar in bars)
+        {
+            window.Enqueue(bar.ClosePrice);
+            if (window.Count > slow) { window.Dequeue(); }
+            decimal? f = window.Count >= fast ? window.TakeLast(fast).Average() : null;
+            decimal? s = window.Count == slow ? window.Average() : null;
+            decimal? gap = f - s;
+            result.Add(new(bar.EndTimestamp, bar.ClosePrice, bar.TickCount, f, s, gap, previous <= 0 && gap > 0, previous >= 0 && gap < 0));
             previous = gap;
         }
         return result;
@@ -112,6 +161,174 @@ public static class ReversalResearch
         return signals;
     }
 
+    /// <summary>
+    /// 2026-09-26, user-specified rule -- deliberately independent of Pattern A/B and the
+    /// C0/C1/C2 crossover hurdles: "Everyday there will be move in nifty... If ce is moving we
+    /// will make buy trade. We will buy PE if its price is moving up." No moving-average
+    /// smoothing, no cost hurdle, no confirmation delay -- fires whenever a bucket's own raw
+    /// average price (Reading.Average, the same causal cadence Cadences() already builds) is
+    /// higher than it was <paramref name="lookback"/> buckets earlier (default 8 buckets = 2
+    /// minutes at the default 15s bucket width, reusing this project's own established short
+    /// lookback -- e.g. CrossSignals' C2 "armed" window is also 8 buckets -- not a newly invented
+    /// number). Entry price ("fair price," left to my judgment per the user's own instruction) is
+    /// the prevailing ask, gated by the same liquidity/Rs.100-150 band every other signal here uses.
+    /// </summary>
+    public static List<Signal> MomentumSignals(Instrument instrument, IReadOnlyList<Print> ticks,
+        IReadOnlyList<Reading> readings, int lookback = 8)
+    {
+        var signals = new List<Signal>();
+        for (var b = lookback; b < readings.Count; b++)
+        {
+            var r = readings[b]; var prior = readings[b - lookback];
+            if (r.Average is null || prior.Average is null || r.Average <= prior.Average) { continue; }
+            var p = Before(ticks, r.End);
+            if (!Fresh(p, r.End) || !Valid(p!, instrument.LotSize)) { continue; }
+            if (p!.Ask < 100 || p.Ask > 150) { continue; }
+            signals.Add(new(r.End, instrument.OptionType.ToString(), instrument.Token, "M0", r.Average.Value - prior.Average.Value));
+        }
+        return signals;
+    }
+
+    /// <summary>
+    /// Exit side of the same rule, mirrored: once the option's own price stops moving up (its raw
+    /// average is no longer above where it was <paramref name="lookback"/> buckets earlier), exit.
+    /// Symmetric with MomentumSignals' entry condition rather than reusing an unrelated mechanism
+    /// (the gap-based Up/Down used by CrossSignals is a different, MA-crossover-based rule).
+    /// </summary>
+    public static List<DateTimeOffset> MomentumDownTimes(IReadOnlyList<Reading> readings, int lookback = 8)
+    {
+        var times = new List<DateTimeOffset>();
+        for (var b = lookback; b < readings.Count; b++)
+        {
+            var r = readings[b]; var prior = readings[b - lookback];
+            if (r.Average is not null && prior.Average is not null && r.Average < prior.Average) { times.Add(r.End); }
+        }
+        return times;
+    }
+
+    /// <summary>
+    /// 2026-09-26, user-specified: "Bollinger Band on the options price of call and put." Same
+    /// causal 15-second average-price bucketing Cadences() already uses (never raw ticks), with a
+    /// rolling mean and population standard deviation over the trailing <paramref name="period"/>
+    /// buckets, then Upper/Lower = Mean +/- <paramref name="k"/> * StdDev. 20 buckets (5 minutes at
+    /// the default 15s bucket) and k=2 are the textbook Bollinger Band defaults (Bollinger's own
+    /// published convention), not a number fit to this data -- a first, stated-as-such starting
+    /// choice, same discipline as every other constant in this file.
+    /// </summary>
+    public static List<BollingerReading> BollingerBands(IReadOnlyList<Print> ticks, DateTimeOffset start,
+        DateTimeOffset end, int period = 20, decimal k = 2m, int bucketSeconds = 15)
+    {
+        var result = new List<BollingerReading>();
+        var window = new Queue<decimal>();
+        var cursor = 0;
+        var bucket = TimeSpan.FromSeconds(bucketSeconds);
+        for (var left = start; left < end; left += bucket)
+        {
+            var right = left + bucket;
+            decimal sum = 0; int count = 0;
+            while (cursor < ticks.Count && ticks[cursor].Time <= right)
+            {
+                var tick = ticks[cursor++];
+                if (tick.Time > left && tick.Price > 0 && tick.Received <= right) { sum += tick.Price; count++; }
+            }
+            if (count == 0)
+            {
+                window.Clear();
+                result.Add(new(right, null, 0, null, null, null, null));
+                continue;
+            }
+            var avg = sum / count;
+            window.Enqueue(avg);
+            if (window.Count > period) { window.Dequeue(); }
+            if (window.Count < period)
+            {
+                result.Add(new(right, avg, count, null, null, null, null));
+                continue;
+            }
+            var mean = window.Average();
+            var variance = window.Sum(v => (v - mean) * (v - mean)) / period;
+            var std = (decimal)Math.Sqrt((double)variance);
+            result.Add(new(right, avg, count, mean, std, mean + k * std, mean - k * std));
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Breakout entry: the option's own price closes above its own upper Bollinger Band -- an
+    /// "unusually large" up-move sized by the option's OWN recent volatility (not a fixed rupee
+    /// magnitude), fired only on the cross (previous bar at/below its band) so it doesn't re-fire
+    /// every bar while price stays extended. Same liquidity/Rs.100-150 band gate as every other
+    /// signal here; entry price ("fair price") is the prevailing ask.
+    /// </summary>
+    public static List<Signal> BollingerBreakoutSignals(Instrument instrument, IReadOnlyList<Print> ticks, IReadOnlyList<BollingerReading> bands)
+    {
+        var signals = new List<Signal>();
+        for (var b = 1; b < bands.Count; b++)
+        {
+            var r = bands[b]; var prev = bands[b - 1];
+            if (r.Average is null || r.Upper is null || prev.Average is null || prev.Upper is null) { continue; }
+            if (!(prev.Average <= prev.Upper && r.Average > r.Upper)) { continue; }
+            var p = Before(ticks, r.End);
+            if (!Fresh(p, r.End) || !Valid(p!, instrument.LotSize)) { continue; }
+            if (p!.Ask < 100 || p.Ask > 150) { continue; }
+            signals.Add(new(r.End, instrument.OptionType.ToString(), instrument.Token, "B0", r.Average.Value - r.Mean!.Value));
+        }
+        return signals;
+    }
+
+    /// <summary>
+    /// Mean-reversion entry: the option's own price, having closed below its lower band (an
+    /// unusually large down-move), closes back ABOVE the lower band on a later bar -- a confirmed
+    /// bounce, not a falling-knife catch (same "confirm after the extreme, don't just catch it"
+    /// discipline as CrossSignals' C2 mode). Opposite hypothesis from B0: bets the extreme move
+    /// reverts toward the mean instead of continuing.
+    /// </summary>
+    public static List<Signal> BollingerReversionSignals(Instrument instrument, IReadOnlyList<Print> ticks, IReadOnlyList<BollingerReading> bands)
+    {
+        var signals = new List<Signal>();
+        var wasBelow = false;
+        foreach (var r in bands)
+        {
+            if (r.Average is null || r.Lower is null || r.Mean is null) { wasBelow = false; continue; }
+            if (wasBelow && r.Average > r.Lower)
+            {
+                var p = Before(ticks, r.End);
+                if (Fresh(p, r.End) && Valid(p!, instrument.LotSize) && p!.Ask >= 100 && p.Ask <= 150)
+                {
+                    signals.Add(new(r.End, instrument.OptionType.ToString(), instrument.Token, "B1", r.Mean.Value - r.Average.Value));
+                }
+            }
+            wasBelow = r.Average <= r.Lower;
+        }
+        return signals;
+    }
+
+    /// <summary>Exit for B0 (breakout/continuation): the move has stopped extending -- price falls back through the mean.</summary>
+    public static List<DateTimeOffset> BollingerMidCrossDownTimes(IReadOnlyList<BollingerReading> bands)
+    {
+        var times = new List<DateTimeOffset>();
+        for (var b = 1; b < bands.Count; b++)
+        {
+            var r = bands[b]; var prev = bands[b - 1];
+            if (r.Average is null || r.Mean is null || prev.Average is null || prev.Mean is null) { continue; }
+            if (prev.Average >= prev.Mean && r.Average < r.Mean) { times.Add(r.End); }
+        }
+        return times;
+    }
+
+    /// <summary>Exit for B1 (mean-reversion): the reversion target is reached -- price rises back through the mean.</summary>
+    public static List<DateTimeOffset> BollingerMidCrossUpTimes(IReadOnlyList<BollingerReading> bands)
+    {
+        var times = new List<DateTimeOffset>();
+        for (var b = 1; b < bands.Count; b++)
+        {
+            var r = bands[b]; var prev = bands[b - 1];
+            if (r.Average is null || r.Mean is null || prev.Average is null || prev.Mean is null) { continue; }
+            if (prev.Average <= prev.Mean && r.Average > r.Mean) { times.Add(r.End); }
+        }
+        return times;
+    }
+
     public static Simulation Simulate(DateOnly date, List<Signal> signals, Dictionary<string, Instrument> instruments,
         Dictionary<string, List<Print>> ticks, Func<Signal, IEnumerable<DateTimeOffset>> exitTimes)
     {
@@ -149,6 +366,184 @@ public static class ReversalResearch
             busyUntil = exit.Time;
         }
         return new(trades, decisions, unresolved);
+    }
+
+    /// <summary>
+    /// 2026-09-26, user-specified variant on Pattern A/B: same entry signals (patternSignals from
+    /// BuildPatternPopulation), two changes only. (1) Exit is a fixed +/-<paramref name="points"/>
+    /// rupee move on the option's OWN premium (measured off the same last-traded-price convention
+    /// already used for every Mfe/Mae figure in this file, not bid/ask), checked tick-by-tick from
+    /// the entry fill -- not the wait-for-opposite-pattern exit P0/P1 use. (2) Once a trade closes
+    /// (win or loss), the next trade must be the OPPOSITE side (Pattern A only ever trades Puts,
+    /// Pattern B only ever trades Calls in this codebase, so alternating Signal.Side ("A"/"B") is
+    /// exactly alternating Call/Put) -- any same-side signal that fires before an opposite-side one
+    /// does is skipped outright, not queued; the very first trade of the day is unconstrained. The
+    /// Rs.100-150 strike/liquidity band is unchanged -- BuildPatternPopulation's own eligibility
+    /// selection already enforces it.
+    /// </summary>
+    public static Simulation SimulateAlternatingFixedExit(DateOnly date, List<Signal> signals,
+        Dictionary<string, Instrument> instruments, Dictionary<string, List<Print>> ticks, decimal points = 5m)
+    {
+        var trades = new List<Trade>(); var decisions = new List<ActionRow>();
+        var busyUntil = DateTimeOffset.MinValue; int unresolved = 0; string? lastSide = null;
+        foreach (var group in signals.GroupBy(s => s.Time).OrderBy(g => g.Key))
+        {
+            if (group.Key >= At(date, 15, 0)) { decisions.Add(new(group.Key, "WAIT", "", "Entry cutoff")); continue; }
+            if (group.Key <= busyUntil) { decisions.Add(new(group.Key, "WAIT", "", "Position or exit order active")); continue; }
+            var candidates = group.Where(s => lastSide is null || s.Side != lastSide).ToList();
+            if (candidates.Count == 0)
+            { decisions.Add(new(group.Key, "WAIT", "", "Same side as previous trade; alternation rule")); continue; }
+            var selected = candidates.OrderBy(s => { var p = Before(ticks[s.Token], s.Time)!; return (p.Ask - p.Bid) / p.Ask; })
+                .ThenBy(s => s.Token, StringComparer.Ordinal).First();
+            var inst = instruments[selected.Token];
+            var series = ticks[selected.Token];
+            var entry = Fill(series, selected.Time, inst.LotSize, true);
+            if (entry is null || entry.Time >= At(date, 15, 0))
+            { decisions.Add(new(selected.Time, "WAIT", selected.Token, "No timely valid entry quote")); continue; }
+            var buy = entry.Ask + inst.TickSize;
+            var scheduledClose = At(date, 15, 15);
+            var trigger = series.FirstOrDefault(p => p.Time > entry.Time && p.Time < scheduledClose && p.Price > 0
+                && (p.Price >= buy + points || p.Price <= buy - points));
+            var exitDecision = trigger?.Time ?? scheduledClose;
+            var exit = Fill(series, exitDecision, inst.LotSize, false);
+            if (exit is null)
+            {
+                unresolved++; busyUntil = At(date, 15, 30);
+                decisions.Add(new(exitDecision, "UNRESOLVED", inst.Token, "No valid quote after exit order; P&L unknown")); continue;
+            }
+            var sell = exit.Bid - inst.TickSize;
+            var path = series.Where(p => p.Time >= entry.Time && p.Time <= exit.Time).ToList();
+            var gross = (sell - buy) * inst.LotSize;
+            var fees = Fees(buy, sell, inst.LotSize);
+            var reason = trigger is null ? "ScheduledClose" : trigger.Price >= buy + points ? $"TakeProfit{points}pt" : $"StopLoss{points}pt";
+            trades.Add(new(selected.Side, inst.Token, selected.Time, entry.Time, exitDecision, exit.Time, buy, sell,
+                inst.LotSize, gross, fees, gross - fees, Math.Max(0, path.Max(p => p.Price) - buy),
+                Math.Max(0, buy - path.Min(p => p.Price)), (exit.Time - entry.Time).TotalSeconds, reason, entry.Id, exit.Id));
+            decisions.Add(new(selected.Time, "BUY", inst.Token, $"{selected.Reason}; fill {entry.Time:O}; ask+tick {buy}"));
+            decisions.Add(new(exitDecision, "EXIT", inst.Token, $"{reason}; fill {exit.Time:O}; bid-tick {sell}"));
+            busyUntil = exit.Time; lastSide = selected.Side;
+        }
+        return new(trades, decisions, unresolved);
+    }
+
+    /// <summary>
+    /// Hypothesis v1 (2026-09-25), REJECTED -- kept in the record, not deleted. P0/P1's only exit is
+    /// waiting for the full opposite-pattern confirmation (or scheduled close) -- at DTE 0/4 this
+    /// pool's own MFE/MAE ratio (~2x) shows a real favorable move is usually available, but win rate
+    /// is only ~50%. v1 exited once the position cleared its own bare round-trip cost, then gave back
+    /// 50% of peak. Result (all 12 validated days, same-entry comparison via
+    /// SimulateGivebackFixedEntries): win rate at DTE 0/4 got WORSE (47.6%->38.1%, 50.0%->0.0%), and
+    /// MFE collapsed from ~16% to ~2% across every DTE -- the bare-cost floor (~0.3 points) is
+    /// negligible next to real favorable moves (~15-20 points), so it fired on noise almost
+    /// immediately instead of after a real move. Rejected as tested, per its own stated failure
+    /// criteria ("fails if it mainly cuts winners short before they fully develop").
+    /// Hypothesis v2 (2026-09-26): same mechanism, but the floor scales with the position's own
+    /// premium instead of bare cost -- <paramref name="minPeakFraction"/> of the buy price (or the
+    /// bare cost floor, whichever is larger) must be cleared before trailing can trigger. 5% reuses
+    /// this project's own established threshold convention from the price-crossover track
+    /// (Price_Based_Findings.md) rather than inventing a new number; it is still a first,
+    /// stated-as-such starting choice, not fit to this data. Same expected/failure criteria as v1.
+    /// IMPORTANT (caught empirically, not assumed): this re-runs the SAME signal-selection/busyUntil
+    /// loop as Simulate, so a faster exit frees capital sooner and lets MORE signals become trades --
+    /// this measures the exit change AND the opportunity-set effect together (BACKTEST_RULES rule 14's
+    /// "complete sequential simulation" step), confirmed directly here (trade count nearly doubled vs
+    /// P0/P1 at every DTE on the v1 first run). It is NOT a same-entry comparison by itself --
+    /// SimulateGivebackFixedEntries is the same-entry-only counterpart; report both, never just this one.
+    /// </summary>
+    public static Simulation SimulateGiveback(DateOnly date, List<Signal> signals, Dictionary<string, Instrument> instruments,
+        Dictionary<string, List<Print>> ticks, Func<Signal, IEnumerable<DateTimeOffset>> exitTimes, decimal givebackFraction,
+        decimal minPeakFraction = 0.05m)
+    {
+        var trades = new List<Trade>(); var decisions = new List<ActionRow>();
+        var busyUntil = DateTimeOffset.MinValue; int unresolved = 0;
+        foreach (var group in signals.GroupBy(s => s.Time).OrderBy(g => g.Key))
+        {
+            if (group.Key >= At(date, 15, 0)) { decisions.Add(new(group.Key, "WAIT", "", "Entry cutoff")); continue; }
+            if (group.Key <= busyUntil) { decisions.Add(new(group.Key, "WAIT", "", "Position or exit order active")); continue; }
+            var selected = group.OrderBy(s => { var p = Before(ticks[s.Token], s.Time)!; return (p.Ask - p.Bid) / p.Ask; })
+                .ThenBy(s => s.Token, StringComparer.Ordinal).First();
+            var inst = instruments[selected.Token];
+            var series = ticks[selected.Token];
+            var entry = Fill(series, selected.Time, inst.LotSize, true);
+            if (entry is null || entry.Time >= At(date, 15, 0))
+            { decisions.Add(new(selected.Time, "WAIT", selected.Token, "No timely valid entry quote")); continue; }
+            var buy = entry.Ask + inst.TickSize;
+            var minPeak = Math.Max(Fees(buy, buy, inst.LotSize) / inst.LotSize + inst.TickSize, minPeakFraction * buy);
+            var scheduledClose = At(date, 15, 15);
+            var oppositeTime = exitTimes(selected).Where(t => t > entry.Time && t < scheduledClose).Append(scheduledClose).Min();
+
+            decimal peak = 0; DateTimeOffset? givebackTime = null;
+            foreach (var p in series.Where(p => p.Time > entry.Time && p.Time <= oppositeTime).OrderBy(p => p.Time).ThenBy(p => p.Id))
+            {
+                var gain = p.Price - buy;
+                if (gain > peak) { peak = gain; }
+                if (peak >= minPeak && peak - gain >= givebackFraction * peak) { givebackTime = p.Time; break; }
+            }
+            var exitDecision = givebackTime ?? oppositeTime;
+            var exit = Fill(series, exitDecision, inst.LotSize, false);
+            if (exit is null)
+            {
+                unresolved++; busyUntil = At(date, 15, 30);
+                decisions.Add(new(exitDecision, "UNRESOLVED", inst.Token, "No valid quote after exit order; P&L unknown")); continue;
+            }
+            var sell = exit.Bid - inst.TickSize;
+            var path = series.Where(p => p.Time >= entry.Time && p.Time <= exit.Time).ToList();
+            var gross = (sell - buy) * inst.LotSize;
+            var fees = Fees(buy, sell, inst.LotSize);
+            var reason = givebackTime is not null ? "GivebackExit" : exitDecision == scheduledClose ? "ScheduledClose" : "PremiseReversed";
+            trades.Add(new(selected.Side, inst.Token, selected.Time, entry.Time, exitDecision, exit.Time, buy, sell,
+                inst.LotSize, gross, fees, gross - fees, Math.Max(0, path.Max(p => p.Price) - buy),
+                Math.Max(0, buy - path.Min(p => p.Price)), (exit.Time - entry.Time).TotalSeconds, reason, entry.Id, exit.Id));
+            decisions.Add(new(selected.Time, "BUY", inst.Token, $"{selected.Reason}; fill {entry.Time:O}; ask+tick {buy}"));
+            decisions.Add(new(exitDecision, "EXIT", inst.Token, $"{reason}; fill {exit.Time:O}; bid-tick {sell}"));
+            busyUntil = exit.Time;
+        }
+        return new(trades, decisions, unresolved);
+    }
+
+    /// <summary>
+    /// The true same-entry-only counterpart to SimulateGiveback (BACKTEST_RULES rule 14's first
+    /// step): reuses each baseline trade's OWN already-fixed entry (same token, same entry time, same
+    /// buy fill) verbatim -- no signal re-selection, no busyUntil, so trade count can never differ
+    /// from the baseline's. Only the exit rule changes. Skips (rather than counts as unresolved) a
+    /// baseline trade whose exit can't be re-filled under the new rule, since this is a diagnostic
+    /// comparison on fixed entries, not a standalone tradeable simulation.
+    /// </summary>
+    public static Simulation SimulateGivebackFixedEntries(DateOnly date, List<Trade> baseline, Dictionary<string, Instrument> instruments,
+        Dictionary<string, List<Print>> ticks, Func<Signal, IEnumerable<DateTimeOffset>> exitTimes, decimal givebackFraction,
+        decimal minPeakFraction = 0.05m)
+    {
+        var trades = new List<Trade>(); var decisions = new List<ActionRow>();
+        var scheduledClose = At(date, 15, 15);
+        foreach (var b in baseline)
+        {
+            var inst = instruments[b.Token];
+            var series = ticks[b.Token];
+            var buy = b.Buy;
+            var minPeak = Math.Max(Fees(buy, buy, inst.LotSize) / inst.LotSize + inst.TickSize, minPeakFraction * buy);
+            var pseudoSignal = new Signal(b.Decision, b.Side, b.Token, "SameEntry", 0);
+            var oppositeTime = exitTimes(pseudoSignal).Where(t => t > b.Entry && t < scheduledClose).Append(scheduledClose).Min();
+
+            decimal peak = 0; DateTimeOffset? givebackTime = null;
+            foreach (var p in series.Where(p => p.Time > b.Entry && p.Time <= oppositeTime).OrderBy(p => p.Time).ThenBy(p => p.Id))
+            {
+                var gain = p.Price - buy;
+                if (gain > peak) { peak = gain; }
+                if (peak >= minPeak && peak - gain >= givebackFraction * peak) { givebackTime = p.Time; break; }
+            }
+            var exitDecision = givebackTime ?? oppositeTime;
+            var exit = Fill(series, exitDecision, inst.LotSize, false);
+            if (exit is null) { continue; }
+            var sell = exit.Bid - inst.TickSize;
+            var path = series.Where(p => p.Time >= b.Entry && p.Time <= exit.Time).ToList();
+            var gross = (sell - buy) * inst.LotSize;
+            var fees = Fees(buy, sell, inst.LotSize);
+            var reason = givebackTime is not null ? "GivebackExit" : exitDecision == scheduledClose ? "ScheduledClose" : "PremiseReversed";
+            trades.Add(new(b.Side, b.Token, b.Decision, b.Entry, exitDecision, exit.Time, buy, sell,
+                inst.LotSize, gross, fees, gross - fees, Math.Max(0, path.Max(p => p.Price) - buy),
+                Math.Max(0, buy - path.Min(p => p.Price)), (exit.Time - b.Entry).TotalSeconds, reason, b.EntryId, exit.Id));
+        }
+        return new(trades, decisions, 0);
     }
 
     public static object Summary(IEnumerable<Trade> source)
@@ -197,12 +592,43 @@ public static class ReversalResearch
         foreach (var date in researchDates)
         {
             Console.WriteLine($"Loading {date:yyyy-MM-dd} raw option ticks...");
+            var report = await BuildDayReportAsync(db, date);
+            var path = Path.Combine(output, $"{date:yyyy-MM-dd}.json");
+            if (File.Exists(path)) { throw new IOException($"Report already exists: {path}; use a fresh run directory"); }
+            await File.WriteAllTextAsync(path, JsonSerializer.Serialize(report, Json));
+            daily.Add(new { Date = date, report.Dte, Reports = path });
+            Console.WriteLine($"Saved {path}; A/B full-surface state entries={report.patternRows.Count(r => r.StateEntry && r.Full)}.");
+        }
+        await File.WriteAllTextAsync(Path.Combine(output, "manifest.json"), JsonSerializer.Serialize(daily, Json));
+        return 0;
+    }
+
+    public sealed record DayReport(DateOnly Date, DateOnly Expiry, int Dte, List<object> coverage, List<object> samples,
+        List<PatternRow> patternRows, List<PatternRow> referencePatterns, Dictionary<string, object> experiments,
+        List<object> traces, string QuoteAge);
+
+    /// <summary>
+    /// Everything for one session: cadence coverage/verification samples, C0/C1/C2 and P0/P1
+    /// experiments, and full raw-tick trade traces. Pure w.r.t. its DbContext -- takes any
+    /// NiftySignalDbContext already populated for this date, live Postgres or a seeded
+    /// EF Core InMemoryDatabase (see FileBackedResearchRunner), so this exact logic is what both
+    /// paths run, never a parallel reimplementation.
+    /// </summary>
+    public static async Task<DayReport> BuildDayReportAsync(NiftySignalDbContext db, DateOnly date)
+    {
             var chainAll = await db.Instruments.Where(i => i.AsOfDate == date && i.Underlying == "NIFTY"
                 && i.InstrumentType == InstrumentType.Option && i.ExpiryDate >= date).ToListAsync();
             var expiry = chainAll.Min(i => i.ExpiryDate)!.Value;
             var chain = chainAll.Where(i => i.ExpiryDate == expiry).OrderBy(i => i.Token).ToDictionary(i => i.Token);
             var start = At(date, 9, 15).ToUniversalTime(); var end = At(date, 15, 30).ToUniversalTime();
             var ticks = new Dictionary<string, List<Print>>(); var readings = new Dictionary<string, List<Reading>>();
+            // 2026-09-26: a second, wider time cadence (30s buckets, fast=10 readings=5min,
+            // slow=40 readings=20min) requested alongside the original 15s/8-40 (2min/10min) one,
+            // to compare against volume-bar-based construction on equal footing. Same fast:slow
+            // ratio family, just a different cadence -- applied identically across every DTE, no
+            // per-DTE tuning, per instruction. A first, stated-as-such starting choice at the low
+            // end of the requested 5-10min/20-30min ranges, not fit to this data.
+            var readingsT = new Dictionary<string, List<Reading>>();
             var coverage = new List<object>(); var samples = new List<object>();
             foreach (var inst in chain.Values)
             {
@@ -211,8 +637,9 @@ public static class ReversalResearch
                     .OrderBy(t => t.ExchangeTimestamp).ThenBy(t => t.Id)
                     .Select(t => new Print(t.Id, t.ExchangeTimestamp, t.ReceivedAt, t.LastPrice,
                         t.Depth == null ? 0 : t.Depth.Bid1Price, t.Depth == null ? 0 : t.Depth.Ask1Price,
-                        t.Depth == null ? 0 : t.Depth.Bid1Qty, t.Depth == null ? 0 : t.Depth.Ask1Qty)).ToListAsync();
+                        t.Depth == null ? 0 : t.Depth.Bid1Qty, t.Depth == null ? 0 : t.Depth.Ask1Qty, t.Volume)).ToListAsync();
                 ticks[token] = list; var bars = Cadences(list, start, end); readings[token] = bars;
+                readingsT[token] = Cadences(list, start, end, fast: 10, slow: 40, bucketSeconds: 30);
                 coverage.Add(new { token, inst.OptionType, inst.StrikePrice, inst.LotSize, Count = list.Count,
                     First = list.FirstOrDefault()?.Time, Last = list.LastOrDefault()?.Time,
                     Empty = bars.Count(b => b.Count == 0), Warm = bars.Count(b => b.Gap is not null),
@@ -241,37 +668,143 @@ public static class ReversalResearch
                         s => readings[s.Token].Where(r => r.Down).Select(r => r.End));
                     experiments[$"{mode}-{side}"] = new { Summary = Summary(simulation.Trades), simulation, signals };
                 }
+                // Same C0/C1/C2 logic, wider 30s/5min/20min cadence (readingsT) instead of the
+                // original 15s/2min/10min (readings) -- "CT" = Cadence-Time-variant.
+                foreach (var mode in new[] { "C0", "C1", "C2" })
+                {
+                    var signals = chain.Values.Where(i => i.OptionType == side)
+                        .SelectMany(i => CrossSignals(i, ticks[i.Token], readingsT[i.Token], mode)).ToList();
+                    signals = signals.Select(s => Forward(s, ticks[s.Token])).ToList();
+                    var simulation = Simulate(date, signals, chain, ticks,
+                        s => readingsT[s.Token].Where(r => r.Down).Select(r => r.End));
+                    experiments[$"{mode}T-{side}"] = new { Summary = Summary(simulation.Trades), simulation, signals };
+                }
+                // Same C0/C1/C2 logic again, this time on each token's own volume-threshold bars
+                // (650, see OptionVolumeBars) instead of any time cadence -- "V" = Volume-bar variant.
+                var readingsV = chain.Values.Where(i => i.OptionType == side)
+                    .ToDictionary(i => i.Token, i => ReadingsFromBars(OptionVolumeBars(ticks[i.Token], 650), fast: 8, slow: 40));
+                foreach (var mode in new[] { "C0", "C1", "C2" })
+                {
+                    var signals = chain.Values.Where(i => i.OptionType == side)
+                        .SelectMany(i => CrossSignals(i, ticks[i.Token], readingsV[i.Token], mode)).ToList();
+                    signals = signals.Select(s => Forward(s, ticks[s.Token])).ToList();
+                    var simulation = Simulate(date, signals, chain, ticks,
+                        s => readingsV[s.Token].Where(r => r.Down).Select(r => r.End));
+                    experiments[$"{mode}V-{side}"] = new { Summary = Summary(simulation.Trades), simulation, signals };
+                }
+                // M0: 2026-09-26 user-specified simple momentum rule (see MomentumSignals'
+                // own doc comment) -- own-price-moving-up entry, own-price-stops-moving-up exit,
+                // no MA smoothing/hurdle/confirmation. Independent of Pattern A/B and C0/C1/C2.
+                {
+                    var signals = chain.Values.Where(i => i.OptionType == side)
+                        .SelectMany(i => MomentumSignals(i, ticks[i.Token], readings[i.Token])).ToList();
+                    signals = signals.Select(s => Forward(s, ticks[s.Token])).ToList();
+                    var simulation = Simulate(date, signals, chain, ticks,
+                        s => MomentumDownTimes(readings[s.Token]));
+                    experiments[$"M0-{side}"] = new { Summary = Summary(simulation.Trades), simulation, signals };
+                }
+                // B0/B1: 2026-09-26 user-specified Bollinger Band rule on each option's own price
+                // (see BollingerBands/BollingerBreakoutSignals/BollingerReversionSignals' own doc
+                // comments) -- 20-bucket (5min)/2-std textbook defaults, tested both as a breakout
+                // (continuation) and mean-reversion (bounce) hypothesis, since they're opposite bets.
+                var bands = chain.Values.Where(i => i.OptionType == side)
+                    .ToDictionary(i => i.Token, i => BollingerBands(ticks[i.Token], start, end));
+                {
+                    var signals = chain.Values.Where(i => i.OptionType == side)
+                        .SelectMany(i => BollingerBreakoutSignals(i, ticks[i.Token], bands[i.Token])).ToList();
+                    signals = signals.Select(s => Forward(s, ticks[s.Token])).ToList();
+                    var simulation = Simulate(date, signals, chain, ticks,
+                        s => BollingerMidCrossDownTimes(bands[s.Token]));
+                    experiments[$"B0-{side}"] = new { Summary = Summary(simulation.Trades), simulation, signals };
+                }
+                {
+                    var signals = chain.Values.Where(i => i.OptionType == side)
+                        .SelectMany(i => BollingerReversionSignals(i, ticks[i.Token], bands[i.Token])).ToList();
+                    signals = signals.Select(s => Forward(s, ticks[s.Token])).ToList();
+                    var simulation = Simulate(date, signals, chain, ticks,
+                        s => BollingerMidCrossUpTimes(bands[s.Token]));
+                    experiments[$"B1-{side}"] = new { Summary = Summary(simulation.Trades), simulation, signals };
+                }
             }
-            var futureBars = await FutureEventBarBuilder.BuildDayAsync(db, date, 13000, CancellationToken.None);
             var future = await db.Instruments.Where(i => i.AsOfDate == date && i.Underlying == "NIFTY" && i.InstrumentType == InstrumentType.Future)
                 .OrderBy(i => i.ExpiryDate).FirstAsync();
             var futureReceipts = await db.Ticks.Where(t => t.Token == future.Token && t.ExchangeTimestamp >= start && t.ExchangeTimestamp <= end)
                 .OrderBy(t => t.ExchangeTimestamp).ThenBy(t => t.Id).Select(t => new { t.ExchangeTimestamp, t.ReceivedAt }).ToListAsync();
-            var available = new List<DateTimeOffset>(); var latestReceipt = start; var fc = 0;
-            foreach (var bar in futureBars)
+
+            var futureBars = await FutureEventBarBuilder.BuildDayAsync(db, date, 13000, CancellationToken.None);
+            var available = ComputeAvailability(futureBars, futureReceipts.Select(r => (r.ExchangeTimestamp, r.ReceivedAt)).ToList(), start);
+            var (patternRows, referencePatterns, patternSignals) = BuildPatternPopulation(chain, ticks, readings, futureBars, available);
+
+            // 2026-09-26: same Pattern A/B detection logic, but the underlying future "bars" are
+            // built on a fixed 30-second wall-clock interval instead of the 13,000-contract volume
+            // threshold -- comparing bar CONSTRUCTION method, signal/eligibility logic unchanged.
+            // Patterns()'s own 180-second window is real-time-based already, so bar granularity here
+            // only affects price-sampling resolution within that window, not the window length.
+            var futureTicks = await db.Ticks.Where(t => t.Token == future.Token && t.ExchangeTimestamp >= start && t.ExchangeTimestamp <= end && t.LastPrice > 0)
+                .OrderBy(t => t.ExchangeTimestamp).ThenBy(t => t.Id)
+                .Select(t => new Print(t.Id, t.ExchangeTimestamp, t.ReceivedAt, t.LastPrice,
+                    t.Depth == null ? 0 : t.Depth.Bid1Price, t.Depth == null ? 0 : t.Depth.Ask1Price,
+                    t.Depth == null ? 0 : t.Depth.Bid1Qty, t.Depth == null ? 0 : t.Depth.Ask1Qty)).ToListAsync();
+            var futureBarsT = BuildTimeBasedFutureBars(futureTicks, start, end, bucketSeconds: 30);
+            var availableT = ComputeAvailability(futureBarsT, futureReceipts.Select(r => (r.ExchangeTimestamp, r.ReceivedAt)).ToList(), start);
+            var (patternRowsT, referencePatternsT, patternSignalsT) = BuildPatternPopulation(chain, ticks, readings, futureBarsT, availableT);
+            var baselineSims = new Dictionary<string, Simulation>();
+            foreach (var mode in new[] { "PT0", "PT1" })
             {
-                while (fc < futureReceipts.Count && futureReceipts[fc].ExchangeTimestamp <= bar.EndTimestamp)
-                { latestReceipt = latestReceipt > futureReceipts[fc].ReceivedAt ? latestReceipt : futureReceipts[fc].ReceivedAt; fc++; }
-                available.Add(latestReceipt > bar.EndTimestamp ? latestReceipt : bar.EndTimestamp);
-            }
-            var patternRows = Patterns(chain, ticks, futureBars, available);
-            var referencePatterns = Patterns(chain, ticks, futureBars, futureBars.Select(b => b.EndTimestamp).ToList(), false);
-            var patternSignals = new List<Signal>();
-            foreach (var row in patternRows.Where(r => r.StateEntry && r.Full))
-            {
-                var side = row.State == "A" ? OptionType.Put : OptionType.Call;
-                var eligible = chain.Values.Where(i => i.OptionType == side).Select(i => (i, p: Before(ticks[i.Token], row.Time)))
-                    .Where(x => Fresh(x.p, row.Time) && Valid(x.p!, x.i.LotSize) && x.p!.Ask >= 100 && x.p.Ask <= 150)
-                    .OrderBy(x => (x.p!.Ask - x.p.Bid) / x.p.Ask).ThenBy(x => x.i.Token, StringComparer.Ordinal).FirstOrDefault();
-                if (eligible.i is null) { continue; }
-                var history = readings[eligible.i.Token].Where(r => r.End <= row.Time && r.Slow is not null && r.Average is not null).TakeLast(41).ToList();
-                var extended = history.Count < 41 || eligible.p!.Price - history[^1].Slow!.Value > history.Take(40).Max(r => r.Average!.Value - r.Slow!.Value);
-                patternSignals.Add(Forward(new(row.Time, row.State, eligible.i.Token, "Pattern" + row.State, 0, extended), ticks[eligible.i.Token]));
+                var signals = patternSignalsT.Where(s => mode == "PT0" || !s.Extended).ToList();
+                var sim = Simulate(date, signals, chain, ticks, s => patternRowsT.Where(r => r.StateEntry && r.State is "A" or "B" && r.State != s.Side).Select(r => r.Time));
+                experiments[mode] = new { Summary = Summary(sim.Trades), simulation = sim, signals,
+                    BySide = sim.Trades.GroupBy(t => t.Side).ToDictionary(g => g.Key, g => Summary(g)) };
             }
             foreach (var mode in new[] { "P0", "P1" })
             {
                 var signals = patternSignals.Where(s => mode == "P0" || !s.Extended).ToList();
                 var sim = Simulate(date, signals, chain, ticks, s => patternRows.Where(r => r.StateEntry && r.State is "A" or "B" && r.State != s.Side).Select(r => r.Time));
+                baselineSims[mode] = sim;
+                experiments[mode] = new { Summary = Summary(sim.Trades), simulation = sim, signals,
+                    BySide = sim.Trades.GroupBy(t => t.Side).ToDictionary(g => g.Key, g => Summary(g)) };
+            }
+            // P6: 2026-09-26 user-specified variant -- same P0 entry population, fixed +/-5-rupee
+            // TP/SL exit instead of wait-for-opposite-pattern, and a forced Call/Put alternation
+            // (see SimulateAlternatingFixedExit's own doc comment for exactly what changed and why).
+            {
+                var sim6 = SimulateAlternatingFixedExit(date, patternSignals, chain, ticks);
+                experiments["P6"] = new { Summary = Summary(sim6.Trades), simulation = sim6, signals = patternSignals,
+                    BySide = sim6.Trades.GroupBy(t => t.Side).ToDictionary(g => g.Key, g => Summary(g)) };
+            }
+            // P4: entry-side filter only, exit UNCHANGED from P0 (both exit redesigns tried
+            // earlier -- SimulateGiveback v1/v2 -- failed; the wait-for-opposite-pattern exit
+            // remains the best one found). Keeps only signals whose relative-move ratio (Signal.Gap,
+            // see BuildPatternPopulation's own comment) clears 0.35 -- the median split from the
+            // event-study work on this exact 12-day set landed at 0.23 (A/DTE=0) and 0.44 (B/DTE=4);
+            // 0.35 sits between them, applied identically to every DTE/side, not tuned per group.
+            // NOT an independently pre-registered threshold -- it's the final packaging of an
+            // exploratory lead found on this same data, not a blind validation. Report it as such.
+            {
+                var signals = patternSignals.Where(s => s.Gap >= 0.35m).ToList();
+                var sim = Simulate(date, signals, chain, ticks, s => patternRows.Where(r => r.StateEntry && r.State is "A" or "B" && r.State != s.Side).Select(r => r.Time));
+                experiments["P4"] = new { Summary = Summary(sim.Trades), simulation = sim, signals,
+                    BySide = sim.Trades.GroupBy(t => t.Side).ToDictionary(g => g.Key, g => Summary(g)) };
+            }
+            // P0G/P1G: TRUE same-entry comparison (BACKTEST_RULES rule 14, first step) -- P0/P1's
+            // own already-fixed entries, only the exit changes. Trade count is identical to the
+            // paired baseline by construction; this isolates the pure exit effect.
+            foreach (var (mode, baseline) in new[] { ("P0G", "P0"), ("P1G", "P1") })
+            {
+                var sim = SimulateGivebackFixedEntries(date, baselineSims[baseline].Trades, chain, ticks,
+                    s => patternRows.Where(r => r.StateEntry && r.State is "A" or "B" && r.State != s.Side).Select(r => r.Time), 0.5m);
+                experiments[mode] = new { Summary = Summary(sim.Trades), simulation = sim,
+                    BySide = sim.Trades.GroupBy(t => t.Side).ToDictionary(g => g.Key, g => Summary(g)) };
+            }
+            // P2/P3: FULL sequential re-simulation with the giveback exit (BACKTEST_RULES rule 14,
+            // second step) -- same starting signal set as P0/P1, but a faster exit frees capital
+            // sooner, so trade count can legitimately differ (opportunity-set effect included).
+            // Report alongside P0G/P1G, never in place of it -- see SimulateGiveback's doc comment.
+            foreach (var mode in new[] { "P2", "P3" })
+            {
+                var signals = patternSignals.Where(s => mode == "P2" || !s.Extended).ToList();
+                var sim = SimulateGiveback(date, signals, chain, ticks,
+                    s => patternRows.Where(r => r.StateEntry && r.State is "A" or "B" && r.State != s.Side).Select(r => r.Time), 0.5m);
                 experiments[mode] = new { Summary = Summary(sim.Trades), simulation = sim, signals,
                     BySide = sim.Trades.GroupBy(t => t.Side).ToDictionary(g => g.Key, g => Summary(g)) };
             }
@@ -282,17 +815,9 @@ public static class ReversalResearch
             var crossTrace = Simulate(date, crossTraceSignals, chain, ticks, s => readings[s.Token].Where(r => r.Down).Select(r => r.End));
             var traces = traceSim.Trades.Take(1).Concat(traceSim.Trades.OrderBy(t => t.Net).Take(1)).Concat(traceSim.Trades.OrderByDescending(t => t.Net).Take(1))
                 .Concat(crossTrace.Trades.Take(2))
-                .Distinct().Select(t => new { Trade = t, RawTicks = ticks[t.Token].Where(p => p.Time >= t.Decision.AddSeconds(-15) && p.Time <= t.Exit).ToList() }).ToList();
-            var report = new { Date = date, Expiry = expiry, Dte = expiry.DayNumber - date.DayNumber, coverage, samples,
-                patternRows, referencePatterns, experiments, traces, QuoteAge = "Individual field age unavailable; modeled fills only" };
-            var path = Path.Combine(output, $"{date:yyyy-MM-dd}.json");
-            if (File.Exists(path)) { throw new IOException($"Report already exists: {path}; use a fresh run directory"); }
-            await File.WriteAllTextAsync(path, JsonSerializer.Serialize(report, Json));
-            daily.Add(new { Date = date, Dte = expiry.DayNumber - date.DayNumber, Reports = path });
-            Console.WriteLine($"Saved {path}; A/B full-surface state entries={patternRows.Count(r => r.StateEntry && r.Full)}.");
-        }
-        await File.WriteAllTextAsync(Path.Combine(output, "manifest.json"), JsonSerializer.Serialize(daily, Json));
-        return 0;
+                .Distinct().Select(t => (object)new { Trade = t, RawTicks = ticks[t.Token].Where(p => p.Time >= t.Decision.AddSeconds(-15) && p.Time <= t.Exit).ToList() }).ToList();
+            return new(date, expiry, expiry.DayNumber - date.DayNumber, coverage, samples,
+                patternRows, referencePatterns, experiments, traces, "Individual field age unavailable; modeled fills only");
     }
 
     static Signal Forward(Signal s, List<Print> ticks)
@@ -306,7 +831,94 @@ public static class ReversalResearch
         return s with { Forward1 = Return(1), Forward2 = Return(2), Forward5 = Return(5) };
     }
 
-    static List<PatternRow> Patterns(Dictionary<string, Instrument> chain, Dictionary<string, List<Print>> ticks, List<FutureEventBar> bars, List<DateTimeOffset> available, bool causal = true)
+    /// <summary>
+    /// Causal "when could this bar's close actually have been acted on" timestamps -- the later of
+    /// the bar's own end and the latest receipt time among all future ticks up to that end. Shared
+    /// by both the volume-threshold and time-based bar constructions; the logic itself doesn't care
+    /// how a bar was built, only that it has an EndTimestamp.
+    /// </summary>
+    internal static List<DateTimeOffset> ComputeAvailability(List<FutureEventBar> bars, List<(DateTimeOffset ExchangeTimestamp, DateTimeOffset ReceivedAt)> futureReceipts, DateTimeOffset start)
+    {
+        var available = new List<DateTimeOffset>(); var latestReceipt = start; var fc = 0;
+        foreach (var bar in bars)
+        {
+            while (fc < futureReceipts.Count && futureReceipts[fc].ExchangeTimestamp <= bar.EndTimestamp)
+            { latestReceipt = latestReceipt > futureReceipts[fc].ReceivedAt ? latestReceipt : futureReceipts[fc].ReceivedAt; fc++; }
+            available.Add(latestReceipt > bar.EndTimestamp ? latestReceipt : bar.EndTimestamp);
+        }
+        return available;
+    }
+
+    /// <summary>
+    /// Fixed 30-second (or whatever bucketSeconds is) wall-clock future bars -- the time-based
+    /// counterpart to FutureEventBarBuilder's 13,000-contract volume threshold, for comparing bar
+    /// CONSTRUCTION method on Pattern A/B. A self-contained builder (not a shared/tested class
+    /// reused elsewhere) so this doesn't risk FutureEventBarBuilder/TimeBasedBarBuilder's own
+    /// existing callers. A bucket with zero ticks is skipped entirely, never fabricated -- same
+    /// discipline as Cadences().
+    /// </summary>
+    internal static List<FutureEventBar> BuildTimeBasedFutureBars(List<Print> futureTicks, DateTimeOffset start, DateTimeOffset end, int bucketSeconds)
+    {
+        var bars = new List<FutureEventBar>();
+        var bucket = TimeSpan.FromSeconds(bucketSeconds);
+        var cursor = 0; var eventId = 0;
+        for (var left = start; left < end; left += bucket)
+        {
+            var right = left + bucket;
+            decimal? open = null, high = null, low = null, close = null; long volume = 0; var count = 0;
+            while (cursor < futureTicks.Count && futureTicks[cursor].Time <= right)
+            {
+                var t = futureTicks[cursor++];
+                if (t.Time <= left) { continue; }
+                open ??= t.Price;
+                high = high is { } h ? Math.Max(h, t.Price) : t.Price;
+                low = low is { } l ? Math.Min(l, t.Price) : t.Price;
+                close = t.Price;
+                count++;
+            }
+            if (count == 0) { continue; }
+            bars.Add(new(eventId++, DateOnly.FromDateTime(start.Date), left, right, open!.Value, high!.Value, low!.Value, close!.Value,
+                volume, null, null, count, false));
+        }
+        return bars;
+    }
+
+    /// <summary>
+    /// The full Pattern A/B population (rows, non-causal reference rows, and the eligible tradeable
+    /// signals with the exhaustion/extended flag) for one bar series -- shared by both the
+    /// volume-threshold and time-based constructions so the signal/eligibility logic itself is
+    /// never duplicated between them.
+    /// </summary>
+    static (List<PatternRow> Rows, List<PatternRow> Reference, List<Signal> Signals) BuildPatternPopulation(
+        Dictionary<string, Instrument> chain, Dictionary<string, List<Print>> ticks, Dictionary<string, List<Reading>> readings,
+        List<FutureEventBar> bars, List<DateTimeOffset> available)
+    {
+        var patternRows = Patterns(chain, ticks, bars, available);
+        var referencePatterns = Patterns(chain, ticks, bars, bars.Select(b => b.EndTimestamp).ToList(), false);
+        var moveByIndex = patternRows.ToDictionary(r => r.Index, r => Math.Abs(r.Move));
+        var patternSignals = new List<Signal>();
+        foreach (var row in patternRows.Where(r => r.StateEntry && r.Full))
+        {
+            var side = row.State == "A" ? OptionType.Put : OptionType.Call;
+            var eligible = chain.Values.Where(i => i.OptionType == side).Select(i => (i, p: Before(ticks[i.Token], row.Time)))
+                .Where(x => Fresh(x.p, row.Time) && Valid(x.p!, x.i.LotSize) && x.p!.Ask >= 100 && x.p.Ask <= 150)
+                .OrderBy(x => (x.p!.Ask - x.p.Bid) / x.p.Ask).ThenBy(x => x.i.Token, StringComparer.Ordinal).FirstOrDefault();
+            if (eligible.i is null) { continue; }
+            var history = readings[eligible.i.Token].Where(r => r.End <= row.Time && r.Slow is not null && r.Average is not null).TakeLast(41).ToList();
+            var extended = history.Count < 41 || eligible.p!.Price - history[^1].Slow!.Value > history.Take(40).Max(r => r.Average!.Value - r.Slow!.Value);
+            // 2026-09-26: relative-move ratio (this event's own |Move| divided by the trailing
+            // 20-bar average |Move| strictly before it, causal) -- stored in Signal.Gap (otherwise
+            // unused for pattern signals) so a candidate rule can filter on it without changing the
+            // Signal shape. Exploratory lead from the earlier event-study work on this exact 12-day
+            // set, not an independently pre-registered threshold -- see P4/P5's own doc comment.
+            var trail = Enumerable.Range(Math.Max(0, row.Index - 20), Math.Min(20, row.Index)).Where(moveByIndex.ContainsKey).Select(i => moveByIndex[i]).ToList();
+            var ratio = trail.Count >= 5 && trail.Average() > 0 ? Math.Abs(row.Move) / trail.Average() : 0;
+            patternSignals.Add(Forward(new(row.Time, row.State, eligible.i.Token, "Pattern" + row.State, ratio, extended), ticks[eligible.i.Token]));
+        }
+        return (patternRows, referencePatterns, patternSignals);
+    }
+
+    internal static List<PatternRow> Patterns(Dictionary<string, Instrument> chain, Dictionary<string, List<Print>> ticks, List<FutureEventBar> bars, List<DateTimeOffset> available, bool causal = true)
     {
         var result = new List<PatternRow>(); string previous = "Other";
         var strikes = chain.Values.Select(i => i.StrikePrice!.Value).Distinct().Order().ToList();
