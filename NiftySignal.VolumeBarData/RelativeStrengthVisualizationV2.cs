@@ -108,7 +108,7 @@ public static class RelativeStrengthVisualizationV2
         DateTimeOffset IncrementalStart, DateTimeOffset IncrementalEnd,
         double? IncrementalCeLogReturn, double? IncrementalPeLogReturn, double? IncrementalRelativeShift,
         double CeIncrementalIndex, double PeIncrementalIndex, double? IncrementalLogRelativeIndex,
-        decimal AtmStrike, int ValidCeStrikeCount, int ValidPeStrikeCount,
+        decimal FuturesEndPrice, decimal AtmStrike, int ValidCeStrikeCount, int ValidPeStrikeCount,
         Dictionary<string, double?> CeRolling, Dictionary<string, double?> PeRolling, Dictionary<string, double?> RollingShift,
         string ExistingAtmState, bool ExistingFullSurfaceState, bool IsExistingStateEntry,
         List<Leg> Legs, List<string> RefPoints);
@@ -247,7 +247,7 @@ public static class RelativeStrengthVisualizationV2
                 cadenceType == "volume" ? RollingDuration(8) : null,
                 prevTimestamp, current.EndTimestamp,
                 incCe, incPe, incShift, ceIndex, peIndex, ceIndex != 0 ? Math.Log(peIndex / ceIndex) : null,
-                atmStrike, ceValidCount, peValidCount,
+                current.Close, atmStrike, ceValidCount, peValidCount,
                 ceRolling, peRolling, shiftRolling,
                 pr.State, pr.Full, pr.StateEntry, legs, [.. refTimestamps.Keys]));
         }
@@ -266,7 +266,7 @@ public static class RelativeStrengthVisualizationV2
         {
             "IncrementalStart","IncrementalEnd","IncrementalCELogReturn","IncrementalPELogReturn","IncrementalRelativeShift",
             "CEIncrementalIndex","PEIncrementalIndex","IncrementalLogRelativeIndex",
-            "ATMStrike","ValidCEStrikeCount","ValidPEStrikeCount",
+            "FuturesEndPrice","ATMStrike","ValidCEStrikeCount","ValidPEStrikeCount",
         });
         var rollingLabels = cadenceType == "time" ? TimeHorizonSeconds.Select(s => $"{s}s").ToArray() : VolumeHorizonBars.Select(n => $"{n}Bars").ToArray();
         foreach (var lbl in rollingLabels) { header.AddRange(new[] { $"CERollingLogReturn_{lbl}", $"PERollingLogReturn_{lbl}", $"RelativeShift_{lbl}" }); }
@@ -297,7 +297,7 @@ public static class RelativeStrengthVisualizationV2
             fields.Add(r.IncrementalStart); fields.Add(r.IncrementalEnd);
             fields.Add(r.IncrementalCeLogReturn); fields.Add(r.IncrementalPeLogReturn); fields.Add(r.IncrementalRelativeShift);
             fields.Add(r.CeIncrementalIndex); fields.Add(r.PeIncrementalIndex); fields.Add(r.IncrementalLogRelativeIndex);
-            fields.Add(r.AtmStrike); fields.Add(r.ValidCeStrikeCount); fields.Add(r.ValidPeStrikeCount);
+            fields.Add(r.FuturesEndPrice); fields.Add(r.AtmStrike); fields.Add(r.ValidCeStrikeCount); fields.Add(r.ValidPeStrikeCount);
             foreach (var lbl in rollingLabels) { fields.Add(r.CeRolling[lbl]); fields.Add(r.PeRolling[lbl]); fields.Add(r.RollingShift[lbl]); }
             fields.Add(r.ExistingAtmState); fields.Add(r.ExistingFullSurfaceState); fields.Add(r.IsExistingStateEntry);
 
