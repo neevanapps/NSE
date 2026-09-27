@@ -113,6 +113,14 @@ public static class ConfirmationExperiment
             var rowCount = await AppendDayAsync(db, date, sb);
             totalRows += rowCount;
             Console.WriteLine($"  {date:yyyy-MM-dd}: {rowCount} Pattern A/B FullSurface entries.");
+
+            // Full per-bar series (OHLC + signed order flow + Pattern A/B state) for chart forensics
+            // -- same underlying computation, just also written out at bar granularity, not only at
+            // Pattern entries. Written for every session processed (cheap, harmless for the 10
+            // primary sessions too, and directly reusable if the discovery charts need more days later).
+            var barPath = Path.Combine(Path.GetDirectoryName(outPath) ?? ".", $"{date:yyyy-MM-dd}_bars.csv");
+            await WriteBarSeriesAsync(db, date, barPath);
+
             await db.Database.EnsureDeletedAsync();
         }
         await File.WriteAllTextAsync(outPath, sb.ToString());
@@ -276,6 +284,53 @@ public static class ConfirmationExperiment
     /// CadencePopulator/LiveFeatureEngine already use. Returns each bar index's CadenceNet (null if
     /// that bar had no tick with both a two-sided quote and a positive volume delta to classify).
     /// </summary>
+    /// <summary>Chart-forensics export only: full per-bar OHLC/order-flow/Pattern-state series, not used by the primary statistics.</summary>
+    static async Task WriteBarSeriesAsync(NiftySignalDbContext db, DateOnly date, string path)
+    {
+        var chainAll = await db.Instruments.Where(i => i.AsOfDate == date && i.Underlying == "NIFTY"
+            && i.InstrumentType == InstrumentType.Option && i.ExpiryDate >= date).ToListAsync();
+        var expiry = chainAll.Min(i => i.ExpiryDate)!.Value;
+        var chain = chainAll.Where(i => i.ExpiryDate == expiry).OrderBy(i => i.Token).ToDictionary(i => i.Token);
+        var start = ReversalResearch.At(date, 9, 15).ToUniversalTime();
+        var end = ReversalResearch.At(date, 15, 30).ToUniversalTime();
+        var ticks = new Dictionary<string, List<ReversalResearch.Print>>();
+        foreach (var inst in chain.Values)
+        {
+            var token = inst.Token;
+            ticks[token] = await db.Ticks.Where(t => t.Token == token && t.ExchangeTimestamp >= start && t.ExchangeTimestamp <= end && t.LastPrice > 0)
+                .OrderBy(t => t.ExchangeTimestamp).ThenBy(t => t.Id)
+                .Select(t => new ReversalResearch.Print(t.Id, t.ExchangeTimestamp, t.ReceivedAt, t.LastPrice,
+                    t.Depth == null ? 0 : t.Depth.Bid1Price, t.Depth == null ? 0 : t.Depth.Ask1Price,
+                    t.Depth == null ? 0 : t.Depth.Bid1Qty, t.Depth == null ? 0 : t.Depth.Ask1Qty, t.Volume)).ToListAsync();
+        }
+        var bars = await FutureEventBarBuilder.BuildDayAsync(db, date, VolumeThreshold, CancellationToken.None);
+        var futureInst = await db.Instruments.Where(i => i.AsOfDate == date && i.Underlying == "NIFTY" && i.InstrumentType == InstrumentType.Future)
+            .OrderBy(i => i.ExpiryDate).FirstAsync();
+        var futureReceipts = await db.Ticks.Where(t => t.Token == futureInst.Token && t.ExchangeTimestamp >= start && t.ExchangeTimestamp <= end)
+            .OrderBy(t => t.ExchangeTimestamp).ThenBy(t => t.Id).Select(t => new { t.ExchangeTimestamp, t.ReceivedAt }).ToListAsync();
+        var available = ReversalResearch.ComputeAvailability(bars, futureReceipts.Select(r => (r.ExchangeTimestamp, r.ReceivedAt)).ToList(), start);
+        var patternRows = ReversalResearch.Patterns(chain, ticks, bars, available);
+        var patternByIndex = patternRows.ToDictionary(p => p.Index);
+        var futureTicksRaw = await db.Ticks.Where(t => t.Token == futureInst.Token && t.ExchangeTimestamp >= start && t.ExchangeTimestamp <= end)
+            .OrderBy(t => t.ExchangeTimestamp).ThenBy(t => t.Id).ToListAsync();
+        var cadenceNetByBar = ComputeCadenceNetPerBar(futureTicksRaw, bars);
+
+        var sb = new StringBuilder();
+        sb.AppendLine("BarIndex,Timestamp,Open,High,Low,Close,CadenceNet,ExistingAtmState,ExistingFullSurfaceState,IsExistingStateEntry");
+        for (var b = 0; b < bars.Count; b++)
+        {
+            if (bars[b].IsFinalPartialBar) { continue; }
+            patternByIndex.TryGetValue(b, out var pr);
+            AppendCsvRow(sb, new List<object?>
+            {
+                b, available[b], bars[b].Open, bars[b].High, bars[b].Low, bars[b].Close,
+                cadenceNetByBar.TryGetValue(b, out var net) ? net : null,
+                pr?.State ?? "Other", pr?.Full ?? false, pr?.StateEntry ?? false,
+            });
+        }
+        await File.WriteAllTextAsync(path, sb.ToString());
+    }
+
     static Dictionary<int, long?> ComputeCadenceNetPerBar(List<Tick> futureTicks, List<FutureEventBar> bars)
     {
         var result = new Dictionary<int, long?>();
