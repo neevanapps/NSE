@@ -318,3 +318,10 @@ The main question remains:
 
 > Does the metric contain repeatable forward Futures information that is not already explained by
 > the simple current 6500-bar reversal mechanism?
+
+## Frozen CVD mechanism follow-up
+
+The second-batch CVD proxy relationship is not translated to options immediately. The next locked
+step is documented in 'docs/VOLUME_BAR_6500_CVD_CONTROL.md'. It keeps the existing move-matched
+cells and applies partial-Spearman controls for signal-bar CloseLocation, TopOfBookImbalance and
+DepthImbalance, individually and jointly, with identical complete-case samples for fair comparison.

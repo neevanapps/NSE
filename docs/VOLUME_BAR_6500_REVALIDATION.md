@@ -243,6 +243,11 @@ The output directory contains:
 - 'second-metric-move-controlled-sessions.csv'
 - 'second-metric-leave-one-session-out.csv'
 - 'second-metric-oi-states.csv'
+- 'cvd-control-diagnostics.csv'
+- 'cvd-control-summary.csv'
+- 'cvd-control-cells.csv'
+- 'cvd-control-sessions.csv'
+- 'cvd-control-leave-one-session-out.csv'
 
 The directory is regenerable and is ignored by git. Do not commit these CSVs as source.
 
@@ -264,3 +269,10 @@ The next locked raw-Futures revalidation batch is documented in
 Futures OI buildup, TrendReversion, tick activity/efficiency and VWAP deviation while preserving
 the simple current-bar reversal relationship as the benchmark and reusing the frozen direction x
 move-magnitude cells for incremental-information checks.
+
+## CVD control follow-up
+
+The clean second-batch result for 'FutureCvdProxyNet' is followed by the locked mechanism test in
+'docs/VOLUME_BAR_6500_CVD_CONTROL.md'. It reuses the same frozen direction x move-magnitude cells
+and asks whether the inverse CVD/future relationship survives contemporaneous CloseLocation,
+TopOfBookImbalance and DepthImbalance controls.

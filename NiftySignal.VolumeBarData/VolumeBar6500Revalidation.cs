@@ -750,6 +750,7 @@ public static class VolumeBar6500RevalidationRunner
         await VolumeBar6500MetricAnalysis.WriteReportsAsync(allObservations, outputDirectory);
         await VolumeBar6500DurationIncrementalAnalysis.WriteReportsAsync(allObservations, outputDirectory);
         await VolumeBar6500SecondMetricAnalysis.WriteReportsAsync(allObservations, outputDirectory);
+        await VolumeBar6500CvdControlAnalysis.WriteReportsAsync(allObservations, outputDirectory);
 
         Console.WriteLine($"6500 raw-feed-update revalidation + metric analyses complete -> {outputDirectory}");
         return 0;
