@@ -121,7 +121,7 @@ public static class VolumeBar6500DurationIncrementalAnalysis
             .Where(IsEligibleSignal)
             .ToArray();
 
-        var definitions = BuildDefinitions(eligibleSignals);
+        var definitions = BuildFrozenDefinitions(eligibleSignals);
         var definitionMap = definitions.ToDictionary(
             d => (d.DirectionSign, d.MagnitudeQuintile));
 
@@ -203,7 +203,7 @@ public static class VolumeBar6500DurationIncrementalAnalysis
         return result;
     }
 
-    static IReadOnlyList<CellDefinition> BuildDefinitions(
+    public static IReadOnlyList<CellDefinition> BuildFrozenDefinitions(
         IReadOnlyList<VolumeBar6500Revalidation.Observation> observations)
     {
         var definitions = new List<CellDefinition>();

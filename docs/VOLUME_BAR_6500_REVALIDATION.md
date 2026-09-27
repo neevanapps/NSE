@@ -115,6 +115,7 @@ Every exposed common field must match:
 - observed bar volume,
 - feed-update count,
 - latest OI,
+- whole-session VWAP-at-close,
 - CVD proxy,
 - depth imbalance,
 - order-flow imbalance,
@@ -233,6 +234,15 @@ The output directory contains:
 - 'duration-incremental-cells.csv'
 - 'duration-incremental-sessions.csv'
 - 'duration-incremental-leave-one-session-out.csv'
+- 'second-metric-baseline.csv'
+- 'second-metric-summary.csv'
+- 'second-metric-sessions.csv'
+- 'second-metric-quintiles.csv'
+- 'second-metric-dte.csv'
+- 'second-metric-move-controlled-cells.csv'
+- 'second-metric-move-controlled-sessions.csv'
+- 'second-metric-leave-one-session-out.csv'
+- 'second-metric-oi-states.csv'
 
 The directory is regenerable and is ignored by git. Do not commit these CSVs as source.
 
@@ -246,3 +256,11 @@ Until this pass is reviewed:
 - later survives realistic option execution: 'TRADEABLE_CANDIDATE'
 - clean revalidation fails: 'FAILED_6500_REVALIDATION'
 - frozen unchanged on genuinely new sessions: 'FROZEN_FORWARD_TEST'
+
+## Second metric batch
+
+The next locked raw-Futures revalidation batch is documented in
+'docs/VOLUME_BAR_6500_SECOND_METRIC_BATCH.md'. It evaluates TOB, CVD proxy, price impact,
+Futures OI buildup, TrendReversion, tick activity/efficiency and VWAP deviation while preserving
+the simple current-bar reversal relationship as the benchmark and reusing the frozen direction x
+move-magnitude cells for incremental-information checks.

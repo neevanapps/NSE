@@ -42,7 +42,8 @@ public static class VolumeBar6500Revalidation
         double? DepthImbalance,
         double? OrderFlowImbalance,
         double? TopOfBookImbalance,
-        bool IsFinalPartialBar)
+        bool IsFinalPartialBar,
+        double? VwapAtClose = null)
     {
         public double ExchangeDurationSeconds => (EndTimestamp - StartTimestamp).TotalSeconds;
         public double ReceiptDurationSeconds => (AvailableAt - StartReceivedAt).TotalSeconds;
@@ -97,7 +98,19 @@ public static class VolumeBar6500Revalidation
         double? MaxUp4Points,
         double? MaxDown1Points,
         double? MaxDown2Points,
-        double? MaxDown4Points);
+        double? MaxDown4Points,
+        long? OpenInterestAtClose = null,
+        double? VwapAtClose = null,
+        double? PriceImpact = null,
+        string? FutureOiBuildupState = null,
+        double? FutureOiBuildupSignedMagnitude = null,
+        double? TrendReversion15 = null,
+        double? TrendPersistence15Raw = null,
+        double? TickDensity = null,
+        double? TickVelocity = null,
+        double? PriceEfficiency = null,
+        double? Churn = null,
+        double? VwapDeviation = null);
 
     public sealed record OvershootSummary(
         int FullBarCount,
@@ -221,10 +234,54 @@ public static class VolumeBar6500Revalidation
     {
         var full = bars.Where(b => !b.IsFinalPartialBar).ToList();
         var rows = new List<Observation>(full.Count);
+        var trendTracker = new VolumeBarTrendReversionTracker(15);
 
         for (var i = 0; i < full.Count; i++)
         {
             var bar = full[i];
+            var previousClose = i > 0 ? full[i - 1].Close : (decimal?)null;
+            var previousOi = i > 0 ? full[i - 1].OpenInterestAtClose : null;
+            var closeToCloseChange = previousClose is { } pc ? (double)(bar.Close - pc) : (double?)null;
+            var trendReversion15 = trendTracker.Observe(closeToCloseChange);
+            var trendPersistence15Raw = trendReversion15 is { } tr ? -tr : (double?)null;
+
+            double? priceImpact = previousClose is { } prevClose && bar.ObservedVolume > 0
+                ? (double)(bar.Close - prevClose) / bar.ObservedVolume
+                : null;
+
+            string? oiState = null;
+            double? oiSignedMagnitude = null;
+            if (previousClose is { } prevPrice &&
+                previousOi is { } prevOpenInterest &&
+                bar.OpenInterestAtClose is { } currentOpenInterest)
+            {
+                var oiChange = currentOpenInterest - prevOpenInterest;
+                var classification = OiBuildupClassifier.Classify(bar.Close - prevPrice, oiChange);
+                oiState = classification.ToString();
+
+                var directionSign = classification switch
+                {
+                    OiBuildupClassification.LongBuildup or OiBuildupClassification.ShortCovering => 1,
+                    OiBuildupClassification.ShortBuildup or OiBuildupClassification.LongUnwinding => -1,
+                    _ => 0,
+                };
+
+                oiSignedMagnitude = directionSign * Math.Abs((double)oiChange);
+            }
+
+            var activity = TickActivityFeatures.Compute(
+                bar.Open,
+                bar.High,
+                bar.Low,
+                bar.Close,
+                bar.ObservedVolume,
+                bar.FeedUpdateCount,
+                bar.ExchangeDurationSeconds);
+
+            var vwapDeviation = bar.VwapAtClose is { } vwap
+                ? (double)bar.Close - vwap
+                : (double?)null;
+
             rows.Add(new Observation(
                 tradingDate,
                 dte,
@@ -261,7 +318,19 @@ public static class VolumeBar6500Revalidation
                 MaxUp(full, i, 4),
                 MaxDown(full, i, 1),
                 MaxDown(full, i, 2),
-                MaxDown(full, i, 4)));
+                MaxDown(full, i, 4),
+                bar.OpenInterestAtClose,
+                bar.VwapAtClose,
+                priceImpact,
+                oiState,
+                oiSignedMagnitude,
+                trendReversion15,
+                trendPersistence15Raw,
+                activity.TickDensity,
+                activity.TickVelocity,
+                activity.PriceEfficiency,
+                activity.Churn,
+                vwapDeviation));
         }
 
         return rows;
@@ -366,6 +435,8 @@ public static class VolumeBar6500Revalidation
             return $"OI existing={expected.OpenInterestAtClose}, audited={actual.OpenInterestAtClose}";
         if (expected.TickCount != actual.FeedUpdateCount)
             return $"FeedUpdateCount existing={expected.TickCount}, audited={actual.FeedUpdateCount}";
+        if (!Same(expected.VwapAtClose, actual.VwapAtClose))
+            return $"VWAP existing={expected.VwapAtClose}, audited={actual.VwapAtClose}";
         if (expected.FutureCvdNet != actual.FutureCvdProxyNet)
             return $"CVD proxy existing={expected.FutureCvdNet}, audited={actual.FutureCvdProxyNet}";
         if (!Same(expected.DepthImbalance, actual.DepthImbalance))
@@ -455,6 +526,8 @@ public static class VolumeBar6500Revalidation
         long? _lastOpenInterest;
         int _feedUpdateCount;
         int _depthUpdateCount;
+        double _sessionPriceVolume;
+        double _sessionVolume;
 
         public Bar? Apply(OptionTickV2 tick)
         {
@@ -488,6 +561,12 @@ public static class VolumeBar6500Revalidation
             _lastOpenInterest = tick.OpenInterest ?? _lastOpenInterest;
             _feedUpdateCount++;
             _barVolume += delta;
+
+            if (delta > 0)
+            {
+                _sessionPriceVolume += (double)tick.LastPrice * delta;
+                _sessionVolume += delta;
+            }
 
             if (tick.Depth is { } depth)
             {
@@ -560,7 +639,8 @@ public static class VolumeBar6500Revalidation
                 _depth.CadenceImbalance,
                 _ofi.CadenceNet,
                 _tob.CadenceImbalance,
-                isFinalPartialBar);
+                isFinalPartialBar,
+                _sessionVolume > 0 ? _sessionPriceVolume / _sessionVolume : null);
 
             _hasOpenBar = false;
             _barVolume = 0;
@@ -669,6 +749,7 @@ public static class VolumeBar6500RevalidationRunner
         await WriteObservationsCsvAsync(Path.Combine(outputDirectory, "observations-6500.csv"), allObservations);
         await VolumeBar6500MetricAnalysis.WriteReportsAsync(allObservations, outputDirectory);
         await VolumeBar6500DurationIncrementalAnalysis.WriteReportsAsync(allObservations, outputDirectory);
+        await VolumeBar6500SecondMetricAnalysis.WriteReportsAsync(allObservations, outputDirectory);
 
         Console.WriteLine($"6500 raw-feed-update revalidation + metric analyses complete -> {outputDirectory}");
         return 0;
@@ -724,7 +805,7 @@ public static class VolumeBar6500RevalidationRunner
         await writer.WriteLineAsync(
             "TradingDate,Dte,BarIndex,StartTimestamp,EndTimestamp,StartReceivedAt,AvailableAt," +
             "FirstUpdateId,LastUpdateId,Open,High,Low,Close,ObservedVolume,OvershootVolume," +
-            "OpenInterestAtClose,FeedUpdateCount,DepthUpdateCount,FutureCvdProxyNet,DepthImbalance," +
+            "OpenInterestAtClose,VwapAtClose,FeedUpdateCount,DepthUpdateCount,FutureCvdProxyNet,DepthImbalance," +
             "OrderFlowImbalance,TopOfBookImbalance,TobDepthDivergence,ExchangeDurationSeconds," +
             "ReceiptDurationSeconds,BarDurationUrgency,IsFinalPartialBar");
 
@@ -748,6 +829,7 @@ public static class VolumeBar6500RevalidationRunner
                 b.ObservedVolume,
                 b.OvershootVolume,
                 b.OpenInterestAtClose,
+                b.VwapAtClose,
                 b.FeedUpdateCount,
                 b.DepthUpdateCount,
                 b.FutureCvdProxyNet,
@@ -772,6 +854,8 @@ public static class VolumeBar6500RevalidationRunner
             "SignalBarChangePoints,SignalBarReturn,SignalBarRangePoints,ObservedVolume,OvershootVolume," +
             "FeedUpdateCount,DepthUpdateCount,ExchangeDurationSeconds,ReceiptDurationSeconds,DepthImbalance," +
             "TopOfBookImbalance,TobDepthDivergence,OrderFlowImbalance,FutureCvdProxyNet,BarDurationUrgency," +
+            "OpenInterestAtClose,VwapAtClose,PriceImpact,FutureOiBuildupState,FutureOiBuildupSignedMagnitude," +
+            "TrendReversion15,TrendPersistence15Raw,TickDensity,TickVelocity,PriceEfficiency,Churn,VwapDeviation," +
             "Forward1Points,Forward2Points,Forward4Points,Forward1ObservedVolume,Forward2ObservedVolume," +
             "Forward4ObservedVolume,MaxUp1Points,MaxUp2Points,MaxUp4Points,MaxDown1Points,MaxDown2Points,MaxDown4Points");
 
@@ -802,6 +886,18 @@ public static class VolumeBar6500RevalidationRunner
                 r.OrderFlowImbalance,
                 r.FutureCvdProxyNet,
                 r.BarDurationUrgency,
+                r.OpenInterestAtClose,
+                r.VwapAtClose,
+                r.PriceImpact,
+                r.FutureOiBuildupState,
+                r.FutureOiBuildupSignedMagnitude,
+                r.TrendReversion15,
+                r.TrendPersistence15Raw,
+                r.TickDensity,
+                r.TickVelocity,
+                r.PriceEfficiency,
+                r.Churn,
+                r.VwapDeviation,
                 r.Forward1Points,
                 r.Forward2Points,
                 r.Forward4Points,

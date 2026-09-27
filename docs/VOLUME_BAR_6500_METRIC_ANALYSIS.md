@@ -220,3 +220,18 @@ command. It tests whether duration adds reversal information after matching sign
 
 This follow-up was frozen before its result was inspected. It must not be replaced by a search over
 alternative duration thresholds or magnitude buckets after seeing the output.
+
+
+## Second independent metric batch
+
+After the first four metrics and the frozen duration incremental follow-up, the next predeclared
+batch is documented in 'docs/VOLUME_BAR_6500_SECOND_METRIC_BATCH.md'.
+
+It evaluates TopOfBookImbalance, FutureCvdProxyNet, PriceImpact, Futures OI buildup,
+TrendReversion15, TickDensity, TickVelocity, PriceEfficiency, Churn and VwapDeviation while
+keeping the current signal-bar reversal relationship visible as the benchmark. The un-negated
+TrendPersistence15Raw is exported only as a sign diagnostic, not promoted as another candidate.
+
+The second batch reuses the exact frozen direction x absolute-move quintile cells from the duration
+test to ask whether each metric adds information after controlling for the simple current-bar
+move.
