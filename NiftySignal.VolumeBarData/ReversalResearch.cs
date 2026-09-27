@@ -837,7 +837,7 @@ public static class ReversalResearch
     /// by both the volume-threshold and time-based bar constructions; the logic itself doesn't care
     /// how a bar was built, only that it has an EndTimestamp.
     /// </summary>
-    static List<DateTimeOffset> ComputeAvailability(List<FutureEventBar> bars, List<(DateTimeOffset ExchangeTimestamp, DateTimeOffset ReceivedAt)> futureReceipts, DateTimeOffset start)
+    internal static List<DateTimeOffset> ComputeAvailability(List<FutureEventBar> bars, List<(DateTimeOffset ExchangeTimestamp, DateTimeOffset ReceivedAt)> futureReceipts, DateTimeOffset start)
     {
         var available = new List<DateTimeOffset>(); var latestReceipt = start; var fc = 0;
         foreach (var bar in bars)
@@ -918,7 +918,7 @@ public static class ReversalResearch
         return (patternRows, referencePatterns, patternSignals);
     }
 
-    static List<PatternRow> Patterns(Dictionary<string, Instrument> chain, Dictionary<string, List<Print>> ticks, List<FutureEventBar> bars, List<DateTimeOffset> available, bool causal = true)
+    internal static List<PatternRow> Patterns(Dictionary<string, Instrument> chain, Dictionary<string, List<Print>> ticks, List<FutureEventBar> bars, List<DateTimeOffset> available, bool causal = true)
     {
         var result = new List<PatternRow>(); string previous = "Other";
         var strikes = chain.Values.Select(i => i.StrikePrice!.Value).Distinct().Order().ToList();
