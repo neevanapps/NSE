@@ -4,27 +4,12 @@ using NiftySignal.Features;
 
 namespace NiftySignal.VolumeBarData;
 
-/// <summary>
-/// Correctness-first 6500-contract Futures event-bar revalidation built directly from the
-/// committed research-ticks-v2 raw tick export. This deliberately does not reuse the older
-/// persisted VolumeBarRow dataset.
-///
-/// The older VolumeBarBuilder assigns the whole threshold-crossing tick to the open bar and then
-/// resets cadence volume to zero. The later FutureEventBarBuilder assigns that same whole tick to
-/// exactly one bar but carries threshold excess into the next bar's accounting balance. This
-/// harness uses the latter accounting convention and makes the carry explicit on every bar.
-/// </summary>
 public static class VolumeBar6500Revalidation
 {
     public const long ThresholdContracts = 6500;
 
-    /// <summary>
-    /// Fixed historical revalidation set. Discovery 2026-09-22/23, consumed OOS 2026-09-24 and
-    /// provisional 2026-09-25 are deliberately excluded.
-    /// </summary>
     public static readonly DateOnly[] PrimaryResearchDates =
     [
-        new(2026, 9, 4),
         new(2026, 9, 8),
         new(2026, 9, 9),
         new(2026, 9, 10),
@@ -42,20 +27,18 @@ public static class VolumeBar6500Revalidation
         DateTimeOffset EndTimestamp,
         DateTimeOffset StartReceivedAt,
         DateTimeOffset AvailableAt,
-        long FirstTickId,
-        long LastTickId,
+        long FirstUpdateId,
+        long LastUpdateId,
         decimal Open,
         decimal High,
         decimal Low,
         decimal Close,
-        long RealAssignedVolume,
-        long ThresholdCarryIn,
-        long ThresholdBalanceAtClose,
-        long? ThresholdCarryOut,
+        long ObservedVolume,
+        long? OvershootVolume,
         long? OpenInterestAtClose,
-        int TickCount,
-        int DepthTickCount,
-        long? FutureCvdNet,
+        int FeedUpdateCount,
+        int DepthUpdateCount,
+        long? FutureCvdProxyNet,
         double? DepthImbalance,
         double? OrderFlowImbalance,
         double? TopOfBookImbalance,
@@ -64,16 +47,9 @@ public static class VolumeBar6500Revalidation
         public double ExchangeDurationSeconds => (EndTimestamp - StartTimestamp).TotalSeconds;
         public double ReceiptDurationSeconds => (AvailableAt - StartReceivedAt).TotalSeconds;
 
-        /// <summary>
-        /// Raw, untuned frame. Direction is intentionally not assumed in this revalidation.
-        /// </summary>
         public double? TobDepthDivergence =>
             DepthImbalance is { } depth && TopOfBookImbalance is { } tob ? depth - tob : null;
 
-        /// <summary>
-        /// Historical formulation reproduced exactly before any ranking:
-        /// sign(Close-Open) / exchange-duration-seconds.
-        /// </summary>
         public double? BarDurationUrgency
         {
             get
@@ -92,22 +68,24 @@ public static class VolumeBar6500Revalidation
         DateTimeOffset Timestamp,
         DateTimeOffset AvailableAt,
         decimal FuturesClose,
-        long RealAssignedVolume,
-        long ThresholdCarryIn,
-        long? ThresholdCarryOut,
-        int TickCount,
-        int DepthTickCount,
+        long ObservedVolume,
+        long? OvershootVolume,
+        int FeedUpdateCount,
+        int DepthUpdateCount,
         double ExchangeDurationSeconds,
         double ReceiptDurationSeconds,
         double? DepthImbalance,
         double? TopOfBookImbalance,
         double? TobDepthDivergence,
         double? OrderFlowImbalance,
-        long? FutureCvdNet,
+        long? FutureCvdProxyNet,
         double? BarDurationUrgency,
         double? Forward1Points,
         double? Forward2Points,
         double? Forward4Points,
+        long? Forward1ObservedVolume,
+        long? Forward2ObservedVolume,
+        long? Forward4ObservedVolume,
         double? MaxUp1Points,
         double? MaxUp2Points,
         double? MaxUp4Points,
@@ -115,11 +93,28 @@ public static class VolumeBar6500Revalidation
         double? MaxDown2Points,
         double? MaxDown4Points);
 
+    public sealed record OvershootSummary(
+        int FullBarCount,
+        long MedianOvershoot,
+        long P90Overshoot,
+        long P95Overshoot,
+        long P99Overshoot,
+        long MaxOvershoot,
+        long MaxObservedVolume,
+        int BarsAtLeast7500,
+        int BarsAtLeast10000,
+        int BarsAtLeast13000);
+
+    public sealed record ParityReport(
+        int ComparedBarCount,
+        int MismatchCount,
+        string? FirstMismatch);
+
     public sealed record SessionAudit(
         DateOnly TradingDate,
         string FutureToken,
         int Dte,
-        int TotalTicks,
+        int TotalFeedUpdates,
         DateTimeOffset? FirstExchangeTimestamp,
         DateTimeOffset? LastExchangeTimestamp,
         DateTimeOffset? FirstReceivedAt,
@@ -130,18 +125,20 @@ public static class VolumeBar6500Revalidation
         int NegativeVolumeDeltas,
         int FullBarCount,
         int PartialBarCount,
-        int BarsWithCarryIn,
-        long MaxCarryOut);
+        int LegacyParityMismatchCount,
+        long MedianOvershoot,
+        long P90Overshoot,
+        long P95Overshoot,
+        long P99Overshoot,
+        long MaxOvershoot,
+        long MaxObservedVolume,
+        int BarsAtLeast7500,
+        int BarsAtLeast10000,
+        int BarsAtLeast13000);
 
-    /// <summary>
-    /// Builds fixed 6500-contract event bars from one session's raw Futures ticks. Input order is
-    /// authoritative and must be ExchangeTimestamp non-decreasing with Id strictly increasing,
-    /// exactly as TickExporterV2 writes it. Negative cumulative-volume deltas fail the run rather
-    /// than being clamped or silently ignored.
-    /// </summary>
     public static IReadOnlyList<Bar> BuildBars(IReadOnlyList<OptionTickV2> ticks)
     {
-        var builder = new CarryAwareBuilder();
+        var builder = new WholeFeedUpdateNoCarryBuilder();
         var bars = new List<Bar>();
 
         foreach (var tick in ticks)
@@ -160,10 +157,57 @@ public static class VolumeBar6500Revalidation
         return bars;
     }
 
-    /// <summary>
-    /// Creates one metric/outcome row for every completed 6500 bar. The final partial bar is not
-    /// a signal observation. +1/+2/+4 mean 6500/13000/26000 contracts later respectively.
-    /// </summary>
+    public static ParityReport CompareWithExistingVolumeBarBuilder(
+        IReadOnlyList<OptionTickV2> ticks,
+        IReadOnlyList<Bar> candidateBars)
+    {
+        var referenceBuilder = new VolumeBarBuilder(ThresholdContracts);
+        var referenceBars = new List<VolumeBar>();
+        DateTimeOffset? lastTimestamp = null;
+
+        foreach (var tick in ticks)
+        {
+            lastTimestamp = tick.ExchangeTimestamp;
+            var completed = referenceBuilder.ApplyTick(
+                tick.ExchangeTimestamp,
+                tick.LastPrice,
+                tick.Volume,
+                tick.Depth,
+                tick.OpenInterest);
+
+            if (completed is not null)
+            {
+                referenceBars.Add(completed);
+            }
+        }
+
+        if (lastTimestamp is { } last && referenceBuilder.FlushPartial(last) is { } partial)
+        {
+            referenceBars.Add(partial);
+        }
+
+        var mismatches = 0;
+        string? firstMismatch = null;
+
+        if (referenceBars.Count != candidateBars.Count)
+        {
+            mismatches++;
+            firstMismatch = $"bar-count mismatch: existing={referenceBars.Count}, audited={candidateBars.Count}";
+        }
+
+        var comparable = Math.Min(referenceBars.Count, candidateBars.Count);
+        for (var i = 0; i < comparable; i++)
+        {
+            var mismatch = FirstBarMismatch(referenceBars[i], candidateBars[i]);
+            if (mismatch is null) { continue; }
+
+            mismatches++;
+            firstMismatch ??= $"bar {i}: {mismatch}";
+        }
+
+        return new ParityReport(comparable, mismatches, firstMismatch);
+    }
+
     public static IReadOnlyList<Observation> BuildObservations(
         DateOnly tradingDate,
         int dte,
@@ -182,22 +226,24 @@ public static class VolumeBar6500Revalidation
                 bar.EndTimestamp,
                 bar.AvailableAt,
                 bar.Close,
-                bar.RealAssignedVolume,
-                bar.ThresholdCarryIn,
-                bar.ThresholdCarryOut,
-                bar.TickCount,
-                bar.DepthTickCount,
+                bar.ObservedVolume,
+                bar.OvershootVolume,
+                bar.FeedUpdateCount,
+                bar.DepthUpdateCount,
                 bar.ExchangeDurationSeconds,
                 bar.ReceiptDurationSeconds,
                 bar.DepthImbalance,
                 bar.TopOfBookImbalance,
                 bar.TobDepthDivergence,
                 bar.OrderFlowImbalance,
-                bar.FutureCvdNet,
+                bar.FutureCvdProxyNet,
                 bar.BarDurationUrgency,
                 Forward(full, i, 1),
                 Forward(full, i, 2),
                 Forward(full, i, 4),
+                ForwardObservedVolume(full, i, 1),
+                ForwardObservedVolume(full, i, 2),
+                ForwardObservedVolume(full, i, 4),
                 MaxUp(full, i, 1),
                 MaxUp(full, i, 2),
                 MaxUp(full, i, 4),
@@ -209,12 +255,39 @@ public static class VolumeBar6500Revalidation
         return rows;
     }
 
+    public static OvershootSummary SummarizeOvershoot(IReadOnlyList<Bar> bars)
+    {
+        var full = bars.Where(b => !b.IsFinalPartialBar).ToList();
+        if (full.Count == 0)
+        {
+            return new OvershootSummary(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        }
+
+        var overshoots = full
+            .Select(b => b.OvershootVolume ?? throw new InvalidOperationException("Full bar missing overshoot."))
+            .OrderBy(x => x)
+            .ToArray();
+
+        return new OvershootSummary(
+            full.Count,
+            NearestRank(overshoots, 0.50),
+            NearestRank(overshoots, 0.90),
+            NearestRank(overshoots, 0.95),
+            NearestRank(overshoots, 0.99),
+            overshoots[^1],
+            full.Max(b => b.ObservedVolume),
+            full.Count(b => b.ObservedVolume >= 7_500),
+            full.Count(b => b.ObservedVolume >= 10_000),
+            full.Count(b => b.ObservedVolume >= 13_000));
+    }
+
     public static SessionAudit AuditSession(
         DateOnly tradingDate,
         string futureToken,
         int dte,
         IReadOnlyList<OptionTickV2> ticks,
-        IReadOnlyList<Bar> bars)
+        IReadOnlyList<Bar> bars,
+        ParityReport parity)
     {
         var exchangeViolations = 0;
         var idViolations = 0;
@@ -232,6 +305,8 @@ public static class VolumeBar6500Revalidation
             if (current.Volume < previous.Volume) { negativeVolumeDeltas++; }
         }
 
+        var overshoot = SummarizeOvershoot(bars);
+
         return new SessionAudit(
             tradingDate,
             futureToken,
@@ -247,17 +322,81 @@ public static class VolumeBar6500Revalidation
             negativeVolumeDeltas,
             bars.Count(b => !b.IsFinalPartialBar),
             bars.Count(b => b.IsFinalPartialBar),
-            bars.Count(b => b.ThresholdCarryIn > 0),
-            bars.Where(b => b.ThresholdCarryOut is not null)
-                .Select(b => b.ThresholdCarryOut!.Value)
-                .DefaultIfEmpty(0)
-                .Max());
+            parity.MismatchCount,
+            overshoot.MedianOvershoot,
+            overshoot.P90Overshoot,
+            overshoot.P95Overshoot,
+            overshoot.P99Overshoot,
+            overshoot.MaxOvershoot,
+            overshoot.MaxObservedVolume,
+            overshoot.BarsAtLeast7500,
+            overshoot.BarsAtLeast10000,
+            overshoot.BarsAtLeast13000);
+    }
+
+    static string? FirstBarMismatch(VolumeBar expected, Bar actual)
+    {
+        if (expected.StartTimestamp != actual.StartTimestamp)
+            return $"StartTimestamp existing={expected.StartTimestamp:O}, audited={actual.StartTimestamp:O}";
+        if (expected.EndTimestamp != actual.EndTimestamp)
+            return $"EndTimestamp existing={expected.EndTimestamp:O}, audited={actual.EndTimestamp:O}";
+        if (expected.OpenPrice != actual.Open)
+            return $"Open existing={expected.OpenPrice}, audited={actual.Open}";
+        if (expected.HighPrice != actual.High)
+            return $"High existing={expected.HighPrice}, audited={actual.High}";
+        if (expected.LowPrice != actual.Low)
+            return $"Low existing={expected.LowPrice}, audited={actual.Low}";
+        if (expected.ClosePrice != actual.Close)
+            return $"Close existing={expected.ClosePrice}, audited={actual.Close}";
+        if (expected.Volume != actual.ObservedVolume)
+            return $"Volume existing={expected.Volume}, audited={actual.ObservedVolume}";
+        if (expected.OpenInterestAtClose != actual.OpenInterestAtClose)
+            return $"OI existing={expected.OpenInterestAtClose}, audited={actual.OpenInterestAtClose}";
+        if (expected.TickCount != actual.FeedUpdateCount)
+            return $"FeedUpdateCount existing={expected.TickCount}, audited={actual.FeedUpdateCount}";
+        if (expected.FutureCvdNet != actual.FutureCvdProxyNet)
+            return $"CVD proxy existing={expected.FutureCvdNet}, audited={actual.FutureCvdProxyNet}";
+        if (!Same(expected.DepthImbalance, actual.DepthImbalance))
+            return $"DepthImbalance existing={expected.DepthImbalance}, audited={actual.DepthImbalance}";
+        if (!Same(expected.OrderFlowImbalance, actual.OrderFlowImbalance))
+            return $"OFI existing={expected.OrderFlowImbalance}, audited={actual.OrderFlowImbalance}";
+        if (!Same(expected.TopOfBookImbalance, actual.TopOfBookImbalance))
+            return $"TOB existing={expected.TopOfBookImbalance}, audited={actual.TopOfBookImbalance}";
+
+        return null;
+    }
+
+    static bool Same(double? left, double? right)
+    {
+        if (left is null || right is null) { return left == right; }
+        return Math.Abs(left.Value - right.Value) <= 1e-12;
+    }
+
+    static long NearestRank(IReadOnlyList<long> sorted, double percentile)
+    {
+        if (sorted.Count == 0) { return 0; }
+        var rank = (int)Math.Ceiling(percentile * sorted.Count);
+        var index = Math.Clamp(rank - 1, 0, sorted.Count - 1);
+        return sorted[index];
     }
 
     static double? Forward(IReadOnlyList<Bar> bars, int index, int horizon)
     {
         var target = index + horizon;
         return target < bars.Count ? (double)(bars[target].Close - bars[index].Close) : null;
+    }
+
+    static long? ForwardObservedVolume(IReadOnlyList<Bar> bars, int index, int horizon)
+    {
+        if (index + horizon >= bars.Count) { return null; }
+
+        long total = 0;
+        for (var i = index + 1; i <= index + horizon; i++)
+        {
+            total += bars[i].ObservedVolume;
+        }
+
+        return total;
     }
 
     static double? MaxUp(IReadOnlyList<Bar> bars, int index, int horizon)
@@ -276,7 +415,7 @@ public static class VolumeBar6500Revalidation
         return Math.Max(0.0, (double)(anchor - minLow));
     }
 
-    sealed class CarryAwareBuilder
+    sealed class WholeFeedUpdateNoCarryBuilder
     {
         readonly FutureCvdProxyAccumulator _cvd = new();
         readonly DepthImbalanceAccumulator _depth = new();
@@ -288,46 +427,39 @@ public static class VolumeBar6500Revalidation
         DateTimeOffset? _lastExchangeTimestamp;
 
         int _barIndex;
-        long _thresholdBalance;
-        long _carryIn;
+        long _barVolume;
 
         bool _hasOpenBar;
         DateTimeOffset _startTimestamp;
         DateTimeOffset _endTimestamp;
         DateTimeOffset _startReceivedAt;
         DateTimeOffset _availableAt;
-        long _firstTickId;
-        long _lastTickId;
+        long _firstUpdateId;
+        long _lastUpdateId;
         decimal _open;
         decimal _high;
         decimal _low;
         decimal _close;
-        long _realAssignedVolume;
         long? _lastOpenInterest;
-        int _tickCount;
-        int _depthTickCount;
+        int _feedUpdateCount;
+        int _depthUpdateCount;
 
         public Bar? Apply(OptionTickV2 tick)
         {
             if (_lastId is { } lastId && tick.Id <= lastId)
-            {
-                throw new InvalidDataException($"Tick Id must strictly increase: {lastId} -> {tick.Id}.");
-            }
+                throw new InvalidDataException($"Feed update Id must strictly increase: {lastId} -> {tick.Id}.");
+
             if (_lastExchangeTimestamp is { } lastTs && tick.ExchangeTimestamp < lastTs)
-            {
                 throw new InvalidDataException(
                     $"ExchangeTimestamp must not go backwards: {lastTs:O} -> {tick.ExchangeTimestamp:O}.");
-            }
 
             var delta = _previousCumulativeVolume is { } previousVolume
                 ? tick.Volume - previousVolume
                 : 0;
 
             if (delta < 0)
-            {
                 throw new InvalidDataException(
-                    $"Negative cumulative-volume delta at tick {tick.Id}: {_previousCumulativeVolume} -> {tick.Volume}.");
-            }
+                    $"Negative cumulative-volume delta at update {tick.Id}: {_previousCumulativeVolume} -> {tick.Volume}.");
 
             _previousCumulativeVolume = tick.Volume;
             _lastId = tick.Id;
@@ -337,34 +469,26 @@ public static class VolumeBar6500Revalidation
 
             _endTimestamp = tick.ExchangeTimestamp;
             _availableAt = tick.ReceivedAt > _availableAt ? tick.ReceivedAt : _availableAt;
-            _lastTickId = tick.Id;
+            _lastUpdateId = tick.Id;
             _high = Math.Max(_high, tick.LastPrice);
             _low = Math.Min(_low, tick.LastPrice);
             _close = tick.LastPrice;
             _lastOpenInterest = tick.OpenInterest ?? _lastOpenInterest;
-            _tickCount++;
-
-            if (delta > 0)
-            {
-                _realAssignedVolume += delta;
-            }
+            _feedUpdateCount++;
+            _barVolume += delta;
 
             if (tick.Depth is { } depth)
             {
                 _depth.ApplyTick(depth);
                 _ofi.ApplyTick(depth);
                 _tob.ApplyTick(depth);
-                _depthTickCount++;
+                _depthUpdateCount++;
 
                 if (delta > 0)
-                {
                     _cvd.ApplyTick(tick.LastPrice, depth, delta);
-                }
             }
 
-            _thresholdBalance += delta;
-
-            return _thresholdBalance >= ThresholdContracts
+            return _barVolume >= ThresholdContracts
                 ? CompleteBar(isFinalPartialBar: false)
                 : null;
         }
@@ -377,35 +501,30 @@ public static class VolumeBar6500Revalidation
             if (_hasOpenBar) { return; }
 
             _hasOpenBar = true;
-            _carryIn = _thresholdBalance;
             _startTimestamp = tick.ExchangeTimestamp;
             _endTimestamp = tick.ExchangeTimestamp;
             _startReceivedAt = tick.ReceivedAt;
             _availableAt = tick.ReceivedAt;
-            _firstTickId = tick.Id;
-            _lastTickId = tick.Id;
+            _firstUpdateId = tick.Id;
+            _lastUpdateId = tick.Id;
             _open = tick.LastPrice;
             _high = tick.LastPrice;
             _low = tick.LastPrice;
             _close = tick.LastPrice;
-            _realAssignedVolume = 0;
-            _tickCount = 0;
-            _depthTickCount = 0;
+            _barVolume = 0;
+            _feedUpdateCount = 0;
+            _depthUpdateCount = 0;
         }
 
         Bar CompleteBar(bool isFinalPartialBar)
         {
-            var balanceAtClose = _thresholdBalance;
-            long? carryOut = null;
-
+            long? overshoot = null;
             if (!isFinalPartialBar)
             {
-                carryOut = balanceAtClose - ThresholdContracts;
-                if (carryOut.Value < 0)
-                {
+                overshoot = _barVolume - ThresholdContracts;
+                if (overshoot.Value < 0)
                     throw new InvalidOperationException(
-                        $"Completed bar {_barIndex} below threshold: {balanceAtClose}.");
-                }
+                        $"Completed bar {_barIndex} below threshold: {_barVolume}.");
             }
 
             var bar = new Bar(
@@ -414,19 +533,17 @@ public static class VolumeBar6500Revalidation
                 _endTimestamp,
                 _startReceivedAt,
                 _availableAt,
-                _firstTickId,
-                _lastTickId,
+                _firstUpdateId,
+                _lastUpdateId,
                 _open,
                 _high,
                 _low,
                 _close,
-                _realAssignedVolume,
-                _carryIn,
-                balanceAtClose,
-                carryOut,
+                _barVolume,
+                overshoot,
                 _lastOpenInterest,
-                _tickCount,
-                _depthTickCount,
+                _feedUpdateCount,
+                _depthUpdateCount,
                 _cvd.CadenceNet,
                 _depth.CadenceImbalance,
                 _ofi.CadenceNet,
@@ -434,11 +551,9 @@ public static class VolumeBar6500Revalidation
                 isFinalPartialBar);
 
             _hasOpenBar = false;
-            _thresholdBalance = carryOut ?? 0;
-            _carryIn = _thresholdBalance;
-            _realAssignedVolume = 0;
-            _tickCount = 0;
-            _depthTickCount = 0;
+            _barVolume = 0;
+            _feedUpdateCount = 0;
+            _depthUpdateCount = 0;
             _cvd.ResetCadence();
             _depth.Reset();
             _ofi.ResetCadence();
@@ -449,11 +564,6 @@ public static class VolumeBar6500Revalidation
     }
 }
 
-/// <summary>
-/// File-backed exporter for the first revalidation pass. It reads only the ten predeclared
-/// primary sessions. Running it creates regenerable research CSV output; it does not touch the
-/// volume-bar database, live Host/Dashboard, or any strategy.
-/// </summary>
 public static class VolumeBar6500RevalidationRunner
 {
     public static async Task<int> RunAsync(string inputRoot, string outputDirectory, CancellationToken cancellationToken)
@@ -476,9 +586,7 @@ public static class VolumeBar6500RevalidationRunner
 
             var dayDir = Path.Combine(inputRoot, date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
             if (!Directory.Exists(dayDir))
-            {
                 throw new DirectoryNotFoundException($"Missing predeclared primary session: {dayDir}");
-            }
 
             var manifest = await OptionTickReaderV2.LoadManifestAsync(dayDir);
             var future = manifest
@@ -496,35 +604,33 @@ public static class VolumeBar6500RevalidationRunner
                 .FirstOrDefault();
 
             if (nearestOptionExpiry == default)
-            {
                 throw new InvalidDataException($"{date:yyyy-MM-dd}: no nearest-expiry option chain in instruments.json.");
-            }
 
             var dte = nearestOptionExpiry.DayNumber - date.DayNumber;
             var futurePath = Path.Combine(dayDir, $"{future.Token}.ndjson");
             if (!File.Exists(futurePath))
-            {
-                throw new FileNotFoundException($"{date:yyyy-MM-dd}: Future tick file missing.", futurePath);
-            }
+                throw new FileNotFoundException($"{date:yyyy-MM-dd}: Future feed-update file missing.", futurePath);
 
             var ticks = OptionTickReaderV2.LoadFile(futurePath);
 
             var orderingViolations = OptionTickReaderV2.ValidateOrdering(ticks);
             if (orderingViolations.Count > 0)
-            {
                 throw new InvalidDataException(
-                    $"{date:yyyy-MM-dd}: deterministic tick ordering failed: {orderingViolations[0]}");
-            }
+                    $"{date:yyyy-MM-dd}: deterministic feed-update ordering failed: {orderingViolations[0]}");
 
             var volumeReport = OptionTickReaderV2.ValidateCumulativeVolume(ticks);
             if (volumeReport.NegativeDeltaCount > 0)
-            {
                 throw new InvalidDataException(
                     $"{date:yyyy-MM-dd}: {volumeReport.NegativeDeltaCount} negative cumulative-volume delta(s).");
-            }
 
             var bars = VolumeBar6500Revalidation.BuildBars(ticks);
-            var audit = VolumeBar6500Revalidation.AuditSession(date, future.Token, dte, ticks, bars);
+            var parity = VolumeBar6500Revalidation.CompareWithExistingVolumeBarBuilder(ticks, bars);
+            if (parity.MismatchCount > 0)
+                throw new InvalidDataException(
+                    $"{date:yyyy-MM-dd}: audited builder does not match existing VolumeBarBuilder(6500): " +
+                    $"{parity.FirstMismatch}");
+
+            var audit = VolumeBar6500Revalidation.AuditSession(date, future.Token, dte, ticks, bars, parity);
             var observations = VolumeBar6500Revalidation.BuildObservations(date, dte, bars);
 
             audits.Add(audit);
@@ -532,16 +638,25 @@ public static class VolumeBar6500RevalidationRunner
             allBars.AddRange(bars.Select(b => (date, dte, b)));
 
             Console.WriteLine(
-                $"{date:yyyy-MM-dd}: ticks={ticks.Count:N0}, fullBars={audit.FullBarCount:N0}, " +
-                $"partialBars={audit.PartialBarCount}, carryBars={audit.BarsWithCarryIn:N0}, " +
-                $"receivedAtBackwards={audit.ReceivedAtBackwards:N0}, observations={observations.Count:N0}");
+                $"{date:yyyy-MM-dd}: updates={ticks.Count:N0}, fullBars={audit.FullBarCount:N0}, " +
+                $"partialBars={audit.PartialBarCount}, parity=PASS, medianOvershoot={audit.MedianOvershoot:N0}, " +
+                $"p95Overshoot={audit.P95Overshoot:N0}, maxOvershoot={audit.MaxOvershoot:N0}, " +
+                $"observations={observations.Count:N0}");
         }
+
+        var aggregate = VolumeBar6500Revalidation.SummarizeOvershoot(allBars.Select(x => x.Bar).ToList());
+        Console.WriteLine(
+            $"Aggregate overshoot: bars={aggregate.FullBarCount:N0}, median={aggregate.MedianOvershoot:N0}, " +
+            $"p90={aggregate.P90Overshoot:N0}, p95={aggregate.P95Overshoot:N0}, " +
+            $"p99={aggregate.P99Overshoot:N0}, max={aggregate.MaxOvershoot:N0}; " +
+            $">=7500={aggregate.BarsAtLeast7500:N0}, >=10000={aggregate.BarsAtLeast10000:N0}, " +
+            $">=13000={aggregate.BarsAtLeast13000:N0}");
 
         await WriteAuditCsvAsync(Path.Combine(outputDirectory, "session-audit.csv"), audits);
         await WriteBarsCsvAsync(Path.Combine(outputDirectory, "bars-6500.csv"), allBars);
         await WriteObservationsCsvAsync(Path.Combine(outputDirectory, "observations-6500.csv"), allObservations);
 
-        Console.WriteLine($"6500 raw-tick revalidation export complete -> {outputDirectory}");
+        Console.WriteLine($"6500 raw-feed-update revalidation export complete -> {outputDirectory}");
         return 0;
     }
 
@@ -551,9 +666,11 @@ public static class VolumeBar6500RevalidationRunner
     {
         await using var writer = new StreamWriter(path, false, new UTF8Encoding(false));
         await writer.WriteLineAsync(
-            "TradingDate,FutureToken,Dte,TotalTicks,FirstExchangeTimestamp,LastExchangeTimestamp," +
+            "TradingDate,FutureToken,Dte,TotalFeedUpdates,FirstExchangeTimestamp,LastExchangeTimestamp," +
             "FirstReceivedAt,LastReceivedAt,ExchangeOrderingViolations,IdOrderingViolations," +
-            "ReceivedAtBackwards,NegativeVolumeDeltas,FullBarCount,PartialBarCount,BarsWithCarryIn,MaxCarryOut");
+            "ReceivedAtBackwards,NegativeVolumeDeltas,FullBarCount,PartialBarCount,LegacyParityMismatchCount," +
+            "MedianOvershoot,P90Overshoot,P95Overshoot,P99Overshoot,MaxOvershoot,MaxObservedVolume," +
+            "BarsAtLeast7500,BarsAtLeast10000,BarsAtLeast13000");
 
         foreach (var r in rows)
         {
@@ -561,7 +678,7 @@ public static class VolumeBar6500RevalidationRunner
                 r.TradingDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
                 r.FutureToken,
                 r.Dte,
-                r.TotalTicks,
+                r.TotalFeedUpdates,
                 Iso(r.FirstExchangeTimestamp),
                 Iso(r.LastExchangeTimestamp),
                 Iso(r.FirstReceivedAt),
@@ -572,8 +689,16 @@ public static class VolumeBar6500RevalidationRunner
                 r.NegativeVolumeDeltas,
                 r.FullBarCount,
                 r.PartialBarCount,
-                r.BarsWithCarryIn,
-                r.MaxCarryOut));
+                r.LegacyParityMismatchCount,
+                r.MedianOvershoot,
+                r.P90Overshoot,
+                r.P95Overshoot,
+                r.P99Overshoot,
+                r.MaxOvershoot,
+                r.MaxObservedVolume,
+                r.BarsAtLeast7500,
+                r.BarsAtLeast10000,
+                r.BarsAtLeast13000));
         }
     }
 
@@ -584,10 +709,10 @@ public static class VolumeBar6500RevalidationRunner
         await using var writer = new StreamWriter(path, false, new UTF8Encoding(false));
         await writer.WriteLineAsync(
             "TradingDate,Dte,BarIndex,StartTimestamp,EndTimestamp,StartReceivedAt,AvailableAt," +
-            "FirstTickId,LastTickId,Open,High,Low,Close,RealAssignedVolume,ThresholdCarryIn," +
-            "ThresholdBalanceAtClose,ThresholdCarryOut,OpenInterestAtClose,TickCount,DepthTickCount," +
-            "FutureCvdNet,DepthImbalance,OrderFlowImbalance,TopOfBookImbalance,TobDepthDivergence," +
-            "ExchangeDurationSeconds,ReceiptDurationSeconds,BarDurationUrgency,IsFinalPartialBar");
+            "FirstUpdateId,LastUpdateId,Open,High,Low,Close,ObservedVolume,OvershootVolume," +
+            "OpenInterestAtClose,FeedUpdateCount,DepthUpdateCount,FutureCvdProxyNet,DepthImbalance," +
+            "OrderFlowImbalance,TopOfBookImbalance,TobDepthDivergence,ExchangeDurationSeconds," +
+            "ReceiptDurationSeconds,BarDurationUrgency,IsFinalPartialBar");
 
         foreach (var row in rows)
         {
@@ -600,20 +725,18 @@ public static class VolumeBar6500RevalidationRunner
                 b.EndTimestamp.ToString("O", CultureInfo.InvariantCulture),
                 b.StartReceivedAt.ToString("O", CultureInfo.InvariantCulture),
                 b.AvailableAt.ToString("O", CultureInfo.InvariantCulture),
-                b.FirstTickId,
-                b.LastTickId,
+                b.FirstUpdateId,
+                b.LastUpdateId,
                 b.Open,
                 b.High,
                 b.Low,
                 b.Close,
-                b.RealAssignedVolume,
-                b.ThresholdCarryIn,
-                b.ThresholdBalanceAtClose,
-                b.ThresholdCarryOut,
+                b.ObservedVolume,
+                b.OvershootVolume,
                 b.OpenInterestAtClose,
-                b.TickCount,
-                b.DepthTickCount,
-                b.FutureCvdNet,
+                b.FeedUpdateCount,
+                b.DepthUpdateCount,
+                b.FutureCvdProxyNet,
                 b.DepthImbalance,
                 b.OrderFlowImbalance,
                 b.TopOfBookImbalance,
@@ -631,11 +754,11 @@ public static class VolumeBar6500RevalidationRunner
     {
         await using var writer = new StreamWriter(path, false, new UTF8Encoding(false));
         await writer.WriteLineAsync(
-            "TradingDate,Dte,BarIndex,Timestamp,AvailableAt,FuturesClose,RealAssignedVolume," +
-            "ThresholdCarryIn,ThresholdCarryOut,TickCount,DepthTickCount,ExchangeDurationSeconds," +
-            "ReceiptDurationSeconds,DepthImbalance,TopOfBookImbalance,TobDepthDivergence," +
-            "OrderFlowImbalance,FutureCvdNet,BarDurationUrgency,Forward1Points,Forward2Points," +
-            "Forward4Points,MaxUp1Points,MaxUp2Points,MaxUp4Points,MaxDown1Points,MaxDown2Points,MaxDown4Points");
+            "TradingDate,Dte,BarIndex,Timestamp,AvailableAt,FuturesClose,ObservedVolume,OvershootVolume," +
+            "FeedUpdateCount,DepthUpdateCount,ExchangeDurationSeconds,ReceiptDurationSeconds,DepthImbalance," +
+            "TopOfBookImbalance,TobDepthDivergence,OrderFlowImbalance,FutureCvdProxyNet,BarDurationUrgency," +
+            "Forward1Points,Forward2Points,Forward4Points,Forward1ObservedVolume,Forward2ObservedVolume," +
+            "Forward4ObservedVolume,MaxUp1Points,MaxUp2Points,MaxUp4Points,MaxDown1Points,MaxDown2Points,MaxDown4Points");
 
         foreach (var r in rows)
         {
@@ -646,22 +769,24 @@ public static class VolumeBar6500RevalidationRunner
                 r.Timestamp.ToString("O", CultureInfo.InvariantCulture),
                 r.AvailableAt.ToString("O", CultureInfo.InvariantCulture),
                 r.FuturesClose,
-                r.RealAssignedVolume,
-                r.ThresholdCarryIn,
-                r.ThresholdCarryOut,
-                r.TickCount,
-                r.DepthTickCount,
+                r.ObservedVolume,
+                r.OvershootVolume,
+                r.FeedUpdateCount,
+                r.DepthUpdateCount,
                 r.ExchangeDurationSeconds,
                 r.ReceiptDurationSeconds,
                 r.DepthImbalance,
                 r.TopOfBookImbalance,
                 r.TobDepthDivergence,
                 r.OrderFlowImbalance,
-                r.FutureCvdNet,
+                r.FutureCvdProxyNet,
                 r.BarDurationUrgency,
                 r.Forward1Points,
                 r.Forward2Points,
                 r.Forward4Points,
+                r.Forward1ObservedVolume,
+                r.Forward2ObservedVolume,
+                r.Forward4ObservedVolume,
                 r.MaxUp1Points,
                 r.MaxUp2Points,
                 r.MaxUp4Points,
@@ -685,9 +810,7 @@ public static class VolumeBar6500RevalidationRunner
         };
 
         if (field.IndexOfAny([',', '"', '\r', '\n']) < 0)
-        {
             return field;
-        }
 
         return "\"" + field.Replace("\"", "\"\"") + "\"";
     }

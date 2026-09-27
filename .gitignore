@@ -52,3 +52,7 @@ research-file-run/
 # Same reasoning: gamma-filter's own output is cheaply regenerable from research-ticks/ +
 # research-file-run/ + current code.
 gamma-filter.json
+
+# 6500 volume-bar revalidation output is regenerated from committed research-ticks-v2 + code.
+# Keep source/audit logic in git, not transient CSV output.
+research-6500-revalidation/

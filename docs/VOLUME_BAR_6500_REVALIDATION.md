@@ -1,28 +1,60 @@
-# 6500 Volume-Bar Raw-Tick Revalidation
+# 6500 Volume-Bar Feed-Update Revalidation
 
 ## Why this revalidation exists
 
-The earlier volume-bar metric research used 'VolumeBarPopulator -> VolumeBarBuilder'. That builder
-assigns the whole threshold-crossing tick to the open bar and then resets the cadence-volume
-counter to zero. The later Pattern A/B event-bar research uses 'FutureEventBarBuilder', which also
-assigns the whole crossing tick to exactly one bar but **carries the threshold excess** into the
-next bar's accounting balance.
+The earlier volume-bar metric research used 'VolumeBarPopulator -> VolumeBarBuilder'. A later
+Pattern A/B research path used a different threshold-excess carry convention. The first audit run
+showed that carrying threshold excess can create artificial follow-on bars when a single recorded
+feed update contains more than one 6500-contract threshold of newly observed cumulative volume.
 
-Those are different event-clock semantics. That difference does not prove the older metric
-findings were wrong, but it is large enough that the old 650/1300/2600 headline rankings should
-not be treated as final evidence without a clean rebuild.
+That matters because the FlatTrade stream used by this project is **not an exchange trade tape**.
+Operationally it is usually only about 2-5 feed updates per second. One row can therefore summarize
+many underlying trades that occurred between two received updates. We know the cumulative traded
+volume changed, but we do not know the hidden sequence of trade prices/book states inside that
+jump.
 
-This track therefore labels the historical metric conclusions as **UNVERIFIED_OLD_RESULT** until
-they are rechecked from raw V2 ticks.
+The first carry-aware audit made the problem visible: on 2026-09-09 a large volume jump produced a
+sequence of apparent carry values at 14:35:42-14:35:44 (51350, 44850, 38350, 31850, ...). Those
+were not independently observed 6500-volume market events. They were one sampled jump being
+propagated across later bars.
 
-## Predeclared first pass
+The primary revalidation therefore uses the same whole-update/no-carry convention as the existing
+'VolumeBarBuilder'. The old metric conclusions remain **UNVERIFIED_OLD_RESULT** until they are
+rechecked from V2 feed updates under this audited clock.
 
-Fixed event threshold: **6500 Futures contracts**. This is a structural research choice, not a
-parameter sweep. Do not rerun neighboring bar sizes after seeing the result.
+## Locked primary bar convention
 
-Primary sessions only:
+Fixed threshold: **6500 newly observed Futures contracts minimum per completed bar**.
 
-- 2026-09-04
+For each received feed update:
+
+    delta = current cumulative Futures volume - previous cumulative Futures volume
+    current_bar_volume += delta
+
+    if current_bar_volume >= 6500:
+        assign the whole current feed update to this bar
+        close exactly one bar
+        next bar starts at volume = 0
+
+There is:
+
+- no fractional splitting of a feed update,
+- no duplicate price/depth observation,
+- no threshold-excess carry into the next bar,
+- no fabricated intermediate bar for hidden exchange trades we did not receive.
+
+A completed bar can therefore contain 6500, 7200, 10000, 30000 or more observed contracts. The
+correct description is **minimum-6500 observed-volume event bar**, not an exact-6500 trade bar.
+
+'OvershootVolume = ObservedVolume - 6500' is recorded for every completed bar so the approximation
+can be audited directly.
+
+The final incomplete bar is explicit and excluded from signal/outcome observations.
+
+## Predeclared primary sessions
+
+Primary sessions:
+
 - 2026-09-08
 - 2026-09-09
 - 2026-09-10
@@ -33,134 +65,168 @@ Primary sessions only:
 - 2026-09-18
 - 2026-09-21
 
-'2026-09-22/23' remain discovery-only and are not loaded. '2026-09-24' is consumed OOS and is not
-loaded. '2026-09-25' remains excluded from this first pass.
+'2026-09-04' is excluded **before metric inspection** because its first recorded NIFTY Futures
+update is 09:25:35 IST rather than the 09:15 market open.
 
-The first four metrics are:
+'2026-09-22/23' remain discovery-only. '2026-09-24' is consumed OOS. '2026-09-25' remains excluded
+from this historical revalidation.
+
+The first four metrics remain:
 
 1. 'TobDepthDivergence'
 2. 'DepthImbalance'
 3. 'OrderFlowImbalance'
 4. 'BarDurationUrgency'
 
-No composite score, no option trade simulation, no threshold search and no gating are part of this
-phase.
+No composite score, option P&L, threshold search, gate or parameter tuning belongs to this phase.
 
-## Raw-tick source
+## Raw source and terminology
 
 The harness reads the NIFTY Futures token directly from each
 'research-ticks-v2/<date>/instruments.json' and loads that token's '.ndjson' file through
 'OptionTickReaderV2'.
 
-The export schema supplies:
+The export contains:
 
 - deterministic 'ExchangeTimestamp, Id' ordering,
 - 'ReceivedAt',
-- LTP,
-- cumulative Futures volume,
+- latest observed LTP,
+- exchange cumulative Futures volume,
 - Futures OI,
-- full top-5 bid/ask price and quantity.
+- full top-5 bid/ask snapshot.
 
-Negative cumulative-volume deltas are fatal. Ordering violations are fatal. They are never clamped
-or silently repaired.
+Research output deliberately uses **FeedUpdateCount** rather than "trade count" or "tick count".
+The feed rows are broker-delivered snapshots/updates, not individual exchange trades.
 
-## 6500 event-bar construction
+Negative cumulative-volume deltas are fatal. Ordering violations are fatal. They are never clamped,
+re-sorted or silently repaired.
 
-Each raw tick belongs to exactly one bar.
+## Mandatory parity audit
 
-When a tick takes the threshold accumulator above 6500:
+Before any metric CSV is accepted, the same V2 updates are replayed through:
 
-    balance_before + current_tick_delta >= 6500
-        -> close the current bar on that whole tick
-        -> carry_out = balance_at_close - 6500
-        -> the next bar starts with carry_out in its threshold-accounting balance
+    A. the new audited WholeFeedUpdateNoCarryBuilder(6500)
+    B. the existing NiftySignal.Features.VolumeBarBuilder(6500)
 
-The closing tick itself is **not duplicated** into the next bar. Carry is accounting only; it does
-not fabricate a second price/depth observation.
+Every exposed common field must match:
 
-The bar output keeps both:
+- start/end exchange timestamp,
+- OHLC,
+- observed bar volume,
+- feed-update count,
+- latest OI,
+- CVD proxy,
+- depth imbalance,
+- order-flow imbalance,
+- top-of-book imbalance.
 
-- 'RealAssignedVolume': positive cumulative-volume deltas from real ticks actually assigned to the
-  bar;
-- 'ThresholdCarryIn/ThresholdBalanceAtClose/ThresholdCarryOut': the separate 6500 threshold
-  accounting.
+The command fails immediately on the first session with a mismatch. A valid run therefore requires
+'LegacyParityMismatchCount = 0' for every primary session.
 
-This makes the convention directly auditable.
+This does not make the feed complete. It proves that the old whole-update/no-carry bar convention
+is reproducible from the committed V2 raw feed updates rather than depending on an unexplained
+persisted dataset.
 
-The final incomplete bar is explicitly marked 'IsFinalPartialBar=true' and is excluded from
-forward-response observations.
+## Overshoot audit
 
-## Metric definitions
+For each session the audit reports:
 
-All metrics are calculated from the same raw ticks and the same 6500 bars.
+- median overshoot,
+- P90 / P95 / P99 overshoot (nearest-rank),
+- maximum overshoot,
+- maximum observed bar volume,
+- count of bars with volume >= 7500,
+- count >= 10000,
+- count >= 13000.
 
-'DepthImbalance':
+These fields quantify how closely the sampled-feed event clock approximates a nominal 6500-volume
+clock.
 
-    per tick = (sum BidQty L1..L5 - sum AskQty L1..L5)
-               / (sum BidQty L1..L5 + sum AskQty L1..L5)
+## Metric semantics
 
-    bar value = average of valid per-tick ratios
+All metrics use the same bar boundaries.
 
-'TopOfBookImbalance' is the same shape using only Bid1Qty/Ask1Qty.
+'DepthImbalance' is an **observed-snapshot-weighted** average:
 
-'TobDepthDivergence' is exported in the raw, untuned frame:
+    per received depth update =
+        (sum BidQty L1..L5 - sum AskQty L1..L5)
+        / (sum BidQty L1..L5 + sum AskQty L1..L5)
+
+    bar value = average of valid received-depth-update ratios
+
+It is not exchange-event-weighted and not trade-weighted.
+
+'TopOfBookImbalance' has the same shape using Bid1Qty/Ask1Qty only.
+
+'TobDepthDivergence':
 
     DepthImbalance - TopOfBookImbalance
 
-Its directional sign is **not assumed** in this revalidation.
+Its directional sign is not assumed.
 
-'OrderFlowImbalance' reuses the existing Cont/Kukanov/Stoikov top-of-book change formula. Previous
-quote state persists across bar boundaries; only the bar-local OFI sum resets.
+'OrderFlowImbalance' uses the existing Cont/Kukanov/Stoikov top-of-book change formula between
+**received book snapshots**. Book events that occurred between FlatTrade updates are unavailable.
+Previous observed quote state persists across bar boundaries; only the bar-local sum resets.
 
-'BarDurationUrgency' reproduces the historical formulation:
+'FutureCvdProxyNet' is explicitly a proxy. A cumulative-volume jump can contain many hidden
+transactions, but the current implementation classifies that entire observed volume delta from the
+received update's price/book state. It must never be described as exchange-trade CVD.
+
+'BarDurationUrgency':
 
     sign(Close - Open) / exchange-duration-seconds
 
-The report also keeps receipt duration separately; it does not silently substitute one for the
-other.
+The timing resolution is limited by the feed update cadence. Receipt duration is exported
+separately.
 
 ## Forward outcomes
 
-For a bar closing at T, response is measured only from later completed 6500 bars:
+'+1', '+2' and '+4' mean the close of one, two and four later **completed event bars**.
 
-- '+1': next 6500-contract bar close,
-- '+2': 13,000 contracts later,
-- '+4': 26,000 contracts later.
+They do **not** mean exactly 6500 / 13000 / 26000 contracts because each completed bar can overshoot.
+For that reason the CSV also exports:
 
-The CSV also records maximum favorable up/down Futures excursion over each horizon. These are
-diagnostics only and are never fed back into the signal.
+- 'Forward1ObservedVolume'
+- 'Forward2ObservedVolume'
+- 'Forward4ObservedVolume'
+
+so every observation states the actual sampled cumulative-volume horizon used.
+
+Maximum up/down Futures excursions over each horizon are diagnostics only and are never fed into a
+signal.
 
 ## Evaluation
 
-The first export deliberately stops before statistical selection. 'observations-6500.csv' contains
-the raw metric values plus +1/+2/+4 Futures outcomes needed for the next analysis pass:
+The export still stops before statistical selection. The next analysis pass will examine the raw
+metric values with:
 
 - pooled and per-session Spearman correlation,
 - raw-value quintile response,
 - DTE breakdown,
-- MFE/MAE-style up/down excursion diagnostics.
+- directional response,
+- MFE/MAE-style Futures excursion diagnostics,
+- sensitivity to actual forward observed-volume horizon.
 
-That analysis is performed after the bar-construction audit is accepted, not mixed into the
-builder implementation itself.
+No metric is promoted because one percentile, day, DTE or P&L happens to look attractive.
 
-A result will not be promoted because one percentile, session, DTE or trade P&L looks attractive.
-The first question is only: **does the raw metric carry repeatable forward Futures information?**
+The first question remains:
+
+> Does the raw metric carry repeatable forward Futures information under the audited sampled-feed
+> event clock?
 
 ## Running
-
-The implementation is isolated from live trading and the existing volume-bar database.
 
     dotnet run --project NiftySignal.VolumeBarRevalidation -- ^
       --root=research-ticks-v2 ^
       --out=research-6500-revalidation
 
-Running the command creates a new, regenerable research output directory containing:
+The output directory contains:
 
 - 'session-audit.csv'
 - 'bars-6500.csv'
 - 'observations-6500.csv'
 
-Do not commit those generated outputs by default. They are research artifacts, not source data.
+The directory is regenerable and is ignored by git. Do not commit these CSVs as source.
 
 ## Status labels
 
