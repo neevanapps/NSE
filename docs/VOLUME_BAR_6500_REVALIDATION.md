@@ -253,6 +253,10 @@ The output directory contains:
 - 'option-translation-summary.csv'
 - 'option-translation-sessions.csv'
 - 'option-translation-dte.csv'
+- 'magnitude-dose-response-summary.csv'
+- 'magnitude-dose-response-sessions.csv'
+- 'magnitude-dose-response-dte.csv'
+- 'magnitude-dose-response-monotonicity.csv'
 
 The directory is regenerable and is ignored by git. Do not commit these CSVs as source.
 
@@ -290,3 +294,11 @@ After the CVD mechanism controls, the fixed Futures-to-weekly-option diagnostic 
 receipt-time-causal contract selection, same-token pinning, bid/ask fills, fixed one-second latency,
 one-tick adverse slippage and the corrected fee model. Observations may overlap and are not summed
 as strategy P&L.
+
+## Magnitude dose-response follow-up
+
+After unconditional option translation, the next frozen diagnostic is documented in
+'docs/VOLUME_BAR_6500_MAGNITUDE_DOSE_RESPONSE.md'. It keeps 'CurrentBarReversal' and
+'FutureCvdProxyExhaustion' separate and uses fixed causal expanding-percentile quintiles to test
+whether stronger magnitude produces a monotonic improvement in Futures reversal and weekly-option
+response. It does not choose an entry threshold or create sequential strategy P&L.

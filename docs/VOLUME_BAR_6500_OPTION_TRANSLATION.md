@@ -272,3 +272,11 @@ It cannot establish a production strategy because:
 
 Only after the translation relationship is understood should a separate rule be frozen for
 forward validation.
+
+## Magnitude dose-response follow-up
+
+The unconditional translation result is followed by the frozen descriptive intensity test in
+'docs/VOLUME_BAR_6500_MAGNITUDE_DOSE_RESPONSE.md'. It uses only the already-recorded causal
+expanding absolute percentile for each candidate, fixes Q1..Q5 at 20% intervals, and tests whether
+Futures direction/magnitude and option economics improve monotonically with signal intensity.
+No quintile becomes an entry threshold in that run.
