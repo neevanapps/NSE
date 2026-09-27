@@ -104,7 +104,7 @@ public static class OptionTickReaderV2
     public sealed record VolumeIrregularityReport(int TotalTicks, int NegativeDeltaCount, List<int> SampleOffendingRowIndices);
 
     public sealed record ManifestRow(string Token, string Exchange, string TradingSymbol, string InstrumentType,
-        string OptionType, decimal StrikePrice, DateOnly? ExpiryDate, string Underlying, int LotSize, decimal TickSize);
+        string OptionType, decimal? StrikePrice, DateOnly? ExpiryDate, string Underlying, int LotSize, decimal TickSize);
 
     public static async Task<List<ManifestRow>> LoadManifestAsync(string dayDir) =>
         JsonSerializer.Deserialize<List<ManifestRow>>(await File.ReadAllTextAsync(Path.Combine(dayDir, "instruments.json")))!;
