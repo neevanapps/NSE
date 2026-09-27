@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
+using NiftySignal.Domain.Entities;
 using NiftySignal.Domain.Enums;
 using NiftySignal.Persistence;
 
@@ -18,6 +19,13 @@ namespace NiftySignal.VolumeBarData;
 /// database identity/insert-order surrogate key), same tie-break V1 already uses, and written to
 /// file in that exact order -- this is the ordering every V2 reader/calculation must assume and
 /// must not silently re-sort.
+///
+/// Also exports the day's spot (<see cref="InstrumentType.Index"/>) instrument when one exists,
+/// so the previously-blocked Spot/Futures Basis confirmation family (docs/VolumeCandle_0DTE_Findings.md's
+/// 2026-09-27 findings, item G) can be revisited -- that blocker was the V1 export never selecting
+/// Index rows, not the data being genuinely unavailable; <see cref="UnderlyingOptionRelationshipRecorder"/>
+/// already queries the exact same row for other, DB-connected research. Guarded the same way that
+/// call site guards it: never assumed present, never fabricated if absent for a given day.
 /// </summary>
 public static class TickExporterV2
 {
@@ -78,7 +86,16 @@ public static class TickExporterV2
             var options_ = nearestExpiry is null ? [] : chainAll.Where(i => i.ExpiryDate == nearestExpiry).ToList();
             var futures = await db.Instruments.Where(i => i.AsOfDate == date && i.Underlying == underlying
                 && i.InstrumentType == InstrumentType.Future).OrderBy(i => i.ExpiryDate).ToListAsync();
-            var instruments = options_.Concat(futures)
+
+            // Spot (Index) may or may not exist for this day -- never assumed, never fabricated
+            // if absent, same guard UnderlyingOptionRelationshipRecorder.cs already established
+            // for this exact lookup. Excludes InstrumentType.Vix deliberately (see its own doc
+            // comment): that's India VIX, not the underlying's own spot price.
+            var spot = await db.Instruments.Where(i => i.AsOfDate == date && i.Underlying == underlying
+                && i.InstrumentType == InstrumentType.Index).FirstOrDefaultAsync();
+            var spotList = spot is null ? [] : new List<Instrument> { spot };
+
+            var instruments = options_.Concat(futures).Concat(spotList)
                 .OrderBy(i => i.InstrumentType).ThenBy(i => i.StrikePrice).ThenBy(i => i.OptionType).ToList();
 
             var manifest = instruments.Select(i => new
@@ -134,6 +151,9 @@ public static class TickExporterV2
             // confirms, per session, whether depth beyond Level 1 is actually present in this
             // export rather than assuming the domain type's capability implies populated data.
             Console.WriteLine($"{date:yyyy-MM-dd}: {totalWithDepthBeyondL1:N0} of {totalTicks:N0} ticks carry non-zero depth beyond Level 1.");
+            Console.WriteLine(spot is null
+                ? $"{date:yyyy-MM-dd}: no {underlying} spot (InstrumentType.Index) instrument found for this day -- not fabricated, simply absent."
+                : $"{date:yyyy-MM-dd}: spot instrument found (token {spot.Token}, {spot.TradingSymbol}) and exported.");
             await File.WriteAllTextAsync(doneMarker, JsonSerializer.Serialize(new
             {
                 Date = date,
@@ -142,6 +162,8 @@ public static class TickExporterV2
                 InstrumentCount = instruments.Count,
                 TotalTicks = totalTicks,
                 TicksWithDepthBeyondLevel1 = totalWithDepthBeyondL1,
+                SpotFound = spot is not null,
+                SpotToken = spot?.Token,
                 ExportedAtUtc = DateTimeOffset.UtcNow,
                 SchemaVersion = "v2",
                 Schema = RowSchema,
