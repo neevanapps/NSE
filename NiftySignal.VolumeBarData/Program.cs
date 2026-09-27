@@ -536,8 +536,16 @@ if (args.Length > 0 && string.Equals(args[0], "option-futures-dislocation-export
     return await OptionFuturesDislocationExport.RunAsync(args);
 }
 
+// 2026-09-27 confirmation-variable experiment (Structure + OrderFlow families; Basis blocked --
+// see ConfirmationExperiment.cs's own doc comment for why). Never modifies Pattern A/B.
+//   dotnet run --project NiftySignal.VolumeBarData -- confirmation-experiment <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [--in=research-ticks] [--out=confirmation-raw.csv]
+if (args.Length > 0 && string.Equals(args[0], "confirmation-experiment", StringComparison.OrdinalIgnoreCase))
+{
+    return await ConfirmationExperiment.RunAsync(args);
+}
+
 Console.WriteLine($"Unknown command '{(args.Length > 0 ? args[0] : "(none)")}'. Known commands while " +
-    "RESEARCH_LEGACY_COMMANDS is undefined: reversal-research, export-ticks, research-from-files, gamma-filter, dump-cadences, band-pct-experiment, relative-strength-viz, relative-strength-viz-v2, option-futures-dislocation-export.");
+    "RESEARCH_LEGACY_COMMANDS is undefined: reversal-research, export-ticks, research-from-files, gamma-filter, dump-cadences, band-pct-experiment, relative-strength-viz, relative-strength-viz-v2, option-futures-dislocation-export, confirmation-experiment.");
 return 1;
 
 // TEMPORARILY DISABLED (2026-09-25, build-speed) -- see the matching #if above these three commands.
