@@ -563,8 +563,16 @@ if (args.Length > 0 && string.Equals(args[0], "confirmation-experiment", StringC
     return await ConfirmationExperiment.RunAsync(args);
 }
 
+// 2026-09-27 Options Order Flow research track -- pure data export (no modeling here; Python
+// downstream). Never modifies Pattern A/B. See OptionOrderFlowExport.cs.
+//   dotnet run --project NiftySignal.VolumeBarData -- option-order-flow-export <fromDate:yyyy-MM-dd> <toDate:yyyy-MM-dd> [--in=research-ticks-v2] [--out=option-order-flow-raw.csv]
+if (args.Length > 0 && string.Equals(args[0], "option-order-flow-export", StringComparison.OrdinalIgnoreCase))
+{
+    return await OptionOrderFlowExport.RunAsync(args);
+}
+
 Console.WriteLine($"Unknown command '{(args.Length > 0 ? args[0] : "(none)")}'. Known commands while " +
-    "RESEARCH_LEGACY_COMMANDS is undefined: reversal-research, export-ticks, export-ticks-v2, validate-ticks-v2, research-from-files, gamma-filter, dump-cadences, band-pct-experiment, relative-strength-viz, relative-strength-viz-v2, option-futures-dislocation-export, confirmation-experiment.");
+    "RESEARCH_LEGACY_COMMANDS is undefined: reversal-research, export-ticks, export-ticks-v2, validate-ticks-v2, research-from-files, gamma-filter, dump-cadences, band-pct-experiment, relative-strength-viz, relative-strength-viz-v2, option-futures-dislocation-export, confirmation-experiment, option-order-flow-export.");
 return 1;
 
 // TEMPORARILY DISABLED (2026-09-25, build-speed) -- see the matching #if above these three commands.
