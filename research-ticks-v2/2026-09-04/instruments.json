@@ -1,5 +1,17 @@
 [
   {
+    "Token": "26000",
+    "Exchange": "Nse",
+    "TradingSymbol": "Nifty 50",
+    "InstrumentType": "Index",
+    "OptionType": "None",
+    "StrikePrice": null,
+    "ExpiryDate": null,
+    "Underlying": "NIFTY",
+    "LotSize": 1,
+    "TickSize": 0.0500
+  },
+  {
     "Token": "68407",
     "Exchange": "Nfo",
     "TradingSymbol": "NIFTY29SEP26F",
