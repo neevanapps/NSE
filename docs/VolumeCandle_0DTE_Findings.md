@@ -7603,3 +7603,175 @@ classification and/or top-of-book depth on the option contracts themselves, as d
 already-tested futures-side order flow in F) provides an earlier and independent confirmation
 than either the option-price relative-strength signal or the futures Structure/OrderFlow results
 above. That is the subject of the next experiment.
+
+## Options Order Flow Findings (2026-09-27)
+
+Full research track per the user's own 29-section spec. Pure data export in C#
+(`OptionOrderFlowExport.cs`, command `option-order-flow-export`), statistical analysis in Python
+downstream -- no trading simulation, no Pattern A/B modification, no composite score, no threshold
+search. Dataset: the same 10 primary sessions used throughout this file, 1,703 valid 13K/180s
+observations (every bar `Patterns()` considers, "Other" state included, not just entries);
+2026-09-22/23 run separately afterward as discovery reference only (346 rows), never mixed into
+primary totals; 2026-09-24/25+ never touched.
+
+### Schema inspection (mandatory first step)
+
+Inspected the actual V2 tick export before writing any calculation: LTP, cumulative traded volume
+(from which incremental volume is derived exactly as `FutureFlowAccumulator` already does for
+futures), best bid/ask + quantities, full top-5 bid/ask price+quantity, timestamp, and
+token/strike/option-type via the manifest are all present. Printed and confirmed in the prior
+session (`_complete.json`'s `TicksWithDepthBeyondLevel1`): depth beyond Level 1 is genuinely
+populated in this feed (99.96% of ticks on the first inspected session), so both the trade-flow
+and the depth-imbalance halves of the spec were buildable -- neither was blocked.
+
+### Validation (Section 28)
+
+`OptionOrderFlowCalculations` (trade detection, aggressor classification, contract flow, depth
+imbalance, band median) is covered by 23 unit tests exercising every classification branch
+(buy/sell/unknown-inside-spread/missing-book/locked/crossed), quote-vs-trade detection, negative-
+delta handling, and pre-trade-book usage -- all passing. `validate-ticks-v2` cross-checked the
+underlying tick data itself (0 ordering violations beyond one same-second spot-token tie, 0
+aggressor-classification mismatches on independent recompute) on several sessions before this
+export was built. For the export's own new logic (window construction, ATM+/-2 band selection),
+an independent Python recompute of 12 band observations across 4 sessions (using the export's own
+recorded `FuturesClose`/`AtmStrike` audit columns, added specifically for this purpose) matched
+the exported `BandCETradeOFI`/`BandPETradeOFI` to floating-point precision in all 12 cases; one
+earlier apparent mismatch was traced to the *validation script* picking the wrong same-second
+future tick, not a defect in the export (the export correctly uses `FutureEventBar.Close`, the
+bar's own authoritative value from the already-frozen `FutureEventBarBuilder`). The full existing
+test suite (1,123 tests) passes unchanged. A methodology bug was also caught and fixed during
+analysis itself (see the Section 20 note below) rather than reported as a finding -- recorded here
+as part of the validation trail, since it changed a result from an apparent inversion to a
+near-null one.
+
+### Section 5 / Q1 -- classification coverage
+
+Pooled across all primary five-strike-available windows: **92.2% of volume classified (Buy+Sell),
+7.8% Unknown**. Median per-window classification coverage 0.876; per-session median-of-minimum
+coverage ranges 0.76-0.87. Not materially large Unknown -- no flag needed before interpreting the
+rest.
+
+### Sections 13/14 -- standalone (no Pattern A/B)
+
+`RelativeOptionTradeFlow` vs `BearishFuturePoints` (+1/+2/+4): pooled Spearman is weak in all
+cases (0.039 / 0.046 / 0.040). Session-level signs split roughly evenly (5 positive/5 negative at
++1 and +4, 4/6 at +2) -- **not session-robust**. Descriptive terciles (Section 14) show a small
+monotonic tendency in the hypothesized direction (Low-tercile downside hit-rate ~46-49% across
+horizons, High-tercile ~52-54%), but the effect is a few percentage points, consistent with the
+weak pooled correlation rather than a real edge. `RelativeOptionDepth` standalone is similarly
+weak and flips sign across horizons (session medians -0.020 / +0.006 / +0.045). **Neither
+standalone variable shows a real, session-robust independent directional edge.**
+
+### Sections 15/16 -- Pattern A/B conditional
+
+**Pattern A** (n=61 entries, 9 sessions): pooled Spearman(directional flow, downside outcome) is
+weakly positive and consistent in sign across horizons (0.116 / 0.097 / 0.138), but the median
+per-session correlation is inconsistent (-0.086 at +1, +0.381 at +2, +0.095 at +4) -- a modest
+tendency at best, not decisively established.
+
+**Pattern B** (n=52 entries, 7 sessions): pooled Spearman(directional flow, upside outcome) is
+**negative at every horizon** (-0.214 / -0.019 / -0.054), and every session-median is also
+negative (-0.143 / -0.205 / -0.300). This is the opposite of the hypothesized direction. Per the
+"do not assume symmetry" instruction: Pattern B's flow relationship is not just weaker than
+Pattern A's, it runs the other way, on the same 7-session evidence base explored here -- another
+confirmation of this file's running finding that Pattern B does not mirror Pattern A.
+
+Depth-based directional correlations (both patterns) are similarly weak/inconsistent and add no
+clearer signal than flow.
+
+### Section 17 -- good vs bad Patterns
+
+**Pattern A**: good entries show consistently *higher* median `RelativeOptionTradeFlow` than bad
+ones at every horizon (0.140 vs 0.082 at +1; 0.131 vs 0.097 at +2; 0.145 vs 0.096 at +4) -- a
+modest but consistent distinguishing signal, in the hypothesized direction, at Pattern time itself.
+**Pattern B**: no such distinction (good and bad medians are nearly identical or mildly reversed:
+0.126 vs 0.136 at +1; 0.131 vs 0.141 at +2; 0.120 vs 0.146 at +4). Depth shows no consistent
+distinguishing pattern for either side.
+
+### Sections 18/19 -- lead/lag
+
+**Pattern A**: median directional flow does *not* build smoothly into the pattern bar -- it dips
+at T-1 (-0.105) before jumping at T0 (0.128), with T-2 near zero (0.007). `FlowChange_2to0` is
+*larger* for Bad patterns (0.146) than Good ones (0.059) -- the opposite of "rapidly strengthening
+flow predicts a better outcome." **Pattern B** shows a smoother monotonic rise into T0 (T-2=0.017,
+T-1=0.052, T0=0.135), closer to a "building before" shape, but again `FlowChange` is larger for Bad
+(0.158) than Good (0.123) patterns. **No evidence that directional flow reliably strengthens
+before Pattern A/B in a way that distinguishes good from bad outcomes** -- if anything the
+opposite, on this data.
+
+### Section 20 -- price-vs-flow disagreement (methodology note)
+
+An initial pooled-over-everything version of this comparison produced an apparently inverted
+result (rows where price and flow "agreed" showed a *lower* downside hit-rate than rows where they
+"disagreed"). Investigating rather than reporting this at face value found the cause: this
+experiment's `DirectionalRelativeStrength` sign is flipped according to the option-price band's
+*own* internal A-like/B-like classification, not `ExistingAtmState` (the Futures-move-based
+Pattern A/B classification) -- comparing it directly against a flow variable normalized by
+`ExistingAtmState` mixes two different sign frames whenever those two classifications disagree.
+Restricting the comparison to genuine Pattern A/B FullSurface state entries (where the two
+classifications are known from Finding B above to usually agree) removed the inversion: of 108
+such entries, 98 (91%) show price and flow agreeing in direction, and outcomes are close to a
+coin-flip either way (46-56% hit-rate for "agree," 40-60% for the 10-row "disagree" group -- too
+small to read into). **Practical upshot for Q12: price-based relative strength and trade-flow
+pressure are largely redundant at Pattern A/B entry time (91% directional agreement), not two
+independent reads.**
+
+### Section 21 -- TradeFlow vs Depth
+
+Pooled Spearman(`RelativeOptionTradeFlow`, `RelativeOptionDepth`) = **-0.268** -- a moderate
+negative correlation (not strongly redundant, not clearly independent either). Depth's
+Pattern-conditional and standalone correlations were consistently weaker/less consistent than
+flow's throughout (Sections 13, 15/16, 17) -- depth did not add anything flow didn't already show
+more clearly anywhere in this experiment.
+
+### Section 22 -- DTE-aware
+
+Spearman(flow, +2 downside) by DTE: DTE0 -0.016, DTE1 +0.031, DTE4 -0.027, DTE5 +0.018, DTE6
++0.134 -- all weak, no clear dose-response with DTE, no DTE showing a strong relationship.
+
+### Section 23 -- activity-aware
+
+Spearman(flow, +2 downside) by activity tercile: Low 0.038, Medium 0.071, High 0.024 -- all weak,
+no activity-conditional pattern worth flagging as a gate candidate (none was built, per spec).
+
+### Section 8's own DTE-noise question (Q8)
+
+Unlike option **price** behavior (Finding C above: 0-DTE structurally noisier), 0-DTE **flow**
+classification coverage was actually *higher* than DTE4-6 (0.936 vs 0.847-0.864), and its
+directional correlation was not obviously more extreme or unstable than the other DTEs. **Flow's
+DTE-noise profile does not mirror price's** -- worth recording explicitly rather than assuming the
+same pattern carries over.
+
+### Discovery reference only (2026-09-22/23, never mixed into the above)
+
+Standalone Spearman(flow, +2 downside): 09-22 (DTE0) +0.063, 09-23 (DTE6) -0.114 -- both weak,
+mixed sign, consistent with the primary sessions' "not session-robust" standalone finding.
+Pattern-conditional (tiny samples, 9 A-entries and 11 B-entries across 2 sessions): A = -0.4
+(opposite of the already-weak primary tendency), B = +0.288 (opposite sign from primary's
+consistently negative -0.214/-0.019/-0.054). These two discovery sessions do not corroborate
+either pattern-conditional finding above; recorded as-is, not blended into the primary numbers,
+and not treated as overturning them (2 sessions, single-digit entry counts) -- but the discrepancy
+itself is worth keeping in mind before generalizing the primary Pattern A/B flow findings further.
+
+### Answers to the 29 final questions
+
+1. **~88-92% of volume reliably classified** (pooled 92.2% Buy+Sell, 7.8% Unknown); not materially large.
+2. **No** -- `RelativeOptionTradeFlow` does not show a real, session-robust independent directional edge standalone (weak pooled correlation, session signs split roughly evenly).
+3. **No** -- `RelativeOptionDepth` is similarly weak and flips sign across horizons standalone.
+4. **Weak/inconsistent** -- Pattern A shows a modest positive pooled tendency but inconsistent session-level correlation across horizons; not decisively established.
+5. **No -- opposite of hypothesized** -- Pattern B's flow relationship with future upside is negative at every horizon and every session-median, on this evidence base.
+6. **Mostly pooled-only / inconsistent** for the standalone question; Pattern B's negative relationship is at least sign-consistent across its 7 sessions, but on a small sample.
+7. **No clear dose-response across DTE** -- all DTE buckets show weak, inconsistent-sign correlations.
+8. **No** -- flow's DTE-noise profile does not mirror price's; 0-DTE flow classification coverage was actually *better*, not worse, than DTE4-6.
+9. **No** -- directional flow does not reliably strengthen at T-2/T-1 before Pattern A/B; for both patterns, the change into the pattern bar was *larger* for Bad outcomes than Good ones.
+10. **Partially, for Pattern A only** -- good Pattern A entries show consistently higher PE-relative flow than bad ones at pattern time (all 3 horizons); Pattern B shows no such distinction.
+11. **No** -- depth did not add information beyond trade flow anywhere in this experiment; its correlations were consistently weaker/less consistent.
+12. **Largely redundant, not independent** -- 91% directional agreement between price-based relative strength and trade-flow pressure at genuine Pattern A/B entries.
+13. **No** -- Options Order Flow, as defined here, does not clear this project's evaluation bar to become its own validated research signal. It joins Dislocation V1 (D) and futures OrderFlow sign confirmation (F) as **NOT ADOPTED** on the evidence gathered.
+14. **None of the four cleanly** -- the one real, consistent signal found (Pattern A's good-vs-bad flow distinction at pattern time) is a weak same-time distinguishing feature specific to Pattern A, not a standalone early warning (too weak/non-robust), not a confirmation independent of price (91% redundant with it), and not a lead indicator (no clean pre-pattern buildup was found; if anything the opposite).
+
+**Status: NOT ADOPTED.** Do not use Options Order Flow (trade-flow or depth, as defined here) as a
+trading signal, confirmation, or lead indicator. Do not combine it with Pattern A/B. The one
+narrow, consistent observation worth keeping in mind for later work is Pattern A's own
+good-vs-bad flow distinction at pattern time (Section 17) -- interesting, but on its own far short
+of the bar this project's other candidate metrics have had to clear before being trusted.
