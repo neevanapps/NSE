@@ -68,6 +68,12 @@ public static class VolumeBar6500Revalidation
         DateTimeOffset Timestamp,
         DateTimeOffset AvailableAt,
         decimal FuturesClose,
+        decimal SignalBarOpen,
+        decimal SignalBarHigh,
+        decimal SignalBarLow,
+        double SignalBarChangePoints,
+        double SignalBarReturn,
+        double SignalBarRangePoints,
         long ObservedVolume,
         long? OvershootVolume,
         int FeedUpdateCount,
@@ -226,6 +232,12 @@ public static class VolumeBar6500Revalidation
                 bar.EndTimestamp,
                 bar.AvailableAt,
                 bar.Close,
+                bar.Open,
+                bar.High,
+                bar.Low,
+                (double)(bar.Close - bar.Open),
+                bar.Open != 0 ? (double)((bar.Close / bar.Open) - 1m) : 0.0,
+                (double)(bar.High - bar.Low),
                 bar.ObservedVolume,
                 bar.OvershootVolume,
                 bar.FeedUpdateCount,
@@ -655,8 +667,9 @@ public static class VolumeBar6500RevalidationRunner
         await WriteAuditCsvAsync(Path.Combine(outputDirectory, "session-audit.csv"), audits);
         await WriteBarsCsvAsync(Path.Combine(outputDirectory, "bars-6500.csv"), allBars);
         await WriteObservationsCsvAsync(Path.Combine(outputDirectory, "observations-6500.csv"), allObservations);
+        await VolumeBar6500MetricAnalysis.WriteReportsAsync(allObservations, outputDirectory);
 
-        Console.WriteLine($"6500 raw-feed-update revalidation export complete -> {outputDirectory}");
+        Console.WriteLine($"6500 raw-feed-update revalidation + metric analysis complete -> {outputDirectory}");
         return 0;
     }
 
@@ -754,7 +767,8 @@ public static class VolumeBar6500RevalidationRunner
     {
         await using var writer = new StreamWriter(path, false, new UTF8Encoding(false));
         await writer.WriteLineAsync(
-            "TradingDate,Dte,BarIndex,Timestamp,AvailableAt,FuturesClose,ObservedVolume,OvershootVolume," +
+            "TradingDate,Dte,BarIndex,Timestamp,AvailableAt,FuturesClose,SignalBarOpen,SignalBarHigh,SignalBarLow," +
+            "SignalBarChangePoints,SignalBarReturn,SignalBarRangePoints,ObservedVolume,OvershootVolume," +
             "FeedUpdateCount,DepthUpdateCount,ExchangeDurationSeconds,ReceiptDurationSeconds,DepthImbalance," +
             "TopOfBookImbalance,TobDepthDivergence,OrderFlowImbalance,FutureCvdProxyNet,BarDurationUrgency," +
             "Forward1Points,Forward2Points,Forward4Points,Forward1ObservedVolume,Forward2ObservedVolume," +
@@ -769,6 +783,12 @@ public static class VolumeBar6500RevalidationRunner
                 r.Timestamp.ToString("O", CultureInfo.InvariantCulture),
                 r.AvailableAt.ToString("O", CultureInfo.InvariantCulture),
                 r.FuturesClose,
+                r.SignalBarOpen,
+                r.SignalBarHigh,
+                r.SignalBarLow,
+                r.SignalBarChangePoints,
+                r.SignalBarReturn,
+                r.SignalBarRangePoints,
                 r.ObservedVolume,
                 r.OvershootVolume,
                 r.FeedUpdateCount,

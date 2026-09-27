@@ -197,15 +197,14 @@ signal.
 
 ## Evaluation
 
-The export still stops before statistical selection. The next analysis pass will examine the raw
-metric values with:
+The predeclared first-pass metric analyzer is implemented separately in
+'VolumeBar6500MetricAnalysis.cs' and documented in
+'docs/VOLUME_BAR_6500_METRIC_ANALYSIS.md'.
 
-- pooled and per-session Spearman correlation,
-- raw-value quintile response,
-- DTE breakdown,
-- directional response,
-- MFE/MAE-style Futures excursion diagnostics,
-- sensitivity to actual forward observed-volume horizon.
+It examines the four locked raw metrics with pooled and session-level Spearman correlation,
+raw-value quintiles, DTE breakdown, leave-one-session-out concentration checks, current-bar price
+redundancy diagnostics, MFE/MAE-style Futures excursions and the predeclared
+'SignalBarVolumeLt13000' sampled-feed sensitivity.
 
 No metric is promoted because one percentile, day, DTE or P&L happens to look attractive.
 
@@ -225,6 +224,11 @@ The output directory contains:
 - 'session-audit.csv'
 - 'bars-6500.csv'
 - 'observations-6500.csv'
+- 'metric-summary.csv'
+- 'metric-sessions.csv'
+- 'metric-quintiles.csv'
+- 'metric-dte.csv'
+- 'metric-leave-one-session-out.csv'
 
 The directory is regenerable and is ignored by git. Do not commit these CSVs as source.
 
