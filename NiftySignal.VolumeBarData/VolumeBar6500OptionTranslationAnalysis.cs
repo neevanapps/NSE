@@ -510,7 +510,7 @@ public static class VolumeBar6500OptionTranslationAnalysis
                             signal.FuturesClose, driver.Value, driverRanks[i] ?? 0,
                             expectedDirection, optionType, SignalStatus.NoEligibleContract,
                             null, null, null, null, null, null, null,
-                            null, null, null, null, null, null, null, null));
+                            null, null, null, null, null, null, null));
                         continue;
                     }
 
