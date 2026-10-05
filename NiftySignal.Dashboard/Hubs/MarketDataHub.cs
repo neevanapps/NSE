@@ -13,7 +13,7 @@ namespace NiftySignal.Dashboard.Hubs;
 /// no longer have to round-trip through Postgres and a poll timer to reach the Live Quote
 /// panel.
 /// </summary>
-public sealed class MarketDataHub(LiveDataService liveData) : Hub
+public sealed class MarketDataHub(LiveDataService liveData, AdaptiveObserverDataService adaptiveObserver) : Hub
 {
     public void PushTick(Tick tick) => liveData.ApplyPushedTick(tick);
 
@@ -25,4 +25,11 @@ public sealed class MarketDataHub(LiveDataService liveData) : Hub
     /// load -- unlike ticks, there's no need to carry the row itself over the wire.
     /// </summary>
     public Task PushTradesChanged() => liveData.RefreshTradesAsync();
+
+    /// <summary>
+    /// Host calls this only after a completed adaptive-bar package commits. The payload is an
+    /// invalidation key, not market state; Blazor reads the authoritative adaptive DB immediately.
+    /// </summary>
+    public void PushAdaptiveStateChanged(long sessionId, int barSeq) =>
+        adaptiveObserver.NotifyStateChanged(sessionId, barSeq);
 }
