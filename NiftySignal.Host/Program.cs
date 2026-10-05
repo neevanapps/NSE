@@ -1,6 +1,8 @@
+using NiftySignal.AdaptiveObserverData;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Options;
+using NiftySignal.Domain;
 using NiftySignal.Domain.Abstractions;
 using NiftySignal.Domain.Configuration;
 using NiftySignal.Host;
@@ -28,6 +30,9 @@ Log.Logger = new LoggerConfiguration()
 try
 {
     Log.Information("Starting NiftySignal Host");
+    var buildIdentity = BuildIdentity.Current();
+    Log.Information("Build identity: {SourceBranch} @ {CommitSha}, build UTC {BuildUtc}",
+        buildIdentity.SourceBranch, buildIdentity.CommitSha, buildIdentity.BuildUtc);
 
     var builder = Host.CreateApplicationBuilder(args);
 
@@ -61,6 +66,17 @@ try
             Database = VolumeBarPopulator.VolumeBarDatabaseName,
         }.ConnectionString;
         options.UseNpgsql(volumeBarConnectionString);
+    });
+
+    builder.Services.AddDbContext<AdaptiveObserverDbContext>(options =>
+    {
+        var baseConnectionString = builder.Configuration.GetConnectionString("NiftySignalDb")
+            ?? throw new InvalidOperationException("ConnectionStrings:NiftySignalDb is not set.");
+        var adaptiveConnectionString = new NpgsqlConnectionStringBuilder(baseConnectionString)
+        {
+            Database = AdaptiveObserverDbContext.DatabaseName,
+        }.ConnectionString;
+        options.UseNpgsql(adaptiveConnectionString);
     });
 
     builder.Services.Configure<TelegramOptions>(builder.Configuration.GetSection(TelegramOptions.SectionName));
@@ -162,6 +178,15 @@ try
     // built and actually run.
     builder.Services.AddHostedService<LiveFuturesCrossoverEngine>();
 
+    // Adaptive Market Observer V1: watch-only, independent of the legacy score/trading workers.
+    // It reads authoritative persisted raw ticks, writes its own isolated database and never
+    // creates a paper or real order.
+    builder.Services.AddSingleton<AdaptiveSourceTickReader>();
+    builder.Services.AddSingleton<AdaptiveSessionCoordinator>();
+    builder.Services.AddSingleton<AdaptiveObserverPersistence>();
+    builder.Services.AddSingleton<AdaptiveStateRecoveryService>();
+    builder.Services.AddHostedService<AdaptiveObserverWorker>();
+
     var host = builder.Build();
 
     // Self-provisioning: a fresh machine gets its schema on first run.
@@ -174,6 +199,9 @@ try
         // database this Host process now writes to for the first time.
         var volumeBarDb = scope.ServiceProvider.GetRequiredService<VolumeBarDbContext>();
         volumeBarDb.Database.Migrate();
+
+        var adaptiveObserverDb = scope.ServiceProvider.GetRequiredService<AdaptiveObserverDbContext>();
+        adaptiveObserverDb.Database.Migrate();
 
         // Force eager construction (and therefore eager startup validation -- see
         // ValidatedOptionsMonitor's own doc comment) rather than waiting for the first cadence
