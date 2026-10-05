@@ -193,6 +193,8 @@ public sealed class AdaptiveObserverPersistence(ILogger<AdaptiveObserverPersiste
             StrictDominanceEvolution = flow.StrictDominanceEvolution,
             IsStrong = flow.IsStrong,
             WeakeningSequence = flow.WeakeningSequence,
+            StrongBaseBarSeq = flow.StrongBaseBarSeq,
+            Weak1BarSeq = flow.Weak1BarSeq,
             State = flow.State,
         };
     }
