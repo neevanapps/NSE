@@ -3,37 +3,18 @@
 @rendermode InteractiveServer
 @using NiftySignal.Dashboard.Components.Dashboard
 
-<PageTitle>NiftySignal Dashboard</PageTitle>
+<PageTitle>NiftySignal Adaptive Observer</PageTitle>
 
-@* Dashboard reorg (2026-09-21, docs/LIVE_PARITY_PLAN.md): the live-strategy pipeline
-   (OptionsScoreThreeWaySwitchMaxPainConfirmed, via LiveOptionsScorePanel) is now the PRIMARY
-   content on this page -- promoted to the top, above the older feed/connection panels. The old
-   CoreScore Hysteresis/Crossover strategies were retired from live trading the same day (see
-   MarketDataIngestionWorker's own cutover comment); ScorePanel now labels itself retired and
-   sits at the bottom of the grid rather than being removed outright, since its Core Score/
-   Strategy Positions readout is still useful as a "last known state" reference.
-
-   Futures-crossover live-wiring task (2026-09-21, same doc's "Futures crossover: wired live"
-   section): LiveFuturesCrossoverPanel added alongside (not replacing) LiveOptionsScorePanel --
-   both volume-bar-pipeline strategies are live and independently paper-trading (see
-   LivePaperTradeRow.Strategy's own doc comment), so both need to be visible at once, clearly
-   labeled which is which. Registered in Program.cs but NOT wired into deploy.ps1/the VM as part
-   of this task -- local-only until a separate, explicit deploy step. *@
 <div class="dashboard-shell">
+    @* Existing operational header/status row remains unchanged. *@
     <StatusBar />
 
-    <div style="display:grid; grid-template-columns: repeat(12, 1fr); gap:16px; padding: 20px 20px 0;">
-        <LiveOptionsScorePanel ShowFullPageLink="true" />
-        <LiveFuturesCrossoverPanel />
-    </div>
-
+    @* Existing access-token controls and Live Quote remain on the primary page unchanged.
+       The adaptive observer starts below them. *@
     <div class="dashboard-grid">
         <FlatTradeLoginPanel />
         <LiveQuotePanel />
-        <OiProfilePanel />
-        <PositionsPanel />
-        <OptionChainPanel />
-        <PerformancePanel />
-        <ScorePanel />
     </div>
+
+    <AdaptiveObserverPanel />
 </div>
