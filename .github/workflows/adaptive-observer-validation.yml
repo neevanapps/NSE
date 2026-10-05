@@ -22,10 +22,10 @@ jobs:
           dotnet-version: '10.0.x'
 
       - name: Restore
-        run: dotnet restore NiftySignal.Tests/NiftySignal.Tests.csproj
+        run: dotnet restore NiftySignal.slnx
 
       - name: Build
-        run: dotnet build NiftySignal.Tests/NiftySignal.Tests.csproj --configuration Release --no-restore
+        run: dotnet build NiftySignal.slnx --configuration Release --no-restore -p:SourceBranch=${{ github.ref_name }} -p:CommitSha=${{ github.sha }}
 
       - name: Test adaptive observer
         run: dotnet test NiftySignal.Tests/NiftySignal.Tests.csproj --configuration Release --no-build --filter FullyQualifiedName~AdaptiveObserver
@@ -44,4 +44,15 @@ jobs:
         with:
           name: adaptive-observer-generated-migration
           path: NiftySignal.AdaptiveObserverData/Migrations
+          if-no-files-found: ignore
+
+      - name: Full solution regression
+        run: dotnet test NiftySignal.Tests/NiftySignal.Tests.csproj --configuration Release --no-build --logger "trx;LogFileName=regression.trx"
+
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: adaptive-observer-test-evidence
+          path: NiftySignal.Tests/TestResults
           if-no-files-found: ignore

@@ -1,13 +1,20 @@
 using NiftySignal.AdaptiveObserver;
 using NiftySignal.Domain.Enums;
 using NiftySignal.Pricing;
+using NiftySignal.Host;
+using System.Text.Json;
 
 namespace NiftySignal.Tests.AdaptiveObserver;
 
 public sealed class AdaptiveRestartParityTests
 {
-    [Fact]
-    public void FullReplayAfterArtificialRestart_ReproducesCompletedOutputs()
+    [Theory]
+    [InlineData(1)]
+    [InlineData(15)]
+    [InlineData(200)]
+    [InlineData(500)]
+    [InlineData(900)]
+    public void FullReplayAfterArtificialRestart_ReproducesCompletedOutputs(int restartAfter)
     {
         var day = new DateOnly(2026, 9, 25);
         var expiry = new DateOnly(2026, 9, 29);
@@ -23,18 +30,34 @@ public sealed class AdaptiveRestartParityTests
         // deliberately discarded. Recovery creates a fresh engine and replays authoritative input
         // from session start before continuing -- exactly what AdaptiveStateRecoveryService does.
         var prefixEngine = NewEngine(session, expiry, options, anchor, 0.05d, signalStart);
-        foreach (var item in input.Take(input.Count / 2))
+        var persisted = new Dictionary<int, string>();
+        var prefix = input.Take(restartAfter).ToArray();
+        foreach (var item in prefix)
         {
-            prefixEngine.Process(item.Token, item.Tick);
+            foreach (var package in prefixEngine.Process(item.Token, item.Tick))
+                persisted.Add(package.FutureBar.BarSeq, JsonSerializer.Serialize(package));
         }
 
-        var recovered = Run(session, expiry, options, anchor, input, 0.05d, signalStart);
+        var resumedEngine = NewEngine(session, expiry, options, anchor, .05d, signalStart);
+        var recovered = new List<AdaptiveCompletedBarPackage>();
+        foreach (var item in prefix)
+        {
+            foreach (var package in resumedEngine.Process(item.Token, item.Tick))
+            {
+                Assert.Equal(persisted[package.FutureBar.BarSeq], JsonSerializer.Serialize(package));
+                recovered.Add(package);
+            }
+        }
+        Assert.Equal(prefixEngine.PartialBar, resumedEngine.PartialBar);
+        foreach (var item in input.Skip(prefix.Length))
+            recovered.AddRange(resumedEngine.Process(item.Token, item.Tick));
 
         Assert.Equal(uninterrupted.Count, recovered.Count);
         for (var i = 0; i < uninterrupted.Count; i++)
         {
-            AssertPackageEqual(uninterrupted[i], recovered[i]);
+            Assert.Equal(JsonSerializer.Serialize(uninterrupted[i]), JsonSerializer.Serialize(recovered[i]));
         }
+        Assert.Equal(uninterrupted.Count, recovered.Select(x => x.FutureBar.BarSeq).Distinct().Count());
     }
 
     static List<AdaptiveCompletedBarPackage> Run(
@@ -63,49 +86,6 @@ public sealed class AdaptiveRestartParityTests
         double rate,
         DateTimeOffset signalStart) =>
         new(session, expiry, rate, strongThreshold:null, signalStart, options, anchor);
-
-    static void AssertPackageEqual(AdaptiveCompletedBarPackage a, AdaptiveCompletedBarPackage b)
-    {
-        Assert.Equal(a.FutureBar.BarSeq, b.FutureBar.BarSeq);
-        Assert.Equal(a.FutureBar.StartAvailableAtUtc, b.FutureBar.StartAvailableAtUtc);
-        Assert.Equal(a.FutureBar.EndAvailableAtUtc, b.FutureBar.EndAvailableAtUtc);
-        Assert.Equal(a.FutureBar.Volume, b.FutureBar.Volume);
-        Assert.Equal(a.FutureBar.StrictDelta, b.FutureBar.StrictDelta);
-        Assert.Equal(a.FutureBar.EnrichedDelta, b.FutureBar.EnrichedDelta);
-        Assert.Equal(a.FutureBar.Close, b.FutureBar.Close, 10);
-
-        Assert.Equal(a.FlowState.State, b.FlowState.State);
-        Assert.Equal(a.FlowState.StrictDominanceEvolution, b.FlowState.StrictDominanceEvolution);
-        if (a.FlowState.Rolling is null || b.FlowState.Rolling is null)
-        {
-            Assert.Equal(a.FlowState.Rolling is null, b.FlowState.Rolling is null);
-        }
-        else
-        {
-            Assert.Equal(a.FlowState.Rolling.StrictDelta, b.FlowState.Rolling.StrictDelta);
-            Assert.Equal(a.FlowState.Rolling.StrictDeltaRatioTotal, b.FlowState.Rolling.StrictDeltaRatioTotal, 12);
-            Assert.Equal(a.FlowState.Rolling.PriceDisplacement, b.FlowState.Rolling.PriceDisplacement, 12);
-        }
-
-        Assert.Equal(a.OptionBand.Selection?.CenterStrike, b.OptionBand.Selection?.CenterStrike);
-        Assert.Equal(a.OptionBand.Call?.ContractStrictDelta, b.OptionBand.Call?.ContractStrictDelta);
-        Assert.Equal(a.OptionBand.Put?.ContractStrictDelta, b.OptionBand.Put?.ContractStrictDelta);
-        Assert.Equal(a.OptionBand.Call?.NotionalStrictDelta, b.OptionBand.Call?.NotionalStrictDelta, 8);
-        Assert.Equal(a.OptionBand.Put?.NotionalStrictDelta, b.OptionBand.Put?.NotionalStrictDelta, 8);
-
-        Assert.Equal(a.Residuals.Count, b.Residuals.Count);
-        for (var j = 0; j < a.Residuals.Count; j++)
-        {
-            Assert.Equal(a.Residuals[j].Variant, b.Residuals[j].Variant);
-            Assert.Equal(a.Residuals[j].IsAvailable, b.Residuals[j].IsAvailable);
-            if (a.Residuals[j].Reading is { } ar && b.Residuals[j].Reading is { } br)
-            {
-                Assert.Equal(ar.DirectionalResidualPct, br.DirectionalResidualPct, 10);
-                Assert.Equal(ar.CEResidual, br.CEResidual, 10);
-                Assert.Equal(ar.PEResidual, br.PEResidual, 10);
-            }
-        }
-    }
 
     static IReadOnlyList<ObserverOptionInstrument> BuildChain(DateOnly expiry)
     {

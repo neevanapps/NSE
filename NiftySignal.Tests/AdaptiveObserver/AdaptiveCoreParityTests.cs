@@ -138,6 +138,23 @@ public sealed class AdaptiveCoreParityTests
     }
 
     [Fact]
+    public void Weak2_Weak1PriceMayTurnWhileDeltaKeepsOriginalDirection()
+    {
+        // Pinned discovery checks Weak1 delta sign, but only checks price alignment at the
+        // strong base and trigger. A turn at Weak1 is diagnostic, not an extra entry gate.
+        var states = new List<AdaptiveFlowState>
+        {
+            MakeFlowState(10, .30, 1, 1, null),
+            MakeFlowState(11, .26, -1, 1, "Weakening"),
+            MakeFlowState(12, .22, 1, 1, "Weakening"),
+        };
+        AdaptiveWeak2Classifier.Apply(states, .20);
+        Assert.Equal(AdaptiveStateKind.Weak2, states[2].State);
+        Assert.Equal(10, states[2].StrongBaseBarSeq);
+        Assert.Equal(11, states[2].Weak1BarSeq);
+    }
+
+    [Fact]
     public void OpeningProjection_RoundsToFiftyLotBlock()
     {
         var selected = OpeningVolumeProjectionV1.SelectBaseBarVolume(303_940, 65);
@@ -145,7 +162,7 @@ public sealed class AdaptiveCoreParityTests
         Assert.Equal(0, selected % (65 * 50));
     }
 
-    static ExactAdaptiveBar MakeBar(int seq, double open, double close, long strictBuy, long strictSell, long strictUnknown) =>
+    internal static ExactAdaptiveBar MakeBar(int seq, double open, double close, long strictBuy, long strictSell, long strictUnknown) =>
         new()
         {
             TradeDate = new DateOnly(2026,9,25),
@@ -180,7 +197,7 @@ public sealed class AdaptiveCoreParityTests
             Microprice = close,
         };
 
-    static AdaptiveFlowState MakeFlowState(int seq, double ratio, int priceDirection, int deltaDirection, string? evolution)
+    internal static AdaptiveFlowState MakeFlowState(int seq, double ratio, int priceDirection, int deltaDirection, string? evolution)
     {
         var delta = (long)Math.Round(ratio * 1000);
         return new AdaptiveFlowState

@@ -75,10 +75,9 @@ public static class AdaptiveWeak2Classifier
                 || current.Rolling is not { } r
                 || weak1.StrictDominanceEvolution != "Weakening"
                 || current.StrictDominanceEvolution != "Weakening"
-                || !SameOriginalDirection(b, w1)
+                || w1.StrictDeltaDirection != b.StrictDeltaDirection
                 || !SameOriginalDirection(b, r)
-                || w1.StrictDeltaDirection != r.StrictDeltaDirection
-                || w1.PriceDirection != r.PriceDirection)
+                || w1.StrictDeltaDirection != r.StrictDeltaDirection)
             {
                 continue;
             }
