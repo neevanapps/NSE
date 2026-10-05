@@ -36,6 +36,8 @@ public static class AdaptiveWeak2Classifier
         {
             row.IsStrong = IsStrong(row, strongThreshold);
             row.WeakeningSequence = 0;
+            row.StrongBaseBarSeq = row.IsStrong ? row.Bar.BarSeq : null;
+            row.Weak1BarSeq = null;
             row.State = row.IsStrong ? AdaptiveStateKind.Strong : AdaptiveStateKind.Normal;
 
             var rolling = row.Rolling;
@@ -62,6 +64,7 @@ public static class AdaptiveWeak2Classifier
                     if (weak1 is null)
                     {
                         row.WeakeningSequence = 1;
+                        row.StrongBaseBarSeq = strongBase.Bar.BarSeq;
                         row.State = AdaptiveStateKind.Weak1;
                         weak1 = row;
                         continue;
@@ -72,6 +75,8 @@ public static class AdaptiveWeak2Classifier
                         && weak1Rolling.PriceDirection == rolling.PriceDirection)
                     {
                         row.WeakeningSequence = 2;
+                        row.StrongBaseBarSeq = strongBase.Bar.BarSeq;
+                        row.Weak1BarSeq = weak1.Bar.BarSeq;
                         row.State = AdaptiveStateKind.Weak2;
                         strongBase = null;
                         weak1 = null;
