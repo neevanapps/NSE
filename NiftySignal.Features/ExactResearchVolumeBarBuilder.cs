@@ -45,8 +45,6 @@ public sealed class ExactResearchVolumeBarBuilder
 
     Tick? _previous;
     long _maxCumVolume;
-    int _tickDirection;
-
     DateTimeOffset _intervalStart;
     long _previousOi;
     long _volume;
@@ -85,9 +83,6 @@ public sealed class ExactResearchVolumeBarBuilder
         }
 
         var previous = _previous;
-
-        if (tick.LastPrice > previous.LastPrice) _tickDirection = 1;
-        else if (tick.LastPrice < previous.LastPrice) _tickDirection = -1;
 
         long traded = 0;
         if (tick.Volume > _maxCumVolume)
