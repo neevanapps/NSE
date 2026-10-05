@@ -10,6 +10,7 @@ namespace NiftySignal.Host;
 /// </summary>
 public sealed class AdaptiveObserverWorker(
     IServiceScopeFactory scopeFactory,
+    AdaptiveHistoricalBootstrapService historicalBootstrap,
     AdaptiveSessionCoordinator coordinator,
     AdaptiveSourceTickReader tickReader,
     AdaptiveStateRecoveryService recovery,
@@ -93,6 +94,7 @@ public sealed class AdaptiveObserverWorker(
         var source = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
         var observer = scope.ServiceProvider.GetRequiredService<AdaptiveObserverDbContext>();
 
+        await historicalBootstrap.EnsurePriorSessionsAsync(source, observer, day, ct);
         var context = await coordinator.TryGetOrCreateAsync(source, observer, day, nowUtc, ct);
         if (context is null)
         {
