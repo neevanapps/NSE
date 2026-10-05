@@ -1,8 +1,9 @@
 # Adaptive V1 release validation — 2026-10-05
 
-Feature code checkpoint: `22592b07fb48f2c81a27e65bf407e7f78b44d9e3`.
+Latest feature code checkpoint: `b40851c48afddcc5b693d5ee75b15a24738e23dc`.
+Traceability/current-build gate: https://github.com/neevanapps/NSE/actions/runs/37354356288 . F72 current Dashboard SHA/branch assertion passed independently of session provenance; current Host identity is in startup logs. 48 adaptive / 1,123 tests, zero compiler warnings/errors, migrations/restart/selectors/publish all passed; latest feature latency P95 142.0 ms / max 144.8 ms.
 Feature gate: https://github.com/neevanapps/NSE/actions/runs/37335634158 .
-Final documentation checkpoint changes no passed production or test code. Exact master CI is mandatory before release handoff.
+Final documentation checkpoint changes no passed production or test code; exact master CI follows the final merge. Exact master CI is mandatory before release handoff.
 
 | Gate | Result |
 |---|---|
@@ -26,8 +27,8 @@ Historical price/OI/timing tolerances remain explicit; no sealed dates used. Com
 
 Reviewed feature scope against original master cf0decbe: 82 files before this report, isolated adaptive domain/schema/source/recovery/UI, focused tests and validation tools, build metadata, deployment guards and docs. Existing operational header/access-token/Live Quote components are retained unchanged on home. Legacy panels are preserved under /legacy. Existing migrations and source/tables are retained. Host starts only ingestion, legacy volume-bar persistence and adaptive observer; both legacy paper-executing workers are unhosted. No adaptive order or paper-execution path is introduced.
 
-Audit findings F63–F71 are repaired with historical/unit/relational/browser evidence in REVIEW_FINDINGS.md. Broader original Dashboard design inventory (chart, separate observation list and quality panels) is not part of the frozen three-grid delivery and is not claimed complete.
+Audit findings F63–F72 are repaired with historical/unit/relational/browser evidence in REVIEW_FINDINGS.md. Broader original Dashboard design inventory (chart, separate observation list and quality panels) is not part of the frozen three-grid delivery and is not claimed complete.
 
 ## Manual release boundary
 
-Merge SHA and its master workflow must be verified after merge; PR #2 records the final immutable SHA/run. User performs VM deployment via ADAPTIVE_VM_HANDOFF.md and existing deploy.ps1. VM DB permissions, required discovery/source history, services, broker login/live quotes, deployed SHA, controlled Windows-service restart, VM latency and prospective watch-only sessions remain **pending manual validation**. CI does not imply VM measurements or profitable prospective behavior.
+Merge SHA and its master workflow must be verified after merge; PR #3 records the final immutable SHA/run; PR #2 contains the initial baseline merge. User performs VM deployment via ADAPTIVE_VM_HANDOFF.md and existing deploy.ps1. VM DB permissions, required discovery/source history, services, broker login/live quotes, deployed SHA, controlled Windows-service restart, VM latency and prospective watch-only sessions remain **pending manual validation**. CI does not imply VM measurements or profitable prospective behavior.

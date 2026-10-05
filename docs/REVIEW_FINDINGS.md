@@ -3348,4 +3348,10 @@ The first browser selector gate found five requested rows still displaying ten. 
 
 **Validation checkpoint, 2026-10-05:** F67 completed-projection corruption rejection passed seven real PostgreSQL recovery boundaries; F68 hosted call-site review confirms only ingestion, volume-bar writer and adaptive observer are started, and full regression passed; F69 complete Release solution builds with zero warnings/errors; F70 missing-history unit regression and actual-source 13-session historical gate passed; F71 actual blocked PostgreSQL reader/selector race and 36 browser combinations passed. Public run 37332433765 at 64ece10: 48 adaptive / 1,123 total tests, P95 painted three-grid latency 158.8837 ms, max 181.7617 ms. Private frozen historical run 37330577623 at a43ca3c passed all 13 discovery sessions, source/bootstrap, independent band/rolling, residual/H5 and 87 historical engine resets. This is CI/historical validation; VM service/restart/broker checks remain manual. The final fixture strengthens distinguishable CE/PE, residual and unavailable-row values without changing production calculations.
 
-**Numbering note:** F72 is next-free going forward.
+## F72 — Dashboard shows immutable session provenance as though it were runtime build — FIXED
+
+The session source/build card describes the process that originally froze the daily configuration. After deployment or recovery it can retain an older SHA; no current Dashboard assembly identity was exposed. A separate always-visible full Dashboard branch/SHA/build UTC is now rendered from its own assembly, while existing cards are explicitly labeled session provenance. A real browser assertion requires the current Dashboard SHA/branch to match the checked-out CI build, independently of the synthetic session branch. Host current provenance remains in its startup log. This affects traceability only; no adaptive calculation or session is rewritten.
+
+Validation passed at b40851c48afddcc5b693d5ee75b15a24738e23dc, run 37354356288: real Chromium verified full current Dashboard SHA/branch independently of the session branch; zero compiler warnings/errors, 48 adaptive / 1,123 total tests, migrations/restart/selectors and both publish outputs pass. P95 142.0 ms / max 144.8 ms in isolated CI.
+
+**Numbering note:** F73 is next-free going forward.

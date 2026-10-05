@@ -20,6 +20,8 @@
 - Grid 2 is a new live-binding view: its independent oracle uses original research cleaner/classifier and separate causal selection/aggregation. It is not claimed to be an identical pre-existing research Dashboard.
 - CI commit-to-three-grids plus two animation frames: 20 samples, P95 **158.8837 ms**, maximum **181.7617 ms**. This measures isolated PostgreSQL/Chromium, **not VM latency** and not feed-arrival latency.
 - Final feature gate **PASS**: [37335634158](https://github.com/neevanapps/NSE/actions/runs/37335634158), SHA `22592b07fb48f2c81a27e65bf407e7f78b44d9e3`. Distinct CE/PE, contract/notional, ATM/band and unavailable-row assertions pass; both Host/Dashboard publish successfully. 48 adaptive / 1,123 total tests; seven PostgreSQL recovery boundaries; P95 189.0 ms / max 224.4 ms. Exact merged master verification is the remaining automated release gate.
+- Current-build traceability F72 **PASS** at `b40851c48afddcc5b693d5ee75b15a24738e23dc`, [37354356288](https://github.com/neevanapps/NSE/actions/runs/37354356288): current Dashboard full SHA/branch independently asserted; session provenance separately labeled; 48 adaptive / 1,123 full tests, migration/restart/browser and publish pass; P95 142.0 ms / max 144.8 ms. No calculation changes.
+- Final merge SHA and exact master CI result are recorded in [release PR #3](https://github.com/neevanapps/NSE/pull/3) after completion. The badge below is live workflow status, not a claim about VM deployment.
 - **VM deployment is manual by the user with the existing `deploy.ps1`.** VM service/DB permissions, source-history completeness, deployed SHA, prospective observation and VM latency are not validated by CI.
 - No adaptive or legacy paper executor is hosted. Legacy source/schema and `/legacy` remain for compatibility/rollback.
 
@@ -30,7 +32,7 @@ Status terminology: **VALIDATED** means the stated gate passed in the stated env
 | Workstream | Status | Evidence / remaining boundary |
 |---|---|---|
 | Branch isolation | VALIDATED | Fresh branch from master. |
-| Build/SHA traceability | VALIDATED in CI | Dashboard, Host and harness assembly metadata verified. VM SHA check pending manual deployment. |
+| Build/SHA traceability | VALIDATED in CI | F72 verifies current Dashboard full SHA/branch, separate from immutable session provenance; Host startup logs identify current build. VM SHA check remains manual. |
 | Exact futures / 09:30 estimator / Strong–Weak1–Weak2 | VALIDATED | All 13 frozen discovery sessions, source/bootstrap and thresholds. |
 | CE/PE ATM±2 contract/notional flow and rolling metrics | VALIDATED | Independent causal band oracle across all 13 sessions. |
 | Fixed 09:30 ATM and ATM±2 residuals | VALIDATED | Complete integrated historical replay, availability and numeric parity. |
@@ -39,10 +41,10 @@ Status terminology: **VALIDATED** means the stated gate passed in the stated env
 | Restart reconstruction | VALIDATED | 87 historical engine resets, seven actual PostgreSQL recovery boundaries, frozen-universe/after-hours unit tests, corruption rejection. This is deterministic process-state reconstruction, not a Windows-service crash experiment. |
 | Dashboard three synchronized grids, selectors, partial bar | VALIDATED in CI | 36 combinations, blocked-reader race, reader reload, unavailable rows, legacy route. Distinct-value and unavailable-row assertions passed at 22592b0. |
 | Header/access-token/Live Quote retention | IMPLEMENTED; source reviewed | Existing components retained. Real broker-authenticated quote behavior requires VM observation. |
-| Sub-second commit-to-visible Dashboard | VALIDATED in CI | P95 159 ms / max 182 ms; VM measurement pending. |
+| Sub-second commit-to-visible Dashboard | VALIDATED in CI | Latest feature P95 142 ms / max 145 ms; VM measurement pending. |
 | Legacy runtime paper-worker removal | VALIDATED | Hosted call-site review and full regression; other legacy source retained. |
-| Final diff review / publish gate | VALIDATED | Full 82-file scope reviewed; F63–F71 repaired; final publish run passed. No adaptive calculation change since historical-tested a43ca3c. |
-| Merge and exact master CI | PENDING | Only after final feature gates pass. |
+| Final diff review / publish gate | VALIDATED | Full 82-file scope reviewed; F63–F72 repaired; final publish run passed. No adaptive calculation change since historical-tested a43ca3c. |
+| Merge and exact master CI | [![Master validation](https://github.com/neevanapps/NSE/actions/workflows/adaptive-observer-validation.yml/badge.svg?branch=master)](https://github.com/neevanapps/NSE/actions/workflows/adaptive-observer-validation.yml?query=branch%3Amaster) | Baseline merged in PR #2; final release SHA and exact green run recorded in PR #3. Deploy only that verified SHA. |
 | VM deployment / live observation | PENDING — USER MANUAL | Follow ADAPTIVE_VM_HANDOFF.md after exact master CI passes. |
 | Paper trading / orders | OUT OF V1 | Deliberately excluded. |
 
@@ -50,8 +52,8 @@ Status terminology: **VALIDATED** means the stated gate passed in the stated env
 
 1. **DONE:** final distinguishable Dashboard fixture and Host/Dashboard publish gate.
 2. **DONE:** release diff review and final feature evidence recorded.
-3. Merge to `master` with the expected feature head SHA.
-4. Verify build, full regression, migrations, restart/browser checks and publish outputs at the exact merged SHA.
+3. Baseline merge **DONE** (PR #2). Final traceability merge and immutable release SHA recorded in [PR #3](https://github.com/neevanapps/NSE/pull/3).
+4. Final release gate: verify build, full regression, migrations, restart/browser checks and publish outputs at the exact final master SHA. The live badge and PR #3 carry completion evidence without changing release source merely to update a status.
 5. User deploys that SHA with `deploy.ps1 -Target Vm -Service Both -ExpectedCommitSha <sha>`.
 6. Verify VM services, logs, migration/bootstrap, build metadata and live grid behavior; measure VM latency and begin watch-only prospective observation.
 
