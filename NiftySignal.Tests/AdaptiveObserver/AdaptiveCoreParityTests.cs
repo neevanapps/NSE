@@ -115,6 +115,28 @@ public sealed class AdaptiveCoreParityTests
     }
 
     [Fact]
+    public void Weak2_OverlappingStrongBases_AreBothDetected()
+    {
+        var states = new List<AdaptiveFlowState>
+        {
+            MakeFlowState(10, 0.30, 1, 1, null),
+            MakeFlowState(11, 0.28, 1, 1, "Weakening"),
+            MakeFlowState(12, 0.26, 1, 1, "Weakening"),
+            MakeFlowState(13, 0.24, 1, 1, "Weakening"),
+        };
+
+        AdaptiveWeak2Classifier.Apply(states, 0.20);
+
+        Assert.Equal(AdaptiveStateKind.Weak2, states[2].State);
+        Assert.Equal(10, states[2].StrongBaseBarSeq);
+        Assert.Equal(11, states[2].Weak1BarSeq);
+
+        Assert.Equal(AdaptiveStateKind.Weak2, states[3].State);
+        Assert.Equal(11, states[3].StrongBaseBarSeq);
+        Assert.Equal(12, states[3].Weak1BarSeq);
+    }
+
+    [Fact]
     public void OpeningProjection_RoundsToFiftyLotBlock()
     {
         var selected = OpeningVolumeProjectionV1.SelectBaseBarVolume(303_940, 65);
