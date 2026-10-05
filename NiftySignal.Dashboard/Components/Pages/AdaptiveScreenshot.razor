@@ -1,5 +1,5 @@
 @page "/adaptive-screenshot/{JobId:long}"
-@attribute [Authorize]
+@attribute [Authorize(AuthenticationSchemes = "Cookies,AdaptiveCapture")]
 @using Microsoft.EntityFrameworkCore
 @using NiftySignal.AdaptiveObserverData
 @using NiftySignal.Dashboard.Components.Dashboard

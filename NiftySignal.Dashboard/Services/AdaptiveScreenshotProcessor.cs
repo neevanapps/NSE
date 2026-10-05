@@ -12,6 +12,9 @@ public sealed class AdaptiveScreenshotProcessor(IAdaptiveScreenshotRenderer rend
 {
     public async Task ProcessOneAsync(AdaptiveObserverDbContext db, DateTimeOffset now, CancellationToken ct)
     {
+        // Telegram retry_after is chat-wide; do not immediately upload a different queued job.
+        if (await db.ScreenshotJobs.AnyAsync(x => x.Status == AdaptiveScreenshotStatus.Pending && x.NextAttemptUtc > now
+            && x.LastError != null && x.LastError.StartsWith("Telegram rejected upload"), ct)) return;
         var job = await db.ScreenshotJobs.Where(x => x.Status == AdaptiveScreenshotStatus.Pending && x.NextAttemptUtc <= now)
             .OrderBy(x => x.Id).FirstOrDefaultAsync(ct);
         if (job is null) return;
@@ -41,7 +44,10 @@ public sealed class AdaptiveScreenshotProcessor(IAdaptiveScreenshotRenderer rend
         {
             job.Status = AdaptiveScreenshotStatus.Pending;
             job.NextAttemptUtc = now.AddSeconds(60);
-            job.LastError = $"Capture failed ({ex.GetType().Name}); safe retry queued.";
+            // Our validation errors contain no credentials; preserve their actionable reason.
+            var reason = ex is InvalidOperationException ? ex.Message : ex.GetType().Name;
+            job.LastError = $"Capture failed ({reason}); safe retry queued.";
+            if (job.LastError.Length > 512) job.LastError = job.LastError[..512];
             await db.SaveChangesAsync(CancellationToken.None);
             return;
         }

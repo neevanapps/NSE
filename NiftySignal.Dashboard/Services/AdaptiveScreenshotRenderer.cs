@@ -15,6 +15,7 @@ public interface IAdaptiveScreenshotRenderer
 public sealed class AdaptiveScreenshotRenderer(IOptions<AdaptiveScreenshotOptions> settings,
     IOptionsMonitor<CookieAuthenticationOptions> cookieOptions, IOptions<DashboardAuthOptions> auth) : IAdaptiveScreenshotRenderer
 {
+    public const string AuthenticationScheme = "AdaptiveCapture";
     public async Task CaptureAsync(AdaptiveScreenshotJobRow job, string path, CancellationToken ct)
     {
         var origin = settings.Value.LocalUri(); // Never send a privileged cookie to a configured external URL.
@@ -22,20 +23,23 @@ public sealed class AdaptiveScreenshotRenderer(IOptions<AdaptiveScreenshotOption
         using var playwright = await Playwright.CreateAsync();
         await using var browser = await playwright.Chromium.LaunchAsync(new() { Headless = true, Timeout = 30000 });
         await using var context = await browser.NewContextAsync(new() { ViewportSize = new() { Width = 1920, Height = 1080 } });
-        var scheme = CookieAuthenticationDefaults.AuthenticationScheme;
+        var scheme = AuthenticationScheme;
         var cookie = cookieOptions.Get(scheme);
         var now = DateTimeOffset.UtcNow;
         var ticket = new AuthenticationTicket(new ClaimsPrincipal(new ClaimsIdentity(
             [new Claim(ClaimTypes.Name, "adaptive-screenshot-reader")], scheme)),
             new AuthenticationProperties { IssuedUtc = now, ExpiresUtc = now.AddMinutes(2), AllowRefresh = false }, scheme);
         await context.AddCookiesAsync([new Cookie { Name = cookie.Cookie.Name!, Value = cookie.TicketDataFormat.Protect(ticket),
-            Url = origin.ToString(), HttpOnly = true, Secure = origin.Scheme == "https", SameSite = SameSiteAttribute.Lax }]);
+            Domain = origin.Host, Path = "/adaptive-screenshot", HttpOnly = true, Secure = origin.Scheme == "https", SameSite = SameSiteAttribute.Strict }]);
         await context.RouteAsync("**/*", route => Uri.TryCreate(route.Request.Url, UriKind.Absolute, out var requested)
             && requested.IsLoopback && requested.Scheme == origin.Scheme && requested.Authority == origin.Authority
             ? route.ContinueAsync() : route.AbortAsync());
         var page = await context.NewPageAsync();
         page.SetDefaultTimeout(30000);
         ct.ThrowIfCancellationRequested();
+        await page.GotoAsync(origin.ToString());
+        if (await page.Locator(".adaptive-observer").CountAsync() != 0)
+            throw new InvalidOperationException("Capture-only authentication unexpectedly grants normal Dashboard access.");
         await page.GotoAsync(new Uri(origin, $"adaptive-screenshot/{job.Id}").ToString());
         await page.Locator(".adaptive-observer[data-capture-ready='true']").WaitForAsync();
         await Microsoft.Playwright.Assertions.Expect(page.Locator(".adaptive-capture")).ToHaveAttributeAsync("data-job-id", job.Id.ToString());
@@ -47,10 +51,15 @@ public sealed class AdaptiveScreenshotRenderer(IOptions<AdaptiveScreenshotOption
                     await Microsoft.Playwright.Assertions.Expect(table.Locator("tbody tr td:first-child").First).ToHaveTextAsync(job.TargetBarSeq.ToString());
         }
         // Wide tables scroll in the human UI. Expand capture to expose every column, not just the viewport.
-        var width = await page.EvaluateAsync<int>("() => Math.ceil(Math.max(1920,...Array.from(document.querySelectorAll('table')).map(t=>t.scrollWidth+100)))");
-        if (width > 10000) throw new InvalidOperationException("Capture table exceeds safe image width.");
-        await page.SetViewportSizeAsync(width, 1080);
-        await page.EvaluateAsync("() => new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))");
+        for (var pass = 0; pass < 3; pass++)
+        {
+            var overflow = await page.EvaluateAsync<int>("() => Math.ceil(Math.max(0,...Array.from(document.querySelectorAll('.adaptive-table')).map(t=>t.scrollWidth-t.parentElement.clientWidth)))");
+            if (overflow <= 1) break;
+            var width = page.ViewportSize!.Width + overflow + 32;
+            if (width > 10000) throw new InvalidOperationException("Capture table exceeds safe image width.");
+            await page.SetViewportSizeAsync(width, 1080);
+            await page.EvaluateAsync("() => new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))");
+        }
         if (!await page.EvaluateAsync<bool>("() => Array.from(document.querySelectorAll('.adaptive-table')).every(t=>t.scrollWidth<=t.parentElement.clientWidth+1)"))
             throw new InvalidOperationException("Capture would hide grid columns; image not uploaded.");
         ct.ThrowIfCancellationRequested();

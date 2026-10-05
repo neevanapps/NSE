@@ -144,6 +144,23 @@ public sealed class AdaptiveScreenshotTests
     [InlineData("http://localhost:5210/path")]
     public void Capture_RejectsNonLocalOrigin(string url) => Assert.Throws<InvalidOperationException>(() => new AdaptiveScreenshotOptions { BaseUrl = url }.LocalUri());
 
+    [Fact]
+    public async Task Processor_TelegramRejection_PausesOtherQueuedUploads()
+    {
+        await using var db = Database();
+        db.Add(AdaptiveScreenshotSchedule.New(null, Day, 0, AdaptiveScreenshotKind.PreLiveTest, Cutoff, Cutoff));
+        db.Add(AdaptiveScreenshotSchedule.New(null, Day, 0, AdaptiveScreenshotKind.PreLiveTest, Cutoff, Cutoff)); await db.SaveChangesAsync();
+        var root = Path.Combine(Path.GetTempPath(), "adaptive-screenshot-test-" + Guid.NewGuid());
+        try {
+            var renderer = new Renderer(); var sender = new Sender(TelegramDocumentOutcome.Rejected);
+            var processor = new AdaptiveScreenshotProcessor(renderer, sender, Options.Create(new AdaptiveScreenshotOptions { OutputDirectory = root }));
+            await processor.ProcessOneAsync(db, Cutoff, default);
+            await processor.ProcessOneAsync(db, Cutoff.AddSeconds(1), default);
+            Assert.Equal(1, sender.Count);
+            Assert.Equal(1, renderer.Count);
+        } finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+    }
+
     sealed class Factory(DbContextOptions<AdaptiveObserverDbContext> options) : IDbContextFactory<AdaptiveObserverDbContext>
     {
         public AdaptiveObserverDbContext CreateDbContext() => new(options);
@@ -157,6 +174,7 @@ public sealed class AdaptiveScreenshotTests
     sealed class Sender(TelegramDocumentOutcome outcome) : ITelegramDocumentSender
     {
         public int Count; public TelegramDocumentOutcome Outcome = outcome;
-        public Task<TelegramDocumentResult> SendAsync(string file, string caption, CancellationToken ct) { Count++; return Task.FromResult(new TelegramDocumentResult(Outcome, Outcome == TelegramDocumentOutcome.Sent ? 123 : null)); }
+        public Task<TelegramDocumentResult> SendAsync(string file, string caption, CancellationToken ct) { Count++; return Task.FromResult(new TelegramDocumentResult(Outcome, Outcome == TelegramDocumentOutcome.Sent ? 123 : null,
+            Error: Outcome == TelegramDocumentOutcome.Rejected ? "Telegram rejected upload (HTTP 429)." : null)); }
     }
 }

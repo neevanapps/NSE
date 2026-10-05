@@ -44,7 +44,7 @@ public sealed class TelegramDocumentSender(HttpClient http, IOptions<TelegramOpt
             }
             return new(TelegramDocumentOutcome.Uncertain, Error: "Telegram upload response did not acknowledge delivery.");
         }
-        catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException or JsonException)
+        catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException or JsonException or InvalidOperationException)
         {
             // Do not log exception messages: HTTP exceptions may contain the bot token URL.
             return new(TelegramDocumentOutcome.Uncertain, Error: $"Upload outcome unknown ({ex.GetType().Name}); no automatic resend.");

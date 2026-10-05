@@ -115,6 +115,16 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
         options.SlidingExpiration = true;
         options.Cookie.HttpOnly = true;
         options.Cookie.SameSite = SameSiteMode.Lax;
+    })
+    .AddCookie(AdaptiveScreenshotRenderer.AuthenticationScheme, options =>
+    {
+        options.LoginPath = "/login";
+        options.Cookie.Name = ".NiftySignal.AdaptiveCapture";
+        options.Cookie.Path = "/adaptive-screenshot";
+        options.Cookie.HttpOnly = true;
+        options.Cookie.SameSite = SameSiteMode.Strict;
+        options.ExpireTimeSpan = TimeSpan.FromMinutes(2);
+        options.SlidingExpiration = false;
     });
 builder.Services.AddAuthorization();
 builder.Services.AddCascadingAuthenticationState();

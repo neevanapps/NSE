@@ -63,6 +63,7 @@ start.Environment["Telegram__ChatId"]="ci-no-real-chat";
 start.Environment["AdaptiveScreenshotValidationApiUrl"]="http://127.0.0.1:5091/";
 using var server=Process.Start(start) ?? throw new Exception("Dashboard did not start.");
 var output=server.StandardOutput.ReadToEndAsync(); var errors=server.StandardError.ReadToEndAsync();
+var previousDashboardLog="";
 try {
     using var http=new HttpClient();
     var ready=false;
@@ -172,8 +173,26 @@ try {
         await Task.Delay(500);
     }
     if(!screenshotJobs.Select(x=>x.TargetBarSeq).SequenceEqual(expectedTargets) || screenshotJobs.Any(x=>x.Status!=AdaptiveScreenshotStatus.Sent))
-        throw new Exception("Screenshot outbox did not deliver pinned initial/every-five-bar snapshots.");
+        throw new Exception("Screenshot outbox did not deliver pinned initial/every-five-bar snapshots: " +
+            JsonSerializer.Serialize(screenshotJobs.Select(x=>new { x.TargetBarSeq,x.Status,x.LastError,x.Attempts })));
     if(telegramStub.Uploads.Count!=7 || telegramStub.Uploads.Any(x=>x.Width<1920))throw new Exception("Screenshot upload count/PNG dimensions invalid.");
+    // Restart the real worker against the same PostgreSQL outbox; acknowledged images must not resend.
+    await push.StopAsync();
+    server.Kill(entireProcessTree:true);
+    await server.WaitForExitAsync();
+    previousDashboardLog=(await output)+(await errors);
+    if(!server.Start())throw new Exception("Dashboard restart failed.");
+    output=server.StandardOutput.ReadToEndAsync(); errors=server.StandardError.ReadToEndAsync();
+    ready=false;
+    for(var attempt=0;attempt<100;attempt++) {
+        try { if((await http.GetAsync(url+"/login")).IsSuccessStatusCode) { ready=true;break; } } catch(HttpRequestException) { }
+        if(server.HasExited)throw new Exception("Dashboard exited during restart.");
+        await Task.Delay(100);
+    }
+    if(!ready)throw new Exception("Dashboard restart timed out.");
+    await Task.Delay(3000);
+    if(telegramStub.Uploads.Count!=7 || await db.ScreenshotJobs.AsNoTracking().CountAsync(x=>x.SessionId==session.Id)!=7)
+        throw new Exception("Dashboard worker restart duplicated acknowledged screenshots.");
     await page.GotoAsync(url+"/adaptive-screenshots");
     await page.GetByRole(AriaRole.Button,new() { Name="Send pre-live test",Exact=true }).ClickAsync();
     for(var attempt=0;attempt<60;attempt++) {
@@ -183,7 +202,7 @@ try {
     if(telegramStub.Uploads.Count!=8)throw new Exception("Pre-live test did not deliver its labeled PNG.");
     await File.WriteAllTextAsync(Path.Combine(evidence,"telegram-screenshots.json"),JsonSerializer.Serialize(new { targets=expectedTargets,uploads=telegramStub.Uploads.Count,
         jobIds=screenshotJobs.Select(x=>x.Id),messageIds=screenshotJobs.Select(x=>x.TelegramMessageId),environment="loopback Telegram emulator, not real account" }));
-    Console.WriteLine("Telegram screenshot PASS: seven pinned initial/five-bar snapshots, full-width PNG multipart delivery, pre-live UI test; no real Telegram call.");
+    Console.WriteLine("Telegram screenshot PASS: seven pinned initial/five-bar snapshots, full-width PNG multipart delivery, real worker restart without resends, pre-live UI test; no real Telegram call.");
     await page.GotoAsync(url+"/legacy");
     await Expect(page.Locator(".dashboard-shell")).ToBeVisibleAsync();
 
@@ -203,7 +222,7 @@ try {
 } finally {
     if(!server.HasExited)server.Kill(entireProcessTree:true);
     await server.WaitForExitAsync();
-    await File.WriteAllTextAsync(Path.Combine(evidence,"dashboard.log"),(await output)+(await errors));
+    await File.WriteAllTextAsync(Path.Combine(evidence,"dashboard.log"),previousDashboardLog+(await output)+(await errors));
 }
 void AddRows(int seq) {
     var end=at.AddMinutes(seq-43);var begin=end.AddMinutes(-1);
