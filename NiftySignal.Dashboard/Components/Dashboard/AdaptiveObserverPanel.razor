@@ -460,7 +460,12 @@
     static string Fmt(double? x, int decimals = 2) => x.HasValue ? x.Value.ToString($"N{decimals}") : "—";
     static string Fmt0(double x) => x.ToString("N0");
     static string FmtInt(long x) => x.ToString("N0");
-    static string FmtSigned(double? x, int decimals = 0) => x.HasValue ? $"{x.Value:+0." + new string('0', decimals) + ";-0." + new string('0', decimals) + ";0}" : "—";
+    static string FmtSigned(double? x, int decimals = 0)
+    {
+        if (!x.HasValue) return "—";
+        var decimalPart = decimals > 0 ? "." + new string('0', decimals) : string.Empty;
+        return x.Value.ToString($"+0{decimalPart};-0{decimalPart};0{decimalPart}");
+    }
     static string FmtSigned(long? x) => x.HasValue ? x.Value.ToString("+0;-0;0") : "—";
     static string FmtSigned(long x) => x.ToString("+0;-0;0");
     static string FmtPct01(double? x) => x.HasValue ? $"{x.Value * 100:0.0}%" : "—";
