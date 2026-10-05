@@ -141,7 +141,7 @@ public sealed class AdaptiveObserverWorker(
         var source = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
         var observer = scope.ServiceProvider.GetRequiredService<AdaptiveObserverDbContext>();
 
-        var raw = await tickReader.ReadRawAfterIdAsync(source, live.Tokens, live.LastFetchedRawId, ct);
+        var raw = await tickReader.ReadRawAfterIdAsync(source, live.Tokens, live.LastFetchedRawId, ct, day: live.Context.Session.TradeDate);
         foreach (var item in raw)
         {
             live.LastFetchedRawId = Math.Max(live.LastFetchedRawId, item.Tick.Id);
@@ -165,17 +165,18 @@ public sealed class AdaptiveObserverWorker(
         var processed = 0;
         while (processed < live.Pending.Count && live.Pending[processed].Tick.AvailableAt <= stableCutoff)
         {
-            var item = live.Pending[processed];
-            var packages = live.Engine.Process(item.Token, item.Tick);
-            live.LastProcessedAvailableAt = item.Tick.AvailableAt;
-            live.LastProcessedTickId = item.Tick.Id;
+            var groupTime=live.Pending[processed].Tick.AvailableAt;
+            var groupEnd=processed+1;
+            while(groupEnd<live.Pending.Count && live.Pending[groupEnd].Tick.AvailableAt==groupTime)groupEnd++;
+            var group=live.Pending.GetRange(processed,groupEnd-processed).Select(x=>(x.Token,x.Tick)).ToArray();
+            var packages = live.Engine.ProcessAvailabilityGroup(group);
+            live.LastProcessedAvailableAt = groupTime;
+            live.LastProcessedTickId = group.Max(x=>x.Tick.Id);
 
             foreach (var package in packages)
             {
                 var saved = await persistence.PersistOrVerifyAsync(
                     observer, live.Context.Session, package, nowUtc, ct);
-                await observations.ProcessPackageAsync(source, observer, live.Context, package, ct);
-
                 if (saved.Inserted)
                 {
                     // Signal only after the DB transaction committed. Failure to notify must not
@@ -190,9 +191,10 @@ public sealed class AdaptiveObserverWorker(
                         logger.LogWarning(ex, "Adaptive state committed at BarSeq {BarSeq} but Dashboard notification failed.", package.FutureBar.BarSeq);
                     }
                 }
+                await observations.ProcessPackageAsync(source, observer, live.Context, package, ct);
             }
 
-            processed++;
+            processed=groupEnd;
         }
 
         if (processed > 0)

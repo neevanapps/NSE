@@ -1,7 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using NiftySignal.AdaptiveObserver;
 using NiftySignal.AdaptiveObserverData;
-using NiftySignal.Domain.Entities;
 using NiftySignal.Domain.Enums;
 using NiftySignal.Persistence;
 
@@ -130,7 +129,7 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
             OldTrendDirection = oldDirection,
             ReversalDirection = reversal,
             StrictNoTurnDiagnostic = strictNoTurn,
-            TriggerTimestampUtc = package.FutureBar.EndAvailableAtUtc,
+            TriggerTimestampUtc = AdaptiveResearchClock.DiagnosticTime(package.FutureBar.EndAvailableAtUtc),
             OptionSide = reversal > 0 ? OptionType.Call : OptionType.Put,
             AtmResidualDirectionalPct = residualAtm,
             BandResidualDirectionalPct = residualBand,
@@ -144,127 +143,98 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
         await db.SaveChangesAsync(ct);
     }
 
-    async Task TryFinalizeAsync(
-        NiftySignalDbContext source,
-        AdaptiveObserverDbContext observer,
-        AdaptiveObserverSessionContext context,
-        AdaptiveWeak2ObservationRow observation,
-        int currentBarSeq,
-        CancellationToken ct,
-        bool sessionClosing = false)
+    long _cachedSessionId;
+    DateOnly _cachedDay;
+    long _cachedRawId;
+    AdaptiveIncrementalTickNormalizer _cacheNormalizer = new();
+    readonly Dictionary<string,List<CleanObserverTick>> _cachedTicks = new(StringComparer.Ordinal);
+
+    async Task<IReadOnlyDictionary<string,List<CleanObserverTick>>> ReadCachedSourceAsync(
+        NiftySignalDbContext source,AdaptiveObserverSessionContext context,CancellationToken ct)
     {
-        var targetBar = await observer.FutureBars.AsNoTracking()
-            .SingleOrDefaultAsync(x => x.SessionId == context.Session.Id && x.BarSeq == observation.H5TargetBarSeq, ct);
-        if (targetBar is null)
+        if (_cachedSessionId!=context.Session.Id || _cachedDay!=context.Session.TradeDate)
         {
-            return;
+            _cachedSessionId=context.Session.Id;_cachedDay=context.Session.TradeDate;_cachedRawId=0;
+            _cacheNormalizer=new();_cachedTicks.Clear();
         }
-
-        var baseBar = await observer.FutureBars.AsNoTracking()
-            .SingleAsync(x => x.SessionId == context.Session.Id && x.BarSeq == observation.StrongBaseBarSeq, ct);
-
-        var sideInstruments = context.Options
-            .Where(x => x.OptionType == observation.OptionSide)
-            .OrderBy(x => x.Strike)
-            .ToArray();
-        if (sideInstruments.Length == 0)
+        var reader=new AdaptiveSourceTickReader();
+        var tokens=context.Options.Select(x=>x.Token).Distinct(StringComparer.Ordinal).ToArray();
+        var dirty=new HashSet<string>(StringComparer.Ordinal);
+        while(true)
         {
-            MarkUnavailable(observation, "No weekly option instruments available for reversal side.");
-            await observer.SaveChangesAsync(ct);
-            return;
+            var batch=await reader.ReadRawAfterIdAsync(source,tokens,_cachedRawId,ct,context.Session.TradeDate,batchSize:10000);
+            foreach(var item in batch)
+            {
+                _cachedRawId=Math.Max(_cachedRawId,item.Tick.Id);
+                if(_cacheNormalizer.Process(item.Token,item.Tick) is not { } clean)continue;
+                if(!_cachedTicks.TryGetValue(item.Token,out var series))_cachedTicks[item.Token]=series=[];
+                series.Add(clean);dirty.Add(item.Token);
+            }
+            if(batch.Count<10000)break;
         }
+        foreach(var token in dirty)_cachedTicks[token].Sort(static (a,b)=> {
+            var time=a.AvailableAt.CompareTo(b.AvailableAt);return time!=0?time:a.Id.CompareTo(b.Id); });
+        return _cachedTicks;
+    }
 
-        // Research chooses the first valid quote for EVERY candidate in the remaining session.
-        // A candidate with no quote yet can still beat today's current nearest-125 selection.
-        // Keep the observation pending until the candidate set is known, or session close.
-        var latestKnown = await LatestSourceAvailableAtAsync(source, sideInstruments.Select(x => x.Token).ToArray(), context.Session.OpeningWindowStartUtc, new DateTimeOffset(context.Session.TradeDate.AddDays(1).ToDateTime(TimeOnly.MinValue), TimeSpan.FromHours(5.5)).ToUniversalTime(), ct);
-        if (!latestKnown.HasValue || latestKnown.Value < targetBar.EndAvailableAtUtc)
+    async Task TryFinalizeAsync(NiftySignalDbContext source,AdaptiveObserverDbContext observer,
+        AdaptiveObserverSessionContext context,AdaptiveWeak2ObservationRow observation,int currentBarSeq,
+        CancellationToken ct,bool sessionClosing=false)
+    {
+        var target=await observer.FutureBars.AsNoTracking().SingleOrDefaultAsync(x=>x.SessionId==context.Session.Id && x.BarSeq==observation.H5TargetBarSeq,ct);
+        if(target is null)return;
+        var baseBar=await observer.FutureBars.AsNoTracking().SingleAsync(x=>x.SessionId==context.Session.Id && x.BarSeq==observation.StrongBaseBarSeq,ct);
+        var trigger=await observer.FutureBars.AsNoTracking().SingleAsync(x=>x.SessionId==context.Session.Id && x.BarSeq==observation.TriggerBarSeq,ct);
+        var ticks=await ReadCachedSourceAsync(source,context,ct);
+        FinalizeFromCleanTicks(context,observation,baseBar.EndAvailableAtUtc,target.EndAvailableAtUtc,target.Close-trigger.Close,ticks,sessionClosing);
+        await observer.SaveChangesAsync(ct);
+        if(observation.Status==AdaptiveObservationStatus.Completed)
+            logger.LogInformation("Adaptive Weak2 observation finalized: session={SessionId}, trigger={Trigger}, OI={OiGate}, H5PnL={Pnl:F2}",
+                observation.SessionId,observation.TriggerBarSeq,observation.OiGatePassed,observation.PnlPoints);
+    }
+
+    /// <summary>Pure watch-only execution/OI/H5 calculation used by live persistence and independent research parity.</summary>
+    public static void FinalizeFromCleanTicks(AdaptiveObserverSessionContext context,AdaptiveWeak2ObservationRow observation,
+        DateTimeOffset baseEndUtc,DateTimeOffset targetEndUtc,double futuresH5Move,
+        IReadOnlyDictionary<string,List<CleanObserverTick>> ticks,bool sessionClosing)
+    {
+        baseEndUtc=AdaptiveResearchClock.DiagnosticTime(baseEndUtc);
+        targetEndUtc=AdaptiveResearchClock.DiagnosticTime(targetEndUtc);
+        observation.TriggerTimestampUtc=AdaptiveResearchClock.DiagnosticTime(observation.TriggerTimestampUtc);
+        var sideInstruments=context.Options.Where(x=>x.OptionType==observation.OptionSide).OrderBy(x=>x.Strike).ToArray();
+        if(sideInstruments.Length==0) { MarkUnavailable(observation,"No weekly option instruments available for reversal side.");return; }
+        var latest=ticks.Values.Where(x=>x.Count>0).Select(x=>x[^1].AvailableAt).DefaultIfEmpty(DateTimeOffset.MinValue).Max();
+        if(latest<targetEndUtc)return;
+        var firstByToken=new Dictionary<string,QuotePoint>(StringComparer.Ordinal);
+        foreach(var instrument in sideInstruments)
         {
-            return;
+            if(!ticks.TryGetValue(instrument.Token,out var series))continue;
+            var lo=0;var hi=series.Count;
+            while(lo<hi) { var mid=(lo+hi)/2;if(series[mid].AvailableAt<observation.TriggerTimestampUtc)lo=mid+1;else hi=mid; }
+            for(var index=lo;index<series.Count;index++)
+            {
+                if(ToQuote(instrument.Token,series[index]) is not { } quote)continue;
+                firstByToken[instrument.Token]=quote.Point;break;
+            }
         }
-
-        var candidateTicks = Normalize(await LoadTicksAsync(
-            source,
-            sideInstruments.Select(x => x.Token).ToArray(),
-            context.Session.OpeningWindowStartUtc.AddMinutes(-1),
-            latestKnown.Value,
-            ct));
-
-        var firstByToken = candidateTicks
-            .Select(ToQuote)
-            .Where(x => x is not null
-                && x.Value.Point.AvailableAt >= observation.TriggerTimestampUtc)
-            .Select(x => x!.Value)
-            .GroupBy(x => x.Token, StringComparer.Ordinal)
-            .ToDictionary(
-                g => g.Key,
-                g => g.OrderBy(x => x.Point.AvailableAt).ThenBy(x => x.Point.Id).First().Point,
-                StringComparer.Ordinal);
-
-        if (!sessionClosing && firstByToken.Count < sideInstruments.Length) return;
-
-        var eligible = sideInstruments
-            .Where(i => firstByToken.TryGetValue(i.Token, out var q) && q.Ask >= PremiumMin && q.Ask <= PremiumMax)
-            .Select(i => new EntryCandidate(i, firstByToken[i.Token]))
-            .OrderBy(x => Math.Abs(x.Quote.Ask - PremiumTarget))
-            .ThenBy(x => x.Instrument.Strike)
-            .ToArray();
-
-        if (eligible.Length == 0)
-        {
-            MarkUnavailable(observation, "No reversal-side option had first post-trigger executable Ask in ₹100–₹150.");
-            await observer.SaveChangesAsync(ct);
-            return;
-        }
-
-        var selected = eligible[0];
-        var pairCall = context.Options.SingleOrDefault(x => x.Strike == selected.Instrument.Strike && x.OptionType == OptionType.Call);
-        var pairPut = context.Options.SingleOrDefault(x => x.Strike == selected.Instrument.Strike && x.OptionType == OptionType.Put);
-        if (pairCall is null || pairPut is null)
-        {
-            MarkUnavailable(observation, "Selected strike did not have a complete CE/PE pair.");
-            await observer.SaveChangesAsync(ct);
-            return;
-        }
-
-        var pairTokens = new[] { pairCall.Token, pairPut.Token };
-        var pairTicks = Normalize(await LoadTicksAsync(
-            source,
-            pairTokens,
-            context.Session.OpeningWindowStartUtc.AddMinutes(-1),
-            latestKnown.Value,
-            ct));
-
-        var callClean = pairTicks.Where(x => x.Token == pairCall.Token)
-            .Select(x => x.Tick).OrderBy(x => x.AvailableAt).ThenBy(x => x.Id).ToArray();
-        var putClean = pairTicks.Where(x => x.Token == pairPut.Token)
-            .Select(x => x.Tick).OrderBy(x => x.AvailableAt).ThenBy(x => x.Id).ToArray();
-
-        // OI parity: use every clean tick carrying OI, not only ticks with a valid two-sided quote.
-        var ceBase = OiAtOrBefore(callClean, baseBar.EndAvailableAtUtc);
-        var peBase = OiAtOrBefore(putClean, baseBar.EndAvailableAtUtc);
-        var ceTrigger = OiAtOrBefore(callClean, observation.TriggerTimestampUtc);
-        var peTrigger = OiAtOrBefore(putClean, observation.TriggerTimestampUtc);
-
-        var callQuotes = callClean.Select(x => ToQuote(pairCall.Token, x)).Where(x => x is not null).Select(x => x!.Value.Point).ToArray();
-        var putQuotes = putClean.Select(x => ToQuote(pairPut.Token, x)).Where(x => x is not null).Select(x => x!.Value.Point).ToArray();
-        var selectedQuotes = selected.Instrument.OptionType == OptionType.Call ? callQuotes : putQuotes;
-        var exit = selectedQuotes.FirstOrDefault(x => x.AvailableAt >= targetBar.EndAvailableAtUtc && x.Bid > 0d);
-        if (exit is null)
-        {
-            // H5 has occurred but its first executable bid has not reached persisted source data yet.
-            return;
-        }
-
-        var bidPath = selectedQuotes
-            .Where(x => x.AvailableAt >= selected.Quote.AvailableAt && x.AvailableAt <= exit.AvailableAt && x.Bid > 0d)
-            .Select(x => x.Bid)
-            .ToArray();
-        if (bidPath.Length == 0)
-        {
-            return;
-        }
-
+        // No unquoted candidate may silently change the eventual nearest-125 selection.
+        if(!sessionClosing && firstByToken.Count<sideInstruments.Length)return;
+        var selected=sideInstruments.Where(i=>firstByToken.TryGetValue(i.Token,out var q) && q.Ask>=PremiumMin && q.Ask<=PremiumMax)
+            .Select(i=>new EntryCandidate(i,firstByToken[i.Token])).OrderBy(x=>Math.Abs(x.Quote.Ask-PremiumTarget)).ThenBy(x=>x.Instrument.Strike).FirstOrDefault();
+        if(selected is null) { MarkUnavailable(observation,"No reversal-side option had first post-trigger executable Ask in ₹100–₹150.");return; }
+        var call=context.Options.SingleOrDefault(x=>x.Strike==selected.Instrument.Strike && x.OptionType==OptionType.Call);
+        var put=context.Options.SingleOrDefault(x=>x.Strike==selected.Instrument.Strike && x.OptionType==OptionType.Put);
+        if(call is null || put is null) { MarkUnavailable(observation,"Selected strike did not have a complete CE/PE pair.");return; }
+        var callClean=ticks.GetValueOrDefault(call.Token)??[];
+        var putClean=ticks.GetValueOrDefault(put.Token)??[];
+        var ceBase=OiAtOrBefore(callClean,baseEndUtc);var peBase=OiAtOrBefore(putClean,baseEndUtc);
+        var ceTrigger=OiAtOrBefore(callClean,observation.TriggerTimestampUtc);var peTrigger=OiAtOrBefore(putClean,observation.TriggerTimestampUtc);
+        var selectedClean=selected.Instrument.OptionType==OptionType.Call?callClean:putClean;
+        var selectedQuotes=selectedClean.Select(x=>ToQuote(selected.Instrument.Token,x)).Where(x=>x is not null).Select(x=>x!.Value.Point).ToArray();
+        var exit=selectedQuotes.FirstOrDefault(x=>x.AvailableAt>=targetEndUtc && x.Bid>0);
+        if(exit is null)return;
+        var bidPath=selectedQuotes.Where(x=>x.AvailableAt>=selected.Quote.AvailableAt && x.AvailableAt<=exit.AvailableAt && x.Bid>0).Select(x=>x.Bid).ToArray();
+        if(bidPath.Length==0)return;
         observation.ExpiryDate = selected.Instrument.ExpiryDate;
         observation.Strike = selected.Instrument.Strike;
         observation.Token = selected.Instrument.Token;
@@ -293,7 +263,7 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
         observation.ExitBid = exit.Bid;
         observation.ExitAsk = exit.Ask;
         observation.ExitTimestampUtc = exit.AvailableAt;
-        observation.ExitLatencySeconds = (exit.AvailableAt - targetBar.EndAvailableAtUtc).TotalSeconds;
+        observation.ExitLatencySeconds = (exit.AvailableAt - targetEndUtc).TotalSeconds;
         observation.HoldingSeconds = (exit.AvailableAt - selected.Quote.AvailableAt).TotalSeconds;
         observation.PnlPoints = exit.Bid - selected.Quote.Ask;
         observation.ReturnPct = selected.Quote.Ask != 0d
@@ -301,72 +271,15 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
             : null;
         observation.MfePointsExecutableBid = bidPath.Max() - selected.Quote.Ask;
         observation.MaePointsExecutableBid = bidPath.Min() - selected.Quote.Ask;
-        observation.FuturesH5Move = targetBar.Close - (await observer.FutureBars.AsNoTracking()
-            .SingleAsync(x => x.SessionId == context.Session.Id && x.BarSeq == observation.TriggerBarSeq, ct)).Close;
+        observation.FuturesH5Move = futuresH5Move;
         observation.Status = AdaptiveObservationStatus.Completed;
 
-        await observer.SaveChangesAsync(ct);
-        logger.LogInformation(
-            "Adaptive Weak2 observation finalized: session={SessionId}, trigger={Trigger}, {Side} {Strike}, OI={OiGate}, H5PnL={Pnl:F2}",
-            observation.SessionId, observation.TriggerBarSeq, observation.OptionSide, observation.Strike, observation.OiGatePassed, observation.PnlPoints);
     }
 
     static void MarkUnavailable(AdaptiveWeak2ObservationRow row, string reason)
     {
         row.Status = AdaptiveObservationStatus.Unavailable;
         row.UnavailableReason = reason;
-    }
-
-    static async Task<DateTimeOffset?> LatestSourceAvailableAtAsync(
-        NiftySignalDbContext db,
-        string[] tokens,
-        DateTimeOffset sessionStart,
-        DateTimeOffset sessionEnd,
-        CancellationToken ct)
-    {
-        return await db.Ticks.AsNoTracking()
-            .Where(x => tokens.Contains(x.Token) && x.ExchangeTimestamp >= sessionStart.AddMinutes(-1)
-                && x.ExchangeTimestamp < sessionEnd && x.ReceivedAt < sessionEnd)
-            .Select(x => (DateTimeOffset?)(x.ReceivedAt < x.ExchangeTimestamp ? x.ExchangeTimestamp : x.ReceivedAt))
-            .MaxAsync(ct);
-    }
-
-    static async Task<List<Tick>> LoadTicksAsync(
-        NiftySignalDbContext db,
-        string[] tokens,
-        DateTimeOffset from,
-        DateTimeOffset through,
-        CancellationToken ct)
-    {
-        var queryFrom = from.AddMinutes(-1);
-        var queryThrough = through.AddMinutes(1);
-        return await db.Ticks.AsNoTracking()
-            .Where(x => tokens.Contains(x.Token)
-                && x.ExchangeTimestamp >= queryFrom
-                && x.ExchangeTimestamp <= queryThrough)
-            .OrderBy(x => x.Id)
-            .ToListAsync(ct);
-    }
-
-    static IReadOnlyList<ObserverTokenTick> Normalize(IReadOnlyList<Tick> rows)
-    {
-        var normalizer = new AdaptiveIncrementalTickNormalizer();
-        var clean = new List<ObserverTokenTick>(rows.Count);
-        foreach (var row in rows.OrderBy(x => x.Id))
-        {
-            var tick = normalizer.Process(row.Token, AdaptiveSourceTickReader.ToRaw(row));
-            if (tick is { } value)
-            {
-                clean.Add(new ObserverTokenTick(row.Token, value));
-            }
-        }
-
-        clean.Sort(static (a, b) =>
-        {
-            var byTime = a.Tick.AvailableAt.CompareTo(b.Tick.AvailableAt);
-            return byTime != 0 ? byTime : a.Tick.Id.CompareTo(b.Tick.Id);
-        });
-        return clean;
     }
 
     static (string Token, QuotePoint Point)? ToQuote(ObserverTokenTick item) =>
@@ -389,10 +302,11 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
             tick.OpenInterest));
     }
 
-    static long? OiAtOrBefore(IReadOnlyList<CleanObserverTick> ticks, DateTimeOffset at) =>
-        ticks.Where(x => x.AvailableAt <= at && x.OpenInterest.HasValue)
-            .OrderByDescending(x => x.AvailableAt)
-            .ThenByDescending(x => x.Id)
-            .Select(x => x.OpenInterest)
-            .FirstOrDefault();
+    static long? OiAtOrBefore(IReadOnlyList<CleanObserverTick> ticks, DateTimeOffset at)
+    {
+        var lo=0;var hi=ticks.Count;
+        while(lo<hi) { var mid=(lo+hi)/2;if(ticks[mid].AvailableAt<=at)lo=mid+1;else hi=mid; }
+        for(var i=lo-1;i>=0;i--)if(ticks[i].OpenInterest is { } oi)return oi;
+        return null;
+    }
 }

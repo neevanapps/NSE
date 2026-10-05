@@ -77,11 +77,12 @@ public sealed class AdaptiveStateRecoveryService(
         var reconciled = 0;
         DateTimeOffset? lastAvailable = null;
         long? lastTickId = null;
-        foreach (var item in clean)
+        foreach (var group in clean.GroupBy(x=>x.Tick.AvailableAt))
         {
-            var packages = engine.Process(item.Token, item.Tick);
-            lastAvailable = item.Tick.AvailableAt;
-            lastTickId = item.Tick.Id;
+            var items=group.Select(x=>(x.Token,x.Tick)).ToArray();
+            var packages = engine.ProcessAvailabilityGroup(items);
+            lastAvailable = group.Key;
+            lastTickId = items.Max(x=>x.Tick.Id);
 
             foreach (var package in packages)
             {

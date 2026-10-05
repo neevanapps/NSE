@@ -255,6 +255,8 @@ public sealed class AdaptiveSessionCoordinator(
             ?? throw new InvalidOperationException($"Adaptive session {row.Id} has no weekly option expiry.");
 
         // Persisted session owns instrument identity, strike, expiry and lot size across source refreshes.
+        if (string.IsNullOrWhiteSpace(row.OptionUniverseJson))
+            throw new InvalidOperationException($"Adaptive session {row.Id} predates the frozen option universe; cannot safely infer its original descriptors.");
         var options = JsonSerializer.Deserialize<List<ObserverOptionInstrument>>(row.OptionUniverseJson)
             ?? throw new InvalidOperationException($"Adaptive session {row.Id} has an invalid frozen option universe.");
         if (options.Select(x => x.Token).Distinct(StringComparer.Ordinal).Count() != options.Count

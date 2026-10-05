@@ -6,8 +6,11 @@ position gate to the observer. Never touch the sealed set or change research sou
 """
 import csv
 import runpy
+import json
 
 reference = runpy.run_path("tools/adaptive_weak2_option_trade_simulation.py")
+with open("adaptive-threshold-reference.json", "w") as stream:
+    json.dump(reference["strong_threshold"], stream, sort_keys=True)
 simulate = reference["simulate_stream"]
 original = simulate.__globals__["candidates"]
 observations = []

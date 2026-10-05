@@ -14,12 +14,15 @@ public sealed class AdaptiveObserverEngine
     readonly double? _strongThreshold;
     readonly DateTimeOffset _signalStartUtc;
     readonly IReadOnlyList<ObserverOptionInstrument> _options;
+    readonly HashSet<string> _optionTokens;
     readonly OptionResidualAnchor? _residualAnchor;
 
     readonly AdaptiveTradeFlowEnricher _futureEnricher = new();
     readonly ExactAdaptiveFuturesBarBuilder _futureBars;
     readonly AdaptiveInstrumentFlowAccumulator _optionFlow = new();
     readonly Dictionary<string, OptionQuoteSnapshot> _latestOptionQuotes = new(StringComparer.Ordinal);
+    readonly Dictionary<string, OptionQuoteSnapshot> _quoteAtDiagnosticBoundary = new(StringComparer.Ordinal);
+    bool _processingAvailabilityGroup;
     readonly List<OptionBandSideMetrics?> _callBandHistory = [];
     readonly List<OptionBandSideMetrics?> _putBandHistory = [];
     readonly List<double> _bandDurations = [];
@@ -51,6 +54,7 @@ public sealed class AdaptiveObserverEngine
         _strongThreshold = strongThreshold;
         _signalStartUtc = signalStartUtc;
         _options = options;
+        _optionTokens=options.Select(x=>x.Token).ToHashSet(StringComparer.Ordinal);
         _residualAnchor = residualAnchor;
         _futureBars = new ExactAdaptiveFuturesBarBuilder(session);
     }
@@ -67,14 +71,42 @@ public sealed class AdaptiveObserverEngine
             return ProcessFuture(tick);
         }
 
-        if (_options.Any(x => string.Equals(x.Token, token, StringComparison.Ordinal)))
+        if (_optionTokens.Contains(token))
         {
             _optionFlow.Process(token, tick);
+            var boundary=AdaptiveResearchClock.DiagnosticTime(tick.AvailableAt);
+            if (_latestOptionQuotes.TryGetValue(token,out var previous) && previous.AvailableAt<=boundary)
+                _quoteAtDiagnosticBoundary[token]=previous;
             _latestOptionQuotes[token] = new OptionQuoteSnapshot(
                 token, tick.AvailableAt, tick.Last, tick.Bid, tick.Ask, tick.OpenInterest);
         }
 
         return Array.Empty<AdaptiveCompletedBarPackage>();
+    }
+
+    /// <summary>
+    /// A stable availability group is one causal boundary. Research as-of marks include every
+    /// option quote at that boundary, even when its source Id follows the closing future Id.
+    /// Per-instrument Id order is preserved; no quote with later availability is used.
+    /// </summary>
+    public IReadOnlyList<AdaptiveCompletedBarPackage> ProcessAvailabilityGroup(
+        IReadOnlyList<(string Token,CleanObserverTick Tick)> group)
+    {
+        if(group.Count==0)return Array.Empty<AdaptiveCompletedBarPackage>();
+        var availableAt=group[0].Tick.AvailableAt;
+        if(group.Any(x=>x.Tick.AvailableAt!=availableAt))throw new ArgumentException("Expected one stable availability boundary.",nameof(group));
+        if(_lastAvailableAt.HasValue && availableAt<=_lastAvailableAt.Value)
+            throw new InvalidOperationException("Availability group arrived after its stable boundary was processed; deterministic recovery required.");
+        _processingAvailabilityGroup=true;
+        try
+        {
+            foreach(var item in group.Where(x=>x.Token!=_session.FutureToken).OrderBy(x=>x.Tick.Id)) Process(item.Token,item.Tick);
+            var result=new List<AdaptiveCompletedBarPackage>();
+            foreach(var item in group.Where(x=>x.Token==_session.FutureToken).OrderBy(x=>x.Tick.Id))result.AddRange(Process(item.Token,item.Tick));
+            _lastId=group.Max(x=>x.Tick.Id);
+            return result;
+        }
+        finally { _processingAvailabilityGroup=false; }
     }
 
     IReadOnlyList<AdaptiveCompletedBarPackage> ProcessFuture(CleanObserverTick tick)
@@ -196,12 +228,16 @@ public sealed class AdaptiveObserverEngine
             };
         }
 
-        // PENDING (audit finding F63) — Python research uses millisecond CSV clocks; engine-level residual/observation clock parity is unvalidated. See docs/REVIEW_FINDINGS.md.
+        var diagnosticTime=AdaptiveResearchClock.DiagnosticTime(bar.EndAvailableAtUtc);
+        var diagnosticQuotes=_latestOptionQuotes.ToDictionary(x=>x.Key,x=>x.Value.AvailableAt<=diagnosticTime
+            ? x.Value : _quoteAtDiagnosticBoundary.GetValueOrDefault(x.Key),StringComparer.Ordinal)
+            .Where(x=>x.Value is not null && x.Value.AvailableAt<=diagnosticTime)
+            .ToDictionary(x=>x.Key,x=>x.Value!,StringComparer.Ordinal);
         var readings = OptionResidualModel.Evaluate(
             _residualAnchor,
-            bar.EndAvailableAtUtc,
+            diagnosticTime,
             bar.Close,
-            _latestOptionQuotes,
+            diagnosticQuotes,
             _riskFreeRate)
             .ToDictionary(x => x.Variant);
 
@@ -243,7 +279,7 @@ public sealed class AdaptiveObserverEngine
         if (_lastAvailableAt.HasValue)
         {
             var cmp = tick.AvailableAt.CompareTo(_lastAvailableAt.Value);
-            if (cmp < 0 || (cmp == 0 && tick.Id < _lastId))
+            if (cmp < 0 || (!_processingAvailabilityGroup && cmp == 0 && tick.Id < _lastId))
             {
                 throw new InvalidOperationException(
                     $"AdaptiveObserverEngine requires globally ordered input. Previous=({_lastAvailableAt:O},{_lastId}), current=({tick.AvailableAt:O},{tick.Id}).");

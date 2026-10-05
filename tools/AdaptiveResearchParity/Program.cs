@@ -11,6 +11,7 @@ if (args.Length != 1) throw new ArgumentException("Expected research checkout pa
 var root = Path.GetFullPath(args[0]);
 using var holdout = JsonDocument.Parse(File.ReadAllText(Path.Combine(root, "config/holdout.json")));
 var sealedFrom = DateOnly.Parse(holdout.RootElement.GetProperty("sealed_from").GetString()!);
+using var thresholdReference=JsonDocument.Parse(File.ReadAllText(Path.Combine(root,"adaptive-threshold-reference.json")));
 var history = new List<double>();
 var reports = new List<object>();
 var checkedFields = 0L;
@@ -80,6 +81,8 @@ foreach (var (day, spec) in OpeningVolumeProjectionV1.DiscoveryOutOfFold.OrderBy
         else Equal(rf[i].Rolling130k is null, af[i].Rolling is null, "rolling availability", day);
     }
     double? threshold = history.Count == 0 ? null : AdaptiveWeak2Classifier.Quantile(history, 2d / 3d);
+    var rq=thresholdReference.RootElement.GetProperty(day.ToString("yyyy-MM-dd"));
+    Equal(rq.ValueKind==JsonValueKind.Null ? (double?)null : rq.GetDouble(),threshold,"original Python daily strong threshold",day);
     if (threshold.HasValue) AdaptiveWeak2Classifier.Apply(af, threshold.Value);
     var referenceTriggers = new List<int>();
     for (var i = 2; i < rf.Count; i++)

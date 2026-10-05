@@ -36,17 +36,12 @@ public sealed class AdaptiveSourceTickReader
             : throughUtc;
         var tokenArray = tokens.Distinct(StringComparer.Ordinal).ToArray();
 
-        var rows = await db.Ticks
-            .AsNoTracking()
+        var query = db.Ticks.AsNoTracking()
             .Where(t => tokenArray.Contains(t.Token)
-                && t.ExchangeTimestamp >= queryStart
-                && t.ReceivedAt >= queryStart
-                && t.ExchangeTimestamp <= upper
-                && t.ReceivedAt <= upper)
-            .OrderBy(t => t.Id)
-            .ToListAsync(ct);
-
-        return rows.Select(x => (x.Token, ToRaw(x))).ToList();
+                && t.ExchangeTimestamp >= queryStart && t.ReceivedAt >= queryStart
+                && t.ExchangeTimestamp <= upper && t.ReceivedAt <= upper)
+            .OrderBy(t => t.Id);
+        return await ReadProjectionAsync(query,ct);
     }
 
     public async Task<IReadOnlyList<ObserverTokenTick>> ReadCleanSessionAsync(
@@ -82,7 +77,9 @@ public sealed class AdaptiveSourceTickReader
         NiftySignalDbContext db,
         IReadOnlyCollection<string> tokens,
         long afterId,
-        CancellationToken ct)
+        CancellationToken ct,
+        DateOnly? day = null,
+        int? batchSize = null)
     {
         if (tokens.Count == 0)
         {
@@ -90,13 +87,29 @@ public sealed class AdaptiveSourceTickReader
         }
 
         var tokenArray = tokens.Distinct(StringComparer.Ordinal).ToArray();
-        var rows = await db.Ticks
-            .AsNoTracking()
-            .Where(t => t.Id > afterId && tokenArray.Contains(t.Token))
-            .OrderBy(t => t.Id)
-            .ToListAsync(ct);
+        IQueryable<NiftySignal.Domain.Entities.Tick> query = db.Ticks.AsNoTracking()
+            .Where(t => t.Id > afterId && tokenArray.Contains(t.Token));
+        if (day is { } sessionDay)
+        {
+            var lower = new DateTimeOffset(sessionDay.ToDateTime(MarketOpen), IstOffset).ToUniversalTime().AddMinutes(-1);
+            var upper = new DateTimeOffset(sessionDay.AddDays(1).ToDateTime(TimeOnly.MinValue), IstOffset).ToUniversalTime();
+            query = query.Where(t => t.ExchangeTimestamp >= lower && t.ReceivedAt >= lower
+                && t.ExchangeTimestamp < upper && t.ReceivedAt < upper);
+        }
+        query = query.OrderBy(t => t.Id);
+        if (batchSize is { } size) query = query.Take(size);
+        return await ReadProjectionAsync(query,ct);
+    }
 
-        return rows.Select(x => (x.Token, ToRaw(x))).ToList();
+    // Select only authoritative scalar fields; avoid materializing millions of owned depth graphs.
+    static async Task<IReadOnlyList<(string Token,ObserverRawTick Tick)>> ReadProjectionAsync(
+        IQueryable<NiftySignal.Domain.Entities.Tick> query,CancellationToken ct)
+    {
+        var rows=await query.Select(t=>new { t.Token,t.Id,t.ExchangeTimestamp,t.ReceivedAt,t.LastPrice,t.Volume,t.OpenInterest,
+            Bid=t.Depth==null?0m:t.Depth.Bid1Price,Ask=t.Depth==null?0m:t.Depth.Ask1Price,
+            BidQty=t.Depth==null?0L:t.Depth.Bid1Qty,AskQty=t.Depth==null?0L:t.Depth.Ask1Qty }).ToListAsync(ct);
+        return rows.Select(t=>(t.Token,new ObserverRawTick(t.Id,t.ExchangeTimestamp,t.ReceivedAt,(double)t.LastPrice,
+            (double)t.Bid,(double)t.Ask,t.BidQty,t.AskQty,t.Volume,t.OpenInterest))).ToList();
     }
 
     public static ObserverRawTick ToRaw(NiftySignal.Domain.Entities.Tick tick)

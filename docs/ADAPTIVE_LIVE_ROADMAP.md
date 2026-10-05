@@ -15,15 +15,15 @@
 
 - Implementation branch: `feature/adaptive-market-observer-v1`
 - Branch base: fresh branch created directly from `master`
-- Last fully green implementation checkpoint: `fb205dfe4a9fa8547e7f7f0f41bd2918303d8c65`.
-- Validation workflow: [37318297210](https://github.com/neevanapps/NSE/actions/runs/37318297210).
-- **Build: PASS — zero warnings/errors; adaptive tests: 32/32; full regression: 1107/1107.**
-- Initial EF migration generated, applied to isolated PostgreSQL 17, and model-drift check passed. Generated initial schema reviewed: eight isolated tables, eight unique indexes, seven restrictive session foreign keys, frozen rate and required selection policy.
+- Last fully green implementation checkpoint: `9663879ebf868d0c48bcba5898d5bb253592225f`.
+- Validation workflow: [37320556273](https://github.com/neevanapps/NSE/actions/runs/37320556273).
+- **Build: PASS — zero warnings/errors; adaptive tests: 44/44; full regression: 1119/1119.**
+- Initial and frozen-universe EF migrations generated, applied to isolated PostgreSQL 17, and model-drift check passed. Generated initial schema reviewed: eight isolated tables, eight unique indexes, seven restrictive session foreign keys, frozen rate and required selection policy.
 - Independent futures-library historical gate: **PASS** at pinned implementation `a80de2b661dc8ea3dc50e7bfd1afcbe3ced99106`, research `e768b8e5b87938fb7be9531310f1c6f786853301`; private run `37315051168`; 13 discovery sessions, 2034 complete bars, 3,905,205 field checks. No sealed dates used.
 - This futures result is limited to cleaning/classification, exact bars, rolling/evolution and Weak2 identities; it does **not** prove production bootstrap inputs, option bands, integrated residuals, selection/OI/H5 or full Host restart parity.
 - Historical residual gate exposed the legacy numerical mismatch; isolated adaptive research pricing now uses double-precision Gaussian integration and frozen 80-step IV bisection. Identical-clock formula and independent overlapping watch-observation comparisons are in progress in private CI.
-- Subsequent additions (independent ATM availability, locked diagnostic quotes, OI/H5 restart fixtures, synchronized dashboard read fixtures and committed initial migration, frozen universe and after-hours recovery) require a fresh green run and a reviewed follow-up migration.
-- Release blockers discovered by review: **F63** diagnostic clock precision/integrated parity; **F64/F65** frozen option universe and after-hours recovery fixes now implemented with tests awaiting validation. See `docs/REVIEW_FINDINGS.md` and code-site markers.
+- Subsequent additions (independent ATM availability, locked diagnostic quotes, OI/H5 restart fixtures, synchronized dashboard read fixtures and committed initial migration, frozen universe and after-hours recovery) passed the checkpoint above. Subsequent diagnostic clock, availability-group, narrow source projection/cache and pure execution parity changes need a fresh green run.
+- Release blockers discovered by review: **F63** diagnostic clock precision/integrated parity; **F64/F65** frozen option universe and after-hours recovery fixes validated. F63 clock fix is implemented and awaiting full integration replay. See `docs/REVIEW_FINDINGS.md` and code-site markers.
 - No browser/VM synchronization or commit-to-visible latency measurement has passed.
 - Merge to `master`: **blocked until every remaining gate passes**.
 - VM deployment and prospective observation: **not performed**.
@@ -43,7 +43,7 @@ Status terminology used below:
 | Build/source traceability | **IMPLEMENTED / UNVALIDATED** | Branch/SHA/build-UTC metadata added to build/deploy/runtime/session path. Full solution build passed at the checkpoint above; exact running-build verification remains pending. |
 | Exact futures adaptive calculation library | **IMPLEMENTED / UNVALIDATED** | Tick cleaning, aggressor classification, exact split bars, rolling state, evolution, adaptive opening-volume estimator and Weak2 logic are ported with focused unit tests. Full historical parity gate is still pending. |
 | Adaptive option-band calculations | **IMPLEMENTED / UNVALIDATED** | Futures-clock ATM±2 selection, CE/PE independent persistence model, contract/notional flow, rolling option metrics and strength-change fields exist. Historical parity gate is still pending. |
-| 09:30 option residual calculations | **IMPLEMENTED / UNVALIDATED** | Both fixed ATM and fixed ATM±2 variants are implemented using the research constant-IV repricing method. Focused deterministic tests exist; constant-IV/richness fixtures passed; identical-clock formula parity is being tested, and F63 prevents integrated parity claims. |
+| 09:30 option residual calculations | **IMPLEMENTED / UNVALIDATED** | Both fixed ATM and fixed ATM±2 variants are implemented using the research constant-IV repricing method. Focused deterministic tests exist; constant-IV/richness fixtures passed; complete engine clock/quote integration is now being compared with the frozen Python rows; F63 remains an unpassed historical gate. |
 | New adaptive persistence schema | **IMPLEMENTED / UNVALIDATED** | Isolated `niftysignal_adaptive_observer` EF model/entities/indexes exist. Initial migration generated/applied in isolated PostgreSQL; reviewed schema is being committed and revalidated. |
 | Immutable 09:30 session coordinator | **IMPLEMENTED / UNVALIDATED** | Waits for persisted data to advance through 09:30, freezes daily threshold/anchors/model identity and reuses the persisted row on restart. |
 | Historical strong-threshold bootstrap | **IMPLEMENTED / UNVALIDATED** | Replays prior production sessions. Discovery dates carry frozen OOF adaptive thresholds so the bootstrap does not retrospectively substitute the final live estimator. Direct futures-library parity passed; production source/bootstrap parity remains pending. |

@@ -37,6 +37,25 @@ static class ResidualParity
             return result;
         }
         var at0 = new DateTimeOffset(day.ToDateTime(new TimeOnly(9,30)),TimeSpan.FromHours(5.5)).ToUniversalTime();
+        var future = instruments.EnumerateArray().Single(x=>x.GetProperty("InstrumentType").GetString()=="Future");
+        var futureToken=future.GetProperty("Token").GetString()!;
+        var futureTicks=AdaptiveTickCleaner.Clean(NdjsonTickReader.Read(Path.Combine(folder,futureToken+".ndjson"))
+            .Select(q=>new ObserverRawTick(q.Id,q.ExchangeTimestamp,q.ReceivedAt,q.Last,q.Bid,q.Ask,q.BidQty,q.AskQty,q.Volume,q.OpenInterest))).Ticks;
+        var anchorFuture=futureTicks.LastOrDefault(x=>x.AvailableAt<=at0);
+        var sessionAnchor=anchorFuture.Id!=0 && (at0-anchorFuture.AvailableAt).TotalSeconds<=5
+            ? OptionResidualModel.BuildAnchor(at0,expiry,anchorFuture.Last,chain,At(at0),rate) : null;
+        var engine=new AdaptiveObserverEngine(new(day,futureToken,future.GetProperty("TradingSymbol").GetString()!,
+            DateOnly.Parse(future.GetProperty("ExpiryDate").GetString()!),future.GetProperty("LotSize").GetInt32(),
+            OpeningVolumeProjectionV1.DiscoveryOutOfFold[day].AdaptiveBarVolume),expiry,rate,null,at0,chain,sessionAnchor);
+        var input=series.SelectMany(x=>x.Value.Select(t=>(Token:x.Key,Tick:t)))
+            .Concat(futureTicks.Select(t=>(Token:futureToken,Tick:t))).OrderBy(x=>x.Tick.AvailableAt).ThenBy(x=>x.Tick.Id).ToList();
+        var integrated=new Dictionary<int,AdaptiveCompletedBarPackage>();
+        for(var offset=0;offset<input.Count;)
+        {
+            var end=offset+1;while(end<input.Count && input[end].Tick.AvailableAt==input[offset].Tick.AvailableAt)end++;
+            foreach(var package in engine.ProcessAvailabilityGroup(input.GetRange(offset,end-offset)))integrated.Add(package.FutureBar.BarSeq,package);
+            offset=end;
+        }
         long checks=0; var maximumError=0d;
         foreach (var variant in new[] { ResidualVariant.Atm, ResidualVariant.AtmPlusMinus2 })
         {
@@ -44,9 +63,13 @@ static class ResidualParity
             var path = Path.Combine(root,$"data/experiments/futures_market_state/{stem}/adaptive_{stem}_detail.csv");
             if (!File.Exists(path)) throw new FileNotFoundException("Generate pinned Python residual evidence first",path);
             var rows=ReadCsv(path).Where(x=>x["TradeDate"]==day.ToString("yyyy-MM-dd")).ToArray();
-            if(rows.Length==0) { Console.WriteLine($"RESIDUAL {day} {variant}: reference unavailable"); continue; }
-            var anchor=OptionResidualModel.BuildAnchor(at0,expiry,N(rows[0],"Future0930"),chain,At(at0),rate)
-                ?? throw new InvalidOperationException($"RESIDUAL {day} {variant}: missing live anchor for {rows.Length} reference rows");
+            if(rows.Length==0) {
+                if(integrated.Values.Any(x=>x.Residuals.Any(r=>r.Variant==variant && r.Reading is not null)))throw new InvalidOperationException("Live diagnostic available on reference-unavailable day");
+                Console.WriteLine($"RESIDUAL {day} {variant}: reference unavailable"); continue; }
+            if(sessionAnchor is null)throw new InvalidOperationException($"RESIDUAL {day} {variant}: missing live anchor for {rows.Length} reference rows");
+            var actualAvailable=integrated.Values.Where(x=>x.Residuals.Any(r=>r.Variant==variant && r.Reading is not null)).Select(x=>x.FutureBar.BarSeq).OrderBy(x=>x);
+            var expectedAvailable=rows.Select(x=>(int)N(x,"BarSeq")).OrderBy(x=>x);
+            if(!actualAvailable.SequenceEqual(expectedAvailable))throw new InvalidOperationException($"RESIDUAL {day} {variant}: integrated availability differs from research");
             foreach(var row in rows)
             {
                 var seq=(int)N(row,"BarSeq"); var bar=bars.Single(x=>x.BarSeq==seq);
@@ -55,8 +78,9 @@ static class ResidualParity
                 var asOf = DateTimeOffset.Parse(row["EndIst"] + "+05:30",CultureInfo.InvariantCulture);
                 if (bar.EndAvailableAtUtc < asOf || (bar.EndAvailableAtUtc-asOf).TotalMilliseconds>=1)
                     throw new InvalidOperationException("Reference CSV timestamp differs beyond serialization precision");
-                var actual=OptionResidualModel.Evaluate(anchor,asOf,N(row,"FutureNow"),At(asOf),rate).SingleOrDefault(x=>x.Variant==variant)
-                    ?? throw new InvalidOperationException($"RESIDUAL {day} {variant} #{seq}: live unavailable, reference available");
+                var actual=integrated[seq].Residuals.Single(x=>x.Variant==variant).Reading
+                    ?? throw new InvalidOperationException($"RESIDUAL {day} {variant} #{seq}: integrated live unavailable, reference available");
+                if(actual.AsOfUtc!=asOf)throw new InvalidOperationException("Integrated residual diagnostic clock mismatch");
                 var band=variant==ResidualVariant.AtmPlusMinus2;
                 var comparisons = new (string Field, double Actual)[] {
                     (band ? "CenterStrike":"Strike",actual.CenterStrike),
