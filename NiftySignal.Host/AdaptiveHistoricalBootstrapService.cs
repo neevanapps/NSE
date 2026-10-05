@@ -144,7 +144,7 @@ public sealed class AdaptiveHistoricalBootstrapService(
             .Select(x => x.Id)
             .ToArrayAsync(ct);
         var priorRatios = priorSessionIds.Length == 0
-            ? []
+            ? new List<double>()
             : await observer.RollingStates.AsNoTracking()
                 .Where(x => priorSessionIds.Contains(x.SessionId))
                 .Select(x => Math.Abs(x.StrictDeltaRatioTotal))
