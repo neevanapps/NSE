@@ -146,6 +146,10 @@ try
     // score, nor place any paper trades -- that's Phase C/D, not yet wired.
     builder.Services.AddHostedService<LiveVolumeBarWriter>();
 
+    // Observation-only adaptive 09:30 volume clock. It logs the frozen daily threshold and does
+    // not modify the existing live volume-bar/scoring/paper-trading pipelines.
+    builder.Services.AddHostedService<LiveAdaptiveVolumeObserver>();
+
     // Phase C of docs/LIVE_PARITY_PLAN.md: computes the live OptionsScoreThreeWaySwitchMaxPainConfirmed
     // score for every bar LiveVolumeBarWriter writes and records entry SIGNALS under the same
     // percentile/Max-Pain/trading-hours rules the offline backtest uses -- see LiveOptionsScoreEngine's
