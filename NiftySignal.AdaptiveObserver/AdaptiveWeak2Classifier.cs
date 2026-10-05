@@ -29,73 +29,73 @@ public static class AdaptiveWeak2Classifier
     /// </summary>
     public static void Apply(IReadOnlyList<AdaptiveFlowState> states, double strongThreshold)
     {
-        AdaptiveFlowState? strongBase = null;
-        AdaptiveFlowState? weak1 = null;
+        var ordered = states.OrderBy(x => x.Bar.BarSeq).ToArray();
 
-        foreach (var row in states.OrderBy(x => x.Bar.BarSeq))
+        // First classify Strong independently. Discovery did not "consume" a strong state merely
+        // because it also participated as Weak1/Weak2 in an earlier overlapping triplet.
+        foreach (var row in ordered)
         {
             row.IsStrong = IsStrong(row, strongThreshold);
             row.WeakeningSequence = 0;
             row.StrongBaseBarSeq = row.IsStrong ? row.Bar.BarSeq : null;
             row.Weak1BarSeq = null;
             row.State = row.IsStrong ? AdaptiveStateKind.Strong : AdaptiveStateKind.Normal;
+        }
 
-            var rolling = row.Rolling;
-            if (rolling is null)
+        // Weak1: immediately follows an independently-strong, direction-aligned base.
+        for (var i = 1; i < ordered.Length; i++)
+        {
+            var baseRow = ordered[i - 1];
+            var current = ordered[i];
+            if (!baseRow.IsStrong
+                || baseRow.Rolling is not { } b
+                || current.Rolling is not { } r
+                || current.StrictDominanceEvolution != "Weakening"
+                || !SameOriginalDirection(b, r))
             {
-                strongBase = null;
-                weak1 = null;
                 continue;
             }
 
-            // IMPORTANT: evaluate an already-open strong -> weakening episode BEFORE deciding
-            // that the current row can itself become a new strong base. In the frozen discovery
-            // definition Weak1/Weak2 are allowed to remain above the strong threshold.
-            if (strongBase?.Rolling is { } baseRolling)
+            current.WeakeningSequence = 1;
+            current.StrongBaseBarSeq = baseRow.Bar.BarSeq;
+            current.State = AdaptiveStateKind.Weak1;
+        }
+
+        // Weak2: frozen research definition evaluated directly over [t-2,t-1,t]. This permits
+        // overlapping episodes exactly like the discovery script.
+        for (var i = 2; i < ordered.Length; i++)
+        {
+            var baseRow = ordered[i - 2];
+            var weak1 = ordered[i - 1];
+            var current = ordered[i];
+
+            if (!baseRow.IsStrong
+                || baseRow.Rolling is not { } b
+                || weak1.Rolling is not { } w1
+                || current.Rolling is not { } r
+                || weak1.StrictDominanceEvolution != "Weakening"
+                || current.StrictDominanceEvolution != "Weakening"
+                || !SameOriginalDirection(b, w1)
+                || !SameOriginalDirection(b, r)
+                || w1.StrictDeltaDirection != r.StrictDeltaDirection
+                || w1.PriceDirection != r.PriceDirection)
             {
-                var sameDirection =
-                    rolling.StrictDeltaDirection == baseRolling.StrictDeltaDirection
-                    && rolling.PriceDirection == baseRolling.PriceDirection
-                    && rolling.StrictDeltaDirection == rolling.PriceDirection
-                    && rolling.StrictDeltaDirection != 0;
-
-                if (sameDirection && row.StrictDominanceEvolution == "Weakening")
-                {
-                    if (weak1 is null)
-                    {
-                        row.WeakeningSequence = 1;
-                        row.StrongBaseBarSeq = strongBase.Bar.BarSeq;
-                        row.State = AdaptiveStateKind.Weak1;
-                        weak1 = row;
-                        continue;
-                    }
-
-                    if (weak1.Rolling is { } weak1Rolling
-                        && weak1Rolling.StrictDeltaDirection == rolling.StrictDeltaDirection
-                        && weak1Rolling.PriceDirection == rolling.PriceDirection)
-                    {
-                        row.WeakeningSequence = 2;
-                        row.StrongBaseBarSeq = strongBase.Bar.BarSeq;
-                        row.Weak1BarSeq = weak1.Bar.BarSeq;
-                        row.State = AdaptiveStateKind.Weak2;
-                        strongBase = null;
-                        weak1 = null;
-                        continue;
-                    }
-                }
-
-                // Episode broke. The current row is still eligible to seed a NEW episode if it
-                // independently qualifies as strong.
-                strongBase = null;
-                weak1 = null;
+                continue;
             }
 
-            if (row.IsStrong)
-            {
-                strongBase = row;
-            }
+            current.WeakeningSequence = 2;
+            current.StrongBaseBarSeq = baseRow.Bar.BarSeq;
+            current.Weak1BarSeq = weak1.Bar.BarSeq;
+            current.State = AdaptiveStateKind.Weak2;
         }
     }
+
+    static bool SameOriginalDirection(AdaptiveRollingState original, AdaptiveRollingState candidate) =>
+        original.StrictDeltaDirection != 0
+        && original.PriceDirection == original.StrictDeltaDirection
+        && candidate.StrictDeltaDirection == original.StrictDeltaDirection
+        && candidate.PriceDirection == original.PriceDirection
+        && candidate.StrictDeltaDirection == candidate.PriceDirection;
 
     public static bool IsStrong(AdaptiveFlowState row, double strongThreshold) =>
         row.Rolling is { } s
