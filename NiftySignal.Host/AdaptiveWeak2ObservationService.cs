@@ -46,6 +46,45 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
         }
     }
 
+    public async Task FinalizeSessionAsync(
+        NiftySignalDbContext source,
+        AdaptiveObserverDbContext observer,
+        AdaptiveObserverSessionContext context,
+        CancellationToken ct)
+    {
+        var pending = await observer.Weak2Observations
+            .Where(x => x.SessionId == context.Session.Id && x.Status == AdaptiveObservationStatus.PendingH5)
+            .OrderBy(x => x.TriggerBarSeq)
+            .ToListAsync(ct);
+
+        var lastBarSeq = await observer.FutureBars.AsNoTracking()
+            .Where(x => x.SessionId == context.Session.Id)
+            .Select(x => (int?)x.BarSeq)
+            .MaxAsync(ct) ?? 0;
+
+        foreach (var observation in pending)
+        {
+            if (observation.H5TargetBarSeq <= lastBarSeq)
+            {
+                await TryFinalizeAsync(source, observer, context, observation, lastBarSeq, ct);
+            }
+
+            if (observation.Status == AdaptiveObservationStatus.PendingH5)
+            {
+                MarkUnavailable(
+                    observation,
+                    observation.H5TargetBarSeq > lastBarSeq
+                        ? "H5 did not complete before session close."
+                        : "No executable H5 option exit was available before session close.");
+            }
+        }
+
+        if (pending.Count > 0)
+        {
+            await observer.SaveChangesAsync(ct);
+        }
+    }
+
     async Task EnsureObservationAsync(
         AdaptiveObserverDbContext db,
         AdaptiveObserverSessionContext context,
