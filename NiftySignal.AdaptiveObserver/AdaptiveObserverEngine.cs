@@ -214,7 +214,7 @@ public sealed class AdaptiveObserverEngine
                 continue;
             }
 
-            var delta = _previousResidual.TryGetValue(variant, out var previous)
+            double? delta = _previousResidual.TryGetValue(variant, out var previous)
                 ? reading.DirectionalResidualPct - previous
                 : null;
             _previousResidual[variant] = reading.DirectionalResidualPct;
