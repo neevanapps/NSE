@@ -230,6 +230,7 @@ public sealed class AdaptiveObserverPersistence(ILogger<AdaptiveObserverPersiste
                 ? 100d * m.BarPriceChange.Value / m.PremiumIndexOpen.Value
                 : null,
             RollingBandPriceChange = rolling?.RollingBandPriceChange,
+            RollingReturnPct = rolling?.RollingReturnPct,
             RollingEfficiency = rolling?.RollingEfficiency,
 
             ContractTotalQuantity = m?.ContractTotalQuantity ?? 0,
@@ -245,8 +246,10 @@ public sealed class AdaptiveObserverPersistence(ILogger<AdaptiveObserverPersiste
             ContractEnrichedDelta = m?.ContractEnrichedDelta ?? 0,
             ContractEnrichedDeltaRatio = m?.ContractEnrichedDeltaRatio ?? 0,
             ContractRollingStrictDelta = rolling?.ContractStrictDelta,
+            ContractRollingStrictAbsDeltaChange = rolling?.ContractStrictAbsDeltaChange,
             ContractRollingStrictDeltaRatioTotal = rolling?.ContractStrictDeltaRatioTotal,
             ContractRollingEnrichedDelta = rolling?.ContractEnrichedDelta,
+            ContractRollingEnrichedDeltaChange = rolling?.ContractEnrichedDeltaChange,
             ContractRollingEnrichedDeltaRatio = rolling?.ContractEnrichedDeltaRatio,
 
             NotionalTotal = m?.NotionalTotal ?? 0,
@@ -262,8 +265,10 @@ public sealed class AdaptiveObserverPersistence(ILogger<AdaptiveObserverPersiste
             NotionalEnrichedDelta = m?.NotionalEnrichedDelta ?? 0,
             NotionalEnrichedDeltaRatio = m?.NotionalEnrichedDeltaRatio ?? 0,
             NotionalRollingStrictDelta = rolling?.NotionalStrictDelta,
+            NotionalRollingStrictAbsDeltaChange = rolling?.NotionalStrictAbsDeltaChange,
             NotionalRollingStrictDeltaRatioTotal = rolling?.NotionalStrictDeltaRatioTotal,
             NotionalRollingEnrichedDelta = rolling?.NotionalEnrichedDelta,
+            NotionalRollingEnrichedDeltaChange = rolling?.NotionalEnrichedDeltaChange,
             NotionalRollingEnrichedDeltaRatio = rolling?.NotionalEnrichedDeltaRatio,
 
             BarTradeUpdates = m?.TradeUpdates ?? 0,
