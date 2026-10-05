@@ -182,6 +182,7 @@ try
     // It reads authoritative persisted raw ticks, writes its own isolated database and never
     // creates a paper or real order.
     builder.Services.AddSingleton<AdaptiveSourceTickReader>();
+    builder.Services.AddSingleton<AdaptiveHistoricalBootstrapService>();
     builder.Services.AddSingleton<AdaptiveSessionCoordinator>();
     builder.Services.AddSingleton<AdaptiveObserverPersistence>();
     builder.Services.AddSingleton<AdaptiveWeak2ObservationService>();
