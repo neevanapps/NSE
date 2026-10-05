@@ -192,12 +192,15 @@ public sealed class AdaptiveOptionBandBarRow
 
     public long BarTradeUpdates { get; set; }
     public long? RollingTradeUpdates { get; set; }
-    public double? RollingQuoteCoverage { get; set; }
-    public double? RollingActivityPerSecond { get; set; }
+    public double? ContractRollingStrictCoverage { get; set; }
+    public double? NotionalRollingStrictCoverage { get; set; }
+    public double? ContractRollingActivityPerSecond { get; set; }
+    public double? NotionalRollingActivityPerSecond { get; set; }
 
     public long? BandOiOpen { get; set; }
     public long? BandOiClose { get; set; }
     public long? BarOiChange { get; set; }
+    public double? BarOiChangePct { get; set; }
     public long? RollingOiChange { get; set; }
     public double? RollingOiChangePct { get; set; }
     public double? PremiumNotionalOiAtClose { get; set; }
