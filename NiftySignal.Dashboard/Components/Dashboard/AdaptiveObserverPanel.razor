@@ -258,8 +258,8 @@
             </div>
 
             <div class="adaptive-anchor-grid">
-                <Metric Label="Future @09:30" Value="@Fmt(_snapshot.Session.Future0930, 2)" />
-                <Metric Label="Synthetic weekly @09:30" Value="@Fmt(_snapshot.Session.SyntheticWeeklyUnderlying0930, 2)" />
+                <Metric Label="Future at 09:30" Value="@Fmt(_snapshot.Session.Future0930, 2)" />
+                <Metric Label="Synthetic weekly at 09:30" Value="@Fmt(_snapshot.Session.SyntheticWeeklyUnderlying0930, 2)" />
                 <Metric Label="Diagnostic center" Value="@FmtStrike(_snapshot.Session.ResidualCenterStrike)" />
                 <Metric Label="Components" Value="@ResidualComponentText" />
             </div>
@@ -342,12 +342,14 @@
             while (_headerTimer is not null && await _headerTimer.WaitForNextTickAsync(ct))
             {
                 var header = await AdaptiveData.LoadHeaderAsync(ct);
-                if (header is not null && _snapshot is not null && header.Session.Id == _snapshot.Session.Id)
+                if (header is not null && _snapshot is not null && header.Session.Id == _snapshot.Session.Id
+                    && header.Runtime.LastCompletedBarSeq == (_snapshot.Futures.FirstOrDefault()?.Bar.BarSeq ?? 0)
+                    && _loadError is null)
                 {
                     _snapshot = _snapshot with { Runtime = header.Runtime, Session = header.Session };
                     await InvokeAsync(StateHasChanged);
                 }
-                else if (header is not null && (_snapshot is null || header.Session.Id != _snapshot.Session.Id))
+                else if (header is not null)
                 {
                     await ReloadAsync();
                 }

@@ -55,7 +55,7 @@ public sealed class AdaptiveWeak2ObservationServiceTests
         Assert.Equal(AdaptiveWeak2ObservationService.SelectionPolicyV1, row.SelectionPolicy);
     }
 
-    static AdaptiveObserverSessionContext Context()
+    internal static AdaptiveObserverSessionContext Context()
     {
         var day = new DateOnly(2026, 9, 25);
         var at = new DateTimeOffset(2026, 9, 25, 4, 0, 0, TimeSpan.Zero);

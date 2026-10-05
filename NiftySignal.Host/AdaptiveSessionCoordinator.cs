@@ -142,6 +142,7 @@ public sealed class AdaptiveSessionCoordinator(
             .ThenByDescending(x => x.Id)
             .FirstOrDefault();
 
+        var riskFreeRate = pricing.CurrentValue.RiskFreeRate;
         OptionResidualAnchor? anchor = null;
         if (future0930Tick.Id != 0
             && (cutoffUtc - future0930Tick.AvailableAt).TotalSeconds <= ResidualQuoteMaxAgeSeconds)
@@ -153,7 +154,7 @@ public sealed class AdaptiveSessionCoordinator(
                 future0930Tick.Last,
                 optionDescriptors,
                 quotes,
-                pricing.CurrentValue.RiskFreeRate,
+                riskFreeRate,
                 ResidualQuoteMaxAgeSeconds);
         }
 
@@ -170,6 +171,7 @@ public sealed class AdaptiveSessionCoordinator(
             FutureSymbol = future.TradingSymbol,
             FutureExpiry = future.ExpiryDate ?? day,
             LotSize = future.LotSize,
+            RiskFreeRate = riskFreeRate,
             OpeningWindowStartUtc = ToUtc(day, MarketOpen),
             OpeningWindowEndUtc = cutoffUtc,
             OpeningVolume = openingVolume,

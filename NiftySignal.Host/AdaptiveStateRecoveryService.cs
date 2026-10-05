@@ -1,5 +1,4 @@
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Options;
 using NiftySignal.AdaptiveObserver;
 using NiftySignal.AdaptiveObserverData;
 using NiftySignal.Persistence;
@@ -19,7 +18,6 @@ public sealed class AdaptiveStateRecoveryService(
     AdaptiveSourceTickReader tickReader,
     AdaptiveObserverPersistence persistence,
     AdaptiveWeak2ObservationService observations,
-    IOptionsMonitor<NiftySignal.Domain.Configuration.PricingOptions> pricing,
     ILogger<AdaptiveStateRecoveryService> logger)
 {
     public async Task<AdaptiveRecoveryResult> RecoverAsync(
@@ -65,7 +63,7 @@ public sealed class AdaptiveStateRecoveryService(
         var engine = new AdaptiveObserverEngine(
             context.Definition,
             context.WeeklyOptionExpiry,
-            pricing.CurrentValue.RiskFreeRate,
+            context.Session.RiskFreeRate,
             context.Session.StrongThreshold,
             context.SignalStartUtc,
             context.Options,

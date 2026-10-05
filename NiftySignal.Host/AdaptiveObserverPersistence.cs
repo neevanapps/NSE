@@ -24,7 +24,7 @@ public sealed class AdaptiveObserverPersistence(ILogger<AdaptiveObserverPersiste
 
         if (existing is not null)
         {
-            VerifyFuture(existing, package.FutureBar);
+            VerifyRow(existing, MapFuture(session.Id, package.FutureBar), package.FutureBar.BarSeq);
             await VerifyDependentRowsAsync(db, session, package, ct);
             logger.LogDebug("Adaptive replay verified session={SessionId}, bar={BarSeq}", session.Id, package.FutureBar.BarSeq);
             return new AdaptivePersistResult(false, true, package.FutureBar.BarSeq);
@@ -350,11 +350,7 @@ public sealed class AdaptiveObserverPersistence(ILogger<AdaptiveObserverPersiste
         {
             if (existingRolling is null)
                 throw Mismatch("persisted rolling row is missing", barSeq);
-            Equal(existingRolling.StrictDelta, rolling.StrictDelta, "Rolling.StrictDelta", barSeq);
-            Near(existingRolling.StrictDeltaRatioTotal, rolling.StrictDeltaRatioTotal, "Rolling.StrictDeltaRatioTotal", barSeq);
-            Near(existingRolling.PriceDisplacement, rolling.PriceDisplacement, "Rolling.PriceDisplacement", barSeq);
-            if (existingRolling.State != package.FlowState.State)
-                throw Mismatch($"State persisted={existingRolling.State}, replay={package.FlowState.State}", barSeq);
+            VerifyRow(existingRolling, MapRolling(session.Id, package.FlowState), barSeq);
         }
 
         var optionRows = await db.OptionBandBars.AsNoTracking()
@@ -367,57 +363,39 @@ public sealed class AdaptiveObserverPersistence(ILogger<AdaptiveObserverPersiste
         {
             var expected = MapOptionBand(session.Id, package, side);
             var actual = optionRows.Single(x => x.Side == side);
-            if (actual.BandAvailable != expected.BandAvailable)
-                throw Mismatch($"{side} BandAvailable differs", barSeq);
-            Near(actual.NotionalStrictDelta, expected.NotionalStrictDelta, $"{side}.NotionalStrictDelta", barSeq);
-            Near(actual.ContractStrictDeltaRatioTotal, expected.ContractStrictDeltaRatioTotal, $"{side}.ContractStrictDeltaRatioTotal", barSeq);
+            VerifyRow(actual, expected, barSeq);
         }
 
-        if (barSeq > 0 && package.FutureBar.EndAvailableAtUtc >= session.OpeningWindowEndUtc)
+        var residualRows = await db.OptionResidualBars.AsNoTracking()
+            .Where(x => x.SessionId == session.Id && x.BarSeq == barSeq)
+            .ToListAsync(ct);
+        if (residualRows.Count != package.Residuals.Count)
+            throw Mismatch($"expected {package.Residuals.Count} residual rows, persisted={residualRows.Count}", barSeq);
+        foreach (var result in package.Residuals)
         {
-            var residualRows = await db.OptionResidualBars.AsNoTracking()
-                .Where(x => x.SessionId == session.Id && x.BarSeq == barSeq)
-                .ToListAsync(ct);
-            if (residualRows.Count != 2)
-                throw Mismatch($"expected 2 residual rows, persisted={residualRows.Count}", barSeq);
-
-            foreach (var expectedResult in package.Residuals)
-            {
-                var expected = MapResidual(session, barSeq, package.FutureBar.EndAvailableAtUtc, expectedResult);
-                var actual = residualRows.Single(x => x.Variant == expected.Variant);
-                if (actual.IsAvailable != expected.IsAvailable)
-                    throw Mismatch($"{expected.Variant} residual availability differs", barSeq);
-                if (actual.IsAvailable)
-                    Near(actual.DirectionalResidualPct, expected.DirectionalResidualPct, $"{expected.Variant}.DirectionalResidualPct", barSeq);
-            }
+            var expected = MapResidual(session, barSeq, package.FutureBar.EndAvailableAtUtc, result);
+            var actual = residualRows.Single(x => x.Variant == expected.Variant);
+            VerifyRow(actual, expected, barSeq);
         }
     }
 
-    static void VerifyFuture(AdaptiveFutureBarRow actual, ExactAdaptiveBar expected)
+    // All scalar fields in the persisted projection participate in reconciliation. The generated
+    // surrogate Id alone is excluded. Mapping is the same mapping used for the initial insert.
+    static void VerifyRow<TRow>(TRow actual, TRow expected, int seq) where TRow : class
     {
-        var seq = expected.BarSeq;
-        Equal(actual.Volume, expected.Volume, "Future.Volume", seq);
-        Equal(actual.FirstSourceTickId, expected.FirstSourceTickId, "Future.FirstSourceTickId", seq);
-        Equal(actual.LastSourceTickId, expected.LastSourceTickId, "Future.LastSourceTickId", seq);
-        if (actual.StartAvailableAtUtc != expected.StartAvailableAtUtc || actual.EndAvailableAtUtc != expected.EndAvailableAtUtc)
-            throw Mismatch("future timestamps differ", seq);
-        Near(actual.Open, expected.Open, "Future.Open", seq);
-        Near(actual.High, expected.High, "Future.High", seq);
-        Near(actual.Low, expected.Low, "Future.Low", seq);
-        Near(actual.Close, expected.Close, "Future.Close", seq);
-        Equal(actual.StrictDelta, expected.StrictDelta, "Future.StrictDelta", seq);
-        Equal(actual.EnrichedDelta, expected.EnrichedDelta, "Future.EnrichedDelta", seq);
-    }
-
-    static void Equal(long actual, long expected, string field, int seq)
-    {
-        if (actual != expected) throw Mismatch($"{field}: persisted={actual}, replay={expected}", seq);
-    }
-
-    static void Near(double actual, double expected, string field, int seq)
-    {
-        if (Math.Abs(actual - expected) > DoubleTolerance)
-            throw Mismatch($"{field}: persisted={actual:R}, replay={expected:R}", seq);
+        foreach (var property in typeof(TRow).GetProperties())
+        {
+            if (property.Name == "Id") continue;
+            var a = property.GetValue(actual);
+            var e = property.GetValue(expected);
+            if (a is double av && e is double ev)
+            {
+                if (double.IsFinite(av) && double.IsFinite(ev) && Math.Abs(av - ev) <= DoubleTolerance)
+                    continue;
+            }
+            else if (Equals(a, e)) continue;
+            throw Mismatch($"{typeof(TRow).Name}.{property.Name}: persisted={a}, replay={e}", seq);
+        }
     }
 
     static InvalidOperationException Mismatch(string message, int seq) =>

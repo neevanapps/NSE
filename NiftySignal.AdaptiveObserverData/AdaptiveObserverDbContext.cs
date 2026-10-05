@@ -78,6 +78,7 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
             e.Property(x => x.Token).HasMaxLength(32);
             e.Property(x => x.TradingSymbol).HasMaxLength(64);
             e.Property(x => x.UnavailableReason).HasMaxLength(512);
+            e.Property(x => x.SelectionPolicy).HasMaxLength(128);
         });
 
         modelBuilder.Entity<AdaptiveObserverRuntimeRow>(e =>
@@ -86,5 +87,20 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
             e.HasIndex(x => x.SessionId).IsUnique();
             e.Property(x => x.LastError).HasMaxLength(2048);
         });
+
+        modelBuilder.Entity<AdaptiveFutureBarRow>().HasOne<AdaptiveSessionStateRow>().WithMany()
+            .HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
+        modelBuilder.Entity<AdaptiveRollingStateRow>().HasOne<AdaptiveSessionStateRow>().WithMany()
+            .HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
+        modelBuilder.Entity<AdaptiveOptionBandBarRow>().HasOne<AdaptiveSessionStateRow>().WithMany()
+            .HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
+        modelBuilder.Entity<AdaptiveResidualAnchorComponentRow>().HasOne<AdaptiveSessionStateRow>().WithMany()
+            .HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
+        modelBuilder.Entity<AdaptiveOptionResidualBarRow>().HasOne<AdaptiveSessionStateRow>().WithMany()
+            .HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
+        modelBuilder.Entity<AdaptiveWeak2ObservationRow>().HasOne<AdaptiveSessionStateRow>().WithMany()
+            .HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
+        modelBuilder.Entity<AdaptiveObserverRuntimeRow>().HasOne<AdaptiveSessionStateRow>().WithMany()
+            .HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
     }
 }
