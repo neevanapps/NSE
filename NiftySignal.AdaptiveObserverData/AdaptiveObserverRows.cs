@@ -156,6 +156,7 @@ public sealed class AdaptiveOptionBandBarRow
     public double? BarBandPriceChange { get; set; }
     public double? BarBandReturnPct { get; set; }
     public double? RollingBandPriceChange { get; set; }
+    public double? RollingReturnPct { get; set; }
     public double? RollingEfficiency { get; set; }
 
     public long ContractTotalQuantity { get; set; }
@@ -171,8 +172,10 @@ public sealed class AdaptiveOptionBandBarRow
     public long ContractEnrichedDelta { get; set; }
     public double ContractEnrichedDeltaRatio { get; set; }
     public long? ContractRollingStrictDelta { get; set; }
+    public long? ContractRollingStrictAbsDeltaChange { get; set; }
     public double? ContractRollingStrictDeltaRatioTotal { get; set; }
     public long? ContractRollingEnrichedDelta { get; set; }
+    public long? ContractRollingEnrichedDeltaChange { get; set; }
     public double? ContractRollingEnrichedDeltaRatio { get; set; }
 
     public double NotionalTotal { get; set; }
@@ -188,8 +191,10 @@ public sealed class AdaptiveOptionBandBarRow
     public double NotionalEnrichedDelta { get; set; }
     public double NotionalEnrichedDeltaRatio { get; set; }
     public double? NotionalRollingStrictDelta { get; set; }
+    public double? NotionalRollingStrictAbsDeltaChange { get; set; }
     public double? NotionalRollingStrictDeltaRatioTotal { get; set; }
     public double? NotionalRollingEnrichedDelta { get; set; }
+    public double? NotionalRollingEnrichedDeltaChange { get; set; }
     public double? NotionalRollingEnrichedDeltaRatio { get; set; }
 
     public long BarTradeUpdates { get; set; }
