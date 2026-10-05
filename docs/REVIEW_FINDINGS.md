@@ -3322,4 +3322,8 @@ The independent historical residual gate observed an expected-price difference o
 
 The worker enters its outside-market delay with `_live == null`; session-close finalization only runs for an existing in-memory live state. A crash near close followed by an after-hours restart can leave persisted pending H5 observations unresolved. Draining the buffer before a normal in-process close is fixed, but this startup path remains uncovered. **Release blocker:** recover/finalize persisted ended sessions and test restart across market close. Fix: dedicated ended-session recovery replays/verifies persisted source, finalizes pending observations and closes runtime both outside hours and before starting the next session. Same-day and next-day idempotent restart tests passed at `9663879`, workflow `37320556273`. Missing source history beyond reconstructed bars also fails closed.
 
-**Numbering note:** F66 is next-free going forward.
+## F66 — adaptive strong threshold bypassed frozen CSV decision precision — FIX IMPLEMENTED / VALIDATION PENDING
+
+Independent original-Python threshold JSON exposed discovery 2026-09-11 threshold `0.201714` versus live `0.20171428571428573`. Frozen research classifiers consume six-decimal CSV ratios. Threshold samples and classifier comparisons now use that exact six-decimal decision representation; full-precision persisted/displayed rolling metrics remain unchanged. A regression protects this separation. Prior checkpoint library parity did not establish this serialized Python gate; rerun the complete historical suite before claiming it.
+
+**Numbering note:** F67 is next-free going forward.

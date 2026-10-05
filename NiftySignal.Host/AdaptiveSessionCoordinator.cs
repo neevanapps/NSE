@@ -134,7 +134,7 @@ public sealed class AdaptiveSessionCoordinator(
                 .ToListAsync(ct);
 
         double? strongThreshold = priorRatios.Count > 0
-            ? AdaptiveWeak2Classifier.Quantile(priorRatios, AdaptiveWeak2Classifier.StrongQuantile)
+            ? AdaptiveWeak2Classifier.ComputeStrongThreshold(priorRatios)
             : null;
 
         var future0930Tick = futureTicks

@@ -20,8 +20,15 @@ public static class AdaptiveWeak2Classifier
         return xs[lo] * (1d - w) + xs[hi] * w;
     }
 
+    // Frozen Python decisions consume FlowEvolutionCsv's six-decimal ratio columns. Persist
+    // and display the original ratio; normalize ONLY classifier/threshold decision inputs.
+    public static double DecisionRatio(double ratio) => Math.Round(ratio,6,MidpointRounding.ToEven);
+
+    public static double ComputeStrongThreshold(IEnumerable<double> priorRatios) =>
+        Quantile(priorRatios.Select(x=>Math.Abs(DecisionRatio(x))),StrongQuantile);
+
     public static double ComputeStrongThreshold(IEnumerable<AdaptiveRollingState> priorSessionStates) =>
-        Quantile(priorSessionStates.Select(x => Math.Abs(x.StrictDeltaRatioTotal)), StrongQuantile);
+        ComputeStrongThreshold(priorSessionStates.Select(x=>x.StrictDeltaRatioTotal));
 
     /// <summary>
     /// Adds Strong/Weak1/Weak2 labels to already-built flow states using one frozen daily strong threshold.
@@ -99,7 +106,7 @@ public static class AdaptiveWeak2Classifier
 
     public static bool IsStrong(AdaptiveFlowState row, double strongThreshold) =>
         row.Rolling is { } s
-        && Math.Abs(s.StrictDeltaRatioTotal) >= strongThreshold
+        && Math.Abs(DecisionRatio(s.StrictDeltaRatioTotal)) >= strongThreshold
         && s.PriceDirection != 0
         && s.PriceDirection == s.StrictDeltaDirection;
 }

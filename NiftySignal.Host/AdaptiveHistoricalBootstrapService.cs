@@ -171,7 +171,7 @@ public sealed class AdaptiveHistoricalBootstrapService(
                 .ToListAsync(ct);
 
         double? strongThreshold = priorRatios.Count > 0
-            ? AdaptiveWeak2Classifier.Quantile(priorRatios, AdaptiveWeak2Classifier.StrongQuantile)
+            ? AdaptiveWeak2Classifier.ComputeStrongThreshold(priorRatios)
             : null;
         if (strongThreshold.HasValue)
         {

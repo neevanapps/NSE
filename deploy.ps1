@@ -51,6 +51,10 @@ param(
 
     [switch] $SkipTests,
 
+    # Release gate: pass the reviewed master SHA to prove the checkout being published.
+    [ValidatePattern('^[0-9a-fA-F]{40}$')]
+    [string] $ExpectedCommitSha,
+
     # Bypasses the "desktop services are still running" guard. Only correct when you have
     # deliberately decided both machines should be up (they normally must not be).
     [switch] $Force
@@ -58,6 +62,16 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = $PSScriptRoot
+
+# Assembly metadata must identify the source actually published, including untracked source files.
+$sourceStatus = & git -C $repoRoot status --porcelain --untracked-files=normal
+if ($LASTEXITCODE -ne 0) { throw 'Cannot verify source worktree; nothing deployed.' }
+if ($sourceStatus) { throw 'Deployment requires a clean source worktree; commit or remove changes first. Nothing deployed.' }
+$verifiedSha = (& git -C $repoRoot rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0) { throw 'Cannot identify source revision; nothing deployed.' }
+if ($ExpectedCommitSha -and $verifiedSha -ne $ExpectedCommitSha) {
+    throw "Expected source SHA $ExpectedCommitSha but checkout is $verifiedSha. Nothing deployed."
+}
 
 $services = @()
 if ($Service -eq 'Both' -or $Service -eq 'Host') {
@@ -101,7 +115,7 @@ if (-not $SkipTests) {
 
 # --- Build/source identity ---------------------------------------------------------------
 $sourceBranch = (& git -C $repoRoot rev-parse --abbrev-ref HEAD).Trim()
-$commitSha = (& git -C $repoRoot rev-parse HEAD).Trim()
+$commitSha = $verifiedSha
 $buildUtc = [DateTimeOffset]::UtcNow.ToString('O')
 Write-Host "    source: $sourceBranch @ $commitSha"
 Write-Host "    build : $buildUtc UTC"

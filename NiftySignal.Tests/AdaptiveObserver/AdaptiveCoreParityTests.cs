@@ -164,6 +164,17 @@ public sealed class AdaptiveCoreParityTests
         Assert.Equal(0, selected % (65 * 50));
     }
 
+    [Fact]
+    public void StrongThreshold_UsesFrozenSixDecimalDecisionInputsWithoutChangingMetrics()
+    {
+        const double raw=.20171428571428573;
+        var state=MakeFlowState(10,raw,1,1,null);
+        var threshold=AdaptiveWeak2Classifier.ComputeStrongThreshold(new[] { raw });
+        Assert.Equal(.201714,threshold);
+        Assert.False(AdaptiveWeak2Classifier.IsStrong(state,.2017141));
+        Assert.Equal(raw,state.Rolling!.StrictDeltaRatioTotal); // Display/persistence stays exact.
+    }
+
     internal static ExactAdaptiveBar MakeBar(int seq, double open, double close, long strictBuy, long strictSell, long strictUnknown) =>
         new()
         {

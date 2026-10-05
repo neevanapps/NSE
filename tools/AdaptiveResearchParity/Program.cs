@@ -80,7 +80,7 @@ foreach (var (day, spec) in OpeningVolumeProjectionV1.DiscoveryOutOfFold.OrderBy
                  ("QuoteDeltaRatioClassified", "StrictDeltaRatioClassified")], ["Symbol"]);
         else Equal(rf[i].Rolling130k is null, af[i].Rolling is null, "rolling availability", day);
     }
-    double? threshold = history.Count == 0 ? null : AdaptiveWeak2Classifier.Quantile(history, 2d / 3d);
+    double? threshold = history.Count == 0 ? null : AdaptiveWeak2Classifier.ComputeStrongThreshold(history);
     var rq=thresholdReference.RootElement.GetProperty(day.ToString("yyyy-MM-dd"));
     Equal(rq.ValueKind==JsonValueKind.Null ? (double?)null : rq.GetDouble(),threshold,"original Python daily strong threshold",day);
     if (threshold.HasValue) AdaptiveWeak2Classifier.Apply(af, threshold.Value);
@@ -90,7 +90,7 @@ foreach (var (day, spec) in OpeningVolumeProjectionV1.DiscoveryOutOfFold.OrderBy
         var b = rf[i - 2].Rolling130k; var w = rf[i - 1]; var t = rf[i];
         if (threshold is null || b is null || w.Rolling130k is null || t.Rolling130k is null) continue;
         var d = b.PriceDirection;
-        if (d != 0 && d == b.StrictDeltaDirection && Math.Abs(b.QuoteDeltaRatioTotal) >= threshold.Value
+        if (d != 0 && d == b.StrictDeltaDirection && Math.Abs(double.Parse(b.QuoteDeltaRatioTotal.ToString("0.######",CultureInfo.InvariantCulture),CultureInfo.InvariantCulture)) >= threshold.Value
             && w.StrictDominanceEvolution == "Weakening" && t.StrictDominanceEvolution == "Weakening"
             && w.Rolling130k.StrictDeltaDirection == d && t.Rolling130k.StrictDeltaDirection == d
             && t.Rolling130k.PriceDirection == d)
