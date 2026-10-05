@@ -142,24 +142,24 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
             return;
         }
 
-        var candidateTicks = await LoadTicksAsync(
+        var candidateTicks = Normalize(await LoadTicksAsync(
             source,
             sideInstruments.Select(x => x.Token).ToArray(),
             observation.TriggerTimestampUtc.AddMinutes(-1),
-            latestKnown.Value,
-            ct);
+            targetBar.EndAvailableAtUtc.AddMinutes(1),
+            ct));
 
         var firstByToken = candidateTicks
             .Select(ToQuote)
-            .Where(x => x is not null && x.AvailableAt >= observation.TriggerTimestampUtc)
-            .Cast<(string Token, QuotePoint Point)>()
+            .Where(x => x is not null
+                && x.Value.Point.AvailableAt >= observation.TriggerTimestampUtc
+                && x.Value.Point.AvailableAt <= targetBar.EndAvailableAtUtc)
+            .Select(x => x!.Value)
             .GroupBy(x => x.Token, StringComparer.Ordinal)
-            .ToDictionary(g => g.Key, g => g.OrderBy(x => x.Point.AvailableAt).ThenBy(x => x.Point.Id).First().Point, StringComparer.Ordinal);
-
-        if (firstByToken.Count < sideInstruments.Length)
-        {
-            return;
-        }
+            .ToDictionary(
+                g => g.Key,
+                g => g.OrderBy(x => x.Point.AvailableAt).ThenBy(x => x.Point.Id).First().Point,
+                StringComparer.Ordinal);
 
         var eligible = sideInstruments
             .Where(i => firstByToken.TryGetValue(i.Token, out var q) && q.Ask >= PremiumMin && q.Ask <= PremiumMax)
@@ -186,21 +186,26 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
         }
 
         var pairTokens = new[] { pairCall.Token, pairPut.Token };
-        var pairTicks = await LoadTicksAsync(
+        var pairTicks = Normalize(await LoadTicksAsync(
             source,
             pairTokens,
             baseBar.EndAvailableAtUtc.AddMinutes(-5),
             latestKnown.Value,
-            ct);
+            ct));
 
-        var callQuotes = pairTicks.Where(x => x.Token == pairCall.Token).Select(ToQuote).Where(x => x is not null).Select(x => x!.Value.Point).OrderBy(x => x.AvailableAt).ThenBy(x => x.Id).ToArray();
-        var putQuotes = pairTicks.Where(x => x.Token == pairPut.Token).Select(ToQuote).Where(x => x is not null).Select(x => x!.Value.Point).OrderBy(x => x.AvailableAt).ThenBy(x => x.Id).ToArray();
+        var callClean = pairTicks.Where(x => x.Token == pairCall.Token)
+            .Select(x => x.Tick).OrderBy(x => x.AvailableAt).ThenBy(x => x.Id).ToArray();
+        var putClean = pairTicks.Where(x => x.Token == pairPut.Token)
+            .Select(x => x.Tick).OrderBy(x => x.AvailableAt).ThenBy(x => x.Id).ToArray();
 
-        var ceBase = OiAtOrBefore(callQuotes, baseBar.EndAvailableAtUtc);
-        var peBase = OiAtOrBefore(putQuotes, baseBar.EndAvailableAtUtc);
-        var ceTrigger = OiAtOrBefore(callQuotes, observation.TriggerTimestampUtc);
-        var peTrigger = OiAtOrBefore(putQuotes, observation.TriggerTimestampUtc);
+        // OI parity: use every clean tick carrying OI, not only ticks with a valid two-sided quote.
+        var ceBase = OiAtOrBefore(callClean, baseBar.EndAvailableAtUtc);
+        var peBase = OiAtOrBefore(putClean, baseBar.EndAvailableAtUtc);
+        var ceTrigger = OiAtOrBefore(callClean, observation.TriggerTimestampUtc);
+        var peTrigger = OiAtOrBefore(putClean, observation.TriggerTimestampUtc);
 
+        var callQuotes = callClean.Select(x => ToQuote(pairCall.Token, x)).Where(x => x is not null).Select(x => x!.Value.Point).ToArray();
+        var putQuotes = putClean.Select(x => ToQuote(pairPut.Token, x)).Where(x => x is not null).Select(x => x!.Value.Point).ToArray();
         var selectedQuotes = selected.Instrument.OptionType == OptionType.Call ? callQuotes : putQuotes;
         var exit = selectedQuotes.FirstOrDefault(x => x.AvailableAt >= targetBar.EndAvailableAtUtc && x.Bid > 0d);
         if (exit is null)
@@ -301,27 +306,50 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
             .ToListAsync(ct);
     }
 
-    static (string Token, QuotePoint Point)? ToQuote(Tick tick)
+    static IReadOnlyList<ObserverTokenTick> Normalize(IReadOnlyList<Tick> rows)
     {
-        if (tick.Depth is not { } d || d.Bid1Price <= 0m || d.Ask1Price <= 0m || d.Ask1Price < d.Bid1Price)
+        var normalizer = new AdaptiveIncrementalTickNormalizer();
+        var clean = new List<ObserverTokenTick>(rows.Count);
+        foreach (var row in rows.OrderBy(x => x.Id))
+        {
+            var tick = normalizer.Process(row.Token, AdaptiveSourceTickReader.ToRaw(row));
+            if (tick is { } value)
+            {
+                clean.Add(new ObserverTokenTick(row.Token, value));
+            }
+        }
+
+        clean.Sort(static (a, b) =>
+        {
+            var byTime = a.Tick.AvailableAt.CompareTo(b.Tick.AvailableAt);
+            return byTime != 0 ? byTime : a.Tick.Id.CompareTo(b.Tick.Id);
+        });
+        return clean;
+    }
+
+    static (string Token, QuotePoint Point)? ToQuote(ObserverTokenTick item) =>
+        ToQuote(item.Token, item.Tick);
+
+    static (string Token, QuotePoint Point)? ToQuote(string token, CleanObserverTick tick)
+    {
+        if (!tick.HasTwoSidedQuote)
         {
             return null;
         }
 
-        var available = tick.ReceivedAt < tick.ExchangeTimestamp ? tick.ExchangeTimestamp : tick.ReceivedAt;
-        return (tick.Token, new QuotePoint(
-            available,
+        return (token, new QuotePoint(
+            tick.AvailableAt,
             tick.Id,
-            (double)d.Bid1Price,
-            (double)d.Ask1Price,
-            (double)tick.LastPrice,
+            tick.Bid,
+            tick.Ask,
+            tick.Last,
             tick.OpenInterest));
     }
 
-    static long? OiAtOrBefore(IReadOnlyList<QuotePoint> quotes, DateTimeOffset at) =>
-        quotes.Where(x => x.AvailableAt <= at && x.Oi.HasValue)
+    static long? OiAtOrBefore(IReadOnlyList<CleanObserverTick> ticks, DateTimeOffset at) =>
+        ticks.Where(x => x.AvailableAt <= at && x.OpenInterest.HasValue)
             .OrderByDescending(x => x.AvailableAt)
             .ThenByDescending(x => x.Id)
-            .Select(x => x.Oi)
+            .Select(x => x.OpenInterest)
             .FirstOrDefault();
 }
