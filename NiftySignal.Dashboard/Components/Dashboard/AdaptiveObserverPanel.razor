@@ -195,8 +195,8 @@
                         <tr>
                             <th>Seq</th><th>End IST</th><th>Dur s</th><th>Center</th><th>Roll?</th><th>Band ΔPx</th>
                             <th>Strict Δ</th><th>Strict ratio</th><th>Coverage</th><th>Enriched Δ</th><th>Enriched ratio</th><th>Updates</th>
-                            <th>Roll band ΔPx</th><th>Roll strict Δ</th><th>Roll strict ratio</th><th>Roll coverage</th>
-                            <th>Roll enriched Δ</th><th>Roll enriched ratio</th><th>Efficiency</th>
+                            <th>Roll band ΔPx</th><th>Roll return %</th><th>Roll strict Δ</th><th>|Strict| Δchg</th><th>Roll strict ratio</th><th>Roll coverage</th>
+                            <th>Roll enriched Δ</th><th>Enriched Δchg</th><th>Roll enriched ratio</th><th>Efficiency</th>
                             <th>OI Δ</th><th>OI Δ%</th><th>Activity/s</th>
                         </tr>
                         </thead>
@@ -209,7 +209,7 @@
                                 <td>@FmtIst(x.EndAvailableAtUtc)</td>
                                 @if (m is null || !m.BandAvailable)
                                 {
-                                    <td colspan="20" class="adaptive-pending">Unavailable: @(m?.UnavailableReason ?? "dependent option row pending")</td>
+                                    <td colspan="23" class="adaptive-pending">Unavailable: @(m?.UnavailableReason ?? "dependent option row pending")</td>
                                 }
                                 else
                                 {
@@ -224,10 +224,13 @@
                                     <td>@FmtSigned(EnrichedRatio(m), 3)</td>
                                     <td>@m.BarTradeUpdates</td>
                                     <td>@FmtSigned(m.RollingBandPriceChange, 2)</td>
+                                    <td>@FmtSigned(m.RollingReturnPct, 2)%</td>
                                     <td>@FmtSigned(RollingStrictDelta(m), 0)</td>
+                                    <td>@FmtSigned(RollingStrictAbsDeltaChange(m), 0)</td>
                                     <td>@FmtSigned(RollingStrictRatio(m), 3)</td>
                                     <td>@FmtPct01(RollingCoverage(m))</td>
                                     <td>@FmtSigned(RollingEnrichedDelta(m), 0)</td>
+                                    <td>@FmtSigned(RollingEnrichedDeltaChange(m), 0)</td>
                                     <td>@FmtSigned(RollingEnrichedRatio(m), 3)</td>
                                     <td>@Fmt(m.RollingEfficiency, 3)</td>
                                     <td>@FmtSigned(m.RollingOiChange)</td>
@@ -435,10 +438,14 @@
         _measurement == "NOTIONAL" ? x.NotionalEnrichedDelta : x.ContractEnrichedDelta;
     double? RollingStrictDelta(AdaptiveOptionBandBarRow? x) => x is null ? null :
         _measurement == "NOTIONAL" ? x.NotionalRollingStrictDelta : x.ContractRollingStrictDelta;
+    double? RollingStrictAbsDeltaChange(AdaptiveOptionBandBarRow? x) => x is null ? null :
+        _measurement == "NOTIONAL" ? x.NotionalRollingStrictAbsDeltaChange : x.ContractRollingStrictAbsDeltaChange;
     double? RollingStrictRatio(AdaptiveOptionBandBarRow? x) => x is null ? null :
         _measurement == "NOTIONAL" ? x.NotionalRollingStrictDeltaRatioTotal : x.ContractRollingStrictDeltaRatioTotal;
     double? RollingEnrichedDelta(AdaptiveOptionBandBarRow? x) => x is null ? null :
         _measurement == "NOTIONAL" ? x.NotionalRollingEnrichedDelta : x.ContractRollingEnrichedDelta;
+    double? RollingEnrichedDeltaChange(AdaptiveOptionBandBarRow? x) => x is null ? null :
+        _measurement == "NOTIONAL" ? x.NotionalRollingEnrichedDeltaChange : x.ContractRollingEnrichedDeltaChange;
     double? RollingEnrichedRatio(AdaptiveOptionBandBarRow? x) => x is null ? null :
         _measurement == "NOTIONAL" ? x.NotionalRollingEnrichedDeltaRatio : x.ContractRollingEnrichedDeltaRatio;
     double? RollingCoverage(AdaptiveOptionBandBarRow? x) => x is null ? null :
