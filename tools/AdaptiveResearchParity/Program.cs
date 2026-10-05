@@ -96,6 +96,7 @@ foreach (var (day, spec) in OpeningVolumeProjectionV1.DiscoveryOutOfFold.OrderBy
     Equal(string.Join(",", referenceTriggers), string.Join(",", af.Where(x => x.State == AdaptiveStateKind.Weak2).Select(x => x.Bar.BarSeq)), "Weak2 identities", day);
     history.AddRange(rf.Where(x => x.Rolling130k is not null).Select(x => Math.Abs(x.Rolling130k!.QuoteDeltaRatioTotal)));
     ResidualParity.Check(root, day, instruments.RootElement, actualBuilder.Bars);
+    await ObservationParity.CheckAsync(root, day, instruments.RootElement, af, spec.AdaptiveBarVolume, threshold);
     reports.Add(new { day, raw = raw.Length, clean = actual.Ticks.Count, bars = af.Count, opening, threshold, weak2 = referenceTriggers.Count });
     Console.WriteLine(JsonSerializer.Serialize(reports[^1]));
 }

@@ -67,7 +67,7 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
         {
             if (observation.H5TargetBarSeq <= lastBarSeq)
             {
-                await TryFinalizeAsync(source, observer, context, observation, lastBarSeq, ct);
+                await TryFinalizeAsync(source, observer, context, observation, lastBarSeq, ct, sessionClosing: true);
             }
 
             if (observation.Status == AdaptiveObservationStatus.PendingH5)
@@ -150,7 +150,8 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
         AdaptiveObserverSessionContext context,
         AdaptiveWeak2ObservationRow observation,
         int currentBarSeq,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool sessionClosing = false)
     {
         var targetBar = await observer.FutureBars.AsNoTracking()
             .SingleOrDefaultAsync(x => x.SessionId == context.Session.Id && x.BarSeq == observation.H5TargetBarSeq, ct);
@@ -173,11 +174,10 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
             return;
         }
 
-        // Pull only the required trigger->current window for candidate selection. We deliberately
-        // wait until every subscribed candidate has produced its first valid post-trigger quote;
-        // because this is watch-only there is no need to invent a timeout that would differ from
-        // the historical simulator's first-valid-quote policy.
-        var latestKnown = await LatestSourceAvailableAtAsync(source, sideInstruments.Select(x => x.Token).ToArray(), ct);
+        // Research chooses the first valid quote for EVERY candidate in the remaining session.
+        // A candidate with no quote yet can still beat today's current nearest-125 selection.
+        // Keep the observation pending until the candidate set is known, or session close.
+        var latestKnown = await LatestSourceAvailableAtAsync(source, sideInstruments.Select(x => x.Token).ToArray(), context.Session.OpeningWindowStartUtc, context.Session.OpeningWindowStartUtc.AddDays(1), ct);
         if (!latestKnown.HasValue || latestKnown.Value < targetBar.EndAvailableAtUtc)
         {
             return;
@@ -186,21 +186,22 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
         var candidateTicks = Normalize(await LoadTicksAsync(
             source,
             sideInstruments.Select(x => x.Token).ToArray(),
-            observation.TriggerTimestampUtc.AddMinutes(-1),
-            targetBar.EndAvailableAtUtc.AddMinutes(1),
+            context.Session.OpeningWindowStartUtc.AddMinutes(-1),
+            latestKnown.Value,
             ct));
 
         var firstByToken = candidateTicks
             .Select(ToQuote)
             .Where(x => x is not null
-                && x.Value.Point.AvailableAt >= observation.TriggerTimestampUtc
-                && x.Value.Point.AvailableAt <= targetBar.EndAvailableAtUtc)
+                && x.Value.Point.AvailableAt >= observation.TriggerTimestampUtc)
             .Select(x => x!.Value)
             .GroupBy(x => x.Token, StringComparer.Ordinal)
             .ToDictionary(
                 g => g.Key,
                 g => g.OrderBy(x => x.Point.AvailableAt).ThenBy(x => x.Point.Id).First().Point,
                 StringComparer.Ordinal);
+
+        if (!sessionClosing && firstByToken.Count < sideInstruments.Length) return;
 
         var eligible = sideInstruments
             .Where(i => firstByToken.TryGetValue(i.Token, out var q) && q.Ask >= PremiumMin && q.Ask <= PremiumMax)
@@ -230,7 +231,7 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
         var pairTicks = Normalize(await LoadTicksAsync(
             source,
             pairTokens,
-            baseBar.EndAvailableAtUtc.AddMinutes(-5),
+            context.Session.OpeningWindowStartUtc.AddMinutes(-1),
             latestKnown.Value,
             ct));
 
@@ -319,15 +320,15 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
     static async Task<DateTimeOffset?> LatestSourceAvailableAtAsync(
         NiftySignalDbContext db,
         string[] tokens,
+        DateTimeOffset sessionStart,
+        DateTimeOffset sessionEnd,
         CancellationToken ct)
     {
-        var latest = await db.Ticks.AsNoTracking()
-            .Where(x => tokens.Contains(x.Token))
-            .OrderByDescending(x => x.Id)
-            .Select(x => new { x.ExchangeTimestamp, x.ReceivedAt })
-            .FirstOrDefaultAsync(ct);
-        if (latest is null) return null;
-        return latest.ReceivedAt < latest.ExchangeTimestamp ? latest.ExchangeTimestamp : latest.ReceivedAt;
+        return await db.Ticks.AsNoTracking()
+            .Where(x => tokens.Contains(x.Token) && x.ExchangeTimestamp >= sessionStart.AddMinutes(-1)
+                && x.ExchangeTimestamp < sessionEnd && x.ReceivedAt < sessionEnd)
+            .Select(x => (DateTimeOffset?)(x.ReceivedAt < x.ExchangeTimestamp ? x.ExchangeTimestamp : x.ReceivedAt))
+            .MaxAsync(ct);
     }
 
     static async Task<List<Tick>> LoadTicksAsync(
@@ -373,7 +374,8 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
 
     static (string Token, QuotePoint Point)? ToQuote(string token, CleanObserverTick tick)
     {
-        if (!tick.HasTwoSidedQuote)
+        // Execution research accepts locked quotes; strict aggressor classification does not.
+        if (!(tick.Bid > 0d && tick.Ask >= tick.Bid))
         {
             return null;
         }

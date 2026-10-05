@@ -50,7 +50,12 @@ static class ResidualParity
             foreach(var row in rows)
             {
                 var seq=(int)N(row,"BarSeq"); var bar=bars.Single(x=>x.BarSeq==seq);
-                var actual=OptionResidualModel.Evaluate(anchor,bar.EndAvailableAtUtc,N(row,"FutureNow"),At(bar.EndAvailableAtUtc),rate).SingleOrDefault(x=>x.Variant==variant)
+                // The frozen Python reference consumes millisecond-formatted flow CSV. Compare
+                // pricing on that SAME input clock; direct exact-bar precision is checked separately.
+                var asOf = DateTimeOffset.Parse(row["EndIst"] + "+05:30",CultureInfo.InvariantCulture);
+                if (bar.EndAvailableAtUtc < asOf || (bar.EndAvailableAtUtc-asOf).TotalMilliseconds>=1)
+                    throw new InvalidOperationException("Reference CSV timestamp differs beyond serialization precision");
+                var actual=OptionResidualModel.Evaluate(anchor,asOf,N(row,"FutureNow"),At(asOf),rate).SingleOrDefault(x=>x.Variant==variant)
                     ?? throw new InvalidOperationException($"RESIDUAL {day} {variant} #{seq}: live unavailable, reference available");
                 var band=variant==ResidualVariant.AtmPlusMinus2;
                 var comparisons = new (string Field, double Actual)[] {
@@ -75,7 +80,7 @@ static class ResidualParity
         Console.WriteLine($"RESIDUAL {day}: fields={checks}, maxAbsoluteError={maximumError:R}");
     }
     static double N(Dictionary<string,string> row,string key)=>double.Parse(row[key],CultureInfo.InvariantCulture);
-    static IEnumerable<Dictionary<string,string>> ReadCsv(string path)
+    public static IEnumerable<Dictionary<string,string>> ReadCsv(string path)
     {
         using var parser=new TextFieldParser(path); parser.SetDelimiters(","); parser.HasFieldsEnclosedInQuotes=true;
         var header=parser.ReadFields()!;

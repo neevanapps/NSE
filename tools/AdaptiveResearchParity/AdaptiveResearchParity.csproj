@@ -3,6 +3,8 @@
     <OutputType>Exe</OutputType>
   </PropertyGroup>
   <ItemGroup>
+    <ProjectReference Include="../../NiftySignal.Host/NiftySignal.Host.csproj" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.InMemory" />
     <ProjectReference Include="../../NiftySignal.AdaptiveObserver/NiftySignal.AdaptiveObserver.csproj" />
     <ProjectReference Include="$(ResearchRoot)/NiftyResearcher.Bars/NiftyResearcher.Bars.csproj" />
   </ItemGroup>

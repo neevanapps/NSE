@@ -26,10 +26,10 @@ public sealed class AdaptiveRecoveryBufferTests
         db.Sessions.Add(context.Session);
         db.Runtime.Add(new AdaptiveObserverRuntimeRow { SessionId=context.Session.Id, LastHeartbeatUtc=cutoff });
         await db.SaveChangesAsync();
-        // Id and availability order differ. Per-token normalization clamps Id 2 to Id 1's time.
+        // Id and availability order differ. Both rows must survive in their causal order.
         source.Ticks.AddRange(
-            new Tick { Id=1, Token="FUT", Exchange=Exchange.Nfo, ExchangeTimestamp=cutoff.AddSeconds(2), ReceivedAt=cutoff.AddSeconds(2), LastPrice=23000m, Volume=1000 },
-            new Tick { Id=2, Token="FUT", Exchange=Exchange.Nfo, ExchangeTimestamp=cutoff.AddSeconds(-1), ReceivedAt=cutoff.AddSeconds(-1), LastPrice=23001m, Volume=1150 });
+            new Tick { Id=1, Token="FUT", Exchange=Exchange.Nfo, ExchangeTimestamp=cutoff.AddSeconds(2), ReceivedAt=cutoff.AddSeconds(2), LastPrice=23001m, Volume=1150 },
+            new Tick { Id=2, Token="FUT", Exchange=Exchange.Nfo, ExchangeTimestamp=cutoff.AddSeconds(-1), ReceivedAt=cutoff.AddSeconds(-1), LastPrice=23000m, Volume=1000 });
         await source.SaveChangesAsync();
         var reader=new AdaptiveSourceTickReader();
         var service = new AdaptiveStateRecoveryService(reader,
@@ -38,15 +38,15 @@ public sealed class AdaptiveRecoveryBufferTests
             NullLogger<AdaptiveStateRecoveryService>.Instance);
         var recovered=await service.RecoverAsync(source,db,context,cutoff,default);
         Assert.Equal(2,recovered.LastFetchedRawId);
-        Assert.Equal(new long[] { 1,2 },recovered.Pending.Select(x=>x.Tick.Id));
+        Assert.Equal(new long[] { 1 },recovered.Pending.Select(x=>x.Tick.Id));
         Assert.All(recovered.Pending,x=>Assert.Equal(cutoff.AddSeconds(2),x.Tick.AvailableAt));
+        Assert.Equal(2,recovered.LastProcessedTickId);
         Assert.Empty(recovered.Engine.FutureBars);
         Assert.Empty(await reader.ReadRawAfterIdAsync(source,recovered.Tokens,recovered.LastFetchedRawId,default));
         var baseline=new AdaptiveObserverEngine(context.Definition,context.WeeklyOptionExpiry,context.Session.RiskFreeRate,
             context.Session.StrongThreshold,context.SignalStartUtc,context.Options,context.ResidualAnchor);
-        var raw=await reader.ReadRawSessionAsync(source,context.Session.TradeDate,["FUT"],cutoff.AddSeconds(3),default);
-        var normalizer=new AdaptiveIncrementalTickNormalizer();
-        foreach(var item in raw) if(normalizer.Process(item.Token,item.Tick) is { } clean) baseline.Process(item.Token,clean);
+        var cleanTicks=await reader.ReadCleanSessionAsync(source,context.Session.TradeDate,["FUT"],cutoff.AddSeconds(3),default);
+        foreach(var item in cleanTicks) baseline.Process(item.Token,item.Tick);
         foreach(var item in recovered.Pending.OrderBy(x=>x.Tick.AvailableAt).ThenBy(x=>x.Tick.Id)) recovered.Engine.Process(item.Token,item.Tick);
         Assert.Equal(JsonSerializer.Serialize(baseline.FutureBars),JsonSerializer.Serialize(recovered.Engine.FutureBars));
         Assert.Equal(JsonSerializer.Serialize(baseline.PartialBar),JsonSerializer.Serialize(recovered.Engine.PartialBar));
