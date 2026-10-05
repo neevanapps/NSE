@@ -75,6 +75,7 @@ public sealed class AdaptiveStateRecoveryService(
             context.ResidualAnchor);
 
         var reconciled = 0;
+        var replayTriggers = new HashSet<int>();
         DateTimeOffset? lastAvailable = null;
         long? lastTickId = null;
         foreach (var group in clean.GroupBy(x=>x.Tick.AvailableAt))
@@ -86,6 +87,7 @@ public sealed class AdaptiveStateRecoveryService(
 
             foreach (var package in packages)
             {
+                if (package.IsActionableWeak2) replayTriggers.Add(package.FutureBar.BarSeq);
                 var result = await persistence.PersistOrVerifyAsync(
                     observer, context.Session, package, DateTimeOffset.UtcNow, ct);
                 await observations.ProcessPackageAsync(source, observer, context, package, ct);
@@ -99,6 +101,12 @@ public sealed class AdaptiveStateRecoveryService(
         var rebuiltLastSeq = engine.FutureBars.Where(x => x.IsComplete).Select(x => x.BarSeq).DefaultIfEmpty(0).Max();
         if (await observer.FutureBars.AsNoTracking().AnyAsync(x => x.SessionId == context.Session.Id && x.BarSeq > rebuiltLastSeq, ct))
             throw new InvalidOperationException("Persisted adaptive bars exceed reconstructed source history. Persisted history will not be overwritten.");
+
+        var persistedTriggers = await observer.Weak2Observations.AsNoTracking()
+            .Where(x => x.SessionId == context.Session.Id).Select(x => x.TriggerBarSeq).ToListAsync(ct);
+        if (!replayTriggers.SetEquals(persistedTriggers))
+            throw new InvalidOperationException("Adaptive observation restart trigger set differs from reconstructed source. Persisted history will not be overwritten.");
+        await observations.VerifyCompletedAsync(source, observer, context, ct);
 
         runtime = await observer.Runtime.SingleAsync(x => x.SessionId == context.Session.Id, ct);
         runtime.RuntimeStatus = AdaptiveRuntimeStatus.Live;

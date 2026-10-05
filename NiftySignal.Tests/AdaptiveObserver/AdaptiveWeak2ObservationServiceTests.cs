@@ -56,6 +56,11 @@ public sealed class AdaptiveWeak2ObservationServiceTests
         Assert.Equal(AdaptiveObservationStatus.Unavailable, row.Status);
         Assert.Contains("H5 did not complete", row.UnavailableReason);
         Assert.Equal(AdaptiveWeak2ObservationService.SelectionPolicyV1, row.SelectionPolicy);
+        row.StrongBaseBarSeq = 999;
+        await db.SaveChangesAsync();
+        var mismatch = await Assert.ThrowsAsync<InvalidOperationException>(() => service.ProcessPackageAsync(source, db, context, package, default));
+        Assert.Contains("StrongBaseBarSeq", mismatch.Message);
+        Assert.Equal(999, (await db.Weak2Observations.AsNoTracking().SingleAsync()).StrongBaseBarSeq);
     }
 
     [Theory]
@@ -107,6 +112,15 @@ public sealed class AdaptiveWeak2ObservationServiceTests
         Assert.Equal(5d,row.HoldingSeconds);
         await service.ProcessPackageAsync(source,db,context,new(h5.Bar,h5,band,[],false),default);
         Assert.Single(await db.Weak2Observations.ToListAsync());
+        db.ChangeTracker.Clear();
+        service = new AdaptiveWeak2ObservationService(NullLogger<AdaptiveWeak2ObservationService>.Instance);
+        await service.VerifyCompletedAsync(source, db, context, default);
+        row = await db.Weak2Observations.SingleAsync();
+        row.PnlPoints = 999d;
+        await db.SaveChangesAsync();
+        var mismatch = await Assert.ThrowsAsync<InvalidOperationException>(() => service.VerifyCompletedAsync(source, db, context, default));
+        Assert.Contains("PnlPoints", mismatch.Message);
+        Assert.Equal(999d, (await db.Weak2Observations.AsNoTracking().SingleAsync()).PnlPoints);
 
         static Tick Quote(long id,string token,DateTimeOffset time,decimal bid,decimal ask,long oi)=>new()
         { Id=id,Token=token,Exchange=Exchange.Nfo,ExchangeTimestamp=time,ReceivedAt=time,LastPrice=125,Volume=id,OpenInterest=oi,

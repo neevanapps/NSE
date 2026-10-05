@@ -3326,4 +3326,8 @@ The worker enters its outside-market delay with `_live == null`; session-close f
 
 Independent original-Python threshold JSON exposed discovery 2026-09-11 threshold `0.201714` versus live `0.20171428571428573`. Frozen research classifiers consume six-decimal CSV ratios. Threshold samples and classifier comparisons now use that exact six-decimal decision representation; full-precision persisted/displayed rolling metrics remain unchanged. A regression protects this separation. Prior checkpoint library parity did not establish this serialized Python gate; rerun the complete historical suite before claiming it.
 
-**Numbering note:** F67 is next-free going forward.
+## F67 — completed Weak2 execution projections skipped restart verification — FIX IMPLEMENTED / VALIDATION PENDING
+
+Recovery replay previously verified futures, rolling, bands and residuals but selected only pending H5 observations. Completed selection/OI/H5/MFE/MAE fields could remain corrupted without stopping recovery. Recovery now recalculates completed execution projections from frozen descriptors and source ticks, compares every scalar except surrogate ID, and fails without overwriting mismatches. Trigger identity/diagnostics are compared to each reconstructed package, and recovery rejects extra persisted trigger rows. Restart fixtures now verify completed results and deliberately corrupt PnL to prove rejection.
+
+**Numbering note:** F68 is next-free going forward.

@@ -85,6 +85,46 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
         }
     }
 
+    // Audit finding F67: completed execution projections must be verified, not skipped, on restart.
+    public async Task VerifyCompletedAsync(NiftySignalDbContext source, AdaptiveObserverDbContext observer,
+        AdaptiveObserverSessionContext context, CancellationToken ct)
+    {
+        var completed = await observer.Weak2Observations.AsNoTracking()
+            .Where(x => x.SessionId == context.Session.Id && x.Status == AdaptiveObservationStatus.Completed)
+            .OrderBy(x => x.TriggerBarSeq).ToListAsync(ct);
+        if (completed.Count == 0) return;
+        var ticks = await ReadCachedSourceAsync(source, context, ct);
+        var bars = await observer.FutureBars.AsNoTracking().Where(x => x.SessionId == context.Session.Id)
+            .ToDictionaryAsync(x => x.BarSeq, ct);
+        foreach (var actual in completed)
+        {
+            var expected = new AdaptiveWeak2ObservationRow
+            {
+                SessionId = actual.SessionId, StrongBaseBarSeq = actual.StrongBaseBarSeq,
+                Weak1BarSeq = actual.Weak1BarSeq, TriggerBarSeq = actual.TriggerBarSeq,
+                OldTrendDirection = actual.OldTrendDirection, ReversalDirection = actual.ReversalDirection,
+                StrictNoTurnDiagnostic = actual.StrictNoTurnDiagnostic, TriggerTimestampUtc = actual.TriggerTimestampUtc,
+                OptionSide = actual.OptionSide, AtmResidualDirectionalPct = actual.AtmResidualDirectionalPct,
+                BandResidualDirectionalPct = actual.BandResidualDirectionalPct,
+                ResidualSupportsReversalDiagnostic = actual.ResidualSupportsReversalDiagnostic,
+                H5TargetBarSeq = actual.H5TargetBarSeq, Status = AdaptiveObservationStatus.PendingH5,
+                SelectionPolicy = SelectionPolicyV1,
+            };
+            FinalizeFromCleanTicks(context, expected, bars[actual.StrongBaseBarSeq].EndAvailableAtUtc,
+                bars[actual.H5TargetBarSeq].EndAvailableAtUtc,
+                bars[actual.H5TargetBarSeq].Close - bars[actual.TriggerBarSeq].Close, ticks, sessionClosing: true);
+            foreach (var property in typeof(AdaptiveWeak2ObservationRow).GetProperties())
+            {
+                if (property.Name == nameof(AdaptiveWeak2ObservationRow.Id)) continue;
+                var a = property.GetValue(actual); var e = property.GetValue(expected);
+                if (a is double av && e is double ev && double.IsFinite(av) && double.IsFinite(ev)
+                    && Math.Abs(av - ev) <= 1e-9) continue;
+                if (Equals(a, e)) continue;
+                throw new InvalidOperationException($"Adaptive observation restart parity mismatch at BarSeq {actual.TriggerBarSeq}: {property.Name}. Persisted history will not be overwritten.");
+            }
+        }
+    }
+
     async Task EnsureObservationAsync(
         AdaptiveObserverDbContext db,
         AdaptiveObserverSessionContext context,
@@ -97,11 +137,8 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
             throw new InvalidOperationException($"Weak2 BarSeq {package.FutureBar.BarSeq} has no strong-base/weak1 identity.");
         }
 
-        if (await db.Weak2Observations.AnyAsync(
-            x => x.SessionId == context.Session.Id && x.TriggerBarSeq == package.FutureBar.BarSeq, ct))
-        {
-            return;
-        }
+        var existing = await db.Weak2Observations.SingleOrDefaultAsync(
+            x => x.SessionId == context.Session.Id && x.TriggerBarSeq == package.FutureBar.BarSeq, ct);
 
         var bars = await db.FutureBars.AsNoTracking()
             .Where(x => x.SessionId == context.Session.Id
@@ -120,7 +157,7 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
         var residualBand = package.Residuals.FirstOrDefault(x => x.Variant == ResidualVariant.AtmPlusMinus2)?.Reading?.DirectionalResidualPct;
         var reversal = -oldDirection;
 
-        db.Weak2Observations.Add(new AdaptiveWeak2ObservationRow
+        var expected = new AdaptiveWeak2ObservationRow
         {
             SessionId = context.Session.Id,
             StrongBaseBarSeq = strongSeq,
@@ -139,9 +176,32 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
             H5TargetBarSeq = package.FutureBar.BarSeq + 5,
             Status = AdaptiveObservationStatus.PendingH5,
             SelectionPolicy = SelectionPolicyV1,
-        });
+        };
+        if (existing is not null)
+        {
+            foreach (var name in IdentityFields)
+            {
+                var property = typeof(AdaptiveWeak2ObservationRow).GetProperty(name)!;
+                var actualValue = property.GetValue(existing); var expectedValue = property.GetValue(expected);
+                if (actualValue is double av && expectedValue is double ev && double.IsFinite(av) && double.IsFinite(ev)
+                    && Math.Abs(av - ev) <= 1e-9) continue;
+                if (Equals(actualValue, expectedValue)) continue;
+                throw new InvalidOperationException($"Adaptive observation restart identity mismatch at BarSeq {package.FutureBar.BarSeq}: {name}. Persisted history will not be overwritten.");
+            }
+            return;
+        }
+        db.Weak2Observations.Add(expected);
         await db.SaveChangesAsync(ct);
     }
+
+    static readonly string[] IdentityFields = [
+        nameof(AdaptiveWeak2ObservationRow.SessionId), nameof(AdaptiveWeak2ObservationRow.StrongBaseBarSeq),
+        nameof(AdaptiveWeak2ObservationRow.Weak1BarSeq), nameof(AdaptiveWeak2ObservationRow.TriggerBarSeq),
+        nameof(AdaptiveWeak2ObservationRow.OldTrendDirection), nameof(AdaptiveWeak2ObservationRow.ReversalDirection),
+        nameof(AdaptiveWeak2ObservationRow.StrictNoTurnDiagnostic), nameof(AdaptiveWeak2ObservationRow.TriggerTimestampUtc),
+        nameof(AdaptiveWeak2ObservationRow.OptionSide), nameof(AdaptiveWeak2ObservationRow.AtmResidualDirectionalPct),
+        nameof(AdaptiveWeak2ObservationRow.BandResidualDirectionalPct), nameof(AdaptiveWeak2ObservationRow.ResidualSupportsReversalDiagnostic),
+        nameof(AdaptiveWeak2ObservationRow.H5TargetBarSeq), nameof(AdaptiveWeak2ObservationRow.SelectionPolicy) ];
 
     long _cachedSessionId;
     DateOnly _cachedDay;
