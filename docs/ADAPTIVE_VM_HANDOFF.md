@@ -27,6 +27,8 @@ The script verifies the clean source checkout and SHA, creates an immutable Git 
 
 ## Verify after deployment
 
+The screenshot release additionally requires Dashboard-local Telegram settings, capture Chromium and the outbox migration. Follow [ADAPTIVE_TELEGRAM_SCREENSHOTS.md](ADAPTIVE_TELEGRAM_SCREENSHOTS.md), including **Send pre-live test** before the 09:30 initialization. Host's bot settings alone do not enable Dashboard delivery.
+
 - Both `NiftySignalHost` and `NiftySignalDashboard` services are running. Check their installed binary timestamps and startup logs; confirm `master`, the exact release SHA and build UTC in the Dashboard. An existing immutable daily session may correctly retain the SHA that originally created it; compare the current **runtime build** metadata too.
 - Host migration/startup succeeds without permission errors. Check logs for missing discovery history, source-history truncation or persisted-row reconciliation errors. Do not delete adaptive rows to conceal a failed recovery.
 - Access-token controls and live quotes work with the VM broker session. Before 09:30 the observer waits; after 09:30 it initializes the frozen session and then consumes persisted raw ticks.

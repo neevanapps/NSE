@@ -40,7 +40,9 @@ public sealed class AdaptiveScreenshotRenderer(IOptions<AdaptiveScreenshotOption
         await page.GotoAsync(origin.ToString());
         if (await page.Locator(".adaptive-observer").CountAsync() != 0)
             throw new InvalidOperationException("Capture-only authentication unexpectedly grants normal Dashboard access.");
-        await page.GotoAsync(new Uri(origin, $"adaptive-screenshot/{job.Id}").ToString());
+        var response = await page.GotoAsync(new Uri(origin, $"adaptive-screenshot/{job.Id}").ToString());
+        if (response is null || response.Status >= 400)
+            throw new InvalidOperationException($"Capture page returned HTTP {response?.Status}; check Dashboard server logs.");
         await page.Locator(".adaptive-observer[data-capture-ready='true']").WaitForAsync();
         await Microsoft.Playwright.Assertions.Expect(page.Locator(".adaptive-capture")).ToHaveAttributeAsync("data-job-id", job.Id.ToString());
         if (job.SessionId is not null)

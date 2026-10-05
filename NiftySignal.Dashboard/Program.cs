@@ -126,7 +126,9 @@ builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationSc
         options.ExpireTimeSpan = TimeSpan.FromMinutes(2);
         options.SlidingExpiration = false;
     });
-builder.Services.AddAuthorization();
+builder.Services.AddAuthorization(options => options.AddPolicy("AdaptiveScreenshotRead", policy =>
+    policy.AddAuthenticationSchemes(CookieAuthenticationDefaults.AuthenticationScheme, AdaptiveScreenshotRenderer.AuthenticationScheme)
+        .RequireAuthenticatedUser()));
 builder.Services.AddCascadingAuthenticationState();
 
 var app = builder.Build();
