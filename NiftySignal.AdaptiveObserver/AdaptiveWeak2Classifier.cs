@@ -46,55 +46,48 @@ public static class AdaptiveWeak2Classifier
                 continue;
             }
 
+            // IMPORTANT: evaluate an already-open strong -> weakening episode BEFORE deciding
+            // that the current row can itself become a new strong base. In the frozen discovery
+            // definition Weak1/Weak2 are allowed to remain above the strong threshold.
+            if (strongBase?.Rolling is { } baseRolling)
+            {
+                var sameDirection =
+                    rolling.StrictDeltaDirection == baseRolling.StrictDeltaDirection
+                    && rolling.PriceDirection == baseRolling.PriceDirection
+                    && rolling.StrictDeltaDirection == rolling.PriceDirection
+                    && rolling.StrictDeltaDirection != 0;
+
+                if (sameDirection && row.StrictDominanceEvolution == "Weakening")
+                {
+                    if (weak1 is null)
+                    {
+                        row.WeakeningSequence = 1;
+                        row.State = AdaptiveStateKind.Weak1;
+                        weak1 = row;
+                        continue;
+                    }
+
+                    if (weak1.Rolling is { } weak1Rolling
+                        && weak1Rolling.StrictDeltaDirection == rolling.StrictDeltaDirection
+                        && weak1Rolling.PriceDirection == rolling.PriceDirection)
+                    {
+                        row.WeakeningSequence = 2;
+                        row.State = AdaptiveStateKind.Weak2;
+                        strongBase = null;
+                        weak1 = null;
+                        continue;
+                    }
+                }
+
+                // Episode broke. The current row is still eligible to seed a NEW episode if it
+                // independently qualifies as strong.
+                strongBase = null;
+                weak1 = null;
+            }
+
             if (row.IsStrong)
             {
                 strongBase = row;
-                weak1 = null;
-                continue;
-            }
-
-            if (strongBase?.Rolling is not { } baseRolling)
-            {
-                continue;
-            }
-
-            var sameDirection =
-                rolling.StrictDeltaDirection == baseRolling.StrictDeltaDirection
-                && rolling.PriceDirection == baseRolling.PriceDirection
-                && rolling.StrictDeltaDirection == rolling.PriceDirection
-                && rolling.StrictDeltaDirection != 0;
-
-            if (!sameDirection || row.StrictDominanceEvolution != "Weakening")
-            {
-                strongBase = null;
-                weak1 = null;
-                continue;
-            }
-
-            if (weak1 is null)
-            {
-                row.WeakeningSequence = 1;
-                row.State = AdaptiveStateKind.Weak1;
-                weak1 = row;
-                continue;
-            }
-
-            if (weak1.Rolling is { } weak1Rolling
-                && weak1Rolling.StrictDeltaDirection == rolling.StrictDeltaDirection
-                && weak1Rolling.PriceDirection == rolling.PriceDirection)
-            {
-                row.WeakeningSequence = 2;
-                row.State = AdaptiveStateKind.Weak2;
-
-                // Frozen definition is a three-state episode. Do not allow a third weakening row
-                // to become another overlapping Weak2 off the same strong base.
-                strongBase = null;
-                weak1 = null;
-            }
-            else
-            {
-                strongBase = null;
-                weak1 = null;
             }
         }
     }
