@@ -3308,3 +3308,44 @@ Nifty rows — behaviorally a no-op today. This closes the gap before the next
   `NiftySignal.Host`/`NiftySignal.Dashboard`, and nothing was deployed.
 
 **Numbering note:** F63 is next-free going forward.
+
+
+## F63 — adaptive diagnostics use a different clock precision from frozen Python research — FIXED
+
+The independent historical residual gate observed an expected-price difference of 1.1206466e-6 points at discovery 2026-09-08 BarSeq 20 after correcting the Gaussian/IV solver. The C# exact bar retains sub-millisecond receive precision; frozen Python residual/H5 scripts consume `FlowEvolutionCsv` timestamps truncated to milliseconds. The formula harness now supplies identical serialized clock inputs, without relaxing its 1e-6 numeric limit. This validates formulas only; it does not establish integrated engine clock/quote selection or observation latency parity. **Release blocker:** resolve this clock policy explicitly and pass full pipeline residual/H5 parity. Fix now implemented: diagnostic timestamps floor to the frozen research millisecond clock, prior boundary quotes exclude later sub-millisecond updates, and stable availability groups include all same-boundary option marks while exact futures timestamps remain unchanged. Clock and availability-group regression tests plus complete engine replay comparisons are added; Full complete-engine residual/H5 integration passed all 13 discovery sessions at e91d1ca, private workflow 37324830737.
+
+## F64 — adaptive restart option universe is not immutable — FIXED
+
+`AdaptiveSessionCoordinator.LoadExistingAsync` reloads today's instruments from the source table. The session freezes residual components and rate, but does not persist the complete option descriptor universe used by adaptive bands and Weak2 selection. An instrument refresh or corrected strike/lot size can change restart outputs or future observation selection. **Release blocker:** persist and reuse the original universe; add a mutation/restart test. Fix: session serializes the complete option descriptors and rate; restart deserializes and validates those descriptors without querying mutable source instruments. Source mutation/rate-change regression passed at `9663879`, workflow `37320556273`. The follow-up generated migration adds a non-null text column; older unsnapshotted adaptive rows fail closed instead of inventing an original universe.
+
+## F65 — persisted pending observations are not recovered after an outside-hours restart — FIXED
+
+The worker enters its outside-market delay with `_live == null`; session-close finalization only runs for an existing in-memory live state. A crash near close followed by an after-hours restart can leave persisted pending H5 observations unresolved. Draining the buffer before a normal in-process close is fixed, but this startup path remains uncovered. **Release blocker:** recover/finalize persisted ended sessions and test restart across market close. Fix: dedicated ended-session recovery replays/verifies persisted source, finalizes pending observations and closes runtime both outside hours and before starting the next session. Same-day and next-day idempotent restart tests passed at `9663879`, workflow `37320556273`. Missing source history beyond reconstructed bars also fails closed.
+
+## F66 — adaptive strong threshold bypassed frozen CSV decision precision — FIXED
+
+Independent original-Python threshold JSON exposed discovery 2026-09-11 threshold `0.201714` versus live `0.20171428571428573`. Frozen research classifiers consume six-decimal CSV ratios. Threshold samples and classifier comparisons now use that exact six-decimal decision representation; full-precision persisted/displayed rolling metrics remain unchanged. A regression protects this separation. Prior checkpoint library parity did not establish this serialized Python gate; The complete historical suite passed at e91d1ca (private workflow 37324830737), including original Python thresholds for all 13 discovery sessions.
+
+## F67 — completed Weak2 execution projections skipped restart verification — FIXED
+
+Recovery replay previously verified futures, rolling, bands and residuals but selected only pending H5 observations. Completed selection/OI/H5/MFE/MAE fields could remain corrupted without stopping recovery. Recovery now recalculates completed execution projections from frozen descriptors and source ticks, compares every scalar except surrogate ID, and fails without overwriting mismatches. Trigger identity/diagnostics are compared to each reconstructed package, and recovery rejects extra persisted trigger rows. Restart fixtures now verify completed results and deliberately corrupt PnL to prove rejection.
+
+## F68 — watch-only Host still starts legacy paper executors — FIXED
+
+`LiveOptionsScoreEngine` and `LiveFuturesCrossoverEngine` are hosted workers calling `LivePaperTradeExecutor.OpenAsync/CloseAsync`. Their registration contradicted the roadmap's deployment gate that all order/paper actions are disabled. Both registrations are removed for the adaptive watch-only cutover; code, tables and existing records remain for rollback. Ingestion and legacy volume-bar persistence continue. This deliberately stops new legacy paper observations too. Full Host regression and release call-site review must pass before deployment.
+
+## F69 — full solution omitted four root projects — FIXED
+
+`NiftySignal.slnx` omitted BacktestData, DataSync, MetricTrials and VolumeBarData. Some were built only transitively; a standalone harness relying on a completed Release solution build could not find their Release reference assemblies. All root projects and the Dashboard validation console are now explicitly included. The browser gate uses this single complete solution build, removing the reference-skip shortcut. Full Release build must pass for these formerly omitted projects too.
+
+## F70 — missing discovery history silently changes strong threshold — FIXED
+
+Historical bootstrap skipped incomplete discovery dates and returned successfully even with no source. The coordinator could freeze a threshold from only the available subset; a fresh start more than 45 days later also excluded mandatory older dates. Bootstrap now queries all prior source dates and refuses readiness until every required prior discovery session has been seeded. Cancellation propagates. A missing-source regression proves no daily configuration can be based on a silently partial discovery history; the real-source 13-session gate must still pass after this change. Production must have the frozen discovery raw source available before the observer starts.
+
+## F71 — Dashboard selector refresh can be lost during prerender or an active read — FIXED
+
+The first browser selector gate found five requested rows still displaying ten. Controls could be changed before the Blazor circuit became interactive; additionally ReloadAsync's nonblocking semaphore skipped any selector/push arriving during another read, while header polling saw unchanged sequence and never repaired the requested row count. Controls now wait for interactive rendering and refresh requests queue behind an active read using the latest selector. Disposal cancels/drains readers. The browser test explicitly blocks a PostgreSQL future-bar read, changes rows again, proves the server received that selection, then unlocks and requires all three grids to show the latest count. Latency samples also wait two animation frames to include browser painting.
+
+**Validation checkpoint, 2026-10-05:** F67 completed-projection corruption rejection passed seven real PostgreSQL recovery boundaries; F68 hosted call-site review confirms only ingestion, volume-bar writer and adaptive observer are started, and full regression passed; F69 complete Release solution builds with zero warnings/errors; F70 missing-history unit regression and actual-source 13-session historical gate passed; F71 actual blocked PostgreSQL reader/selector race and 36 browser combinations passed. Public run 37332433765 at 64ece10: 48 adaptive / 1,123 total tests, P95 painted three-grid latency 158.8837 ms, max 181.7617 ms. Private frozen historical run 37330577623 at a43ca3c passed all 13 discovery sessions, source/bootstrap, independent band/rolling, residual/H5 and 87 historical engine resets. This is CI/historical validation; VM service/restart/broker checks remain manual. The final fixture strengthens distinguishable CE/PE, residual and unavailable-row values without changing production calculations.
+
+**Numbering note:** F72 is next-free going forward.

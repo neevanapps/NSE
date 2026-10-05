@@ -1,6 +1,8 @@
+using NiftySignal.AdaptiveObserverData;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Options;
+using NiftySignal.Domain;
 using NiftySignal.Domain.Abstractions;
 using NiftySignal.Domain.Configuration;
 using NiftySignal.Host;
@@ -28,6 +30,9 @@ Log.Logger = new LoggerConfiguration()
 try
 {
     Log.Information("Starting NiftySignal Host");
+    var buildIdentity = BuildIdentity.Current();
+    Log.Information("Build identity: {SourceBranch} @ {CommitSha}, build UTC {BuildUtc}",
+        buildIdentity.SourceBranch, buildIdentity.CommitSha, buildIdentity.BuildUtc);
 
     var builder = Host.CreateApplicationBuilder(args);
 
@@ -61,6 +66,17 @@ try
             Database = VolumeBarPopulator.VolumeBarDatabaseName,
         }.ConnectionString;
         options.UseNpgsql(volumeBarConnectionString);
+    });
+
+    builder.Services.AddDbContext<AdaptiveObserverDbContext>(options =>
+    {
+        var baseConnectionString = builder.Configuration.GetConnectionString("NiftySignalDb")
+            ?? throw new InvalidOperationException("ConnectionStrings:NiftySignalDb is not set.");
+        var adaptiveConnectionString = new NpgsqlConnectionStringBuilder(baseConnectionString)
+        {
+            Database = AdaptiveObserverDbContext.DatabaseName,
+        }.ConnectionString;
+        options.UseNpgsql(adaptiveConnectionString);
     });
 
     builder.Services.Configure<TelegramOptions>(builder.Configuration.GetSection(TelegramOptions.SectionName));
@@ -151,7 +167,8 @@ try
     // percentile/Max-Pain/trading-hours rules the offline backtest uses -- see LiveOptionsScoreEngine's
     // own doc comment for why this is a separate polling worker rather than literally chained after
     // LiveVolumeBarWriter. Still no paper trading (no strike selection, no fills) -- that's Phase D.
-    builder.Services.AddHostedService<LiveOptionsScoreEngine>();
+    // Audit finding F68: watch-only cutover leaves legacy paper executors unhosted.
+    // LiveOptionsScoreEngine remains in source for rollback; starting it would open paper positions.
 
     // Futures-crossover live-wiring task (2026-09-21, docs/LIVE_PARITY_PLAN.md "Futures crossover:
     // wired live" section): the locked 8-fast/40-slow/5-point-threshold SMA crossover on
@@ -160,7 +177,20 @@ try
     // doc comment). Purely additive/local: registering this hosted service does not touch
     // deploy.ps1 or the VM in any way -- it only starts running the next time THIS Host process is
     // built and actually run.
-    builder.Services.AddHostedService<LiveFuturesCrossoverEngine>();
+    // Audit finding F68: LiveFuturesCrossoverEngine also calls the paper executor.
+    // Keep its source/tables for rollback, but do not run it during prospective watch observation.
+
+    // Adaptive Market Observer V1: watch-only, independent of the legacy score/trading workers.
+    // It reads authoritative persisted raw ticks, writes its own isolated database and never
+    // creates a paper or real order.
+    builder.Services.AddSingleton<AdaptiveSourceTickReader>();
+    builder.Services.AddSingleton<AdaptiveHistoricalBootstrapService>();
+    builder.Services.AddSingleton<AdaptiveSessionCoordinator>();
+    builder.Services.AddSingleton<AdaptiveObserverPersistence>();
+    builder.Services.AddSingleton<AdaptiveWeak2ObservationService>();
+    builder.Services.AddSingleton<AdaptiveStateRecoveryService>();
+    builder.Services.AddSingleton<AdaptiveEndedSessionRecoveryService>();
+    builder.Services.AddHostedService<AdaptiveObserverWorker>();
 
     var host = builder.Build();
 
@@ -174,6 +204,9 @@ try
         // database this Host process now writes to for the first time.
         var volumeBarDb = scope.ServiceProvider.GetRequiredService<VolumeBarDbContext>();
         volumeBarDb.Database.Migrate();
+
+        var adaptiveObserverDb = scope.ServiceProvider.GetRequiredService<AdaptiveObserverDbContext>();
+        adaptiveObserverDb.Database.Migrate();
 
         // Force eager construction (and therefore eager startup validation -- see
         // ValidatedOptionsMonitor's own doc comment) rather than waiting for the first cadence

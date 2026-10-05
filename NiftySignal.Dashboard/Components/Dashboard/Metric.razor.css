@@ -1,0 +1,23 @@
+.adaptive-metric {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    min-width: 0;
+}
+
+.adaptive-metric-label {
+    display: block;
+    color: var(--text-dim);
+    font-size: .7rem;
+    margin-bottom: 3px;
+}
+
+.adaptive-metric-value {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: .82rem;
+    font-variant-numeric: tabular-nums;
+}

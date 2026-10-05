@@ -130,5 +130,26 @@ public sealed class DashboardPushClient : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Signal-only notification emitted after one adaptive completed-bar package commits.
+    /// Dashboard re-reads the authoritative adaptive database; this payload is only an invalidation key.
+    /// </summary>
+    public async Task PushAdaptiveStateChangedAsync(long sessionId, int barSeq, CancellationToken ct)
+    {
+        if (_connection.State != HubConnectionState.Connected)
+        {
+            return;
+        }
+
+        try
+        {
+            await _connection.SendAsync("PushAdaptiveStateChanged", sessionId, barSeq, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Dashboard adaptive-state push failed for SessionId={SessionId}, BarSeq={BarSeq}", sessionId, barSeq);
+        }
+    }
+
     public async ValueTask DisposeAsync() => await _connection.DisposeAsync();
 }

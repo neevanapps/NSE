@@ -1,3 +1,4 @@
+using NiftySignal.AdaptiveObserverData;
 using System.Security.Claims;
 using Microsoft.AspNetCore.Antiforgery;
 using Microsoft.AspNetCore.Authentication;
@@ -57,11 +58,23 @@ builder.Services.AddDbContextFactory<VolumeBarDbContext>(options =>
     options.UseNpgsql(volumeBarConnectionString);
 });
 
+builder.Services.AddDbContextFactory<AdaptiveObserverDbContext>(options =>
+{
+    var baseConnectionString = builder.Configuration.GetConnectionString("NiftySignalDb")
+        ?? throw new InvalidOperationException("ConnectionStrings:NiftySignalDb is not set.");
+    var adaptiveConnectionString = new NpgsqlConnectionStringBuilder(baseConnectionString)
+    {
+        Database = AdaptiveObserverDbContext.DatabaseName,
+    }.ConnectionString;
+    options.UseNpgsql(adaptiveConnectionString);
+});
+
 builder.Services.Configure<FlatTradeOptions>(builder.Configuration.GetSection(FlatTradeOptions.SectionName));
 builder.Services.Configure<PricingOptions>(builder.Configuration.GetSection(PricingOptions.SectionName));
 builder.Services.AddHttpClient<FlatTradeAuthClient>();
 
 builder.Services.AddSingleton<LiveDataService>();
+builder.Services.AddSingleton<AdaptiveObserverDataService>();
 
 // Single-user cookie auth (2026-09-05) -- see DashboardAuthOptions for why this is deliberately
 // minimal. Sliding expiration so a phone left on the dashboard doesn't get logged out mid-session.

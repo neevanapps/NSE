@@ -1,0 +1,11 @@
+.adaptive-grid-section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+}
+
+.adaptive-grid-section h3 {
+    margin: 0 0 10px;
+    font-size: .95rem;
+}

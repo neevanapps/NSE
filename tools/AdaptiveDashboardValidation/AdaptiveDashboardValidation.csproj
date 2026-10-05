@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType></PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../NiftySignal.Host/NiftySignal.Host.csproj" />
+    <PackageReference Include="Microsoft.Playwright" VersionOverride="1.55.0" />
+  </ItemGroup>
+</Project>

@@ -51,6 +51,10 @@ param(
 
     [switch] $SkipTests,
 
+    # Release gate: pass the reviewed master SHA to prove the checkout being published.
+    [ValidatePattern('^[0-9a-fA-F]{40}$')]
+    [string] $ExpectedCommitSha,
+
     # Bypasses the "desktop services are still running" guard. Only correct when you have
     # deliberately decided both machines should be up (they normally must not be).
     [switch] $Force
@@ -58,6 +62,21 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = $PSScriptRoot
+
+# Assembly metadata must identify the source actually published, including untracked source files.
+$sourceStatus = & git -C $repoRoot status --porcelain --untracked-files=normal
+if ($LASTEXITCODE -ne 0) { throw 'Cannot verify source worktree; nothing deployed.' }
+if ($sourceStatus) { throw 'Deployment requires a clean source worktree; commit or remove changes first. Nothing deployed.' }
+$verifiedSha = (& git -C $repoRoot rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0) { throw 'Cannot identify source revision; nothing deployed.' }
+if ($ExpectedCommitSha -and $verifiedSha -ne $ExpectedCommitSha) {
+    throw "Expected source SHA $ExpectedCommitSha but checkout is $verifiedSha. Nothing deployed."
+}
+
+$sourceBranch = (& git -C $repoRoot rev-parse --abbrev-ref HEAD).Trim()
+if ($ExpectedCommitSha -and $sourceBranch -ne 'master') {
+    throw 'Expected-SHA release deployment requires the master branch. Nothing deployed.'
+}
 
 $services = @()
 if ($Service -eq 'Both' -or $Service -eq 'Host') {
@@ -89,18 +108,34 @@ if ($Target -eq 'Vm' -and -not $Force) {
     }
 }
 
+# Publish a tracked immutable archive of the verified revision. Subsequent editor changes
+# cannot change the binaries while leaving their assembly SHA unchanged.
+$stagingRoot = Join-Path $repoRoot 'artifacts\deploy-staging'
+$sourceTag = [Guid]::NewGuid().ToString('N')
+$sourceArchive = Join-Path $stagingRoot "source-$sourceTag.zip"
+$publishSourceRoot = Join-Path $stagingRoot "source-$sourceTag"
+New-Item -ItemType Directory -Path $stagingRoot -Force | Out-Null
+& git -C $repoRoot archive --format=zip --output $sourceArchive $verifiedSha
+if ($LASTEXITCODE -ne 0) { throw 'Cannot archive the verified source revision; nothing deployed.' }
+Expand-Archive -LiteralPath $sourceArchive -DestinationPath $publishSourceRoot
+
 # --- Tests -----------------------------------------------------------------------------
 if (-not $SkipTests) {
     Write-Step "Running tests"
-    & dotnet test $repoRoot --nologo
+    & dotnet test $publishSourceRoot --nologo
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Tests failed -- nothing deployed." -ForegroundColor Red
         exit 1
     }
 }
 
+# --- Build/source identity ---------------------------------------------------------------
+$commitSha = $verifiedSha
+$buildUtc = [DateTimeOffset]::UtcNow.ToString('O')
+Write-Host "    source: $sourceBranch @ $commitSha"
+Write-Host "    build : $buildUtc UTC"
+
 # --- Publish to staging ----------------------------------------------------------------
-$stagingRoot = Join-Path $repoRoot 'artifacts\deploy-staging'
 
 foreach ($svc in $services) {
     $staging = Join-Path $stagingRoot $svc.Project
@@ -110,7 +145,7 @@ foreach ($svc in $services) {
         Remove-Item $staging -Recurse -Force
     }
 
-    & dotnet publish (Join-Path $repoRoot $svc.Project) -c Release -o $staging --nologo
+    & dotnet publish (Join-Path $publishSourceRoot $svc.Project) -c Release -o $staging --nologo "-p:SourceBranch=$sourceBranch" "-p:CommitSha=$commitSha" "-p:BuildUtc=$buildUtc"
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Publish failed for $($svc.Project) -- nothing deployed." -ForegroundColor Red
         exit 1
@@ -124,6 +159,9 @@ foreach ($svc in $services) {
         Write-Host "    stripped appsettings.Local.json from the staged output"
     }
 }
+
+Remove-Item -LiteralPath $sourceArchive -Force
+Remove-Item -LiteralPath $publishSourceRoot -Recurse -Force
 
 # --- Deploy ----------------------------------------------------------------------------
 if ($Target -eq 'Local') {
