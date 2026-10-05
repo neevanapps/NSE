@@ -99,6 +99,13 @@ if (-not $SkipTests) {
     }
 }
 
+# --- Build/source identity ---------------------------------------------------------------
+$sourceBranch = (& git -C $repoRoot rev-parse --abbrev-ref HEAD).Trim()
+$commitSha = (& git -C $repoRoot rev-parse HEAD).Trim()
+$buildUtc = [DateTimeOffset]::UtcNow.ToString('O')
+Write-Host "    source: $sourceBranch @ $commitSha"
+Write-Host "    build : $buildUtc UTC"
+
 # --- Publish to staging ----------------------------------------------------------------
 $stagingRoot = Join-Path $repoRoot 'artifacts\deploy-staging'
 
@@ -110,7 +117,7 @@ foreach ($svc in $services) {
         Remove-Item $staging -Recurse -Force
     }
 
-    & dotnet publish (Join-Path $repoRoot $svc.Project) -c Release -o $staging --nologo
+    & dotnet publish (Join-Path $repoRoot $svc.Project) -c Release -o $staging --nologo `-p:SourceBranch=$sourceBranch` `-p:CommitSha=$commitSha` `-p:BuildUtc=$buildUtc`
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Publish failed for $($svc.Project) -- nothing deployed." -ForegroundColor Red
         exit 1
