@@ -126,6 +126,10 @@ try
     builder.Services.Configure<DashboardPushOptions>(builder.Configuration.GetSection(DashboardPushOptions.SectionName));
     builder.Services.AddSingleton<DashboardPushClient>();
 
+    // Observation-only adaptive exact-volume research clock. It receives the same NIFTY
+    // futures ticks as LiveFeatureEngine but never feeds a trading decision.
+    builder.Services.AddSingleton<AdaptiveFuturesObservationEngine>();
+
     builder.Services.AddHostedService<MarketDataIngestionWorker>();
 
     // Phase G of docs/LIVE_PARITY_PLAN.md (perf fix): Singleton, owned exclusively by
