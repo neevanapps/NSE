@@ -1,5 +1,5 @@
 .adaptive-metric {
-    background: var(--panel);
+    background: var(--surface);
     border: 1px solid var(--border);
     border-radius: 6px;
     padding: 8px 10px;
@@ -8,7 +8,7 @@
 
 .adaptive-metric-label {
     display: block;
-    color: var(--muted);
+    color: var(--text-dim);
     font-size: .7rem;
     margin-bottom: 3px;
 }
