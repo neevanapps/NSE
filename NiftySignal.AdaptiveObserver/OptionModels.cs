@@ -134,4 +134,5 @@ public sealed record OptionBandSideMetrics(
     long TradeUpdates,
     long? OiOpen,
     long? OiClose,
-    long? OiChange);
+    long? OiChange,
+    double? OiChangePct);
