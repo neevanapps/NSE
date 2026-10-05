@@ -27,6 +27,7 @@ public sealed class AdaptiveObserverWorker(
     static readonly TimeSpan StableOrderingLag = TimeSpan.FromSeconds(2);
 
     LiveState? _live;
+    DateOnly? _historyBootstrappedFor;
 
     sealed class LiveState(
         AdaptiveObserverSessionContext context,
@@ -94,7 +95,12 @@ public sealed class AdaptiveObserverWorker(
         var source = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
         var observer = scope.ServiceProvider.GetRequiredService<AdaptiveObserverDbContext>();
 
-        await historicalBootstrap.EnsurePriorSessionsAsync(source, observer, day, ct);
+        if (_historyBootstrappedFor != day)
+        {
+            await historicalBootstrap.EnsurePriorSessionsAsync(source, observer, day, ct);
+            _historyBootstrappedFor = day;
+        }
+
         var context = await coordinator.TryGetOrCreateAsync(source, observer, day, nowUtc, ct);
         if (context is null)
         {
