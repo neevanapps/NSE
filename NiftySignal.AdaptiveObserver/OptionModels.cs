@@ -136,4 +136,7 @@ public sealed record OptionBandSideMetrics(
     long? OiOpen,
     long? OiClose,
     long? OiChange,
-    double? OiChangePct);
+    double? OiChangePct,
+    double? PremiumNotionalOiOpen,
+    double? PremiumNotionalOiClose,
+    double? PremiumNotionalOiChange);
