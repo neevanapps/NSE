@@ -117,7 +117,7 @@ foreach ($svc in $services) {
         Remove-Item $staging -Recurse -Force
     }
 
-    & dotnet publish (Join-Path $repoRoot $svc.Project) -c Release -o $staging --nologo `-p:SourceBranch=$sourceBranch` `-p:CommitSha=$commitSha` `-p:BuildUtc=$buildUtc`
+    & dotnet publish (Join-Path $repoRoot $svc.Project) -c Release -o $staging --nologo "-p:SourceBranch=$sourceBranch" "-p:CommitSha=$commitSha" "-p:BuildUtc=$buildUtc"
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Publish failed for $($svc.Project) -- nothing deployed." -ForegroundColor Red
         exit 1
