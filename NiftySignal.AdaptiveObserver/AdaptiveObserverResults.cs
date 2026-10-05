@@ -10,11 +10,16 @@ public sealed record OptionBandBarResult(
     string? UnavailableReason);
 
 public sealed record ResidualBarResult(
-    OptionResidualReading Reading,
+    ResidualVariant Variant,
+    OptionResidualReading? Reading,
     double? ResidualDelta,
     int ResidualDirection,
     int FuturesRollingDirection,
-    string Relationship);
+    string Relationship,
+    string? UnavailableReason)
+{
+    public bool IsAvailable => Reading is not null;
+}
 
 public sealed record AdaptiveCompletedBarPackage(
     ExactAdaptiveBar FutureBar,
