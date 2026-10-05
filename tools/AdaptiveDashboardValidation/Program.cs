@@ -28,12 +28,13 @@ await db.Database.MigrateAsync();
 await using (var source = new NiftySignalDbContext(new DbContextOptionsBuilder<NiftySignalDbContext>().UseNpgsql(baseConnection).Options))
     await source.Database.EnsureCreatedAsync();
 await RelationalRestartParity.CheckAsync(options,baseConnection,args[1],evidence);
+await using var telegramStub = new TelegramScreenshotStub();
 var at = DateTimeOffset.UtcNow;
 var day = DateOnly.FromDateTime(at.ToOffset(TimeSpan.FromHours(5.5)).DateTime);
 var session = new AdaptiveSessionStateRow {
     TradeDate=day, ModelVersion=OpeningVolumeProjectionV1.ModelVersion, SourceBranch="isolated-ui-validation",
     SourceCommitSha=args[1], BuildUtc=at, FutureToken="VALIDATION", FutureSymbol="NIFTYFUT",
-    FutureExpiry=day.AddDays(4), OpeningWindowStartUtc=at.AddMinutes(-15), OpeningWindowEndUtc=at,
+    FutureExpiry=day.AddDays(4), OpeningWindowStartUtc=at.AddMinutes(-45), OpeningWindowEndUtc=at.AddMinutes(-30),
     EstimatorName=nameof(OpeningVolumeProjectionV1), CreatedAtUtc=at, BaseBarVolume=3250,
     RollingWindowVolume=32500, OptionUniverseJson="[]" };
 db.Sessions.Add(session); await db.SaveChangesAsync();
@@ -54,8 +55,15 @@ start.Environment["ASPNETCORE_URLS"]=url;
 start.Environment["ConnectionStrings__NiftySignalDb"]=baseConnection;
 start.Environment["DashboardAuth__Username"]="validation-user";
 start.Environment["DashboardAuth__PasswordSha256"]=Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(password)));
+start.Environment["AdaptiveScreenshots__Enabled"]="true";
+start.Environment["AdaptiveScreenshots__BaseUrl"]=url;
+start.Environment["AdaptiveScreenshots__OutputDirectory"]=Path.Combine(evidence,"screenshots");
+start.Environment["Telegram__BotToken"]="ci-no-real-token";
+start.Environment["Telegram__ChatId"]="ci-no-real-chat";
+start.Environment["AdaptiveScreenshotValidationApiUrl"]="http://127.0.0.1:5091/";
 using var server=Process.Start(start) ?? throw new Exception("Dashboard did not start.");
 var output=server.StandardOutput.ReadToEndAsync(); var errors=server.StandardError.ReadToEndAsync();
+var previousDashboardLog="";
 try {
     using var http=new HttpClient();
     var ready=false;
@@ -156,6 +164,49 @@ try {
     await Expect(page.GetByLabel("Option measurement",new() { Exact=true })).ToHaveValueAsync("NOTIONAL");
     await Expect(page.GetByLabel("Residual variant",new() { Exact=true })).ToHaveValueAsync("BAND");
     await page.ScreenshotAsync(new() { Path=Path.Combine(evidence,"restarted-reader.png"),FullPage=true });
+    // Durable worker, its own cookie, real production Chromium capture and multipart upload.
+    var expectedTargets = new[] { 13,18,23,28,33,38,43 };
+    var screenshotJobs = new List<AdaptiveScreenshotJobRow>();
+    for(var attempt=0;attempt<100;attempt++) {
+        screenshotJobs=await db.ScreenshotJobs.AsNoTracking().Where(x=>x.SessionId==session.Id).OrderBy(x=>x.TargetBarSeq).ToListAsync();
+        if(screenshotJobs.Count==expectedTargets.Length && screenshotJobs.All(x=>x.Status==AdaptiveScreenshotStatus.Sent))break;
+        await Task.Delay(500);
+    }
+    if(!screenshotJobs.Select(x=>x.TargetBarSeq).SequenceEqual(expectedTargets) || screenshotJobs.Any(x=>x.Status!=AdaptiveScreenshotStatus.Sent))
+        throw new Exception("Screenshot outbox did not deliver pinned initial/every-five-bar snapshots: " +
+            JsonSerializer.Serialize(screenshotJobs.Select(x=>new { x.TargetBarSeq,x.Status,x.LastError,x.Attempts })));
+    if(telegramStub.Uploads.Count!=7 || telegramStub.Uploads.Any(x=>x.Width<1920))throw new Exception("Screenshot upload count/PNG dimensions invalid.");
+    // Restart the real worker against the same PostgreSQL outbox; acknowledged images must not resend.
+    await push.StopAsync();
+    server.Kill(entireProcessTree:true);
+    await server.WaitForExitAsync();
+    previousDashboardLog=(await output)+(await errors);
+    if(!server.Start())throw new Exception("Dashboard restart failed.");
+    output=server.StandardOutput.ReadToEndAsync(); errors=server.StandardError.ReadToEndAsync();
+    ready=false;
+    for(var attempt=0;attempt<100;attempt++) {
+        try { if((await http.GetAsync(url+"/login")).IsSuccessStatusCode) { ready=true;break; } } catch(HttpRequestException) { }
+        if(server.HasExited)throw new Exception("Dashboard exited during restart.");
+        await Task.Delay(100);
+    }
+    if(!ready)throw new Exception("Dashboard restart timed out.");
+    await Task.Delay(3000);
+    if(telegramStub.Uploads.Count!=7 || await db.ScreenshotJobs.AsNoTracking().CountAsync(x=>x.SessionId==session.Id)!=7)
+        throw new Exception("Dashboard worker restart duplicated acknowledged screenshots.");
+    await page.GotoAsync(url+"/adaptive-screenshots");
+    await Expect(page.GetByRole(AriaRole.Button,new() { Name="Send pre-live test",Exact=true })).ToBeEnabledAsync();
+    await page.GetByRole(AriaRole.Button,new() { Name="Send pre-live test",Exact=true }).ClickAsync();
+    await Expect(page.Locator("p[role='status']")).ToContainTextAsync("Pre-live test queued");
+    for(var attempt=0;attempt<60;attempt++) {
+        if(await db.ScreenshotJobs.AsNoTracking().AnyAsync(x=>x.Kind==AdaptiveScreenshotKind.PreLiveTest && x.Status==AdaptiveScreenshotStatus.Sent))break;
+        await Task.Delay(500);
+    }
+    if(telegramStub.Uploads.Count!=8)throw new Exception("Pre-live test did not deliver its labeled PNG: " +
+        JsonSerializer.Serialize(await db.ScreenshotJobs.AsNoTracking().Where(x=>x.Kind==AdaptiveScreenshotKind.PreLiveTest)
+            .Select(x=>new { x.Id,x.Status,x.LastError,x.Attempts }).ToListAsync()));
+    await File.WriteAllTextAsync(Path.Combine(evidence,"telegram-screenshots.json"),JsonSerializer.Serialize(new { targets=expectedTargets,uploads=telegramStub.Uploads.Count,
+        jobIds=screenshotJobs.Select(x=>x.Id),messageIds=screenshotJobs.Select(x=>x.TelegramMessageId),environment="loopback Telegram emulator, not real account" }));
+    Console.WriteLine("Telegram screenshot PASS: seven pinned initial/five-bar snapshots, full-width PNG multipart delivery, real worker restart without resends, pre-live UI test; no real Telegram call.");
     await page.GotoAsync(url+"/legacy");
     await Expect(page.Locator(".dashboard-shell")).ToBeVisibleAsync();
 
@@ -175,7 +226,7 @@ try {
 } finally {
     if(!server.HasExited)server.Kill(entireProcessTree:true);
     await server.WaitForExitAsync();
-    await File.WriteAllTextAsync(Path.Combine(evidence,"dashboard.log"),(await output)+(await errors));
+    await File.WriteAllTextAsync(Path.Combine(evidence,"dashboard.log"),previousDashboardLog+(await output)+(await errors));
 }
 void AddRows(int seq) {
     var end=at.AddMinutes(seq-43);var begin=end.AddMinutes(-1);

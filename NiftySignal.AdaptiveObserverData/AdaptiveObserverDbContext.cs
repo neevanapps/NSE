@@ -14,9 +14,22 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
     public DbSet<AdaptiveOptionResidualBarRow> OptionResidualBars => Set<AdaptiveOptionResidualBarRow>();
     public DbSet<AdaptiveWeak2ObservationRow> Weak2Observations => Set<AdaptiveWeak2ObservationRow>();
     public DbSet<AdaptiveObserverRuntimeRow> Runtime => Set<AdaptiveObserverRuntimeRow>();
+    public DbSet<AdaptiveScreenshotJobRow> ScreenshotJobs => Set<AdaptiveScreenshotJobRow>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
+        modelBuilder.Entity<AdaptiveScreenshotJobRow>(e =>
+        {
+            e.ToTable("adaptive_screenshot_jobs");
+            e.HasIndex(x => new { x.SessionId, x.Kind, x.TargetBarSeq }).IsUnique();
+            e.HasIndex(x => x.SessionId).IsUnique().HasFilter("\"Kind\" = 0");
+            e.HasIndex(x => new { x.Status, x.NextAttemptUtc });
+            e.Property(x => x.ImageSha256).HasMaxLength(64);
+            e.Property(x => x.Caption).HasMaxLength(1024);
+            e.Property(x => x.LastError).HasMaxLength(512);
+            e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId)
+                .OnDelete(DeleteBehavior.Restrict);
+        });
         modelBuilder.Entity<AdaptiveSessionStateRow>(e =>
         {
             e.ToTable("adaptive_sessions");

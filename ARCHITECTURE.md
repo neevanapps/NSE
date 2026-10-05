@@ -19,7 +19,7 @@ Solo developer, one machine, running 24/7. Splitting ingestion/features/scoring/
 | `NiftySignal.Rules` | Hand-written entry/exit rule evaluators, ruleset config, hot-reload + validation (`IOptionsMonitor` + `ValidatedOptionsMonitor`, not NCalc — that was the original plan, never built; see `docs/REVIEW_FINDINGS.md`). |
 | `NiftySignal.Ingestion` | FlatTrade REST/WebSocket client, instrument master, tick demux. All FlatTrade-specific mapping is isolated here — nothing outside this project should see a FlatTrade type. |
 | `NiftySignal.Persistence` | EF Core `NiftySignalDbContext`, `IEntityTypeConfiguration<T>` per entity, migrations, repositories. |
-| `NiftySignal.Notifications` | Telegram alerts, with per-category rate limiting. |
+| `NiftySignal.Notifications` | Telegram alerts, with per-category rate limiting; acknowledged PNG document transport for adaptive screenshots. |
 | `NiftySignal.Execution` | Strike selection, paper trade simulator, position tracking. |
 | `NiftySignal.Backtest` | `BacktestTickSource` (implements `ITickSource` over stored ticks) and `PerformanceReportBuilder` exist and are tested, but nothing wires them through the live entry/exit pipeline yet — see audit finding F32 in `docs/REVIEW_FINDINGS.md` for the scoped, not-yet-built runner. |
 | `NiftySignal.Host` | Worker Service composition root. Wires DI, hosts `BackgroundService` workers, runs as a Windows Service. |
@@ -41,7 +41,7 @@ Domain
 
 Backtest    → Domain, Persistence, Features, Scoring, Rules, Execution, Ingestion
 Host        → Domain, Ingestion, Persistence, Notifications, Pricing, Features, Scoring, Rules, Execution
-Dashboard   → Domain, Persistence, Execution, Rules
+Dashboard   → Domain, Persistence, Execution, Rules, Notifications, AdaptiveObserver, AdaptiveObserverData, VolumeBarData, Ingestion
 Tests       → everything
 ```
 
@@ -56,4 +56,10 @@ Tests       → everything
 
 ## Where things run
 
-`NiftySignal.Host` is the only long-running process — a Windows Service (`AddWindowsService()`), auto-restarting on failure, self-provisioning its database schema on startup (`context.Database.Migrate()`) so a fresh machine needs no manual setup step. `NiftySignal.Dashboard` is a separate ASP.NET Core process (Blazor Server) that reads/writes the same database and config files; it does not run the trading pipeline itself.
+`NiftySignal.Host` runs the market pipeline as a Windows Service (`AddWindowsService()`), auto-restarting on failure and self-provisioning its database schema on startup (`context.Database.Migrate()`). `NiftySignal.Dashboard` is a separate ASP.NET Core process (Blazor Server) that reads/writes operational database/configuration state; it does not run the trading pipeline itself.
+
+## Adaptive screenshot side channel (2026-10-05)
+
+Dashboard hosts an optional screenshot worker, independent of Host ingestion/calculations. It reads committed adaptive session/bar projections and writes only `adaptive_screenshot_jobs` in the separate adaptive database. Host applies the shared EF migration at startup. A PostgreSQL advisory lease serializes delivery; durable identities distinguish initialization and subsequent five-bar boundaries.
+
+Playwright captures the existing three-grid component at a pinned session/sequence using a short-lived capture-only cookie. The cookie cannot authenticate normal Dashboard controls. Full-width PNG documents are uploaded through `ITelegramDocumentSender`; acknowledged deliveries do not resend and ambiguous uploads require manual inspection. No orders, scoring formulas or market projections are changed. See [configuration and pre-live acceptance](docs/ADAPTIVE_TELEGRAM_SCREENSHOTS.md).

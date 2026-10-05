@@ -1,0 +1,29 @@
+@page "/adaptive-screenshot/{JobId:long}"
+@attribute [Authorize(Policy = "AdaptiveScreenshotRead")]
+@using Microsoft.EntityFrameworkCore
+@using NiftySignal.AdaptiveObserverData
+@using NiftySignal.Dashboard.Components.Dashboard
+@inject IDbContextFactory<AdaptiveObserverDbContext> DbFactory
+
+<PageTitle>Adaptive screenshot</PageTitle>
+@if (_job is not null)
+{
+    <main class="adaptive-capture" data-job-id="@JobId" style="padding:20px">
+        <h1>NIFTY · @_job.TradeDate.ToString("yyyy-MM-dd") · @_job.Kind · completed bar @_job.TargetBarSeq</h1>
+        <p>Trigger IST: @_job.TriggeredAtUtc.ToOffset(TimeSpan.FromHours(5.5)).ToString("yyyy-MM-dd HH:mm:ss") · Snapshot viewed IST: @DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromHours(5.5)).ToString("yyyy-MM-dd HH:mm:ss")</p>
+        <p>Pinned completed boundary · BOTH / NOTIONAL / ATM±2 · live incomplete bar excluded · job @JobId</p>
+        @if (_job.Kind == AdaptiveScreenshotKind.PreLiveTest) { <h2>PRE-LIVE DELIVERY TEST — not a market observation</h2> }
+        <AdaptiveObserverPanel CaptureMode="true" CaptureSessionId="@_job.SessionId" CaptureBarSeq="@_job.TargetBarSeq" />
+    </main>
+}
+else { <p>Capture job unavailable.</p> }
+
+@code {
+    [Parameter] public long JobId { get; set; }
+    AdaptiveScreenshotJobRow? _job;
+    protected override async Task OnInitializedAsync()
+    {
+        await using var db = await DbFactory.CreateDbContextAsync();
+        _job = await db.ScreenshotJobs.AsNoTracking().SingleOrDefaultAsync(x => x.Id == JobId);
+    }
+}

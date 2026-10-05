@@ -48,7 +48,13 @@ Status terminology: **VALIDATED** means the stated gate passed in the stated env
 | VM deployment / live observation | PENDING — USER MANUAL | Follow ADAPTIVE_VM_HANDOFF.md after exact master CI passes. |
 | Paper trading / orders | OUT OF V1 | Deliberately excluded. |
 
-### Remaining sequence
+### Follow-on: Telegram Dashboard screenshots
+
+Implementation is on fresh master-based `feature/adaptive-telegram-screenshots`; release evidence is recorded in [PR #4](https://github.com/neevanapps/NSE/pull/4). It adds the 09:30 ready-state image and one image every five completed adaptive bars after that boundary, without changing the validated adaptive calculations. [Screenshot configuration and morning acceptance](ADAPTIVE_TELEGRAM_SCREENSHOTS.md) covers the separate Dashboard bot settings, generated outbox migration, browser installation and pre-live test.
+
+Screenshot implementation, migration/regression and browser/restart gates are tracked separately from manual VM deployment and real Telegram delivery. The VM gates remain **PENDING** until performed; green CI is not a substitute.
+
+### Adaptive release / manual deployment sequence
 
 1. **DONE:** final distinguishable Dashboard fixture and Host/Dashboard publish gate.
 2. **DONE:** release diff review and final feature evidence recorded.
