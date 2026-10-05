@@ -181,9 +181,19 @@ public sealed class AdaptiveObserverEngine
 
     IReadOnlyList<ResidualBarResult> BuildResiduals(ExactAdaptiveBar bar, AdaptiveRollingState? rolling)
     {
-        if (_residualAnchor is null || bar.EndAvailableAtUtc < _residualAnchor.AnchorTimeUtc)
+        if (bar.EndAvailableAtUtc < _signalStartUtc)
         {
             return Array.Empty<ResidualBarResult>();
+        }
+
+        var futuresDirection = rolling?.PriceDirection ?? 0;
+        if (_residualAnchor is null)
+        {
+            return new[]
+            {
+                UnavailableResidual(ResidualVariant.Atm, futuresDirection, "09:30 residual anchor unavailable."),
+                UnavailableResidual(ResidualVariant.AtmPlusMinus2, futuresDirection, "09:30 residual anchor unavailable."),
+            };
         }
 
         var readings = OptionResidualModel.Evaluate(
@@ -191,27 +201,41 @@ public sealed class AdaptiveObserverEngine
             bar.EndAvailableAtUtc,
             bar.Close,
             _latestOptionQuotes,
-            _riskFreeRate);
+            _riskFreeRate)
+            .ToDictionary(x => x.Variant);
 
-        var result = new List<ResidualBarResult>(readings.Count);
-        foreach (var reading in readings)
+        var result = new List<ResidualBarResult>(2);
+        foreach (var variant in new[] { ResidualVariant.Atm, ResidualVariant.AtmPlusMinus2 })
         {
-            var delta = _previousResidual.TryGetValue(reading.Variant, out var previous)
+            if (!readings.TryGetValue(variant, out var reading))
+            {
+                result.Add(UnavailableResidual(
+                    variant, futuresDirection, "One or more fixed diagnostic option quotes are missing or stale."));
+                continue;
+            }
+
+            var delta = _previousResidual.TryGetValue(variant, out var previous)
                 ? reading.DirectionalResidualPct - previous
                 : null;
-            _previousResidual[reading.Variant] = reading.DirectionalResidualPct;
+            _previousResidual[variant] = reading.DirectionalResidualPct;
 
             var residualDirection = Sign(reading.DirectionalResidualPct);
-            var futuresDirection = rolling?.PriceDirection ?? 0;
             var relationship = residualDirection == 0 || futuresDirection == 0
                 ? "NEUTRAL"
                 : residualDirection == futuresDirection ? "ALIGN" : "OPPOSE";
 
-            result.Add(new ResidualBarResult(reading, delta, residualDirection, futuresDirection, relationship));
+            result.Add(new ResidualBarResult(
+                variant, reading, delta, residualDirection, futuresDirection, relationship, null));
         }
 
         return result;
     }
+
+    static ResidualBarResult UnavailableResidual(
+        ResidualVariant variant,
+        int futuresDirection,
+        string reason) =>
+        new(variant, null, null, 0, futuresDirection, "NEUTRAL", reason);
 
     void EnsureOrder(CleanObserverTick tick)
     {
