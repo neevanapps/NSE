@@ -102,6 +102,19 @@ jobs:
       - name: Validate dashboard selectors and commit-to-visible latency
         run: dotnet tools/AdaptiveDashboardValidation/bin/Release/net10.0/AdaptiveDashboardValidation.dll "$GITHUB_WORKSPACE" "${{ github.sha }}"
 
+      - name: Publish exact checked-out Host and Dashboard
+        run: |
+          dotnet publish NiftySignal.Host/NiftySignal.Host.csproj --configuration Release --no-restore -o artifacts/release/Host -p:SourceBranch=${{ github.ref_name }} -p:CommitSha=${{ github.sha }}
+          dotnet publish NiftySignal.Dashboard/NiftySignal.Dashboard.csproj --configuration Release --no-restore -o artifacts/release/Dashboard -p:SourceBranch=${{ github.ref_name }} -p:CommitSha=${{ github.sha }}
+          find artifacts/release -name appsettings.Local.json -delete
+          echo '${{ github.sha }}' > artifacts/release/source-sha.txt
+
+      - name: Upload published release evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: adaptive-observer-published-${{ github.sha }}
+          path: artifacts/release
+
       - name: Upload dashboard evidence
         if: always()
         uses: actions/upload-artifact@v4

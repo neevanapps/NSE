@@ -71,6 +71,7 @@ try {
     await context.Tracing.StartAsync(new() { Screenshots=true,Snapshots=true,Sources=true });
     var page=await context.NewPageAsync();
     page.SetDefaultTimeout(15000);
+    try {
     await page.GotoAsync(url+"/");
     await page.GetByLabel("Username",new() { Exact=true }).FillAsync("validation-user");
     await page.GetByLabel("Password",new() { Exact=true }).FillAsync(password);
@@ -112,9 +113,21 @@ try {
                         var expected=Enumerable.Range(21-count,count).Reverse().Select(x=>x.ToString()).ToArray();
                         if(!actual.SequenceEqual(expected))throw new Exception("Grid sequences are not synchronized.");
                     }
-                    if(side!="BOTH")
-                        await Expect(page.Locator(".adaptive-table").Nth(1).Locator("tbody tr").First.Locator("td").Nth(7))
-                            .ToHaveTextAsync(measure=="NOTIONAL" ? "+0.400" : "+0.200");
+                    var optionFirst=page.Locator(".adaptive-table").Nth(1).Locator("tbody tr").First.Locator("td");
+                    var ce=measure=="NOTIONAL" ? "+0.400" : "+0.200";
+                    var pe=measure=="NOTIONAL" ? "-0.500" : "-0.300";
+                    await Expect(optionFirst.Nth(7)).ToHaveTextAsync(side=="PE"?pe:ce);
+                    if(side=="BOTH") {
+                        await Expect(optionFirst.Nth(8)).ToHaveTextAsync(pe);
+                        await Expect(optionFirst.Nth(9)).ToHaveTextAsync(measure=="NOTIONAL"?"+0.900":"+0.500");
+                    }
+                    await Expect(page.Locator(".adaptive-table").Nth(2).Locator("tbody tr").First.Locator("td").Nth(4))
+                        .ToHaveTextAsync(variant=="ATM"?"+1.00":"+5.00");
+                    await Expect(page.Locator(".adaptive-table").Nth(1).Locator("tbody tr:has(td:first-child:text-is('18'))"))
+                        .ToContainTextAsync("Unavailable");
+                    if(variant=="BAND")
+                        await Expect(page.Locator(".adaptive-table").Nth(2).Locator("tbody tr:has(td:first-child:text-is('17'))"))
+                            .ToContainTextAsync("Unavailable");
                 }
             }
         }
@@ -142,7 +155,7 @@ try {
     await page.ScreenshotAsync(new() { Path=Path.Combine(evidence,"restarted-reader.png"),FullPage=true });
     await page.GotoAsync(url+"/legacy");
     await Expect(page.Locator(".dashboard-shell")).ToBeVisibleAsync();
-    await context.Tracing.StopAsync(new() { Path=Path.Combine(evidence,"browser-trace.zip") });
+
     var sorted=samples.Order().ToArray(); var p95=sorted[(int)Math.Ceiling(sorted.Length*.95)-1];
     var report=new { sourceSha=args[1], environment="isolated GitHub Actions PostgreSQL and Chromium; not VM measurement",
         selectorCombinations=36,blockedReaderSelectorRace=true,assemblySourceShaVerified=true,paintFramesAwaited=true, latencySamples=samples, meanMs=samples.Average(),p95Ms=p95,maxMs=samples.Max(),
@@ -150,6 +163,12 @@ try {
     await File.WriteAllTextAsync(Path.Combine(evidence,"report.json"),JsonSerializer.Serialize(report,new JsonSerializerOptions { WriteIndented=true }));
     Console.WriteLine($"Dashboard PASS: 36 selector combinations, reader restart, commit-to-three-grids p95={p95:F1}ms max={samples.Max():F1}ms.");
     if(samples.Any(x=>x>=1000))throw new Exception("Commit-to-visible dashboard latency exceeded one second.");
+    } finally {
+        try {
+            await page.ScreenshotAsync(new() { Path=Path.Combine(evidence,"last-state.png"),FullPage=true });
+            await context.Tracing.StopAsync(new() { Path=Path.Combine(evidence,"browser-trace.zip") });
+        } catch(PlaywrightException ex) { Console.WriteLine($"Browser evidence capture failed: {ex.Message}"); }
+    }
 } finally {
     if(!server.HasExited)server.Kill(entireProcessTree:true);
     await server.WaitForExitAsync();
@@ -162,9 +181,12 @@ void AddRows(int seq) {
     foreach(var side in new[] { OptionType.Call,OptionType.Put })
         db.OptionBandBars.Add(new AdaptiveOptionBandBarRow { SessionId=session.Id,BarSeq=seq,Side=side,
             StartAvailableAtUtc=begin,EndAvailableAtUtc=end,BandStrikes="22900,22950,23000,23050,23100",
-            BandAvailable=true,CenterStrike=23000,DurationSeconds=60,
-            ContractStrictDeltaRatioTotal=.2,NotionalStrictDeltaRatioTotal=.4 });
+            BandAvailable=seq!=18,UnavailableReason="fixture option quotes missing",CenterStrike=23000,DurationSeconds=60,
+            ContractStrictDeltaRatioTotal=side==OptionType.Call ? .2 : -.3,
+            NotionalStrictDeltaRatioTotal=side==OptionType.Call ? .4 : -.5 });
     foreach(var variant in new[] { ResidualVariant.Atm,ResidualVariant.AtmPlusMinus2 })
         db.OptionResidualBars.Add(new AdaptiveOptionResidualBarRow { SessionId=session.Id,BarSeq=seq,Variant=variant,
-            EndAvailableAtUtc=end,Relationship="NEUTRAL",IsAvailable=true,CenterStrike=23000 });
+            EndAvailableAtUtc=end,Relationship="NEUTRAL",IsAvailable=variant!=ResidualVariant.AtmPlusMinus2 || seq!=17,
+            UnavailableReason="fixture diagnostic quote missing",CenterStrike=23000,
+            CEActualChange=variant==ResidualVariant.Atm?1:5 });
 }

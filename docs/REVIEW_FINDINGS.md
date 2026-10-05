@@ -3326,24 +3326,26 @@ The worker enters its outside-market delay with `_live == null`; session-close f
 
 Independent original-Python threshold JSON exposed discovery 2026-09-11 threshold `0.201714` versus live `0.20171428571428573`. Frozen research classifiers consume six-decimal CSV ratios. Threshold samples and classifier comparisons now use that exact six-decimal decision representation; full-precision persisted/displayed rolling metrics remain unchanged. A regression protects this separation. Prior checkpoint library parity did not establish this serialized Python gate; The complete historical suite passed at e91d1ca (private workflow 37324830737), including original Python thresholds for all 13 discovery sessions.
 
-## F67 — completed Weak2 execution projections skipped restart verification — FIX IMPLEMENTED / VALIDATION PENDING
+## F67 — completed Weak2 execution projections skipped restart verification — FIXED
 
 Recovery replay previously verified futures, rolling, bands and residuals but selected only pending H5 observations. Completed selection/OI/H5/MFE/MAE fields could remain corrupted without stopping recovery. Recovery now recalculates completed execution projections from frozen descriptors and source ticks, compares every scalar except surrogate ID, and fails without overwriting mismatches. Trigger identity/diagnostics are compared to each reconstructed package, and recovery rejects extra persisted trigger rows. Restart fixtures now verify completed results and deliberately corrupt PnL to prove rejection.
 
-## F68 — watch-only Host still starts legacy paper executors — FIX IMPLEMENTED / RELEASE REVIEW PENDING
+## F68 — watch-only Host still starts legacy paper executors — FIXED
 
 `LiveOptionsScoreEngine` and `LiveFuturesCrossoverEngine` are hosted workers calling `LivePaperTradeExecutor.OpenAsync/CloseAsync`. Their registration contradicted the roadmap's deployment gate that all order/paper actions are disabled. Both registrations are removed for the adaptive watch-only cutover; code, tables and existing records remain for rollback. Ingestion and legacy volume-bar persistence continue. This deliberately stops new legacy paper observations too. Full Host regression and release call-site review must pass before deployment.
 
-## F69 — full solution omitted four root projects — FIX IMPLEMENTED / BUILD VALIDATION PENDING
+## F69 — full solution omitted four root projects — FIXED
 
 `NiftySignal.slnx` omitted BacktestData, DataSync, MetricTrials and VolumeBarData. Some were built only transitively; a standalone harness relying on a completed Release solution build could not find their Release reference assemblies. All root projects and the Dashboard validation console are now explicitly included. The browser gate uses this single complete solution build, removing the reference-skip shortcut. Full Release build must pass for these formerly omitted projects too.
 
-## F70 — missing discovery history silently changes strong threshold — FIX IMPLEMENTED / VALIDATION PENDING
+## F70 — missing discovery history silently changes strong threshold — FIXED
 
 Historical bootstrap skipped incomplete discovery dates and returned successfully even with no source. The coordinator could freeze a threshold from only the available subset; a fresh start more than 45 days later also excluded mandatory older dates. Bootstrap now queries all prior source dates and refuses readiness until every required prior discovery session has been seeded. Cancellation propagates. A missing-source regression proves no daily configuration can be based on a silently partial discovery history; the real-source 13-session gate must still pass after this change. Production must have the frozen discovery raw source available before the observer starts.
 
-## F71 — Dashboard selector refresh can be lost during prerender or an active read — FIX IMPLEMENTED / BROWSER GATE PENDING
+## F71 — Dashboard selector refresh can be lost during prerender or an active read — FIXED
 
 The first browser selector gate found five requested rows still displaying ten. Controls could be changed before the Blazor circuit became interactive; additionally ReloadAsync's nonblocking semaphore skipped any selector/push arriving during another read, while header polling saw unchanged sequence and never repaired the requested row count. Controls now wait for interactive rendering and refresh requests queue behind an active read using the latest selector. Disposal cancels/drains readers. The browser test explicitly blocks a PostgreSQL future-bar read, changes rows again, proves the server received that selection, then unlocks and requires all three grids to show the latest count. Latency samples also wait two animation frames to include browser painting.
+
+**Validation checkpoint, 2026-10-05:** F67 completed-projection corruption rejection passed seven real PostgreSQL recovery boundaries; F68 hosted call-site review confirms only ingestion, volume-bar writer and adaptive observer are started, and full regression passed; F69 complete Release solution builds with zero warnings/errors; F70 missing-history unit regression and actual-source 13-session historical gate passed; F71 actual blocked PostgreSQL reader/selector race and 36 browser combinations passed. Public run 37332433765 at 64ece10: 48 adaptive / 1,123 total tests, P95 painted three-grid latency 158.8837 ms, max 181.7617 ms. Private frozen historical run 37330577623 at a43ca3c passed all 13 discovery sessions, source/bootstrap, independent band/rolling, residual/H5 and 87 historical engine resets. This is CI/historical validation; VM service/restart/broker checks remain manual. The final fixture strengthens distinguishable CE/PE, residual and unavailable-row values without changing production calculations.
 
 **Numbering note:** F72 is next-free going forward.
