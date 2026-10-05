@@ -194,12 +194,16 @@ try {
     if(telegramStub.Uploads.Count!=7 || await db.ScreenshotJobs.AsNoTracking().CountAsync(x=>x.SessionId==session.Id)!=7)
         throw new Exception("Dashboard worker restart duplicated acknowledged screenshots.");
     await page.GotoAsync(url+"/adaptive-screenshots");
+    await Expect(page.GetByRole(AriaRole.Button,new() { Name="Send pre-live test",Exact=true })).ToBeEnabledAsync();
     await page.GetByRole(AriaRole.Button,new() { Name="Send pre-live test",Exact=true }).ClickAsync();
+    await Expect(page.Locator("p[role='status']")).ToContainTextAsync("Pre-live test queued");
     for(var attempt=0;attempt<60;attempt++) {
         if(await db.ScreenshotJobs.AsNoTracking().AnyAsync(x=>x.Kind==AdaptiveScreenshotKind.PreLiveTest && x.Status==AdaptiveScreenshotStatus.Sent))break;
         await Task.Delay(500);
     }
-    if(telegramStub.Uploads.Count!=8)throw new Exception("Pre-live test did not deliver its labeled PNG.");
+    if(telegramStub.Uploads.Count!=8)throw new Exception("Pre-live test did not deliver its labeled PNG: " +
+        JsonSerializer.Serialize(await db.ScreenshotJobs.AsNoTracking().Where(x=>x.Kind==AdaptiveScreenshotKind.PreLiveTest)
+            .Select(x=>new { x.Id,x.Status,x.LastError,x.Attempts }).ToListAsync()));
     await File.WriteAllTextAsync(Path.Combine(evidence,"telegram-screenshots.json"),JsonSerializer.Serialize(new { targets=expectedTargets,uploads=telegramStub.Uploads.Count,
         jobIds=screenshotJobs.Select(x=>x.Id),messageIds=screenshotJobs.Select(x=>x.TelegramMessageId),environment="loopback Telegram emulator, not real account" }));
     Console.WriteLine("Telegram screenshot PASS: seven pinned initial/five-bar snapshots, full-width PNG multipart delivery, real worker restart without resends, pre-live UI test; no real Telegram call.");

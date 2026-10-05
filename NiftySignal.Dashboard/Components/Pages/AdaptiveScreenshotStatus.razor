@@ -15,8 +15,8 @@
     <p>Dashboard: @BuildIdentity.Current().SourceBranch / @BuildIdentity.Current().CommitSha</p>
     <p>Worker configured: @(Options.Value.Enabled ? "Enabled" : "Disabled") · PNG files retained locally · no paper or real orders</p>
     <p>Initialization at 09:30 IST; then every five completed bars counted from that boundary. Delayed messages retain their original bar/date. An uncertain upload is not automatically resent.</p>
-    <button disabled="@(!Options.Value.Enabled || _busy)" @onclick="SendTestAsync">Send pre-live test</button>
-    <button disabled="@_busy" @onclick="ReloadAsync">Refresh status</button>
+    <button disabled="@(!_interactiveReady || !Options.Value.Enabled || _busy)" @onclick="SendTestAsync">Send pre-live test</button>
+    <button disabled="@(!_interactiveReady || _busy)" @onclick="ReloadAsync">Refresh status</button>
     <a href="/">Dashboard</a>
     <p role="status">@_message</p>
     <table class="adaptive-table">
@@ -30,8 +30,14 @@
 @code {
     List<AdaptiveScreenshotJobRow> _jobs = [];
     bool _busy;
+    bool _interactiveReady;
     string? _message;
     protected override Task OnInitializedAsync() => ReloadAsync();
+    protected override void OnAfterRender(bool firstRender)
+    {
+        // Static SSR cannot dispatch clicks; do not expose enabled controls before the circuit exists.
+        if (firstRender) { _interactiveReady = true; StateHasChanged(); }
+    }
     async Task ReloadAsync()
     {
         try { await using var db = await DbFactory.CreateDbContextAsync(); _jobs = await db.ScreenshotJobs.AsNoTracking().OrderByDescending(x => x.Id).Take(50).ToListAsync(); }
@@ -39,7 +45,7 @@
     }
     async Task SendTestAsync()
     {
-        if (_busy || !Options.Value.Enabled) return;
+        if (!_interactiveReady || _busy || !Options.Value.Enabled) return;
         _busy = true;
         try
         {
