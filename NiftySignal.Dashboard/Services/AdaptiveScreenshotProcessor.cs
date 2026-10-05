@@ -8,7 +8,7 @@ using Microsoft.Extensions.Options;
 namespace NiftySignal.Dashboard.Services;
 
 public sealed class AdaptiveScreenshotProcessor(IAdaptiveScreenshotRenderer renderer, ITelegramDocumentSender sender,
-    IOptions<AdaptiveScreenshotOptions> options)
+    IOptions<AdaptiveScreenshotOptions> options, TimeProvider? clock = null)
 {
     public async Task ProcessOneAsync(AdaptiveObserverDbContext db, DateTimeOffset now, CancellationToken ct)
     {
@@ -29,7 +29,7 @@ public sealed class AdaptiveScreenshotProcessor(IAdaptiveScreenshotRenderer rend
                 await renderer.CaptureAsync(job, path, ct);
                 await using (var stream = File.OpenRead(path))
                     job.ImageSha256 = Convert.ToHexString(await SHA256.HashDataAsync(stream, ct));
-                job.CapturedAtUtc = DateTimeOffset.UtcNow;
+                job.CapturedAtUtc = (clock ?? TimeProvider.System).GetUtcNow();
                 job.Caption = $"NIFTY adaptive | {job.TradeDate:yyyy-MM-dd} | {job.Kind}\nCompleted BarSeq {job.TargetBarSeq} | trigger IST {job.TriggeredAtUtc.ToOffset(TimeSpan.FromHours(5.5)):HH:mm:ss}\nCaptured IST {job.CapturedAtUtc.Value.ToOffset(TimeSpan.FromHours(5.5)):HH:mm:ss} | job {job.Id}\nBOTH / NOTIONAL / ATM±2 | completed rows only\nDashboard SHA {BuildIdentity.Current().CommitSha}";
                 await db.SaveChangesAsync(ct);
             }
@@ -61,8 +61,10 @@ public sealed class AdaptiveScreenshotProcessor(IAdaptiveScreenshotRenderer rend
             TelegramDocumentOutcome.Rejected => AdaptiveScreenshotStatus.Pending,
             _ => AdaptiveScreenshotStatus.DeliveryUncertain };
         job.TelegramMessageId = delivery.MessageId;
-        job.SentAtUtc = delivery.Outcome == TelegramDocumentOutcome.Sent ? DateTimeOffset.UtcNow : null;
-        job.NextAttemptUtc = now.AddSeconds(delivery.RetryAfterSeconds);
+        var acknowledgedAt = (clock ?? TimeProvider.System).GetUtcNow();
+        job.SentAtUtc = delivery.Outcome == TelegramDocumentOutcome.Sent ? acknowledgedAt : null;
+        // retry_after starts when Telegram responds, not before the potentially slow browser/upload.
+        job.NextAttemptUtc = acknowledgedAt.AddSeconds(delivery.RetryAfterSeconds);
         job.LastError = delivery.Error;
         await db.SaveChangesAsync(CancellationToken.None);
     }

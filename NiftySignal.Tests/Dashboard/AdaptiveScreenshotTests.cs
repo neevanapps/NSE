@@ -112,7 +112,7 @@ public sealed class AdaptiveScreenshotTests
         var root = Path.Combine(Path.GetTempPath(), "adaptive-screenshot-test-" + Guid.NewGuid());
         try {
             var renderer = new Renderer(); var sender = new Sender(outcome);
-            var processor = new AdaptiveScreenshotProcessor(renderer, sender, Options.Create(new AdaptiveScreenshotOptions { OutputDirectory = root }));
+            var processor = new AdaptiveScreenshotProcessor(renderer, sender, Options.Create(new AdaptiveScreenshotOptions { OutputDirectory = root }), new Clock());
             await processor.ProcessOneAsync(db, Cutoff, default);
             await processor.ProcessOneAsync(db, Cutoff.AddMinutes(10), default);
             Assert.Equal(status, job.Status); Assert.Equal(1, sender.Count); Assert.Equal(1, renderer.Count);
@@ -127,7 +127,7 @@ public sealed class AdaptiveScreenshotTests
         var root = Path.Combine(Path.GetTempPath(), "adaptive-screenshot-test-" + Guid.NewGuid());
         try {
             var renderer = new Renderer(); var sender = new Sender(TelegramDocumentOutcome.Rejected);
-            var processor = new AdaptiveScreenshotProcessor(renderer, sender, Options.Create(new AdaptiveScreenshotOptions { OutputDirectory = root }));
+            var processor = new AdaptiveScreenshotProcessor(renderer, sender, Options.Create(new AdaptiveScreenshotOptions { OutputDirectory = root }), new Clock());
             await processor.ProcessOneAsync(db, Cutoff, default);
             await processor.ProcessOneAsync(db, Cutoff.AddSeconds(30), default);
             Assert.Equal(1, sender.Count);
@@ -153,12 +153,22 @@ public sealed class AdaptiveScreenshotTests
         var root = Path.Combine(Path.GetTempPath(), "adaptive-screenshot-test-" + Guid.NewGuid());
         try {
             var renderer = new Renderer(); var sender = new Sender(TelegramDocumentOutcome.Rejected);
-            var processor = new AdaptiveScreenshotProcessor(renderer, sender, Options.Create(new AdaptiveScreenshotOptions { OutputDirectory = root }));
+            var clock = new Clock();
+            var processor = new AdaptiveScreenshotProcessor(renderer, sender, Options.Create(new AdaptiveScreenshotOptions { OutputDirectory = root }), clock);
+            sender.OnSend = () => clock.UtcNow = Cutoff.AddSeconds(20);
             await processor.ProcessOneAsync(db, Cutoff, default);
             await processor.ProcessOneAsync(db, Cutoff.AddSeconds(1), default);
+            await processor.ProcessOneAsync(db, Cutoff.AddSeconds(70), default);
             Assert.Equal(1, sender.Count);
             Assert.Equal(1, renderer.Count);
+            Assert.Equal(Cutoff.AddSeconds(80), (await db.ScreenshotJobs.OrderBy(x=>x.Id).FirstAsync()).NextAttemptUtc);
         } finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+    }
+
+    sealed class Clock : TimeProvider
+    {
+        public DateTimeOffset UtcNow = Cutoff;
+        public override DateTimeOffset GetUtcNow() => UtcNow;
     }
 
     sealed class Factory(DbContextOptions<AdaptiveObserverDbContext> options) : IDbContextFactory<AdaptiveObserverDbContext>
@@ -173,8 +183,8 @@ public sealed class AdaptiveScreenshotTests
     }
     sealed class Sender(TelegramDocumentOutcome outcome) : ITelegramDocumentSender
     {
-        public int Count; public TelegramDocumentOutcome Outcome = outcome;
-        public Task<TelegramDocumentResult> SendAsync(string file, string caption, CancellationToken ct) { Count++; return Task.FromResult(new TelegramDocumentResult(Outcome, Outcome == TelegramDocumentOutcome.Sent ? 123 : null,
+        public int Count; public TelegramDocumentOutcome Outcome = outcome; public Action? OnSend;
+        public Task<TelegramDocumentResult> SendAsync(string file, string caption, CancellationToken ct) { Count++; OnSend?.Invoke(); return Task.FromResult(new TelegramDocumentResult(Outcome, Outcome == TelegramDocumentOutcome.Sent ? 123 : null,
             Error: Outcome == TelegramDocumentOutcome.Rejected ? "Telegram rejected upload (HTTP 429)." : null)); }
     }
 }
