@@ -1,0 +1,493 @@
+@using NiftySignal.AdaptiveObserver
+@using NiftySignal.AdaptiveObserverData
+@using NiftySignal.Dashboard.Services
+@using NiftySignal.Domain.Enums
+@implements IAsyncDisposable
+@inject AdaptiveObserverDataService AdaptiveData
+
+<section class="adaptive-observer">
+    <div class="adaptive-title-row">
+        <div>
+            <h2>Adaptive Market Observer</h2>
+            <div class="adaptive-subtitle">Watch-only · exact futures adaptive clock · no paper or real orders</div>
+        </div>
+        <div class="adaptive-controls">
+            <label>
+                Rows
+                <select @bind="_rowCount" @bind:after="ReloadAsync">
+                    <option value="5">5</option>
+                    <option value="10">10</option>
+                    <option value="15">15</option>
+                </select>
+            </label>
+        </div>
+    </div>
+
+    @if (_loadError is not null)
+    {
+        <div class="adaptive-alert adaptive-alert-error">@_loadError</div>
+    }
+    else if (_snapshot is null)
+    {
+        <div class="adaptive-alert">Waiting for today's adaptive session. The daily clock is frozen only after persisted data has advanced through 09:30 IST.</div>
+    }
+    else
+    {
+        <div class="adaptive-session-grid">
+            <Metric Label="Runtime" Value="@_snapshot.Runtime.RuntimeStatus.ToString()" />
+            <Metric Label="Base bar" Value="@FmtInt(_snapshot.Session.BaseBarVolume)" />
+            <Metric Label="Rolling volume" Value="@FmtInt(_snapshot.Session.RollingWindowVolume)" />
+            <Metric Label="Expected day volume" Value="@Fmt0(_snapshot.Session.EstimatedFullDayVolume)" />
+            <Metric Label="Opening 09:15–09:30" Value="@FmtInt(_snapshot.Session.OpeningVolume)" />
+            <Metric Label="Strong threshold" Value="@FmtSigned(_snapshot.Session.StrongThreshold, 4)" />
+            <Metric Label="Completed bars" Value="@_snapshot.Runtime.LastCompletedBarSeq.ToString()" />
+            <Metric Label="Observed volume" Value="@FmtInt(ObservedVolume)" />
+            <Metric Label="Last processed" Value="@FmtAge(_snapshot.Runtime.LastProcessedSourceAvailableAtUtc)" />
+            <Metric Label="Model" Value="@_snapshot.Session.ModelVersion" />
+            <Metric Label="Source" Value="@ShortSource" />
+            <Metric Label="Build UTC" Value="@FmtUtc(_snapshot.Session.BuildUtc)" />
+        </div>
+
+        <div class="adaptive-current-bar">
+            <div class="adaptive-current-header">
+                <strong>Current incomplete adaptive bar</strong>
+                <span>@FmtInt(_snapshot.Runtime.CurrentPartialBarVolume) / @FmtInt(_snapshot.Session.BaseBarVolume) (@CurrentProgress.ToString("0.0")%)</span>
+            </div>
+            <div class="adaptive-progress-track">
+                <div class="adaptive-progress-fill" style="@($"width:{CurrentProgress:0.##}%")"></div>
+            </div>
+            <div class="adaptive-current-meta">
+                <span>Started: @FmtIst(_snapshot.Runtime.CurrentPartialBarStartedAtUtc)</span>
+                <span>Recovery: @RecoveryText</span>
+            </div>
+        </div>
+
+        <GridSection Title="Futures — exact adaptive bars">
+            <div class="adaptive-table-wrap">
+                <table class="adaptive-table">
+                    <thead>
+                    <tr>
+                        <th>Seq</th><th>End IST</th><th>Dur s</th><th>Bar ΔPx</th>
+                        <th>Strict Δ</th><th>Strict ratio</th><th>Strict cov</th>
+                        <th>Enriched Δ</th><th>Enriched ratio</th><th>Updates</th>
+                        <th>Roll ΔPx</th><th>Roll strict Δ</th><th>Roll strict ratio</th><th>Roll quote cov</th>
+                        <th>Roll enriched Δ</th><th>Roll enriched ratio</th><th>|Strict| Δ</th><th>Enriched Δchg</th>
+                        <th>Efficiency</th><th>Return bps</th><th>OI Δ</th><th>OI Δ%</th><th>Vol/sec</th>
+                        <th>Evolution</th><th>State</th>
+                    </tr>
+                    </thead>
+                    <tbody>
+                    @foreach (var x in _snapshot.Futures)
+                    {
+                        var r = x.Rolling;
+                        <tr class="@StateClass(r?.State)">
+                            <td class="sticky-col">@x.Bar.BarSeq</td>
+                            <td>@FmtIst(x.Bar.EndAvailableAtUtc)</td>
+                            <td>@x.Bar.DurationSeconds.ToString("0.0")</td>
+                            <td>@FmtSigned(x.Bar.BarPriceDisplacement, 2)</td>
+                            <td>@FmtSigned(x.Bar.StrictDelta)</td>
+                            <td>@FmtSigned(x.Bar.StrictDeltaRatioTotal, 3)</td>
+                            <td>@FmtPct01(x.Bar.StrictCoverage)</td>
+                            <td>@FmtSigned(x.Bar.EnrichedDelta)</td>
+                            <td>@FmtSigned(x.Bar.EnrichedDeltaRatio, 3)</td>
+                            <td>@x.Bar.TradeUpdates</td>
+                            <td>@FmtSigned(r?.PriceDisplacement, 2)</td>
+                            <td>@FmtSigned(r?.StrictDelta)</td>
+                            <td>@FmtSigned(r?.StrictDeltaRatioTotal, 3)</td>
+                            <td>@FmtPct01(r?.StrictQuoteCoverage)</td>
+                            <td>@FmtSigned(r?.EnrichedDelta)</td>
+                            <td>@FmtSigned(r?.EnrichedDeltaRatio, 3)</td>
+                            <td>@FmtSigned(r?.RollingStrictAbsDeltaChange)</td>
+                            <td>@FmtSigned(r?.RollingEnrichedDeltaChange)</td>
+                            <td>@Fmt(r?.Efficiency, 3)</td>
+                            <td>@FmtSigned(r?.ReturnBps, 2)</td>
+                            <td>@FmtSigned(r?.OiChange)</td>
+                            <td>@FmtPct01(r?.OiChangePct)</td>
+                            <td>@Fmt(r?.VolumePerSecond, 1)</td>
+                            <td>@(r?.StrictDominanceEvolution ?? "—")</td>
+                            <td><span class="state-badge">@((r?.State).ToString() ?? "—")</span></td>
+                        </tr>
+                    }
+                    </tbody>
+                </table>
+            </div>
+        </GridSection>
+
+        <GridSection Title="Options — ATM ±2 inside the same futures bar timestamps">
+            <div class="adaptive-grid-toolbar">
+                <label>
+                    Side
+                    <select @bind="_optionSide">
+                        <option value="BOTH">BOTH</option>
+                        <option value="CE">CE</option>
+                        <option value="PE">PE</option>
+                    </select>
+                </label>
+                <label>
+                    Measurement
+                    <select @bind="_measurement">
+                        <option value="NOTIONAL">NOTIONAL</option>
+                        <option value="CONTRACT">CONTRACT</option>
+                    </select>
+                </label>
+                <span class="adaptive-note">BOTH is a direct CE-vs-PE comparison, not a composite score.</span>
+            </div>
+
+            @if (_optionSide == "BOTH")
+            {
+                <div class="adaptive-table-wrap">
+                    <table class="adaptive-table">
+                        <thead>
+                        <tr>
+                            <th>Seq</th><th>End IST</th><th>Dur s</th><th>Center</th><th>Roll?</th>
+                            <th>CE ΔPx</th><th>PE ΔPx</th>
+                            <th>CE strict r</th><th>PE strict r</th><th>CE−PE strict</th>
+                            <th>CE enrich r</th><th>PE enrich r</th><th>CE−PE enrich</th>
+                            <th>CE cov</th><th>PE cov</th>
+                            <th>CE roll strict</th><th>PE roll strict</th><th>Relative roll strict</th>
+                            <th>CE roll enrich</th><th>PE roll enrich</th>
+                            <th>CE OI Δ%</th><th>PE OI Δ%</th><th>Relative OI Δ%</th>
+                            <th>CE activity/s</th><th>PE activity/s</th>
+                        </tr>
+                        </thead>
+                        <tbody>
+                        @foreach (var x in _snapshot.Options)
+                        {
+                            var ce = x.Call;
+                            var pe = x.Put;
+                            <tr>
+                                <td class="sticky-col">@x.BarSeq</td>
+                                <td>@FmtIst(x.EndAvailableAtUtc)</td>
+                                <td>@Fmt(ce?.DurationSeconds ?? pe?.DurationSeconds, 1)</td>
+                                <td>@FmtStrike(ce?.CenterStrike ?? pe?.CenterStrike)</td>
+                                <td>@BoolMark((ce?.BandRolled ?? false) || (pe?.BandRolled ?? false))</td>
+                                <td>@FmtSigned(ce?.BarBandPriceChange, 2)</td>
+                                <td>@FmtSigned(pe?.BarBandPriceChange, 2)</td>
+                                <td>@FmtSigned(StrictRatio(ce), 3)</td>
+                                <td>@FmtSigned(StrictRatio(pe), 3)</td>
+                                <td>@FmtSigned(Relative(StrictRatio(ce), StrictRatio(pe)), 3)</td>
+                                <td>@FmtSigned(EnrichedRatio(ce), 3)</td>
+                                <td>@FmtSigned(EnrichedRatio(pe), 3)</td>
+                                <td>@FmtSigned(Relative(EnrichedRatio(ce), EnrichedRatio(pe)), 3)</td>
+                                <td>@FmtPct01(Coverage(ce))</td>
+                                <td>@FmtPct01(Coverage(pe))</td>
+                                <td>@FmtSigned(RollingStrictRatio(ce), 3)</td>
+                                <td>@FmtSigned(RollingStrictRatio(pe), 3)</td>
+                                <td>@FmtSigned(Relative(RollingStrictRatio(ce), RollingStrictRatio(pe)), 3)</td>
+                                <td>@FmtSigned(RollingEnrichedRatio(ce), 3)</td>
+                                <td>@FmtSigned(RollingEnrichedRatio(pe), 3)</td>
+                                <td>@FmtPct01(ce?.RollingOiChangePct)</td>
+                                <td>@FmtPct01(pe?.RollingOiChangePct)</td>
+                                <td>@FmtPct01(Relative(ce?.RollingOiChangePct, pe?.RollingOiChangePct))</td>
+                                <td>@Fmt(ActivityPerSecond(ce), 1)</td>
+                                <td>@Fmt(ActivityPerSecond(pe), 1)</td>
+                            </tr>
+                        }
+                        </tbody>
+                    </table>
+                </div>
+            }
+            else
+            {
+                <div class="adaptive-table-wrap">
+                    <table class="adaptive-table">
+                        <thead>
+                        <tr>
+                            <th>Seq</th><th>End IST</th><th>Dur s</th><th>Center</th><th>Roll?</th><th>Band ΔPx</th>
+                            <th>Strict Δ</th><th>Strict ratio</th><th>Coverage</th><th>Enriched Δ</th><th>Enriched ratio</th><th>Updates</th>
+                            <th>Roll band ΔPx</th><th>Roll strict Δ</th><th>Roll strict ratio</th><th>Roll coverage</th>
+                            <th>Roll enriched Δ</th><th>Roll enriched ratio</th><th>Efficiency</th>
+                            <th>OI Δ</th><th>OI Δ%</th><th>Activity/s</th>
+                        </tr>
+                        </thead>
+                        <tbody>
+                        @foreach (var x in _snapshot.Options)
+                        {
+                            var m = _optionSide == "CE" ? x.Call : x.Put;
+                            <tr>
+                                <td class="sticky-col">@x.BarSeq</td>
+                                <td>@FmtIst(x.EndAvailableAtUtc)</td>
+                                @if (m is null || !m.BandAvailable)
+                                {
+                                    <td colspan="20" class="adaptive-pending">Unavailable: @(m?.UnavailableReason ?? "dependent option row pending")</td>
+                                }
+                                else
+                                {
+                                    <td>@m.DurationSeconds.ToString("0.0")</td>
+                                    <td>@FmtStrike(m.CenterStrike)</td>
+                                    <td>@BoolMark(m.BandRolled)</td>
+                                    <td>@FmtSigned(m.BarBandPriceChange, 2)</td>
+                                    <td>@FmtSigned(StrictDelta(m), 0)</td>
+                                    <td>@FmtSigned(StrictRatio(m), 3)</td>
+                                    <td>@FmtPct01(Coverage(m))</td>
+                                    <td>@FmtSigned(EnrichedDelta(m), 0)</td>
+                                    <td>@FmtSigned(EnrichedRatio(m), 3)</td>
+                                    <td>@m.BarTradeUpdates</td>
+                                    <td>@FmtSigned(m.RollingBandPriceChange, 2)</td>
+                                    <td>@FmtSigned(RollingStrictDelta(m), 0)</td>
+                                    <td>@FmtSigned(RollingStrictRatio(m), 3)</td>
+                                    <td>@FmtPct01(RollingCoverage(m))</td>
+                                    <td>@FmtSigned(RollingEnrichedDelta(m), 0)</td>
+                                    <td>@FmtSigned(RollingEnrichedRatio(m), 3)</td>
+                                    <td>@Fmt(m.RollingEfficiency, 3)</td>
+                                    <td>@FmtSigned(m.RollingOiChange)</td>
+                                    <td>@FmtPct01(m.RollingOiChangePct)</td>
+                                    <td>@Fmt(ActivityPerSecond(m), 1)</td>
+                                }
+                            </tr>
+                        }
+                        </tbody>
+                    </table>
+                </div>
+            }
+        </GridSection>
+
+        <GridSection Title="CE / PE theoretical residual — fixed 09:30 diagnostic">
+            <div class="adaptive-grid-toolbar">
+                <label>
+                    Residual view
+                    <select @bind="_residualVariant">
+                        <option value="BAND">ATM ±2</option>
+                        <option value="ATM">ATM</option>
+                    </select>
+                </label>
+                <span class="adaptive-note">Strike composition is frozen at 09:30 for the entire session.</span>
+            </div>
+
+            <div class="adaptive-anchor-grid">
+                <Metric Label="Future @09:30" Value="@Fmt(_snapshot.Session.Future0930, 2)" />
+                <Metric Label="Synthetic weekly @09:30" Value="@Fmt(_snapshot.Session.SyntheticWeeklyUnderlying0930, 2)" />
+                <Metric Label="Diagnostic center" Value="@FmtStrike(_snapshot.Session.ResidualCenterStrike)" />
+                <Metric Label="Components" Value="@ResidualComponentText" />
+            </div>
+
+            <div class="adaptive-table-wrap">
+                <table class="adaptive-table">
+                    <thead>
+                    <tr>
+                        <th>Seq</th><th>End IST</th><th>Future Δ09:30</th><th>Center</th>
+                        <th>CE actual Δ</th><th>CE expected Δ</th><th>CE residual</th><th>CE residual %</th>
+                        <th>PE actual Δ</th><th>PE expected Δ</th><th>PE residual</th><th>PE residual %</th>
+                        <th>Directional residual %</th><th>Residual Δ</th><th>Direction</th>
+                        <th>Future roll dir</th><th>Relation</th><th>Common residual %</th><th>Quote age s</th>
+                    </tr>
+                    </thead>
+                    <tbody>
+                    @foreach (var r in SelectedResidualRows)
+                    {
+                        <tr>
+                            <td class="sticky-col">@r.BarSeq</td>
+                            <td>@FmtIst(r.EndAvailableAtUtc)</td>
+                            @if (!r.IsAvailable)
+                            {
+                                <td colspan="17" class="adaptive-pending">Unavailable: @(r.UnavailableReason ?? "diagnostic quotes pending")</td>
+                            }
+                            else
+                            {
+                                <td>@FmtSigned(r.FutureChangeFrom0930, 2)</td>
+                                <td>@FmtStrike(r.CenterStrike)</td>
+                                <td>@FmtSigned(r.CEActualChange, 2)</td>
+                                <td>@FmtSigned(r.CEExpectedChange, 2)</td>
+                                <td>@FmtSigned(r.CEResidual, 2)</td>
+                                <td>@FmtSigned(r.CEResidualPct, 2)%</td>
+                                <td>@FmtSigned(r.PEActualChange, 2)</td>
+                                <td>@FmtSigned(r.PEExpectedChange, 2)</td>
+                                <td>@FmtSigned(r.PEResidual, 2)</td>
+                                <td>@FmtSigned(r.PEResidualPct, 2)%</td>
+                                <td>@FmtSigned(r.DirectionalResidualPct, 2)%</td>
+                                <td>@FmtSigned(r.ResidualDelta, 2)%</td>
+                                <td>@DirectionText(r.ResidualDirection)</td>
+                                <td>@DirectionText(r.FuturesRollingDirection)</td>
+                                <td>@r.Relationship</td>
+                                <td>@FmtSigned(r.CommonResidualPct, 2)%</td>
+                                <td>@r.MaxQuoteAgeSeconds.ToString("0.00")</td>
+                            }
+                        </tr>
+                    }
+                    </tbody>
+                </table>
+            </div>
+        </GridSection>
+    }
+</section>
+
+@code {
+    AdaptiveObserverSnapshot? _snapshot;
+    string? _loadError;
+    int _rowCount = 10;
+    string _optionSide = "BOTH";
+    string _measurement = "NOTIONAL";
+    string _residualVariant = "BAND";
+    readonly SemaphoreSlim _reloadGate = new(1, 1);
+    PeriodicTimer? _headerTimer;
+    CancellationTokenSource? _cts;
+    Task? _headerLoop;
+
+    protected override async Task OnInitializedAsync()
+    {
+        AdaptiveData.Updated += OnAdaptiveUpdated;
+        _cts = new CancellationTokenSource();
+        _headerTimer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
+        await ReloadAsync();
+        _headerLoop = HeaderLoopAsync(_cts.Token);
+    }
+
+    async Task HeaderLoopAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (_headerTimer is not null && await _headerTimer.WaitForNextTickAsync(ct))
+            {
+                var header = await AdaptiveData.LoadHeaderAsync(ct);
+                if (header is not null && _snapshot is not null && header.Session.Id == _snapshot.Session.Id)
+                {
+                    _snapshot = _snapshot with { Runtime = header.Runtime, Session = header.Session };
+                    await InvokeAsync(StateHasChanged);
+                }
+                else if (header is not null && (_snapshot is null || header.Session.Id != _snapshot.Session.Id))
+                {
+                    await ReloadAsync();
+                }
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            _loadError = $"Adaptive header refresh failed: {ex.Message}";
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    void OnAdaptiveUpdated() => _ = InvokeAsync(ReloadAsync);
+
+    async Task ReloadAsync()
+    {
+        if (!await _reloadGate.WaitAsync(0))
+        {
+            return;
+        }
+
+        try
+        {
+            _snapshot = await AdaptiveData.LoadSnapshotAsync(_rowCount);
+            _loadError = null;
+        }
+        catch (Exception ex)
+        {
+            _loadError = $"Adaptive observer read failed: {ex.Message}";
+        }
+        finally
+        {
+            _reloadGate.Release();
+        }
+
+        await InvokeAsync(StateHasChanged);
+    }
+
+    IEnumerable<AdaptiveOptionResidualBarRow> SelectedResidualRows =>
+        (_snapshot?.Residuals ?? [])
+            .Where(x => x.Variant == (_residualVariant == "ATM" ? ResidualVariant.Atm : ResidualVariant.AtmPlusMinus2))
+            .OrderByDescending(x => x.BarSeq);
+
+    long ObservedVolume => _snapshot is null
+        ? 0
+        : (_snapshot.Runtime.LastCompletedBarSeq * _snapshot.Session.BaseBarVolume) + _snapshot.Runtime.CurrentPartialBarVolume;
+
+    double CurrentProgress => _snapshot is null || _snapshot.Session.BaseBarVolume <= 0
+        ? 0d
+        : Math.Min(100d, 100d * _snapshot.Runtime.CurrentPartialBarVolume / _snapshot.Session.BaseBarVolume);
+
+    string ShortSource => _snapshot is null
+        ? "—"
+        : $"{_snapshot.Session.SourceBranch} / {(_snapshot.Session.SourceCommitSha.Length > 8 ? _snapshot.Session.SourceCommitSha[..8] : _snapshot.Session.SourceCommitSha)}";
+
+    string RecoveryText => _snapshot?.Runtime.RuntimeStatus == AdaptiveRuntimeStatus.Rebuilding
+        ? $"rebuilding since {FmtIst(_snapshot.Runtime.LastRecoveryStartedUtc)}"
+        : _snapshot?.Runtime.LastRecoveryCompletedUtc is { } t
+            ? $"last completed {FmtIst(t)} · reconciled {_snapshot.Runtime.LastRecoveryReconciledBars}"
+            : "not required yet";
+
+    string ResidualComponentText
+    {
+        get
+        {
+            if (_snapshot is null) return "—";
+            var selected = _residualVariant == "ATM"
+                ? _snapshot.ResidualAnchors.Where(x => x.IsCenterStrike)
+                : _snapshot.ResidualAnchors;
+            var calls = selected.Count(x => x.Side == OptionType.Call);
+            var puts = selected.Count(x => x.Side == OptionType.Put);
+            return $"{calls} CE + {puts} PE";
+        }
+    }
+
+    double? StrictRatio(AdaptiveOptionBandBarRow? x) => x is null ? null :
+        _measurement == "NOTIONAL" ? x.NotionalStrictDeltaRatioTotal : x.ContractStrictDeltaRatioTotal;
+    double? EnrichedRatio(AdaptiveOptionBandBarRow? x) => x is null ? null :
+        _measurement == "NOTIONAL" ? x.NotionalEnrichedDeltaRatio : x.ContractEnrichedDeltaRatio;
+    double? Coverage(AdaptiveOptionBandBarRow? x) => x is null ? null :
+        _measurement == "NOTIONAL" ? x.NotionalStrictCoverage : x.ContractStrictCoverage;
+    double? StrictDelta(AdaptiveOptionBandBarRow? x) => x is null ? null :
+        _measurement == "NOTIONAL" ? x.NotionalStrictDelta : x.ContractStrictDelta;
+    double? EnrichedDelta(AdaptiveOptionBandBarRow? x) => x is null ? null :
+        _measurement == "NOTIONAL" ? x.NotionalEnrichedDelta : x.ContractEnrichedDelta;
+    double? RollingStrictDelta(AdaptiveOptionBandBarRow? x) => x is null ? null :
+        _measurement == "NOTIONAL" ? x.NotionalRollingStrictDelta : x.ContractRollingStrictDelta;
+    double? RollingStrictRatio(AdaptiveOptionBandBarRow? x) => x is null ? null :
+        _measurement == "NOTIONAL" ? x.NotionalRollingStrictDeltaRatioTotal : x.ContractRollingStrictDeltaRatioTotal;
+    double? RollingEnrichedDelta(AdaptiveOptionBandBarRow? x) => x is null ? null :
+        _measurement == "NOTIONAL" ? x.NotionalRollingEnrichedDelta : x.ContractRollingEnrichedDelta;
+    double? RollingEnrichedRatio(AdaptiveOptionBandBarRow? x) => x is null ? null :
+        _measurement == "NOTIONAL" ? x.NotionalRollingEnrichedDeltaRatio : x.ContractRollingEnrichedDeltaRatio;
+    double? RollingCoverage(AdaptiveOptionBandBarRow? x) => x is null ? null :
+        _measurement == "NOTIONAL" ? x.NotionalRollingStrictCoverage : x.ContractRollingStrictCoverage;
+    double? ActivityPerSecond(AdaptiveOptionBandBarRow? x) => x is null ? null :
+        _measurement == "NOTIONAL" ? x.NotionalRollingActivityPerSecond : x.ContractRollingActivityPerSecond;
+
+    static double? Relative(double? a, double? b) => a.HasValue && b.HasValue ? a.Value - b.Value : null;
+    static string BoolMark(bool x) => x ? "YES" : "—";
+    static string DirectionText(int direction) => direction > 0 ? "UP" : direction < 0 ? "DOWN" : "NEUTRAL";
+    static string StateClass(AdaptiveStateKind? state) => state switch
+    {
+        AdaptiveStateKind.Weak2 => "adaptive-row-weak2",
+        AdaptiveStateKind.Weak1 => "adaptive-row-weak1",
+        AdaptiveStateKind.Strong => "adaptive-row-strong",
+        _ => string.Empty,
+    };
+
+    static string Fmt(double? x, int decimals = 2) => x.HasValue ? x.Value.ToString($"N{decimals}") : "—";
+    static string Fmt0(double x) => x.ToString("N0");
+    static string FmtInt(long x) => x.ToString("N0");
+    static string FmtSigned(double? x, int decimals = 0) => x.HasValue ? $"{x.Value:+0." + new string('0', decimals) + ";-0." + new string('0', decimals) + ";0}" : "—";
+    static string FmtSigned(long? x) => x.HasValue ? x.Value.ToString("+0;-0;0") : "—";
+    static string FmtSigned(long x) => x.ToString("+0;-0;0");
+    static string FmtPct01(double? x) => x.HasValue ? $"{x.Value * 100:0.0}%" : "—";
+    static string FmtStrike(double? x) => x.HasValue && x.Value > 0 ? x.Value.ToString("0") : "—";
+    static string FmtIst(DateTimeOffset? x) => x.HasValue ? x.Value.ToOffset(TimeSpan.FromHours(5.5)).ToString("HH:mm:ss") : "—";
+    static string FmtIst(DateTimeOffset x) => x.ToOffset(TimeSpan.FromHours(5.5)).ToString("HH:mm:ss");
+    static string FmtUtc(DateTimeOffset x) => x.UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss");
+    static string FmtAge(DateTimeOffset? x)
+    {
+        if (!x.HasValue) return "—";
+        var seconds = Math.Max(0d, (DateTimeOffset.UtcNow - x.Value).TotalSeconds);
+        return seconds < 60 ? $"{seconds:0.0}s ago" : $"{seconds / 60:0.0}m ago";
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        AdaptiveData.Updated -= OnAdaptiveUpdated;
+        if (_cts is not null)
+        {
+            await _cts.CancelAsync();
+            _cts.Dispose();
+        }
+        _headerTimer?.Dispose();
+        if (_headerLoop is not null)
+        {
+            try { await _headerLoop; } catch (OperationCanceledException) { }
+        }
+        _reloadGate.Dispose();
+    }
+}
