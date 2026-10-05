@@ -125,7 +125,7 @@ public sealed class AdaptiveSessionCoordinator(
             .ToArrayAsync(ct);
 
         var priorRatios = priorSessionIds.Length == 0
-            ? []
+            ? new List<double>()
             : await observer.RollingStates
                 .AsNoTracking()
                 .Where(x => priorSessionIds.Contains(x.SessionId))
