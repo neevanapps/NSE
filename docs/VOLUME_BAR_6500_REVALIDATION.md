@@ -264,6 +264,10 @@ The output directory contains:
 - 'episode-state-entry-sessions.csv'
 - 'episode-state-entry-dte.csv'
 - 'episode-state-age-summary.csv'
+- 'futures-execution-summary.csv'
+- 'futures-execution-breakeven.csv'
+- 'futures-execution-sessions.csv'
+- 'futures-execution-leave-one-session-out.csv'
 
 The directory is regenerable and is ignored by git. Do not commit these CSVs as source.
 
@@ -317,3 +321,12 @@ After the magnitude dose-response diagnostic, the next frozen test is documented
 CVD and unweighted price+CVD agreement states into episodes, evaluates only the first bar for the
 primary state-entry comparison, and exports exact continuation-state age separately. No magnitude
 threshold, DTE filter, weighted composite, stop, target or confirmation-age rule is selected.
+
+## Futures-execution follow-up
+
+After the episode/state-entry diagnostic showed a directional underlying edge that the weekly-option
+translation could not monetize, the next frozen test is documented in
+'docs/VOLUME_BAR_6500_FUTURES_EXECUTION.md'. It reuses the same first-bar-of-episode
+'AlignedForwardPoints' and prices a direct one-lot NIFTY Futures round trip against a swept
+round-trip cost grid instead of a weekly option, so the underlying edge can be judged on its own
+execution economics.

@@ -680,57 +680,14 @@ public static class VolumeBar6500RevalidationRunner
             if (!Directory.Exists(dayDir))
                 throw new DirectoryNotFoundException($"Missing predeclared primary session: {dayDir}");
 
-            var manifest = await OptionTickReaderV2.LoadManifestAsync(dayDir);
-            var future = manifest
-                .Where(m => string.Equals(m.InstrumentType, "Future", StringComparison.OrdinalIgnoreCase)
-                    && string.Equals(m.Underlying, "NIFTY", StringComparison.OrdinalIgnoreCase))
-                .OrderBy(m => m.ExpiryDate)
-                .FirstOrDefault()
-                ?? throw new InvalidDataException($"{date:yyyy-MM-dd}: no NIFTY Future in instruments.json.");
-
-            var nearestOptionExpiry = manifest
-                .Where(m => string.Equals(m.InstrumentType, "Option", StringComparison.OrdinalIgnoreCase)
-                    && m.ExpiryDate is { } expiry && expiry >= date)
-                .Select(m => m.ExpiryDate!.Value)
-                .OrderBy(expiry => expiry)
-                .FirstOrDefault();
-
-            if (nearestOptionExpiry == default)
-                throw new InvalidDataException($"{date:yyyy-MM-dd}: no nearest-expiry option chain in instruments.json.");
-
-            var dte = nearestOptionExpiry.DayNumber - date.DayNumber;
-            var futurePath = Path.Combine(dayDir, $"{future.Token}.ndjson");
-            if (!File.Exists(futurePath))
-                throw new FileNotFoundException($"{date:yyyy-MM-dd}: Future feed-update file missing.", futurePath);
-
-            var ticks = OptionTickReaderV2.LoadFile(futurePath);
-
-            var orderingViolations = OptionTickReaderV2.ValidateOrdering(ticks);
-            if (orderingViolations.Count > 0)
-                throw new InvalidDataException(
-                    $"{date:yyyy-MM-dd}: deterministic feed-update ordering failed: {orderingViolations[0]}");
-
-            var volumeReport = OptionTickReaderV2.ValidateCumulativeVolume(ticks);
-            if (volumeReport.NegativeDeltaCount > 0)
-                throw new InvalidDataException(
-                    $"{date:yyyy-MM-dd}: {volumeReport.NegativeDeltaCount} negative cumulative-volume delta(s).");
-
-            var bars = VolumeBar6500Revalidation.BuildBars(ticks);
-            var parity = VolumeBar6500Revalidation.CompareWithExistingVolumeBarBuilder(ticks, bars);
-            if (parity.MismatchCount > 0)
-                throw new InvalidDataException(
-                    $"{date:yyyy-MM-dd}: audited builder does not match existing VolumeBarBuilder(6500): " +
-                    $"{parity.FirstMismatch}");
-
-            var audit = VolumeBar6500Revalidation.AuditSession(date, future.Token, dte, ticks, bars, parity);
-            var observations = VolumeBar6500Revalidation.BuildObservations(date, dte, bars);
+            var (audit, observations, bars) = await LoadSessionAsync(inputRoot, date);
 
             audits.Add(audit);
             allObservations.AddRange(observations);
-            allBars.AddRange(bars.Select(b => (date, dte, b)));
+            allBars.AddRange(bars.Select(b => (date, audit.Dte, b)));
 
             Console.WriteLine(
-                $"{date:yyyy-MM-dd}: updates={ticks.Count:N0}, fullBars={audit.FullBarCount:N0}, " +
+                $"{date:yyyy-MM-dd}: updates={audit.TotalFeedUpdates:N0}, fullBars={audit.FullBarCount:N0}, " +
                 $"partialBars={audit.PartialBarCount}, parity=PASS, medianOvershoot={audit.MedianOvershoot:N0}, " +
                 $"p95Overshoot={audit.P95Overshoot:N0}, maxOvershoot={audit.MaxOvershoot:N0}, " +
                 $"observations={observations.Count:N0}");
@@ -755,11 +712,75 @@ public static class VolumeBar6500RevalidationRunner
             inputRoot, allObservations, outputDirectory, cancellationToken);
         await VolumeBar6500MagnitudeDoseResponseAnalysis.WriteReportsAsync(
             allObservations, optionTranslation, outputDirectory);
-        await VolumeBar6500EpisodeStateAnalysis.WriteReportsAsync(
+        var episodeState = await VolumeBar6500EpisodeStateAnalysis.WriteReportsAsync(
             allObservations, optionTranslation, outputDirectory);
+        await VolumeBar6500FuturesExecutionAnalysis.WriteReportsAsync(
+            episodeState.EntryObservations, outputDirectory);
 
-        Console.WriteLine($"6500 raw-feed-update revalidation + metric analyses + option translation + magnitude dose-response + episode/state-entry complete -> {outputDirectory}");
+        Console.WriteLine($"6500 raw-feed-update revalidation + metric analyses + option translation + magnitude dose-response + episode/state-entry + futures-execution complete -> {outputDirectory}");
         return 0;
+    }
+
+    /// <summary>
+    /// Loads, audits and bars a single session directory under the same locked convention used by
+    /// the primary batch (whole-update/no-carry 6500 builder, mandatory legacy-parity audit). Shared
+    /// by the primary-batch loop and by <see cref="VolumeBar6500ForwardTestRunner"/> so a
+    /// forward-test session goes through byte-for-byte the same construction as a primary one.
+    /// </summary>
+    public static async Task<(
+        VolumeBar6500Revalidation.SessionAudit Audit,
+        IReadOnlyList<VolumeBar6500Revalidation.Observation> Observations,
+        IReadOnlyList<VolumeBar6500Revalidation.Bar> Bars)> LoadSessionAsync(string inputRoot, DateOnly date)
+    {
+        var dayDir = Path.Combine(inputRoot, date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture));
+        if (!Directory.Exists(dayDir))
+            throw new DirectoryNotFoundException($"Missing session directory: {dayDir}");
+
+        var manifest = await OptionTickReaderV2.LoadManifestAsync(dayDir);
+        var future = manifest
+            .Where(m => string.Equals(m.InstrumentType, "Future", StringComparison.OrdinalIgnoreCase)
+                && string.Equals(m.Underlying, "NIFTY", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(m => m.ExpiryDate)
+            .FirstOrDefault()
+            ?? throw new InvalidDataException($"{date:yyyy-MM-dd}: no NIFTY Future in instruments.json.");
+
+        var nearestOptionExpiry = manifest
+            .Where(m => string.Equals(m.InstrumentType, "Option", StringComparison.OrdinalIgnoreCase)
+                && m.ExpiryDate is { } expiry && expiry >= date)
+            .Select(m => m.ExpiryDate!.Value)
+            .OrderBy(expiry => expiry)
+            .FirstOrDefault();
+
+        if (nearestOptionExpiry == default)
+            throw new InvalidDataException($"{date:yyyy-MM-dd}: no nearest-expiry option chain in instruments.json.");
+
+        var dte = nearestOptionExpiry.DayNumber - date.DayNumber;
+        var futurePath = Path.Combine(dayDir, $"{future.Token}.ndjson");
+        if (!File.Exists(futurePath))
+            throw new FileNotFoundException($"{date:yyyy-MM-dd}: Future feed-update file missing.", futurePath);
+
+        var ticks = OptionTickReaderV2.LoadFile(futurePath);
+
+        var orderingViolations = OptionTickReaderV2.ValidateOrdering(ticks);
+        if (orderingViolations.Count > 0)
+            throw new InvalidDataException(
+                $"{date:yyyy-MM-dd}: deterministic feed-update ordering failed: {orderingViolations[0]}");
+
+        var volumeReport = OptionTickReaderV2.ValidateCumulativeVolume(ticks);
+        if (volumeReport.NegativeDeltaCount > 0)
+            throw new InvalidDataException(
+                $"{date:yyyy-MM-dd}: {volumeReport.NegativeDeltaCount} negative cumulative-volume delta(s).");
+
+        var bars = VolumeBar6500Revalidation.BuildBars(ticks);
+        var parity = VolumeBar6500Revalidation.CompareWithExistingVolumeBarBuilder(ticks, bars);
+        if (parity.MismatchCount > 0)
+            throw new InvalidDataException(
+                $"{date:yyyy-MM-dd}: audited builder does not match existing VolumeBarBuilder(6500): " +
+                $"{parity.FirstMismatch}");
+
+        var audit = VolumeBar6500Revalidation.AuditSession(date, future.Token, dte, ticks, bars, parity);
+        var observations = VolumeBar6500Revalidation.BuildObservations(date, dte, bars);
+        return (audit, observations, bars);
     }
 
     static async Task WriteAuditCsvAsync(

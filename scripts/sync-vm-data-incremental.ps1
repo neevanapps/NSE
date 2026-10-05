@@ -247,13 +247,20 @@ try {
             Copy-Item -Path $vmTempFile -Destination $localTemp -FromSession $session -Force
 
             Write-Host "    importing locally into $LocalDatabase..."
-            $importOutput = & dotnet run --project (Join-Path $repoRoot 'NiftySignal.DataSync') -c Release -- import --table=$table --in=$localTemp --gzip --connection="$localConnectionString"
+            # --expected-count=$exportedCount (2026-10-01): import no longer re-counts the table
+            # after COPY to "verify" the row count -- that re-count itself timed out on a real
+            # 33.2M-row Ticks import (`COUNT(*)` on a connection left idle through the whole COPY).
+            # COPY FROM STDIN is one atomic server-side operation (NiftySignal.DataSync/Program.cs's
+            # own ImportAsync comment): if it returns without throwing, every row from this exact
+            # file -- already counted once, cheaply, by ExportAsync -- was committed. Nothing left
+            # to independently re-verify; import just echoes $exportedCount back.
+            $importOutput = & dotnet run --project (Join-Path $repoRoot 'NiftySignal.DataSync') -c Release -- import --table=$table --in=$localTemp --gzip --connection="$localConnectionString" --expected-count=$exportedCount
             if ($LASTEXITCODE -ne 0) {
                 throw "Local import failed for $table. Raw output:`n$($importOutput -join [Environment]::NewLine)"
             }
             $importLine = $importOutput | Where-Object { $_ -match '^SYNC_RESULT' } | Select-Object -Last 1
-            if ($null -ne $importLine -and $importLine -match 'count=(\d+)' -and [int]$Matches[1] -ne $exportedCount) {
-                Write-Host "    WARNING: imported $($Matches[1]) rows but exported $exportedCount -- investigate before trusting today's local backtest data for $table." -ForegroundColor Yellow
+            if ($null -eq $importLine -or $importLine -notmatch 'count=(\d+)') {
+                Write-Host "    WARNING: import exited 0 but printed no parseable SYNC_RESULT line -- investigate before trusting today's local backtest data for $table." -ForegroundColor Yellow
             }
             else {
                 Write-Host "    imported $exportedCount row(s)." -ForegroundColor Green
