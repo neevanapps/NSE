@@ -59,6 +59,7 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
             e.HasIndex(x => new { x.SessionId, x.Side, x.Strike }).IsUnique();
             e.Property(x => x.Token).HasMaxLength(32);
             e.Property(x => x.TradingSymbol).HasMaxLength(64);
+            e.Property(x => x.UnavailableReason).HasMaxLength(512);
         });
 
         modelBuilder.Entity<AdaptiveOptionResidualBarRow>(e =>
