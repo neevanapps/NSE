@@ -19,7 +19,7 @@
 - Historical tolerances remain declared: residual numeric error <=1e-6 points (observed maximum <5e-11); observation price/OI <=1e-9; Python serialized observation timestamps <=1 microsecond. Exact identities, counts, classifications and selected strikes must agree.
 - Grid 2 is a new live-binding view: its independent oracle uses original research cleaner/classifier and separate causal selection/aggregation. It is not claimed to be an identical pre-existing research Dashboard.
 - CI commit-to-three-grids plus two animation frames: 20 samples, P95 **158.8837 ms**, maximum **181.7617 ms**. This measures isolated PostgreSQL/Chromium, **not VM latency** and not feed-arrival latency.
-- Final checkpoint strengthens distinguishable selector-value/unavailable-row assertions and publishes both applications. Its green run and exact merged `master` run must be recorded before release handoff.
+- Final feature gate **PASS**: [37335634158](https://github.com/neevanapps/NSE/actions/runs/37335634158), SHA `22592b07fb48f2c81a27e65bf407e7f78b44d9e3`. Distinct CE/PE, contract/notional, ATM/band and unavailable-row assertions pass; both Host/Dashboard publish successfully. 48 adaptive / 1,123 total tests; seven PostgreSQL recovery boundaries; P95 189.0 ms / max 224.4 ms. Exact merged master verification is the remaining automated release gate.
 - **VM deployment is manual by the user with the existing `deploy.ps1`.** VM service/DB permissions, source-history completeness, deployed SHA, prospective observation and VM latency are not validated by CI.
 - No adaptive or legacy paper executor is hosted. Legacy source/schema and `/legacy` remain for compatibility/rollback.
 
@@ -37,19 +37,19 @@ Status terminology: **VALIDATED** means the stated gate passed in the stated env
 | Adaptive schema and EF migrations | VALIDATED | Eight tables, eight unique indexes, seven restrictive session FKs; PostgreSQL 17 apply/model drift pass. |
 | ₹100–₹150 fixed selection, CE+PE OI, H5/MFE/MAE | VALIDATED | Independent overlapping historical observation reference. |
 | Restart reconstruction | VALIDATED | 87 historical engine resets, seven actual PostgreSQL recovery boundaries, frozen-universe/after-hours unit tests, corruption rejection. This is deterministic process-state reconstruction, not a Windows-service crash experiment. |
-| Dashboard three synchronized grids, selectors, partial bar | VALIDATED in CI | 36 combinations, blocked-reader race, reader reload, unavailable rows, legacy route. Final distinct-value fixture rerun pending. |
+| Dashboard three synchronized grids, selectors, partial bar | VALIDATED in CI | 36 combinations, blocked-reader race, reader reload, unavailable rows, legacy route. Distinct-value and unavailable-row assertions passed at 22592b0. |
 | Header/access-token/Live Quote retention | IMPLEMENTED; source reviewed | Existing components retained. Real broker-authenticated quote behavior requires VM observation. |
 | Sub-second commit-to-visible Dashboard | VALIDATED in CI | P95 159 ms / max 182 ms; VM measurement pending. |
 | Legacy runtime paper-worker removal | VALIDATED | Hosted call-site review and full regression; other legacy source retained. |
-| Final diff review / publish gate | IN PROGRESS | Review findings F63–F71 repaired; final publish run pending. |
+| Final diff review / publish gate | VALIDATED | Full 82-file scope reviewed; F63–F71 repaired; final publish run passed. No adaptive calculation change since historical-tested a43ca3c. |
 | Merge and exact master CI | PENDING | Only after final feature gates pass. |
 | VM deployment / live observation | PENDING — USER MANUAL | Follow ADAPTIVE_VM_HANDOFF.md after exact master CI passes. |
 | Paper trading / orders | OUT OF V1 | Deliberately excluded. |
 
 ### Remaining sequence
 
-1. Pass the final distinguishable Dashboard fixture and Host/Dashboard publish gate.
-2. Complete release diff review and record the final feature evidence.
+1. **DONE:** final distinguishable Dashboard fixture and Host/Dashboard publish gate.
+2. **DONE:** release diff review and final feature evidence recorded.
 3. Merge to `master` with the expected feature head SHA.
 4. Verify build, full regression, migrations, restart/browser checks and publish outputs at the exact merged SHA.
 5. User deploys that SHA with `deploy.ps1 -Target Vm -Service Both -ExpectedCommitSha <sha>`.
