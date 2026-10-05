@@ -65,7 +65,8 @@ public sealed class AdaptiveCoreParityTests
         Assert.Equal(2, completed.Count);
         Assert.All(completed, x => Assert.Equal(100, x.Volume));
         Assert.Equal(50, b.PartialVolume);
-        Assert.Equal(1, b.SplitUpdates);\n        Assert.Equal(3, b.MaxChunksPerUpdate);
+        Assert.Equal(1, b.SplitUpdates);
+        Assert.Equal(3, b.MaxChunksPerUpdate);
 
         var partial = b.FlushPartial();
         Assert.NotNull(partial);

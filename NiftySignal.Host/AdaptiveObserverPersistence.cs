@@ -26,6 +26,7 @@ public sealed class AdaptiveObserverPersistence(ILogger<AdaptiveObserverPersiste
         {
             VerifyFuture(existing, package.FutureBar);
             await VerifyDependentRowsAsync(db, session, package, ct);
+            logger.LogDebug("Adaptive replay verified session={SessionId}, bar={BarSeq}", session.Id, package.FutureBar.BarSeq);
             return new AdaptivePersistResult(false, true, package.FutureBar.BarSeq);
         }
 

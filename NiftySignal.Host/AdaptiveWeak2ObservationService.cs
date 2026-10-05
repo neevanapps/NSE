@@ -17,6 +17,7 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
     const double PremiumMin = 100d;
     const double PremiumMax = 150d;
     const double PremiumTarget = 125d;
+    public const string SelectionPolicyV1 = "first-post-trigger-ask-100-150-nearest-125-strike-ascending-v1";
 
     sealed record QuotePoint(DateTimeOffset AvailableAt, long Id, double Bid, double Ask, double Last, long? Oi);
     sealed record EntryCandidate(ObserverOptionInstrument Instrument, QuotePoint Quote);
@@ -138,6 +139,7 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
                 : null,
             H5TargetBarSeq = package.FutureBar.BarSeq + 5,
             Status = AdaptiveObservationStatus.PendingH5,
+            SelectionPolicy = SelectionPolicyV1,
         });
         await db.SaveChangesAsync(ct);
     }
