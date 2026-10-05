@@ -132,6 +132,8 @@ public sealed class AdaptiveRollingStateRow
     public string? StrictDominanceEvolution { get; set; }
     public bool IsStrong { get; set; }
     public int WeakeningSequence { get; set; }
+    public int? StrongBaseBarSeq { get; set; }
+    public int? Weak1BarSeq { get; set; }
     public AdaptiveStateKind State { get; set; }
 }
 
