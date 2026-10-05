@@ -56,6 +56,7 @@ static class ResidualParity
             foreach(var package in engine.ProcessAvailabilityGroup(input.GetRange(offset,end-offset)))integrated.Add(package.FutureBar.BarSeq,package);
             offset=end;
         }
+        OptionBandParity.Check(folder,day,chain,bars,integrated,futureTicks);
         long checks=0; var maximumError=0d;
         foreach (var variant in new[] { ResidualVariant.Atm, ResidualVariant.AtmPlusMinus2 })
         {

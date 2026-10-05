@@ -105,8 +105,8 @@ foreach (var (day, spec) in OpeningVolumeProjectionV1.DiscoveryOutOfFold.OrderBy
 }
 if (reports.Count != 13) throw new InvalidOperationException("Expected all 13 discovery sessions.");
 Console.WriteLine(JsonSerializer.Serialize(new { status = "PASS", sessions = reports.Count, checkedFields,
-    scope = "clean ticks, per-tick classification, exact bars, rolling states, evolution, Weak2 identities",
-    pending = "option bands, residuals, selection/OI/H5 and database restart parity" }));
+    scope = "clean ticks, per-tick classification, exact bars, rolling states, evolution, thresholds, Weak2 identities; independent band/residual/H5 sub-gates above",
+    pending = "production source bootstrap parity, option rolling oracle, full database restart and VM gates" }));
 
 void Compare(object reference, object actual, DateOnly day,
     (string Source, string Target)[] aliases, string[] ignored)

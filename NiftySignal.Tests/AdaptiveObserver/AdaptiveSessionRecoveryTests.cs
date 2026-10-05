@@ -40,21 +40,25 @@ public sealed class AdaptiveSessionRecoveryTests
     {
         await using var source=Source(); await using var db=Observer();
         var context=Context();var at=context.SignalStartUtc;
+        context.Session.StrongThreshold=.2;
         db.Sessions.Add(context.Session);
         db.Runtime.Add(new AdaptiveObserverRuntimeRow { SessionId=1,LastHeartbeatUtc=at });
         await db.SaveChangesAsync();
         for(var i=0;i<=12;i++)source.Ticks.Add(new Tick { Id=i+1,Token="FUT",Exchange=Exchange.Nfo,
-            ExchangeTimestamp=at.AddSeconds(i),ReceivedAt=at.AddSeconds(i),LastPrice=23000+i,Volume=1000+100*i });
+            ExchangeTimestamp=at.AddSeconds(i),ReceivedAt=at.AddSeconds(i),LastPrice=23000+i,Volume=1000+100*i,
+            Depth=new NiftySignal.Domain.ValueObjects.MarketDepth(
+                i<10?23000+i-1:24000,1,0,0,0,0,0,0,0,0,
+                i<10?23000+i+.1m:24001,1,0,0,0,0,0,0,0,0) });
         await source.SaveChangesAsync();
         var persistence=new AdaptiveObserverPersistence(NullLogger<AdaptiveObserverPersistence>.Instance);
         var observations=new AdaptiveWeak2ObservationService(NullLogger<AdaptiveWeak2ObservationService>.Instance);
         var recovery=new AdaptiveStateRecoveryService(new(),persistence,observations,NullLogger<AdaptiveStateRecoveryService>.Instance);
         await recovery.RecoverAsync(source,db,context,at.AddMinutes(1),default);
         Assert.Equal(12,await db.FutureBars.CountAsync());
-        db.Weak2Observations.Add(new AdaptiveWeak2ObservationRow { SessionId=1,StrongBaseBarSeq=10,Weak1BarSeq=11,
-            TriggerBarSeq=12,TriggerTimestampUtc=at.AddSeconds(12),OptionSide=OptionType.Put,H5TargetBarSeq=17,
-            SelectionPolicy=AdaptiveWeak2ObservationService.SelectionPolicyV1,Status=AdaptiveObservationStatus.PendingH5 });
-        await db.SaveChangesAsync();db.ChangeTracker.Clear();
+        var pending=Assert.Single(await db.Weak2Observations.ToListAsync());
+        Assert.Equal(12,pending.TriggerBarSeq);
+        Assert.Equal(AdaptiveObservationStatus.PendingH5,pending.Status);
+        db.ChangeTracker.Clear();
         var service=new AdaptiveEndedSessionRecoveryService(Coordinator(),recovery,observations,persistence,
             NullLogger<AdaptiveEndedSessionRecoveryService>.Instance);
         var day=nextDay?context.Session.TradeDate.AddDays(1):context.Session.TradeDate;
