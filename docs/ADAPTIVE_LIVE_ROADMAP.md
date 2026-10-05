@@ -1,0 +1,295 @@
+# Adaptive Market Observer V1 — Live Binding Roadmap
+
+## Base and operating principle
+
+- Canonical implementation base: `master`.
+- New work must start from a fresh feature branch based on `master`.
+- The current `NiftyRatio` branch is treated as research/development history, not the production source of truth.
+- The new adaptive system is observation-only first. No paper trading or real order routing is enabled as part of the initial live binding.
+- The implementation must reproduce the validated NiftyResearcher semantics exactly before any live result is trusted.
+- Dashboard code is a reader only. Market-state calculations belong in Host/domain services and are persisted.
+
+## Non-negotiable restart safety
+
+Every live component must be able to restart mid-session and reconstruct the exact same state it would have held without the restart.
+
+A restart must not:
+- change today's selected adaptive bar threshold;
+- change the strong-state threshold;
+- lose a partially formed exact-volume bar;
+- duplicate or skip a source tick;
+- duplicate a completed bar;
+- duplicate a weak1/weak2 observation;
+- change fixed-strike selection for an existing observation;
+- lose H5 progress or generate H5 twice;
+- reinterpret historical events using a newer configuration/model version.
+
+Restart strategy:
+
+1. Persist one immutable daily session configuration row as soon as the 09:30 selection is made:
+   - trade date;
+   - opening 09:15–09:30 futures volume;
+   - estimator/model version;
+   - estimated full-day volume;
+   - exchange lot size;
+   - selected exact base-bar volume;
+   - rolling 10-bar volume;
+   - strong threshold;
+   - build commit SHA / strategy version;
+   - selection timestamp.
+
+2. On process restart:
+   - if today's daily configuration row exists, load and reuse it exactly;
+   - never recompute today's 09:30 threshold from a revised model or changed historical set;
+   - rebuild deterministic market state from persisted raw ticks / completed exact bars;
+   - resume from an explicit source-tick boundary `(ExchangeTimestamp, TickId)`;
+   - reconcile persisted completed bars before accepting any new tick.
+
+3. Persist enough identity for idempotency:
+   - unique `(TradeDate, AdaptiveModelVersion, BarSeq)` for exact bars;
+   - unique `(TradeDate, AdaptiveModelVersion, EndBarSeq)` for rolling states;
+   - unique trigger identity for weak2 observations;
+   - observation lifecycle state persisted separately from in-memory state.
+
+4. Add a mandatory restart-parity test:
+   - uninterrupted replay of a historical day;
+   - replay with several artificial process restarts at arbitrary tick/bar boundaries;
+   - resulting daily session row, exact bars, rolling states, weak2 triggers, option selections, OI-gate decisions and H5 outcomes must be byte/field equivalent.
+
+## Validated V1 market clock
+
+At 09:30 IST, after observing NIFTY futures from 09:15 to 09:30:
+
+```text
+EstimatedDayVolume
+= 1,228,063.4608804993
++ 4.699614102486805 * OpeningVolume0930
+```
+
+Then:
+
+```text
+RawBaseBarVolume = EstimatedDayVolume / 160
+BaseBarVolume = round to nearest 50 exchange lots
+RollingStateVolume = BaseBarVolume * 10
+```
+
+V1 freezes `BaseBarVolume` for the entire session.
+
+The 09:15–09:30 ticks are replayed using the selected threshold to initialize state, but no adaptive weak2 trigger before 09:30 is actionable.
+
+## Exact market-state semantics
+
+Do not reuse the existing production `VolumeBarBuilder` for this observer.
+
+The research definition requires:
+- each complete base bar has exactly the configured traded volume;
+- crossing cumulative-volume updates are split across exact bars;
+- strict buyer/seller aggressor flow is quote-derived;
+- enriched tick-rule fallback remains a separate diagnostic;
+- OI is point-in-time and split-volume safe;
+- rolling state is the latest 10 complete exact adaptive bars;
+- incomplete end-of-day bars are never silently treated as complete state bars.
+
+Strong-state threshold:
+- calculated only from completed prior sessions;
+- frozen for the current day;
+- current session cannot influence its own threshold.
+
+Weak2:
+- strong direction-aligned rolling state;
+- then two same-sign `Weakening` transitions;
+- all event fields persisted, including rejected events.
+
+## Option observation semantics
+
+At each weak2 trigger:
+- old bullish dominance -> reversal side PE;
+- old bearish dominance -> reversal side CE;
+- nearest weekly expiry;
+- executable ask must be in ₹100–₹150;
+- choose ask closest to ₹125, deterministic tie-break;
+- selected strike is fixed for the observation;
+- evaluate CE and PE OI at the same strike;
+- OI gate:
+  `CE_OI(trigger) + PE_OI(trigger) > CE_OI(strong-base) + PE_OI(strong-base)`;
+- persist accepted and rejected observations;
+- record hypothetical ask entry and H5 executable bid outcome, MFE and MAE;
+- observation only until a separate paper-trading decision.
+
+## Persistence / read model
+
+Keep the adaptive observer separate from the legacy 2,600-volume pipeline.
+
+Suggested concepts:
+- `AdaptiveSessionState`
+- `AdaptiveExactFlowBar`
+- `AdaptiveRollingMarketState`
+- `AdaptiveWeak2Observation`
+
+All rows carry:
+- strategy/model version;
+- build Git SHA where applicable;
+- timestamps;
+- deterministic event identity.
+
+The database is the source of truth. The dashboard never reconstructs strategy logic.
+
+## Dashboard rewrite
+
+The new `/` dashboard becomes Adaptive Market Observer.
+
+Primary sections:
+
+1. Runtime/build status
+   - feed status and tick age;
+   - Git branch, commit SHA, build UTC;
+   - observer model version;
+   - restart/rebuild status.
+
+2. Adaptive session clock
+   - opening 15-minute volume;
+   - expected day volume;
+   - actual volume so far;
+   - base-bar volume;
+   - rolling 10-bar volume;
+   - completed bars;
+   - current in-progress bar percentage;
+   - strong threshold.
+
+3. Main futures/state chart
+   - futures price;
+   - exact adaptive bar boundaries;
+   - rolling strict delta ratio;
+   - positive/negative strong thresholds;
+   - strong, weak1 and weak2 markers;
+   - OI-accepted and OI-rejected trigger markers.
+
+4. Current market-state panel
+   - price direction;
+   - strict delta and ratio;
+   - strict quote coverage;
+   - dominance/evolution;
+   - weakening count;
+   - rolling duration and activity.
+
+5. Current reversal observation
+   - reversal direction;
+   - fixed CE/PE strike;
+   - bid/ask/spread;
+   - CE/PE OI at strong-base and trigger;
+   - pair-OI change and accepted/rejected status;
+   - H5 progress/outcome.
+
+6. Today's observations
+   - all accepted and rejected weak2 events;
+   - H5 outcome;
+   - hypothetical P&L;
+   - MFE/MAE;
+   - data-quality fields.
+
+7. Data quality
+   - futures tick lag;
+   - option quote/OI age;
+   - strict classification coverage;
+   - unknown-flow share;
+   - duplicate/reset counters;
+   - source-tick checkpoint.
+
+Legacy operational functionality can temporarily remain under `/legacy` or `/operations` during cutover.
+
+## Deployment traceability
+
+Before this observer is deployed, add immutable build metadata:
+- source branch;
+- commit SHA;
+- build UTC;
+- model/strategy version.
+
+Expose it:
+- in application startup logs;
+- in the dashboard header;
+- optionally in a small persisted/runtime health record.
+
+`deploy.ps1` currently publishes whichever checkout invoked it and does not prove which Git revision is running. This ambiguity must be eliminated before the adaptive observer becomes the production baseline.
+
+## Implementation phases and gates
+
+### Phase 0 — production/source-control baseline
+- branch from `master`;
+- add build metadata;
+- establish deploy/revision visibility.
+
+Gate: running revision is unambiguous.
+
+### Phase 1 — exact research semantics in NSE
+Port/reuse exact tick cleaning, strict/enriched classification, exact-volume splitting and rolling-state logic.
+
+Gate: golden historical replay matches NiftyResearcher bar-for-bar and state-for-state.
+
+### Phase 2 — adaptive session coordinator
+Implement 09:30 V1 estimation, daily immutable session row and prior-session strong threshold.
+
+Gate: historical session thresholds match NiftyResearcher exactly.
+
+### Phase 3 — incremental live + restart recovery
+Consume new ticks incrementally while retaining deterministic replay/recovery.
+
+Gate: restart-parity tests at arbitrary points produce identical results to uninterrupted replay.
+
+### Phase 4 — weak2 state lifecycle
+Persist strong/weak1/weak2 transitions.
+
+Gate: historical trigger identities/times match research exactly.
+
+### Phase 5 — option selection and CE/PE OI gate
+Implement ₹100–₹150 fixed-strike selection and pair-OI expansion.
+
+Gate: historical accepted/rejected observations match research exactly.
+
+### Phase 6 — H5 observation lifecycle
+Persist hypothetical executable entry, H5 bid exit, MFE/MAE.
+
+Gate: historical simulation outcomes reproduce.
+
+### Phase 7 — dashboard replacement
+Build the new observer UI entirely from persisted/read-model state.
+
+Gate: dashboard performs no trading calculations and survives dashboard/Host restart independently.
+
+### Phase 8 — live observation
+Deploy with all order/paper-trade actions disabled.
+
+Gate: collect live sessions and compare accepted versus rejected behavior prospectively.
+
+### Phase 9 — paper-trading decision
+Only after prospective observation is accepted.
+
+## Legacy cleanup
+
+Maintenance cleanup is part of the migration, but should happen after the adaptive observer has historical parity and initial live stability.
+
+Do not delete old code before it has served as a rollback/reference path.
+
+Cleanup sequence:
+1. inventory legacy Host engines, score models, tables, Razor panels, config sections, migrations and tests;
+2. classify each as:
+   - still operational infrastructure;
+   - required historical/schema compatibility;
+   - genuinely unused/retired;
+3. remove retired runtime registrations first;
+4. remove retired Dashboard panels/routes/services;
+5. remove dead configuration/options;
+6. remove unreachable score/trading code and its tests;
+7. keep migrations already applied to production history even when their model is retired unless a deliberate schema-cleanup migration is made;
+8. simplify deployment and documentation;
+9. run full build/test + historical adaptive parity + restart parity after each cleanup batch.
+
+Likely legacy candidates must be verified by current references before deletion; no class is removed merely because its name belongs to an older strategy.
+
+## Change discipline
+
+- No composite score is introduced into the adaptive weak2 research.
+- No new historical filter is added merely to improve backtest P&L.
+- Any new metric discovered during observation is persisted/visualized first and tested separately.
+- Production behavior changes only after deterministic historical parity and restart parity.
