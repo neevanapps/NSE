@@ -184,6 +184,7 @@ try
     builder.Services.AddSingleton<AdaptiveSourceTickReader>();
     builder.Services.AddSingleton<AdaptiveSessionCoordinator>();
     builder.Services.AddSingleton<AdaptiveObserverPersistence>();
+    builder.Services.AddSingleton<AdaptiveWeak2ObservationService>();
     builder.Services.AddSingleton<AdaptiveStateRecoveryService>();
     builder.Services.AddHostedService<AdaptiveObserverWorker>();
 
