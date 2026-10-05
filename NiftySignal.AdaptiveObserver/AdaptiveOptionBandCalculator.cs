@@ -151,7 +151,8 @@ public static class AdaptiveOptionBandCalculator
             Diff(starts, ends, x => x.TradeUpdates),
             oiOpen,
             oiClose,
-            oiOpen.HasValue && oiClose.HasValue ? oiClose.Value - oiOpen.Value : null);
+            oiOpen.HasValue && oiClose.HasValue ? oiClose.Value - oiOpen.Value : null,
+            oiOpen is > 0 && oiClose.HasValue ? (double)(oiClose.Value - oiOpen.Value) / oiOpen.Value : null);
     }
 
     static bool FreshMid(
