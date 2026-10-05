@@ -43,7 +43,7 @@ public sealed class AdaptiveObserverDataService(
         return runtime is null ? null : new AdaptiveObserverHeaderSnapshot(session, runtime);
     }
 
-    public async Task<AdaptiveObserverSnapshot?> LoadSnapshotAsync(int requestedRows, CancellationToken ct = default)
+    public async Task<AdaptiveObserverSnapshot?> LoadSnapshotAsync(int requestedRows, CancellationToken ct = default, long? captureSessionId = null, int? throughBarSeq = null)
     {
         var rowCount = requestedRows switch
         {
@@ -53,7 +53,9 @@ public sealed class AdaptiveObserverDataService(
         };
 
         await using var db = await dbFactory.CreateDbContextAsync(ct);
-        var session = await FindTodaySessionAsync(db, ct);
+        var session = captureSessionId is { } id
+            ? await db.Sessions.AsNoTracking().SingleOrDefaultAsync(x => x.Id == id, ct)
+            : await FindTodaySessionAsync(db, ct);
         if (session is null)
         {
             return null;
@@ -66,6 +68,15 @@ public sealed class AdaptiveObserverDataService(
             return null;
         }
 
+        if (throughBarSeq is { } boundary)
+        {
+            if (captureSessionId is null || boundary < 0 || boundary > runtime.LastCompletedBarSeq)
+                throw new InvalidOperationException("Capture boundary is not committed.");
+            runtime.LastCompletedBarSeq = boundary;
+            runtime.CurrentPartialBarVolume = 0;
+            runtime.CurrentPartialBarStartedAtUtc = null;
+            runtime.LastProcessedSourceAvailableAtUtc = null;
+        }
         var futureBars = await db.FutureBars.AsNoTracking()
             .Where(x => x.SessionId == session.Id && x.BarSeq <= runtime.LastCompletedBarSeq)
             .OrderByDescending(x => x.BarSeq)
@@ -73,6 +84,9 @@ public sealed class AdaptiveObserverDataService(
             .ToListAsync(ct);
 
         var seqs = futureBars.Select(x => x.BarSeq).ToArray();
+        if (throughBarSeq is { } expected && expected > 0 && futureBars.FirstOrDefault()?.BarSeq != expected)
+            throw new InvalidOperationException("Capture boundary bar is missing.");
+        if (throughBarSeq is not null) runtime.LastProcessedSourceAvailableAtUtc = futureBars.FirstOrDefault()?.EndAvailableAtUtc;
         var rolling = seqs.Length == 0
             ? new List<AdaptiveRollingStateRow>()
             : await db.RollingStates.AsNoTracking()

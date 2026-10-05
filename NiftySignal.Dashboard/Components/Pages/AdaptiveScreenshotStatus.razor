@@ -1,0 +1,57 @@
+@page "/adaptive-screenshots"
+@attribute [Authorize]
+@rendermode InteractiveServer
+@using Microsoft.EntityFrameworkCore
+@using Microsoft.Extensions.Options
+@using NiftySignal.AdaptiveObserverData
+@using NiftySignal.Dashboard.Services
+@using NiftySignal.Domain
+@inject IDbContextFactory<AdaptiveObserverDbContext> DbFactory
+@inject IOptions<AdaptiveScreenshotOptions> Options
+
+<PageTitle>Adaptive Telegram screenshots</PageTitle>
+<main style="padding:24px">
+    <h1>Adaptive Telegram screenshots</h1>
+    <p>Dashboard: @BuildIdentity.Current().SourceBranch / @BuildIdentity.Current().CommitSha</p>
+    <p>Worker configured: @(Options.Value.Enabled ? "Enabled" : "Disabled") · PNG files retained locally · no paper or real orders</p>
+    <p>Initialization at 09:30 IST; then every five completed bars counted from that boundary. Delayed messages retain their original bar/date. An uncertain upload is not automatically resent.</p>
+    <button disabled="@(!Options.Value.Enabled || _busy)" @onclick="SendTestAsync">Send pre-live test</button>
+    <button disabled="@_busy" @onclick="ReloadAsync">Refresh status</button>
+    <a href="/">Dashboard</a>
+    <p role="status">@_message</p>
+    <table class="adaptive-table">
+        <thead><tr><th>Job</th><th>Date</th><th>Kind</th><th>Bar</th><th>Status</th><th>Attempts</th><th>Telegram message</th><th>Last error</th></tr></thead>
+        <tbody>@foreach (var job in _jobs) {
+            <tr><td>@job.Id</td><td>@job.TradeDate</td><td>@job.Kind</td><td>@job.TargetBarSeq</td><td>@job.Status</td><td>@job.Attempts</td><td>@job.TelegramMessageId</td><td>@job.LastError</td></tr>
+        }</tbody>
+    </table>
+</main>
+
+@code {
+    List<AdaptiveScreenshotJobRow> _jobs = [];
+    bool _busy;
+    string? _message;
+    protected override Task OnInitializedAsync() => ReloadAsync();
+    async Task ReloadAsync()
+    {
+        try { await using var db = await DbFactory.CreateDbContextAsync(); _jobs = await db.ScreenshotJobs.AsNoTracking().OrderByDescending(x => x.Id).Take(50).ToListAsync(); }
+        catch (Exception ex) { _message = $"Status read failed ({ex.GetType().Name}); check migration and Dashboard logs."; }
+    }
+    async Task SendTestAsync()
+    {
+        if (_busy || !Options.Value.Enabled) return;
+        _busy = true;
+        try
+        {
+            await using var db = await DbFactory.CreateDbContextAsync();
+            var now = DateTimeOffset.UtcNow;
+            db.ScreenshotJobs.Add(AdaptiveScreenshotSchedule.New(null, DateOnly.FromDateTime(now.ToOffset(TimeSpan.FromHours(5.5)).DateTime),
+                0, AdaptiveScreenshotKind.PreLiveTest, now, now));
+            await db.SaveChangesAsync();
+            _message = "Pre-live test queued. Refresh to check Sent and Telegram message ID; verify the PNG in Telegram.";
+            await ReloadAsync();
+        }
+        catch (Exception ex) { _message = $"Test queue failed ({ex.GetType().Name}); nothing acknowledged as sent."; }
+        finally { _busy = false; }
+    }
+}

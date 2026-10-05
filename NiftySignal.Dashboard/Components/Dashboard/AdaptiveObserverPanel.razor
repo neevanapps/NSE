@@ -6,7 +6,7 @@
 @implements IAsyncDisposable
 @inject AdaptiveObserverDataService AdaptiveData
 
-<section class="adaptive-observer" data-requested-rows="@_rowCount">
+<section class="adaptive-observer" data-requested-rows="@_rowCount" data-capture-ready="@(_captureReady ? "true" : "false")">
     <div class="adaptive-title-row">
         <div>
             <h2>Adaptive Market Observer</h2>
@@ -39,7 +39,7 @@
     else
     {
         <div class="adaptive-session-grid">
-            <Metric Label="Runtime" Value="@_snapshot.Runtime.RuntimeStatus.ToString()" />
+            <Metric Label="Runtime" Value="@(CaptureMode ? "Completed snapshot" : _snapshot.Runtime.RuntimeStatus.ToString())" />
             <Metric Label="Base bar" Value="@FmtInt(_snapshot.Session.BaseBarVolume)" />
             <Metric Label="Rolling volume" Value="@FmtInt(_snapshot.Session.RollingWindowVolume)" />
             <Metric Label="Expected day volume" Value="@Fmt0(_snapshot.Session.EstimatedFullDayVolume)" />
@@ -47,12 +47,14 @@
             <Metric Label="Strong threshold" Value="@FmtSigned(_snapshot.Session.StrongThreshold, 4)" />
             <Metric Label="Completed bars" Value="@_snapshot.Runtime.LastCompletedBarSeq.ToString()" />
             <Metric Label="Observed volume" Value="@FmtInt(ObservedVolume)" />
-            <Metric Label="Last processed" Value="@FmtAge(_snapshot.Runtime.LastProcessedSourceAvailableAtUtc)" />
+            <Metric Label="@(CaptureMode ? "Boundary IST" : "Last processed")" Value="@(CaptureMode ? FmtIst(_snapshot.Runtime.LastProcessedSourceAvailableAtUtc) : FmtAge(_snapshot.Runtime.LastProcessedSourceAvailableAtUtc))" />
             <Metric Label="Model" Value="@_snapshot.Session.ModelVersion" />
             <Metric Label="Session source" Value="@ShortSource" />
             <Metric Label="Session build UTC" Value="@FmtUtc(_snapshot.Session.BuildUtc)" />
         </div>
 
+        @if (!CaptureMode)
+        {
         <div class="adaptive-current-bar">
             <div class="adaptive-current-header">
                 <strong>Current incomplete adaptive bar</strong>
@@ -67,6 +69,7 @@
             </div>
         </div>
 
+        }
         <GridSection Title="Futures — exact adaptive bars">
             <div class="adaptive-table-wrap">
                 <table class="adaptive-table">
@@ -327,6 +330,10 @@
 </section>
 
 @code {
+    [Parameter] public bool CaptureMode { get; set; }
+    [Parameter] public long? CaptureSessionId { get; set; }
+    [Parameter] public int CaptureBarSeq { get; set; }
+    bool _captureReady;
     // Audit finding F72: immutable session provenance is not the currently running Dashboard build.
     static readonly BuildIdentity _dashboardBuild = BuildIdentity.Current(typeof(AdaptiveObserverPanel).Assembly);
     // Audit finding F71: SSR controls must wait for the circuit; refreshes must not drop selector changes.
@@ -345,6 +352,18 @@
 
     protected override async Task OnInitializedAsync()
     {
+        if (CaptureMode)
+        {
+            try
+            {
+                _snapshot = CaptureSessionId is null ? null : await AdaptiveData.LoadSnapshotAsync(10,
+                    captureSessionId: CaptureSessionId, throughBarSeq: CaptureBarSeq);
+                if (CaptureSessionId is not null && _snapshot is null) throw new InvalidOperationException("Capture session is unavailable.");
+                _captureReady = true;
+            }
+            catch (Exception ex) { _loadError = $"Pinned capture failed ({ex.GetType().Name})."; }
+            return;
+        }
         AdaptiveData.Updated += OnAdaptiveUpdated;
         _cts = new CancellationTokenSource();
         _headerTimer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
@@ -354,7 +373,7 @@
 
     protected override Task OnAfterRenderAsync(bool firstRender)
     {
-        if (firstRender)
+        if (firstRender && !CaptureMode)
         {
             _interactiveReady = true;
             StateHasChanged();

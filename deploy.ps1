@@ -179,6 +179,10 @@ if ($Target -eq 'Local') {
         (Get-Service $svc.Name).WaitForStatus('Stopped', '00:00:30')
 
         Copy-Item -Path (Join-Path $staging '*') -Destination $targetDir -Recurse -Force
+        if ($svc.Name -eq 'NiftySignalDashboard') {
+            & dotnet (Join-Path $targetDir 'NiftySignal.Dashboard.dll') --install-screenshot-browser
+            if ($LASTEXITCODE -ne 0) { throw 'Screenshot Chromium installation failed; Dashboard remains stopped.' }
+        }
         Start-Service -Name $svc.Name
         (Get-Service $svc.Name).WaitForStatus('Running', '00:00:30')
         Write-Host "    $($svc.Name) is Running" -ForegroundColor Green
@@ -250,7 +254,9 @@ else {
                     # folder rather than just catching the error, since it should never have
                     # been part of a "did the deployed app change" comparison anyway.
                     Get-ChildItem -Path $dir -Recurse -File |
-                        Where-Object { $_.FullName -notlike (Join-Path $dir 'logs\*') } |
+                        Where-Object { $_.FullName -notlike (Join-Path $dir 'logs\*') -and
+                            $_.FullName -notlike (Join-Path $dir 'screenshots\*') -and
+                            $_.FullName -notlike (Join-Path $dir '.playwright-browsers\*') } |
                         ForEach-Object {
                             $file = $_
                             $rel = $file.FullName.Substring($dir.Length + 1)
@@ -299,8 +305,12 @@ else {
                 Write-Host "    files copied"
             }
 
-            $state = Invoke-Command -Session $session -ArgumentList $svc.Name -ScriptBlock {
-                param($name)
+            $state = Invoke-Command -Session $session -ArgumentList $svc.Name, $targetDir -ScriptBlock {
+                param($name, $dir)
+                if ($name -eq 'NiftySignalDashboard') {
+                    & dotnet (Join-Path $dir 'NiftySignal.Dashboard.dll') --install-screenshot-browser
+                    if ($LASTEXITCODE -ne 0) { throw 'Screenshot Chromium installation failed; Dashboard remains stopped.' }
+                }
                 Start-Service -Name $name
                 (Get-Service $name).WaitForStatus('Running', '00:00:30')
                 (Get-Service $name).Status.ToString()

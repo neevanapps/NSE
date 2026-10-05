@@ -13,6 +13,14 @@ using NiftySignal.Ingestion.FlatTrade;
 using NiftySignal.Persistence;
 using NiftySignal.VolumeBarData;
 using Npgsql;
+using NiftySignal.Notifications;
+
+Environment.SetEnvironmentVariable("PLAYWRIGHT_BROWSERS_PATH", Path.Combine(AppContext.BaseDirectory, ".playwright-browsers"));
+if (args.Contains("--install-screenshot-browser"))
+{
+    Environment.ExitCode = Microsoft.Playwright.Program.Main(["install", "chromium"]);
+    return;
+}
 
 // Windows Services start with their working directory at C:\Windows\System32, not the
 // exe's own folder -- any future relative path (log files, etc.) would silently land there
@@ -75,6 +83,25 @@ builder.Services.AddHttpClient<FlatTradeAuthClient>();
 
 builder.Services.AddSingleton<LiveDataService>();
 builder.Services.AddSingleton<AdaptiveObserverDataService>();
+builder.Services.Configure<AdaptiveScreenshotOptions>(builder.Configuration.GetSection(AdaptiveScreenshotOptions.SectionName));
+builder.Services.Configure<TelegramOptions>(builder.Configuration.GetSection(TelegramOptions.SectionName));
+builder.Services.AddSingleton<IAdaptiveScreenshotRenderer, AdaptiveScreenshotRenderer>();
+builder.Services.AddSingleton<ITelegramDocumentSender>(sp =>
+{
+    // No HTTP logging handler: request URLs contain the bot token. Optional loopback emulator is Development-only.
+    Uri? emulator = null;
+    var testUrl = builder.Configuration["AdaptiveScreenshotValidationApiUrl"];
+    if (builder.Environment.IsDevelopment() && !string.IsNullOrEmpty(testUrl))
+    {
+        emulator = new Uri(testUrl);
+        if (!emulator.IsLoopback || emulator.Scheme != "http") throw new InvalidOperationException("Validation API must be loopback HTTP.");
+    }
+    return new TelegramDocumentSender(new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false,
+        PooledConnectionLifetime = TimeSpan.FromMinutes(5) }) { Timeout = TimeSpan.FromSeconds(30) },
+        sp.GetRequiredService<IOptions<TelegramOptions>>(), emulator);
+});
+builder.Services.AddSingleton<AdaptiveScreenshotProcessor>();
+builder.Services.AddHostedService<AdaptiveScreenshotWorker>();
 
 // Single-user cookie auth (2026-09-05) -- see DashboardAuthOptions for why this is deliberately
 // minimal. Sliding expiration so a phone left on the dashboard doesn't get logged out mid-session.
