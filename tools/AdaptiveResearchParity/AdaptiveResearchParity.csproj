@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../NiftySignal.AdaptiveObserver/NiftySignal.AdaptiveObserver.csproj" />
+    <ProjectReference Include="$(ResearchRoot)/NiftyResearcher.Bars/NiftyResearcher.Bars.csproj" />
+  </ItemGroup>
+</Project>

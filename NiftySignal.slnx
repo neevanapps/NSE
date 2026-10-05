@@ -2,7 +2,9 @@
   <Folder Name="/spikes/">
     <Project Path="spikes/FlatTradeSpike/FlatTradeSpike.csproj" />
   </Folder>
-  <Project Path="NiftySignal.AdaptiveObserver/NiftySignal.AdaptiveObserver.csproj" />\n  <Project Path="NiftySignal.AdaptiveObserverData/NiftySignal.AdaptiveObserverData.csproj" />\n  <Project Path="NiftySignal.Backtest/NiftySignal.Backtest.csproj" />
+  <Project Path="NiftySignal.AdaptiveObserver/NiftySignal.AdaptiveObserver.csproj" />
+  <Project Path="NiftySignal.AdaptiveObserverData/NiftySignal.AdaptiveObserverData.csproj" />
+  <Project Path="NiftySignal.Backtest/NiftySignal.Backtest.csproj" />
   <Project Path="NiftySignal.CoreScoreReplayDiff/NiftySignal.CoreScoreReplayDiff.csproj" />
   <Project Path="NiftySignal.Dashboard/NiftySignal.Dashboard.csproj" />
   <Project Path="NiftySignal.Domain/NiftySignal.Domain.csproj" />
