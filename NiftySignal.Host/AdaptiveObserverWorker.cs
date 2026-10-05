@@ -14,6 +14,7 @@ public sealed class AdaptiveObserverWorker(
     AdaptiveSourceTickReader tickReader,
     AdaptiveStateRecoveryService recovery,
     AdaptiveObserverPersistence persistence,
+    AdaptiveWeak2ObservationService observations,
     DashboardPushClient dashboardPush,
     ILogger<AdaptiveObserverWorker> logger) : BackgroundService
 {
@@ -149,6 +150,7 @@ public sealed class AdaptiveObserverWorker(
             {
                 var saved = await persistence.PersistOrVerifyAsync(
                     observer, live.Context.Session, package, nowUtc, ct);
+                await observations.ProcessPackageAsync(source, observer, live.Context, package, ct);
 
                 if (saved.Inserted)
                 {
