@@ -167,7 +167,8 @@ try
     // percentile/Max-Pain/trading-hours rules the offline backtest uses -- see LiveOptionsScoreEngine's
     // own doc comment for why this is a separate polling worker rather than literally chained after
     // LiveVolumeBarWriter. Still no paper trading (no strike selection, no fills) -- that's Phase D.
-    builder.Services.AddHostedService<LiveOptionsScoreEngine>();
+    // Audit finding F68: watch-only cutover leaves legacy paper executors unhosted.
+    // LiveOptionsScoreEngine remains in source for rollback; starting it would open paper positions.
 
     // Futures-crossover live-wiring task (2026-09-21, docs/LIVE_PARITY_PLAN.md "Futures crossover:
     // wired live" section): the locked 8-fast/40-slow/5-point-threshold SMA crossover on
@@ -176,7 +177,8 @@ try
     // doc comment). Purely additive/local: registering this hosted service does not touch
     // deploy.ps1 or the VM in any way -- it only starts running the next time THIS Host process is
     // built and actually run.
-    builder.Services.AddHostedService<LiveFuturesCrossoverEngine>();
+    // Audit finding F68: LiveFuturesCrossoverEngine also calls the paper executor.
+    // Keep its source/tables for rollback, but do not run it during prospective watch observation.
 
     // Adaptive Market Observer V1: watch-only, independent of the legacy score/trading workers.
     // It reads authoritative persisted raw ticks, writes its own isolated database and never

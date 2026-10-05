@@ -15,6 +15,7 @@ using var thresholdReference=JsonDocument.Parse(File.ReadAllText(Path.Combine(ro
 var history = new List<double>();
 var reports = new List<object>();
 var checkedFields = 0L;
+await using var sourceParity = new SourceBootstrapParity();
 foreach (var (day, spec) in OpeningVolumeProjectionV1.DiscoveryOutOfFold.OrderBy(x => x.Key))
 {
     if (day >= sealedFrom) throw new InvalidOperationException($"Sealed-set violation: {day}.");
@@ -98,7 +99,9 @@ foreach (var (day, spec) in OpeningVolumeProjectionV1.DiscoveryOutOfFold.OrderBy
     }
     Equal(string.Join(",", referenceTriggers), string.Join(",", af.Where(x => x.State == AdaptiveStateKind.Weak2).Select(x => x.Bar.BarSeq)), "Weak2 identities", day);
     history.AddRange(rf.Where(x => x.Rolling130k is not null).Select(x => Math.Abs(x.Rolling130k!.QuoteDeltaRatioTotal)));
-    ResidualParity.Check(root, day, instruments.RootElement, actualBuilder.Bars);
+    await sourceParity.CheckAsync(day,token,symbol,expiry,lot,raw.Select(x=>new ObserverRawTick(
+        x.Id,x.ExchangeTimestamp,x.ReceivedAt,x.Last,x.Bid,x.Ask,x.BidQty,x.AskQty,x.Volume,x.OpenInterest)).ToArray(),af,threshold);
+    ResidualParity.Check(root, day, instruments.RootElement, actualBuilder.Bars,threshold);
     await ObservationParity.CheckAsync(root, day, instruments.RootElement, af, spec.AdaptiveBarVolume, threshold);
     reports.Add(new { day, raw = raw.Length, clean = actual.Ticks.Count, bars = af.Count, opening, threshold, weak2 = referenceTriggers.Count });
     Console.WriteLine(JsonSerializer.Serialize(reports[^1]));
@@ -106,7 +109,7 @@ foreach (var (day, spec) in OpeningVolumeProjectionV1.DiscoveryOutOfFold.OrderBy
 if (reports.Count != 13) throw new InvalidOperationException("Expected all 13 discovery sessions.");
 Console.WriteLine(JsonSerializer.Serialize(new { status = "PASS", sessions = reports.Count, checkedFields,
     scope = "clean ticks, per-tick classification, exact bars, rolling states, evolution, thresholds, Weak2 identities; independent band/residual/H5 sub-gates above",
-    pending = "production source bootstrap parity, option rolling oracle, full database restart and VM gates" }));
+    pending = "relational restart and VM gates" }));
 
 void Compare(object reference, object actual, DateOnly day,
     (string Source, string Target)[] aliases, string[] ignored)

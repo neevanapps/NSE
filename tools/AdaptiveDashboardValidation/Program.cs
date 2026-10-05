@@ -39,8 +39,10 @@ for (var seq=1;seq<=20;seq++) AddRows(seq);
 await db.SaveChangesAsync();
 const string url="http://127.0.0.1:5089";
 const string password="isolated-ci-validation-password";
-var start=new ProcessStartInfo("dotnet", Path.Combine(root,"NiftySignal.Dashboard/bin/Release/net10.0/NiftySignal.Dashboard.dll")) {
+var start=new ProcessStartInfo("dotnet") {
     WorkingDirectory=root, RedirectStandardOutput=true, RedirectStandardError=true };
+start.ArgumentList.Add(Path.Combine(root,"NiftySignal.Dashboard/bin/Release/net10.0/NiftySignal.Dashboard.dll"));
+start.ArgumentList.Add("--urls");start.ArgumentList.Add(url);
 start.Environment["ASPNETCORE_ENVIRONMENT"]="Development";
 start.Environment["ASPNETCORE_URLS"]=url;
 start.Environment["ConnectionStrings__NiftySignalDb"]=baseConnection;

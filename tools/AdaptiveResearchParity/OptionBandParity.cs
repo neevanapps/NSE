@@ -42,6 +42,8 @@ static class OptionBandParity
             data[instrument.Token]=points;
         }
         var checkedFields=0L;double[]? previousBand=null;
+        var expectedRows=new Dictionary<(int,OptionType),Dictionary<string,double?>>();
+        Dictionary<string,double?>? currentRow=null;
         foreach(var bar in bars)
         {
             var actual=packages[bar.BarSeq].OptionBand;
@@ -88,6 +90,9 @@ static class OptionBandParity
                 var start=members.Select(x=>data[x.Token][bar.StartAvailableAtUtc]).ToArray();
                 var end=members.Select(x=>data[x.Token][bar.EndAvailableAtUtc]).ToArray();
                 var metric=side==OptionType.Call?actual.Call!:actual.Put!;
+                currentRow=new();expectedRows[(bar.BarSeq,side)]=currentRow;
+                CheckField(metric,"CenterStrike",expectedBand[2]);
+                CheckField(metric,"MaxQuoteAgeSeconds",end.All(x=>x.At.HasValue)?end.Max(x=>Math.Max(0,(bar.EndAvailableAtUtc-x.At!.Value).TotalSeconds)):null);
                 for(var category=0;category<6;category++)
                 {
                     var suffix=new[] { "StrictBuy","StrictSell","StrictUnknown","EnrichedBuy","EnrichedSell","EnrichedUnknown" }[category];
@@ -106,7 +111,7 @@ static class OptionBandParity
                 CheckField(metric,"PremiumNotionalOiChange",noiEnd-noiStart);
                 foreach(var prefix in new[] { "Contract","Notional" })
                 {
-                    double V(string suffix)=>Convert.ToDouble(metric.GetType().GetProperty(prefix+suffix)!.GetValue(metric));
+                    double V(string suffix)=>currentRow![prefix+suffix]!.Value;
                     var total=V("StrictBuy")+V("StrictSell")+V("StrictUnknown");
                     var delta=V("StrictBuy")-V("StrictSell");var etotal=V("EnrichedBuy")+V("EnrichedSell")+V("EnrichedUnknown");
                     CheckField(metric,prefix+(prefix=="Contract"?"TotalQuantity":"Total"),total);
@@ -117,9 +122,46 @@ static class OptionBandParity
                 }
             }
         }
-        Console.WriteLine($"BAND {day}: PASS independent selection, CE/PE native quantity, premium notional, price/OI and roll flags; fields={checkedFields}");
+        currentRow=null;
+        foreach(var bar in bars)
+        foreach(var side in new[] { OptionType.Call,OptionType.Put })
+        {
+            var package=packages[bar.BarSeq].OptionBand;
+            var actual=side==OptionType.Call?package.CallRolling:package.PutRolling;
+            var sequences=Enumerable.Range(Math.Max(1,bar.BarSeq-9),Math.Min(10,bar.BarSeq)).ToArray();
+            if(sequences.Length<10 || sequences.Any(seq=>!expectedRows.ContainsKey((seq,side))))
+            { if(actual is not null)throw new Exception("Rolling option availability mismatch");continue; }
+            if(actual is null)throw new Exception("Expected option rolling window missing");
+            var rows=sequences.Select(seq=>expectedRows[(seq,side)]).ToArray();
+            double? S(string key)=>SumNullable(rows.Select(x=>x[key]));
+            var elapsed=sequences.Sum(seq=>bars.Single(x=>x.BarSeq==seq).DurationSeconds);
+            var price=S("BarPriceChange");var path=rows.Sum(x=>Math.Abs(x["BarPriceChange"]??0));
+            CheckField(actual,"WindowBars",10);CheckField(actual,"RollingBandPriceChange",price);
+            CheckField(actual,"RollingEfficiency",price.HasValue && path>0?Math.Min(1,Math.Abs(price.Value)/path):0);
+            CheckField(actual,"RollingReturnPct",rows.All(x=>x["PremiumIndexOpen"]>0 && x["BarPriceChange"].HasValue)
+                ?rows.Sum(x=>100*x["BarPriceChange"]!.Value/x["PremiumIndexOpen"]!.Value):null);
+            CheckField(actual,"TradeUpdates",S("TradeUpdates"));CheckField(actual,"OiChange",S("OiChange"));CheckField(actual,"OiChangePct",S("OiChangePct"));
+            foreach(var prefix in new[] { "Contract","Notional" })
+            {
+                var total=S(prefix+(prefix=="Contract"?"TotalQuantity":"Total"))!.Value;
+                var strict=S(prefix+"StrictDelta")!.Value;var enriched=S(prefix+"EnrichedDelta")!.Value;
+                var etotal=S(prefix+"EnrichedBuy")+S(prefix+"EnrichedSell")+S(prefix+"EnrichedUnknown");
+                CheckField(actual,prefix+"StrictDelta",strict);CheckField(actual,prefix+"EnrichedDelta",enriched);
+                CheckField(actual,prefix+"StrictDeltaRatioTotal",total>0?strict/total:0);
+                CheckField(actual,prefix+"StrictCoverage",total>0?(S(prefix+"StrictBuy")+S(prefix+"StrictSell"))/total:0);
+                CheckField(actual,prefix+"EnrichedDeltaRatio",etotal>0?enriched/etotal:0);
+                CheckField(actual,prefix+"ActivityPerSecond",elapsed>0?total/elapsed:0);
+                var previousSequences=Enumerable.Range(Math.Max(1,bar.BarSeq-10),Math.Min(10,bar.BarSeq-1)).ToArray();
+                var previous=previousSequences.Length==10 && previousSequences.All(seq=>expectedRows.ContainsKey((seq,side)))
+                    ?previousSequences.Select(seq=>expectedRows[(seq,side)]).ToArray():null;
+                CheckField(actual,prefix+"StrictAbsDeltaChange",previous is null?null:Math.Abs(strict)-Math.Abs(previous.Sum(x=>x[prefix+"StrictDelta"]!.Value)));
+                CheckField(actual,prefix+"EnrichedDeltaChange",previous is null?null:enriched-previous.Sum(x=>x[prefix+"EnrichedDelta"]!.Value));
+            }
+        }
+        Console.WriteLine($"BAND {day}: PASS independent selection, CE/PE native quantity, premium notional, price/OI, band roll flags and every ten-bar rolling metric; fields={checkedFields}");
         void CheckField(object actual,string field,double? expected)
         {
+            if(currentRow is not null)currentRow[field]=expected;
             checkedFields++;var value=actual.GetType().GetProperty(field)!.GetValue(actual);
             if(value is null && expected is null)return;
             if(value is not null && expected.HasValue && double.IsFinite(Convert.ToDouble(value))

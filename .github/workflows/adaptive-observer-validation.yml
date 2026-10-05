@@ -36,6 +36,21 @@ jobs:
           key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj') }}
           restore-keys: nuget-${{ runner.os }}-
 
+      - name: Validate deployment syntax and source guards
+        shell: pwsh
+        run: |
+          $tokens = $null; $parseErrors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/deploy.ps1", [ref]$tokens, [ref]$parseErrors) | Out-Null
+          if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
+          try { & ./deploy.ps1 -Target Local -SkipTests -ExpectedCommitSha ('0' * 40); throw 'SHA guard did not reject.' }
+          catch { if ($_.Exception.Message -notlike 'Expected source SHA*') { throw } }
+          $probe = Join-Path $PWD 'adaptive-deploy-guard-probe.txt'
+          try {
+            Set-Content $probe 'isolated CI probe'
+            try { & ./deploy.ps1 -Target Local -SkipTests; throw 'Dirty source guard did not reject.' }
+            catch { if ($_.Exception.Message -notlike 'Deployment requires a clean source worktree*') { throw } }
+          } finally { Remove-Item $probe -Force -ErrorAction SilentlyContinue }
+
       - name: Restore
         run: dotnet restore NiftySignal.slnx
 
@@ -81,7 +96,7 @@ jobs:
         run: dotnet test NiftySignal.Tests/NiftySignal.Tests.csproj --configuration Release --no-build --logger "trx;LogFileName=regression.trx"
 
       - name: Build dashboard browser gate
-        run: dotnet build tools/AdaptiveDashboardValidation/AdaptiveDashboardValidation.csproj --configuration Release -p:SourceBranch=${{ github.ref_name }} -p:CommitSha=${{ github.sha }}
+        run: dotnet build tools/AdaptiveDashboardValidation/AdaptiveDashboardValidation.csproj --configuration Release -p:BuildProjectReferences=false -p:SourceBranch=${{ github.ref_name }} -p:CommitSha=${{ github.sha }}
 
       - name: Install isolated Chromium
         run: pwsh tools/AdaptiveDashboardValidation/bin/Release/net10.0/playwright.ps1 install --with-deps chromium
