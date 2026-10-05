@@ -10,10 +10,10 @@ public sealed class AdaptiveCausalClockTests
     public void SameAvailability_OptionIdAfterFutureIdStillBelongsToClosingBoundary()
     {
         var setup=Setup();var engine=setup.Engine;var at=setup.At;
-        engine.ProcessAvailabilityGroup([( "FUT",Future(1,at,1000) )]);
-        var first=setup.Quotes.Select((q,i)=>(q.Token,Quote(i+3,at.AddSeconds(1),q,1000))).ToList();
-        first.Add(("FUT",Future(2,at.AddSeconds(1),1050)));
-        Assert.Empty(engine.ProcessAvailabilityGroup(first));
+        var initial=setup.Quotes.Select((q,i)=>(q.Token,Quote(i+2,at,q,1000))).ToList();
+        initial.Add(("FUT",Future(1,at,1000)));
+        engine.ProcessAvailabilityGroup(initial);
+        Assert.Empty(engine.ProcessAvailabilityGroup([("FUT",Future(12,at.AddSeconds(1),1050))]));
         var call=setup.Quotes.Single(x=>x.Token=="C23000");
         var changed=call with { AvailableAt=at.AddSeconds(2),Last=call.Last+1,Bid=call.Bid+1,Ask=call.Ask+1 };
         var package=Assert.Single(engine.ProcessAvailabilityGroup([
@@ -29,10 +29,10 @@ public sealed class AdaptiveCausalClockTests
     public void DiagnosticMilliseconds_DoNotUseQuoteFromLaterFractionOfSameMillisecond()
     {
         var setup=Setup();var engine=setup.Engine;var at=setup.At;
-        engine.ProcessAvailabilityGroup([("FUT",Future(1,at,1000))]);
-        var first=setup.Quotes.Select((q,i)=>(q.Token,Quote(i+3,at.AddSeconds(1),q,1000))).ToList();
-        first.Add(("FUT",Future(2,at.AddSeconds(1),1050)));
-        engine.ProcessAvailabilityGroup(first);
+        var initial=setup.Quotes.Select((q,i)=>(q.Token,Quote(i+2,at,q,1000))).ToList();
+        initial.Add(("FUT",Future(1,at,1000)));
+        engine.ProcessAvailabilityGroup(initial);
+        engine.ProcessAvailabilityGroup([("FUT",Future(12,at.AddSeconds(1),1050))]);
         var call=setup.Quotes.Single(x=>x.Token=="C23000");
         var quoteTime=at.AddSeconds(2).AddTicks(1000);
         var changed=call with { AvailableAt=quoteTime,Last=call.Last+100,Bid=call.Bid+100,Ask=call.Ask+100 };
@@ -42,7 +42,7 @@ public sealed class AdaptiveCausalClockTests
         Assert.Equal(closeTime,package.FutureBar.EndAvailableAtUtc); // Exact clock is preserved.
         var actual=package.Residuals.Single(x=>x.Variant==ResidualVariant.Atm).Reading!;
         var expected=OptionResidualModel.Evaluate(setup.Anchor,at.AddSeconds(2),23000,
-            setup.Quotes.ToDictionary(x=>x.Token,x=>x with { AvailableAt=at.AddSeconds(1) }),.065)
+            setup.Quotes.ToDictionary(x=>x.Token),.065)
             .Single(x=>x.Variant==ResidualVariant.Atm);
         Assert.Equal(at.AddSeconds(2),actual.AsOfUtc);
         Assert.InRange(Math.Abs(actual.CEResidual-expected.CEResidual),0,1e-9);

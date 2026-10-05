@@ -128,6 +128,7 @@ public sealed class AdaptiveCoreParityTests
 
         AdaptiveWeak2Classifier.Apply(states, 0.20);
 
+        Assert.Equal(AdaptiveStateKind.Weak1, states[1].State);
         Assert.Equal(AdaptiveStateKind.Weak2, states[2].State);
         Assert.Equal(10, states[2].StrongBaseBarSeq);
         Assert.Equal(11, states[2].Weak1BarSeq);
@@ -149,6 +150,7 @@ public sealed class AdaptiveCoreParityTests
             MakeFlowState(12, .22, 1, 1, "Weakening"),
         };
         AdaptiveWeak2Classifier.Apply(states, .20);
+        Assert.Equal(AdaptiveStateKind.Weak1, states[1].State);
         Assert.Equal(AdaptiveStateKind.Weak2, states[2].State);
         Assert.Equal(10, states[2].StrongBaseBarSeq);
         Assert.Equal(11, states[2].Weak1BarSeq);
