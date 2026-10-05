@@ -299,6 +299,7 @@ public sealed class AdaptiveWeak2ObservationRow
     public bool? ResidualSupportsReversalDiagnostic { get; set; }
     public int H5TargetBarSeq { get; set; }
     public AdaptiveObservationStatus Status { get; set; }
+    public required string SelectionPolicy { get; set; }
     public double? ExitBid { get; set; }
     public double? ExitAsk { get; set; }
     public DateTimeOffset? ExitTimestampUtc { get; set; }
