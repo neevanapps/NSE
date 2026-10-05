@@ -8,10 +8,15 @@ using Microsoft.Playwright;
 using NiftySignal.AdaptiveObserver;
 using NiftySignal.AdaptiveObserverData;
 using NiftySignal.Domain.Enums;
+using NiftySignal.Domain;
+using NiftySignal.Host;
 using NiftySignal.Persistence;
 using static Microsoft.Playwright.Assertions;
 
 // Isolated synthetic UI fixtures. These validate rendering/transport, not research calculations.
+if (BuildIdentity.Current().CommitSha != args[1]
+    || BuildIdentity.Current(typeof(AdaptiveSessionCoordinator).Assembly).CommitSha != args[1])
+    throw new Exception("Validation and Host assembly SHA metadata differ from the checked-out revision.");
 var root = Path.GetFullPath(args[0]);
 var evidence = Path.Combine(root, "artifacts", "adaptive-dashboard-validation");
 Directory.CreateDirectory(evidence);
@@ -72,6 +77,27 @@ try {
     await page.GetByRole(AriaRole.Button,new() { Name="Sign in",Exact=true }).ClickAsync();
     await Expect(page.Locator(".adaptive-table")).ToHaveCountAsync(3);
     await Expect(page.Locator(".adaptive-current-bar")).ToContainTextAsync("50.0%");
+    await Expect(page.GetByLabel("Completed rows",new() { Exact=true })).ToBeEnabledAsync();
+    // Reproduce the lost-selector race with a real in-flight PostgreSQL read.
+    await using(var blocker=new AdaptiveObserverDbContext(options))
+    await using(var transaction=await blocker.Database.BeginTransactionAsync())
+    {
+        await blocker.Database.ExecuteSqlRawAsync("LOCK TABLE adaptive_future_bars IN ACCESS EXCLUSIVE MODE");
+        await page.GetByLabel("Completed rows",new() { Exact=true }).SelectOptionAsync("15");
+        var blocked=false;
+        for(var attempt=0;attempt<30;attempt++)
+        {
+            var count=await db.Database.SqlQueryRaw<int>("SELECT count(*)::int AS \"Value\" FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE '%adaptive_future_bars%'").SingleAsync();
+            if(count>0) { blocked=true;break; }
+            await Task.Delay(100);
+        }
+        if(!blocked)throw new Exception("Selector race fixture did not create an in-flight blocked database read.");
+        await page.GetByLabel("Completed rows",new() { Exact=true }).SelectOptionAsync("5");
+        await Expect(page.Locator(".adaptive-observer")).ToHaveAttributeAsync("data-requested-rows","5");
+        await transaction.CommitAsync();
+    }
+    foreach(var table in await page.Locator(".adaptive-table").AllAsync())
+        await Expect(table.Locator("tbody tr")).ToHaveCountAsync(5);
     foreach(var count in new[] { 5,10,15 }) {
         await page.GetByLabel("Completed rows",new() { Exact=true }).SelectOptionAsync(count.ToString());
         foreach(var side in new[] { "BOTH","CE","PE" }) {
@@ -104,17 +130,22 @@ try {
         await push.InvokeAsync("PushAdaptiveStateChanged",session.Id,seq);
         foreach(var table in await page.Locator(".adaptive-table").AllAsync())
             await Expect(table.Locator("tbody tr td:first-child").First).ToHaveTextAsync(seq.ToString(),new() { Timeout=5000 });
+        await page.EvaluateAsync("() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))");
         if(seq>=24)samples.Add(timer.Elapsed.TotalMilliseconds); // Three warm-up commits.
     }
     await page.ReloadAsync();
     await Expect(page.Locator(".adaptive-table").First.Locator("tbody tr td:first-child").First).ToHaveTextAsync("43");
+    await Expect(page.GetByLabel("Completed rows",new() { Exact=true })).ToHaveValueAsync("10");
+    await Expect(page.GetByLabel("Option side",new() { Exact=true })).ToHaveValueAsync("BOTH");
+    await Expect(page.GetByLabel("Option measurement",new() { Exact=true })).ToHaveValueAsync("NOTIONAL");
+    await Expect(page.GetByLabel("Residual variant",new() { Exact=true })).ToHaveValueAsync("BAND");
     await page.ScreenshotAsync(new() { Path=Path.Combine(evidence,"restarted-reader.png"),FullPage=true });
     await page.GotoAsync(url+"/legacy");
     await Expect(page.Locator(".dashboard-shell")).ToBeVisibleAsync();
     await context.Tracing.StopAsync(new() { Path=Path.Combine(evidence,"browser-trace.zip") });
     var sorted=samples.Order().ToArray(); var p95=sorted[(int)Math.Ceiling(sorted.Length*.95)-1];
     var report=new { sourceSha=args[1], environment="isolated GitHub Actions PostgreSQL and Chromium; not VM measurement",
-        selectorCombinations=36, latencySamples=samples, meanMs=samples.Average(),p95Ms=p95,maxMs=samples.Max(),
+        selectorCombinations=36,blockedReaderSelectorRace=true,assemblySourceShaVerified=true,paintFramesAwaited=true, latencySamples=samples, meanMs=samples.Average(),p95Ms=p95,maxMs=samples.Max(),
         allSamplesBelowOneSecond=samples.All(x=>x<1000), readerRestart=true };
     await File.WriteAllTextAsync(Path.Combine(evidence,"report.json"),JsonSerializer.Serialize(report,new JsonSerializerOptions { WriteIndented=true }));
     Console.WriteLine($"Dashboard PASS: 36 selector combinations, reader restart, commit-to-three-grids p95={p95:F1}ms max={samples.Max():F1}ms.");

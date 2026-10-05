@@ -8,6 +8,7 @@ on:
   push:
     branches:
       - feature/adaptive-market-observer-v1
+      - master
   workflow_dispatch:
 
 jobs:

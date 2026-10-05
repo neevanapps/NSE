@@ -3342,4 +3342,8 @@ Recovery replay previously verified futures, rolling, bands and residuals but se
 
 Historical bootstrap skipped incomplete discovery dates and returned successfully even with no source. The coordinator could freeze a threshold from only the available subset; a fresh start more than 45 days later also excluded mandatory older dates. Bootstrap now queries all prior source dates and refuses readiness until every required prior discovery session has been seeded. Cancellation propagates. A missing-source regression proves no daily configuration can be based on a silently partial discovery history; the real-source 13-session gate must still pass after this change. Production must have the frozen discovery raw source available before the observer starts.
 
-**Numbering note:** F71 is next-free going forward.
+## F71 — Dashboard selector refresh can be lost during prerender or an active read — FIX IMPLEMENTED / BROWSER GATE PENDING
+
+The first browser selector gate found five requested rows still displaying ten. Controls could be changed before the Blazor circuit became interactive; additionally ReloadAsync's nonblocking semaphore skipped any selector/push arriving during another read, while header polling saw unchanged sequence and never repaired the requested row count. Controls now wait for interactive rendering and refresh requests queue behind an active read using the latest selector. Disposal cancels/drains readers. The browser test explicitly blocks a PostgreSQL future-bar read, changes rows again, proves the server received that selection, then unlocks and requires all three grids to show the latest count. Latency samples also wait two animation frames to include browser painting.
+
+**Numbering note:** F72 is next-free going forward.

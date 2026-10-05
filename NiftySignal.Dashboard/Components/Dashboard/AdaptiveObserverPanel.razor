@@ -5,7 +5,7 @@
 @implements IAsyncDisposable
 @inject AdaptiveObserverDataService AdaptiveData
 
-<section class="adaptive-observer">
+<section class="adaptive-observer" data-requested-rows="@_rowCount">
     <div class="adaptive-title-row">
         <div>
             <h2>Adaptive Market Observer</h2>
@@ -14,7 +14,7 @@
         <div class="adaptive-controls">
             <label>
                 Rows
-                <select aria-label="Completed rows" @bind="_rowCount" @bind:after="ReloadAsync">
+                <select disabled="@(!_interactiveReady)" aria-label="Completed rows" @bind="_rowCount" @bind:after="ReloadAsync">
                     <option value="5">5</option>
                     <option value="10">10</option>
                     <option value="15">15</option>
@@ -117,7 +117,7 @@
             <div class="adaptive-grid-toolbar">
                 <label>
                     Side
-                    <select aria-label="Option side" @bind="_optionSide">
+                    <select disabled="@(!_interactiveReady)" aria-label="Option side" @bind="_optionSide">
                         <option value="BOTH">BOTH</option>
                         <option value="CE">CE</option>
                         <option value="PE">PE</option>
@@ -125,7 +125,7 @@
                 </label>
                 <label>
                     Measurement
-                    <select aria-label="Option measurement" @bind="_measurement">
+                    <select disabled="@(!_interactiveReady)" aria-label="Option measurement" @bind="_measurement">
                         <option value="NOTIONAL">NOTIONAL</option>
                         <option value="CONTRACT">CONTRACT</option>
                     </select>
@@ -256,7 +256,7 @@
             <div class="adaptive-grid-toolbar">
                 <label>
                     Residual view
-                    <select aria-label="Residual variant" @bind="_residualVariant">
+                    <select disabled="@(!_interactiveReady)" aria-label="Residual variant" @bind="_residualVariant">
                         <option value="BAND">ATM ±2</option>
                         <option value="ATM">ATM</option>
                     </select>
@@ -322,6 +322,9 @@
 </section>
 
 @code {
+    // Audit finding F71: SSR controls must wait for the circuit; refreshes must not drop selector changes.
+    bool _interactiveReady;
+    bool _disposed;
     AdaptiveObserverSnapshot? _snapshot;
     string? _loadError;
     int _rowCount = 10;
@@ -340,6 +343,16 @@
         _headerTimer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
         await ReloadAsync();
         _headerLoop = HeaderLoopAsync(_cts.Token);
+    }
+
+    protected override Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            _interactiveReady = true;
+            StateHasChanged();
+        }
+        return Task.CompletedTask;
     }
 
     async Task HeaderLoopAsync(CancellationToken ct)
@@ -376,26 +389,28 @@
 
     async Task ReloadAsync()
     {
-        if (!await _reloadGate.WaitAsync(0))
-        {
-            return;
-        }
-
+        if (_disposed) return;
+        var ct = _cts?.Token ?? CancellationToken.None;
         try
         {
-            _snapshot = await AdaptiveData.LoadSnapshotAsync(_rowCount);
-            _loadError = null;
+            // A selector or push arriving during a read must be serviced afterwards. The
+            // queued read uses the latest selection and committed sequence, not a stale request.
+            await _reloadGate.WaitAsync(ct);
+            try
+            {
+                if (_disposed) return;
+                _snapshot = await AdaptiveData.LoadSnapshotAsync(_rowCount, ct);
+                _loadError = null;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+            catch (Exception ex)
+            {
+                _loadError = $"Adaptive observer read failed: {ex.Message}";
+            }
+            finally { _reloadGate.Release(); }
+            if (!_disposed) await InvokeAsync(StateHasChanged);
         }
-        catch (Exception ex)
-        {
-            _loadError = $"Adaptive observer read failed: {ex.Message}";
-        }
-        finally
-        {
-            _reloadGate.Release();
-        }
-
-        await InvokeAsync(StateHasChanged);
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
     }
 
     IEnumerable<AdaptiveOptionResidualBarRow> SelectedResidualRows =>
@@ -498,6 +513,7 @@
 
     public async ValueTask DisposeAsync()
     {
+        _disposed = true;
         AdaptiveData.Updated -= OnAdaptiveUpdated;
         if (_cts is not null)
         {
@@ -509,6 +525,7 @@
         {
             try { await _headerLoop; } catch (OperationCanceledException) { }
         }
+        await _reloadGate.WaitAsync(); // Drain an active read before disposing its semaphore.
         _reloadGate.Dispose();
     }
 }
