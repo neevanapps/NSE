@@ -23,7 +23,7 @@
 
 .adaptive-subtitle,
 .adaptive-note {
-    color: var(--muted);
+    color: var(--text-dim);
     font-size: .82rem;
 }
 
@@ -40,12 +40,12 @@
     gap: 6px;
     align-items: center;
     font-size: .82rem;
-    color: var(--muted);
+    color: var(--text-dim);
 }
 
 .adaptive-controls select,
 .adaptive-grid-toolbar select {
-    background: var(--panel);
+    background: var(--surface);
     color: var(--text);
     border: 1px solid var(--border);
     border-radius: 5px;
@@ -61,15 +61,15 @@
 
 .adaptive-current-bar,
 .adaptive-alert {
-    background: var(--panel);
+    background: var(--surface);
     border: 1px solid var(--border);
     border-radius: 7px;
     padding: 10px 12px;
 }
 
 .adaptive-alert-error {
-    border-color: var(--red);
-    color: var(--red);
+    border-color: var(--bear);
+    color: var(--bear);
 }
 
 .adaptive-progress-track {
@@ -82,12 +82,12 @@
 
 .adaptive-progress-fill {
     height: 100%;
-    background: var(--blue);
+    background: var(--accent);
     transition: width .2s linear;
 }
 
 .adaptive-current-meta {
-    color: var(--muted);
+    color: var(--text-dim);
     font-size: .78rem;
 }
 
@@ -120,7 +120,7 @@
     top: 0;
     z-index: 2;
     background: var(--surface);
-    color: var(--muted);
+    color: var(--text-dim);
     font-weight: 600;
 }
 
@@ -133,7 +133,7 @@
     position: sticky;
     left: 0;
     z-index: 1;
-    background: var(--panel);
+    background: var(--surface);
 }
 
 .adaptive-row-strong td { background: rgba(91, 141, 239, .05); }
@@ -147,6 +147,6 @@
 
 .adaptive-pending {
     text-align: left !important;
-    color: var(--muted);
+    color: var(--text-dim);
     font-style: italic;
 }
