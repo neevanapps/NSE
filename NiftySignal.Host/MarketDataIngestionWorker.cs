@@ -29,6 +29,7 @@ public sealed class MarketDataIngestionWorker(
     DashboardPushClient dashboardPush,
     IValidatedOptions<ScoreWeights> scoreWeightsOptions,
     IOptionsMonitor<PricingOptions> pricingOptions,
+    AdaptiveFuturesObservationEngine adaptiveFuturesObserver,
     ILogger<MarketDataIngestionWorker> logger) : BackgroundService
 {
     static readonly TimeSpan IstOffset = TimeSpan.FromHours(5.5);
@@ -197,6 +198,20 @@ public sealed class MarketDataIngestionWorker(
         var instruments = await ResolveInstrumentsAsync(session.Token, asOfDate, stoppingToken);
         var subscriptions = instruments.Select(i => (i.Exchange, i.Token)).ToList();
 
+        // Isolated research observer: initialize from today's NIFTY future and replay any
+        // already-persisted market-open ticks before the socket starts. This makes a service
+        // restart after 09:30 reproduce the same opening-volume forecast/bar state rather than
+        // silently starting from the restart time.
+        var observationFuture = instruments
+            .Where(i => i.InstrumentType == InstrumentType.Future && i.Underlying == "NIFTY")
+            .OrderBy(i => i.ExpiryDate)
+            .FirstOrDefault();
+        if (observationFuture is not null)
+        {
+            adaptiveFuturesObserver.StartSession(asOfDate, observationFuture);
+            await SeedAdaptiveFuturesObserverAsync(observationFuture.Token, asOfDate, stoppingToken);
+        }
+
         // Monitoring-only snapshot (see _tokenToUnderlying's own doc comment) -- built from the
         // SAME `instruments` list passed to LiveFeatureEngine below, which is safe to include
         // SENSEX/BANKNIFTY rows because LiveFeatureEngine's own constructor (audit finding F61)
@@ -254,6 +269,7 @@ public sealed class MarketDataIngestionWorker(
         await pendingSubscriptionLoop;
         await monitoringLoop;
         await closeWatchdog;
+        adaptiveFuturesObserver.EndSession();
         return true;
     }
 
@@ -306,6 +322,37 @@ public sealed class MarketDataIngestionWorker(
         }
     }
 
+    async Task SeedAdaptiveFuturesObserverAsync(string futureToken, DateOnly asOfDate, CancellationToken ct)
+    {
+        await using var scope = scopeFactory.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
+        var dayStartUtc = new DateTimeOffset(asOfDate.ToDateTime(new TimeOnly(9, 15)), IstTime.Offset).ToUniversalTime();
+        var cutoffUtc = DateTimeOffset.UtcNow;
+
+        var ticks = db.Ticks
+            .AsNoTracking()
+            .Where(t => t.Token == futureToken
+                && t.ExchangeTimestamp >= dayStartUtc
+                && t.ExchangeTimestamp <= cutoffUtc)
+            .OrderBy(t => t.ExchangeTimestamp)
+            .ThenBy(t => t.Id)
+            .AsAsyncEnumerable();
+
+        var count = 0;
+        await foreach (var tick in ticks.WithCancellation(ct))
+        {
+            adaptiveFuturesObserver.OnTick(tick);
+            count++;
+        }
+
+        if (count > 0)
+        {
+            logger.LogInformation(
+                "Adaptive futures observer seeded with {Count} persisted future ticks for {AsOfDate}",
+                count, asOfDate);
+        }
+    }
+
     async Task RunTickLoopAsync(FlatTradeTickSource tickSource, CancellationToken stoppingToken)
     {
         var buffer = new List<Tick>(FlushBatchSize);
@@ -326,6 +373,8 @@ public sealed class MarketDataIngestionWorker(
                     {
                         _engineSync.Release();
                     }
+
+                    adaptiveFuturesObserver.OnTick(tick);
 
                     await dashboardPush.PushTickAsync(tick, stoppingToken);
 
