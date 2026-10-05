@@ -18,6 +18,7 @@ public sealed record AdaptiveRecoveryResult(
 public sealed class AdaptiveStateRecoveryService(
     AdaptiveSourceTickReader tickReader,
     AdaptiveObserverPersistence persistence,
+    AdaptiveWeak2ObservationService observations,
     IOptionsMonitor<NiftySignal.Domain.Configuration.PricingOptions> pricing,
     ILogger<AdaptiveStateRecoveryService> logger)
 {
@@ -83,6 +84,7 @@ public sealed class AdaptiveStateRecoveryService(
             {
                 var result = await persistence.PersistOrVerifyAsync(
                     observer, context.Session, package, DateTimeOffset.UtcNow, ct);
+                await observations.ProcessPackageAsync(source, observer, context, package, ct);
                 if (result.VerifiedExisting)
                 {
                     reconciled++;
