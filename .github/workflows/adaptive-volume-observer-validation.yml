@@ -15,6 +15,6 @@ jobs:
         with:
           dotnet-version: '10.0.x'
       - name: Restore
-        run: dotnet restore NiftySignal.sln
+        run: dotnet restore NiftySignal.slnx
       - name: Test
         run: dotnet test NiftySignal.Tests/NiftySignal.Tests.csproj --configuration Release --no-restore --logger "console;verbosity=normal"
