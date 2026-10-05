@@ -132,6 +132,7 @@ public sealed record OptionBandSideMetrics(
     double NotionalEnrichedDelta,
     double NotionalEnrichedDeltaRatio,
     long TradeUpdates,
+    double? MaxQuoteAgeSeconds,
     long? OiOpen,
     long? OiClose,
     long? OiChange,
