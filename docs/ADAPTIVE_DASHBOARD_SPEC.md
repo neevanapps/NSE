@@ -118,13 +118,15 @@ Options do not create an independent clock.
 Controls:
 
 ```text
-Side:         CE | PE
+Side:         BOTH | CE | PE
 Measurement:  NOTIONAL | CONTRACT
 ```
 
 Defaults:
-- side: CE initially; user may switch freely;
+- side: BOTH;
 - measurement: NOTIONAL.
+
+BOTH is the primary directional-comparison view. CE and PE remain persisted as separate rows; BOTH never collapses them into a composite score. It shows the paired raw/normalized values plus explicit relative differences such as CE ratio - PE ratio.
 
 Both contract and notional values are persisted. The dashboard selector changes displayed persisted columns only.
 
@@ -157,7 +159,39 @@ Persist for both CONTRACT and NOTIONAL:
 
 Notional uses observed option premium × traded quantity using a precisely documented quantity unit. Before implementation, confirm FlatTrade Volume/LotSize semantics and persist raw quantity plus normalized contract/lot quantity where needed.
 
-### Grid columns
+### BOTH-mode columns
+
+BOTH is intentionally more compact than a doubled full grid:
+
+1. Bar Seq
+2. End IST
+3. Duration
+4. Center Strike
+5. Band Rolled
+6. CE Band Price Change / Return
+7. PE Band Price Change / Return
+8. CE Bar Strict Delta Ratio Total
+9. PE Bar Strict Delta Ratio Total
+10. Relative Strict Flow = CE ratio - PE ratio
+11. CE Bar Enriched Delta Ratio
+12. PE Bar Enriched Delta Ratio
+13. Relative Enriched Flow = CE ratio - PE ratio
+14. CE Strict Coverage
+15. PE Strict Coverage
+16. CE Rolling Strict Delta Ratio Total
+17. PE Rolling Strict Delta Ratio Total
+18. Relative Rolling Strict Flow = CE rolling ratio - PE rolling ratio
+19. CE Rolling Enriched Delta Ratio
+20. PE Rolling Enriched Delta Ratio
+21. CE Rolling OI Change %
+22. PE Rolling OI Change %
+23. Relative OI Change % = CE - PE
+24. CE Rolling Activity / Second
+25. PE Rolling Activity / Second
+
+Positive pair-relative flow means CE is stronger relative to PE; negative means PE is stronger. These are standalone pair differences, not weighted/composite scores.
+
+### CE-only / PE-only full-detail columns
 
 1. Bar Seq
 2. End IST
