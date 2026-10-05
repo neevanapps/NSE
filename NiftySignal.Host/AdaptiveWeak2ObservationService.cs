@@ -267,7 +267,7 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
     static void MarkUnavailable(AdaptiveWeak2ObservationRow row, string reason)
     {
         row.Status = AdaptiveObservationStatus.Unavailable;
-        row.TradingSymbol = reason;
+        row.UnavailableReason = reason;
     }
 
     static async Task<DateTimeOffset?> LatestSourceAvailableAtAsync(
