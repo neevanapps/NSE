@@ -1,3 +1,5 @@
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 using NiftySignal.AdaptiveObserver;
 using NiftySignal.AdaptiveObserverData;
 using NiftySignal.Persistence;
