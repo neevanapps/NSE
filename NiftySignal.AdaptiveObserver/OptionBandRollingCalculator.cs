@@ -23,7 +23,7 @@ public sealed record OptionBandRollingMetrics(
 public static class OptionBandRollingCalculator
 {
     public static OptionBandRollingMetrics? BuildLatest(
-        IReadOnlyList<OptionBandSideMetrics> bars,
+        IReadOnlyList<OptionBandSideMetrics?> bars,
         IReadOnlyList<double> durationsSeconds,
         int windowBars = 10)
     {
@@ -43,7 +43,13 @@ public static class OptionBandRollingCalculator
         }
 
         var start = bars.Count - windowBars;
-        var xs = bars.Skip(start).Take(windowBars).ToArray();
+        var window = bars.Skip(start).Take(windowBars).ToArray();
+        if (window.Any(x => x is null))
+        {
+            return null;
+        }
+
+        var xs = window.Select(x => x!).ToArray();
         var ds = durationsSeconds.Skip(start).Take(windowBars).ToArray();
         var elapsed = ds.Sum();
 
