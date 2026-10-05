@@ -57,6 +57,11 @@ public sealed class AdaptiveObserverWorker(
 
                 if (!weekday || time < MarketOpen || time >= MarketHardClose)
                 {
+                    if (_live is not null && time >= MarketHardClose)
+                    {
+                        await CloseCurrentSessionAsync(_live, stoppingToken);
+                    }
+
                     _live = null;
                     await DelayAsync(OutsideMarketPoll, stoppingToken);
                     continue;
@@ -192,6 +197,29 @@ public sealed class AdaptiveObserverWorker(
             live.LastProcessedAvailableAt,
             live.LastProcessedTickId,
             ct);
+    }
+
+    async Task CloseCurrentSessionAsync(LiveState live, CancellationToken ct)
+    {
+        try
+        {
+            await using var scope = scopeFactory.CreateAsyncScope();
+            var source = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
+            var observer = scope.ServiceProvider.GetRequiredService<AdaptiveObserverDbContext>();
+
+            await observations.FinalizeSessionAsync(source, observer, live.Context, ct);
+            await persistence.SetRuntimeStatusAsync(
+                observer,
+                live.Context.Session.Id,
+                AdaptiveRuntimeStatus.Closed,
+                DateTimeOffset.UtcNow,
+                error: null,
+                ct);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Adaptive observer session-close finalization failed.");
+        }
     }
 
     async Task MarkCurrentDegradedBestEffortAsync(Exception ex, CancellationToken ct)
