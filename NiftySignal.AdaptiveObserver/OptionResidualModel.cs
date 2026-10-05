@@ -130,7 +130,7 @@ public static class OptionResidualModel
                 return null;
             }
 
-            var iv = ImpliedVolatilitySolver.Solve(i.OptionType, mid, synthetic, i.Strike, t, rate);
+            var iv = AdaptiveResearchPricing.SolveIv(i.OptionType, mid, synthetic, i.Strike, t, rate);
             if (iv is null)
             {
                 return null;
@@ -174,7 +174,7 @@ public static class OptionResidualModel
 
             actual += mid;
             baseline += c.Price0930;
-            expected += BlackScholes.Calculate(side, modeledUnderlying, c.Instrument.Strike, t, rate, c.ImpliedVolatility0930).Price;
+            expected += AdaptiveResearchPricing.Price(side, modeledUnderlying, c.Instrument.Strike, t, rate, c.ImpliedVolatility0930);
             maxQuoteAge = Math.Max(maxQuoteAge, (asOf-q.AvailableAt).TotalSeconds);
         }
 

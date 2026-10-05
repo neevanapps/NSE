@@ -158,6 +158,12 @@
                             <tr>
                                 <td class="sticky-col">@x.BarSeq</td>
                                 <td>@FmtIst(x.EndAvailableAtUtc)</td>
+                                @if (ce is null || pe is null || !ce.BandAvailable || !pe.BandAvailable)
+                                {
+                                    <td colspan="23" class="adaptive-pending">Unavailable: @(ce?.UnavailableReason ?? pe?.UnavailableReason ?? "dependent option rows pending")</td>
+                                }
+                                else
+                                {
                                 <td>@Fmt(ce?.DurationSeconds ?? pe?.DurationSeconds, 1)</td>
                                 <td>@FmtStrike(ce?.CenterStrike ?? pe?.CenterStrike)</td>
                                 <td>@BoolMark((ce?.BandRolled ?? false) || (pe?.BandRolled ?? false))</td>
@@ -181,6 +187,7 @@
                                 <td>@FmtPct01(Relative(ce?.RollingOiChangePct, pe?.RollingOiChangePct))</td>
                                 <td>@Fmt(ActivityPerSecond(ce), 1)</td>
                                 <td>@Fmt(ActivityPerSecond(pe), 1)</td>
+                                }
                             </tr>
                         }
                         </tbody>

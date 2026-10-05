@@ -40,7 +40,7 @@ public sealed class AdaptiveObserverWorker(
         public long LastFetchedRawId { get; set; } = recovered.LastFetchedRawId;
         public DateTimeOffset? LastProcessedAvailableAt { get; set; } = recovered.LastProcessedAvailableAt;
         public long? LastProcessedTickId { get; set; } = recovered.LastProcessedTickId;
-        public List<ObserverTokenTick> Pending { get; } = [];
+        public List<ObserverTokenTick> Pending { get; } = recovered.Pending.ToList();
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -207,6 +207,8 @@ public sealed class AdaptiveObserverWorker(
             var source = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
             var observer = scope.ServiceProvider.GetRequiredService<AdaptiveObserverDbContext>();
 
+            // Drain the persisted source and ordering buffer before resolving H5 at close.
+            await PollLiveAsync(live, DateTimeOffset.UtcNow + StableOrderingLag, ct);
             await observations.FinalizeSessionAsync(source, observer, live.Context, ct);
             await persistence.SetRuntimeStatusAsync(
                 observer,

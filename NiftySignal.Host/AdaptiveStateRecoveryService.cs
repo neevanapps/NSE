@@ -12,7 +12,8 @@ public sealed record AdaptiveRecoveryResult(
     DateTimeOffset? LastProcessedAvailableAt,
     long? LastProcessedTickId,
     int ReconciledBars,
-    IReadOnlyList<string> Tokens);
+    IReadOnlyList<string> Tokens,
+    IReadOnlyList<ObserverTokenTick> Pending);
 
 public sealed class AdaptiveStateRecoveryService(
     AdaptiveSourceTickReader tickReader,
@@ -38,9 +39,10 @@ public sealed class AdaptiveStateRecoveryService(
             .Distinct(StringComparer.Ordinal)
             .ToArray();
 
-        var raw = await tickReader.ReadRawSessionAsync(source, context.Session.TradeDate, tokens, throughUtc, ct);
+        var raw = await tickReader.ReadRawSessionAsync(source, context.Session.TradeDate, tokens, throughUtc, ct, includeBeyondThrough: true);
         var normalizer = new AdaptiveIncrementalTickNormalizer();
         var clean = new List<ObserverTokenTick>(raw.Count);
+        var pending = new List<ObserverTokenTick>();
         var marketOpenUtc = new DateTimeOffset(
             context.Session.TradeDate.ToDateTime(new TimeOnly(9, 15)),
             TimeSpan.FromHours(5.5)).ToUniversalTime();
@@ -48,9 +50,12 @@ public sealed class AdaptiveStateRecoveryService(
         foreach (var item in raw)
         {
             var normalized = normalizer.Process(item.Token, item.Tick);
-            if (normalized is { } tick && tick.AvailableAt >= marketOpenUtc && tick.AvailableAt <= throughUtc)
+            if (normalized is { } tick && tick.AvailableAt >= marketOpenUtc)
             {
-                clean.Add(new ObserverTokenTick(item.Token, tick));
+                // Normalize the full persisted Id prefix, retaining rows newer than the stable
+                // cutoff. Advancing the Id cursor while dropping these rows loses them forever.
+                if (tick.AvailableAt <= throughUtc) clean.Add(new ObserverTokenTick(item.Token, tick));
+                else pending.Add(new ObserverTokenTick(item.Token, tick));
             }
         }
 
@@ -115,6 +120,7 @@ public sealed class AdaptiveStateRecoveryService(
             lastAvailable,
             lastTickId,
             reconciled,
-            tokens);
+            tokens,
+            pending);
     }
 }

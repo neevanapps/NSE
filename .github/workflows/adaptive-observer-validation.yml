@@ -30,28 +30,35 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
+      - uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj') }}
+          restore-keys: nuget-${{ runner.os }}-
+
       - name: Restore
         run: dotnet restore NiftySignal.slnx
 
       - name: Build
+        id: build
         run: dotnet build NiftySignal.slnx --configuration Release --no-restore -p:SourceBranch=${{ github.ref_name }} -p:CommitSha=${{ github.sha }}
 
       - name: Test adaptive observer
-        run: dotnet test NiftySignal.Tests/NiftySignal.Tests.csproj --configuration Release --no-build --filter FullyQualifiedName~AdaptiveObserver
+        run: dotnet test NiftySignal.Tests/NiftySignal.Tests.csproj --configuration Release --no-build --filter FullyQualifiedName~AdaptiveObserver --logger "trx;LogFileName=adaptive.trx"
 
       - name: Generate initial adaptive DB migration for review
         if: ${{ hashFiles('NiftySignal.AdaptiveObserverData/Migrations/*.cs') == '' }}
         run: |
           dotnet tool install --global dotnet-ef --version 10.0.11
-          dotnet ef migrations add InitialAdaptiveObserver \
+          dotnet-ef migrations add InitialAdaptiveObserver \
             --project NiftySignal.AdaptiveObserverData/NiftySignal.AdaptiveObserverData.csproj \
             --output-dir Migrations
 
       - name: Apply migration to isolated PostgreSQL and check model drift
         run: |
           dotnet tool install --global dotnet-ef --version 10.0.11 || dotnet tool update --global dotnet-ef --version 10.0.11
-          dotnet ef database update --project NiftySignal.AdaptiveObserverData/NiftySignal.AdaptiveObserverData.csproj
-          dotnet ef migrations has-pending-model-changes --project NiftySignal.AdaptiveObserverData/NiftySignal.AdaptiveObserverData.csproj
+          dotnet-ef database update --project NiftySignal.AdaptiveObserverData/NiftySignal.AdaptiveObserverData.csproj
+          dotnet-ef migrations has-pending-model-changes --project NiftySignal.AdaptiveObserverData/NiftySignal.AdaptiveObserverData.csproj
 
       - name: Upload generated adaptive migration
         if: ${{ hashFiles('NiftySignal.AdaptiveObserverData/Migrations/*.cs') != '' }}
@@ -62,6 +69,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Full solution regression
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: dotnet test NiftySignal.Tests/NiftySignal.Tests.csproj --configuration Release --no-build --logger "trx;LogFileName=regression.trx"
 
       - name: Upload test evidence

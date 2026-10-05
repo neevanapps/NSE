@@ -33,9 +33,9 @@ public sealed class OptionResidualModelTests
         Assert.Equal(2, readings.Count);
         Assert.All(readings, x =>
         {
-            Assert.InRange(Math.Abs(x.CEResidual), 0d, 5e-6);
-            Assert.InRange(Math.Abs(x.PEResidual), 0d, 5e-6);
-            Assert.InRange(Math.Abs(x.DirectionalResidualPct), 0d, 5e-6);
+            Assert.InRange(Math.Abs(x.CEResidual), 0d, 1e-6);
+            Assert.InRange(Math.Abs(x.PEResidual), 0d, 1e-6);
+            Assert.InRange(Math.Abs(x.DirectionalResidualPct), 0d, 1e-6);
         });
     }
 
@@ -65,7 +65,7 @@ public sealed class OptionResidualModelTests
             .Single(x => x.Variant == ResidualVariant.AtmPlusMinus2);
 
         Assert.True(band.CEResidual > 4.9d);
-        Assert.InRange(Math.Abs(band.PEResidual), 0d, 5e-6);
+        Assert.InRange(Math.Abs(band.PEResidual), 0d, 1e-6);
         Assert.True(band.DirectionalResidualPct > 0d);
     }
 
@@ -92,7 +92,7 @@ public sealed class OptionResidualModelTests
         var result = new Dictionary<string, OptionQuoteSnapshot>();
         foreach (var i in chain)
         {
-            var price = BlackScholes.Calculate(i.OptionType, underlying, i.Strike, t, rate, vol).Price;
+            var price = AdaptiveResearchPricing.Price(i.OptionType, underlying, i.Strike, t, rate, vol);
             result[i.Token] = new OptionQuoteSnapshot(i.Token, at, price, price - 0.01d, price + 0.01d, 1000);
         }
 

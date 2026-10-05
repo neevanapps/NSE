@@ -21,7 +21,8 @@ public sealed class AdaptiveSourceTickReader
         DateOnly day,
         IReadOnlyCollection<string> tokens,
         DateTimeOffset throughUtc,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool includeBeyondThrough = false)
     {
         if (tokens.Count == 0)
         {
@@ -30,6 +31,9 @@ public sealed class AdaptiveSourceTickReader
 
         var startUtc = new DateTimeOffset(day.ToDateTime(MarketOpen), IstOffset).ToUniversalTime();
         var queryStart = startUtc.AddMinutes(-1);
+        var upper = includeBeyondThrough
+            ? new DateTimeOffset(day.AddDays(1).ToDateTime(TimeOnly.MinValue), IstOffset).ToUniversalTime().AddTicks(-1)
+            : throughUtc;
         var tokenArray = tokens.Distinct(StringComparer.Ordinal).ToArray();
 
         var rows = await db.Ticks
@@ -37,8 +41,8 @@ public sealed class AdaptiveSourceTickReader
             .Where(t => tokenArray.Contains(t.Token)
                 && t.ExchangeTimestamp >= queryStart
                 && t.ReceivedAt >= queryStart
-                && t.ExchangeTimestamp <= throughUtc
-                && t.ReceivedAt <= throughUtc)
+                && t.ExchangeTimestamp <= upper
+                && t.ReceivedAt <= upper)
             .OrderBy(t => t.Id)
             .ToListAsync(ct);
 
