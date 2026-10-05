@@ -5,6 +5,7 @@ using NiftySignal.Domain;
 using NiftySignal.Domain.Abstractions;
 using NiftySignal.Domain.Configuration;
 using NiftySignal.Domain.Entities;
+using NiftySignal.Domain.Enums;
 using NiftySignal.Ingestion.FlatTrade;
 using NiftySignal.Notifications;
 using NiftySignal.Persistence;
