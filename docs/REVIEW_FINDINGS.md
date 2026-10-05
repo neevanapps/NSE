@@ -3338,4 +3338,8 @@ Recovery replay previously verified futures, rolling, bands and residuals but se
 
 `NiftySignal.slnx` omitted BacktestData, DataSync, MetricTrials and VolumeBarData. Some were built only transitively; a standalone harness relying on a completed Release solution build could not find their Release reference assemblies. All root projects and the Dashboard validation console are now explicitly included. The browser gate uses this single complete solution build, removing the reference-skip shortcut. Full Release build must pass for these formerly omitted projects too.
 
-**Numbering note:** F70 is next-free going forward.
+## F70 — missing discovery history silently changes strong threshold — FIX IMPLEMENTED / VALIDATION PENDING
+
+Historical bootstrap skipped incomplete discovery dates and returned successfully even with no source. The coordinator could freeze a threshold from only the available subset; a fresh start more than 45 days later also excluded mandatory older dates. Bootstrap now queries all prior source dates and refuses readiness until every required prior discovery session has been seeded. Cancellation propagates. A missing-source regression proves no daily configuration can be based on a silently partial discovery history; the real-source 13-session gate must still pass after this change. Production must have the frozen discovery raw source available before the observer starts.
+
+**Numbering note:** F71 is next-free going forward.

@@ -71,6 +71,16 @@ public sealed class AdaptiveSessionRecoveryTests
         Assert.Equal(12,await db.FutureBars.CountAsync());Assert.Single(await db.Weak2Observations.ToListAsync());
     }
 
+    [Fact]
+    public async Task MissingDiscoveryHistory_RefusesToFreezeThresholdFromPartialSource()
+    {
+        await using var source=Source();await using var db=Observer();
+        var bootstrap=new AdaptiveHistoricalBootstrapService(new(),NullLogger<AdaptiveHistoricalBootstrapService>.Instance);
+        var ex=await Assert.ThrowsAsync<InvalidOperationException>(()=>bootstrap.EnsurePriorSessionsAsync(source,db,new DateOnly(2026,9,26),default));
+        Assert.Contains("required frozen discovery sessions missing",ex.Message);
+        Assert.Empty(await db.Sessions.ToListAsync());
+    }
+
     static AdaptiveObserverSessionContext Context()
     {
         var c=AdaptiveWeak2ObservationServiceTests.Context();c.Session.WeeklyOptionExpiry=c.WeeklyOptionExpiry;

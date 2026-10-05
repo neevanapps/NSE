@@ -31,17 +31,11 @@ public sealed class AdaptiveHistoricalBootstrapService(
         var candidateDays = await source.Instruments.AsNoTracking()
             .Where(x => x.Underlying == "NIFTY"
                 && x.InstrumentType == InstrumentType.Future
-                && x.AsOfDate < beforeDay
-                && x.AsOfDate >= beforeDay.AddDays(-45))
+                && x.AsOfDate < beforeDay)
             .Select(x => x.AsOfDate)
             .Distinct()
             .OrderBy(x => x)
             .ToListAsync(ct);
-
-        if (candidateDays.Count == 0)
-        {
-            return;
-        }
 
         var existing = await observer.Sessions.AsNoTracking()
             .Where(x => x.ModelVersion == OpeningVolumeProjectionV1.ModelVersion
@@ -65,14 +59,23 @@ public sealed class AdaptiveHistoricalBootstrapService(
                     existingSet.Add(day);
                 }
             }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
             catch (Exception ex)
             {
-                // A partial/missing historical day is not allowed to break today's live observer.
-                // It is skipped explicitly and logged; strong threshold uses only successfully
-                // completed prior sessions.
+                // Collect evidence for other dates, then enforce required discovery coverage
+                // below before allowing today's threshold to freeze.
                 logger.LogWarning(ex, "Adaptive historical bootstrap skipped {TradeDate}.", day);
             }
         }
+
+        // Audit finding F70: a threshold trained on a silent subset is not research parity.
+        var requiredDiscovery = OpeningVolumeProjectionV1.DiscoveryOutOfFold.Keys.Where(x => x < beforeDay).ToArray();
+        var verifiedDates = await observer.Sessions.AsNoTracking()
+            .Where(x => x.ModelVersion == OpeningVolumeProjectionV1.ModelVersion && x.TradeDate < beforeDay)
+            .Select(x => x.TradeDate).ToListAsync(ct);
+        var missingDiscovery = requiredDiscovery.Except(verifiedDates).Order().ToArray();
+        if (missingDiscovery.Length > 0)
+            throw new InvalidOperationException($"Adaptive history is incomplete: required frozen discovery sessions missing: {string.Join(", ", missingDiscovery)}. Daily strong threshold will not be frozen from a partial history.");
     }
 
     async Task<bool> SeedOneAsync(
