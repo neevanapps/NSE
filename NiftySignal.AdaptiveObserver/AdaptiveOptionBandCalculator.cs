@@ -115,6 +115,8 @@ public static class AdaptiveOptionBandCalculator
         var closeIndex = SumMids(ends);
         var oiOpen = SumOi(starts);
         var oiClose = SumOi(ends);
+        var premiumNotionalOiOpen = SumPremiumNotionalOi(instruments, starts);
+        var premiumNotionalOiClose = SumPremiumNotionalOi(instruments, ends);
 
         return new OptionBandSideMetrics(
             side,
@@ -154,7 +156,12 @@ public static class AdaptiveOptionBandCalculator
             oiOpen,
             oiClose,
             oiOpen.HasValue && oiClose.HasValue ? oiClose.Value - oiOpen.Value : null,
-            oiOpen is > 0 && oiClose.HasValue ? (double)(oiClose.Value - oiOpen.Value) / oiOpen.Value : null);
+            oiOpen is > 0 && oiClose.HasValue ? (double)(oiClose.Value - oiOpen.Value) / oiOpen.Value : null,
+            premiumNotionalOiOpen,
+            premiumNotionalOiClose,
+            premiumNotionalOiOpen.HasValue && premiumNotionalOiClose.HasValue
+                ? premiumNotionalOiClose.Value - premiumNotionalOiOpen.Value
+                : null);
     }
 
     static bool FreshMid(
@@ -198,6 +205,30 @@ public static class AdaptiveOptionBandCalculator
     {
         var vals = xs.Select(x => x.OpenInterest).ToArray();
         return vals.All(x => x.HasValue) ? vals.Sum(x => x!.Value) : null;
+    }
+
+    static double? SumPremiumNotionalOi(
+        IReadOnlyList<ObserverOptionInstrument> instruments,
+        IReadOnlyList<InstrumentFlowSnapshot> snapshots)
+    {
+        if (instruments.Count != snapshots.Count)
+        {
+            throw new ArgumentException("Instrument and snapshot counts must match.");
+        }
+
+        double total = 0d;
+        for (var i = 0; i < instruments.Count; i++)
+        {
+            var snapshot = snapshots[i];
+            if (!snapshot.OpenInterest.HasValue || snapshot.Mid is not { } mid)
+            {
+                return null;
+            }
+
+            total += snapshot.OpenInterest.Value * instruments[i].LotSize * mid;
+        }
+
+        return total;
     }
 
     static double? MaxQuoteAge(IEnumerable<InstrumentFlowSnapshot> xs, DateTimeOffset endUtc)
