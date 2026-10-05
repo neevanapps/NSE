@@ -95,9 +95,6 @@ jobs:
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: dotnet test NiftySignal.Tests/NiftySignal.Tests.csproj --configuration Release --no-build --logger "trx;LogFileName=regression.trx"
 
-      - name: Build dashboard browser gate
-        run: dotnet build tools/AdaptiveDashboardValidation/AdaptiveDashboardValidation.csproj --configuration Release -p:BuildProjectReferences=false -p:SourceBranch=${{ github.ref_name }} -p:CommitSha=${{ github.sha }}
-
       - name: Install isolated Chromium
         run: pwsh tools/AdaptiveDashboardValidation/bin/Release/net10.0/playwright.ps1 install --with-deps chromium
 

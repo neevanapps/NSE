@@ -22,6 +22,7 @@ await using var db = new AdaptiveObserverDbContext(options);
 await db.Database.MigrateAsync();
 await using (var source = new NiftySignalDbContext(new DbContextOptionsBuilder<NiftySignalDbContext>().UseNpgsql(baseConnection).Options))
     await source.Database.EnsureCreatedAsync();
+await RelationalRestartParity.CheckAsync(options,baseConnection,args[1],evidence);
 var at = DateTimeOffset.UtcNow;
 var day = DateOnly.FromDateTime(at.ToOffset(TimeSpan.FromHours(5.5)).DateTime);
 var session = new AdaptiveSessionStateRow {

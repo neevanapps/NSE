@@ -3334,4 +3334,8 @@ Recovery replay previously verified futures, rolling, bands and residuals but se
 
 `LiveOptionsScoreEngine` and `LiveFuturesCrossoverEngine` are hosted workers calling `LivePaperTradeExecutor.OpenAsync/CloseAsync`. Their registration contradicted the roadmap's deployment gate that all order/paper actions are disabled. Both registrations are removed for the adaptive watch-only cutover; code, tables and existing records remain for rollback. Ingestion and legacy volume-bar persistence continue. This deliberately stops new legacy paper observations too. Full Host regression and release call-site review must pass before deployment.
 
-**Numbering note:** F69 is next-free going forward.
+## F69 — full solution omitted four root projects — FIX IMPLEMENTED / BUILD VALIDATION PENDING
+
+`NiftySignal.slnx` omitted BacktestData, DataSync, MetricTrials and VolumeBarData. Some were built only transitively; a standalone harness relying on a completed Release solution build could not find their Release reference assemblies. All root projects and the Dashboard validation console are now explicitly included. The browser gate uses this single complete solution build, removing the reference-skip shortcut. Full Release build must pass for these formerly omitted projects too.
+
+**Numbering note:** F70 is next-free going forward.
