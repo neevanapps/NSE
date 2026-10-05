@@ -215,6 +215,7 @@ public sealed class AdaptiveResidualAnchorComponentRow
     public double Strike { get; set; }
     public required string Token { get; set; }
     public required string TradingSymbol { get; set; }
+    public int LotSize { get; set; }
     public bool IsCenterStrike { get; set; }
     public double Price0930 { get; set; }
     public double ImpliedVolatility0930 { get; set; }
