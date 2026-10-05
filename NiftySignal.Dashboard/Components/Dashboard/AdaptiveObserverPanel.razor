@@ -2,6 +2,7 @@
 @using NiftySignal.AdaptiveObserverData
 @using NiftySignal.Dashboard.Services
 @using NiftySignal.Domain.Enums
+@using NiftySignal.Domain
 @implements IAsyncDisposable
 @inject AdaptiveObserverDataService AdaptiveData
 
@@ -21,6 +22,10 @@
                 </select>
             </label>
         </div>
+    </div>
+
+    <div class="adaptive-dashboard-build adaptive-subtitle" data-commit-sha="@_dashboardBuild.CommitSha" data-source-branch="@_dashboardBuild.SourceBranch" style="overflow-wrap:anywhere">
+        Dashboard build: @_dashboardBuild.SourceBranch / @_dashboardBuild.CommitSha · UTC @(_dashboardBuild.BuildUtc is { } buildUtc ? FmtUtc(buildUtc) : "unknown")
     </div>
 
     @if (_loadError is not null)
@@ -44,8 +49,8 @@
             <Metric Label="Observed volume" Value="@FmtInt(ObservedVolume)" />
             <Metric Label="Last processed" Value="@FmtAge(_snapshot.Runtime.LastProcessedSourceAvailableAtUtc)" />
             <Metric Label="Model" Value="@_snapshot.Session.ModelVersion" />
-            <Metric Label="Source" Value="@ShortSource" />
-            <Metric Label="Build UTC" Value="@FmtUtc(_snapshot.Session.BuildUtc)" />
+            <Metric Label="Session source" Value="@ShortSource" />
+            <Metric Label="Session build UTC" Value="@FmtUtc(_snapshot.Session.BuildUtc)" />
         </div>
 
         <div class="adaptive-current-bar">
@@ -322,6 +327,8 @@
 </section>
 
 @code {
+    // Audit finding F72: immutable session provenance is not the currently running Dashboard build.
+    static readonly BuildIdentity _dashboardBuild = BuildIdentity.Current(typeof(AdaptiveObserverPanel).Assembly);
     // Audit finding F71: SSR controls must wait for the circuit; refreshes must not drop selector changes.
     bool _interactiveReady;
     bool _disposed;

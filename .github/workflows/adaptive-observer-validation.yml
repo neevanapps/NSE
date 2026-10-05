@@ -104,8 +104,8 @@ jobs:
 
       - name: Publish exact checked-out Host and Dashboard
         run: |
-          dotnet publish NiftySignal.Host/NiftySignal.Host.csproj --configuration Release --no-restore -o artifacts/release/Host -p:SourceBranch=${{ github.ref_name }} -p:CommitSha=${{ github.sha }}
-          dotnet publish NiftySignal.Dashboard/NiftySignal.Dashboard.csproj --configuration Release --no-restore -o artifacts/release/Dashboard -p:SourceBranch=${{ github.ref_name }} -p:CommitSha=${{ github.sha }}
+          dotnet publish NiftySignal.Host/NiftySignal.Host.csproj --configuration Release --no-build --no-restore -o artifacts/release/Host -p:SourceBranch=${{ github.ref_name }} -p:CommitSha=${{ github.sha }}
+          dotnet publish NiftySignal.Dashboard/NiftySignal.Dashboard.csproj --configuration Release --no-build --no-restore -o artifacts/release/Dashboard -p:SourceBranch=${{ github.ref_name }} -p:CommitSha=${{ github.sha }}
           find artifacts/release -name appsettings.Local.json -delete
           echo '${{ github.sha }}' > artifacts/release/source-sha.txt
 

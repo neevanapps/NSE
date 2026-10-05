@@ -77,6 +77,9 @@ try {
     await page.GetByLabel("Password",new() { Exact=true }).FillAsync(password);
     await page.GetByRole(AriaRole.Button,new() { Name="Sign in",Exact=true }).ClickAsync();
     await Expect(page.Locator(".adaptive-table")).ToHaveCountAsync(3);
+    await Expect(page.Locator(".adaptive-dashboard-build")).ToHaveAttributeAsync("data-commit-sha",args[1]);
+    await Expect(page.Locator(".adaptive-dashboard-build")).ToHaveAttributeAsync("data-source-branch",BuildIdentity.Current().SourceBranch);
+    await Expect(page.Locator(".adaptive-dashboard-build")).ToContainTextAsync(args[1]);
     await Expect(page.Locator(".adaptive-current-bar")).ToContainTextAsync("50.0%");
     await Expect(page.GetByLabel("Completed rows",new() { Exact=true })).ToBeEnabledAsync();
     // Reproduce the lost-selector race with a real in-flight PostgreSQL read.
