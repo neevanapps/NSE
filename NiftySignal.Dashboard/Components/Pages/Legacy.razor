@@ -1,0 +1,35 @@
+@page "/legacy"
+@attribute [Authorize]
+@rendermode InteractiveServer
+@using NiftySignal.Dashboard.Components.Dashboard
+
+<PageTitle>NiftySignal Legacy Dashboard</PageTitle>
+
+<div class="dashboard-shell">
+    <StatusBar />
+
+    <div style="padding: 16px 20px 0;">
+        <div class="panel">
+            <div class="panel-title">Legacy / rollback view</div>
+            <div class="text-dim">
+                Existing score, crossover, paper-trade and option-chain panels are retained here during
+                the adaptive watch-only period. They are not part of the Adaptive Market Observer logic.
+            </div>
+        </div>
+    </div>
+
+    <div style="display:grid; grid-template-columns: repeat(12, 1fr); gap:16px; padding: 20px 20px 0;">
+        <LiveOptionsScorePanel ShowFullPageLink="true" />
+        <LiveFuturesCrossoverPanel />
+    </div>
+
+    <div class="dashboard-grid">
+        <FlatTradeLoginPanel />
+        <LiveQuotePanel />
+        <OiProfilePanel />
+        <PositionsPanel />
+        <OptionChainPanel />
+        <PerformancePanel />
+        <ScorePanel />
+    </div>
+</div>
