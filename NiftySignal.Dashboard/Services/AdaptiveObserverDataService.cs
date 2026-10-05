@@ -19,13 +19,13 @@ public sealed class AdaptiveObserverDataService(
 
     public event Action? Updated;
 
-    public long? LastNotifiedSessionId => Volatile.Read(ref _notifiedSessionId);
-    public int? LastNotifiedBarSeq => Volatile.Read(ref _notifiedBarSeq);
+    public long? LastNotifiedSessionId => _notifiedSessionId;
+    public int? LastNotifiedBarSeq => _notifiedBarSeq;
 
     public void NotifyStateChanged(long sessionId, int barSeq)
     {
-        Volatile.Write(ref _notifiedSessionId, sessionId);
-        Volatile.Write(ref _notifiedBarSeq, barSeq);
+        _notifiedSessionId = sessionId;
+        _notifiedBarSeq = barSeq;
         Updated?.Invoke();
     }
 
@@ -74,7 +74,7 @@ public sealed class AdaptiveObserverDataService(
 
         var seqs = futureBars.Select(x => x.BarSeq).ToArray();
         var rolling = seqs.Length == 0
-            ? []
+            ? new List<AdaptiveRollingStateRow>()
             : await db.RollingStates.AsNoTracking()
                 .Where(x => x.SessionId == session.Id && seqs.Contains(x.EndBarSeq))
                 .ToListAsync(ct);
@@ -85,7 +85,7 @@ public sealed class AdaptiveObserverDataService(
             .ToList();
 
         var optionRows = seqs.Length == 0
-            ? []
+            ? new List<AdaptiveOptionBandBarRow>()
             : await db.OptionBandBars.AsNoTracking()
                 .Where(x => x.SessionId == session.Id && seqs.Contains(x.BarSeq))
                 .ToListAsync(ct);
@@ -99,7 +99,7 @@ public sealed class AdaptiveObserverDataService(
             .ToList();
 
         var residuals = seqs.Length == 0
-            ? []
+            ? new List<AdaptiveOptionResidualBarRow>()
             : await db.OptionResidualBars.AsNoTracking()
                 .Where(x => x.SessionId == session.Id && seqs.Contains(x.BarSeq))
                 .OrderByDescending(x => x.BarSeq)
