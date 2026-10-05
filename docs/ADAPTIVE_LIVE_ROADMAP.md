@@ -137,7 +137,25 @@ The database is the source of truth. The dashboard never reconstructs strategy l
 
 ## Dashboard rewrite
 
-The new `/` dashboard becomes Adaptive Market Observer.
+The existing top-of-page operational area remains intact:
+- existing application/header row;
+- access-token/authentication bar and controls;
+- existing Live Quote / live price-tick section;
+- no existing live price-tick display is removed as part of the observer redesign.
+
+The new adaptive observer content is inserted below those existing rows.
+
+The initial deployment is **watch-only**. No adaptive paper-trade engine, order-entry action, strategy kill-switch, or execution control is introduced until a later explicit paper-trading phase.
+
+The new observer body uses three synchronized grids, all keyed to the same completed adaptive futures `BarSeq` and futures bar timestamps:
+1. Futures market-state grid;
+2. CE/PE ATM±2 option-band grid;
+3. 09:30 theoretical CE/PE residual grid.
+
+One global row-count selector controls all three grids:
+`5 | 10 | 15`, default `10`.
+
+The dashboard target is sub-second perceived/update latency after persisted state becomes available. Dashboard rendering must not perform strategy calculations or scan raw tick history.
 
 Primary sections:
 
@@ -157,7 +175,32 @@ Primary sections:
    - current in-progress bar percentage;
    - strong threshold.
 
-3. Main futures/state chart
+3. Futures market-state grid
+   - last 5/10/15 completed adaptive futures bars;
+   - BarSeq, End IST, duration, price displacement;
+   - strict/enriched aggressor flow;
+   - rolling 10-bar market state;
+   - OI, efficiency, return, activity and quality metrics;
+   - explicit Normal / Strong / Weak1 / Weak2 state.
+
+4. CE/PE option-band grid
+   - uses the exact same futures adaptive bar start/end timestamps; options never create their own clock;
+   - side selector: CE / PE;
+   - measurement selector: NOTIONAL / CONTRACT, default NOTIONAL;
+   - ATM±2 weekly-option strikes selected causally at the start of each adaptive futures bar and frozen for that bar;
+   - both contract and premium-notional quantities persisted, never browser-recomputed;
+   - strict and enriched trade classification retained separately with strict coverage exposed;
+   - center strike and band-roll indicator persisted.
+
+5. 09:30 theoretical residual grid
+   - fixed diagnostic composition for the whole session, selected once at 09:30;
+   - persist both the original fixed single-ATM diagnostic and the fixed ATM±2 diagnostic basket for research continuity;
+   - dashboard defaults to the fixed ATM±2 basket because it is less dependent on one option quote while remaining directly comparable with the single-strike research;
+   - optional view selector may expose `ATM | ATM±2` without recalculation;
+   - actual CE/PE basket price change, constant-09:30-IV expected change, residuals, directional residual, residual change, rolling-futures relationship and quote age;
+   - no residual-derived entry rule in watch-only V1.
+
+6. Main futures/state chart
    - futures price;
    - exact adaptive bar boundaries;
    - rolling strict delta ratio;
@@ -165,7 +208,7 @@ Primary sections:
    - strong, weak1 and weak2 markers;
    - OI-accepted and OI-rejected trigger markers.
 
-4. Current market-state panel
+7. Current market-state panel
    - price direction;
    - strict delta and ratio;
    - strict quote coverage;
@@ -173,7 +216,7 @@ Primary sections:
    - weakening count;
    - rolling duration and activity.
 
-5. Current reversal observation
+8. Current reversal observation
    - reversal direction;
    - fixed CE/PE strike;
    - bid/ask/spread;
@@ -181,14 +224,14 @@ Primary sections:
    - pair-OI change and accepted/rejected status;
    - H5 progress/outcome.
 
-6. Today's observations
+9. Today's observations
    - all accepted and rejected weak2 events;
    - H5 outcome;
    - hypothetical P&L;
    - MFE/MAE;
    - data-quality fields.
 
-7. Data quality
+10. Data quality
    - futures tick lag;
    - option quote/OI age;
    - strict classification coverage;
