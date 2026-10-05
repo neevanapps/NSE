@@ -112,7 +112,18 @@ public sealed class AdaptiveHistoricalBootstrapService(
             }
         }
 
-        var baseVolume = OpeningVolumeProjectionV1.SelectBaseBarVolume(openingVolume, future.LotSize);
+        var hasDiscoverySpec = OpeningVolumeProjectionV1.DiscoveryOutOfFold.TryGetValue(day, out var discoverySpec);
+        var baseVolume = hasDiscoverySpec
+            ? discoverySpec!.AdaptiveBarVolume
+            : OpeningVolumeProjectionV1.SelectBaseBarVolume(openingVolume, future.LotSize);
+
+        if (hasDiscoverySpec && openingVolume != discoverySpec!.OpeningVolume0930)
+        {
+            logger.LogWarning(
+                "Adaptive discovery parity warning {TradeDate}: raw opening volume {Actual} != frozen research {Expected}.",
+                day, openingVolume, discoverySpec.OpeningVolume0930);
+        }
+
         var definition = new AdaptiveSessionDefinition(
             day,
             future.Token,
@@ -134,6 +145,14 @@ public sealed class AdaptiveHistoricalBootstrapService(
             logger.LogWarning(
                 "Adaptive historical bootstrap {TradeDate}: only {Bars} complete bars; not seeding.",
                 day, completeBars.Length);
+            return false;
+        }
+
+        if (hasDiscoverySpec && completeBars.Length != discoverySpec!.ExpectedCompleteBars)
+        {
+            logger.LogWarning(
+                "Adaptive discovery parity mismatch {TradeDate}: rebuilt complete bars {Actual} != frozen research {Expected}; day is excluded from strong-threshold seed.",
+                day, completeBars.Length, discoverySpec.ExpectedCompleteBars);
             return false;
         }
 
@@ -176,12 +195,14 @@ public sealed class AdaptiveHistoricalBootstrapService(
             OpeningWindowStartUtc = ToUtc(day, Open),
             OpeningWindowEndUtc = cutoffUtc,
             OpeningVolume = openingVolume,
-            EstimatorName = nameof(OpeningVolumeProjectionV1),
-            EstimatorIntercept = OpeningVolumeProjectionV1.Intercept,
-            EstimatorSlope = OpeningVolumeProjectionV1.Slope,
+            EstimatorName = hasDiscoverySpec ? "adaptive-v1-discovery-loocv" : nameof(OpeningVolumeProjectionV1),
+            EstimatorIntercept = hasDiscoverySpec ? discoverySpec!.TrainingIntercept : OpeningVolumeProjectionV1.Intercept,
+            EstimatorSlope = hasDiscoverySpec ? discoverySpec!.TrainingSlope : OpeningVolumeProjectionV1.Slope,
             TargetBarsPerDay = OpeningVolumeProjectionV1.TargetBarsPerDay,
             RoundingLots = OpeningVolumeProjectionV1.RoundingLots,
-            EstimatedFullDayVolume = OpeningVolumeProjectionV1.PredictFullDayVolume(openingVolume),
+            EstimatedFullDayVolume = hasDiscoverySpec
+                ? discoverySpec!.PredictedFullDayVolume
+                : OpeningVolumeProjectionV1.PredictFullDayVolume(openingVolume),
             BaseBarVolume = baseVolume,
             RollingWindowBars = definition.RollingWindowBars,
             RollingWindowVolume = definition.RollingWindowVolume,
