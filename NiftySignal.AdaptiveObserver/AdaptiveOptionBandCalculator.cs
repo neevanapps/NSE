@@ -78,6 +78,7 @@ public static class AdaptiveOptionBandCalculator
     public static OptionBandSideMetrics BuildSideMetrics(
         OptionBandSelection selection,
         OptionType side,
+        DateTimeOffset endUtc,
         IReadOnlyDictionary<string, InstrumentFlowSnapshot> start,
         IReadOnlyDictionary<string, InstrumentFlowSnapshot> end)
     {
@@ -149,6 +150,7 @@ public static class AdaptiveOptionBandCalculator
                 ? (nEnrichedBuy-nEnrichedSell)/(nEnrichedBuy+nEnrichedSell+nEnrichedUnknown)
                 : 0d,
             Diff(starts, ends, x => x.TradeUpdates),
+            MaxQuoteAge(ends, endUtc),
             oiOpen,
             oiClose,
             oiOpen.HasValue && oiClose.HasValue ? oiClose.Value - oiOpen.Value : null,
@@ -196,5 +198,16 @@ public static class AdaptiveOptionBandCalculator
     {
         var vals = xs.Select(x => x.OpenInterest).ToArray();
         return vals.All(x => x.HasValue) ? vals.Sum(x => x!.Value) : null;
+    }
+
+    static double? MaxQuoteAge(IEnumerable<InstrumentFlowSnapshot> xs, DateTimeOffset endUtc)
+    {
+        var times = xs.Select(x => x.LastAvailableAt).ToArray();
+        if (!times.All(x => x.HasValue))
+        {
+            return null;
+        }
+
+        return times.Max(x => Math.Max(0d, (endUtc - x!.Value).TotalSeconds));
     }
 }
