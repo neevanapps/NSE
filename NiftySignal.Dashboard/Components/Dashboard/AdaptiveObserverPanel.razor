@@ -14,7 +14,7 @@
         <div class="adaptive-controls">
             <label>
                 Rows
-                <select @bind="_rowCount" @bind:after="ReloadAsync">
+                <select aria-label="Completed rows" @bind="_rowCount" @bind:after="ReloadAsync">
                     <option value="5">5</option>
                     <option value="10">10</option>
                     <option value="15">15</option>
@@ -117,7 +117,7 @@
             <div class="adaptive-grid-toolbar">
                 <label>
                     Side
-                    <select @bind="_optionSide">
+                    <select aria-label="Option side" @bind="_optionSide">
                         <option value="BOTH">BOTH</option>
                         <option value="CE">CE</option>
                         <option value="PE">PE</option>
@@ -125,7 +125,7 @@
                 </label>
                 <label>
                     Measurement
-                    <select @bind="_measurement">
+                    <select aria-label="Option measurement" @bind="_measurement">
                         <option value="NOTIONAL">NOTIONAL</option>
                         <option value="CONTRACT">CONTRACT</option>
                     </select>
@@ -256,7 +256,7 @@
             <div class="adaptive-grid-toolbar">
                 <label>
                     Residual view
-                    <select @bind="_residualVariant">
+                    <select aria-label="Residual variant" @bind="_residualVariant">
                         <option value="BAND">ATM ±2</option>
                         <option value="ATM">ATM</option>
                     </select>
