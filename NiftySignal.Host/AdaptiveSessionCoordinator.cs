@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using NiftySignal.AdaptiveObserver;
@@ -172,6 +173,7 @@ public sealed class AdaptiveSessionCoordinator(
             FutureExpiry = future.ExpiryDate ?? day,
             LotSize = future.LotSize,
             RiskFreeRate = riskFreeRate,
+            OptionUniverseJson = JsonSerializer.Serialize(optionDescriptors),
             OpeningWindowStartUtc = ToUtc(day, MarketOpen),
             OpeningWindowEndUtc = cutoffUtc,
             OpeningVolume = openingVolume,
@@ -252,16 +254,12 @@ public sealed class AdaptiveSessionCoordinator(
         var expiry = row.WeeklyOptionExpiry
             ?? throw new InvalidOperationException($"Adaptive session {row.Id} has no weekly option expiry.");
 
-        var optionRows = await source.Instruments
-            .AsNoTracking()
-            .Where(i => i.AsOfDate == row.TradeDate
-                && i.Underlying == "NIFTY"
-                && i.InstrumentType == InstrumentType.Option
-                && i.ExpiryDate == expiry
-                && i.StrikePrice != null)
-            .OrderBy(i => i.StrikePrice)
-            .ToListAsync(ct);
-        var options = optionRows.Select(ToDescriptor).ToList();
+        // Persisted session owns instrument identity, strike, expiry and lot size across source refreshes.
+        var options = JsonSerializer.Deserialize<List<ObserverOptionInstrument>>(row.OptionUniverseJson)
+            ?? throw new InvalidOperationException($"Adaptive session {row.Id} has an invalid frozen option universe.");
+        if (options.Select(x => x.Token).Distinct(StringComparer.Ordinal).Count() != options.Count
+            || options.Any(x => x.ExpiryDate != expiry || x.LotSize <= 0 || x.Strike <= 0))
+            throw new InvalidOperationException($"Adaptive session {row.Id} has inconsistent frozen option descriptors.");
 
         OptionResidualAnchor? anchor = null;
         if (row.Future0930.HasValue && row.SyntheticWeeklyUnderlying0930.HasValue && row.ResidualCenterStrike.HasValue)

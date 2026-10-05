@@ -18,8 +18,8 @@ public sealed record OptionQuoteSnapshot(
     double Ask,
     long? OpenInterest)
 {
-    public bool HasTwoSidedQuote => Bid > 0d && Ask > Bid;
-    public double? Mid => HasTwoSidedQuote ? (Bid + Ask) / 2d : Last > 0d ? Last : null;
+    public bool HasTwoSidedQuote => double.IsFinite(Bid) && double.IsFinite(Ask) && Bid > 0d && Ask >= Bid;
+    public double? Mid => HasTwoSidedQuote ? (Bid + Ask) / 2d : null;
 }
 
 public sealed record OptionBandSelection(

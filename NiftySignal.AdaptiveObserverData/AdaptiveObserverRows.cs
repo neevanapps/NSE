@@ -17,6 +17,7 @@ public sealed class AdaptiveSessionStateRow
     public required DateOnly FutureExpiry { get; set; }
     public int LotSize { get; set; }
     public double RiskFreeRate { get; set; }
+    public string OptionUniverseJson { get; set; } = "[]";
     public required DateTimeOffset OpeningWindowStartUtc { get; set; }
     public required DateTimeOffset OpeningWindowEndUtc { get; set; }
     public long OpeningVolume { get; set; }

@@ -3308,3 +3308,18 @@ Nifty rows — behaviorally a no-op today. This closes the gap before the next
   `NiftySignal.Host`/`NiftySignal.Dashboard`, and nothing was deployed.
 
 **Numbering note:** F63 is next-free going forward.
+
+
+## F63 — adaptive diagnostics use a different clock precision from frozen Python research — PENDING
+
+The independent historical residual gate observed an expected-price difference of 1.1206466e-6 points at discovery 2026-09-08 BarSeq 20 after correcting the Gaussian/IV solver. The C# exact bar retains sub-millisecond receive precision; frozen Python residual/H5 scripts consume `FlowEvolutionCsv` timestamps truncated to milliseconds. The formula harness now supplies identical serialized clock inputs, without relaxing its 1e-6 numeric limit. This validates formulas only; it does not establish integrated engine clock/quote selection or observation latency parity. **Release blocker:** resolve this clock policy explicitly and pass full pipeline residual/H5 parity. Code-site marker: `AdaptiveObserverEngine.BuildResiduals`.
+
+## F64 — adaptive restart option universe is not immutable — FIX IMPLEMENTED / VALIDATION PENDING
+
+`AdaptiveSessionCoordinator.LoadExistingAsync` reloads today's instruments from the source table. The session freezes residual components and rate, but does not persist the complete option descriptor universe used by adaptive bands and Weak2 selection. An instrument refresh or corrected strike/lot size can change restart outputs or future observation selection. **Release blocker:** persist and reuse the original universe; add a mutation/restart test. Fix: session serializes the complete option descriptors and rate; restart deserializes and validates those descriptors without querying mutable source instruments. A source mutation/rate-change regression test has been added; CI gate remains pending.
+
+## F65 — persisted pending observations are not recovered after an outside-hours restart — FIX IMPLEMENTED / VALIDATION PENDING
+
+The worker enters its outside-market delay with `_live == null`; session-close finalization only runs for an existing in-memory live state. A crash near close followed by an after-hours restart can leave persisted pending H5 observations unresolved. Draining the buffer before a normal in-process close is fixed, but this startup path remains uncovered. **Release blocker:** recover/finalize persisted ended sessions and test restart across market close. Fix: dedicated ended-session recovery replays/verifies persisted source, finalizes pending observations and closes runtime both outside hours and before starting the next session. Same-day and next-day idempotent restart tests have been added; CI gate remains pending.
+
+**Numbering note:** F66 is next-free going forward.

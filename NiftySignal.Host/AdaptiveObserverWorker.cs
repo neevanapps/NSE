@@ -16,6 +16,7 @@ public sealed class AdaptiveObserverWorker(
     AdaptiveStateRecoveryService recovery,
     AdaptiveObserverPersistence persistence,
     AdaptiveWeak2ObservationService observations,
+    AdaptiveEndedSessionRecoveryService endedSessionRecovery,
     DashboardPushClient dashboardPush,
     ILogger<AdaptiveObserverWorker> logger) : BackgroundService
 {
@@ -63,12 +64,14 @@ public sealed class AdaptiveObserverWorker(
                     }
 
                     _live = null;
+                    await FinalizeEndedSessionsAsync(day, time >= MarketHardClose, stoppingToken);
                     await DelayAsync(OutsideMarketPoll, stoppingToken);
                     continue;
                 }
 
                 if (_live is null || _live.Context.Session.TradeDate != day)
                 {
+                    await FinalizeEndedSessionsAsync(day, includeToday: false, stoppingToken);
                     _live = await TryStartOrRecoverAsync(day, nowUtc, stoppingToken);
                     if (_live is null)
                     {
@@ -92,6 +95,14 @@ public sealed class AdaptiveObserverWorker(
                 await DelayAsync(TimeSpan.FromSeconds(1), stoppingToken);
             }
         }
+    }
+
+    async Task FinalizeEndedSessionsAsync(DateOnly todayIst, bool includeToday, CancellationToken ct)
+    {
+        await using var scope = scopeFactory.CreateAsyncScope();
+        await endedSessionRecovery.FinalizeEndedAsync(
+            scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>(),
+            scope.ServiceProvider.GetRequiredService<AdaptiveObserverDbContext>(),todayIst,includeToday,ct);
     }
 
     async Task<LiveState?> TryStartOrRecoverAsync(DateOnly day, DateTimeOffset nowUtc, CancellationToken ct)

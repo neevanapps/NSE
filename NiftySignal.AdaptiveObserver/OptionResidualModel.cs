@@ -15,7 +15,9 @@ public static class OptionResidualModel
         double maxQuoteAgeSeconds = 5d)
     {
         var selection = AdaptiveOptionBandCalculator.Select(
-            atUtc, expiry, future0930, chain, quotes, riskFreeRate, maxQuoteAgeSeconds, halfWidth:2);
+            atUtc, expiry, future0930, chain, quotes, riskFreeRate, maxQuoteAgeSeconds, halfWidth:2)
+            ?? AdaptiveOptionBandCalculator.Select(atUtc, expiry, future0930, chain, quotes,
+                riskFreeRate, maxQuoteAgeSeconds, halfWidth:0);
 
         if (selection is null)
         {
@@ -27,7 +29,13 @@ public static class OptionResidualModel
         var puts = BuildComponents(selection.Puts, selection.CenterStrike, selection.SyntheticUnderlying, atUtc, quotes, t, riskFreeRate, maxQuoteAgeSeconds);
         if (calls is null || puts is null)
         {
-            return null;
+            // Single ATM research has its own availability; an unavailable wing must not
+            // suppress a valid center pair. Persist only center components in this case.
+            calls = BuildComponents(selection.Calls.Where(x => x.Strike == selection.CenterStrike).ToArray(),
+                selection.CenterStrike, selection.SyntheticUnderlying, atUtc, quotes, t, riskFreeRate, maxQuoteAgeSeconds);
+            puts = BuildComponents(selection.Puts.Where(x => x.Strike == selection.CenterStrike).ToArray(),
+                selection.CenterStrike, selection.SyntheticUnderlying, atUtc, quotes, t, riskFreeRate, maxQuoteAgeSeconds);
+            if (calls is null || puts is null || calls.Count != 1 || puts.Count != 1) return null;
         }
 
         return new OptionResidualAnchor(
@@ -58,7 +66,8 @@ public static class OptionResidualModel
                 ? anchor.Puts.Where(x => x.IsCenterStrike).ToArray()
                 : anchor.Puts.ToArray();
 
-            if (calls.Length == 0 || puts.Length == 0)
+            if (calls.Length == 0 || puts.Length == 0
+                || (variant == ResidualVariant.AtmPlusMinus2 && (calls.Length != 5 || puts.Length != 5)))
             {
                 continue;
             }

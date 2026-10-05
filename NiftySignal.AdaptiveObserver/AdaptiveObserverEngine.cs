@@ -196,6 +196,7 @@ public sealed class AdaptiveObserverEngine
             };
         }
 
+        // PENDING (audit finding F63) — Python research uses millisecond CSV clocks; engine-level residual/observation clock parity is unvalidated. See docs/REVIEW_FINDINGS.md.
         var readings = OptionResidualModel.Evaluate(
             _residualAnchor,
             bar.EndAvailableAtUtc,

@@ -177,7 +177,7 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
         // Research chooses the first valid quote for EVERY candidate in the remaining session.
         // A candidate with no quote yet can still beat today's current nearest-125 selection.
         // Keep the observation pending until the candidate set is known, or session close.
-        var latestKnown = await LatestSourceAvailableAtAsync(source, sideInstruments.Select(x => x.Token).ToArray(), context.Session.OpeningWindowStartUtc, context.Session.OpeningWindowStartUtc.AddDays(1), ct);
+        var latestKnown = await LatestSourceAvailableAtAsync(source, sideInstruments.Select(x => x.Token).ToArray(), context.Session.OpeningWindowStartUtc, new DateTimeOffset(context.Session.TradeDate.AddDays(1).ToDateTime(TimeOnly.MinValue), TimeSpan.FromHours(5.5)).ToUniversalTime(), ct);
         if (!latestKnown.HasValue || latestKnown.Value < targetBar.EndAvailableAtUtc)
         {
             return;

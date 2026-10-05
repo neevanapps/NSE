@@ -187,6 +187,7 @@ try
     builder.Services.AddSingleton<AdaptiveObserverPersistence>();
     builder.Services.AddSingleton<AdaptiveWeak2ObservationService>();
     builder.Services.AddSingleton<AdaptiveStateRecoveryService>();
+    builder.Services.AddSingleton<AdaptiveEndedSessionRecoveryService>();
     builder.Services.AddHostedService<AdaptiveObserverWorker>();
 
     var host = builder.Build();

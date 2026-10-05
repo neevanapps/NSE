@@ -67,7 +67,7 @@ public sealed class AdaptiveObserverDataService(
         }
 
         var futureBars = await db.FutureBars.AsNoTracking()
-            .Where(x => x.SessionId == session.Id)
+            .Where(x => x.SessionId == session.Id && x.BarSeq <= runtime.LastCompletedBarSeq)
             .OrderByDescending(x => x.BarSeq)
             .Take(rowCount)
             .ToListAsync(ct);
@@ -105,6 +105,16 @@ public sealed class AdaptiveObserverDataService(
                 .OrderByDescending(x => x.BarSeq)
                 .ThenBy(x => x.Variant)
                 .ToListAsync(ct);
+
+        // Every grid shares the same completed sequences. A missing/pre-09:30 diagnostic
+        // remains an explicit unavailable row, rather than silently shortening Grid 3.
+        var residualByKey = residuals.ToDictionary(x => (x.BarSeq,x.Variant));
+        residuals = futureBars.SelectMany(bar => new[] { ResidualVariant.Atm, ResidualVariant.AtmPlusMinus2 }
+            .Select(variant => residualByKey.GetValueOrDefault((bar.BarSeq,variant))
+                ?? new AdaptiveOptionResidualBarRow { SessionId=session.Id, BarSeq=bar.BarSeq, Variant=variant,
+                    EndAvailableAtUtc=bar.EndAvailableAtUtc, Relationship="NEUTRAL", IsAvailable=false,
+                    UnavailableReason="Diagnostic row unavailable for this completed bar." }))
+            .ToList();
 
         var anchors = await db.ResidualAnchorComponents.AsNoTracking()
             .Where(x => x.SessionId == session.Id)

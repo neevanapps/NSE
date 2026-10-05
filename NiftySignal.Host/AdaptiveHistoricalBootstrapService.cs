@@ -120,8 +120,9 @@ public sealed class AdaptiveHistoricalBootstrapService(
         if (hasDiscoverySpec && openingVolume != discoverySpec!.OpeningVolume0930)
         {
             logger.LogWarning(
-                "Adaptive discovery parity warning {TradeDate}: raw opening volume {Actual} != frozen research {Expected}.",
+                "Adaptive discovery parity mismatch {TradeDate}: raw opening volume {Actual} != frozen research {Expected}; day excluded from strong-threshold seed.",
                 day, openingVolume, discoverySpec.OpeningVolume0930);
+            return false;
         }
 
         var definition = new AdaptiveSessionDefinition(

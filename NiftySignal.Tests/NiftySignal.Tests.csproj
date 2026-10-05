@@ -30,6 +30,7 @@
     <ProjectReference Include="..\NiftySignal.BacktestData\NiftySignal.BacktestData.csproj" />
     <ProjectReference Include="..\NiftySignal.MetricTrials\NiftySignal.MetricTrials.csproj" />
     <ProjectReference Include="..\NiftySignal.Host\NiftySignal.Host.csproj" />
+    <ProjectReference Include="..\NiftySignal.Dashboard\NiftySignal.Dashboard.csproj" />
   </ItemGroup>
 
 </Project>

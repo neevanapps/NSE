@@ -95,6 +95,10 @@ public sealed class AdaptiveStateRecoveryService(
             }
         }
 
+        var rebuiltLastSeq = engine.FutureBars.Where(x => x.IsComplete).Select(x => x.BarSeq).DefaultIfEmpty(0).Max();
+        if (await observer.FutureBars.AsNoTracking().AnyAsync(x => x.SessionId == context.Session.Id && x.BarSeq > rebuiltLastSeq, ct))
+            throw new InvalidOperationException("Persisted adaptive bars exceed reconstructed source history. Persisted history will not be overwritten.");
+
         runtime = await observer.Runtime.SingleAsync(x => x.SessionId == context.Session.Id, ct);
         runtime.RuntimeStatus = AdaptiveRuntimeStatus.Live;
         runtime.LastHeartbeatUtc = DateTimeOffset.UtcNow;

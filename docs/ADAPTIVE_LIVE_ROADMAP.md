@@ -15,13 +15,18 @@
 
 - Implementation branch: `feature/adaptive-market-observer-v1`
 - Branch base: fresh branch created directly from `master`
-- Current branch head when this status was written: `247da44aec816dd7fa075d7f49efee3f3a0d200e`
-- Latest validation workflow: `Adaptive Observer Validation`, run `37311333450`
-- Current validation state: **RED — build failure**
-- Immediate blocker: `AdaptiveWeak2ObservationRow.SelectionPolicy` is a required persisted field, but the watch-only Weak2 observation initializer does not currently set it.
-- Because the build failed, adaptive unit tests, restart-parity tests and initial EF migration generation did **not** run on this checkpoint.
-- Merge to `master`: **not allowed yet**
-- VM deployment: **not allowed yet**
+- Last fully green implementation checkpoint: `fb205dfe4a9fa8547e7f7f0f41bd2918303d8c65`.
+- Validation workflow: [37318297210](https://github.com/neevanapps/NSE/actions/runs/37318297210).
+- **Build: PASS — zero warnings/errors; adaptive tests: 32/32; full regression: 1107/1107.**
+- Initial EF migration generated, applied to isolated PostgreSQL 17, and model-drift check passed. Generated initial schema reviewed: eight isolated tables, eight unique indexes, seven restrictive session foreign keys, frozen rate and required selection policy.
+- Independent futures-library historical gate: **PASS** at pinned implementation `a80de2b661dc8ea3dc50e7bfd1afcbe3ced99106`, research `e768b8e5b87938fb7be9531310f1c6f786853301`; private run `37315051168`; 13 discovery sessions, 2034 complete bars, 3,905,205 field checks. No sealed dates used.
+- This futures result is limited to cleaning/classification, exact bars, rolling/evolution and Weak2 identities; it does **not** prove production bootstrap inputs, option bands, integrated residuals, selection/OI/H5 or full Host restart parity.
+- Historical residual gate exposed the legacy numerical mismatch; isolated adaptive research pricing now uses double-precision Gaussian integration and frozen 80-step IV bisection. Identical-clock formula and independent overlapping watch-observation comparisons are in progress in private CI.
+- Subsequent additions (independent ATM availability, locked diagnostic quotes, OI/H5 restart fixtures, synchronized dashboard read fixtures and committed initial migration, frozen universe and after-hours recovery) require a fresh green run and a reviewed follow-up migration.
+- Release blockers discovered by review: **F63** diagnostic clock precision/integrated parity; **F64/F65** frozen option universe and after-hours recovery fixes now implemented with tests awaiting validation. See `docs/REVIEW_FINDINGS.md` and code-site markers.
+- No browser/VM synchronization or commit-to-visible latency measurement has passed.
+- Merge to `master`: **blocked until every remaining gate passes**.
+- VM deployment and prospective observation: **not performed**.
 
 Status terminology used below:
 
@@ -35,16 +40,16 @@ Status terminology used below:
 | Workstream | Status | Notes |
 |---|---|---|
 | Source-control isolation | **VALIDATED** | Work is on a fresh branch from `master`. |
-| Build/source traceability | **IMPLEMENTED / UNVALIDATED** | Branch/SHA/build-UTC metadata added to build/deploy/runtime/session path. Full branch build is currently red for an unrelated Host compile error. |
+| Build/source traceability | **IMPLEMENTED / UNVALIDATED** | Branch/SHA/build-UTC metadata added to build/deploy/runtime/session path. Full solution build passed at the checkpoint above; exact running-build verification remains pending. |
 | Exact futures adaptive calculation library | **IMPLEMENTED / UNVALIDATED** | Tick cleaning, aggressor classification, exact split bars, rolling state, evolution, adaptive opening-volume estimator and Weak2 logic are ported with focused unit tests. Full historical parity gate is still pending. |
 | Adaptive option-band calculations | **IMPLEMENTED / UNVALIDATED** | Futures-clock ATM±2 selection, CE/PE independent persistence model, contract/notional flow, rolling option metrics and strength-change fields exist. Historical parity gate is still pending. |
-| 09:30 option residual calculations | **IMPLEMENTED / UNVALIDATED** | Both fixed ATM and fixed ATM±2 variants are implemented using the research constant-IV repricing method. Focused deterministic tests exist; branch tests have not yet run on current head. |
-| New adaptive persistence schema | **IMPLEMENTED / UNVALIDATED** | Isolated `niftysignal_adaptive_observer` EF model/entities/indexes exist. Initial migration has not yet been successfully generated/committed because CI has not passed Build. |
+| 09:30 option residual calculations | **IMPLEMENTED / UNVALIDATED** | Both fixed ATM and fixed ATM±2 variants are implemented using the research constant-IV repricing method. Focused deterministic tests exist; constant-IV/richness fixtures passed; identical-clock formula parity is being tested, and F63 prevents integrated parity claims. |
+| New adaptive persistence schema | **IMPLEMENTED / UNVALIDATED** | Isolated `niftysignal_adaptive_observer` EF model/entities/indexes exist. Initial migration generated/applied in isolated PostgreSQL; reviewed schema is being committed and revalidated. |
 | Immutable 09:30 session coordinator | **IMPLEMENTED / UNVALIDATED** | Waits for persisted data to advance through 09:30, freezes daily threshold/anchors/model identity and reuses the persisted row on restart. |
-| Historical strong-threshold bootstrap | **IMPLEMENTED / UNVALIDATED** | Replays prior production sessions. Discovery dates carry frozen OOF adaptive thresholds so the bootstrap does not retrospectively substitute the final live estimator. Exact parity with NiftyResearcher discovery output is still pending. |
+| Historical strong-threshold bootstrap | **IMPLEMENTED / UNVALIDATED** | Replays prior production sessions. Discovery dates carry frozen OOF adaptive thresholds so the bootstrap does not retrospectively substitute the final live estimator. Direct futures-library parity passed; production source/bootstrap parity remains pending. |
 | Incremental live observer worker | **IMPLEMENTED / UNVALIDATED** | Watch-only worker reads persisted raw ticks, keeps a causal ordering lag and commits completed-bar packages. |
-| Restart/recovery path | **IMPLEMENTED / UNVALIDATED** | Full-day persisted-tick replay + persisted-row verification is implemented; a deterministic artificial-restart test was added. It has not yet passed on the current branch head. |
-| Weak2/OI/H5 observation lifecycle | **IN PROGRESS** | ₹100–₹150 fixed-strike selection, pair OI gate, H5 bid, MFE/MAE, accepted/rejected/unavailable lifecycle and close handling are implemented, but the current compile blocker is in this area and historical simulation parity is not yet proven. |
+| Restart/recovery path | **IMPLEMENTED / UNVALIDATED** | Full-day persisted-tick replay + persisted-row verification is implemented; a deterministic artificial-restart test was added. Artificial prefix restarts, complete persisted-field corruption checks, and the raw-ID cutoff buffer test passed; full Host/session-close parity remains blocked by F64/F65. |
+| Weak2/OI/H5 observation lifecycle | **IN PROGRESS** | ₹100–₹150 fixed-strike selection, pair OI gate, H5 bid, MFE/MAE, accepted/rejected/unavailable lifecycle and close handling are implemented, but the compile blocker is fixed; historical simulation parity is running and integrated clock parity remains unproven. |
 | Dashboard adaptive read service | **IMPLEMENTED / UNVALIDATED** | Dedicated adaptive DB read path; no raw-tick/strategy calculation in Razor. |
 | Dashboard three-grid UI | **IMPLEMENTED / UNVALIDATED** | Existing StatusBar/access-token/Live Quote retained; adaptive Futures, Options and Residual grids added; incomplete bar is outside grids; old panels moved to `/legacy`. Needs successful build and UI/runtime validation. |
 | Dashboard row selector | **IMPLEMENTED / UNVALIDATED** | Global `5 / 10 / 15`, default 10. |
@@ -89,10 +94,10 @@ The following code paths now exist on the feature branch, although the items mar
 
 ### Immediate next gates
 
-1. **Restore green Build**
-   - populate and freeze `SelectionPolicy` for every `AdaptiveWeak2ObservationRow`;
-   - rerun branch-head CI;
-   - do not proceed to migration/deployment while Build is red.
+1. **Restore green Build — PASSED at checkpoint above**
+   - selection policy and subsequent compile defects fixed;
+   - rerun after each subsequent code/schema change;
+   - do not proceed to deployment on an earlier green SHA.
 
 2. **Run focused adaptive tests**
    - core tick/enricher/exact-bar tests;
@@ -407,12 +412,12 @@ Expose it:
 - add build metadata;
 - establish deploy/revision visibility.
 
-Gate: running revision is unambiguous. Build metadata is implemented; branch-head build must return green before this phase is marked VALIDATED.
+Gate: running revision is unambiguous. Build metadata and the full solution build pass; verification of the actual deployed SHA is pending.
 
 ### Phase 1 — exact research semantics in NSE — **IMPLEMENTED / PARITY PENDING**
 Port/reuse exact tick cleaning, strict/enriched classification, exact-volume splitting and rolling-state logic.
 
-Gate: golden historical replay matches NiftyResearcher bar-for-bar and state-for-state. This gate has not yet passed.
+Gate: golden historical replay matches NiftyResearcher bar-for-bar and state-for-state. Direct independent library comparisons passed; integration gates remain pending.
 
 ### Phase 2 — adaptive session coordinator — **IMPLEMENTED / PARITY PENDING**
 Implement 09:30 V1 estimation, daily immutable session row and prior-session strong threshold.
@@ -422,17 +427,17 @@ Gate: historical session thresholds match NiftyResearcher exactly. Discovery OOF
 ### Phase 3 — incremental live + restart recovery — **IMPLEMENTED / TEST PENDING**
 Consume new ticks incrementally while retaining deterministic replay/recovery.
 
-Gate: restart-parity tests at arbitrary points produce identical results to uninterrupted replay. Test code exists but current branch has not reached the test stage because Build is red.
+Gate: restart-parity tests at arbitrary points produce identical results to uninterrupted replay. Automated artificial restart and buffer/persistence tests passed; full Host restart across mutable universe/session close remains pending.
 
 ### Phase 4 — weak2 state lifecycle — **IMPLEMENTED / PARITY PENDING**
 Persist strong/weak1/weak2 transitions.
 
-Gate: historical trigger identities/times match research exactly. Direct overlapping three-row semantics are implemented; historical identity parity remains pending.
+Gate: historical trigger identities/times match research exactly. Direct overlapping three-row semantics are implemented; direct-library historical identities passed; persisted Host observation identities remain under validation.
 
 ### Phase 5 — option selection and CE/PE OI gate — **IN PROGRESS**
 Implement ₹100–₹150 fixed-strike selection and pair-OI expansion.
 
-Gate: historical accepted/rejected observations match research exactly. Logic exists, but this area contains the current compile blocker and has not passed parity.
+Gate: historical accepted/rejected observations match research exactly. Logic builds and has independent historical execution parity tooling; the full parity gate has not passed yet.
 
 ### Phase 6 — H5 observation lifecycle — **IN PROGRESS**
 Persist hypothetical executable entry, H5 bid exit, MFE/MAE.

@@ -69,6 +69,32 @@ public sealed class OptionResidualModelTests
         Assert.True(band.DirectionalResidualPct > 0d);
     }
 
+    [Fact]
+    public void MissingBandWing_KeepsIndependentAtmDiagnosticAvailable()
+    {
+        var at = new DateTimeOffset(2026,9,25,4,0,0,TimeSpan.Zero);
+        var expiry = new DateOnly(2026,9,29);
+        var chain=BuildChain(expiry);
+        var quotes=BuildQuotes(chain,at,23000,TimeToExpiry.YearsUntilExpiry(expiry,at),.065,.2)
+            .ToDictionary(x=>x.Key,x=>x.Value);
+        quotes.Remove("C22900");
+        var anchor=OptionResidualModel.BuildAnchor(at,expiry,23000,chain,quotes,.065);
+        Assert.NotNull(anchor);
+        Assert.Single(anchor!.Calls); Assert.Single(anchor.Puts);
+        var reading=Assert.Single(OptionResidualModel.Evaluate(anchor,at,23000,quotes,.065));
+        Assert.Equal(ResidualVariant.Atm,reading.Variant);
+        Assert.InRange(Math.Abs(reading.CEResidual),0,1e-6);
+    }
+
+    [Theory]
+    [InlineData(0,0)]
+    [InlineData(100,99)]
+    public void InvalidDiagnosticQuote_DoesNotSubstituteLastTrade(double bid,double ask)
+    {
+        var q=new OptionQuoteSnapshot("C",DateTimeOffset.UtcNow,125,bid,ask,1000);
+        Assert.Null(q.Mid);
+    }
+
     static IReadOnlyList<ObserverOptionInstrument> BuildChain(DateOnly expiry)
     {
         var result = new List<ObserverOptionInstrument>();
