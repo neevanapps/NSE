@@ -121,6 +121,25 @@ public sealed class AdaptiveScreenshotTests
     }
 
     [Fact]
+    public async Task Processor_UnexpectedSenderException_PreservesTypesWithoutSecretsOrResending()
+    {
+        await using var db = Database();
+        var job = AdaptiveScreenshotSchedule.New(null, Day, 0, AdaptiveScreenshotKind.PreLiveTest, Cutoff, Cutoff);
+        db.Add(job); await db.SaveChangesAsync();
+        var root = Path.Combine(Path.GetTempPath(), "adaptive-screenshot-test-" + Guid.NewGuid());
+        try {
+            var renderer = new Renderer(); var sender = new ThrowingSender();
+            var processor = new AdaptiveScreenshotProcessor(renderer, sender, Options.Create(new AdaptiveScreenshotOptions { OutputDirectory = root }), new Clock());
+            await processor.ProcessOneAsync(db, Cutoff, default);
+            await processor.ProcessOneAsync(db, Cutoff.AddMinutes(10), default);
+            Assert.Equal(AdaptiveScreenshotStatus.DeliveryUncertain, job.Status);
+            Assert.Contains("IOException -> ObjectDisposedException", job.LastError!);
+            Assert.DoesNotContain("secret-token", job.LastError!);
+            Assert.Equal(1, sender.Count);
+        } finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+    }
+
+    [Fact]
     public async Task Processor_Rejected_RetriesOriginalImageNotRecaptured()
     {
         await using var db = Database(); db.Add(AdaptiveScreenshotSchedule.New(null, Day, 0, AdaptiveScreenshotKind.PreLiveTest, Cutoff, Cutoff)); await db.SaveChangesAsync();
@@ -180,6 +199,15 @@ public sealed class AdaptiveScreenshotTests
     {
         public int Count;
         public async Task CaptureAsync(AdaptiveScreenshotJobRow job, string path, CancellationToken ct) { Count++; Directory.CreateDirectory(Path.GetDirectoryName(path)!); await File.WriteAllBytesAsync(path, [137,80,78,71,13,10,26,10], ct); }
+    }
+    sealed class ThrowingSender : ITelegramDocumentSender
+    {
+        public int Count;
+        public Task<TelegramDocumentResult> SendAsync(string file, string caption, CancellationToken ct)
+        {
+            Count++;
+            throw new IOException("secret-token", new ObjectDisposedException("secret-token"));
+        }
     }
     sealed class Sender(TelegramDocumentOutcome outcome) : ITelegramDocumentSender
     {

@@ -9,6 +9,7 @@ on:
     branches:
       - feature/adaptive-market-observer-v1
       - feature/adaptive-telegram-screenshots
+      - feature/adaptive-telegram-sender-diagnostics
       - master
   workflow_dispatch:
 
