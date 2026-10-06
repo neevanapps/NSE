@@ -137,6 +137,7 @@ public sealed class AdaptiveWeak2ObservationServiceTests
             SourceBranch = "test", SourceCommitSha = "test", BuildUtc = at,
             FutureToken = "FUT", FutureSymbol = "NIFTYFUT", FutureExpiry = day.AddDays(4),
             OpeningWindowStartUtc = at.AddMinutes(-15), OpeningWindowEndUtc = at,
+            OpeningVolume = 1000,
             EstimatorName = nameof(OpeningVolumeProjectionV1), CreatedAtUtc = at,
         };
         return new AdaptiveObserverSessionContext(session,

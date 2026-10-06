@@ -163,7 +163,8 @@ public sealed class AdaptiveHistoricalBootstrapService(
         var flow = AdaptiveFlowEvolutionTracker.Build(completeBars);
 
         var priorSessionIds = await observer.Sessions.AsNoTracking()
-            .Where(x => x.ModelVersion == OpeningVolumeProjectionV1.ModelVersion && x.TradeDate < day)
+            .Where(x => x.ModelVersion == OpeningVolumeProjectionV1.ModelVersion && x.TradeDate < day
+                && !x.UsesMedianOpeningFallback)
             .Select(x => x.Id)
             .ToArrayAsync(ct);
         var priorRatios = priorSessionIds.Length == 0

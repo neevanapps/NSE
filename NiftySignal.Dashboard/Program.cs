@@ -18,6 +18,13 @@ using NiftySignal.Notifications;
 Environment.SetEnvironmentVariable("PLAYWRIGHT_BROWSERS_PATH", Path.Combine(AppContext.BaseDirectory, ".playwright-browsers"));
 if (args.Contains("--install-screenshot-browser"))
 {
+    // ExecutablePath is version-specific: retain a matching install, install again on upgrade.
+    using var playwright = await Microsoft.Playwright.Playwright.CreateAsync();
+    if (File.Exists(playwright.Chromium.ExecutablePath))
+    {
+        Console.WriteLine("Screenshot Chromium already installed for this Playwright version.");
+        return;
+    }
     Environment.ExitCode = Microsoft.Playwright.Program.Main(["install", "chromium"]);
     return;
 }

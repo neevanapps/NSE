@@ -43,7 +43,10 @@
             <Metric Label="Base bar" Value="@FmtInt(_snapshot.Session.BaseBarVolume)" />
             <Metric Label="Rolling volume" Value="@FmtInt(_snapshot.Session.RollingWindowVolume)" />
             <Metric Label="Expected day volume" Value="@Fmt0(_snapshot.Session.EstimatedFullDayVolume)" />
-            <Metric Label="Opening 09:15–09:30" Value="@FmtInt(_snapshot.Session.OpeningVolume)" />
+            <Metric Label="Observed opening volume" Value="@FmtInt(_snapshot.Session.OpeningVolume)" />
+            <Metric Label="Estimator input" Value="@FmtInt(_snapshot.Session.EstimatorInputOpeningVolume ?? _snapshot.Session.OpeningVolume)" />
+            <Metric Label="Calibration" Value="@(_snapshot.Session.UsesMedianOpeningFallback ? $"Historical median ({_snapshot.Session.MedianOpeningSampleCount} sessions)" : "Observed opening")" />
+            <Metric Label="Valid-bar warm-up" Value="@($"{_snapshot.ConsecutiveValidBars}/{AdaptiveReadinessPolicy.RequiredBars}")" />
             <Metric Label="Strong threshold" Value="@FmtSigned(_snapshot.Session.StrongThreshold, 4)" />
             <Metric Label="Completed bars" Value="@_snapshot.Runtime.LastCompletedBarSeq.ToString()" />
             <Metric Label="Observed volume" Value="@FmtInt(ObservedVolume)" />
@@ -52,6 +55,19 @@
             <Metric Label="Session source" Value="@ShortSource" />
             <Metric Label="Session build UTC" Value="@FmtUtc(_snapshot.Session.BuildUtc)" />
         </div>
+
+        @if (_snapshot.Session.UsesMedianOpeningFallback)
+        {
+            <div class="adaptive-alert">Missing opening coverage: historical median fallback. Observation starts @FmtIst(_snapshot.Session.ObservationStartUtc). This fallback has not passed historical trading validation; unavailable 09:30 residual anchors remain unavailable.</div>
+        }
+        @if (_snapshot.ConsecutiveValidBars < AdaptiveReadinessPolicy.RequiredBars)
+        {
+            <div class="adaptive-alert" data-readiness="warming">Warming up: @_snapshot.ConsecutiveValidBars/10 consecutive valid completed bars. Displayed rows are provisional; do not use for decisions.</div>
+        }
+        else
+        {
+            <div class="adaptive-subtitle" data-readiness="@(_snapshot.CanUseForDecisions ? "ready" : "unavailable")">10-bar warm-up complete · runtime @_snapshot.Runtime.RuntimeStatus · watch-only</div>
+        }
 
         @if (!CaptureMode)
         {
@@ -392,7 +408,7 @@
                     && header.Runtime.LastCompletedBarSeq == (_snapshot.Futures.FirstOrDefault()?.Bar.BarSeq ?? 0)
                     && _loadError is null)
                 {
-                    _snapshot = _snapshot with { Runtime = header.Runtime, Session = header.Session };
+                    _snapshot = _snapshot with { Runtime = header.Runtime, Session = header.Session, ConsecutiveValidBars = header.ConsecutiveValidBars };
                     await InvokeAsync(StateHasChanged);
                 }
                 else if (header is not null)

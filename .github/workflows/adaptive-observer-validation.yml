@@ -10,6 +10,7 @@ on:
       - feature/adaptive-market-observer-v1
       - feature/adaptive-telegram-screenshots
       - feature/adaptive-telegram-sender-diagnostics
+      - feature/adaptive-late-start-readiness
       - master
   workflow_dispatch:
 
@@ -53,6 +54,7 @@ jobs:
             try { & ./deploy.ps1 -Target Local -SkipTests; throw 'Dirty source guard did not reject.' }
             catch { if ($_.Exception.Message -notlike 'Deployment requires a clean source worktree*') { throw } }
           } finally { Remove-Item $probe -Force -ErrorAction SilentlyContinue }
+          & ./tools/TestDeploymentPackaging.ps1
 
       - name: Restore
         run: dotnet restore NiftySignal.slnx
@@ -62,6 +64,12 @@ jobs:
         run: |
           dotnet tool install --global dotnet-ef --version 10.0.11
           dotnet-ef migrations add AddAdaptiveScreenshotOutbox --project NiftySignal.AdaptiveObserverData/NiftySignal.AdaptiveObserverData.csproj --output-dir Migrations
+
+      - name: Generate late-start provenance migration for review
+        if: ${{ hashFiles('NiftySignal.AdaptiveObserverData/Migrations/*AddLateStartProvenance.cs') == '' }}
+        run: |
+          dotnet tool install --global dotnet-ef --version 10.0.11 || dotnet tool update --global dotnet-ef --version 10.0.11
+          dotnet-ef migrations add AddLateStartProvenance --project NiftySignal.AdaptiveObserverData/NiftySignal.AdaptiveObserverData.csproj --output-dir Migrations
 
       - name: Build
         id: build

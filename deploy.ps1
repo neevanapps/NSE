@@ -87,6 +87,10 @@ if ($Service -eq 'Both' -or $Service -eq 'Dashboard') {
 }
 
 function Write-Step($message) {
+    if ($script:stepClock) {
+        Write-Host "    elapsed: $([Math]::Round($script:stepClock.Elapsed.TotalSeconds, 1)) s"
+    }
+    $script:stepClock = [System.Diagnostics.Stopwatch]::StartNew()
     Write-Host ""
     Write-Host "==> $message" -ForegroundColor Cyan
 }
@@ -119,10 +123,17 @@ New-Item -ItemType Directory -Path $stagingRoot -Force | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Cannot archive the verified source revision; nothing deployed.' }
 Expand-Archive -LiteralPath $sourceArchive -DestinationPath $publishSourceRoot
 
+# Build Release once. Test and publish reuse exactly these binaries and source metadata.
+$commitSha = $verifiedSha
+$buildUtc = [DateTimeOffset]::UtcNow.ToString('O')
+Write-Step "Building validated Release source $sourceBranch @ $commitSha"
+& dotnet build (Join-Path $publishSourceRoot 'NiftySignal.slnx') -c Release --nologo "-p:SourceBranch=$sourceBranch" "-p:CommitSha=$commitSha" "-p:BuildUtc=$buildUtc"
+if ($LASTEXITCODE -ne 0) { throw 'Release build failed; nothing deployed.' }
+
 # --- Tests -----------------------------------------------------------------------------
 if (-not $SkipTests) {
     Write-Step "Running tests"
-    & dotnet test $publishSourceRoot --nologo
+    & dotnet test (Join-Path $publishSourceRoot 'NiftySignal.Tests\NiftySignal.Tests.csproj') -c Release --no-build --no-restore --nologo
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Tests failed -- nothing deployed." -ForegroundColor Red
         exit 1
@@ -130,8 +141,6 @@ if (-not $SkipTests) {
 }
 
 # --- Build/source identity ---------------------------------------------------------------
-$commitSha = $verifiedSha
-$buildUtc = [DateTimeOffset]::UtcNow.ToString('O')
 Write-Host "    source: $sourceBranch @ $commitSha"
 Write-Host "    build : $buildUtc UTC"
 
@@ -145,7 +154,7 @@ foreach ($svc in $services) {
         Remove-Item $staging -Recurse -Force
     }
 
-    & dotnet publish (Join-Path $publishSourceRoot $svc.Project) -c Release -o $staging --nologo "-p:SourceBranch=$sourceBranch" "-p:CommitSha=$commitSha" "-p:BuildUtc=$buildUtc"
+    & dotnet publish (Join-Path $publishSourceRoot $svc.Project) -c Release --no-build --no-restore -o $staging --nologo "-p:SourceBranch=$sourceBranch" "-p:CommitSha=$commitSha" "-p:BuildUtc=$buildUtc"
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Publish failed for $($svc.Project) -- nothing deployed." -ForegroundColor Red
         exit 1
@@ -189,6 +198,7 @@ if ($Target -eq 'Local') {
     }
 }
 else {
+    . (Join-Path $repoRoot 'tools\DeploymentPackaging.ps1')
     Write-Step "Connecting to $VmAddress"
     if (-not $Credential) {
         $Credential = Get-Credential -Message "Windows credentials for $VmAddress"
@@ -279,6 +289,27 @@ else {
             }
             Write-Host "    $($toCopy.Count) of $($localHashes.Count) files changed"
 
+            # Transfer one delta ZIP before stopping the service, instead of hundreds of WinRM
+            # file-copy round trips. The archive contains only changed published files.
+            $localPackage = Join-Path $stagingRoot ("delta-" + [Guid]::NewGuid().ToString('N') + '.zip')
+            $remotePackage = $null
+            if ($toCopy.Count -gt 0) {
+                New-ChangedDeploymentArchive -StagingDirectory $staging -RelativePaths @($toCopy) -ArchivePath $localPackage
+                try {
+                    $remotePackage = Invoke-Command -Session $session -ScriptBlock {
+                        Join-Path ([System.IO.Path]::GetTempPath()) ("nifty-deploy-" + [Guid]::NewGuid().ToString('N') + '.zip')
+                    }
+                    Copy-Item -LiteralPath $localPackage -Destination $remotePackage -ToSession $session -Force
+                } catch {
+                    if ($remotePackage) {
+                        Invoke-Command -Session $session -ArgumentList $remotePackage -ScriptBlock {
+                            param($zip) Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+                        }
+                    }
+                    throw
+                } finally { Remove-Item -LiteralPath $localPackage -Force -ErrorAction SilentlyContinue }
+            }
+
             Invoke-Command -Session $session -ArgumentList $svc.Name -ScriptBlock {
                 param($name)
                 Stop-Service -Name $name -Force -ErrorAction SilentlyContinue
@@ -290,17 +321,10 @@ else {
                 Write-Host "    nothing to copy"
             }
             else {
-                # Create every needed destination folder in one round trip, not one per file.
-                $destDirs = $toCopy | ForEach-Object { Split-Path (Join-Path $targetDir $_) -Parent } | Sort-Object -Unique
-                Invoke-Command -Session $session -ArgumentList (, $destDirs) -ScriptBlock {
-                    param($dirs)
-                    foreach ($d in $dirs) {
-                        if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
-                    }
-                }
-
-                foreach ($rel in $toCopy) {
-                    Copy-Item -Path (Join-Path $staging $rel) -Destination (Join-Path $targetDir $rel) -ToSession $session -Force
+                Invoke-Command -Session $session -ArgumentList $remotePackage, $targetDir -ScriptBlock {
+                    param($zip, $dir)
+                    try { Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force }
+                    finally { Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue }
                 }
                 Write-Host "    files copied"
             }
@@ -324,4 +348,5 @@ else {
 }
 
 Write-Host ""
+if ($script:stepClock) { Write-Host "    elapsed: $([Math]::Round($script:stepClock.Elapsed.TotalSeconds, 1)) s" }
 Write-Host "Done." -ForegroundColor Green
