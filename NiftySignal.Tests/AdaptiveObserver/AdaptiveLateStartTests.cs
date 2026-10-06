@@ -115,6 +115,23 @@ public sealed class AdaptiveLateStartTests
         Assert.Equal(2000, AdaptiveOpeningCoverage.Median([3000, 2000, 1000]));
     }
 
+    [Fact]
+    public async Task ReplayInsertion_DoesNotDeclareLiveBeforeReconciliationCompletes()
+    {
+        await using var db = Observer();
+        var context = AdaptiveWeak2ObservationServiceTests.Context();
+        db.Sessions.Add(context.Session);
+        db.Runtime.Add(new AdaptiveObserverRuntimeRow { SessionId = context.Session.Id,
+            RuntimeStatus = AdaptiveRuntimeStatus.Rebuilding, LastHeartbeatUtc = Open });
+        await db.SaveChangesAsync();
+        var bar = AdaptiveCoreParityTests.MakeBar(1, 100, 101, 70, 20, 10);
+        var package = new AdaptiveCompletedBarPackage(bar, AdaptiveFlowEvolutionTracker.Build([bar]).Single(),
+            new OptionBandBarResult(null, false, null, null, null, null, "Unavailable"), [], false);
+        var persistence = new AdaptiveObserverPersistence(NullLogger<AdaptiveObserverPersistence>.Instance);
+        await persistence.PersistOrVerifyAsync(db, context.Session, package, Open, default);
+        Assert.Equal(AdaptiveRuntimeStatus.Rebuilding, (await db.Runtime.SingleAsync()).RuntimeStatus);
+    }
+
     static AdaptiveSessionStateRow AddHistory(AdaptiveObserverDbContext db, DateOnly day, long opening)
     {
         var row = AdaptiveWeak2ObservationServiceTests.Context().Session;
