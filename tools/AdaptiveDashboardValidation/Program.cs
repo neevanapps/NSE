@@ -28,6 +28,7 @@ await db.Database.MigrateAsync();
 await using (var source = new NiftySignalDbContext(new DbContextOptionsBuilder<NiftySignalDbContext>().UseNpgsql(baseConnection).Options))
     await source.Database.EnsureCreatedAsync();
 await RelationalRestartParity.CheckAsync(options,baseConnection,args[1],evidence);
+await LateStartRelationalValidation.CheckAsync(options,baseConnection,args[1],evidence);
 await using var telegramStub = new TelegramScreenshotStub();
 var at = DateTimeOffset.UtcNow;
 var day = DateOnly.FromDateTime(at.ToOffset(TimeSpan.FromHours(5.5)).DateTime);
@@ -35,7 +36,7 @@ var session = new AdaptiveSessionStateRow {
     TradeDate=day, ModelVersion=OpeningVolumeProjectionV1.ModelVersion, SourceBranch="isolated-ui-validation",
     SourceCommitSha=args[1], BuildUtc=at, FutureToken="VALIDATION", FutureSymbol="NIFTYFUT",
     FutureExpiry=day.AddDays(4), OpeningWindowStartUtc=at.AddMinutes(-45), OpeningWindowEndUtc=at.AddMinutes(-30),
-    EstimatorName=nameof(OpeningVolumeProjectionV1), CreatedAtUtc=at, BaseBarVolume=3250,
+    EstimatorName=nameof(OpeningVolumeProjectionV1), CreatedAtUtc=at, BaseBarVolume=3250, OpeningVolume=30000,
     RollingWindowVolume=32500, OptionUniverseJson="[]" };
 db.Sessions.Add(session); await db.SaveChangesAsync();
 var runtime = new AdaptiveObserverRuntimeRow { SessionId=session.Id, LastHeartbeatUtc=at,
@@ -176,6 +177,20 @@ try {
         throw new Exception("Screenshot outbox did not deliver pinned initial/every-five-bar snapshots: " +
             JsonSerializer.Serialize(screenshotJobs.Select(x=>new { x.TargetBarSeq,x.Status,x.LastError,x.Attempts })));
     if(telegramStub.Uploads.Count!=7 || telegramStub.Uploads.Any(x=>x.Width<1920))throw new Exception("Screenshot upload count/PNG dimensions invalid.");
+    // Readiness is based on the committed boundary, not future rows already in the fixture.
+    runtime.LastCompletedBarSeq=9; await db.SaveChangesAsync();
+    await page.GotoAsync(url+"/");
+    await Expect(page.Locator("[data-readiness='warming']")).ToContainTextAsync("9/10");
+    await page.ScreenshotAsync(new() { Path=Path.Combine(evidence,"warmup-nine-bars.png"),FullPage=true });
+    runtime.LastCompletedBarSeq=43; await db.SaveChangesAsync();
+    await page.ReloadAsync();
+    await Expect(page.Locator("[data-readiness='ready']")).ToBeVisibleAsync();
+    var lastFixtureBar=db.FutureBars.Local.Single(x=>x.SessionId==session.Id && x.BarSeq==43);
+    lastFixtureBar.TradeUpdates=0; await db.SaveChangesAsync();
+    await Expect(page.Locator("[data-readiness='warming']")).ToContainTextAsync("0/10");
+    lastFixtureBar.TradeUpdates=1; await db.SaveChangesAsync();
+    await Expect(page.Locator("[data-readiness='ready']")).ToBeVisibleAsync();
+    Console.WriteLine("READINESS BROWSER PASS: nine bars provisional, ten-plus valid bars ready, invalid latest bar revokes readiness.");
     // Restart the real worker against the same PostgreSQL outbox; acknowledged images must not resend.
     await push.StopAsync();
     server.Kill(entireProcessTree:true);
@@ -231,7 +246,7 @@ try {
 void AddRows(int seq) {
     var end=at.AddMinutes(seq-43);var begin=end.AddMinutes(-1);
     db.FutureBars.Add(new AdaptiveFutureBarRow { SessionId=session.Id,BarSeq=seq,StartAvailableAtUtc=begin,EndAvailableAtUtc=end,
-        Open=23000,Close=23001,Volume=3250,DurationSeconds=60 });
+        Open=23000,High=23001,Low=23000,Close=23001,Volume=3250,TradeUpdates=1,DurationSeconds=60 });
     foreach(var side in new[] { OptionType.Call,OptionType.Put })
         db.OptionBandBars.Add(new AdaptiveOptionBandBarRow { SessionId=session.Id,BarSeq=seq,Side=side,
             StartAvailableAtUtc=begin,EndAvailableAtUtc=end,BandStrikes="22900,22950,23000,23050,23100",

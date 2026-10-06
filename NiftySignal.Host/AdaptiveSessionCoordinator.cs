@@ -137,7 +137,7 @@ public sealed class AdaptiveSessionCoordinator(
         var priorSessionIds = await observer.Sessions
             .AsNoTracking()
             .Where(x => x.ModelVersion == OpeningVolumeProjectionV1.ModelVersion && x.TradeDate < day
-                && !x.UsesMedianOpeningFallback)
+                && !x.UsesMedianOpeningFallback && x.OpeningVolume > 0)
             .Select(x => x.Id)
             .ToArrayAsync(ct);
 
