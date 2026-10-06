@@ -18,13 +18,13 @@ public sealed class TelegramDocumentSenderTests
         await File.WriteAllBytesAsync(path, [137,80,78,71]);
         try {
             var handler = new Handler(json, httpStatus);
-            using var sender = new TelegramDocumentSender(new HttpClient(handler), Options.Create(new TelegramOptions { BotToken = "test-token", ChatId = "chat" }));
+            using var sender = new TelegramDocumentSender(new HttpClient(handler), Options.Create(new TelegramOptions { BotToken = "123456:test-token", ChatId = "chat" }));
             var result = await sender.SendAsync(path, "Caption", default);
             Assert.Equal(outcome, result.Outcome);
             Assert.Contains("chat_id", handler.Body);
             Assert.Contains("image/png", handler.Body);
             Assert.Contains("Caption", handler.Body);
-            Assert.EndsWith("/bottest-token/sendDocument", handler.Url);
+            Assert.Equal("https://api.telegram.org/bot123456:test-token/sendDocument", handler.Url);
             if (httpStatus == 429) Assert.Equal(17, result.RetryAfterSeconds);
             if (outcome == TelegramDocumentOutcome.Sent) Assert.Equal(42, result.MessageId);
         } finally { File.Delete(path); }

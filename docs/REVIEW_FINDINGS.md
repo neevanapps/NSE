@@ -3355,3 +3355,13 @@ The session source/build card describes the process that originally froze the da
 Validation passed at b40851c48afddcc5b693d5ee75b15a24738e23dc, run 37354356288: real Chromium verified full current Dashboard SHA/branch independently of the session branch; zero compiler warnings/errors, 48 adaptive / 1,123 total tests, migrations/restart/selectors and both publish outputs pass. P95 142.0 ms / max 144.8 ms in isolated CI.
 
 **Numbering note:** F73 is next-free going forward.
+
+
+## F73 — screenshot sender fallback hides exception identity — FIXED, validation pending
+
+VM pre-live jobs 1–4 on 2026-10-06 reached DeliveryUncertain with only "Sender interrupted". Manual upload of the captured 38,226-byte PNG with Dashboard-local bot/chat succeeded (HTTP 200, acknowledged message ID 133632), but this does not establish the application sender's root cause. The processor fallback now records exception and inner-exception type names only, preserving ambiguous-delivery/no-resend behavior and excluding messages/stack traces which can reveal bot tokens. A regression injects a nested sender exception containing a secret and checks both sanitized diagnostics and no retry. This fixes diagnostic visibility, not the unresolved VM delivery failure. Automated VM delivery remains pending.
+
+
+## F74 — real Telegram token colon is interpreted as URI scheme — FIXED, validation pending
+
+The document sender used `new Uri(baseUri, "bot" + token + "/sendDocument")`. Real numeric-prefix bot tokens contain a colon, making that second argument a syntactically absolute URI with scheme `bot123456`, which HttpClient rejects before upload. Tests and the Chromium upload emulator used colon-free tokens and missed this production-only path. The endpoint now starts with `/bot`, retaining the configured HTTP(S) origin; unit tests assert the entire HTTPS endpoint with a representative colon-bearing fake token, and the full browser harness uses the same token format. The outer sender diagnostic also exposes safe exception type names (F73). No strategy, Host or database model change. Previous uncertain jobs remain untouched; VM acceptance requires a new acknowledged pre-live delivery after Dashboard-only deployment.

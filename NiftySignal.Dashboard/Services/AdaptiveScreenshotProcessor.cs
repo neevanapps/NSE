@@ -55,7 +55,15 @@ public sealed class AdaptiveScreenshotProcessor(IAdaptiveScreenshotRenderer rend
         await db.SaveChangesAsync(ct); // Durable before the first upload byte.
         TelegramDocumentResult delivery;
         try { delivery = await sender.SendAsync(path, job.Caption!, ct); }
-        catch { delivery = new(TelegramDocumentOutcome.Uncertain, Error: "Sender interrupted; delivery uncertain; no automatic resend."); }
+        catch (Exception ex)
+        {
+            // Exception messages/stack traces can contain the bot URL and token. Types are safe.
+            var types = ex.GetType().Name;
+            for (var inner = ex.InnerException; inner is not null && types.Length < 300; inner = inner.InnerException)
+                types += $" -> {inner.GetType().Name}";
+            delivery = new(TelegramDocumentOutcome.Uncertain,
+                Error: $"Sender interrupted ({types}); delivery uncertain; no automatic resend.");
+        }
         job.Status = delivery.Outcome switch {
             TelegramDocumentOutcome.Sent => AdaptiveScreenshotStatus.Sent,
             TelegramDocumentOutcome.Rejected => AdaptiveScreenshotStatus.Pending,
