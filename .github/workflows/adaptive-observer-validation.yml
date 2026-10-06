@@ -15,6 +15,24 @@ on:
   workflow_dispatch:
 
 jobs:
+  deployment-windows:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Windows PowerShell deployment and delta ZIP
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($script in @('deploy.ps1', 'tools/DeploymentPackaging.ps1', 'tools/TestDeploymentPackaging.ps1')) {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD $script), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count) { throw ($errors | Out-String) }
+          }
+          & ./tools/TestDeploymentPackaging.ps1
+          try { & ./deploy.ps1 -Target Local -SkipTests -ExpectedCommitSha ('0' * 40); throw 'SHA guard did not reject.' }
+          catch { if ($_.Exception.Message -notlike 'Expected source SHA*') { throw } }
+
   build-test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
