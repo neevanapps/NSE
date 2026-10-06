@@ -27,7 +27,9 @@ public sealed class TelegramDocumentSender(HttpClient http, IOptions<TelegramOpt
         body.Add(image, "document", Path.GetFileName(file));
         try
         {
-            var endpoint = new Uri(validationApi ?? new Uri("https://api.telegram.org/"), $"bot{options.Value.BotToken}/sendDocument");
+            // Real bot tokens contain ':'. Without the leading '/', "bot123:token/..."
+            // is parsed as an absolute URI with scheme "bot123", not an HTTPS path.
+            var endpoint = new Uri(validationApi ?? new Uri("https://api.telegram.org/"), $"/bot{options.Value.BotToken}/sendDocument");
             using var response = await http.PostAsync(endpoint, body, ct);
             using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
             var root = json.RootElement;
