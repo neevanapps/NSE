@@ -5,8 +5,8 @@ function New-ChangedDeploymentArchive {
     try {
         foreach ($relative in $RelativePaths) {
             $entry = $relative.Replace('\', '/')
-            if ([System.IO.Path]::IsPathRooted($relative) -or $entry.Contains(':') -or $entry.StartsWith('/')
-                -or $entry.Split('/') -contains '..' -or $entry.Split('/')[-1] -eq 'appsettings.Local.json') {
+            if ([System.IO.Path]::IsPathRooted($relative) -or $entry.Contains(':') -or $entry.StartsWith('/') -or
+                $entry.Split('/') -contains '..' -or $entry.Split('/')[-1] -eq 'appsettings.Local.json') {
                 throw 'Deployment archive contains an unsafe or local-configuration path.'
             }
             [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
