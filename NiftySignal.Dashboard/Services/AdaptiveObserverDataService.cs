@@ -40,7 +40,8 @@ public sealed class AdaptiveObserverDataService(
 
         var runtime = await db.Runtime.AsNoTracking()
             .SingleOrDefaultAsync(x => x.SessionId == session.Id, ct);
-        return runtime is null ? null : new AdaptiveObserverHeaderSnapshot(session, runtime);
+        return runtime is null ? null : new AdaptiveObserverHeaderSnapshot(session, runtime,
+            await LoadValidBarCountAsync(db, session, runtime.LastCompletedBarSeq, ct));
     }
 
     public async Task<AdaptiveObserverSnapshot?> LoadSnapshotAsync(int requestedRows, CancellationToken ct = default, long? captureSessionId = null, int? throughBarSeq = null)
@@ -136,7 +137,20 @@ public sealed class AdaptiveObserverDataService(
             .ThenBy(x => x.Strike)
             .ToListAsync(ct);
 
-        return new AdaptiveObserverSnapshot(session, runtime, futures, options, residuals, anchors);
+        return new AdaptiveObserverSnapshot(session, runtime, futures, options, residuals, anchors,
+            await LoadValidBarCountAsync(db, session, runtime.LastCompletedBarSeq, ct));
+    }
+
+    static async Task<int> LoadValidBarCountAsync(AdaptiveObserverDbContext db, AdaptiveSessionStateRow session,
+        int boundary, CancellationToken ct)
+    {
+        var bars = await db.FutureBars.AsNoTracking()
+            .Where(x => x.SessionId == session.Id && x.BarSeq <= boundary
+                && x.BarSeq > boundary - AdaptiveReadinessPolicy.RequiredBars)
+            .ToListAsync(ct);
+        return AdaptiveReadinessPolicy.CountValidSuffix(bars.Select(x => (x.BarSeq,
+            AdaptiveReadinessPolicy.IsValid(x.Volume, session.BaseBarVolume, x.Open, x.High, x.Low,
+                x.Close, x.TradeUpdates, x.StartAvailableAtUtc, x.EndAvailableAtUtc))), boundary);
     }
 
     async Task<AdaptiveSessionStateRow?> FindTodaySessionAsync(AdaptiveObserverDbContext db, CancellationToken ct)

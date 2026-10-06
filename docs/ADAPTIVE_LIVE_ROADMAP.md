@@ -394,3 +394,8 @@ Likely legacy candidates must be verified by current references before deletion;
 - No new historical filter is added merely to improve backtest P&L.
 - Any new metric discovered during observation is persisted/visualized first and tested separately.
 - Production behavior changes only after deterministic historical parity and restart parity.
+# Late-start continuity follow-up — 2026-10-06
+
+Branch `feature/adaptive-late-start-readiness`, based on validated master `36e2e7287cbf4a0b96c813de5e202d3d25ba2373`.
+
+Historical-opening median fallback, explicit frozen provenance, ten-valid-bar readiness (verified reconstruction counts), and one-build/delta-ZIP deployment are IMPLEMENTED / UNVALIDATED until feature and exact merged-master CI pass. The new fallback does not inherit normal-session research/trading parity. No paper or real orders are enabled. VM migration, warm-up/restart acceptance and deployment speed measurement remain PENDING. See `ADAPTIVE_LATE_START.md` and the release PR for final validation evidence and SHA.

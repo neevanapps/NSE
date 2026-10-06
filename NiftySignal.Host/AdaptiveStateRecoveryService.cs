@@ -50,7 +50,7 @@ public sealed class AdaptiveStateRecoveryService(
         foreach (var item in raw)
         {
             var normalized = normalizer.Process(item.Token, item.Tick);
-            if (normalized is { } tick && tick.AvailableAt >= marketOpenUtc)
+            if (normalized is { } tick && tick.AvailableAt >= (context.Session.ObservationStartUtc ?? marketOpenUtc))
             {
                 // Normalize the full persisted Id prefix, retaining rows newer than the stable
                 // cutoff. Advancing the Id cursor while dropping these rows loses them forever.

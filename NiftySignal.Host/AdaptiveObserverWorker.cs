@@ -146,7 +146,7 @@ public sealed class AdaptiveObserverWorker(
         {
             live.LastFetchedRawId = Math.Max(live.LastFetchedRawId, item.Tick.Id);
             var clean = live.Normalizer.Process(item.Token, item.Tick);
-            if (clean is { } tick)
+            if (clean is { } tick && tick.AvailableAt >= (live.Context.Session.ObservationStartUtc ?? live.Context.Session.OpeningWindowStartUtc))
             {
                 live.Pending.Add(new ObserverTokenTick(item.Token, tick));
             }

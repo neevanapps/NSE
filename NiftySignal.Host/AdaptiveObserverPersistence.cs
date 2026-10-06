@@ -48,7 +48,9 @@ public sealed class AdaptiveObserverPersistence(ILogger<AdaptiveObserverPersiste
 
         var runtime = await db.Runtime.SingleAsync(x => x.SessionId == session.Id, ct);
         runtime.LastHeartbeatUtc = nowUtc;
-        runtime.RuntimeStatus = AdaptiveRuntimeStatus.Live;
+        // Replay may insert missing bars, but readiness must wait for full reconciliation.
+        if (runtime.RuntimeStatus != AdaptiveRuntimeStatus.Rebuilding)
+            runtime.RuntimeStatus = AdaptiveRuntimeStatus.Live;
         runtime.LastCompletedBarSeq = package.FutureBar.BarSeq;
         runtime.CurrentPartialBarVolume = 0;
         runtime.CurrentPartialBarStartedAtUtc = package.FutureBar.EndAvailableAtUtc;

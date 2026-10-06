@@ -21,6 +21,12 @@ public sealed class AdaptiveSessionStateRow
     public required DateTimeOffset OpeningWindowStartUtc { get; set; }
     public required DateTimeOffset OpeningWindowEndUtc { get; set; }
     public long OpeningVolume { get; set; }
+    // Null on legacy sessions. OpeningVolume always remains the actually observed quantity.
+    public long? EstimatorInputOpeningVolume { get; set; }
+    public bool UsesMedianOpeningFallback { get; set; }
+    public int? OpeningCoverageMinutes { get; set; }
+    public int? MedianOpeningSampleCount { get; set; }
+    public DateTimeOffset? ObservationStartUtc { get; set; }
     public required string EstimatorName { get; set; }
     public double EstimatorIntercept { get; set; }
     public double EstimatorSlope { get; set; }

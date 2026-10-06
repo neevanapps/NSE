@@ -3365,3 +3365,16 @@ VM pre-live jobs 1–4 on 2026-10-06 reached DeliveryUncertain with only "Sender
 ## F74 — real Telegram token colon is interpreted as URI scheme — FIXED, validation pending
 
 The document sender used `new Uri(baseUri, "bot" + token + "/sendDocument")`. Real numeric-prefix bot tokens contain a colon, making that second argument a syntactically absolute URI with scheme `bot123456`, which HttpClient rejects before upload. Tests and the Chromium upload emulator used colon-free tokens and missed this production-only path. The endpoint now starts with `/bot`, retaining the configured HTTP(S) origin; unit tests assert the entire HTTPS endpoint with a representative colon-bearing fake token, and the full browser harness uses the same token format. The outer sender diagnostic also exposes safe exception type names (F73). No strategy, Host or database model change. Previous uncertain jobs remain untouched; VM acceptance requires a new acknowledged pre-live delivery after Dashboard-only deployment.
+
+
+## F75 — late start silently freezes zero/partial opening volume — FIXED, validation pending
+
+Require observed futures coverage in every minute of the opening window and positive opening volume. Otherwise freeze the median prior validated opening volume with explicit source/input/sample/start metadata, excluding fallback/current/future sessions. Missing offline ticks are not fabricated; warm-up begins from a real cumulative-volume baseline. Missing residual quotes stay unavailable. Existing sessions never silently refreeze. Synthetic late/partial/normal/restart tests added; median fallback trading performance remains unvalidated.
+
+## F76 — decision readiness not explicit and replay can prematurely mark Live — FIXED, validation pending
+
+Shared ten-valid-contiguous-completed-bar gate protects actionable Weak2 and Dashboard readiness. Verified replay bars count after restart. Keep Rebuilding status while replay inserts rows; only complete reconciliation restores Live. Incomplete/invalid/missing rows do not satisfy the gate. Future paper/order consumers must use this gate plus their own risk/data/execution checks. No paper or real orders enabled.
+
+## F77 — deployment rebuilds twice and performs per-file WinRM copies — FIXED, validation pending
+
+One Release build with exact provenance is reused by full unit tests and publish. Only changed files are packaged into one ZIP, transferred before remote service stop, extracted retaining VM-local settings. Reuse version-specific installed Chromium. Print step timing. Tests retain source/SHA guards and verify delta ZIP nesting, secret retention and traversal rejection. Actual Windows/WinRM speed measurement remains pending.

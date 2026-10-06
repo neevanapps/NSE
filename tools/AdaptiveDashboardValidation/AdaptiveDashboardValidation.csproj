@@ -2,6 +2,7 @@
   <PropertyGroup><OutputType>Exe</OutputType></PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../NiftySignal.Host/NiftySignal.Host.csproj" />
+    <ProjectReference Include="../../NiftySignal.Dashboard/NiftySignal.Dashboard.csproj" />
     <PackageReference Include="Microsoft.Playwright" VersionOverride="1.55.0" />
   </ItemGroup>
 </Project>

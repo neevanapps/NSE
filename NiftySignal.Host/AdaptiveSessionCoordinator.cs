@@ -116,12 +116,32 @@ public sealed class AdaptiveSessionCoordinator(
             }
         }
 
-        var predicted = OpeningVolumeProjectionV1.PredictFullDayVolume(openingVolume);
-        var baseVolume = OpeningVolumeProjectionV1.SelectBaseBarVolume(openingVolume, future.LotSize);
+        var openUtc = ToUtc(day, MarketOpen);
+        var coveredMinutes = AdaptiveOpeningCoverage.CoveredMinutes(futureTicks, openUtc, cutoffUtc);
+        var useMedian = coveredMinutes != 15 || openingVolume <= 0;
+        var validatedDiscoveryDays = OpeningVolumeProjectionV1.DiscoveryOutOfFold.Keys.ToArray();
+        var priorOpeningVolumes = useMedian
+            ? await observer.Sessions.AsNoTracking()
+                .Where(x => x.TradeDate < day && x.ModelVersion == OpeningVolumeProjectionV1.ModelVersion
+                    && !x.UsesMedianOpeningFallback && x.OpeningVolume > 0
+                    && (x.OpeningCoverageMinutes == 15
+                        || (x.IsHistoricalSeed && validatedDiscoveryDays.Contains(x.TradeDate))))
+                .Select(x => x.OpeningVolume).ToListAsync(ct)
+            : new List<long>();
+        var estimatorInput = useMedian ? AdaptiveOpeningCoverage.Median(priorOpeningVolumes) : openingVolume;
+        // Ignore incomplete opening fragments in fallback mode. First observed tick is a volume
+        // baseline; cumulative volume collected while offline never becomes a synthetic huge bar.
+        var observationStart = useMedian
+            ? futureTicks.First(x => x.AvailableAt >= cutoffUtc).AvailableAt : openUtc;
+        var predicted = OpeningVolumeProjectionV1.PredictFullDayVolume(estimatorInput);
+        var baseVolume = OpeningVolumeProjectionV1.SelectBaseBarVolume(estimatorInput, future.LotSize);
 
         var priorSessionIds = await observer.Sessions
             .AsNoTracking()
-            .Where(x => x.ModelVersion == OpeningVolumeProjectionV1.ModelVersion && x.TradeDate < day)
+            .Where(x => x.ModelVersion == OpeningVolumeProjectionV1.ModelVersion && x.TradeDate < day
+                && !x.UsesMedianOpeningFallback && x.OpeningVolume > 0
+                && (x.OpeningCoverageMinutes == 15
+                    || (x.IsHistoricalSeed && validatedDiscoveryDays.Contains(x.TradeDate))))
             .Select(x => x.Id)
             .ToArrayAsync(ct);
 
@@ -177,7 +197,12 @@ public sealed class AdaptiveSessionCoordinator(
             OpeningWindowStartUtc = ToUtc(day, MarketOpen),
             OpeningWindowEndUtc = cutoffUtc,
             OpeningVolume = openingVolume,
-            EstimatorName = nameof(OpeningVolumeProjectionV1),
+            EstimatorInputOpeningVolume = estimatorInput,
+            UsesMedianOpeningFallback = useMedian,
+            OpeningCoverageMinutes = coveredMinutes,
+            MedianOpeningSampleCount = useMedian ? priorOpeningVolumes.Count : null,
+            ObservationStartUtc = observationStart,
+            EstimatorName = useMedian ? "historical-opening-median-v1" : nameof(OpeningVolumeProjectionV1),
             EstimatorIntercept = OpeningVolumeProjectionV1.Intercept,
             EstimatorSlope = OpeningVolumeProjectionV1.Slope,
             TargetBarsPerDay = OpeningVolumeProjectionV1.TargetBarsPerDay,
@@ -242,7 +267,7 @@ public sealed class AdaptiveSessionCoordinator(
             weeklyExpiry,
             optionDescriptors,
             anchor,
-            cutoffUtc);
+            useMedian ? observationStart : cutoffUtc);
     }
 
     async Task<AdaptiveObserverSessionContext> LoadContextAsync(
@@ -251,6 +276,8 @@ public sealed class AdaptiveSessionCoordinator(
         AdaptiveSessionStateRow row,
         CancellationToken ct)
     {
+        if (row.OpeningVolume <= 0 && !row.UsesMedianOpeningFallback)
+            throw new InvalidOperationException($"Adaptive session {row.Id} has an invalid zero opening estimate; it cannot be silently refrozen. Review and rebuild this session explicitly.");
         var expiry = row.WeeklyOptionExpiry
             ?? throw new InvalidOperationException($"Adaptive session {row.Id} has no weekly option expiry.");
 
@@ -295,7 +322,9 @@ public sealed class AdaptiveSessionCoordinator(
             expiry,
             options,
             anchor,
-            row.OpeningWindowEndUtc);
+            row.UsesMedianOpeningFallback ? row.ObservationStartUtc
+                ?? throw new InvalidOperationException("Median fallback session has no frozen observation start.")
+                : row.OpeningWindowEndUtc);
     }
 
     static ObserverOptionInstrument ToDescriptor(NiftySignal.Domain.Entities.Instrument i) =>

@@ -137,7 +137,9 @@ public sealed class AdaptiveObserverEngine
 
             var flow = flowStates.Single(x => x.Bar.BarSeq == bar.BarSeq);
             var residuals = BuildResiduals(bar, flow.Rolling);
-            var actionable = flow.State == AdaptiveStateKind.Weak2 && bar.EndAvailableAtUtc >= _signalStartUtc;
+            var ready = AdaptiveReadinessPolicy.ConsecutiveValidBars(_futureBars.Bars, _session.BaseBarVolume, bar.BarSeq)
+                >= AdaptiveReadinessPolicy.RequiredBars;
+            var actionable = ready && flow.State == AdaptiveStateKind.Weak2 && bar.EndAvailableAtUtc >= _signalStartUtc;
             packages.Add(new AdaptiveCompletedBarPackage(bar, flow, optionBand, residuals, actionable));
 
             // A crossing futures update can close multiple exact bars at the same timestamp.

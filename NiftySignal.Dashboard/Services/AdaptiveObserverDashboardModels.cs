@@ -18,8 +18,14 @@ public sealed record AdaptiveObserverSnapshot(
     IReadOnlyList<AdaptiveFuturesGridRow> Futures,
     IReadOnlyList<AdaptiveOptionPairGridRow> Options,
     IReadOnlyList<AdaptiveOptionResidualBarRow> Residuals,
-    IReadOnlyList<AdaptiveResidualAnchorComponentRow> ResidualAnchors);
+    IReadOnlyList<AdaptiveResidualAnchorComponentRow> ResidualAnchors,
+    int ConsecutiveValidBars = 0)
+{
+    public bool CanUseForDecisions => ConsecutiveValidBars >= NiftySignal.AdaptiveObserver.AdaptiveReadinessPolicy.RequiredBars
+        && Runtime.RuntimeStatus == AdaptiveRuntimeStatus.Live;
+}
 
 public sealed record AdaptiveObserverHeaderSnapshot(
     AdaptiveSessionStateRow Session,
-    AdaptiveObserverRuntimeRow Runtime);
+    AdaptiveObserverRuntimeRow Runtime,
+    int ConsecutiveValidBars = 0);

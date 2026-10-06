@@ -10,10 +10,29 @@ on:
       - feature/adaptive-market-observer-v1
       - feature/adaptive-telegram-screenshots
       - feature/adaptive-telegram-sender-diagnostics
+      - feature/adaptive-late-start-readiness
       - master
   workflow_dispatch:
 
 jobs:
+  deployment-windows:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Windows PowerShell deployment and delta ZIP
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($script in @('deploy.ps1', 'tools/DeploymentPackaging.ps1', 'tools/TestDeploymentPackaging.ps1')) {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD $script), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count) { throw ($errors | Out-String) }
+          }
+          & ./tools/TestDeploymentPackaging.ps1
+          try { & ./deploy.ps1 -Target Local -SkipTests -ExpectedCommitSha ('0' * 40); throw 'SHA guard did not reject.' }
+          catch { if ($_.Exception.Message -notlike 'Expected source SHA*') { throw } }
+
   build-test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -53,6 +72,7 @@ jobs:
             try { & ./deploy.ps1 -Target Local -SkipTests; throw 'Dirty source guard did not reject.' }
             catch { if ($_.Exception.Message -notlike 'Deployment requires a clean source worktree*') { throw } }
           } finally { Remove-Item $probe -Force -ErrorAction SilentlyContinue }
+          & ./tools/TestDeploymentPackaging.ps1
 
       - name: Restore
         run: dotnet restore NiftySignal.slnx
@@ -62,6 +82,12 @@ jobs:
         run: |
           dotnet tool install --global dotnet-ef --version 10.0.11
           dotnet-ef migrations add AddAdaptiveScreenshotOutbox --project NiftySignal.AdaptiveObserverData/NiftySignal.AdaptiveObserverData.csproj --output-dir Migrations
+
+      - name: Generate late-start provenance migration for review
+        if: ${{ hashFiles('NiftySignal.AdaptiveObserverData/Migrations/*AddLateStartProvenance.cs') == '' }}
+        run: |
+          dotnet tool install --global dotnet-ef --version 10.0.11 || dotnet tool update --global dotnet-ef --version 10.0.11
+          dotnet-ef migrations add AddLateStartProvenance --project NiftySignal.AdaptiveObserverData/NiftySignal.AdaptiveObserverData.csproj --output-dir Migrations
 
       - name: Build
         id: build
