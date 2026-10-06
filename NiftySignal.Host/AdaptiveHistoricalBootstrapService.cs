@@ -116,6 +116,12 @@ public sealed class AdaptiveHistoricalBootstrapService(
         }
 
         var hasDiscoverySpec = OpeningVolumeProjectionV1.DiscoveryOutOfFold.TryGetValue(day, out var discoverySpec);
+        var coveredMinutes = AdaptiveOpeningCoverage.CoveredMinutes(ticks, ToUtc(day, Open), cutoffUtc);
+        if (!hasDiscoverySpec && (coveredMinutes != 15 || openingVolume <= 0))
+        {
+            logger.LogWarning("Adaptive historical seed {TradeDate}: incomplete opening coverage; excluding calibration.", day);
+            return false;
+        }
         var baseVolume = hasDiscoverySpec
             ? discoverySpec!.AdaptiveBarVolume
             : OpeningVolumeProjectionV1.SelectBaseBarVolume(openingVolume, future.LotSize);
@@ -162,9 +168,12 @@ public sealed class AdaptiveHistoricalBootstrapService(
 
         var flow = AdaptiveFlowEvolutionTracker.Build(completeBars);
 
+        var validatedDiscoveryDays = OpeningVolumeProjectionV1.DiscoveryOutOfFold.Keys.ToArray();
         var priorSessionIds = await observer.Sessions.AsNoTracking()
             .Where(x => x.ModelVersion == OpeningVolumeProjectionV1.ModelVersion && x.TradeDate < day
-                && !x.UsesMedianOpeningFallback && x.OpeningVolume > 0)
+                && !x.UsesMedianOpeningFallback && x.OpeningVolume > 0
+                && (x.OpeningCoverageMinutes == 15
+                    || (x.IsHistoricalSeed && validatedDiscoveryDays.Contains(x.TradeDate))))
             .Select(x => x.Id)
             .ToArrayAsync(ct);
         var priorRatios = priorSessionIds.Length == 0
@@ -200,6 +209,9 @@ public sealed class AdaptiveHistoricalBootstrapService(
             OpeningWindowStartUtc = ToUtc(day, Open),
             OpeningWindowEndUtc = cutoffUtc,
             OpeningVolume = openingVolume,
+            EstimatorInputOpeningVolume = openingVolume,
+            OpeningCoverageMinutes = coveredMinutes,
+            ObservationStartUtc = ToUtc(day, Open),
             EstimatorName = hasDiscoverySpec ? "adaptive-v1-discovery-loocv" : nameof(OpeningVolumeProjectionV1),
             EstimatorIntercept = hasDiscoverySpec ? discoverySpec!.TrainingIntercept : OpeningVolumeProjectionV1.Intercept,
             EstimatorSlope = hasDiscoverySpec ? discoverySpec!.TrainingSlope : OpeningVolumeProjectionV1.Slope,

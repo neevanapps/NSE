@@ -119,11 +119,13 @@ public sealed class AdaptiveSessionCoordinator(
         var openUtc = ToUtc(day, MarketOpen);
         var coveredMinutes = AdaptiveOpeningCoverage.CoveredMinutes(futureTicks, openUtc, cutoffUtc);
         var useMedian = coveredMinutes != 15 || openingVolume <= 0;
+        var validatedDiscoveryDays = OpeningVolumeProjectionV1.DiscoveryOutOfFold.Keys.ToArray();
         var priorOpeningVolumes = useMedian
             ? await observer.Sessions.AsNoTracking()
                 .Where(x => x.TradeDate < day && x.ModelVersion == OpeningVolumeProjectionV1.ModelVersion
                     && !x.UsesMedianOpeningFallback && x.OpeningVolume > 0
-                    && (x.IsHistoricalSeed || x.OpeningCoverageMinutes == 15))
+                    && (x.OpeningCoverageMinutes == 15
+                        || (x.IsHistoricalSeed && validatedDiscoveryDays.Contains(x.TradeDate))))
                 .Select(x => x.OpeningVolume).ToListAsync(ct)
             : new List<long>();
         var estimatorInput = useMedian ? AdaptiveOpeningCoverage.Median(priorOpeningVolumes) : openingVolume;
@@ -137,7 +139,9 @@ public sealed class AdaptiveSessionCoordinator(
         var priorSessionIds = await observer.Sessions
             .AsNoTracking()
             .Where(x => x.ModelVersion == OpeningVolumeProjectionV1.ModelVersion && x.TradeDate < day
-                && !x.UsesMedianOpeningFallback && x.OpeningVolume > 0)
+                && !x.UsesMedianOpeningFallback && x.OpeningVolume > 0
+                && (x.OpeningCoverageMinutes == 15
+                    || (x.IsHistoricalSeed && validatedDiscoveryDays.Contains(x.TradeDate))))
             .Select(x => x.Id)
             .ToArrayAsync(ct);
 

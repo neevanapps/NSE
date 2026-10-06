@@ -30,6 +30,8 @@ public sealed class AdaptiveLateStartTests
         AddHistory(db, Day.AddDays(1), 999999); // Future data must never enter the fallback.
         var fallbackHistory = AddHistory(db, Day.AddDays(-3), 777777);
         fallbackHistory.UsesMedianOpeningFallback = true;
+        var unverifiedHistory = AddHistory(db, Day.AddDays(-4), 888888);
+        unverifiedHistory.OpeningCoverageMinutes = null;
         if (partial) AddTick(source, Open.AddMinutes(14), 1000);
         AddTick(source, Late, 100000);
         await source.SaveChangesAsync(); await db.SaveChangesAsync();
@@ -135,7 +137,7 @@ public sealed class AdaptiveLateStartTests
     static AdaptiveSessionStateRow AddHistory(AdaptiveObserverDbContext db, DateOnly day, long opening)
     {
         var row = AdaptiveWeak2ObservationServiceTests.Context().Session;
-        row.Id = 0; row.TradeDate = day; row.IsHistoricalSeed = true; row.OpeningVolume = opening;
+        row.Id = 0; row.TradeDate = day; row.IsHistoricalSeed = true; row.OpeningVolume = opening; row.OpeningCoverageMinutes = 15;
         db.Sessions.Add(row); return row;
     }
     static void AddInstruments(NiftySignalDbContext source)

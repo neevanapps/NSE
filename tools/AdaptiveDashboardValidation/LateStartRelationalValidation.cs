@@ -24,7 +24,8 @@ static class LateStartRelationalValidation
                 SourceBranch = "isolated-late-start", SourceCommitSha = sha, BuildUtc = at, IsHistoricalSeed = true,
                 FutureToken = "LATE-HISTORY", FutureSymbol = "LATE-HISTORY", FutureExpiry = day,
                 OpeningWindowStartUtc = at.AddMinutes(-45), OpeningWindowEndUtc = at.AddMinutes(-30),
-                OpeningVolume = volume, EstimatorName = nameof(OpeningVolumeProjectionV1), CreatedAtUtc = at });
+                OpeningVolume = volume, OpeningCoverageMinutes = 15,
+                EstimatorName = nameof(OpeningVolumeProjectionV1), CreatedAtUtc = at });
         await db.SaveChangesAsync();
         await using var source = new NiftySignalDbContext(new DbContextOptionsBuilder<NiftySignalDbContext>().UseNpgsql(connection).Options);
         source.Instruments.Add(new Instrument { Token = "LATE-FUT", TradingSymbol = "LATE-FUT", Exchange = Exchange.Nfo,
