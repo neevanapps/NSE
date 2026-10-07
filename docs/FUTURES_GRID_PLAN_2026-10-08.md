@@ -799,3 +799,56 @@ Keep adding decisions to this file. At minimum the following must be frozen befo
 5. Whether Telegram screenshots use exactly the compact futures columns or support a separate wider diagnostic capture. Current preference is **compact columns for normal screenshots**.
 
 No implementation is authorized by this document yet.
+
+
+# 18. Telegram screenshot — include existing NIFTY Live Quote panel
+
+Current Telegram adaptive screenshots do not include the existing Dashboard **NIFTY Live Quote** panel. This must be corrected when implementation begins.
+
+## 18.1 Requirement
+
+Normal Telegram screenshots must include, above the adaptive observer grids, the same existing live-quote panel rendered by the Dashboard.
+
+Do **not** build a second quote calculation path for Telegram. The screenshot must capture the existing Dashboard component/state so browser and Telegram views cannot diverge.
+
+The captured quote panel should therefore include whatever the existing live panel shows at capture time, including:
+- NIFTY spot live quote/change;
+- NIFTY futures live quote/change;
+- VIX live quote/change when available;
+- selected CE strike and its LTP / bid / ask / change;
+- selected PE strike and its LTP / bid / ask / change;
+- the existing stale-session warning/status when applicable.
+
+The exact fields above follow the existing `LiveQuotePanel`; this planning item does not redefine its pricing/subscription logic.
+
+## 18.2 Selected CE/PE must be preserved
+
+The screenshot must use the currently selected CE and PE strikes from the Dashboard state. It must not silently recenter the quote box to a different strike only for Telegram capture.
+
+If capture runs in an isolated browser/session where interactive selection cannot be inherited, that behavior must be made explicit and deterministic before implementation is finalized rather than silently choosing a different contract.
+
+## 18.3 Capture layout
+
+The ordinary Telegram capture should contain, in order:
+
+1. **NIFTY Live Quote panel**;
+2. adaptive session/header information required for context;
+3. current incomplete adaptive-bar progress if still part of the normal Dashboard view;
+4. compact Futures grid;
+5. compact Options grid once finalized;
+6. residual diagnostic section only if it remains part of the normal screenshot specification after this planning phase.
+
+The capture must not omit the Live Quote panel because of viewport clipping or because the screenshot target starts at the adaptive-grid DOM element.
+
+## 18.4 Reliability requirements
+
+Implementation validation must prove that:
+- the live quote panel is visibly present in the generated PNG;
+- quote values shown in the screenshot come from the same Dashboard state as the browser panel;
+- CE and PE strike labels are visible;
+- bid and ask values are visible;
+- a missing/stale quote is rendered as unavailable/stale rather than replaced by an older unrelated quote;
+- the screenshot remains readable at the Telegram image dimensions;
+- adding the quote panel does not truncate the compact Futures/Options grids.
+
+This requirement is part of the eventual Dashboard/Telegram implementation but **no screenshot code is authorized to change until the overall 08-Oct plan is finalized**.
