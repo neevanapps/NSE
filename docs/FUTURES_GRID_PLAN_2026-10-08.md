@@ -852,3 +852,560 @@ Implementation validation must prove that:
 - adding the quote panel does not truncate the compact Futures/Options grids.
 
 This requirement is part of the eventual Dashboard/Telegram implementation but **no screenshot code is authorized to change until the overall 08-Oct plan is finalized**.
+
+
+# 19. Options Grid Live-Observation Plan
+
+**Status:** DRAFT / DESIGN ONLY — agreed direction, no implementation until the complete 08-Oct plan is explicitly finalized.
+
+**Scope:** Adaptive Market Observer → Options grid synchronized to the completed futures adaptive bars.
+
+The options grid does **not** create its own clock. Every options row belongs to exactly one completed futures adaptive bar interval.
+
+The primary compact view will be the CE+PE **BOTH** view. Existing CE-only / PE-only details, ratios, coverage, notional variants and diagnostics remain available internally or in an expanded diagnostic view; they are not deleted.
+
+## 19.1 Option-grid reading model
+
+Read the compact options row from left to right as:
+
+1. Which futures adaptive bar and option band are being observed?
+2. How did CE and PE premiums respond?
+3. Which side saw aggressive executions?
+4. Is that aggressive flow persistent across the rolling window?
+5. What happened to option OI in the center contracts?
+6. Is the center contract behaving like writing, long build, short covering or long unwind?
+7. Is volatility itself expanding/contracting?
+8. Is downside-vs-upside IV skew changing?
+9. Is current and rolling option participation put-heavy or call-heavy?
+10. How does the current bar compare with the full-session volume PCR context?
+
+No individual options column is a trade signal by itself.
+
+# 20. Proposed visible compact Options grid
+
+Visible order:
+
+    Seq | End IST | Center | Roll?
+    | CE ΔPx | PE ΔPx
+    | CE Roll ΔPx | PE Roll ΔPx
+    | CE Strict Δ | PE Strict Δ
+    | CE Enriched Δ | PE Enriched Δ
+    | CE Roll Strict | PE Roll Strict
+    | CE OI Δ | PE OI Δ
+    | CE Position | PE Position
+    | CE ΔIV | PE ΔIV | IV Skew
+    | Vol PCR | Roll Vol PCR
+
+Above the grid, show session context:
+
+    Day Vol PCR: x.xx
+
+The Day Vol PCR label must explicitly indicate that it is **Full nearest-expiry chain**, while row-level Vol PCR and Roll Vol PCR are **ATM±2 band** metrics.
+
+## 20.1 Existing context columns
+
+### Seq
+
+Same completed futures adaptive-bar sequence as the Futures grid.
+
+### End IST
+
+Same causal completed-bar end timestamp as the Futures grid.
+
+### Center
+
+The synthetic weekly-option center strike selected causally at the start of the futures adaptive bar by the existing option-band selection logic.
+
+### Roll?
+
+Visible warning that the ATM±2 band composition changed relative to the previous futures bar.
+
+A band roll is important because rolling values then represent a sequence of per-bar frozen ATM±2 bands, not one unchanged set of option contracts.
+
+The band remains frozen **within each individual futures adaptive bar**.
+
+# 21. Premium-response columns
+
+## 21.1 CE ΔPx / PE ΔPx
+
+Keep the existing ATM±2 band premium-index price change for the current futures adaptive bar.
+
+For each side:
+
+    BarBandPriceChange = PremiumIndexClose - PremiumIndexOpen
+
+The existing premium index is the sum of causally available component mids for the five-strike side.
+
+Interpretation:
+- CE ΔPx positive → call-band premium increased;
+- PE ΔPx positive → put-band premium increased.
+
+Always interpret CE and PE together.
+
+Examples:
+- CE up, PE down → directional bullish transfer is plausible;
+- CE down, PE up → directional bearish transfer is plausible;
+- CE and PE both up → common volatility/premium expansion may be important;
+- CE and PE both down → common volatility/theta/premium contraction may be important.
+
+## 21.2 CE Roll ΔPx / PE Roll ΔPx
+
+Keep the existing rolling band-price change over the existing options rolling window.
+
+Current rolling semantics remain the established adaptive rolling-window length, presently 10 completed futures adaptive bars.
+
+Do not introduce another rolling length as part of this plan.
+
+Because the ATM±2 band can roll, the rolling price metric is a sum of causally frozen per-bar band changes, not a literal same-contract start-to-end premium comparison.
+
+# 22. Options aggressive-flow columns
+
+## 22.1 CE Strict Δ / PE Strict Δ
+
+For the compact grid, display **raw contract-quantity Strict delta**, not the ratio:
+
+    ContractStrictDelta = StrictBuyQuantity - StrictSellQuantity
+
+Use the existing ATM±2 side aggregation for the current futures adaptive bar.
+
+Positive = buyer-aggressive option volume dominates.
+
+Negative = seller-aggressive option volume dominates.
+
+Existing notional Strict values, ratios and coverage remain retained but hidden from the compact grid.
+
+## 22.2 CE Enriched Δ / PE Enriched Δ
+
+Display raw contract-quantity Enriched delta:
+
+    ContractEnrichedDelta = EnrichedBuyQuantity - EnrichedSellQuantity
+
+Use the same current-bar ATM±2 band.
+
+Interpret Strict and Enriched together:
+- same sign → broader agreement;
+- different sign → flow conflict / mixed participation.
+
+## 22.3 CE Roll Strict / PE Roll Strict
+
+Display raw rolling contract Strict delta:
+
+    RollStrictSide = sum of current-bar ContractStrictDelta across the existing rolling option window
+
+This is persistent CE or PE aggressive execution behaviour.
+
+Do not replace it with the current ratio display in the compact grid.
+
+Existing rolling ratios/coverage remain available diagnostically.
+
+## 22.4 Roll Enriched
+
+Do not expose CE/PE Roll Enriched in V1 compact view because width is limited and current Strict + current Enriched + rolling Strict already provide the primary flow view.
+
+Retain the existing rolling Enriched values internally/diagnostically.
+
+# 23. Center-contract OI and Position labels
+
+The compact grid's visible CE OI Δ / PE OI Δ must refer to the **center-strike CE and PE contracts**, not the five-strike band aggregate.
+
+Reason: the Position labels below must describe the same unchanged contract across the bar. A five-strike aggregate can hide different opening/closing behaviour across strikes.
+
+Retain the existing ATM±2 band Bar OI Δ and rolling OI metrics internally.
+
+## 23.1 CE OI Δ / PE OI Δ
+
+For the center CE and center PE separately:
+
+    CenterOiDelta = OI_end - OI_start
+
+where start and end are causal snapshots of the same center-strike contract within the completed futures adaptive bar.
+
+Positive = outstanding contracts increased.
+
+Negative = outstanding contracts decreased.
+
+OI does not identify actor identity by itself.
+
+## 23.2 Center premium change used for position classification
+
+Use valid two-sided quote midpoint, not LTP:
+
+    Mid = (Bid + Ask) / 2
+
+    CenterMidDelta = Mid_end - Mid_start
+
+The center contract is frozen for the bar.
+
+Do not classify Position if:
+- start or end midpoint is unavailable/stale;
+- start or end OI is unavailable;
+- the center contract changed inside the bar, which should not occur under the frozen-band contract;
+- a defined zero-change policy below yields Neutral.
+
+## 23.3 CE Position
+
+Classify the center CE using OI change + midpoint change:
+
+| CE OI | CE midpoint | Label |
+|---|---|---|
+| ↑ | ↓ | CallWriting |
+| ↑ | ↑ | CallLongBuild |
+| ↓ | ↑ | CallShortCover |
+| ↓ | ↓ | CallLongUnwind |
+| 0 / unavailable | any | Neutral / — |
+| any | 0 / unavailable | Neutral / — |
+
+These are behaviour-compatible labels, not proof of the initiating participant.
+
+## 23.4 PE Position
+
+Classify the center PE:
+
+| PE OI | PE midpoint | Label |
+|---|---|---|
+| ↑ | ↓ | PutWriting |
+| ↑ | ↑ | PutLongBuild |
+| ↓ | ↑ | PutShortCover |
+| ↓ | ↓ | PutLongUnwind |
+| 0 / unavailable | any | Neutral / — |
+| any | 0 / unavailable | Neutral / — |
+
+Recent research makes this row-level interpretation especially useful, but **no Position label becomes an entry gate in this implementation**.
+
+# 24. IV metrics
+
+The options compact grid will expose:
+
+    CE ΔIV | PE ΔIV | IV Skew
+
+Use the existing pricing conventions, risk-free-rate source and time-to-expiry convention already used by the adaptive observer/pricing project. Do not create a second independent volatility model for the Dashboard.
+
+All IV calculations must be causal and based on quote midpoint rather than LTP.
+
+## 24.1 Center CE ΔIV / PE ΔIV
+
+For the frozen center CE and PE contract:
+
+    CE ΔIV = CE_IV_end - CE_IV_start
+    PE ΔIV = PE_IV_end - PE_IV_start
+
+Use percentage-point display convention consistently. Example: an IV move from 18.2% to 21.0% is +2.8 IV points.
+
+Purpose:
+- separate underlying-direction premium movement from volatility repricing;
+- identify volatility expansion/crush;
+- make 0-DTE premium behaviour easier to interpret.
+
+Examples:
+- PE premium ↑ + PE ΔIV strongly positive → downside option demand/volatility repricing accompanies the move;
+- PE premium ↑ + PE ΔIV flat/negative → more of the premium move may be explained by underlying/delta rather than volatility expansion.
+
+## 24.2 IV solver quality
+
+Near expiry, especially 0-DTE, IV inversion can become unstable.
+
+Therefore:
+- require a valid two-sided quote midpoint;
+- use the correct strike, expiry, current underlying input and session risk-free rate;
+- reuse the existing time-to-expiry convention;
+- if no stable finite IV solution exists, display —;
+- never carry a later IV backward;
+- retain quote age/solver availability diagnostically.
+
+Do not fabricate/clamp an IV merely to keep the grid populated.
+
+## 24.3 IV Skew
+
+Do **not** define skew as ATM PE IV minus ATM CE IV alone.
+
+Use symmetric OTM wings from the frozen ATM±2 band.
+
+Let:
+- PE -1 = one strike below Center;
+- PE -2 = two strikes below Center;
+- CE +1 = one strike above Center;
+- CE +2 = two strikes above Center.
+
+Primary visible skew:
+
+    IVSkew =
+      [(IV_PE_-1 - IV_CE_+1)
+       + (IV_PE_-2 - IV_CE_+2)] / 2
+
+Positive:
+- downside OTM puts carry higher IV than equivalent upside OTM calls.
+
+Negative:
+- upside OTM calls carry higher IV than equivalent downside puts.
+
+This is a relative volatility-shape metric, not direction by itself.
+
+All four wing IVs must be valid and fresh enough under the final option quote-freshness policy. Otherwise IV Skew is unavailable.
+
+## 24.4 ΔSkew retained internally
+
+Also calculate:
+
+    ΔSkew = IVSkew_end - IVSkew_start
+
+Do not display ΔSkew in V1.
+
+Retain it for later research because change in skew may eventually be more informative than absolute skew.
+
+# 25. Volume PCR metrics
+
+PCR in this plan is a **participation ratio**, not a bullish/bearish signal by itself.
+
+The compact grid exposes:
+
+    Vol PCR | Roll Vol PCR
+
+and the options header exposes:
+
+    Day Vol PCR
+
+## 25.1 Current-bar Vol PCR — ATM±2
+
+Use contract traded quantity across the same frozen ATM±2 bands represented by the row:
+
+    VolPCR_bar =
+      PE_ATM±2_TradedQuantity_bar
+      /
+      CE_ATM±2_TradedQuantity_bar
+
+Use raw contract quantity, not number of feed messages.
+
+If CE volume is zero, display — rather than infinity.
+
+Do not use notional volume for the V1 displayed PCR. Retain notional PCR internally if inexpensive.
+
+Interpretation examples:
+
+A high PCR can mean very different things:
+
+Case A:
+- Vol PCR high;
+- PE Position = PutLongBuild;
+- PE Strict positive;
+- PE ΔIV positive;
+- IV Skew increasing.
+
+This is compatible with active downside-protection / bearish demand.
+
+Case B:
+- Vol PCR high;
+- PE Position = PutWriting;
+- PE Strict negative;
+- PE ΔIV falling;
+- IV Skew falling.
+
+This is compatible with heavy put supply/writing.
+
+Therefore PCR must always be read with price, flow, OI/Position and IV.
+
+## 25.2 Roll Vol PCR — ATM±2
+
+Do **not** average the last N bar PCR values.
+
+Correct formula over the existing option rolling window:
+
+    RollVolPCR =
+      sum(PE_ATM±2_TradedQuantity for last N bars)
+      /
+      sum(CE_ATM±2_TradedQuantity for last N bars)
+
+where N is the existing rolling option-window size, presently 10 completed futures adaptive bars.
+
+This remains valid when the ATM±2 band rolls because each bar contributes its own causally frozen current-band traded quantity.
+
+Interpretation:
+- current Vol PCR far above Roll Vol PCR → sudden put-heavy participation relative to recent regime;
+- current Vol PCR near Roll Vol PCR → current participation resembles the rolling regime.
+
+## 25.3 Day Vol PCR — full nearest-expiry chain
+
+Display above the options grid:
+
+    Day Vol PCR — Full nearest-expiry NIFTY chain
+
+Formula at time t:
+
+    DayVolPCR(t) =
+      cumulative PE traded quantity from 09:15 IST through t
+      /
+      cumulative CE traded quantity from 09:15 IST through t
+
+Universe:
+- NIFTY options only;
+- nearest weekly expiry used by the live adaptive observer;
+- full available strike chain for that expiry;
+- both CE and PE.
+
+This is intentionally a different universe from row-level ATM±2 PCR.
+
+The label must make that distinction visible.
+
+## 25.4 Full-chain coverage requirement
+
+Day Vol PCR must not silently become a partial-chain PCR.
+
+Before implementation is considered correct, prove that cumulative volume is available for the full intended nearest-expiry option universe.
+
+If the live collection/subscription architecture does not provide complete full-chain traded-volume coverage, Day Vol PCR must show unavailable/degraded rather than silently using only subscribed ATM strikes.
+
+Persist/retain a coverage diagnostic so this can be audited.
+
+## 25.5 Day header context
+
+If screen width permits, the header may show:
+
+    Day Vol PCR x.xx | PE Vol x | CE Vol x
+
+The ratio remains the primary label. Underlying cumulative PE/CE volume is useful context and should be retained even if not displayed in V1.
+
+# 26. Additional new option metrics to calculate but hide initially
+
+The following are useful but should not widen the first compact grid.
+
+## 26.1 Center CE/PE MicroDev
+
+For center CE and PE independently, use the same Level-1 definition approved for futures:
+
+    Mid = (Bid + Ask) / 2
+
+    MicroPrice =
+      (Ask × BidQty + Bid × AskQty)
+      /
+      (BidQty + AskQty)
+
+    MicroDev = MicroPrice - Mid
+
+Calculate on every unique valid book state inside the futures adaptive bar and time-weight across the bar.
+
+Retain:
+- CE MicroDev time-weighted average;
+- PE MicroDev time-weighted average;
+- start/end/change if inexpensive.
+
+Do not aggregate microprice naïvely across five strikes.
+
+## 26.2 Center CE/PE OFI
+
+Calculate Level-1 OFI independently for the center CE and PE using the same causal book-transition formula approved for futures.
+
+Purpose:
+- distinguish aggressive option trade flow from passive liquidity replenishment/removal;
+- inspect cases such as PutShortCover + positive PE OFI.
+
+Do not show in V1 compact view initially.
+
+## 26.3 Option Activity/s
+
+Calculate separately for CE and PE ATM±2 bands:
+
+    CE Activity/s = CE traded contract quantity / futures-bar duration
+    PE Activity/s = PE traded contract quantity / futures-bar duration
+
+Option activity does not create the bar clock; it measures how intensely options participated during the futures event.
+
+Retain contract and notional variants internally.
+
+## 26.4 Center straddle change
+
+Using frozen center CE and PE midpoint:
+
+    Straddle = CenterCE_Mid + CenterPE_Mid
+
+    Straddle Δ = Straddle_end - Straddle_start
+
+Purpose:
+- distinguish pure directional premium transfer from common premium/volatility expansion or contraction.
+
+Examples:
+- CE +15, PE -14 → little straddle change; mostly directional transfer;
+- CE +12, PE +10 → large positive straddle change; common premium/volatility expansion.
+
+Retain in V1 diagnostics; do not expose in compact grid yet.
+
+# 27. Options fields to hide, not remove
+
+Keep existing functionality/data for:
+- Strict ratios;
+- Enriched ratios;
+- coverage;
+- CE−PE relative Strict/Enriched ratios;
+- rolling Enriched;
+- rolling Enriched change;
+- |Strict| change variants;
+- band OI Δ and OI %;
+- rolling band OI and OI %;
+- activity/s;
+- rolling efficiency;
+- notional-flow variants;
+- premium-notional OI;
+- quote age;
+- all existing CE-only / PE-only diagnostic fields.
+
+No existing calculation is to be deleted simply because the compact BOTH grid hides it.
+
+# 28. Options-grid data-quality and causality requirements
+
+Implementation must prove:
+
+1. Options rows use exactly the corresponding futures adaptive-bar time boundaries.
+2. Band selection is causal and frozen within each bar.
+3. Roll? is accurate whenever composition changes.
+4. No future option quote is used for premium, OI, IV, MicroDev or OFI.
+5. Center OI Δ and Position use the same center contract for bar start/end.
+6. Position uses midpoint + OI, not LTP + OI.
+7. Position becomes Neutral/unavailable on zero/missing required changes rather than inferring actor identity.
+8. IV uses midpoint and the existing pricing/time-to-expiry conventions.
+9. Invalid/unreliable 0-DTE IV results remain unavailable rather than clamped/fabricated.
+10. IV Skew compares symmetric OTM wings and requires all wing inputs.
+11. Current Vol PCR uses ATM±2 contract traded quantity.
+12. Roll Vol PCR is ratio-of-summed-volumes, never average-of-PCRs.
+13. Day Vol PCR uses the full nearest-expiry NIFTY chain or explicitly reports unavailable/degraded coverage.
+14. Band-roll semantics are explicit; rolling metrics never pretend the basket stayed physically unchanged.
+15. Restart/replay reproduces the same metrics from persisted causal data.
+16. New metrics do not change trading/scoring/execution behaviour.
+17. Compact-grid hiding preserves the existing detailed diagnostics.
+18. Telegram screenshot remains readable after the compact Options grid is introduced.
+
+# 29. Options-grid decisions frozen so far
+
+As of **08 October 2026**:
+
+- Primary live options view = CE+PE BOTH compact grid.
+- Options continue to use the futures adaptive bars as their clock.
+- Keep Seq, End IST, Center and Roll?.
+- Keep CE/PE current and rolling premium change.
+- Show raw **contract-quantity** Strict and Enriched delta for the current bar.
+- Show raw rolling Strict for CE and PE.
+- Keep rolling Enriched internally rather than displaying it in V1.
+- Show center-contract CE/PE OI Δ.
+- Add center-contract CE/PE Position classification using midpoint + OI change.
+- Add center CE ΔIV and PE ΔIV.
+- Add symmetric OTM-wing IV Skew.
+- Retain ΔSkew internally.
+- Add ATM±2 current-bar Vol PCR.
+- Add ATM±2 Roll Vol PCR as ratio of summed volumes.
+- Add full-chain nearest-expiry Day Vol PCR above the grid.
+- Do not interpret PCR alone as bullish/bearish.
+- Calculate center CE/PE MicroDev and OFI internally, not V1 visible.
+- Calculate option Activity/s and center Straddle Δ internally, not V1 visible.
+- Keep existing notional/ratio/coverage/OI diagnostic calculations; hide rather than remove.
+- No composite score and no trading rule are introduced.
+
+# 30. Remaining open items before implementation
+
+The complete 08-Oct plan is close, but implementation should not start until these details are explicitly frozen:
+
+1. **Futures basis spot freshness:** exact stale-age rule for Basis/ΔBasis.
+2. **Option quote freshness for new IV/Position/Skew metrics:** reuse the current 5-second band-selection freshness everywhere, or define another explicit causal threshold. Prefer one consistent rule unless evidence justifies otherwise.
+3. **Day PCR data coverage:** confirm the live collector has full nearest-expiry-chain cumulative volume coverage; otherwise define how the UI reports degraded/unavailable.
+4. **Persistence vs deterministic recomputation:** choose where the new futures and options microstructure metrics live so restart/replay and Telegram screenshot parity are guaranteed.
+5. **Compact vs diagnostic Dashboard UX:** fixed compact grid only versus an expandable detailed view.
+6. **Telegram screenshot final composition:** live quotes + session header + incomplete bar + compact futures + compact options; decide whether residual diagnostics remain in the normal Telegram image or move to a secondary/diagnostic capture.
+7. **Screenshot selection state:** define deterministic CE/PE selected-strike behavior for isolated Telegram browser capture so it cannot silently differ from the intended live selection.
+
+No production implementation is authorized until these open items are resolved or explicitly deferred with deterministic behavior documented.
