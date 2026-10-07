@@ -5,7 +5,8 @@ using NiftySignal.Domain;
 using NiftySignal.Domain.Abstractions;
 using NiftySignal.Domain.Configuration;
 using NiftySignal.Domain.Entities;
-using NiftySignal.Ingestion.FlatTrade;
+using NiftySignal.Ingestion;
+using NiftySignal.Domain.Enums;
 using NiftySignal.Notifications;
 using NiftySignal.Persistence;
 using NiftySignal.Rules;
@@ -14,7 +15,7 @@ using NiftySignal.Scoring;
 namespace NiftySignal.Host;
 
 /// <summary>
-/// Phase 1: resolves the day's instrument universe (plan 3.1), opens the live FlatTrade
+/// Phase 1: resolves the day's instrument universe (plan 3.1), opens the selected broker
 /// feed, and persists raw ticks (plan 3.2 -- capped retention, replay/audit value only;
 /// see <see cref="MarketDataIngestionWorker"/>'s sibling, the feature/score worker not yet
 /// built, for what actually drives decisions). Deliberately does not consult
@@ -23,7 +24,7 @@ namespace NiftySignal.Host;
 /// </summary>
 public sealed class MarketDataIngestionWorker(
     IServiceScopeFactory scopeFactory,
-    IOptions<FlatTradeOptions> flatTradeOptions,
+    IOptions<MarketDataOptions> marketDataOptions,
     ITelegramNotifier telegram,
     CoreScoreCrossoverTradingEngine crossoverEngine,
     DashboardPushClient dashboardPush,
@@ -147,11 +148,8 @@ public sealed class MarketDataIngestionWorker(
 
             if (!await RunTradingSessionAsync(stoppingToken))
             {
-                // A hard-stop condition (today: only a missing/invalid FlatTrade session --
-                // see RunTradingSessionAsync's own doc comment for why that deliberately still
-                // ends the service rather than retrying next day automatically). Everything
-                // else that can go wrong during a session is already caught and logged inside
-                // the per-loop try/catches (audit finding F34) without ending the session early.
+                // Reserved for a deliberate session-stop condition. Missing credentials now
+                // wait visibly for Dashboard login and retry without restarting the service.
                 break;
             }
         }
@@ -160,30 +158,21 @@ public sealed class MarketDataIngestionWorker(
     }
 
     /// <summary>
-    /// One trading day's ingestion/scoring/trading session, from FlatTrade session validation
-    /// through market close. Returns <c>false</c> when <see cref="ExecuteAsync"/>'s day loop
-    /// should stop entirely rather than wait for tomorrow -- currently only when there's no
-    /// valid FlatTrade session, which needs a human to fix via the Dashboard (plan 4.3: "do not
-    /// silently retry"), not an automatic next-day retry that could mask the same problem
-    /// recurring silently every morning. Everything else (feed drops, a bad score cadence, a
-    /// failed DB write) is already resilient at the per-loop level and returns <c>true</c>.
+    /// One trading day's ingestion/scoring session. Provider configuration is captured at
+    /// startup and persisted per day; credentials missing at start are retried visibly.
     /// </summary>
     async Task<bool> RunTradingSessionAsync(CancellationToken stoppingToken)
     {
-        var session = await LoadSessionAsync(stoppingToken);
-        if (session?.Token is null || session.ClientId is null || !session.IsValidAt(DateTimeOffset.UtcNow))
+        var provider = marketDataOptions.Value.Provider;
+        var session = await LoadSessionAsync(provider, stoppingToken);
+        // Audit finding F78: a saved Dashboard credential can resume ingestion without a service restart.
+        if (session is null)
         {
-            var loginUrl = flatTradeOptions.Value.AuthorizeUrl;
-            logger.LogCritical(
-                "No valid FlatTrade session token -- ingestion cannot start. Log in and save a token via the Dashboard: {LoginUrl}",
-                loginUrl);
-            // Do not silently retry (plan 4.3) -- a stale token means no data, and that
-            // needs to be known immediately, not masked by a retry loop.
-            await telegram.SendAsync(
-                NotificationCategory.TokenExpiry,
-                $"NiftySignal: no valid FlatTrade session. Log in and save a token via the Dashboard: {loginUrl}",
-                stoppingToken);
-            return false;
+            logger.LogWarning("No valid {Provider} market-data credential; waiting for Dashboard login", provider);
+            await telegram.SendAsync(NotificationCategory.TokenExpiry,
+                $"NiftySignal: no valid {provider} market-data token. Save a token via the Dashboard; ingestion will retry.", stoppingToken);
+            await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
+            return true;
         }
 
         // Reset for this session's own warm-up stretch -- a prior day's leftover true here
@@ -194,7 +183,7 @@ public sealed class MarketDataIngestionWorker(
         _marketOpenCadenceStartLogged = false;
 
         var asOfDate = DateOnly.FromDateTime(DateTimeOffset.UtcNow.ToOffset(IstOffset).Date);
-        var instruments = await ResolveInstrumentsAsync(session.Token, asOfDate, stoppingToken);
+        var instruments = await ResolveInstrumentsAsync(provider, session, asOfDate, stoppingToken);
         var subscriptions = instruments.Select(i => (i.Exchange, i.Token)).ToList();
 
         // Monitoring-only snapshot (see _tokenToUnderlying's own doc comment) -- built from the
@@ -215,7 +204,7 @@ public sealed class MarketDataIngestionWorker(
         await SeedEngineHistoryAsync(_engine, asOfDate, stoppingToken);
         await SeedPriorSessionIvHistoryAsync(_engine, asOfDate, stoppingToken);
 
-        logger.LogInformation("Starting FlatTrade feed with {Count} subscriptions for {AsOfDate}", subscriptions.Count, asOfDate);
+        logger.LogInformation("Starting {Provider} feed with {Count} subscriptions for {AsOfDate}", provider, subscriptions.Count, asOfDate);
         await telegram.SendAsync(
             NotificationCategory.ConnectionFailure,
             $"NiftySignal ingestion starting: {subscriptions.Count} instruments subscribed for {asOfDate:dd-MMM-yyyy}.",
@@ -223,9 +212,8 @@ public sealed class MarketDataIngestionWorker(
 
         await using var tickScope = scopeFactory.CreateAsyncScope();
         var gapRecorder = tickScope.ServiceProvider.GetRequiredService<IDataGapRecorder>();
-        var tickSourceLogger = tickScope.ServiceProvider.GetRequiredService<ILogger<FlatTradeTickSource>>();
-        var tickSource = new FlatTradeTickSource(
-            flatTradeOptions.Value, session.ClientId, session.Token, subscriptions, gapRecorder, tickSourceLogger);
+        var adapter = tickScope.ServiceProvider.GetServices<IMarketDataProvider>().Single(x => x.Provider == provider);
+        var tickSource = adapter.CreateFeed(session, instruments, gapRecorder);
 
         // The only consumer of ConnectionUnstable -- turns a FATAL log line no one was
         // watching (live-caught 2026-09-07: the feed dropped six times in one morning with
@@ -233,7 +221,7 @@ public sealed class MarketDataIngestionWorker(
         // 5-minute cooldown in RateLimitedTelegramNotifier, so a flapping reconnect can't spam.
         tickSource.ConnectionUnstable += failures => telegram.SendAsync(
             NotificationCategory.ConnectionFailure,
-            $"NiftySignal: FlatTrade feed has failed {failures} times consecutively and may be down.",
+            $"NiftySignal: {provider} feed has failed {failures} times consecutively and may be down.",
             stoppingToken);
 
         // A separate, linked token for THIS DAY's feed/cadence/sample/subscription loops only --
@@ -306,7 +294,7 @@ public sealed class MarketDataIngestionWorker(
         }
     }
 
-    async Task RunTickLoopAsync(FlatTradeTickSource tickSource, CancellationToken stoppingToken)
+    async Task RunTickLoopAsync(ILiveTickSource tickSource, CancellationToken stoppingToken)
     {
         var buffer = new List<Tick>(FlushBatchSize);
         var lastFlush = DateTimeOffset.UtcNow;
@@ -559,7 +547,7 @@ public sealed class MarketDataIngestionWorker(
     /// pushes -- there's no Dashboard-to-Host channel other than the database, matching
     /// how FlatTradeSession/KillSwitchState are already shared between the two processes.
     /// </summary>
-    async Task RunPendingSubscriptionLoopAsync(FlatTradeTickSource tickSource, DateOnly asOfDate, CancellationToken stoppingToken)
+    async Task RunPendingSubscriptionLoopAsync(ILiveTickSource tickSource, DateOnly asOfDate, CancellationToken stoppingToken)
     {
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
         try
@@ -719,86 +707,34 @@ public sealed class MarketDataIngestionWorker(
             snapshot.CompositeScore, coreScoreSnapshot?.CoreScore, snapshot.IsWarmedUp, strikeSnapshots.Count);
     }
 
-    async Task<FlatTradeSession?> LoadSessionAsync(CancellationToken ct)
+    async Task<MarketDataCredential?> LoadSessionAsync(MarketDataProvider provider, CancellationToken ct)
     {
         await using var scope = scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
-        return await db.FlatTradeSessions.FindAsync([FlatTradeSession.SingletonId], ct);
+        return await MarketDataSessionStore.LoadAsync(db, provider, DateTimeOffset.UtcNow, ct);
     }
 
-    /// <summary>
-    /// Reuses today's instruments if the 08:45-equivalent job already ran (e.g. a service restart)
-    /// instead of re-hitting FlatTrade's API -- now checked and resolved PER underlying-group
-    /// (NIFTY vs. SENSEX/BANKNIFTY) rather than as one all-or-nothing set (2026-09-22, Sensex/Bank
-    /// Nifty tick-collection task), so a restart that finds NIFTY's own rows already resolved but
-    /// not yet SENSEX/BANKNIFTY's (or vice versa) still fills in whichever is missing rather than
-    /// silently reusing an incomplete day. NIFTY's own resolution (<see cref="InstrumentUniverseResolver"/>)
-    /// runs first and is entirely unchanged from before this task -- for a day where NIFTY rows
-    /// already exist, this method calls the resolver exactly as often as it did before (zero
-    /// times), returns exactly the same NIFTY rows, in the same way.
-    /// </summary>
-    async Task<IReadOnlyList<Instrument>> ResolveInstrumentsAsync(string sessionToken, DateOnly asOfDate, CancellationToken ct)
+    async Task<IReadOnlyList<Instrument>> ResolveInstrumentsAsync(MarketDataProvider provider, MarketDataCredential credential, DateOnly day, CancellationToken ct)
     {
         await using var scope = scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
-
-        var existing = await db.Instruments.Where(i => i.AsOfDate == asOfDate).ToListAsync(ct);
-        var resolved = new List<Instrument>(existing);
-        var wroteAnything = false;
-
-        if (existing.Any(i => i.Underlying == LiveFeatureEngine.NiftyUnderlying))
+        await MarketDataSessionStore.EnsureDayAsync(db, day, provider, DateTimeOffset.UtcNow, ct);
+        var existing = await db.Instruments.Where(i => i.AsOfDate == day).ToListAsync(ct);
+        if (existing.Any(x => x.Provider != provider)) throw new InvalidOperationException("Instrument provider mismatch.");
+        // Preserve frozen descriptors across restart; fill only absent underlying groups.
+        var groups = existing.Select(x => x.Underlying).ToHashSet(StringComparer.Ordinal);
+        if (!groups.Contains("NIFTY") || !groups.Contains("SENSEX") || !groups.Contains("BANKNIFTY"))
         {
-            logger.LogInformation(
-                "Reusing {Count} previously-resolved NIFTY instruments for {AsOfDate}",
-                existing.Count(i => i.Underlying == LiveFeatureEngine.NiftyUnderlying), asOfDate);
-        }
-        else
-        {
-            var resolver = scope.ServiceProvider.GetRequiredService<InstrumentUniverseResolver>();
-            var niftyInstruments = await resolver.ResolveAsync(sessionToken, asOfDate, ct);
-            db.Instruments.AddRange(niftyInstruments);
-            resolved.AddRange(niftyInstruments);
-            wroteAnything = true;
-        }
-
-        // Write-only/archive, future-backtesting-only addition (2026-09-22) -- deliberately
-        // best-effort and fully independent of NIFTY's own resolution above: a failure here must
-        // never stop or delay NIFTY's own live (paper) trading from starting. See
-        // docs/SENSEX_BANKNIFTY_TICK_COLLECTION.md for the full design/verification.
-        if (existing.Any(i => i.Underlying is SensexBankNiftyInstrumentMasterProvider.SensexUnderlying or SensexBankNiftyInstrumentMasterProvider.BankNiftyUnderlying))
-        {
-            logger.LogInformation(
-                "Reusing {Count} previously-resolved SENSEX/BANKNIFTY instruments for {AsOfDate}",
-                existing.Count(i => i.Underlying is SensexBankNiftyInstrumentMasterProvider.SensexUnderlying or SensexBankNiftyInstrumentMasterProvider.BankNiftyUnderlying),
-                asOfDate);
-        }
-        else
-        {
-            try
-            {
-                var otherResolver = scope.ServiceProvider.GetRequiredService<SensexBankNiftyInstrumentUniverseResolver>();
-                var otherInstruments = await otherResolver.ResolveAsync(sessionToken, asOfDate, ct);
-                db.Instruments.AddRange(otherInstruments);
-                resolved.AddRange(otherInstruments);
-                wroteAnything = wroteAnything || otherInstruments.Count > 0;
-            }
-            catch (Exception ex)
-            {
-                logger.LogError(ex,
-                    "SENSEX/BANKNIFTY instrument resolution failed for {AsOfDate} -- continuing without them for today; NIFTY's own resolution/subscription/trading is unaffected.",
-                    asOfDate);
-            }
-        }
-
-        if (wroteAnything)
-        {
+            var adapter = scope.ServiceProvider.GetServices<IMarketDataProvider>().Single(x => x.Provider == provider);
+            var resolved = await adapter.ResolveAsync(credential, day, ct, groups);
+            var additions = resolved.Where(x => !groups.Contains(x.Underlying)).ToList();
+            db.Instruments.AddRange(additions);
             await db.SaveChangesAsync(ct);
+            existing.AddRange(additions);
         }
-
-        return resolved;
+        return existing;
     }
 
-    /// <summary>Restart-safe warm-up (see LiveFeatureEngine.SeedHistory) -- replays today's already-persisted cadence snapshots instead of starting every rolling window from zero.</summary>
     async Task SeedEngineHistoryAsync(LiveFeatureEngine engine, DateOnly asOfDate, CancellationToken ct)
     {
         // Anchored at today's MarketOpen (09:15), not midnight (2026-09-15 fix, see the cadence

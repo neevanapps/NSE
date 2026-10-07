@@ -30,7 +30,7 @@ public sealed class FlatTradeTickSource(
     string accessToken,
     IReadOnlyList<(Exchange Exchange, string Token)> subscriptions,
     IDataGapRecorder dataGapRecorder,
-    ILogger<FlatTradeTickSource> logger) : ITickSource
+    ILogger<FlatTradeTickSource> logger) : ILiveTickSource
 {
     // Additions requested live, after the session's already connected (e.g. a dashboard
     // user watching a strike outside the originally-resolved ATM band). Kept separately

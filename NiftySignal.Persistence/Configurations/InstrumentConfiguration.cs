@@ -13,6 +13,7 @@ public sealed class InstrumentConfiguration : IEntityTypeConfiguration<Instrumen
         builder.HasKey(i => i.Id);
 
         builder.Property(i => i.Token).HasMaxLength(32).IsRequired();
+        builder.Property(i => i.NativeInstrumentKey).HasMaxLength(128);
         builder.Property(i => i.TradingSymbol).HasMaxLength(64).IsRequired();
         builder.Property(i => i.Underlying).HasMaxLength(32).IsRequired();
         builder.Property(i => i.StrikePrice).HasPrecision(18, 4);

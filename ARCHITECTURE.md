@@ -17,7 +17,7 @@ Solo developer, one machine, running 24/7. Splitting ingestion/features/scoring/
 | `NiftySignal.Features` | Rolling stats (Welford z-scores), OI buildup classification, warm-up tracking. |
 | `NiftySignal.Scoring` | Composite universal directional score. |
 | `NiftySignal.Rules` | Hand-written entry/exit rule evaluators, ruleset config, hot-reload + validation (`IOptionsMonitor` + `ValidatedOptionsMonitor`, not NCalc — that was the original plan, never built; see `docs/REVIEW_FINDINGS.md`). |
-| `NiftySignal.Ingestion` | FlatTrade REST/WebSocket client, instrument master, tick demux. All FlatTrade-specific mapping is isolated here — nothing outside this project should see a FlatTrade type. |
+| `NiftySignal.Ingestion` | Configurable FlatTrade/Upstox market-data adapters, authentication, native-key mapping, instrument discovery and streaming. Shared `IMarketDataProvider`/`ILiveTickSource` boundaries keep protocol mapping here. |
 | `NiftySignal.Persistence` | EF Core `NiftySignalDbContext`, `IEntityTypeConfiguration<T>` per entity, migrations, repositories. |
 | `NiftySignal.Notifications` | Telegram alerts, with per-category rate limiting; acknowledged PNG document transport for adaptive screenshots. |
 | `NiftySignal.Execution` | Strike selection, paper trade simulator, position tracking. |
@@ -63,3 +63,11 @@ Tests       → everything
 Dashboard hosts an optional screenshot worker, independent of Host ingestion/calculations. It reads committed adaptive session/bar projections and writes only `adaptive_screenshot_jobs` in the separate adaptive database. Host applies the shared EF migration at startup. A PostgreSQL advisory lease serializes delivery; durable identities distinguish initialization and subsequent five-bar boundaries.
 
 Playwright captures the existing three-grid component at a pinned session/sequence using a short-lived capture-only cookie. The cookie cannot authenticate normal Dashboard controls. Full-width PNG documents are uploaded through `ITelegramDocumentSender`; acknowledged deliveries do not resend and ambiguous uploads require manual inspection. No orders, scoring formulas or market projections are changed. See [configuration and pre-live acceptance](docs/ADAPTIVE_TELEGRAM_SCREENSHOTS.md).
+
+## Configurable market data (2026-10-07)
+
+Host and Dashboard capture `MarketData.Provider` at startup (default FlatTrade). A persisted
+`MarketDataDay` freezes the provider per IST trading date. Upstox has independent credentials
+and namespaced internal tokens with separate native subscription keys, preserving legacy history.
+Upstox V3 collection reconnects; adaptive processing fails closed after interrupted source continuity.
+No broker order execution is added. See [setup and acceptance](docs/UPSTOX_MARKET_DATA.md).

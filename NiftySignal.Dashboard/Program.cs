@@ -9,7 +9,9 @@ using NiftySignal.Dashboard.Components;
 using NiftySignal.Dashboard.Hubs;
 using NiftySignal.Dashboard.Services;
 using NiftySignal.Domain.Configuration;
+using NiftySignal.Ingestion;
 using NiftySignal.Ingestion.FlatTrade;
+using NiftySignal.Ingestion.Upstox;
 using NiftySignal.Persistence;
 using NiftySignal.VolumeBarData;
 using Npgsql;
@@ -86,7 +88,9 @@ builder.Services.AddDbContextFactory<AdaptiveObserverDbContext>(options =>
 
 builder.Services.Configure<FlatTradeOptions>(builder.Configuration.GetSection(FlatTradeOptions.SectionName));
 builder.Services.Configure<PricingOptions>(builder.Configuration.GetSection(PricingOptions.SectionName));
-builder.Services.AddHttpClient<FlatTradeAuthClient>();
+builder.Services.Configure<MarketDataOptions>(builder.Configuration.GetSection(MarketDataOptions.SectionName));
+builder.Services.Configure<UpstoxOptions>(builder.Configuration.GetSection(UpstoxOptions.SectionName));
+builder.Services.AddMarketDataProviders();
 
 builder.Services.AddSingleton<LiveDataService>();
 builder.Services.AddSingleton<AdaptiveObserverDataService>();

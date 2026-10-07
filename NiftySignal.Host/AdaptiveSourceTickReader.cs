@@ -34,6 +34,7 @@ public sealed class AdaptiveSourceTickReader
         var upper = includeBeyondThrough
             ? new DateTimeOffset(day.AddDays(1).ToDateTime(TimeOnly.MinValue), IstOffset).ToUniversalTime().AddTicks(-1)
             : throughUtc;
+        await UpstoxContinuityGuard.EnsureAsync(db, day, tokens, upper, ct);
         var tokenArray = tokens.Distinct(StringComparer.Ordinal).ToArray();
 
         var query = db.Ticks.AsNoTracking()
@@ -86,6 +87,8 @@ public sealed class AdaptiveSourceTickReader
             return Array.Empty<(string, ObserverRawTick)>();
         }
 
+        if (day is { } guardDay)
+            await UpstoxContinuityGuard.EnsureAsync(db, guardDay, tokens, DateTimeOffset.UtcNow, ct);
         var tokenArray = tokens.Distinct(StringComparer.Ordinal).ToArray();
         IQueryable<NiftySignal.Domain.Entities.Tick> query = db.Ticks.AsNoTracking()
             .Where(t => t.Id > afterId && tokenArray.Contains(t.Token));

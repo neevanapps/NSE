@@ -12,19 +12,25 @@ namespace NiftySignal.Domain.Entities;
 /// </summary>
 public sealed class Tick
 {
+    public MarketDataProvider Provider { get; set; } = MarketDataProvider.FlatTrade;
+
     public long Id { get; set; }
+
+    public bool IsSnapshot { get; set; }
+    public DateTimeOffset? LastTradeTimestamp { get; set; }
 
     public required string Token { get; set; }
 
     public required Exchange Exchange { get; set; }
 
     /// <summary>
-    /// Authoritative for all time-sensitive computation (plan section 3.3) -- never use
-    /// <see cref="ReceivedAt"/> for anything except latency/ops diagnostics.
+    /// Provider update clock: FlatTrade exchange time, or Upstox message currentTs.
+    /// Upstox last-trade time is preserved separately in LastTradeTimestamp. Adaptive
+    /// readers also use receipt time to enforce causal availability.
     /// </summary>
     public required DateTimeOffset ExchangeTimestamp { get; set; }
 
-    /// <summary>Local receive time. Ops/latency diagnostics only -- see <see cref="ExchangeTimestamp"/>.</summary>
+    /// <summary>Local UTC receipt time, used for latency and adaptive causal availability.</summary>
     public required DateTimeOffset ReceivedAt { get; set; }
 
     public decimal LastPrice { get; set; }

@@ -22,6 +22,8 @@ public sealed class NiftySignalDbContext(DbContextOptions<NiftySignalDbContext> 
     public DbSet<PaperTrade> PaperTrades => Set<PaperTrade>();
 
     public DbSet<FlatTradeSession> FlatTradeSessions => Set<FlatTradeSession>();
+    public DbSet<UpstoxSession> UpstoxSessions => Set<UpstoxSession>();
+    public DbSet<MarketDataDay> MarketDataDays => Set<MarketDataDay>();
 
     public DbSet<ScoreSnapshot> ScoreSnapshots => Set<ScoreSnapshot>();
 

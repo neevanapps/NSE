@@ -5,7 +5,7 @@ using NiftySignal.Domain.Configuration;
 using NiftySignal.Domain.Entities;
 using NiftySignal.Domain.Enums;
 using NiftySignal.Features;
-using NiftySignal.Ingestion.FlatTrade;
+using NiftySignal.Domain.Abstractions;
 using NiftySignal.Persistence;
 using NiftySignal.Pricing;
 using NiftySignal.Scoring;
@@ -47,7 +47,8 @@ public sealed class LiveDataService : IDisposable
     static readonly TimeSpan StaleAfter = TimeSpan.FromSeconds(60);
 
     readonly IDbContextFactory<NiftySignalDbContext> _dbFactory;
-    readonly FlatTradeAuthClient _authClient;
+    readonly IServiceScopeFactory _scopeFactory;
+    readonly IOptions<MarketDataOptions> _marketDataOptions;
     readonly ILogger<LiveDataService> _logger;
     readonly Timer _timer;
     readonly Lock _lock = new();
@@ -171,12 +172,14 @@ public sealed class LiveDataService : IDisposable
 
     public LiveDataService(
         IDbContextFactory<NiftySignalDbContext> dbFactory,
-        FlatTradeAuthClient authClient,
+        IServiceScopeFactory scopeFactory,
+        IOptions<MarketDataOptions> marketDataOptions,
         IOptionsMonitor<PricingOptions> pricingOptions,
         ILogger<LiveDataService> logger)
     {
         _dbFactory = dbFactory;
-        _authClient = authClient;
+        _scopeFactory = scopeFactory;
+        _marketDataOptions = marketDataOptions;
         _pricingOptions = pricingOptions;
         _logger = logger;
         _timer = new Timer(_ => Poll(), null, TimeSpan.Zero, PollInterval);
@@ -294,10 +297,10 @@ public sealed class LiveDataService : IDisposable
     }
 
     /// <summary>
-    /// Resolves an arbitrary (strike, side) into a real instrument via a live FlatTrade
+    /// Resolves an arbitrary (strike, side) into a real instrument via the selected broker
     /// call and inserts it (Subscribed=false) for the Host's poll loop to pick up -- the
     /// dashboard's "watch this strike even though it's outside the tracked ATM band" path.
-    /// Returns false if already live, the session's stale, or FlatTrade has no such strike.
+    /// Returns true if already live; false if credentials are stale or the contract is unavailable.
     /// </summary>
     public async Task<bool> RequestSubscriptionAsync(decimal strike, OptionType side)
     {
@@ -307,57 +310,35 @@ public sealed class LiveDataService : IDisposable
         }
 
         await using var db = await _dbFactory.CreateDbContextAsync();
-        var session = await db.FlatTradeSessions.FindAsync(FlatTradeSession.SingletonId);
-        if (session?.Token is null || !session.IsValidAt(DateTimeOffset.UtcNow))
-        {
-            return false;
-        }
-
-        var today = DateOnly.FromDateTime(DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromHours(5.5)).Date);
+        var provider = _marketDataOptions.Value.Provider;
+        var now = DateTimeOffset.UtcNow;
+        var credential = await MarketDataSessionStore.LoadAsync(db, provider, now, CancellationToken.None);
+        if (credential is null) return false;
+        var today = DateOnly.FromDateTime(now.ToOffset(TimeSpan.FromHours(5.5)).Date);
+        var day = await db.MarketDataDays.FindAsync(today);
+        if (day is not null && day.Provider != provider) return false;
         var anchor = await db.Instruments
-            .Where(i => i.AsOfDate == today && i.InstrumentType == InstrumentType.Option)
-            .OrderBy(i => i.ExpiryDate)
-            .FirstOrDefaultAsync();
-        if (anchor is null)
-        {
-            return false;
-        }
-
-        IReadOnlyList<OptionChainEntry> chain;
+            .Where(i => i.AsOfDate == today && i.Provider == provider && i.Underlying == "NIFTY" && i.InstrumentType == InstrumentType.Option)
+            .OrderBy(i => i.ExpiryDate).FirstOrDefaultAsync();
+        if (anchor?.ExpiryDate is null) return false;
+        await using var scope = _scopeFactory.CreateAsyncScope();
+        var adapter = scope.ServiceProvider.GetServices<IMarketDataProvider>().Single(x => x.Provider == provider);
+        Instrument? match;
         try
         {
-            chain = await _authClient.GetOptionChainAsync(session.Token, Exchange.Nfo, anchor.TradingSymbol, strike, strikeCount: 2, CancellationToken.None);
+            match = await adapter.ResolveOptionAsync(credential, today, anchor.ExpiryDate.Value, strike, side, CancellationToken.None);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "On-demand strike resolution failed for {Strike} {Side}", strike, side);
+            _logger.LogWarning("On-demand {Provider} strike resolution failed ({ExceptionType}) for {Strike} {Side}", provider, ex.GetType().Name, strike, side);
             return false;
         }
-
-        var match = chain.FirstOrDefault(c => c.StrikePrice == strike && c.OptionType == side);
-        if (match is null)
-        {
-            return false;
-        }
-
-        var exists = await db.Instruments.AnyAsync(i => i.Token == match.Token && i.AsOfDate == today);
+        if (match is null) return false;
+        var exists = await db.Instruments.AnyAsync(i => i.Token == match.Token && i.Exchange == match.Exchange && i.AsOfDate == today);
         if (!exists)
         {
-            db.Instruments.Add(new Instrument
-            {
-                Token = match.Token,
-                Exchange = match.Exchange,
-                TradingSymbol = match.TradingSymbol,
-                InstrumentType = InstrumentType.Option,
-                OptionType = match.OptionType,
-                StrikePrice = match.StrikePrice,
-                ExpiryDate = anchor.ExpiryDate,
-                Underlying = anchor.Underlying,
-                LotSize = match.LotSize,
-                TickSize = match.TickSize,
-                AsOfDate = today,
-                Subscribed = false,
-            });
+            match.Subscribed = false;
+            db.Instruments.Add(match);
             await db.SaveChangesAsync();
         }
 

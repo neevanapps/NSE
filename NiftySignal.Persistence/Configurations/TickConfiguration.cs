@@ -23,6 +23,10 @@ public sealed class TickConfiguration : IEntityTypeConfiguration<Tick>
         // ReceivedAt with no token filter -- without this, it's a full parallel seq scan
         // (335ms measured against 3.86M rows).
         builder.HasIndex(t => t.ReceivedAt);
+        // Continuity checks poll a few initial snapshots, not the full live tick stream.
+        builder.HasIndex(t => new { t.Token, t.ReceivedAt })
+            .HasDatabaseName("IX_ticks_snapshot_token_received_at")
+            .HasFilter("\"IsSnapshot\" = TRUE");
 
         builder.OwnsOne(t => t.Depth, depth =>
         {

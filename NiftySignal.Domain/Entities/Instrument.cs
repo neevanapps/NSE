@@ -9,6 +9,11 @@ namespace NiftySignal.Domain.Entities;
 /// </summary>
 public sealed class Instrument
 {
+    public MarketDataProvider Provider { get; set; } = MarketDataProvider.FlatTrade;
+
+    /// <summary>Native subscription key. Upstox tokens are namespaced internally; never sent to its API.</summary>
+    public string? NativeInstrumentKey { get; set; }
+
     public long Id { get; set; }
 
     public required string Token { get; set; }

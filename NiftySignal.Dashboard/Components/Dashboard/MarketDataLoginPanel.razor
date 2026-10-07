@@ -1,0 +1,13 @@
+@using Microsoft.Extensions.Options
+@using NiftySignal.Domain.Configuration
+@using NiftySignal.Domain.Enums
+@inject IOptions<MarketDataOptions> MarketData
+
+@if (MarketData.Value.Provider == MarketDataProvider.FlatTrade)
+{
+    <FlatTradeLoginPanel />
+}
+else if (MarketData.Value.Provider == MarketDataProvider.Upstox)
+{
+    <UpstoxLoginPanel />
+}

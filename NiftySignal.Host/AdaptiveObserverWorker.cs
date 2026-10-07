@@ -1,3 +1,4 @@
+using Microsoft.EntityFrameworkCore;
 using NiftySignal.AdaptiveObserver;
 using NiftySignal.AdaptiveObserverData;
 using NiftySignal.Persistence;
@@ -239,18 +240,21 @@ public sealed class AdaptiveObserverWorker(
 
     async Task MarkCurrentDegradedBestEffortAsync(Exception ex, CancellationToken ct)
     {
-        if (_live is null)
-        {
-            return;
-        }
-
         try
         {
             await using var scope = scopeFactory.CreateAsyncScope();
             var db = scope.ServiceProvider.GetRequiredService<AdaptiveObserverDbContext>();
+            var sessionId = _live?.Context.Session.Id;
+            if (sessionId is null)
+            {
+                var day = DateOnly.FromDateTime(DateTimeOffset.UtcNow.ToOffset(IstOffset).DateTime);
+                sessionId = await db.Sessions.Where(x => x.TradeDate == day && x.ModelVersion == OpeningVolumeProjectionV1.ModelVersion)
+                    .Select(x => (long?)x.Id).SingleOrDefaultAsync(ct);
+            }
+            if (sessionId is null) return;
             await persistence.SetRuntimeStatusAsync(
                 db,
-                _live.Context.Session.Id,
+                sessionId.Value,
                 AdaptiveRuntimeStatus.Degraded,
                 DateTimeOffset.UtcNow,
                 ex.Message,

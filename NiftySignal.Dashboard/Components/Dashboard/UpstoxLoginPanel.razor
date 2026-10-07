@@ -1,0 +1,78 @@
+@using Microsoft.EntityFrameworkCore
+@using NiftySignal.Domain.Entities
+@using NiftySignal.Ingestion.Upstox
+@using NiftySignal.Persistence
+@inject IDbContextFactory<NiftySignalDbContext> DbFactory
+@inject UpstoxAuthClient Auth
+
+<div class="panel login-panel">
+    <div class="panel-title">Upstox market data — @(_valid ? "Token saved" : "Login required")</div>
+    <p>Market-data collection only. Saved tokens are shared with Host.</p>
+    @if (_expiry is not null)
+    {
+        <p>Expires @_expiry.Value.ToOffset(TimeSpan.FromHours(5.5)).ToString("dd-MMM-yyyy HH:mm") IST</p>
+    }
+    <a href="@Auth.AuthorizeUrl" target="_blank" rel="noopener">Open Upstox login</a>
+    <input aria-label="Upstox redirect URL or code" placeholder="Paste redirect URL or code" type="password" @bind="_code" disabled="@_saving" />
+    <button @onclick="ExchangeAsync" disabled="@(_saving || string.IsNullOrWhiteSpace(_code))">Exchange &amp; Save</button>
+    <details>
+        <summary>Use a read-only Analytics Token instead</summary>
+        <p>Paste the Analytics Token and its expiry date from Upstox. This avoids daily market-data login.</p>
+        <input aria-label="Analytics token" type="password" @bind="_analyticsToken" disabled="@_saving" />
+        <input aria-label="Analytics expiry date" type="date" @bind="_analyticsExpiry" disabled="@_saving" />
+        <button @onclick="SaveAnalyticsAsync" disabled="@(_saving || string.IsNullOrWhiteSpace(_analyticsToken))">Validate &amp; Save</button>
+    </details>
+    @if (_message is not null) { <p role="status">@_message</p> }
+</div>
+
+@code {
+    string _code = "";
+    string _analyticsToken = "";
+    DateTime _analyticsExpiry = DateTime.Today;
+    DateTimeOffset? _expiry;
+    bool _valid;
+    bool _saving;
+    string? _message;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await using var db = await DbFactory.CreateDbContextAsync();
+        var session = await db.UpstoxSessions.FindAsync(UpstoxSession.SingletonId);
+        _valid = session?.IsValidAt(DateTimeOffset.UtcNow) ?? false;
+        _expiry = session?.ExpiresAtUtc;
+    }
+
+    async Task ExchangeAsync() => await SaveAsync(async () =>
+    {
+        var token = await Auth.ExchangeAsync(UpstoxAuthClient.ExtractCode(_code), CancellationToken.None);
+        return (token, UpstoxAuthClient.RegularExpiry(DateTimeOffset.UtcNow), false);
+    });
+
+    async Task SaveAnalyticsAsync() => await SaveAsync(() =>
+    {
+        // Conservative expiry: stop at the beginning of the displayed expiry date, never after it.
+        var expiry = new DateTimeOffset(DateTime.SpecifyKind(_analyticsExpiry.Date, DateTimeKind.Unspecified), TimeSpan.FromHours(5.5)).ToUniversalTime();
+        if (expiry <= DateTimeOffset.UtcNow) throw new InvalidOperationException("Select a future Analytics Token expiry date.");
+        return Task.FromResult((_analyticsToken.Trim(), expiry, true));
+    });
+
+    async Task SaveAsync(Func<Task<(string Token, DateTimeOffset Expiry, bool Analytics)>> acquire)
+    {
+        _saving = true; _message = null;
+        try
+        {
+            var (token, expiry, analytics) = await acquire();
+            await Auth.ValidateMarketDataTokenAsync(token, CancellationToken.None);
+            await using var db = await DbFactory.CreateDbContextAsync();
+            var session = await db.UpstoxSessions.FindAsync(UpstoxSession.SingletonId);
+            if (session is null) { session = new UpstoxSession(); db.UpstoxSessions.Add(session); }
+            session.Token = token; session.ExpiresAtUtc = expiry; session.IsAnalyticsToken = analytics;
+            await db.SaveChangesAsync();
+            _valid = true; _expiry = expiry; _code = ""; _analyticsToken = "";
+            _message = "Token validated and saved. Host waiting for credentials will resume automatically; replacing an active token requires a Host restart.";
+        }
+        catch (InvalidOperationException ex) { _message = ex.Message; }
+        catch (Exception) { _message = "Unable to validate or save the token. Check connection and configuration."; }
+        finally { _saving = false; }
+    }
+}

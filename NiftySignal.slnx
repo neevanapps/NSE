@@ -25,4 +25,5 @@
   <Project Path="NiftySignal.MetricTrials/NiftySignal.MetricTrials.csproj" />
   <Project Path="NiftySignal.VolumeBarData/NiftySignal.VolumeBarData.csproj" />
   <Project Path="tools/AdaptiveDashboardValidation/AdaptiveDashboardValidation.csproj" />
+  <Project Path="tools/UpstoxMarketDataSmoke/UpstoxMarketDataSmoke.csproj" />
 </Solution>

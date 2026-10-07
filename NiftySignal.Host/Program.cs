@@ -6,7 +6,9 @@ using NiftySignal.Domain;
 using NiftySignal.Domain.Abstractions;
 using NiftySignal.Domain.Configuration;
 using NiftySignal.Host;
+using NiftySignal.Ingestion;
 using NiftySignal.Ingestion.FlatTrade;
+using NiftySignal.Ingestion.Upstox;
 using NiftySignal.Notifications;
 using NiftySignal.Persistence;
 using NiftySignal.Rules;
@@ -86,18 +88,10 @@ try
         new RateLimitedTelegramNotifier(sp.GetRequiredService<TelegramNotifier>(), sp.GetRequiredService<TimeProvider>()));
 
     builder.Services.Configure<FlatTradeOptions>(builder.Configuration.GetSection(FlatTradeOptions.SectionName));
-    builder.Services.AddHttpClient<FlatTradeAuthClient>();
-    builder.Services.AddHttpClient<FlatTradeInstrumentMasterProvider>();
-    builder.Services.AddScoped<IInstrumentMasterProvider>(sp => sp.GetRequiredService<FlatTradeInstrumentMasterProvider>());
+    builder.Services.Configure<MarketDataOptions>(builder.Configuration.GetSection(MarketDataOptions.SectionName));
+    builder.Services.Configure<UpstoxOptions>(builder.Configuration.GetSection(UpstoxOptions.SectionName));
+    builder.Services.AddMarketDataProviders();
     builder.Services.AddScoped<IDataGapRecorder, EfDataGapRecorder>();
-    builder.Services.AddScoped<InstrumentUniverseResolver>();
-
-    // Sensex/Bank Nifty raw-tick-collection resolver (write-only/archive, future backtesting
-    // only) -- registered as its own concrete types, not bound to IInstrumentMasterProvider
-    // above, so Nifty's own resolution (InstrumentUniverseResolver -> IInstrumentMasterProvider
-    // -> FlatTradeInstrumentMasterProvider) is provably untouched by this addition.
-    builder.Services.AddHttpClient<SensexBankNiftyInstrumentMasterProvider>();
-    builder.Services.AddScoped<SensexBankNiftyInstrumentUniverseResolver>();
 
     // Hot-reloaded, validate-before-swap config (2026-09-09, external review -- see
     // ValidatedOptionsMonitor's own doc comment for why plain IOptionsMonitor +
