@@ -1,6 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk.Web">
 
   <ItemGroup>
+    <InternalsVisibleTo Include="NiftySignal.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\NiftySignal.AdaptiveObserver\NiftySignal.AdaptiveObserver.csproj" />
     <ProjectReference Include="..\NiftySignal.AdaptiveObserverData\NiftySignal.AdaptiveObserverData.csproj" />
     <ProjectReference Include="..\NiftySignal.Domain\NiftySignal.Domain.csproj" />

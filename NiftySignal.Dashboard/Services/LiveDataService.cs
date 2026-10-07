@@ -66,6 +66,8 @@ public sealed class LiveDataService : IDisposable
     Dictionary<(decimal Strike, OptionType Type), QuickQuote> _quickQuotes = [];
     Dictionary<string, TokenInfo> _tokenRoles = [];
     Dictionary<string, decimal> _dayOpenByToken = [];
+    Dictionary<string, DateTimeOffset> _quoteReceivedAtByToken = [];
+    DateOnly? _quoteDay;
 
     // PENDING (2026-09-09, found while fixing the "last 24h" leaks -- see TodayIstMidnightUtc):
     // both fields below are set once via ??= and never reset, so if this Dashboard process ever
@@ -174,12 +176,20 @@ public sealed class LiveDataService : IDisposable
         FlatTradeAuthClient authClient,
         IOptionsMonitor<PricingOptions> pricingOptions,
         ILogger<LiveDataService> logger)
+        : this(dbFactory, authClient, pricingOptions, logger, true) { }
+
+    internal LiveDataService(
+        IDbContextFactory<NiftySignalDbContext> dbFactory,
+        FlatTradeAuthClient authClient,
+        IOptionsMonitor<PricingOptions> pricingOptions,
+        ILogger<LiveDataService> logger,
+        bool startPolling)
     {
         _dbFactory = dbFactory;
         _authClient = authClient;
         _pricingOptions = pricingOptions;
         _logger = logger;
-        _timer = new Timer(_ => Poll(), null, TimeSpan.Zero, PollInterval);
+        _timer = new Timer(_ => Poll(), null, startPolling ? TimeSpan.Zero : Timeout.InfiniteTimeSpan, PollInterval);
     }
 
     /// <summary>
@@ -225,51 +235,9 @@ public sealed class LiveDataService : IDisposable
             }
         }
 
-        if (!_tokenRoles.TryGetValue(tick.Token, out var info))
-        {
-            // Preserves the original "unknown token, nothing changed, nothing to notify" drop --
-            // only fire when the position match above actually changed something.
-            if (matchedPosition)
-            {
-                QuoteUpdated?.Invoke();
-            }
-
-            return;
-        }
-
-        var change = _dayOpenByToken.TryGetValue(tick.Token, out var open) ? tick.LastPrice - open : (decimal?)null;
-
-        switch (info.Role)
-        {
-            case TokenRole.Spot:
-                SpotLtp = tick.LastPrice;
-                SpotChange = change;
-                break;
-
-            case TokenRole.Future:
-                FutureLtp = tick.LastPrice;
-                FutureChange = change;
-                break;
-
-            case TokenRole.Vix:
-                VixLtp = tick.LastPrice;
-                VixChange = change;
-                break;
-
-            case TokenRole.Option:
-                var depth = tick.Depth;
-                lock (_lock)
-                {
-                    _quickQuotes[(info.Strike, info.OptionType)] = new QuickQuote(
-                        Ltp: tick.LastPrice,
-                        Bid: depth?.Bid1Price is > 0 ? depth.Bid1Price : null,
-                        Ask: depth?.Ask1Price is > 0 ? depth.Ask1Price : null,
-                        Change: change);
-                }
-                break;
-        }
-
-        QuoteUpdated?.Invoke();
+        bool quoteChanged;
+        lock (_lock) quoteChanged = ApplyQuoteLocked(tick);
+        if (quoteChanged || matchedPosition) QuoteUpdated?.Invoke();
     }
 
     /// <summary>
@@ -315,7 +283,7 @@ public sealed class LiveDataService : IDisposable
 
         var today = DateOnly.FromDateTime(DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromHours(5.5)).Date);
         var anchor = await db.Instruments
-            .Where(i => i.AsOfDate == today && i.InstrumentType == InstrumentType.Option)
+            .Where(i => i.AsOfDate == today && i.Underlying == "NIFTY" && i.InstrumentType == InstrumentType.Option)
             .OrderBy(i => i.ExpiryDate)
             .FirstOrDefaultAsync();
         if (anchor is null)
@@ -495,44 +463,72 @@ public sealed class LiveDataService : IDisposable
         var today = DateOnly.FromDateTime(DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromHours(5.5)).Date);
 
         var instruments = await db.Instruments
-            .Where(i => i.AsOfDate == today && (i.InstrumentType == InstrumentType.Option || i.InstrumentType == InstrumentType.Future || i.InstrumentType == InstrumentType.Index || i.InstrumentType == InstrumentType.Vix))
+            .Where(i => i.AsOfDate == today && i.Underlying == "NIFTY" && (i.InstrumentType == InstrumentType.Option || i.InstrumentType == InstrumentType.Future || i.InstrumentType == InstrumentType.Index || i.InstrumentType == InstrumentType.Vix))
             .ToListAsync();
 
-        // Nearest-expiry options only -- same filter BuildOptionChainAsync already applies.
-        // The tracked universe holds both weekly expiries, and they share identical
-        // strikes (e.g. 23400 CE exists as both a near-week and a next-week token). Without
-        // this filter, both tokens map into _quickQuotes under the same (Strike, OptionType)
-        // key -- no Expiry component -- and the Live Quote panel flips unpredictably between
-        // whichever expiry's tick arrived last (live-caught 2026-09-04).
-        var nearestExpiry = instruments
-            .Where(i => i.InstrumentType == InstrumentType.Option && i.ExpiryDate is not null)
-            .Select(i => i.ExpiryDate!.Value)
-            .DefaultIfEmpty()
-            .Min();
+        var tokens = instruments.Select(i => i.Token).ToArray();
+        var dayOpenTicks = await EarliestTicksAsync(db, tokens, TodayIstMidnightUtc());
+        var latestTicks = await LatestTicksAsync(db, tokens);
+        RefreshQuoteUniverse(instruments, dayOpenTicks, latestTicks, today);
+    }
 
+    // F80: this panel owns NIFTY only; secondary collection must not overwrite its slots.
+    // Publish roles, day-open baselines and persisted quotes together. A slow DB read must
+    // never replace a newer push that arrived while that read was in flight.
+    internal void RefreshQuoteUniverse(IReadOnlyList<Instrument> instruments, IReadOnlyList<Tick> dayOpenTicks,
+        IReadOnlyList<Tick> latestTicks, DateOnly today)
+    {
+        var nifty = instruments.Where(i => i.AsOfDate == today && i.Underlying == "NIFTY").ToList();
+        var nearestExpiry = nifty.Where(i => i.InstrumentType == InstrumentType.Option && i.ExpiryDate is not null)
+            .Select(i => i.ExpiryDate!.Value).OrderBy(x => x).FirstOrDefault();
         var roles = new Dictionary<string, TokenInfo>();
-        foreach (var instrument in instruments)
+        foreach (var instrument in nifty)
         {
-            if (instrument.InstrumentType == InstrumentType.Option && instrument.ExpiryDate != nearestExpiry)
-            {
-                continue;
-            }
-
+            if (instrument.InstrumentType == InstrumentType.Option && instrument.ExpiryDate != nearestExpiry) continue;
+            if (instrument.InstrumentType is not (InstrumentType.Index or InstrumentType.Future or InstrumentType.Vix or InstrumentType.Option)) continue;
             roles[instrument.Token] = instrument.InstrumentType switch
             {
-                InstrumentType.Index => new TokenInfo(TokenRole.Spot, 0, OptionType.None),
-                InstrumentType.Future => new TokenInfo(TokenRole.Future, 0, OptionType.None),
-                InstrumentType.Vix => new TokenInfo(TokenRole.Vix, 0, OptionType.None),
-                _ => new TokenInfo(TokenRole.Option, instrument.StrikePrice!.Value, instrument.OptionType),
+                InstrumentType.Index => new(TokenRole.Spot, 0, OptionType.None),
+                InstrumentType.Future => new(TokenRole.Future, 0, OptionType.None),
+                InstrumentType.Vix => new(TokenRole.Vix, 0, OptionType.None),
+                _ => new(TokenRole.Option, instrument.StrikePrice!.Value, instrument.OptionType),
             };
         }
+        var start = new DateTimeOffset(today.ToDateTime(TimeOnly.MinValue), TimeSpan.FromHours(5.5)).ToUniversalTime();
+        lock (_lock)
+        {
+            if (_quoteDay != today)
+            {
+                _quoteDay = today;
+                _quickQuotes.Clear(); _quoteReceivedAtByToken.Clear();
+                SpotLtp = FutureLtp = VixLtp = SpotChange = FutureChange = VixChange = null;
+            }
+            _tokenRoles = roles;
+            _dayOpenByToken = dayOpenTicks.Where(t => roles.ContainsKey(t.Token) && t.ReceivedAt >= start)
+                .ToDictionary(t => t.Token, t => t.LastPrice);
+            foreach (var tick in latestTicks.Where(t => t.ReceivedAt >= start && t.ReceivedAt < start.AddDays(1)))
+                ApplyQuoteLocked(tick);
+        }
+    }
 
-        var allTokens = instruments.Select(i => i.Token).ToArray();
-        var dayOpenTicks = await EarliestTicksAsync(db, allTokens, TodayIstMidnightUtc());
-        var dayOpenByToken = dayOpenTicks.ToDictionary(t => t.Token, t => t.LastPrice);
-
-        _tokenRoles = roles;
-        _dayOpenByToken = dayOpenByToken;
+    bool ApplyQuoteLocked(Tick tick)
+    {
+        if (!_tokenRoles.TryGetValue(tick.Token, out var info)) return false;
+        if (_quoteReceivedAtByToken.TryGetValue(tick.Token, out var previous) && tick.ReceivedAt < previous) return false;
+        _quoteReceivedAtByToken[tick.Token] = tick.ReceivedAt;
+        var change = _dayOpenByToken.TryGetValue(tick.Token, out var open) ? tick.LastPrice - open : (decimal?)null;
+        switch (info.Role)
+        {
+            case TokenRole.Spot: SpotLtp = tick.LastPrice; SpotChange = change; break;
+            case TokenRole.Future: FutureLtp = tick.LastPrice; FutureChange = change; break;
+            case TokenRole.Vix: VixLtp = tick.LastPrice; VixChange = change; break;
+            case TokenRole.Option:
+                _quickQuotes[(info.Strike, info.OptionType)] = new QuickQuote(tick.LastPrice,
+                    tick.Depth?.Bid1Price is > 0 ? tick.Depth.Bid1Price : null,
+                    tick.Depth?.Ask1Price is > 0 ? tick.Depth.Ask1Price : null, change);
+                break;
+        }
+        return true;
     }
 
     /// <summary>
@@ -645,7 +641,7 @@ public sealed class LiveDataService : IDisposable
         var today = DateOnly.FromDateTime(DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromHours(5.5)).Date);
 
         var instruments = await db.Instruments
-            .Where(i => i.AsOfDate == today && i.InstrumentType == InstrumentType.Option)
+            .Where(i => i.AsOfDate == today && i.Underlying == "NIFTY" && i.InstrumentType == InstrumentType.Option)
             .ToListAsync();
         if (instruments.Count == 0)
         {
@@ -662,7 +658,7 @@ public sealed class LiveDataService : IDisposable
         var tokens = instruments.Select(i => i.Token).ToArray();
 
         var spotToken = await db.Instruments
-            .Where(i => i.AsOfDate == today && i.InstrumentType == InstrumentType.Index)
+            .Where(i => i.AsOfDate == today && i.Underlying == "NIFTY" && i.InstrumentType == InstrumentType.Index)
             .Select(i => i.Token)
             .FirstOrDefaultAsync();
 

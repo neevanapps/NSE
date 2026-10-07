@@ -11,6 +11,7 @@ on:
       - feature/adaptive-telegram-screenshots
       - feature/adaptive-telegram-sender-diagnostics
       - feature/adaptive-late-start-readiness
+      - fix/dashboard-live-nifty-quotes
       - master
   workflow_dispatch:
 
