@@ -1816,3 +1816,1287 @@ Also frozen:
 - No composite score or trading rule is introduced.
 
 The **Residual-grid metric design itself is finalized**. The broader implementation remains blocked only by the cross-cutting open items already listed in section 30, unless those are explicitly resolved/deferred before coding.
+
+
+# 44. Running Market Commentary — IMPLEMENTATION PLAN
+
+**Status:** APPROVED FOR THE 08 OCTOBER IMPLEMENTATION PLAN.
+
+**Purpose:** Add a deterministic, event-driven commentary layer on top of the finalized Futures, Options and Residual observations. The commentary exists to reduce the amount of manual interpretation required while watching live. It must explain meaningful market-state changes without generating a message after every adaptive bar.
+
+The commentary engine is observational. It does not place orders, modify scoring, or change any existing trading/execution path.
+
+The core output of every commentary event is:
+
+    Event
+    + Event Bias
+    + Market Regime
+    + Lifecycle
+    + Confidence
+    + Primary Evidence
+    + Confirmations
+    + Contradictions
+
+Event Bias is explicitly:
+
+    LONG | SHORT | NEUTRAL
+
+This means the direction the event currently supports for NIFTY. It is **not** an automatic instruction to place a trade.
+
+# 45. Commentary architecture
+
+The V1 processing flow is:
+
+    completed futures adaptive bar
+            |
+            v
+    finalized Futures metrics
+    finalized Options metrics
+    finalized Residual metrics
+            |
+            v
+    CommentaryFrame
+            |
+            v
+    Deterministic Event Detector
+            |
+            v
+    Lifecycle / Regime Engine
+            |
+            v
+    PostgreSQL Event Store
+            |
+            +----> Dashboard commentary panel
+            |
+            +----> Notification policy
+                        |
+                        v
+                 PostgreSQL outbox
+                        |
+                        v
+                     Telegram
+
+The event detector must evaluate only completed adaptive bars.
+
+The commentary engine must not read a later live quote after the completed bar boundary in order to reinterpret that bar. All values in the CommentaryFrame must already obey the causality/freshness rules defined elsewhere in this document.
+
+# 46. CommentaryFrame — deterministic input contract
+
+Create one immutable CommentaryFrame per completed adaptive bar after the three observation layers are finalized.
+
+The frame should contain references/values required for commentary and no wall-clock-dependent calculations.
+
+At minimum it must contain:
+
+### Identity / timing
+- SessionId
+- TradeDate
+- BarSeq
+- BarEndAvailableAtUtc
+
+### Futures
+- BarPriceDisplacement
+- RollingPriceDisplacement
+- StrictDelta
+- EnrichedDelta
+- RollingStrictDelta
+- RollingEnrichedDelta
+- RollingStrictAbsDeltaChange
+- RollOiDelta
+- Urgency
+- MicroDev
+- OFI
+- DeltaBasis
+- RollingEfficiency
+- Evolution
+- State
+- data-quality availability flags required by those metrics
+
+### Options
+- CenterStrike
+- BandRolled
+- CE/PE BarPriceChange
+- CE/PE RollingPriceChange
+- CE/PE StrictDelta
+- CE/PE EnrichedDelta
+- CE/PE RollingStrictDelta
+- center CE/PE OiDelta
+- CEPosition
+- PEPosition
+- CE/PE DeltaIV
+- IVSkew
+- current VolPCR
+- RollingVolPCR
+- DayVolPCR and its coverage status
+- option quote/data-quality flags
+
+### Residual
+Use the selected primary residual view configured for commentary. V1 should default to ATM±2 unless a later explicit decision changes it.
+
+Include:
+- CEResidualPct
+- CEResidualDeltaPct
+- PEResidualPct
+- PEResidualDeltaPct
+- DirectionalResidualPct
+- DirectionalResidualDelta
+- StraddleResidualPct
+- ResidualDirection
+- Relation
+- QuoteAge
+- availability flag
+
+The CommentaryFrame must be serializable for deterministic tests/replay, but it does not have to be persisted as another full duplicate of all market data if the source metrics are already durably stored.
+
+# 47. Directional concepts
+
+The commentary system deliberately keeps three separate concepts.
+
+## 47.1 Event Bias
+
+Values:
+
+    Long
+    Short
+    Neutral
+
+Meaning:
+
+- Long: this event supports upward NIFTY direction.
+- Short: this event supports downward NIFTY direction.
+- Neutral: the event is important but does not yet justify directional interpretation.
+
+Event Bias must not be labeled Buy/Sell because the engine is describing market behaviour, not sending an order instruction.
+
+## 47.2 Market Regime
+
+Values:
+
+    Bullish
+    Bearish
+    Transition
+    Conflict
+    Neutral
+
+Meaning:
+
+- Bullish: established broader evidence remains predominantly upward.
+- Bearish: established broader evidence remains predominantly downward.
+- Transition: established regime is being challenged by a material opposing event.
+- Conflict: independent evidence families materially disagree.
+- Neutral: no established directional regime.
+
+The Market Regime can differ from Event Bias.
+
+Example:
+
+    Event        SellerAbsorption
+    Event Bias   Neutral
+    Regime       Bearish
+
+This means the broader market remains bearish, but the newest event no longer supports adding directional confidence to the short side.
+
+## 47.3 Bias transition
+
+Persist:
+
+    PreviousBias
+    CurrentBias
+    BiasChanged
+
+Important transitions include:
+
+    Short -> Neutral
+    Neutral -> Long
+    Long -> Neutral
+    Neutral -> Short
+    Long -> Short
+    Short -> Long
+
+A bias transition is more important than another bar retaining the same bias and should receive notification priority.
+
+# 48. V1 futures event classifier
+
+The primary event classifier should begin from futures behaviour because the adaptive clock and principal directional state originate there.
+
+Define current aligned flow:
+
+    BuyAligned =
+      StrictDelta > 0
+      AND EnrichedDelta > 0
+      AND RollingStrictDelta > 0
+      AND RollingEnrichedDelta > 0
+
+    SellAligned =
+      StrictDelta < 0
+      AND EnrichedDelta < 0
+      AND RollingStrictDelta < 0
+      AND RollingEnrichedDelta < 0
+
+Define flow conflict:
+
+    FlowConflict =
+      sign(StrictDelta) != sign(EnrichedDelta)
+      OR sign(RollingStrictDelta) != sign(RollingEnrichedDelta)
+
+Zero values are not forced into Buy or Sell alignment.
+
+V1 primary events:
+
+## 48.1 BuyerExpansion
+
+Requirements:
+
+    BuyAligned
+    AND RollOiDelta > 0
+    AND BarPriceDisplacement > 0
+    AND RollingPriceDisplacement > 0
+
+Event Bias:
+
+    LONG
+
+Meaning:
+
+Fresh/expanding futures positioning is being initiated with buyer-aggressive flow and price is accepting it upward.
+
+## 48.2 SellerExpansion
+
+Requirements:
+
+    SellAligned
+    AND RollOiDelta > 0
+    AND BarPriceDisplacement < 0
+    AND RollingPriceDisplacement < 0
+
+Event Bias:
+
+    SHORT
+
+## 48.3 ShortCovering
+
+Requirements:
+
+    BuyAligned
+    AND RollOiDelta < 0
+    AND BarPriceDisplacement > 0
+    AND RollingPriceDisplacement > 0
+
+Event Bias:
+
+    LONG
+
+This is contraction/covering-compatible behaviour and must remain distinguishable from BuyerExpansion.
+
+## 48.4 LongLiquidation
+
+Requirements:
+
+    SellAligned
+    AND RollOiDelta < 0
+    AND BarPriceDisplacement < 0
+    AND RollingPriceDisplacement < 0
+
+Event Bias:
+
+    SHORT
+
+## 48.5 BuyerAbsorption
+
+Requirements:
+
+    BuyAligned
+    AND RollOiDelta >= 0
+    AND BarPriceDisplacement <= 0
+
+Initial Event Bias:
+
+    NEUTRAL
+
+The important observation is aggressive buying without expected upward price acceptance.
+
+Do not immediately label this SHORT.
+
+## 48.6 SellerAbsorption
+
+Requirements:
+
+    SellAligned
+    AND RollOiDelta >= 0
+    AND BarPriceDisplacement >= 0
+
+Initial Event Bias:
+
+    NEUTRAL
+
+Do not immediately label this LONG.
+
+## 48.7 FlowConflict
+
+Requirements:
+
+    FlowConflict == true
+
+Event Bias:
+
+    NEUTRAL
+
+This should normally reduce confidence in any same-bar directional interpretation.
+
+If none of the above primary events exists, the engine can remain silent for that bar unless a previously active event changes lifecycle materially.
+
+# 49. Absorption-to-reversal confirmation
+
+Absorption is deliberately two-stage.
+
+## 49.1 SellerRejectionConfirmed
+
+This can occur only if the immediately active relevant lifecycle previously contained SellerAbsorption.
+
+Mandatory evidence:
+
+    BarPriceDisplacement > 0
+
+and one of:
+
+    Evolution == Weakening
+    OR Evolution == FlipToBuyer
+    OR RollingStrictAbsDeltaChange < 0
+
+Then require confirmation from at least **two independent evidence families** below:
+
+### Book family
+At least one:
+
+    OFI > 0
+    OR MicroDev > 0
+
+The book family counts once even if both agree.
+
+### Inter-market family
+
+    DeltaBasis > 0
+
+### Options family
+
+Strong LONG-supporting option evidence as defined in section 50.
+
+### Residual family
+
+    DirectionalResidualPct > 0
+
+If mandatory conditions and at least two independent confirming families are present:
+
+    EventType    SellerRejectionConfirmed
+    EventBias    LONG
+    Regime       Transition initially
+    Lifecycle    Confirmed
+
+A later BuyerExpansion can move the regime from Transition to Bullish.
+
+## 49.2 BuyerRejectionConfirmed
+
+Mirror rule after BuyerAbsorption.
+
+Mandatory:
+
+    BarPriceDisplacement < 0
+
+and one of:
+
+    Evolution == Weakening
+    OR Evolution == FlipToSeller
+    OR RollingStrictAbsDeltaChange < 0
+
+Require at least two independent confirmations:
+
+### Book
+
+    OFI < 0
+    OR MicroDev < 0
+
+### Inter-market
+
+    DeltaBasis < 0
+
+### Options
+
+Strong SHORT-supporting option evidence.
+
+### Residual
+
+    DirectionalResidualPct < 0
+
+Result:
+
+    EventType    BuyerRejectionConfirmed
+    EventBias    SHORT
+    Regime       Transition initially
+    Lifecycle    Confirmed
+
+This two-stage rule prevents an early absorption observation from being mislabeled as an immediate reversal.
+
+# 50. Options directional-support rules for commentary
+
+PCR alone must never create Long or Short bias.
+
+IV alone must never create Long or Short bias.
+
+For V1, classify **strong Options support** using Position + aggressive flow.
+
+## 50.1 Strong LONG options support
+
+At least one of:
+
+### Call-long build
+
+    CEPosition == CallLongBuild
+    AND CE StrictDelta > 0
+
+### Put writing
+
+    PEPosition == PutWriting
+    AND PE StrictDelta < 0
+
+These are the primary fresh LONG-supporting option patterns.
+
+The following may be recorded as supporting/mature evidence but do not create strong LONG support by themselves:
+
+    CEPosition == CallShortCover
+
+because covering can occur late in an existing move.
+
+## 50.2 Strong SHORT options support
+
+At least one of:
+
+### Put-long build
+
+    PEPosition == PutLongBuild
+    AND PE StrictDelta > 0
+
+### Call writing
+
+    CEPosition == CallWriting
+    AND CE StrictDelta < 0
+
+The following is supporting/mature evidence but not sufficient by itself:
+
+    PEPosition == PutShortCover
+
+because it may represent a later-stage move.
+
+## 50.3 IV, skew and PCR as confirmation/context
+
+Examples of LONG-compatible confirmation include:
+
+- CE DeltaIV positive while PE DeltaIV is flat/falling;
+- IV skew falling;
+- Vol PCR high because PE activity is PutWriting rather than PutLongBuild;
+- current PCR moving below its rolling/session context while call-long activity expands.
+
+Examples of SHORT-compatible confirmation include:
+
+- PE DeltaIV positive while CE DeltaIV is flat/falling;
+- IV skew increasing;
+- high Vol PCR accompanied by PutLongBuild and positive PE aggressive flow.
+
+These fields strengthen/explain an options conclusion but must not be converted into standalone direction without the Position/flow context.
+
+# 51. Residual directional support
+
+Residual direction is defined by the finalized residual model:
+
+    DirectionalResidualPct > 0  => LONG-supporting residual
+    DirectionalResidualPct < 0  => SHORT-supporting residual
+    DirectionalResidualPct == 0 => Neutral
+
+Residual acceleration adds context:
+
+    DirectionalResidualDelta > 0
+        => residual is becoming more LONG-oriented
+
+    DirectionalResidualDelta < 0
+        => residual is becoming more SHORT-oriented
+
+Leg-specific residual deltas should be used in commentary text to explain which side is driving the change.
+
+StraddleResidualPct remains common-richness/common-cheapness context and does not create Long/Short direction by itself.
+
+# 52. Independent evidence families
+
+Never calculate confidence by counting every raw column because many metrics are correlated.
+
+For commentary, evidence is grouped into independent families:
+
+1. **Futures core** — aggressive flow + OI + price response.
+2. **Book** — MicroDev / OFI.
+3. **Inter-market** — DeltaBasis.
+4. **Options** — Position + option aggressive flow; IV/PCR/skew as context.
+5. **Residual** — directional theoretical dislocation.
+
+Within a family, multiple agreeing metrics improve the explanation but the family still counts only once when calculating confidence.
+
+# 53. Confidence — V1 deterministic bands
+
+V1 uses discrete confidence rather than a false-precision numeric score.
+
+Values:
+
+    LOW
+    MEDIUM
+    HIGH
+
+For a directional primary event:
+
+### HIGH
+
+- Futures core event exists;
+- at least three of the four independent external families (Book, Inter-market, Options, Residual) support the same Event Bias;
+- no independent family gives a clear opposite-direction contradiction.
+
+### MEDIUM
+
+- Futures core event exists;
+- at least one external family supports the same bias;
+- no more than one external family clearly contradicts it.
+
+### LOW
+
+- Futures core event exists but confirmation is weak;
+- or two or more independent families materially disagree;
+- or important inputs required for confirmation are unavailable.
+
+For Neutral events such as absorption/conflict, Confidence means confidence that the **event condition exists**, not confidence in Long/Short direction.
+
+Data unavailability must not be counted as agreement or contradiction.
+
+# 54. Market Regime state machine
+
+V1 should maintain one current Market Regime per session.
+
+Initial state:
+
+    Neutral
+
+Transitions:
+
+### Neutral -> Bullish
+When a LONG BuyerExpansion or ShortCovering event is created with MEDIUM/HIGH confidence.
+
+### Neutral -> Bearish
+When a SHORT SellerExpansion or LongLiquidation event is created with MEDIUM/HIGH confidence.
+
+### Bullish -> Transition
+When BuyerAbsorption, BuyerRejectionConfirmed, or a material SHORT event challenges the existing bullish regime.
+
+### Bearish -> Transition
+When SellerAbsorption, SellerRejectionConfirmed, or a material LONG event challenges the existing bearish regime.
+
+### Transition -> Bullish
+When BuyerExpansion occurs after a LONG-confirmed transition.
+
+### Transition -> Bearish
+When SellerExpansion occurs after a SHORT-confirmed transition.
+
+### Any directional regime -> Conflict
+When material independent-family disagreement persists and no directional event can be confirmed.
+
+### Conflict -> Bullish/Bearish
+When aligned directional evidence returns with MEDIUM/HIGH confidence.
+
+### Any -> Neutral
+Only at session initialization/reset or when no active directional lifecycle remains under the finalized regime-expiry policy.
+
+V1 should avoid aggressively resetting to Neutral between ordinary bars. Regime is intentionally more persistent than an individual event.
+
+# 55. Event lifecycle
+
+Lifecycle values:
+
+    New
+    Strengthening
+    Weakening
+    Confirmed
+    Resolved
+    Flipped
+
+Do not persist an event row for every ordinary Active bar.
+
+## 55.1 New
+
+A materially different EventType appears compared with the current active event, or the same event reappears after being resolved.
+
+## 55.2 Strengthening
+
+Same directional event remains active and at least one meaningful change occurs, such as:
+
+- Evolution changes toward Strengthening;
+- RollingStrictAbsDeltaChange increases in the event direction;
+- a previously absent independent confirmation family becomes supportive;
+- Confidence improves LOW -> MEDIUM or MEDIUM -> HIGH.
+
+Do not generate Strengthening repeatedly only because raw magnitudes drift.
+
+## 55.3 Weakening
+
+Same event remains relevant but at least one material deterioration occurs:
+
+- Evolution becomes Weakening;
+- RollingStrict dominance magnitude contracts;
+- expected price acceptance disappears;
+- a supporting independent family becomes Neutral/opposing;
+- Confidence falls.
+
+## 55.4 Confirmed
+
+Used when a previously tentative transition becomes explicitly confirmed, especially SellerRejectionConfirmed / BuyerRejectionConfirmed.
+
+## 55.5 Resolved
+
+The event condition no longer exists and no immediate opposite-direction event replaced it.
+
+## 55.6 Flipped
+
+A directly opposing directional event replaces the previous directional event.
+
+Examples:
+
+    SellerExpansion -> BuyerExpansion
+    LongLiquidation -> BuyerExpansion
+
+A Flipped lifecycle is always notification-worthy.
+
+# 56. Commentary event persistence — PostgreSQL is authoritative
+
+Files must **not** be the primary store.
+
+Create a PostgreSQL event table conceptually named:
+
+    adaptive_commentary_events
+
+Recommended fields:
+
+    Id                         bigint primary key
+    SessionId                  bigint not null
+    TradeDate                  date not null
+    BarSeq                     int not null
+    OccurredAtUtc              timestamptz not null
+
+    EventType                  enum/string not null
+    EventBias                  enum/string not null
+    MarketRegime               enum/string not null
+    Lifecycle                  enum/string not null
+    Confidence                 enum/string not null
+    Severity                   enum/string not null
+
+    PreviousEventId            bigint null
+    PreviousBias               enum/string null
+    BiasChanged                bool not null
+
+    PrimaryEvidenceJson        jsonb not null
+    ConfirmationEvidenceJson   jsonb not null
+    ContradictionEvidenceJson  jsonb not null
+    DataQualityJson            jsonb not null
+
+    RenderedCommentary         text not null
+
+    ShouldNotifyTelegram       bool not null
+    NotificationReason        text null
+
+    CreatedAtUtc               timestamptz not null
+
+Foreign-key SessionId to the adaptive session where practical.
+
+Recommended indexes:
+
+    (SessionId, BarSeq)
+    (TradeDate, OccurredAtUtc)
+    (SessionId, EventBias, OccurredAtUtc)
+    (SessionId, EventType, OccurredAtUtc)
+
+Idempotency requirement:
+
+Create a deterministic EventIdentity from:
+
+    SessionId
+    + BarSeq
+    + EventType
+    + Lifecycle
+    + EventBias
+
+and enforce uniqueness either through a stored identity column or an equivalent unique composite index.
+
+Restart/replay of the same completed bar must not produce a duplicate event.
+
+## 56.1 Evidence JSON content
+
+Do not store only prose.
+
+PrimaryEvidenceJson must contain the exact structured facts that created the event.
+
+Example shape:
+
+    {
+      "futures": {
+        "strictDelta": -18400,
+        "enrichedDelta": -22600,
+        "rollStrict": -121000,
+        "rollOiDelta": 12450,
+        "barPriceDelta": -7.5,
+        "rollPriceDelta": -31.5
+      }
+    }
+
+ConfirmationEvidenceJson can contain independent confirmation families such as:
+
+    {
+      "book": {
+        "ofi": -6200,
+        "microDev": -0.31
+      },
+      "basis": {
+        "deltaBasis": -4.8
+      },
+      "options": {
+        "pePosition": "PutLongBuild",
+        "peStrictDelta": 9200,
+        "peDeltaIv": 2.4
+      },
+      "residual": {
+        "directionalResidualPct": -5.2,
+        "directionalResidualDelta": -1.4
+      }
+    }
+
+ContradictionEvidenceJson contains only meaningful opposing facts, not every unavailable metric.
+
+DataQualityJson must record important unavailable/stale/degraded inputs used when determining Confidence.
+
+# 57. Commentary runtime checkpoint
+
+Because many completed bars will legitimately produce **no commentary event**, event rows alone cannot indicate how far evaluation progressed.
+
+Create a small operational checkpoint table conceptually named:
+
+    adaptive_commentary_runtime
+
+One row per SessionId.
+
+Recommended fields:
+
+    SessionId                  bigint primary key
+    LastEvaluatedBarSeq        int not null
+    CurrentEventId             bigint null
+    CurrentEventType           enum/string null
+    CurrentBias                enum/string not null
+    CurrentRegime              enum/string not null
+    CurrentLifecycle           enum/string null
+    LastTelegramBarSeq         int null
+    UpdatedAtUtc               timestamptz not null
+
+This row is operational state, **not** the authoritative market history.
+
+It must be rebuildable by replaying persisted completed bars and commentary events.
+
+On restart:
+
+1. Load session commentary runtime.
+2. Load/reconstruct the current active event/regime.
+3. Evaluate only completed bars after LastEvaluatedBarSeq.
+4. Persist event(s) and checkpoint atomically for each processed bar where practical.
+5. Never announce an old event as New solely because the process restarted.
+
+# 58. Dashboard commentary panel
+
+Add a compact **Live Market Commentary** panel to the Dashboard.
+
+This panel should show the latest meaningful events, newest first.
+
+Recommended visible content per event:
+
+    HH:mm:ss IST
+    Event name
+    Bias: LONG / SHORT / NEUTRAL
+    Regime: BULLISH / BEARISH / TRANSITION / CONFLICT / NEUTRAL
+    Lifecycle
+    Confidence
+    short deterministic explanation
+
+Suggested maximum visible history:
+
+    latest 5 meaningful events
+
+Older history remains queryable from PostgreSQL; the live panel does not need to render the entire day.
+
+Example:
+
+    11:18:43  Seller Expansion
+    Bias SHORT | Regime BEARISH | Strengthening | HIGH
+    Aggressive selling remains dominant with expanding OI and accepted lower prices.
+    OFI, basis and PE PutLongBuild confirm. Residual is aligned.
+
+Example absorption:
+
+    11:31:02  Seller Absorption
+    Bias NEUTRAL | Regime BEARISH | New | MEDIUM
+    Selling remains aggressive but price no longer moves lower.
+    OFI and MicroDev have turned positive; basis is recovering.
+
+Do not display raw JSON in the normal Dashboard panel.
+
+# 59. Deterministic commentary rendering
+
+V1 must **not** use an LLM to decide:
+- EventType;
+- Bias;
+- MarketRegime;
+- Lifecycle;
+- Confidence;
+- whether Telegram should be notified.
+
+Use deterministic templates.
+
+A renderer should receive the structured event and produce concise text.
+
+Recommended structure:
+
+    [Event title]
+    Bias / Regime / Lifecycle / Confidence
+    Primary evidence sentence.
+    Confirmation sentence if present.
+    Contradiction sentence if present.
+
+Example:
+
+    Seller expansion strengthening.
+    Bias SHORT | Regime BEARISH | Confidence HIGH.
+    Seller-aggressive flow remains dominant with rising OI and accepted lower prices.
+    OFI and basis weakened; PE PutLongBuild and bearish residual confirm.
+
+The renderer must never invent evidence that is not present in the event JSON.
+
+If a family is unavailable, either omit it or explicitly say it is unavailable when data quality itself matters.
+
+An LLM can be considered later for non-critical end-of-day summaries, but it is out of V1 live event detection and notification.
+
+# 60. Telegram notification policy
+
+Dashboard commentary can show all persisted meaningful events.
+
+Telegram must be stricter.
+
+Severity values:
+
+    Info
+    Medium
+    High
+
+## 60.1 High severity — Telegram eligible
+
+Examples:
+
+- Event Bias changes Long <-> Short.
+- Event Bias changes directional -> Neutral because a significant absorption/conflict event appeared.
+- SellerRejectionConfirmed / BuyerRejectionConfirmed.
+- New BuyerExpansion / SellerExpansion with HIGH confidence.
+- A directional event Flipped.
+- Confidence becomes HIGH because a new independent family creates broad cross-market agreement.
+- material data-quality failure invalidates previously reliable commentary during the live session.
+
+## 60.2 Medium severity
+
+Normally Dashboard-only unless later configured otherwise.
+
+Examples:
+
+- New absorption.
+- directional event Strengthening or Weakening at MEDIUM confidence.
+- material Basis divergence.
+- Residual dislocation materially opposes an established regime.
+- Options support appears/disappears without a bias change.
+
+## 60.3 Info
+
+Persisted/displayed only.
+
+Examples:
+
+- ordinary continuation;
+- minor context change;
+- one isolated confirming metric with no lifecycle effect.
+
+# 61. Telegram deduplication and cooldown
+
+Never send Telegram directly from the detector.
+
+Use a durable notification outbox following the same reliability principles already used by Adaptive screenshot delivery.
+
+Create a conceptually separate table:
+
+    adaptive_commentary_notification_jobs
+
+Recommended fields:
+
+    Id
+    EventId
+    Status
+    CreatedAtUtc
+    NextAttemptUtc
+    SentAtUtc
+    TelegramMessageId
+    Attempts
+    LastError
+
+Status semantics should mirror the existing safe outbox pattern:
+
+    Pending
+    Sending
+    Sent
+    DeliveryUncertain
+
+Telegram acknowledgement and database commit are not atomic; do not claim exactly-once delivery.
+
+Deduplication:
+
+- One event can create at most one automatic Telegram job.
+- Sent jobs never automatically resend.
+- DeliveryUncertain is not blindly retried.
+- EventId must be unique in the notification outbox.
+
+Cooldown:
+
+Default V1 policy:
+
+    MinimumBarsBetweenSameEventTelegram = 5
+
+This applies to repeated notifications for the same EventType + Bias.
+
+The following bypass cooldown because they are materially new:
+
+- BiasChanged;
+- Flipped;
+- Confirmed rejection/reversal;
+- transition to HIGH confidence caused by new independent-family agreement;
+- critical data-quality warning.
+
+This is an operational notification throttle, not a trading parameter.
+
+# 62. Commentary examples
+
+## 62.1 Seller expansion begins
+
+Possible frame:
+
+    Strict / Enriched       SELL
+    Roll Strict / Enriched  SELL
+    Roll OI                 positive
+    Bar / Roll price        negative
+    OFI                     negative
+    MicroDev                negative
+    DeltaBasis              negative
+    PE Position             PutLongBuild
+    Residual                negative
+
+Persist:
+
+    EventType     SellerExpansion
+    Bias          SHORT
+    Regime        BEARISH
+    Lifecycle     New
+    Confidence    HIGH
+
+Rendered commentary:
+
+    Seller expansion started.
+    Bias SHORT | Regime BEARISH | Confidence HIGH.
+    Seller-aggressive flow is persistent, OI is expanding and price is accepting the selling.
+    OFI, basis, PE PutLongBuild and the residual confirm downside pressure.
+
+## 62.2 Same move continues
+
+Next bar still satisfies SellerExpansion but nothing materially changes.
+
+Result:
+
+    no new event row
+    no Telegram
+    runtime/checkpoint advances
+
+This silence is intentional.
+
+## 62.3 Seller expansion strengthens
+
+Later:
+- rolling Strict magnitude increases materially through existing Evolution logic;
+- Confidence moves MEDIUM -> HIGH because Options becomes supportive.
+
+Persist:
+
+    EventType     SellerExpansion
+    Bias          SHORT
+    Lifecycle     Strengthening
+    Confidence    HIGH
+
+Potential Telegram only if notification policy and cooldown allow it.
+
+## 62.4 Seller absorption appears
+
+Current selling stays aligned, OI remains non-negative, but BarPriceDisplacement becomes >= 0.
+
+Persist:
+
+    EventType     SellerAbsorption
+    Bias          NEUTRAL
+    Regime        BEARISH
+    Lifecycle     New
+
+Commentary:
+
+    Seller absorption appeared.
+    Bias NEUTRAL | Regime BEARISH.
+    Aggressive selling persists, but price is no longer accepting it lower.
+    Book pressure is improving against sellers.
+
+Do not call LONG yet.
+
+## 62.5 Seller rejection becomes confirmed
+
+After SellerAbsorption:
+- price turns positive;
+- selling dominance weakens;
+- at least two independent confirmation families turn LONG-compatible.
+
+Persist:
+
+    EventType     SellerRejectionConfirmed
+    Bias          LONG
+    Regime        TRANSITION
+    Lifecycle     Confirmed
+
+This is Telegram-eligible even during cooldown because BiasChanged.
+
+## 62.6 Buyer expansion follows
+
+Later:
+
+    EventType     BuyerExpansion
+    Bias          LONG
+    Regime        BULLISH
+    Lifecycle     New or Flipped depending on prior active directional event
+
+The commentary timeline now describes the complete transition rather than treating each bar independently.
+
+# 63. Commentary history and research use
+
+PostgreSQL commentary events should later support research without changing V1 live decisions.
+
+Do not modify historical event classification after seeing future prices.
+
+Outcomes may be attached only **after** their horizons become available.
+
+Recommended later outcome fields/table:
+
+    EventId
+    FutureMoveH1
+    FutureMoveH3
+    FutureMoveH5
+    MfePoints
+    MaePoints
+    EventDurationBars
+    NextMajorEventType
+    OutcomeCompletedAtUtc
+
+Prefer a separate table such as:
+
+    adaptive_commentary_event_outcomes
+
+so the immutable event-at-detection record remains unchanged.
+
+These outcomes are research diagnostics only.
+
+They can later answer questions such as:
+
+- What happened after HIGH-confidence SellerExpansion?
+- How often did SellerAbsorption lead to SellerRejectionConfirmed?
+- What happened after Short -> Neutral bias transitions?
+- Did three-family/four-family confirmation outperform a futures-only event?
+- How long did expansion regimes normally persist?
+
+Future outcome analysis must not retroactively rewrite the original EventType, Bias, Confidence or evidence.
+
+# 64. Optional file export
+
+PostgreSQL is the authoritative source.
+
+Files are export only.
+
+A later end-of-day exporter may produce CSV/JSON/text such as:
+
+    09:51  SHORT    SellerExpansion       New
+    10:07  SHORT    SellerExpansion       Strengthening
+    10:24  NEUTRAL  SellerAbsorption      New
+    10:31  LONG     SellerRejection       Confirmed
+    10:38  LONG     BuyerExpansion        New
+
+Deleting an export file must never lose commentary history.
+
+Restart recovery must never depend on an export file.
+
+# 65. Commentary implementation boundaries
+
+The initial implementation must **not**:
+
+- create orders;
+- modify paper/live entry or exit logic;
+- feed commentary back into Futures/Options/Residual calculations;
+- optimize event definitions against historical P&L;
+- create a -100..+100 composite score;
+- use an LLM in the live decision path;
+- send Telegram after every completed bar;
+- infer Long/Short from PCR alone;
+- infer a reversal immediately from absorption;
+- rewrite past events after future outcomes are known.
+
+The commentary engine is a deterministic observation/read-model layer.
+
+# 66. Commentary testing and acceptance requirements
+
+Implementation is not complete until automated/replay tests prove:
+
+1. Same CommentaryFrame always produces the same event classification.
+2. Future data cannot affect a historical event.
+3. BuyerExpansion/SellerExpansion/covering/liquidation rules classify correctly.
+4. Absorption initially produces Neutral bias.
+5. Rejection confirmation requires the prior absorption lifecycle plus the required independent confirmations.
+6. Option support cannot be created from PCR alone.
+7. CallShortCover and PutShortCover are not treated as sufficient fresh directional confirmation by themselves.
+8. Evidence-family counting does not double-count MicroDev+OFI as two families.
+9. Missing data is not treated as contradiction or confirmation.
+10. Confidence bands follow section 53 exactly.
+11. BiasChanged is persisted correctly.
+12. Same bar replay cannot duplicate an event.
+13. Bars with no material event still advance the commentary runtime checkpoint.
+14. Service restart does not turn an existing event into a false New event.
+15. Same-event Telegram cooldown works.
+16. Flipped/BiasChanged/Confirmed events can bypass cooldown.
+17. Sent Telegram jobs are not automatically resent after restart.
+18. DeliveryUncertain follows the existing conservative notification pattern.
+19. Dashboard text is rendered only from the persisted structured event.
+20. Rendered commentary never mentions evidence absent from structured event data.
+21. Historical replay and live processing produce identical commentary events for identical persisted inputs.
+22. Event outcome enrichment cannot mutate the original event record.
+
+# 67. Commentary implementation order
+
+A new engineer should implement commentary in this order:
+
+### Phase C1 — domain contract
+- CommentaryFrame.
+- enums for EventType, EventBias, MarketRegime, Lifecycle, Confidence, Severity.
+- pure deterministic classifier.
+- pure deterministic lifecycle/regime transition logic.
+- pure deterministic renderer.
+- unit tests with hand-built frames.
+
+### Phase C2 — persistence
+- adaptive_commentary_events migration/model.
+- adaptive_commentary_runtime migration/model.
+- idempotent event identity/indexes.
+- repository/service for atomic event + checkpoint advancement.
+- replay/restart tests.
+
+### Phase C3 — projection integration
+- create CommentaryFrame only after Futures/Options/Residual metrics for a completed bar are available.
+- process bars in strict BarSeq order.
+- prove no wall-clock/live-later state leaks into evaluation.
+
+### Phase C4 — Dashboard
+- Live Market Commentary panel.
+- latest five meaningful events.
+- explicit Bias, Regime, Lifecycle, Confidence.
+- deterministic prose from persisted event.
+
+### Phase C5 — Telegram
+- adaptive_commentary_notification_jobs outbox.
+- severity policy.
+- 5-bar same-event cooldown.
+- BiasChanged/Flipped/Confirmed bypasses.
+- safe retry / DeliveryUncertain behavior.
+- Telegram message formatting.
+
+### Phase C6 — replay validation
+- run a historical session through the same completed-bar projection.
+- restart mid-session.
+- compare event identities, order, lifecycle, bias and rendered text.
+- verify no duplicate notifications are queued.
+
+### Phase C7 — research outcomes later
+- event outcome table/export.
+- H1/H3/H5, MFE/MAE and event-duration analysis.
+- this phase remains observational and must not modify V1 live classification.
+
+# 68. Commentary decisions locked for implementation
+
+As of 08 October 2026:
+
+- PostgreSQL is the authoritative commentary store.
+- File output is export-only.
+- Commentary is event-driven, not one message per bar.
+- Commentary evaluates completed futures adaptive bars only.
+- Every meaningful event carries LONG / SHORT / NEUTRAL Event Bias.
+- Event Bias describes directional implication, not an order instruction.
+- Market Regime is separate from Event Bias.
+- Bias transitions are first-class events.
+- Absorption starts NEUTRAL.
+- Reversal direction requires a later confirmation event.
+- Futures core behaviour creates the primary event.
+- Book, Basis, Options and Residual are independent confirmation families.
+- Option PCR/IV/skew are contextual; PCR alone never defines direction.
+- Confidence uses LOW/MEDIUM/HIGH family agreement, not a composite numeric score.
+- Do not double-count correlated metrics from the same evidence family.
+- Persist structured evidence and contradictions, not only prose.
+- Persist meaningful lifecycle transitions, not ordinary continuation bars.
+- Keep an operational per-session checkpoint so silent bars are restart-safe.
+- Dashboard shows recent commentary.
+- Telegram is reserved for material events under explicit severity/cooldown rules.
+- Telegram delivery uses a durable PostgreSQL outbox and conservative DeliveryUncertain semantics.
+- Live event detection/rendering is deterministic and does not use an LLM.
+- Historical outcomes may be attached later but cannot rewrite the original event.
+- Commentary does not modify any trading/execution behaviour in V1.
+
+# 69. Commentary-specific items that remain configurable, not research-tuned
+
+The following are implementation configuration rather than market-edge parameters:
+
+    MinimumBarsBetweenSameEventTelegram = 5
+    DashboardCommentaryRows = 5
+    CommentaryResidualVariant = ATM±2
+
+Defaults above are part of the V1 operational design.
+
+They must not be optimized against P&L during implementation.
+
+Any later change should be explicit and versioned so historical commentary can be reproduced.
+
+# 70. Plan self-sufficiency rule
+
+This document is the implementation contract for the 08-Oct Dashboard/observer enhancement.
+
+A new engineer must be able to understand from this file alone:
+
+- what appears in each compact grid;
+- how every new visible metric is calculated;
+- what remains internal/diagnostic;
+- timestamp/causality/freshness requirements;
+- how Telegram screenshots should be composed;
+- how the Running Market Commentary classifies events;
+- how LONG/SHORT/NEUTRAL bias differs from Market Regime;
+- how events transition through lifecycle;
+- how commentary is persisted/recovered;
+- when Telegram is and is not notified;
+- which behaviors are explicitly forbidden.
+
+If implementation encounters an ambiguity that would alter a metric definition, event direction, persistence semantics, or notification behavior, **stop and update/finalize this plan before inventing behavior in code**.
+
+No undocumented fallback or silently different calculation is acceptable.
