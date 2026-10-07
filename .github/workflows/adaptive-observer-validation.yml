@@ -12,6 +12,7 @@ on:
       - feature/adaptive-telegram-sender-diagnostics
       - feature/adaptive-late-start-readiness
       - fix/dashboard-live-nifty-quotes
+      - fix/dashboard-live-quote-browser-values
       - master
   workflow_dispatch:
 

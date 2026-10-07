@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Playwright;
+using System.Text.RegularExpressions;
 using NiftySignal.Domain.Entities;
 using NiftySignal.Domain.Enums;
 using NiftySignal.Domain.ValueObjects;
@@ -29,17 +30,19 @@ static class LiveQuoteBrowserValidation
         await Expect(panel).ToContainTextAsync("109.00 / 111.00");
         var call = page.GetByLabel("Nifty call strike", new() { Exact=true });
         var put = page.GetByLabel("Nifty put strike", new() { Exact=true });
-        await Expect(call).ToHaveValueAsync("25000"); await Expect(put).ToHaveValueAsync("25000");
+        var selectedStrike = new Regex(@"^25000(?:\.0+)?$"); // PostgreSQL preserves decimal scale.
+        await Expect(call).ToHaveValueAsync(selectedStrike); await Expect(put).ToHaveValueAsync(selectedStrike);
         foreach(var token in new[] { "QUOTE-BANK", "QUOTE-SENSEX", "QUOTE-SENSEX-CE", "QUOTE-NEXT" })
             await push.InvokeAsync("PushTick", Quote(token, 85000));
         // Follow with an accepted NIFTY tick to flush any circuit render triggered by those pushes.
         await push.InvokeAsync("PushTick", Quote("QUOTE-CE", 102));
         await Expect(panel).ToContainTextAsync("101.00 / 103.00");
         await Expect(panel).Not.ToContainTextAsync("85000");
-        await call.SelectOptionAsync("25000"); await put.SelectOptionAsync("25000");
+        await call.SelectOptionAsync(new SelectOptionValue { Label="25000" });
+        await put.SelectOptionAsync(new SelectOptionValue { Label="25000" });
         await push.InvokeAsync("PushTick", Quote("QUOTE-SPOT", 27000));
         await Expect(panel).ToContainTextAsync("27000.00");
-        await Expect(call).ToHaveValueAsync("25000"); await Expect(put).ToHaveValueAsync("25000");
+        await Expect(call).ToHaveValueAsync(selectedStrike); await Expect(put).ToHaveValueAsync(selectedStrike);
         await Expect(panel).ToContainTextAsync("101.00 / 103.00");
         await page.ScreenshotAsync(new() { Path=Path.Combine(evidence,"nifty-live-quote.png"),FullPage=true });
         Console.WriteLine("NIFTY LIVE QUOTE BROWSER PASS: visible without session metadata, persisted LTP/bid/ask, mixed-index/expiry push isolation, CE/PE selection preserved after spot move.");
