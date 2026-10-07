@@ -1409,3 +1409,410 @@ The complete 08-Oct plan is close, but implementation should not start until the
 7. **Screenshot selection state:** define deterministic CE/PE selected-strike behavior for isolated Telegram browser capture so it cannot silently differ from the intended live selection.
 
 No production implementation is authorized until these open items are resolved or explicitly deferred with deterministic behavior documented.
+
+
+# 31. Residual Grid Live-Observation Plan — LOCKED
+
+**Status:** LOCKED FOR IMPLEMENTATION DESIGN as of 08 October 2026.
+
+**Scope:** Adaptive Market Observer → **CE / PE theoretical residual — fixed 09:30 diagnostic**.
+
+The residual grid has one narrow purpose:
+
+> **Show whether CE/PE premiums are richer or cheaper than the fixed 09:30 theoretical expectation, identify which side is driving the dislocation, and show whether that dislocation is strengthening or weakening.**
+
+Do not duplicate Futures-grid or Options-grid metrics here.
+
+Specifically, do **not** add OFI, MicroDev, PCR, OI, IV change or IV skew to the residual grid. Those belong in the Futures/Options grids.
+
+The residual model remains a fixed-09:30 diagnostic, not a trading score or entry/exit rule.
+
+## 31.1 Existing residual model semantics remain unchanged
+
+The existing residual framework remains:
+
+- diagnostic anchor frozen at 09:30;
+- fixed diagnostic strike composition for the entire session;
+- selectable ATM or ATM±2 residual variant;
+- actual option price from causal valid bid/ask midpoint;
+- expected option price produced from the existing pricing model;
+- anchor IV frozen at 09:30;
+- current time-to-expiry allowed to decay naturally;
+- modeled underlying moved from the 09:30 synthetic anchor by the observed futures change;
+- no future quote may be used;
+- stale/missing required quotes make the residual unavailable.
+
+For a side:
+
+    ActualChange = ActualNow - BasePrice09:30
+
+    ExpectedChange = ExpectedNow - BasePrice09:30
+
+    Residual = ActualNow - ExpectedNow
+
+    ResidualPct = 100 × Residual / BasePrice09:30
+
+Current directional residual remains:
+
+    DirectionalResidualPct =
+      CEResidualPct - PEResidualPct
+
+Positive directional residual means CE is relatively richer and/or PE relatively cheaper than the frozen theoretical expectation.
+
+Negative directional residual means PE is relatively richer and/or CE relatively cheaper.
+
+This definition is preserved for continuity with existing research/history.
+
+# 32. Proposed compact Residual grid
+
+Visible order:
+
+    Seq | End IST | Future Δ09:30
+    | CE Res % | CE Res Δ%
+    | PE Res % | PE Res Δ%
+    | Directional Res % | Directional Res Δ
+    | Straddle Res %
+    | Direction | Relation
+    | Quote Age
+
+This becomes the primary compact live residual grid.
+
+The purpose of the compact row is:
+
+    underlying displacement
+    → CE dislocation and its change
+    → PE dislocation and its change
+    → relative directional dislocation
+    → common CE+PE richness/cheapness
+    → direction/relationship summary
+    → quote quality
+
+## 32.1 Seq
+
+Same completed futures adaptive-bar sequence used by the Futures and Options grids.
+
+## 32.2 End IST
+
+Same completed futures adaptive-bar causal end timestamp.
+
+## 32.3 Future Δ09:30
+
+Keep the existing value:
+
+    FutureDelta0930 =
+      FutureNow - Future09:30
+
+This provides the underlying move against which the fixed residual model is being evaluated.
+
+# 33. CE Res % and PE Res %
+
+Keep the existing side residual percentages:
+
+    CEResidualPct =
+      100 × (CEActual - CEExpected) / CEBase09:30
+
+    PEResidualPct =
+      100 × (PEActual - PEExpected) / PEBase09:30
+
+For ATM, CE/PE refer to the fixed center contracts.
+
+For ATM±2, CE/PE values are the corresponding fixed five-contract side aggregates established by the 09:30 anchor.
+
+Interpretation:
+
+- positive CE Res % → calls are richer than frozen-model expectation;
+- negative CE Res % → calls are cheaper than expectation;
+- positive PE Res % → puts are richer than expectation;
+- negative PE Res % → puts are cheaper than expectation.
+
+Residual percentages are relative to their own 09:30 side baseline and must not be treated as equivalent absolute rupee dislocations.
+
+# 34. New visible metrics: CE Res Δ% and PE Res Δ%
+
+The existing grid shows the level of each residual but not how each leg changed from the previous completed adaptive bar.
+
+Add:
+
+    CEResidualDeltaPct_t =
+      CEResidualPct_t - CEResidualPct_(t-1)
+
+    PEResidualDeltaPct_t =
+      PEResidualPct_t - PEResidualPct_(t-1)
+
+Use the previous available residual reading for the **same residual variant** (ATM compared with prior ATM; ATM±2 compared with prior ATM±2).
+
+If the previous residual reading for that variant was unavailable, the delta is unavailable rather than bridging across the gap.
+
+Interpretation:
+
+Example A:
+
+    CE Res %      +4.0
+    PE Res %      -3.0
+    CE Res Δ%     +0.2
+    PE Res Δ%     -2.5
+
+The directional dislocation is strengthening mainly because PE is becoming increasingly cheap relative to expectation.
+
+Example B:
+
+    CE Res %      +4.0
+    PE Res %      -3.0
+    CE Res Δ%     +2.8
+    PE Res Δ%     -0.1
+
+The same directional residual level is now being driven mainly by calls becoming richer.
+
+This distinction is the primary reason to add the two leg-specific residual-delta columns.
+
+# 35. Directional Res % and Directional Res Δ
+
+## 35.1 Directional Res %
+
+Keep the existing definition:
+
+    DirectionalResidualPct =
+      CEResidualPct - PEResidualPct
+
+Do not replace it in V1 because existing research/history already uses this exact value.
+
+## 35.2 Directional Res Δ
+
+Keep the existing Residual Δ calculation but rename/display it clearly as:
+
+    Directional Res Δ
+
+Formula:
+
+    DirectionalResidualDelta_t =
+      DirectionalResidualPct_t
+      - DirectionalResidualPct_(t-1)
+
+Again, do not bridge across an unavailable previous residual reading.
+
+Interpretation:
+- positive → CE-vs-PE relative dislocation is becoming more positive;
+- negative → it is becoming more negative;
+- near zero → little change in the directional residual.
+
+# 36. New visible metric: Straddle Res %
+
+The current Common residual % is an equal-weight average of CE and PE residual percentages:
+
+    CommonResidualPct =
+      (CEResidualPct + PEResidualPct) / 2
+
+Retain that existing value internally for backward compatibility, but the compact grid should instead expose a more economically interpretable **Straddle Res %**.
+
+## 36.1 Formula
+
+Let:
+
+    StraddleActual =
+      CEActual + PEActual
+
+    StraddleExpected =
+      CEExpected + PEExpected
+
+    StraddleResidual =
+      StraddleActual - StraddleExpected
+      = CEResidual + PEResidual
+
+Use the common 09:30 premium denominator:
+
+    StraddleBase09:30 =
+      CEBase09:30 + PEBase09:30
+
+Then:
+
+    StraddleResidualPct =
+      100 × StraddleResidual / StraddleBase09:30
+
+For the ATM±2 variant, CE/PE values are the corresponding fixed side aggregates, so the formula applies to the aggregate fixed diagnostic basket.
+
+## 36.2 Interpretation
+
+Positive Straddle Res %:
+
+> Combined CE+PE premium is richer than the frozen-09:30-IV theoretical model expects.
+
+Negative Straddle Res %:
+
+> Combined CE+PE premium is cheaper than the frozen model expects.
+
+This separates **common premium/volatility richness** from **relative CE-vs-PE directional dislocation**.
+
+Example:
+
+    Directional Res %    +6.0
+    Straddle Res %       +0.3
+
+Interpretation:
+- primarily a relative/directional CE-vs-PE repricing;
+- little common CE+PE richness.
+
+Versus:
+
+    Directional Res %    +1.0
+    Straddle Res %       +7.0
+
+Interpretation:
+- little relative directional dislocation;
+- both option sides are collectively much richer than the frozen model.
+
+This complements the live IV metrics in the Options grid without duplicating them.
+
+# 37. Direction and Relation
+
+## 37.1 Direction
+
+Keep the existing residual direction derived from the sign of DirectionalResidualPct:
+
+- positive → UP;
+- negative → DOWN;
+- zero → NEUTRAL.
+
+This is a residual-direction label, not a trade recommendation.
+
+## 37.2 Relation
+
+Keep the existing comparison against the current futures rolling price direction:
+
+- same non-zero sign → ALIGN;
+- opposite non-zero sign → OPPOSE;
+- either side neutral → NEUTRAL.
+
+This remains a compact descriptive comparison between residual direction and futures rolling direction.
+
+The separate Future roll dir column is no longer required in the compact grid because Relation already conveys the comparison and the Futures grid shows the underlying rolling state directly.
+
+Retain Future roll direction internally/diagnostically.
+
+# 38. Quote Age
+
+Keep maximum quote age visible:
+
+    QuoteAge =
+      max age of all option quotes required by the selected residual variant
+
+Purpose:
+- immediately distinguish a genuine residual reading from one produced near the permitted freshness boundary;
+- make data quality visible without opening diagnostics.
+
+If any required quote breaches the final approved option freshness rule, the residual reading itself should become unavailable rather than merely showing a large age.
+
+# 39. Straddle-normalized directional residual — calculate internally, do not display initially
+
+The existing directional residual subtracts two percentages that use different denominators:
+
+    CEResidualPct - PEResidualPct
+
+On 0-DTE one side can become very cheap, causing a small absolute residual on that side to become a large percentage.
+
+Therefore calculate a second diagnostic with a common denominator:
+
+    DirectionalResidualStraddleNormPct =
+      100 × (CEResidual - PEResidual)
+      / (CEBase09:30 + PEBase09:30)
+
+Do **not** replace the existing DirectionalResidualPct in V1.
+
+Retain both:
+- existing directional residual for research continuity;
+- straddle-normalized directional residual for future comparison/validation.
+
+No threshold or trading rule is attached to the new normalized metric.
+
+# 40. Residual anchor context above the grid
+
+Keep a compact anchor/context area above the residual rows.
+
+Visible context should include:
+
+- **Residual variant:** ATM or ATM±2 selector;
+- **Expiry / DTE**;
+- **Future @09:30**;
+- **Synthetic weekly @09:30**;
+- **Fixed diagnostic center**;
+- **Components:** 1 CE + 1 PE for ATM, or 5 CE + 5 PE for ATM±2.
+
+Continue to state clearly that:
+
+> **Residual strike composition is frozen at 09:30 for the entire session.**
+
+The residual grid must never silently roll its diagnostic strike composition with intraday ATM.
+
+# 41. Residual fields to hide, not remove
+
+Hide from the primary compact residual grid:
+
+- CE Actual Δ;
+- CE Expected Δ;
+- CE Residual points;
+- PE Actual Δ;
+- PE Expected Δ;
+- PE Residual points;
+- Future roll direction;
+- existing Common Residual %;
+- modeled underlying;
+- raw CE/PE actual prices;
+- raw CE/PE expected prices;
+- any existing anchor/component diagnostics not required by the compact view.
+
+Retain all of these in the model/persistence/diagnostic path.
+
+They remain important for:
+- debugging;
+- theoretical-model validation;
+- explaining an abnormal residual;
+- historical research;
+- regression testing.
+
+No residual functionality is removed by hiding a column.
+
+# 42. Residual-grid data-quality and causality requirements
+
+Implementation must prove:
+
+1. The 09:30 residual anchor and its strike composition remain immutable throughout the session.
+2. ATM and ATM±2 histories remain separate.
+3. No option quote later than the bar's causal diagnostic boundary is used.
+4. Required quote freshness is enforced consistently.
+5. CE/PE residual Δ does not bridge across unavailable prior readings.
+6. Directional Res Δ does not bridge across unavailable prior readings.
+7. Straddle Res % uses the common 09:30 CE+PE denominator.
+8. The existing Directional Res % formula remains unchanged.
+9. The new straddle-normalized directional residual is additive/diagnostic only and cannot silently replace existing research fields.
+10. 0-DTE time decay continues to use the existing time-to-expiry convention.
+11. Restart/replay reproduces identical residual rows and deltas.
+12. Compact-grid hiding does not delete existing actual/expected/residual-point diagnostics.
+13. No residual metric is used to alter scoring, entries, exits or execution.
+14. Telegram/browser rendering shows the same residual values for the same persisted completed bar.
+
+# 43. Residual-grid decisions frozen
+
+As of **08 October 2026**, the Residual grid design is locked as:
+
+    Seq | End IST | Future Δ09:30
+    | CE Res % | CE Res Δ%
+    | PE Res % | PE Res Δ%
+    | Directional Res % | Directional Res Δ
+    | Straddle Res %
+    | Direction | Relation
+    | Quote Age
+
+Also frozen:
+
+- Keep fixed 09:30 anchor semantics.
+- Keep ATM and ATM±2 selector.
+- Keep current Directional Residual % definition for continuity.
+- Add CE and PE residual change independently.
+- Add Straddle Residual % using a common 09:30 CE+PE premium denominator.
+- Calculate straddle-normalized directional residual internally only.
+- Keep Quote Age visible.
+- Keep Direction and Relation.
+- Hide rather than remove actual/expected/intermediate diagnostic columns.
+- Do not duplicate Options-grid IV/OI/PCR/MicroDev/OFI in this grid.
+- No composite score or trading rule is introduced.
+
+The **Residual-grid metric design itself is finalized**. The broader implementation remains blocked only by the cross-cutting open items already listed in section 30, unless those are explicitly resolved/deferred before coding.
