@@ -21,6 +21,11 @@ public sealed class AdaptiveHistoricalBootstrapService(
     static readonly TimeOnly Open = new(9, 15);
     static readonly TimeOnly Cutoff = new(9, 30);
     static readonly TimeOnly Close = new(15, 35);
+    // The 13 frozen discovery sessions (ExpectedCompleteBars, strong threshold) were produced from
+    // ticks whose EXCHANGE timestamp is <= 15:30:00. Later ticks add extra exact bars and break parity
+    // (an AvailableAt cutoff is not equivalent: 2026-09-25 has a 15:30:00 exchange tick that is
+    // available after 15:30:00).
+    static readonly TimeOnly DiscoveryResearchClose = new(15, 30);
 
     public async Task EnsurePriorSessionsAsync(
         NiftySignalDbContext source,
@@ -95,9 +100,13 @@ public sealed class AdaptiveHistoricalBootstrapService(
             return false;
         }
 
+        var hasDiscoverySpec = OpeningVolumeProjectionV1.DiscoveryOutOfFold.TryGetValue(day, out var discoverySpec);
         var closeUtc = ToUtc(day, Close);
         var clean = await tickReader.ReadCleanSessionAsync(source, day, new[] { future.Token }, closeUtc, ct);
-        var ticks = clean.Select(x => x.Tick).ToArray();
+        var researchCloseUtc = ToUtc(day, DiscoveryResearchClose);
+        var ticks = clean.Select(x => x.Tick)
+            .Where(x => !hasDiscoverySpec || x.ExchangeTimestamp <= researchCloseUtc)
+            .ToArray();
         if (ticks.Length < 2)
         {
             return false;
@@ -115,7 +124,6 @@ public sealed class AdaptiveHistoricalBootstrapService(
             }
         }
 
-        var hasDiscoverySpec = OpeningVolumeProjectionV1.DiscoveryOutOfFold.TryGetValue(day, out var discoverySpec);
         var coveredMinutes = AdaptiveOpeningCoverage.CoveredMinutes(ticks, ToUtc(day, Open), cutoffUtc);
         if (!hasDiscoverySpec && (coveredMinutes != 15 || openingVolume <= 0))
         {
