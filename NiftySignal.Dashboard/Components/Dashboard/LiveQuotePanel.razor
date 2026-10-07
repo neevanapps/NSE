@@ -37,10 +37,10 @@
             <div class="quote-group quote-group-right">
                 <div class="quote-stat">
                     <span class="badge badge-bull">CE</span>
-                    <select class="quote-select" aria-label="Nifty call strike" value="@_selectedCallStrike?.ToString("0")" @onchange="OnCallStrikeChanged">
+                    <select class="quote-select" aria-label="Nifty call strike" @bind="_selectedCallStrike" @bind:after="OnCallStrikeChanged">
                         @foreach (var strike in Strikes)
                         {
-                            <option value="@strike">@strike.ToString("0")</option>
+                            <option @key="strike" value="@strike" selected="@(strike == _selectedCallStrike)">@strike.ToString("0")</option>
                         }
                     </select>
                     <span class="mono quote-value">@FormatQuote(CallRow, _callPending)</span>
@@ -48,10 +48,10 @@
 
                 <div class="quote-stat">
                     <span class="badge badge-bear">PE</span>
-                    <select class="quote-select" aria-label="Nifty put strike" value="@_selectedPutStrike?.ToString("0")" @onchange="OnPutStrikeChanged">
+                    <select class="quote-select" aria-label="Nifty put strike" @bind="_selectedPutStrike" @bind:after="OnPutStrikeChanged">
                         @foreach (var strike in Strikes)
                         {
-                            <option value="@strike">@strike.ToString("0")</option>
+                            <option @key="strike" value="@strike" selected="@(strike == _selectedPutStrike)">@strike.ToString("0")</option>
                         }
                     </select>
                     <span class="mono quote-value">@FormatQuote(PutRow, _putPending)</span>
@@ -120,14 +120,13 @@
         _sessionValid = session?.IsValidAt(DateTimeOffset.UtcNow) ?? false;
     }
 
-    async Task OnCallStrikeChanged(ChangeEventArgs e)
+    async Task OnCallStrikeChanged()
     {
-        if (!decimal.TryParse(e.Value?.ToString(), out var strike))
+        if (_selectedCallStrike is not { } strike)
         {
             return;
         }
 
-        _selectedCallStrike = strike;
         if (Live.QuickQuotes.ContainsKey((strike, OptionType.Call)))
         {
             return;
@@ -139,14 +138,13 @@
         finally { _callPending = false; }
     }
 
-    async Task OnPutStrikeChanged(ChangeEventArgs e)
+    async Task OnPutStrikeChanged()
     {
-        if (!decimal.TryParse(e.Value?.ToString(), out var strike))
+        if (_selectedPutStrike is not { } strike)
         {
             return;
         }
 
-        _selectedPutStrike = strike;
         if (Live.QuickQuotes.ContainsKey((strike, OptionType.Put)))
         {
             return;
