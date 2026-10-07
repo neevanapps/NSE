@@ -147,6 +147,7 @@ try {
     await page.ScreenshotAsync(new() { Path=Path.Combine(evidence,"selectors.png"),FullPage=true });
     await using var push=new HubConnectionBuilder().WithUrl(url+"/hubs/market-data").Build();
     await push.StartAsync();
+    await LiveQuoteBrowserValidation.CheckAsync(page, push, baseConnection, evidence);
     var samples=new List<double>();
     for(var seq=21;seq<=43;seq++) {
         AddRows(seq); runtime.LastCompletedBarSeq=seq;runtime.LastHeartbeatUtc=DateTimeOffset.UtcNow;

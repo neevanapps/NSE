@@ -7,10 +7,10 @@
 @inject IDbContextFactory<NiftySignalDbContext> DbFactory
 @inject LiveDataService Live
 
-@if (_sessionValid)
-{
-    <div class="panel quote-panel">
-        <div class="panel-title">Live Quote</div>
+    <div class="panel quote-panel" data-testid="live-quote">
+        <div class="panel-title">NIFTY Live Quote
+            @if (!_sessionValid) { <span class="badge badge-warn">Session metadata stale — check login</span> }
+        </div>
 
         <div class="quote-row">
             <div class="quote-group">
@@ -37,10 +37,10 @@
             <div class="quote-group quote-group-right">
                 <div class="quote-stat">
                     <span class="badge badge-bull">CE</span>
-                    <select class="quote-select" value="@_selectedCallStrike?.ToString("0")" @onchange="OnCallStrikeChanged">
+                    <select class="quote-select" aria-label="Nifty call strike" @bind="_selectedCallStrike" @bind:after="OnCallStrikeChanged">
                         @foreach (var strike in Strikes)
                         {
-                            <option value="@strike">@strike.ToString("0")</option>
+                            <option @key="strike" value="@strike" selected="@(strike == _selectedCallStrike)">@strike.ToString("0")</option>
                         }
                     </select>
                     <span class="mono quote-value">@FormatQuote(CallRow, _callPending)</span>
@@ -48,10 +48,10 @@
 
                 <div class="quote-stat">
                     <span class="badge badge-bear">PE</span>
-                    <select class="quote-select" value="@_selectedPutStrike?.ToString("0")" @onchange="OnPutStrikeChanged">
+                    <select class="quote-select" aria-label="Nifty put strike" @bind="_selectedPutStrike" @bind:after="OnPutStrikeChanged">
                         @foreach (var strike in Strikes)
                         {
-                            <option value="@strike">@strike.ToString("0")</option>
+                            <option @key="strike" value="@strike" selected="@(strike == _selectedPutStrike)">@strike.ToString("0")</option>
                         }
                     </select>
                     <span class="mono quote-value">@FormatQuote(PutRow, _putPending)</span>
@@ -59,7 +59,7 @@
             </div>
         </div>
     </div>
-}
+
 
 @code {
     const decimal StrikeInterval = 50m;
@@ -71,16 +71,34 @@
     bool _putPending;
     bool _sessionValid;
 
-    IEnumerable<decimal> Strikes
+    bool _disposed;
+
+    IEnumerable<decimal> Strikes => BuildStrikes(Live.SpotLtp,
+        Live.QuickQuotes.Keys.Select(x => x.Strike), _selectedCallStrike, _selectedPutStrike);
+
+    internal static IReadOnlyList<decimal> BuildStrikes(decimal? spot, IEnumerable<decimal> available,
+        decimal? selectedCall, decimal? selectedPut)
     {
-        get
-        {
-            var center = Live.SpotLtp is { } spot ? Math.Round(spot / StrikeInterval) * StrikeInterval : 0m;
+        var known = available.Where(x => x > 0).Distinct().OrderBy(x => x).ToArray();
+        var center = spot is > 0 ? Math.Round(spot.Value / StrikeInterval) * StrikeInterval
+            : known.Length > 0 ? known[known.Length / 2] : 0m;
+        var strikes = new SortedSet<decimal>(known);
+        if (center > 0)
             for (var i = -StrikeRangeCount; i <= StrikeRangeCount; i++)
-            {
-                yield return center + (i * StrikeInterval);
-            }
-        }
+                if (center + i * StrikeInterval > 0) strikes.Add(center + i * StrikeInterval);
+        if (selectedCall is > 0) strikes.Add(selectedCall.Value);
+        if (selectedPut is > 0) strikes.Add(selectedPut.Value);
+        return strikes.ToArray();
+    }
+
+    void SeedSelection()
+    {
+        var strikes = Live.QuickQuotes.Keys.Select(x => x.Strike).Where(x => x > 0).Distinct().ToArray();
+        if (strikes.Length == 0) return; // Never freeze zero before the first quote arrives.
+        var initial = Live.SpotLtp is > 0 ? strikes.OrderBy(x => Math.Abs(x - Live.SpotLtp.Value)).ThenBy(x => x).First()
+            : strikes.OrderBy(x => x).ElementAt(strikes.Length / 2);
+        _selectedCallStrike ??= initial;
+        _selectedPutStrike ??= initial;
     }
 
     QuickQuote? CallRow => _selectedCallStrike is { } s && Live.QuickQuotes.TryGetValue((s, OptionType.Call), out var q) ? q : null;
@@ -90,6 +108,7 @@
     protected override async Task OnInitializedAsync()
     {
         await RefreshSessionValidityAsync();
+        SeedSelection();
         Live.Updated += OnLiveUpdated;
         Live.QuoteUpdated += OnQuoteUpdated;
     }
@@ -101,14 +120,13 @@
         _sessionValid = session?.IsValidAt(DateTimeOffset.UtcNow) ?? false;
     }
 
-    async Task OnCallStrikeChanged(ChangeEventArgs e)
+    async Task OnCallStrikeChanged()
     {
-        if (!decimal.TryParse(e.Value?.ToString(), out var strike))
+        if (_selectedCallStrike is not { } strike)
         {
             return;
         }
 
-        _selectedCallStrike = strike;
         if (Live.QuickQuotes.ContainsKey((strike, OptionType.Call)))
         {
             return;
@@ -116,18 +134,17 @@
 
         _callPending = true;
         StateHasChanged();
-        await Live.RequestSubscriptionAsync(strike, OptionType.Call);
-        _callPending = false;
+        try { await Live.RequestSubscriptionAsync(strike, OptionType.Call); }
+        finally { _callPending = false; }
     }
 
-    async Task OnPutStrikeChanged(ChangeEventArgs e)
+    async Task OnPutStrikeChanged()
     {
-        if (!decimal.TryParse(e.Value?.ToString(), out var strike))
+        if (_selectedPutStrike is not { } strike)
         {
             return;
         }
 
-        _selectedPutStrike = strike;
         if (Live.QuickQuotes.ContainsKey((strike, OptionType.Put)))
         {
             return;
@@ -135,8 +152,8 @@
 
         _putPending = true;
         StateHasChanged();
-        await Live.RequestSubscriptionAsync(strike, OptionType.Put);
-        _putPending = false;
+        try { await Live.RequestSubscriptionAsync(strike, OptionType.Put); }
+        finally { _putPending = false; }
     }
 
     static string FormatPrice(decimal? price) => price is { } p ? p.ToString("0.00") : "—";
@@ -191,16 +208,13 @@
     // seed only -- both change rarely, unlike the quote data itself.
     void OnLiveUpdated()
     {
-        InvokeAsync(async () =>
+        if (_disposed) return;
+        _ = InvokeAsync(async () =>
         {
             await RefreshSessionValidityAsync();
 
-            if (_selectedCallStrike is null || _selectedPutStrike is null)
-            {
-                var atm = Live.OptionChain.FirstOrDefault(r => r.IsAtm)?.Strike;
-                _selectedCallStrike ??= atm ?? Live.OptionChain.Select(r => r.Strike).FirstOrDefault();
-                _selectedPutStrike ??= atm ?? Live.OptionChain.Select(r => r.Strike).FirstOrDefault();
-            }
+            if (_disposed) return;
+            SeedSelection();
 
             StateHasChanged();
         });
@@ -208,10 +222,15 @@
 
     // Fast path (push, via Live.QuoteUpdated -- fires the instant Host forwards a tick):
     // the actual quote values this panel exists to show.
-    void OnQuoteUpdated() => InvokeAsync(StateHasChanged);
+    void OnQuoteUpdated()
+    {
+        if (_disposed) return;
+        _ = InvokeAsync(() => { if (_disposed) return; SeedSelection(); StateHasChanged(); });
+    }
 
     public void Dispose()
     {
+        _disposed = true;
         Live.Updated -= OnLiveUpdated;
         Live.QuoteUpdated -= OnQuoteUpdated;
     }
