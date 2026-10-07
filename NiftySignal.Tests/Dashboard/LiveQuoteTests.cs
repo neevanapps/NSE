@@ -113,7 +113,7 @@ public sealed class LiveQuoteTests
     {
         public Factory Factory { get; } = new();
         public LiveDataService Live { get; }
-        public Fixture() => Live = new(Factory, new FlatTradeAuthClient(new HttpClient(), Options.Create(new FlatTradeOptions())),
+        public Fixture() => Live = new(Factory, new FlatTradeAuthClient(new HttpClient(), Options.Create(new FlatTradeOptions { UserId = "test", ApiKey = "test", ApiSecret = "test" })),
             new Monitor(), NullLogger<LiveDataService>.Instance, startPolling: false);
         public void Dispose() => Live.Dispose();
     }
