@@ -188,6 +188,9 @@ try
     builder.Services.AddSingleton<AdaptiveSessionCoordinator>();
     builder.Services.AddSingleton<AdaptiveObserverPersistence>();
     builder.Services.AddSingleton<AdaptiveSupplementalPersistence>();
+    // Shared with the Dashboard (NiftySignal.Notifications): the Host creates commentary notification jobs only while this is enabled and Telegram is configured.
+    builder.Services.Configure<AdaptiveCommentaryTelegramOptions>(builder.Configuration.GetSection(AdaptiveCommentaryTelegramOptions.SectionName));
+    builder.Services.AddSingleton<AdaptiveCommentaryNotificationGate>();
     builder.Services.AddSingleton<AdaptiveCommentaryFrameLoader>();
     builder.Services.AddSingleton<AdaptiveCommentaryService>();
     builder.Services.AddSingleton<AdaptiveWeak2ObservationService>();

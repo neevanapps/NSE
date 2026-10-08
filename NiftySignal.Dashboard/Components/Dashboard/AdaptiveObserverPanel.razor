@@ -584,17 +584,25 @@
         {
             while (_headerTimer is not null && await _headerTimer.WaitForNextTickAsync(ct))
             {
-                var header = await AdaptiveData.LoadHeaderAsync(ct);
-                if (header is not null && _snapshot is not null && header.Session.Id == _snapshot.Session.Id
-                    && header.Runtime.LastCompletedBarSeq == (_snapshot.Futures.FirstOrDefault()?.Bar.BarSeq ?? 0)
-                    && _loadError is null)
+                var displayed = _snapshot;
+                if (displayed is not null && _loadError is null && displayed.Session.TradeDate == TodayIst())
                 {
-                    _snapshot = _snapshot with { Runtime = header.Runtime, Session = header.Session, ConsecutiveValidBars = header.ConsecutiveValidBars };
-                    await InvokeAsync(StateHasChanged);
+                    // Steady state: ONE indexed runtime read by the known session id. Session metadata and ten-bar readiness only change when
+                    // a completed bar changes, which a push or the sequence comparison below turns into a full reload.
+                    var runtime = await AdaptiveData.LoadRuntimeAsync(displayed.Session.Id, ct);
+                    if (runtime is null) { await ReloadAsync(); }
+                    else if (runtime.LastCompletedBarSeq == (displayed.Futures.FirstOrDefault()?.Bar.BarSeq ?? 0))
+                    {
+                        _snapshot = displayed with { Runtime = runtime };
+                        await InvokeAsync(StateHasChanged);
+                    }
+                    else { await ReloadAsync(); }
                 }
-                else if (header is not null)
+                else
                 {
-                    await ReloadAsync();
+                    // No snapshot yet, a failed previous read, or the trade date rolled over: locate today's session the full way.
+                    var header = await AdaptiveData.LoadHeaderAsync(ct);
+                    if (header is not null) await ReloadAsync();
                 }
             }
         }
@@ -607,6 +615,8 @@
             await InvokeAsync(StateHasChanged);
         }
     }
+
+    static DateOnly TodayIst() => DateOnly.FromDateTime(DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromHours(5.5)).DateTime);
 
     void OnAdaptiveUpdated() => _ = InvokeAsync(ReloadAsync);
 

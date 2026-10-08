@@ -20,8 +20,8 @@
     @if (_model.IsDegraded)
     {
         <div class="commentary-degraded" data-testid="commentary-degraded" role="alert">
-            Commentary is DEGRADED and stopped: replay disagreed with stored history at bar @_model.Degraded![0].BarSeq.
-            Stored events were not modified; nothing after that bar is evaluated until this is reconciled. The market data above is unaffected.
+            Commentary is DEGRADED and stopped: replay mismatch at bar @_model.Degraded![0].BarSeq; commentary verified only through bar @_model.VerifiedThroughBar.
+            Stored events were not modified@(_model.QuarantinedCount > 0 ? $" ({_model.QuarantinedCount} later stored event(s) are quarantined and not shown)" : ""); nothing after the verified bar is evaluated or notified until this is reconciled. The market data above is unaffected.
         </div>
     }
     <div class="commentary-note">

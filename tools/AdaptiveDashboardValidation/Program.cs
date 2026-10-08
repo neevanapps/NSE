@@ -261,9 +261,16 @@ try {
     await page.ReloadAsync();
     await Expect(page.Locator("[data-readiness='ready']")).ToBeVisibleAsync();
     var lastFixtureBar=db.FutureBars.Local.Single(x=>x.SessionId==session.Id && x.BarSeq==43);
-    lastFixtureBar.TradeUpdates=0; await db.SaveChangesAsync();
+    // Completed bars are immutable in production, so readiness only changes when the completed sequence moves (the steady-state header refresh reads
+    // just the runtime row). Model "the latest completed bar is invalid" as the sequence advancing onto an invalid bar.
+    var newestSeq=page.Locator("table[data-grid='futures-compact'] tbody tr").First.Locator("td").First;
+    async Task MoveTo(int seq) { runtime.LastCompletedBarSeq=seq; await db.SaveChangesAsync(); await Expect(newestSeq).ToHaveTextAsync(seq.ToString()); }
+    lastFixtureBar.TradeUpdates=0; await MoveTo(42);
+    await Expect(page.Locator("[data-readiness='ready']")).ToBeVisibleAsync();
+    await MoveTo(43);
     await Expect(page.Locator("[data-readiness='warming']")).ToContainTextAsync("0/10");
-    lastFixtureBar.TradeUpdates=1; await db.SaveChangesAsync();
+    lastFixtureBar.TradeUpdates=1; await MoveTo(42);
+    await MoveTo(43);
     await Expect(page.Locator("[data-readiness='ready']")).ToBeVisibleAsync();
     Console.WriteLine("READINESS BROWSER PASS: nine bars provisional, ten-plus valid bars ready, invalid latest bar revokes readiness.");
     // Commentary (Slice 4C): events are persisted, shown newest first, and only the eligible one (Flipped; the later move to NEUTRAL is Dashboard-only) was queued and delivered once.

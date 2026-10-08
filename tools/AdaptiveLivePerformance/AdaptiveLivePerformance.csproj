@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType></PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../NiftySignal.Host/NiftySignal.Host.csproj" />
+    <ProjectReference Include="../../NiftySignal.Dashboard/NiftySignal.Dashboard.csproj" />
+  </ItemGroup>
+</Project>

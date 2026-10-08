@@ -36,9 +36,13 @@ public sealed class AdaptiveCommentaryService(
 
     /// <summary>Evaluates every completed persisted bar after the checkpoint up to <paramref name="throughBarSeq"/>. Returns the number of bars evaluated.</summary>
     public async Task<int> ProcessThroughAsync(
-        AdaptiveObserverDbContext db, AdaptiveSessionStateRow session, int throughBarSeq, CommentaryNotificationMode mode, CancellationToken ct)
+        AdaptiveObserverDbContext db, AdaptiveSessionStateRow session, int throughBarSeq, CommentaryNotificationMode mode, CancellationToken ct,
+        int? stopBeforeBarSeq = null)
     {
         var evaluated = 0;
+        // A bar whose sidecar integrity is unknown (and every later bar) is not evaluated now: commentary only consumes verified inputs,
+        // and evaluating it later with the verified row is deterministic. Bars before the cap are catch-up, so nothing is enqueued for them.
+        var lastBar = stopBeforeBarSeq is { } cap ? Math.Min(throughBarSeq, cap - 1) : throughBarSeq;
         try
         {
             var version = CommentaryEvaluator.Version;
@@ -51,7 +55,7 @@ public sealed class AdaptiveCommentaryService(
 
             var runtime = await db.CommentaryRuntime.SingleOrDefaultAsync(x => x.SessionId == session.Id && x.CommentaryVersion == version, ct);
             var state = runtime is null ? CommentaryState.Initial : ToState(runtime);
-            for (var seq = state.LastEvaluatedBarSeq + 1; seq <= throughBarSeq; seq++)
+            for (var seq = state.LastEvaluatedBarSeq + 1; seq <= lastBar; seq++)
             {
                 var frame = await frames.LoadAsync(db, session, seq, ct);
                 if (frame is null) break;                       // bar not persisted (yet): stop; the next call resumes here
@@ -103,10 +107,14 @@ public sealed class AdaptiveCommentaryService(
     /// Catches the checkpoint up to the latest persisted completed bar (restart / mid-session deployment / rebuild). Always a non-notifying
     /// backfill: history is reconstructed and persisted, but no Telegram job is created for it.
     /// </summary>
-    public async Task<int> ProcessAllCompletedAsync(AdaptiveObserverDbContext db, AdaptiveSessionStateRow session, CancellationToken ct)
+    public Task<int> ProcessAllCompletedAsync(AdaptiveObserverDbContext db, AdaptiveSessionStateRow session, CancellationToken ct) =>
+        ProcessAllCompletedAsync(db, session, stopBeforeBarSeq: null, ct);
+
+    /// <summary>As above, never evaluating at or past <paramref name="stopBeforeBarSeq"/> (a bar whose sidecar integrity is unknown).</summary>
+    public async Task<int> ProcessAllCompletedAsync(AdaptiveObserverDbContext db, AdaptiveSessionStateRow session, int? stopBeforeBarSeq, CancellationToken ct)
     {
         var last = await db.FutureBars.AsNoTracking().Where(x => x.SessionId == session.Id).Select(x => (int?)x.BarSeq).MaxAsync(ct) ?? 0;
-        return last == 0 ? 0 : await ProcessThroughAsync(db, session, last, CommentaryNotificationMode.Suppress, ct);
+        return last == 0 ? 0 : await ProcessThroughAsync(db, session, last, CommentaryNotificationMode.Suppress, ct, stopBeforeBarSeq);
     }
 
     async Task StopOnMismatchAsync(AdaptiveObserverDbContext db, long sessionId, string version, int barSeq, string detail, CancellationToken ct)
@@ -119,8 +127,12 @@ public sealed class AdaptiveCommentaryService(
             Detail = detail.Length > 512 ? detail[..512] : detail, DetectedAtUtc = DateTimeOffset.UtcNow,
         });
         await db.SaveChangesAsync(ct);
-        logger.LogError("Adaptive commentary STOPPED at bar {Bar} (session={SessionId}, version={Version}); the checkpoint was not advanced and history was not modified. {Detail}",
-            barSeq, sessionId, version, detail);
+        // Defense in depth: jobs for events at or after the mismatch are downstream of an unverified state transition and must never be sent.
+        // Already-Sent jobs cannot be recalled; Suppressed is terminal and is never revived by a later reconciliation.
+        var suppressed = await AdaptiveCommentaryOutbox.SuppressPendingFromBarAsync(db, sessionId, version, barSeq,
+            $"Suppressed: commentary projection degraded upstream at bar {barSeq}.", ct);
+        logger.LogError("Adaptive commentary STOPPED at bar {Bar} (session={SessionId}, version={Version}); the checkpoint was not advanced and history was not modified. {Detail} ({Suppressed} downstream pending notification(s) suppressed)",
+            barSeq, sessionId, version, detail, suppressed);
     }
 
     /// <summary>Queues at most one Telegram job per event, applying the same-event cooldown (V1: every eligible class bypasses it). Never sends.</summary>

@@ -69,8 +69,9 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
             logger.LogError(
                 "Adaptive futures supplemental metrics mismatch (row left untouched): session={SessionId}, bar={BarSeq}, version={Version}, {Difference}",
                 sessionId, expected.BarSeq, expected.MetricsVersion, difference);
-            await RecordInvalidAsync(db, sessionId, AdaptiveProjectionComponents.FuturesSupplemental, expected.MetricsVersion, expected.BarSeq, difference, ct);
-            return SupplementalOutcome.Mismatch;
+            // If the known-invalid marker cannot be stored, integrity is UNKNOWN (not "known invalid"): report Failed so nothing consumes the row.
+            return await RecordInvalidAsync(db, sessionId, AdaptiveProjectionComponents.FuturesSupplemental, expected.MetricsVersion, expected.BarSeq, difference, ct)
+                ? SupplementalOutcome.Mismatch : SupplementalOutcome.Failed;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -133,8 +134,8 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
             logger.LogError(
                 "Adaptive options supplemental metrics mismatch (row left untouched): session={SessionId}, bar={BarSeq}, version={Version}, {Difference}",
                 session.Id, expected.BarSeq, expected.MetricsVersion, difference);
-            await RecordInvalidAsync(db, session.Id, AdaptiveProjectionComponents.OptionsSupplemental, expected.MetricsVersion, expected.BarSeq, difference, ct);
-            return SupplementalOutcome.Mismatch;
+            return await RecordInvalidAsync(db, session.Id, AdaptiveProjectionComponents.OptionsSupplemental, expected.MetricsVersion, expected.BarSeq, difference, ct)
+                ? SupplementalOutcome.Mismatch : SupplementalOutcome.Failed;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -165,7 +166,7 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
     /// Durably marks a bar's sidecar as known-invalid (insert-if-missing; the sidecar row itself is never touched). A failure to write the
     /// marker is logged and swallowed: the core observer must never be affected by sidecar health bookkeeping.
     /// </summary>
-    async Task RecordInvalidAsync(AdaptiveObserverDbContext db, long sessionId, string component, string version, int barSeq, string detail, CancellationToken ct)
+    async Task<bool> RecordInvalidAsync(AdaptiveObserverDbContext db, long sessionId, string component, string version, int barSeq, string detail, CancellationToken ct)
     {
         AdaptiveProjectionHealthRow? marker = null;
         try
@@ -173,7 +174,7 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
             if (await db.ProjectionHealth.AsNoTracking().AnyAsync(x => x.SessionId == sessionId && x.Component == component
                     && x.Version == version && x.BarSeq == barSeq, ct))
             {
-                return;
+                return true;
             }
 
             marker = new AdaptiveProjectionHealthRow
@@ -183,6 +184,7 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
             };
             db.ProjectionHealth.Add(marker);
             await db.SaveChangesAsync(ct);
+            return true;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -201,7 +203,26 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
             {
                 // The context itself is unusable; nothing more to protect.
             }
+
+            return false;
         }
+    }
+
+    /// <summary>
+    /// Persists/verifies both sidecars of a completed bar. Returns true when the integrity of each is established: Skipped, Inserted, Verified,
+    /// or Mismatch (durably marked known-invalid, so consumers treat it as unavailable). Returns false when integrity is UNKNOWN (a write/verify
+    /// failed): commentary must not consume that bar's sidecars. One immediate retry absorbs a transient failure; the caller retries later.
+    /// </summary>
+    public async Task<bool> PersistAndVerifyAsync(AdaptiveObserverDbContext db, AdaptiveSessionStateRow session, AdaptiveCompletedBarPackage package, CancellationToken ct)
+    {
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            var futures = await PersistOrVerifyFuturesAsync(db, session.Id, package, ct);
+            var options = await PersistOrVerifyOptionsAsync(db, session, package, ct);
+            if (futures != SupplementalOutcome.Failed && options != SupplementalOutcome.Failed) return true;
+        }
+
+        return false;
     }
 
     public static AdaptiveOptionsSupplementalRow MapOptions(long sessionId, int barSeq, OptionsSupplementalBar b, DateTimeOffset observationStartUtc) => new()

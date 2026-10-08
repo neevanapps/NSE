@@ -13,7 +13,8 @@ public sealed record AdaptiveRecoveryResult(
     long? LastProcessedTickId,
     int ReconciledBars,
     IReadOnlyList<string> Tokens,
-    IReadOnlyList<ObserverTokenTick> Pending);
+    IReadOnlyList<ObserverTokenTick> Pending,
+    IReadOnlyCollection<int> UnverifiedSidecarBars);
 
 public sealed class AdaptiveStateRecoveryService(
     AdaptiveSourceTickReader tickReader,
@@ -40,7 +41,9 @@ public sealed class AdaptiveStateRecoveryService(
             .Distinct(StringComparer.Ordinal)
             .ToArray();
 
-        var raw = await tickReader.ReadRawSessionAsync(source, context.Session.TradeDate, tokens, throughUtc, ct, includeBeyondThrough: true);
+        IReadOnlyList<(string Token, ObserverRawTick Tick)> raw;
+        using (AdaptiveLiveTelemetry.Source.StartActivity("recovery.read"))
+            raw = await tickReader.ReadRawSessionAsync(source, context.Session.TradeDate, tokens, throughUtc, ct, includeBeyondThrough: true);
         var normalizer = new AdaptiveIncrementalTickNormalizer();
         var clean = new List<ObserverTokenTick>(raw.Count);
         var pending = new List<ObserverTokenTick>();
@@ -48,6 +51,7 @@ public sealed class AdaptiveStateRecoveryService(
             context.Session.TradeDate.ToDateTime(new TimeOnly(9, 15)),
             TimeSpan.FromHours(5.5)).ToUniversalTime();
 
+        using (AdaptiveLiveTelemetry.Source.StartActivity("recovery.normalize"))
         foreach (var item in raw)
         {
             var normalized = normalizer.Process(item.Token, item.Tick);
@@ -60,6 +64,7 @@ public sealed class AdaptiveStateRecoveryService(
             }
         }
 
+        using (AdaptiveLiveTelemetry.Source.StartActivity("recovery.sort"))
         clean.Sort(static (a, b) =>
         {
             var byTime = a.Tick.AvailableAt.CompareTo(b.Tick.AvailableAt);
@@ -77,27 +82,34 @@ public sealed class AdaptiveStateRecoveryService(
 
         var reconciled = 0;
         var replayTriggers = new HashSet<int>();
+        var unverifiedSidecars = new SortedSet<int>();
         DateTimeOffset? lastAvailable = null;
         long? lastTickId = null;
         foreach (var group in clean.GroupBy(x=>x.Tick.AvailableAt))
         {
             var items=group.Select(x=>(x.Token,x.Tick)).ToArray();
-            var packages = engine.ProcessAvailabilityGroup(items);
+            IReadOnlyList<AdaptiveCompletedBarPackage> packages;
+            using (AdaptiveLiveTelemetry.Source.StartActivity("recovery.engine"))
+                packages = engine.ProcessAvailabilityGroup(items);
             lastAvailable = group.Key;
             lastTickId = items.Max(x=>x.Tick.Id);
 
             foreach (var package in packages)
             {
                 if (package.IsActionableWeak2) replayTriggers.Add(package.FutureBar.BarSeq);
-                var result = await persistence.PersistOrVerifyAsync(
-                    observer, context.Session, package, DateTimeOffset.UtcNow, ct);
+                AdaptivePersistResult result;
+                using (AdaptiveLiveTelemetry.Source.StartActivity("recovery.core"))
+                    result = await persistence.PersistOrVerifyAsync(observer, context.Session, package, DateTimeOffset.UtcNow, ct);
                 // Replay recomputes the supplemental metrics: verify rows that exist, insert the ones that do not (mid-session backfill).
+                // A bar whose sidecar integrity cannot be established is remembered so commentary never evaluates at or past it.
                 if (supplemental is not null)
                 {
-                    await supplemental.PersistOrVerifyFuturesAsync(observer, context.Session.Id, package, ct);
-                    await supplemental.PersistOrVerifyOptionsAsync(observer, context.Session, package, ct);
+                    using (AdaptiveLiveTelemetry.Source.StartActivity("recovery.sidecars"))
+                        if (!await supplemental.PersistAndVerifyAsync(observer, context.Session, package, ct))
+                            unverifiedSidecars.Add(package.FutureBar.BarSeq);
                 }
-                await observations.ProcessPackageAsync(source, observer, context, package, ct);
+                using (AdaptiveLiveTelemetry.Source.StartActivity("recovery.observations"))
+                    await observations.ProcessPackageAsync(source, observer, context, package, ct);
                 if (result.VerifiedExisting)
                 {
                     reconciled++;
@@ -113,7 +125,8 @@ public sealed class AdaptiveStateRecoveryService(
             .Where(x => x.SessionId == context.Session.Id).Select(x => x.TriggerBarSeq).ToListAsync(ct);
         if (!replayTriggers.SetEquals(persistedTriggers))
             throw new InvalidOperationException("Adaptive observation restart trigger set differs from reconstructed source. Persisted history will not be overwritten.");
-        await observations.VerifyCompletedAsync(source, observer, context, ct);
+        using (AdaptiveLiveTelemetry.Source.StartActivity("recovery.verify"))
+            await observations.VerifyCompletedAsync(source, observer, context, ct);
 
         runtime = await observer.Runtime.SingleAsync(x => x.SessionId == context.Session.Id, ct);
         runtime.RuntimeStatus = AdaptiveRuntimeStatus.Live;
@@ -141,6 +154,7 @@ public sealed class AdaptiveStateRecoveryService(
             lastTickId,
             reconciled,
             tokens,
-            pending);
+            pending,
+            unverifiedSidecars);
     }
 }

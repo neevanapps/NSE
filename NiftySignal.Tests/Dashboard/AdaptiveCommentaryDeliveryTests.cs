@@ -407,7 +407,7 @@ public sealed class AdaptiveCommentaryDeliveryTests
                 PreviousBias = EventBias.Neutral, PrimaryEvidenceJson = "[]", ConfirmationEvidenceJson = "[]", ContradictionEvidenceJson = "[]", DataQualityJson = "[]",
                 CommentaryVersion = version, EventIdentity = $"{version}:1:{bar}:x:New:y", RenderedCommentary = $"Title.\nBias.\nMeaning {text}.\nEvidence: none.",
             };
-            db.CommentaryEvents.AddRange(Event("commentary-v1", 11, "current"), Event("commentary-v0", 12, "foreign"));
+            db.CommentaryEvents.AddRange(Event("commentary-v1", 8, "current"), Event("commentary-v0", 12, "foreign"));
             db.CommentaryRuntime.Add(new AdaptiveCommentaryRuntimeRow { SessionId = 1, LastEvaluatedBarSeq = 9, CurrentRegime = MarketRegime.Neutral, CurrentBias = EventBias.Neutral, CommentaryVersion = "commentary-v1" });
             db.ProjectionHealth.Add(new AdaptiveProjectionHealthRow { SessionId = 1, Component = AdaptiveProjectionComponents.Commentary, Version = CommentaryEvaluator.Version, BarSeq = 10, Detail = "x", DetectedAtUtc = T0 });
             await db.SaveChangesAsync();

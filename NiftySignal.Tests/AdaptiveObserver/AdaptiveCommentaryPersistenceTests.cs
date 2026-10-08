@@ -15,23 +15,23 @@ public sealed class AdaptiveCommentaryPersistenceTests
     static readonly DateTimeOffset T0 = new(2026, 10, 8, 4, 30, 0, TimeSpan.Zero);
     const long BaseVolume = 1000;
 
-    sealed record Spec(int Seq, int Flow, long? RollOi, double Bar, double Roll, string? Evolution = null, long? Ofi = null, double? Residual = null);
+    internal sealed record Spec(int Seq, int Flow, long? RollOi, double Bar, double Roll, string? Evolution = null, long? Ofi = null, double? Residual = null);
 
-    static AdaptiveObserverDbContext Database() => new(new DbContextOptionsBuilder<AdaptiveObserverDbContext>()
+    internal static AdaptiveObserverDbContext Database() => new(new DbContextOptionsBuilder<AdaptiveObserverDbContext>()
         .UseInMemoryDatabase(Guid.NewGuid().ToString())
         .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.InMemoryEventId.TransactionIgnoredWarning)).Options);
 
-    static AdaptiveSessionStateRow Session() => new()
+    internal static AdaptiveSessionStateRow Session() => new()
     {
         Id = 1, TradeDate = new DateOnly(2026, 10, 8), ModelVersion = "adaptive-v1", SourceBranch = "t", SourceCommitSha = "t", BuildUtc = T0,
         FutureToken = "FUT", FutureSymbol = "FUT", FutureExpiry = new DateOnly(2026, 10, 29), OpeningWindowStartUtc = T0.AddMinutes(-15),
         OpeningWindowEndUtc = T0, EstimatorName = "V1", CreatedAtUtc = T0, BaseBarVolume = BaseVolume,
     };
 
-    static AdaptiveCommentaryService Service() => new(new AdaptiveCommentaryFrameLoader(), NullLogger<AdaptiveCommentaryService>.Instance);
+    internal static AdaptiveCommentaryService Service() => new(new AdaptiveCommentaryFrameLoader(), NullLogger<AdaptiveCommentaryService>.Instance);
 
     /// <summary>Persists one valid completed bar (and its rolling row once ten bars exist) shaped by the spec, as the core observer would.</summary>
-    static async Task Seed(AdaptiveObserverDbContext db, Spec s)
+    internal static async Task Seed(AdaptiveObserverDbContext db, Spec s)
     {
         var end = T0.AddMinutes(s.Seq); var start = end.AddMinutes(-1);
         db.FutureBars.Add(new()
@@ -57,7 +57,7 @@ public sealed class AdaptiveCommentaryPersistenceTests
         await db.SaveChangesAsync();
     }
 
-    static Spec[] Scenario() =>
+    internal static Spec[] Scenario() =>
     [
         .. Enumerable.Range(1, 9).Select(i => new Spec(i, -1, 50, -2, -5)),                       // warm-up: readiness not met => silent
         new(10, -1, 50, -2, -5),                                                                   // ten valid bars: SellerExpansion New (LOW)
@@ -69,7 +69,7 @@ public sealed class AdaptiveCommentaryPersistenceTests
         new(16, 1, 50, 2, 5),                                                                      // BuyerExpansion New
     ];
 
-    static async Task<AdaptiveObserverDbContext> Seeded(params Spec[] specs)
+    internal static async Task<AdaptiveObserverDbContext> Seeded(params Spec[] specs)
     {
         var db = Database(); db.Sessions.Add(Session()); await db.SaveChangesAsync();
         foreach (var s in specs) await Seed(db, s);

@@ -7,16 +7,6 @@ using NiftySignal.Notifications;
 namespace NiftySignal.Dashboard.Services;
 
 /// <summary>
-/// Explicit opt-in for sending commentary to Telegram. Commentary events are always persisted and shown on the Dashboard; messages are only
-/// sent when this is enabled AND Dashboard Telegram settings exist. Default is off so a deployment never starts messaging a real account by surprise.
-/// </summary>
-public sealed class AdaptiveCommentaryTelegramOptions
-{
-    public const string SectionName = "AdaptiveCommentaryTelegram";
-    public bool Enabled { get; set; }
-}
-
-/// <summary>
 /// Durable commentary outbox delivery (08-Oct plan section 61), mirroring the screenshot outbox: the job is marked Sending and saved before the
 /// first byte leaves, Sent jobs are never resent, a Telegram acknowledgement is required for Sent, an interrupted or unacknowledged send becomes
 /// DeliveryUncertain and is never retried automatically, and a definitive Telegram refusal is retried after its retry_after.
@@ -43,6 +33,19 @@ public sealed class AdaptiveCommentaryNotificationProcessor(ITelegramTextSender 
             .OrderBy(x => x.Id).FirstOrDefaultAsync(ct);
         if (job is null) return;
         var ev = await db.CommentaryEvents.AsNoTracking().SingleAsync(x => x.Id == job.EventId, ct);
+        // Defense in depth: never send an event that sits at or after a commentary replay mismatch (state diverged upstream of it).
+        var degradedAt = await db.ProjectionHealth.AsNoTracking()
+            .Where(x => x.SessionId == ev.SessionId && x.Component == AdaptiveProjectionComponents.Commentary
+                && x.Version == ev.CommentaryVersion && x.BarSeq <= ev.BarSeq)
+            .OrderBy(x => x.BarSeq).Select(x => (int?)x.BarSeq).FirstOrDefaultAsync(ct);
+        if (degradedAt is { } degradedBar)
+        {
+            job.Status = AdaptiveCommentaryNotificationStatus.Suppressed;
+            job.LastError = $"Suppressed: commentary projection degraded upstream at bar {degradedBar}.";
+            await db.SaveChangesAsync(ct);
+            return;
+        }
+
         var text = CommentaryNotificationPolicy.FormatMessage(ev.TradeDate, ev.BarSeq, ev.OccurredAtUtc, ev.RenderedCommentary);
 
         job.Status = AdaptiveCommentaryNotificationStatus.Sending;
@@ -74,34 +77,58 @@ public sealed class AdaptiveCommentaryNotificationProcessor(ITelegramTextSender 
 }
 
 public sealed class AdaptiveCommentaryNotificationWorker(IDbContextFactory<AdaptiveObserverDbContext> factory,
-    AdaptiveCommentaryNotificationProcessor processor, IOptions<AdaptiveCommentaryTelegramOptions> options,
-    IOptions<TelegramOptions> telegram, IHostApplicationLifetime lifetime, ILogger<AdaptiveCommentaryNotificationWorker> logger) : BackgroundService
+    AdaptiveCommentaryNotificationProcessor processor, IOptionsMonitor<AdaptiveCommentaryTelegramOptions> options,
+    IOptionsMonitor<TelegramOptions> telegram, IHostApplicationLifetime lifetime, ILogger<AdaptiveCommentaryNotificationWorker> logger) : BackgroundService
 {
+    internal const string DisabledReason = "Suppressed: commentary Telegram delivery is disabled or not configured; unsent commentary is never delivered later.";
+
+    /// <summary>While not deliverable, unsent jobs (for example created by a Host whose configuration differs) are re-suppressed this often.</summary>
+    static readonly TimeSpan ResuppressInterval = TimeSpan.FromSeconds(30);
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        if (!options.Value.Enabled) { logger.LogInformation("Adaptive commentary Telegram delivery is not enabled (events are still persisted and shown on the Dashboard)."); return; }
-        if (string.IsNullOrWhiteSpace(telegram.Value.BotToken) || string.IsNullOrWhiteSpace(telegram.Value.ChatId))
-        { logger.LogError("Adaptive commentary Telegram delivery requires Dashboard Telegram configuration; nothing will be sent."); return; }
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var registration = lifetime.ApplicationStarted.Register(() => started.TrySetResult());
         await started.Task.WaitAsync(stoppingToken);
+        bool? lastDeliverable = null;
+        var lastSuppressUtc = DateTimeOffset.MinValue;
         while (!stoppingToken.IsCancellationRequested)
         {
+            // Re-evaluated every cycle so enabling/disabling through configuration takes effect without a restart.
+            var deliverable = options.CurrentValue.IsDeliverable(telegram.CurrentValue);
             try
             {
-                await using var db = await factory.CreateDbContextAsync(stoppingToken);
-                await db.Database.OpenConnectionAsync(stoppingToken);
-                // Connection-scoped PostgreSQL lease: two Dashboards cannot deliver the same outbox.
-                var held = await db.Database.SqlQueryRaw<bool>("SELECT pg_try_advisory_lock(73063006) AS \"Value\"").SingleAsync(stoppingToken);
-                if (held)
+                if (!deliverable)
                 {
-                    try
+                    // On start and on every transition to "not deliverable": unsent jobs become terminally non-deliverable, so re-enabling later
+                    // can only ever announce FUTURE events, never a stale backlog.
+                    if (lastDeliverable != false || DateTimeOffset.UtcNow - lastSuppressUtc >= ResuppressInterval)
                     {
-                        await AdaptiveCommentaryNotificationProcessor.RecoverInterruptedAsync(db, stoppingToken);
-                        await processor.ProcessOneAsync(db, DateTimeOffset.UtcNow, stoppingToken);
+                        await using var db = await factory.CreateDbContextAsync(stoppingToken);
+                        var suppressed = await AdaptiveCommentaryOutbox.SuppressAllPendingAsync(db, DisabledReason, stoppingToken);
+                        lastSuppressUtc = DateTimeOffset.UtcNow;
+                        if (suppressed > 0 || lastDeliverable != false)
+                            logger.LogInformation("Adaptive commentary Telegram delivery is not enabled/configured (events are still persisted and shown on the Dashboard); {Count} unsent job(s) suppressed.", suppressed);
                     }
-                    finally { await db.Database.ExecuteSqlRawAsync("SELECT pg_advisory_unlock(73063006)", CancellationToken.None); }
                 }
+                else
+                {
+                    await using var db = await factory.CreateDbContextAsync(stoppingToken);
+                    await db.Database.OpenConnectionAsync(stoppingToken);
+                    // Connection-scoped PostgreSQL lease: two Dashboards cannot deliver the same outbox.
+                    var held = await db.Database.SqlQueryRaw<bool>("SELECT pg_try_advisory_lock(73063006) AS \"Value\"").SingleAsync(stoppingToken);
+                    if (held)
+                    {
+                        try
+                        {
+                            await AdaptiveCommentaryNotificationProcessor.RecoverInterruptedAsync(db, stoppingToken);
+                            await processor.ProcessOneAsync(db, DateTimeOffset.UtcNow, stoppingToken);
+                        }
+                        finally { await db.Database.ExecuteSqlRawAsync("SELECT pg_advisory_unlock(73063006)", CancellationToken.None); }
+                    }
+                }
+
+                lastDeliverable = deliverable;
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
             catch (Exception ex) { logger.LogWarning("Adaptive commentary notification cycle failed ({ErrorType}); market calculations are unaffected.", ex.GetType().Name); }

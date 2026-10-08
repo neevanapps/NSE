@@ -45,6 +45,17 @@ public sealed class AdaptiveObserverDataService(
             await LoadValidBarCountAsync(db, session, runtime.LastCompletedBarSeq, ct));
     }
 
+    /// <summary>
+    /// Steady-state live refresh: the already-displayed session is known, so a single indexed read of its runtime row is enough to refresh status,
+    /// heartbeat and partial-bar progress. Whether a completed bar changed (and a full reload is needed) is decided by the caller from
+    /// <c>LastCompletedBarSeq</c>; the session row and the ten-bar readiness only change when a bar completes.
+    /// </summary>
+    public async Task<AdaptiveObserverRuntimeRow?> LoadRuntimeAsync(long sessionId, CancellationToken ct = default)
+    {
+        await using var db = await dbFactory.CreateDbContextAsync(ct);
+        return await db.Runtime.AsNoTracking().SingleOrDefaultAsync(x => x.SessionId == sessionId, ct);
+    }
+
     public async Task<AdaptiveObserverSnapshot?> LoadSnapshotAsync(int requestedRows, CancellationToken ct = default, long? captureSessionId = null, int? throughBarSeq = null)
     {
         var rowCount = requestedRows switch

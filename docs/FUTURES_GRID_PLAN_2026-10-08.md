@@ -2645,17 +2645,20 @@ Recommended indexes:
 
 Idempotency requirement:
 
-Create a deterministic EventIdentity from:
+Create a deterministic, **version-keyed** EventIdentity from:
 
-    SessionId
+    CommentaryVersion
+    + SessionId
     + BarSeq
     + EventType
     + Lifecycle
     + EventBias
 
-and enforce uniqueness either through a stored identity column or an equivalent unique composite index.
+(rendered `{CommentaryVersion}:{SessionId}:{BarSeq}:{EventType}:{Lifecycle}:{EventBias}`) and enforce uniqueness through the stored identity column's unique index.
 
-Restart/replay of the same completed bar must not produce a duplicate event.
+Restart/replay of the same completed bar under the same version must not produce a duplicate event, and an event row is immutable once written (a replay verifies it and never overwrites it). A later `CommentaryVersion` produces its own identities and its own runtime row, so versions coexist without collision and v1 history is never rewritten.
+
+If a replay recomputes an event that differs from the stored one, the stored row is left untouched, processing stops at that bar and a durable `adaptive_projection_health` marker is written (sections 57 and 74). Rows after the marker stay in PostgreSQL for forensics but are quarantined: the Dashboard shows only events at or before the verified checkpoint, and Telegram never sends an event at or after the marker.
 
 ## 56.1 Evidence JSON content
 
@@ -2709,11 +2712,12 @@ Create a small operational checkpoint table conceptually named:
 
     adaptive_commentary_runtime
 
-One row per SessionId.
+One row per `SessionId` + `CommentaryVersion` (unique index on that pair).
 
 Recommended fields:
 
-    SessionId                  bigint primary key
+    SessionId                  bigint
+    CommentaryVersion          text    (part of the unique key)
     LastEvaluatedBarSeq        int not null
     CurrentEventId             bigint null
     CurrentEventType           enum/string null
@@ -2721,7 +2725,6 @@ Recommended fields:
     CurrentRegime              enum/string not null
     CurrentLifecycle           enum/string null
     LastTelegramBarSeq         int null
-    CommentaryVersion          text not null
     UpdatedAtUtc               timestamptz not null
 
 This row is operational state, **not** the authoritative market history.
@@ -2876,7 +2879,7 @@ Cooldown:
 
 It applies to repeated notifications for the same EventType + Bias. The following bypass the cooldown because they are materially new: DirectReversal, Flipped, Confirmed, newly HIGH EvidenceAgreement caused by a new independent confirmation family, and a critical data-quality event.
 
-In V1 every Telegram-eligible class (Confirmed, Flipped, actual bias change) is in the bypass list, so the cooldown currently has no practical effect. It is implemented as configuration so that enabling additional eligible classes later cannot flood Telegram. It is an operational notification throttle, not a trading parameter.
+In V1 every Telegram-eligible class (Confirmed, Flipped, direct LONG <-> SHORT reversal) is in the bypass list, so the cooldown currently has no practical effect. It is implemented as configuration so that enabling additional eligible classes later cannot flood Telegram. It is an operational notification throttle, not a trading parameter.
 
 ## 61.1 Implementation contract (Slice 4C, implemented)
 
@@ -3085,7 +3088,7 @@ Implementation is not complete until automated/replay tests prove:
 14. Lifecycle rules (New/Strengthening/Weakening/Confirmed/Resolved/Flipped, continuation, replacement, precedence) follow section 55 exactly; no `Active` lifecycle exists.
 15. BiasChanged is persisted correctly; the Telegram rule (60.1.3, direct LONG <-> SHORT only) is applied exactly.
 16. Adjacent residual delta is used; the legacy bridged delta is never used.
-17. Same bar replay cannot duplicate an event (identity: SessionId + BarSeq + EventType + Lifecycle + Bias).
+17. Same bar replay cannot duplicate an event (identity: CommentaryVersion + SessionId + BarSeq + EventType + Lifecycle + Bias); a different CommentaryVersion coexists without collision.
 18. Bars with no persisted event still advance the commentary runtime checkpoint.
 19. Service restart does not turn an existing event into a false New event.
 20. Telegram eligibility is limited to the V1 set; same-event cooldown works; bypasses work.
@@ -3093,7 +3096,10 @@ Implementation is not complete until automated/replay tests prove:
 22. Dashboard text is rendered only from the persisted structured event; the renderer never mentions evidence absent from the event data.
 23. Historical replay and live processing produce identical commentary events for identical persisted inputs.
 24. Event outcome enrichment cannot mutate the original event record.
-25. No UI, database or domain identifier uses the word "EvidenceAgreement" for commentary.
+25. No UI, database or domain identifier uses the word "Confidence" for the commentary concept; the agreement concept is named `EvidenceAgreement` everywhere (section 0.5).
+26. A replay mismatch never mutates a stored event: processing stops at that bar, the checkpoint does not advance past it, a durable projection-health marker is written, later calls stay stopped after a restart, the Dashboard shows only events at or before the verified bar plus the degraded banner, and any Pending Telegram job at or after the bar becomes terminally Suppressed (never revived by reconciliation).
+27. Telegram disabled or unconfigured: events are persisted and shown, NO notification job is created, unsent jobs become Suppressed on every transition to that state, and re-enabling announces only future live events. Restart/first-deployment catch-up and rebuilds never create jobs.
+28. A sidecar whose integrity could not be established (write/verify failed) is never read by commentary; commentary stops before that bar and resumes deterministically once the sidecar is verified.
 
 # 67. Commentary implementation order
 
@@ -3139,7 +3145,7 @@ As of 08 October 2026:
 - Persist structured evidence and contradictions, not only prose; persist lifecycle events, not ordinary continuation bars.
 - A per-session runtime checkpoint keeps silent bars restart-safe.
 - New commentary residual logic uses adjacent-bar deltas only.
-- Dashboard shows recent commentary; Telegram is limited to Confirmed, Flipped and actual bias changes in V1, through a durable outbox with conservative DeliveryUncertain semantics.
+- Dashboard shows recent commentary; Telegram is limited to Confirmed, Flipped and a direct LONG <-> SHORT reversal in V1, through a durable outbox with conservative DeliveryUncertain semantics.
 - Live event detection/rendering is deterministic and does not use an LLM.
 - Historical outcomes may be attached later but cannot rewrite the original event.
 - Commentary does not modify any trading/execution behaviour.
@@ -3263,3 +3269,22 @@ An independent review of the eight slice commits found the defects below; each w
 7. **Commentary replay mismatch stops projection.** When a stored event disagrees with the recomputation, the unit of work is rolled back, the stored event is not modified, the checkpoint does not advance past the mismatched bar, a `commentary` row is written to `adaptive_projection_health`, and every later call (including after a restart) does nothing until the marker is reconciled. The Dashboard commentary panel shows the degraded state. Core adaptive processing is unaffected.
 8. **Per-token option book trackers (measured, left unchanged).** `AdaptiveObserverEngine._optionBooks` keeps one `FuturesMicrostructureTracker` per option token with every unique book state of the session. Measured over the 18 historical sessions (40-41 universe tokens, ~1.1 M ticks per day): at most ~560 000 retained unique states per session (~31 MB at 56 B/state, ~60 MB with `List` growth slack), and a full-day engine replay of ~1-2 s. That is bounded and small for a single-day process, so no pruning was added. If it ever matters, the safe design is `PruneBefore(barEnd)` after each bar completes (keep the last state at/before the end as the next bar's reference and baseline, drop earlier ones); it is not implemented because it would add a stateful mutation to a parity-protected replay path for no measured benefit.
 9. **Observer-Universe Day Vol PCR.** `OptionUniverseJson` is the session's frozen option universe selected at 09:30; it does not prove that every token was subscribed or ticked. The diagnostic is therefore labelled **Observer-Universe Day Vol PCR (frozen observer option universe, not the full chain)** and keeps `observed/total` token coverage visible. Nothing is called full-chain.
+
+# 75. Final hardening pass (pre-integration)
+
+1. **Telegram disabled means do not queue.** `AdaptiveCommentaryTelegramOptions` (shared in `NiftySignal.Notifications`) is bound by both the Host and the Dashboard. The Host's `AdaptiveCommentaryNotificationGate` selects `CommentaryNotificationMode.EnqueueFinalBar` only while `AdaptiveCommentaryTelegram:Enabled` is true AND a Telegram bot token and chat id exist; otherwise `Suppress`. The gate re-reads configuration through `IOptionsMonitor`, so disabling stops job creation immediately. On start and on every transition to "not deliverable" the Host makes all unsent (`Pending`) jobs `Suppressed` (terminal, reason in `LastError`); the Dashboard delivery worker does the same and re-suppresses every 30 s while not deliverable. Market classification (`ShouldNotifyTelegram`) never depends on Telegram configuration.
+2. **Terminal `Suppressed` outbox status.** Never delivered, never revived. Used for (a) disabled/unconfigured Telegram and (b) commentary projection degraded upstream. `Sending`/`Sent`/`DeliveryUncertain` are untouched by suppression. No schema change (the status is stored as text).
+3. **Commentary mismatch quarantine.** `StopOnMismatchAsync` writes the health marker and suppresses Pending jobs for events at or after the mismatch bar (same session and version). The delivery processor independently refuses to send an event when a commentary marker exists at or before its bar. The Dashboard shows only events at or before the verified checkpoint (`LastEvaluatedBarSeq`), the banner "replay mismatch at bar X; commentary verified only through bar Y", and the number of quarantined later rows.
+4. **Sidecar integrity states.** `Skipped`/`Inserted`/`Verified` => usable; `Mismatch` => durably marked known-invalid => unavailable; `Failed` (including failure to store the marker) => integrity UNKNOWN. `AdaptiveSupplementalPersistence.PersistAndVerifyAsync` retries once and returns false on unknown integrity. The worker keeps such packages and retries them on every later bar; commentary never evaluates at or past the first unverified bar (`stopBeforeBarSeq`) and resumes deterministically afterwards, so an event can never be computed from an unverified row. Bars found unverified during recovery (no package retained) cap commentary until the next recovery. Core adaptive processing is unaffected.
+
+# 76. Live performance contract
+
+The observer must not fall behind the market. Correctness and determinism outrank micro-optimization; no market value, ordering rule, threshold or persistence check was changed for performance.
+
+- **Operational runtime row cadence.** The `adaptive_runtime` row (heartbeat, last processed source position, partial-bar progress) is not market data and restart correctness never depends on it (recovery replays the raw ticks). It is persisted at most about once per second during ordinary polling (`RuntimePersistInterval`), and immediately on a completed bar, a status transition, and session close. The 250 ms poll cadence is unchanged.
+- **Pending buffer.** The ordering buffer is sorted only when new ticks were appended (or once after recovery); removing a prefix preserves `AvailableAt`, then source Id order.
+- **Dashboard header refresh.** Steady state (no completed-bar change, same trade date) is ONE indexed runtime read by session id every 500 ms; the full snapshot and ten-bar readiness are reloaded only when the completed bar sequence changes, a push arrives, or the date rolls over. Capture mode is unaffected.
+- **Pinned quote.** Two ordered index probes plus an Id tie-break (section 74.3); no fixed candidate window.
+- **Not optimized (measured, left simple):** completed-bar pipeline round trips (about 177 bars/day), poll cadence (processing time is negligible against 250 ms), per-token option book retention (bounded, ~30 MB), full-day recovery materialization.
+- **Measurement.** `tools/AdaptiveLivePerformance` drives the real `PollLiveAsync` / `TryStartOrRecoverAsync` / `CloseCurrentSessionAsync` and `AdaptiveStateRecoveryService` against an isolated PostgreSQL cluster (read-only historical source; Telegram disabled; no Dashboard connection) with SQL-command counting and stage timing; `docs/ADAPTIVE_LIVE_PERFORMANCE_2026-10-08.md` records the numbers. Timing assertions never appear in unit tests.
+- **Acceptance.** No steadily growing pending backlog at normal load; temporary backlog at the historical maximum burst must drain; sustained 2x the observed peak 1-second rate must not accumulate backlog; completed-bar p99 must stay well under the 250 ms poll cadence; no data may be dropped; live and restart-replay outputs must be value-identical.

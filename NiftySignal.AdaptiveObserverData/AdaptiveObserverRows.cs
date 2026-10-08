@@ -525,7 +525,11 @@ public sealed class AdaptiveProjectionHealthRow
     public DateTimeOffset DetectedAtUtc { get; set; }
 }
 
-public enum AdaptiveCommentaryNotificationStatus { Pending = 0, Sending = 1, Sent = 2, DeliveryUncertain = 3 }
+/// <summary>
+/// Suppressed is terminal and never delivered: Telegram commentary was disabled/unconfigured while the job was unsent, or the commentary
+/// projection degraded upstream of the job's event. Nothing revives a Suppressed job.
+/// </summary>
+public enum AdaptiveCommentaryNotificationStatus { Pending = 0, Sending = 1, Sent = 2, DeliveryUncertain = 3, Suppressed = 4 }
 
 /// <summary>
 /// Durable Telegram outbox for commentary (08-Oct plan section 61). One job per event (unique <see cref="EventId"/>); never written by the
