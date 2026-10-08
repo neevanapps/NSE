@@ -22,7 +22,7 @@ Branch `adaptive-08oct-s4c`; baseline = `0c5817c`, after = the hardening commit 
 | Dashboard header refresh (every 500 ms per client) | 3 queries -> 1 indexed runtime read (0.17-0.23 ms p50); no session lookup or ten-bar readiness read unless a completed bar changed. |
 | Completed-bar pipeline | p50 7.5 ms, p99 10-15 ms, max 19-22 ms (about 22-24 SQL commands, 112-288 bars/session). Far below the 250 ms cadence, so no batching architecture was added. |
 | Market outputs unchanged | Every persisted market table (future bars, rolling states, option bands, residuals, futures/options sidecars, commentary events, Weak2 observations) hashes identically between `0c5817c` and the final code for all three sessions, and live output equals restart-replay output. |
-| Recovery | Full-day recovery 7.6-8.5 s when verifying an existing session and 12.9-15.5 s when creating one from scratch; the source read (EF projection of ~2.3 M rows) is 40-75 % of it. Memory is the one number worth watching: see "Remaining bottleneck". |
+| Recovery | Full-day recovery 7.6-8.5 s when verifying an existing session and 12.9-15.5 s when creating one from scratch; the source read (EF projection of ~2.3 M rows) is 40-75 % of it. Memory is the one number worth watching: PROCESS WORKING-SET peaks reach about 1.9 GB (1,902 MB in the final full-day table) while the MANAGED-HEAP peak is 1.49-1.62 GB; see "Remaining bottleneck". |
 
 ## Decisions (measured, not assumed)
 
@@ -34,7 +34,7 @@ Branch `adaptive-08oct-s4c`; baseline = `0c5817c`, after = the hardening commit 
 
 ## Remaining bottleneck
 
-Full-day recovery peaks at about 1.1-1.3 GB of additional managed heap (1.5-1.6 GB total in the harness) because the whole session's raw rows, the normalized list and the sorted list coexist; the dominant stage is the PostgreSQL read/materialization. It is a one-off restart cost, not a per-tick cost, and a mid-session restart is proportionally smaller. If the VM has little memory, the next step would be a chunked read that preserves exact Id order for the normalizer and a global AvailableAt order for the engine; that needs its own equivalence proof and was not attempted here.
+Full-day recovery peaks at about 1.1-1.3 GB of additional managed heap (managed-heap peak 1.49-1.62 GB in the harness, of which ~0.36-0.40 GB is the harness's own staged data) and a process working-set peak of up to about 1.9 GB (1,902 MB; one intermediate run reached 2,053 MB) because the whole session's raw rows, the normalized list and the sorted list coexist; the dominant stage is the PostgreSQL read/materialization. It is a one-off restart cost, not a per-tick cost, and a mid-session restart is proportionally smaller. If the VM has little memory, the next step would be a chunked read that preserves exact Id order for the normalizer and a global AvailableAt order for the engine; that needs its own equivalence proof and was not attempted here.
 
 ## Measurements
 
@@ -335,3 +335,37 @@ Limit  (cost=3189.43..3189.43 rows=1 width=16) (actual time=36.654..36.655 rows=
                           Buffers: shared hit=3 read=159
 
 ```
+
+
+## Abrupt mid-session restart-continuation validation
+
+**Question:** can the Host die mid-session, lose all in-memory state, restart, recover only from persisted data, keep processing live and finish with exactly the output of an uninterrupted run?
+
+**Method (`tools/AdaptiveLivePerformance`, `ADAPTIVE_PERF_STAGES=restart`).** For each session the real production bootstrap first seeds the genuine prior-session history (so the real `StrongThreshold` is frozen), then:
+- **Run A** - uninterrupted production `PollLiveAsync` from the 09:30 session start to 15:35:30 IST, then the production session close.
+- **Run B (per case)** - identical, except that at the restart point the process is "killed": no `CloseCurrentSessionAsync`, no flush; the worker, engine, normalizer, ordering buffer, option/futures book trackers, band history, residual state, commentary service, notification gate, every DbContext, the whole DI container and all pooled database connections are disposed and the GC is forced. A brand-new service provider and worker are built (nothing is carried over - the historical-bootstrap flag is also fresh) and `TryStartOrRecoverAsync` reconstructs everything from the persisted source ticks and the adaptive database; polling then continues. Ingestion keeps persisting during a 3-second downtime, so the recovery also has to backfill whatever the dead process had not yet written.
+- Both runs end with a deterministic synchronization poll at the same clock, are compared at that horizon (live partial bar, ordering-buffer fingerprint, last processed tick id/AvailableAt, last fetched raw id, completed bars) and again after the session close, table by table (canonical row hash; a structural column diff is printed on any difference). A negative control (mutated copy of run A) is flagged by the comparator in both sessions, so the equalities are not vacuous. Telegram is disabled: zero notification jobs were created in any run.
+
+**Compared exactly (every column except wall-clock heartbeat/recovery timestamps and surrogate ids):** frozen `Sessions` definition, `FutureBars`, `RollingStates`, `OptionBandBars`, `OptionResidualBars`, `ResidualAnchorComponents`, `Weak2Observations` (incl. H5 results), `FuturesSupplemental` (MicroDev, OFI, TOB), `OptionsSupplemental` (center strike, positions, IV, dIV, skew, Vol PCR, Roll Vol PCR, CE/PE MicroDev and OFI, observer-universe volumes), `ProjectionHealth`, `CommentaryEvents`, `CommentaryRuntime`, `CommentaryNotificationJobs`, the deterministic runtime fields, and the derived-only values (Urgency per bar; residual adjacent deltas: CE/PE residual delta %, Adjacent Directional Residual delta, Straddle Residual).
+
+**Sessions and restart points.** 2026-09-29 (real `StrongThreshold` 0.1836, **33 natural Weak2 observations** with H5 outcomes, 260 bars) and 2026-10-01 (`StrongThreshold` 0.2005, **32 natural Weak2 observations**, 288 bars). Weak2 was not forced or tuned. The data contains real multi-bar closes: 15 exact bars close at one AvailableAt (10:07:41 IST) on 09-29 and 7 bars at 13:43:29 IST on 10-01, so case C uses a genuine boundary.
+- **A** - the first poll after 11:30 IST with partial futures volume at 40-60% of `BaseBarVolume` and unprocessed ticks in the ordering buffer (tests partial volume, bar start, band state and book state reconstruction).
+- **B** - the first poll after 12:30 IST that completed a bar (tests row idempotency, the runtime cursor, no duplicate bar/commentary, start of the next partial bar).
+- **C1** - the poll where the multi-bar boundary's ticks have been fetched but not processed (they die in the lost buffer; the recovery must close and persist all of them). **C2** - the poll that completes that boundary.
+
+| Case | Session | Restart IST | Completed bars before | Partial vol at crash | Ticks lost in buffer | Recovery ms (status Live) | Bars / partial vol after recovery | Status | Sidecars inserted + verified | Commentary events backfilled | WS peak / managed-heap peak MB | Final equality | ProjectionHealth | Notification jobs |
+|---|---|---|---:|---|---:|---:|---|---|---|---:|---|---|---:|---:|
+| A | 2026-09-29 | 11:30:12.548 | 105 | 8,905 / 19,500 (46%) | 117 | 3,700 | 105 / 13,975 | Live | 0+105 | 0 | 1,137 / 928 | IDENTICAL | 0 | 0 |
+| B | 2026-09-29 | 12:30:35.574 | 137 | 3,445 / 19,500 (18%) | 126 | 5,097 | 137 / 8,125 | Live | 0+137 | 0 | 1,707 / 1,592 | IDENTICAL | 0 | 0 |
+| C1 | 2026-09-29 | 10:07:41.661 | 49 | 12,415 / 19,500 (64%) | 129 | 1,536 | 64 / 15,925 | Live | 15+49 | 3 | 941 / 682 | IDENTICAL | 0 | 0 |
+| C2 | 2026-09-29 | 10:07:43.669 | 64 | 15,925 / 19,500 (82%) | 105 | 1,443 | 64 / 17,680 | Live | 0+64 | 0 | 871 / 676 | IDENTICAL | 0 | 0 |
+| A | 2026-10-01 | 11:36:16.462 | 58 | 8,840 / 19,500 (45%) | 102 | 5,880 | 58 / 8,840 | Live | 0+58 | 0 | 1,138 / 874 | IDENTICAL | 0 | 0 |
+| B | 2026-10-01 | 12:30:17.406 | 83 | 1,690 / 19,500 (9%) | 104 | 8,019 | 83 / 1,885 | Live | 0+83 | 0 | 1,664 / 1,552 | IDENTICAL | 0 | 0 |
+| C1 | 2026-10-01 | 13:43:29.580 | 172 | 9,555 / 19,500 (49%) | 115 | 11,931 | 179 / 6,500 | Live | 7+172 | 1 | 1,677 / 1,551 | IDENTICAL | 0 | 0 |
+| C2 | 2026-10-01 | 13:43:31.619 | 179 | 6,500 / 19,500 (33%) | 149 | 11,529 | 179 / 9,230 | Live | 0+179 | 0 | 1,624 / 1,496 | IDENTICAL | 0 | 0 |
+
+**Result: all 8 abrupt restarts (2 sessions x 4 cases) reproduce the uninterrupted run exactly, at the horizon and after the session close - every compared table hash and the live partial-bar/ordering-buffer/cursor state are identical, ProjectionHealth is empty and no notification job exists.** In C1 the dead process had persisted 49 bars; recovery inserted the 15 bars that close at the boundary (plus their 15 futures and 15 options sidecars and 3 commentary events) and the final output is still identical to the run that never died; those backfilled events created no jobs.
+
+**Memory (distinguish the two numbers).** The table gives the process **working-set** peak and the **managed-heap** peak during recovery. The harness process itself holds one session's staged ticks (about 0.4 GB of managed heap), so absolute values overstate the Host. Mid-session restarts peak at about 0.9-1.7 GB working set; the earlier full-day recovery table reached up to about 1.9 GB working set (1.49-1.62 GB managed heap). Recovery memory was not redesigned.
+
+**Limitations.** Downtime is modelled as a 3-second gap during which ticks were still persisted; a longer outage only enlarges the backfill, which is the same code path (C1 backfills 15 bars). Telegram is disabled, so job creation during live continuation after the restart is not exercised here (it is covered by the unit tests and the earlier Chromium/outbox validation). Wall-clock timestamps (heartbeat, recovery start/end) are deliberately excluded from the comparison.

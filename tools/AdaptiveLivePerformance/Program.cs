@@ -486,6 +486,326 @@ async Task<SimResult> SimulateAsync(DayData d, Staged staged, string observerDb,
     return new SimResult(summary, observerDb, lastPollNow);
 }
 
+// ---------------------------------------------------------------- mid-session ABRUPT restart-continuation validation
+// RUN A: one uninterrupted production live path. RUN B: the same session, but at a chosen point the whole process state is destroyed WITHOUT any
+// graceful close (worker, engine, normalizer, pending buffer, trackers, commentary service, notification gate, DbContexts, DI container, pooled
+// connections), a completely new service provider / worker is built, and TryStartOrRecoverAsync reconstructs everything from the persisted source
+// ticks and the adaptive database only; live polling then continues to the same horizon. Final persisted state must be identical.
+(AdaptiveObserverWorker Worker, ServiceProvider Provider) NewWorkerWithProvider(string observerDb)
+{
+    var s = new ServiceCollection();
+    s.AddLogging(b => b.SetMinimumLevel(LogLevel.Error).AddSimpleConsole());
+    s.AddDbContext<NiftySignalDbContext>(o => o.UseNpgsql(DbCs(SourceDb)).AddInterceptors(new CountingInterceptor(sourceCounter)));
+    s.AddDbContext<AdaptiveObserverDbContext>(o => o.UseNpgsql(DbCs(observerDb)).AddInterceptors(new CountingInterceptor(observerCounter)));
+    s.AddOptions<PricingOptions>();
+    s.Configure<DashboardPushOptions>(o => o.HubUrl = "http://127.0.0.1:1/hubs/never-connected");
+#if !BASELINE
+    s.AddSingleton<IOptionsMonitor<AdaptiveCommentaryTelegramOptions>>(new StaticMonitor<AdaptiveCommentaryTelegramOptions>(new AdaptiveCommentaryTelegramOptions { Enabled = false }));
+    s.AddSingleton<IOptionsMonitor<TelegramOptions>>(new StaticMonitor<TelegramOptions>(new TelegramOptions { BotToken = "", ChatId = "" }));
+    s.AddSingleton<AdaptiveCommentaryNotificationGate>();
+#endif
+    s.AddSingleton<AdaptiveSourceTickReader>(); s.AddSingleton<AdaptiveHistoricalBootstrapService>(); s.AddSingleton<AdaptiveSessionCoordinator>();
+    s.AddSingleton<AdaptiveObserverPersistence>(); s.AddSingleton<AdaptiveSupplementalPersistence>(); s.AddSingleton<AdaptiveCommentaryFrameLoader>();
+    s.AddSingleton<AdaptiveCommentaryService>(); s.AddSingleton<AdaptiveWeak2ObservationService>();
+    s.AddSingleton<AdaptiveStateRecoveryService>(); s.AddSingleton<AdaptiveEndedSessionRecoveryService>(); s.AddSingleton<DashboardPushClient>();
+    s.AddSingleton<AdaptiveObserverWorker>();
+    var provider = s.BuildServiceProvider();
+    return (provider.GetRequiredService<AdaptiveObserverWorker>(), provider);
+}
+
+async Task BuildPriorsTemplateAsync(DateOnly day, string template)
+{
+    await FreshObserverAsync(template);
+    await using var obs = new AdaptiveObserverDbContext(new DbContextOptionsBuilder<AdaptiveObserverDbContext>().UseNpgsql(DbCs(template)).Options);
+    // The real production bootstrap, against the real (read-only) source, writing only into the isolated observer database.
+    await new AdaptiveHistoricalBootstrapService(reader, Microsoft.Extensions.Logging.Abstractions.NullLogger<AdaptiveHistoricalBootstrapService>.Instance)
+        .EnsurePriorSessionsAsync(src, obs, day, default);
+}
+
+async Task CloneObserverAsync(string template, string name)
+{
+    NpgsqlConnection.ClearAllPools();
+    await using var admin = new NpgsqlConnection(DbCs("postgres"));
+    await admin.OpenAsync();
+    await using (var drop = new NpgsqlCommand($"DROP DATABASE IF EXISTS {name} WITH (FORCE)", admin)) await drop.ExecuteNonQueryAsync();
+    await using (var create = new NpgsqlCommand($"CREATE DATABASE {name} TEMPLATE {template}", admin)) await create.ExecuteNonQueryAsync();
+}
+
+var volatileColumns = new HashSet<string> {"Id", "LastHeartbeatUtc", "LastRecoveryStartedUtc", "LastRecoveryCompletedUtc", "LastRecoveryReconciledBars", "UpdatedAtUtc", "DetectedAtUtc" };
+
+async Task<Dictionary<string, List<string>>> DumpAsync(string observerDb, long sessionId)
+{
+    await using var db = new AdaptiveObserverDbContext(observerOptions(observerDb));
+    List<string> Rows<T>(IEnumerable<T> rows, params string[] only) where T : class
+    {
+        var props = typeof(T).GetProperties().Where(p => !volatileColumns.Contains(p.Name) && (only.Length == 0 || only.Contains(p.Name))
+            && (p.PropertyType.IsPrimitive || p.PropertyType.IsEnum || p.PropertyType == typeof(string) || p.PropertyType == typeof(decimal)
+                || p.PropertyType == typeof(DateTimeOffset) || p.PropertyType == typeof(DateOnly) || Nullable.GetUnderlyingType(p.PropertyType) is not null)).ToArray();
+        return rows.Select(r => string.Join(';', props.Select(p => p.Name + "=" + (p.GetValue(r) is double dv ? dv.ToString("R") : p.GetValue(r)?.ToString() ?? "null")))).ToList();
+    }
+
+    var d = new Dictionary<string, List<string>>
+    {
+        ["Sessions(frozen definition)"] = Rows(await db.Sessions.AsNoTracking().Where(x => x.Id == sessionId).ToListAsync()),
+        ["FutureBars"] = Rows(await db.FutureBars.AsNoTracking().Where(x => x.SessionId == sessionId).OrderBy(x => x.BarSeq).ToListAsync()),
+        ["RollingStates"] = Rows(await db.RollingStates.AsNoTracking().Where(x => x.SessionId == sessionId).OrderBy(x => x.EndBarSeq).ToListAsync()),
+        ["OptionBandBars"] = Rows(await db.OptionBandBars.AsNoTracking().Where(x => x.SessionId == sessionId).OrderBy(x => x.BarSeq).ThenBy(x => x.Side).ToListAsync()),
+        ["OptionResidualBars"] = Rows(await db.OptionResidualBars.AsNoTracking().Where(x => x.SessionId == sessionId).OrderBy(x => x.BarSeq).ThenBy(x => x.Variant).ToListAsync()),
+        ["ResidualAnchorComponents"] = Rows(await db.ResidualAnchorComponents.AsNoTracking().Where(x => x.SessionId == sessionId).OrderBy(x => x.Side).ThenBy(x => x.Strike).ToListAsync()),
+        ["Weak2Observations"] = Rows(await db.Weak2Observations.AsNoTracking().Where(x => x.SessionId == sessionId).OrderBy(x => x.TriggerBarSeq).ToListAsync()),
+        ["FuturesSupplemental"] = Rows(await db.FuturesSupplemental.AsNoTracking().Where(x => x.SessionId == sessionId).OrderBy(x => x.BarSeq).ThenBy(x => x.MetricsVersion).ToListAsync()),
+        ["OptionsSupplemental"] = Rows(await db.OptionsSupplemental.AsNoTracking().Where(x => x.SessionId == sessionId).OrderBy(x => x.BarSeq).ThenBy(x => x.MetricsVersion).ToListAsync()),
+        ["ProjectionHealth"] = Rows(await db.ProjectionHealth.AsNoTracking().Where(x => x.SessionId == sessionId).OrderBy(x => x.BarSeq).ToListAsync()),
+        ["CommentaryEvents"] = Rows(await db.CommentaryEvents.AsNoTracking().Where(x => x.SessionId == sessionId).OrderBy(x => x.BarSeq).ThenBy(x => x.EventIdentity).ToListAsync()),
+        ["CommentaryRuntime"] = Rows(await db.CommentaryRuntime.AsNoTracking().Where(x => x.SessionId == sessionId).ToListAsync()),
+        ["CommentaryNotificationJobs"] = Rows(await db.CommentaryNotificationJobs.AsNoTracking().ToListAsync()),
+        ["Runtime(deterministic fields)"] = Rows(await db.Runtime.AsNoTracking().Where(x => x.SessionId == sessionId).ToListAsync(),
+            "LastCompletedBarSeq", "CurrentPartialBarVolume", "CurrentPartialBarStartedAtUtc", "LastProcessedSourceAvailableAtUtc", "LastProcessedSourceTickId", "RuntimeStatus"),
+    };
+
+    // Derived-only metrics evaluated from the persisted rows exactly as the Dashboard / commentary frame do.
+    var bars = await db.FutureBars.AsNoTracking().Where(x => x.SessionId == sessionId).OrderBy(x => x.BarSeq).ToListAsync();
+    d["Derived: Urgency"] = bars.Select(b => $"{b.BarSeq}:{AdaptiveMetricMath.Urgency(b.Volume, b.DurationSeconds)?.ToString("R") ?? "null"}").ToList();
+    var anchors = await db.ResidualAnchorComponents.AsNoTracking().Where(x => x.SessionId == sessionId).ToListAsync();
+    var bases = new ResidualBases(anchors.Where(x => x.Side == OptionType.Call).Sum(x => x.Price0930), anchors.Where(x => x.Side == OptionType.Put).Sum(x => x.Price0930));
+    var residuals = await db.OptionResidualBars.AsNoTracking().Where(x => x.SessionId == sessionId && x.Variant == ResidualVariant.AtmPlusMinus2).OrderBy(x => x.BarSeq).ToListAsync();
+    d["Derived: residual adjacent deltas"] = AdaptiveResidualProjection.Derive(residuals.Select(x => new ResidualReadingPoint(x.BarSeq, x.IsAvailable, x.CEResidual, x.PEResidual,
+        x.CEResidualPct, x.PEResidualPct, x.DirectionalResidualPct)), bases).Select(x => $"{x.BarSeq}:{x.AdjacentDirectionalResidualDelta?.ToString("R")}:{x.CeResidualDeltaPct?.ToString("R")}:{x.PeResidualDeltaPct?.ToString("R")}:{x.StraddleResidualPct?.ToString("R")}").ToList();
+    return d;
+}
+
+static string HashRows(List<string> rows) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(string.Join('\n', rows))))[..16];
+
+Dictionary<string, object> Compare(Dictionary<string, List<string>> a, Dictionary<string, List<string>> b)
+{
+    var tables = new List<object>(); var allEqual = true; var diffs = new List<string>();
+    foreach (var key in a.Keys)
+    {
+        var equal = a[key].SequenceEqual(b[key]);
+        allEqual &= equal;
+        tables.Add(new { table = key, rowsA = a[key].Count, rowsB = b[key].Count, hashA = HashRows(a[key]), hashB = HashRows(b[key]), equal });
+        if (!equal)
+        {
+            var max = Math.Max(a[key].Count, b[key].Count);
+            for (var i = 0; i < max && diffs.Count < 12; i++)
+            {
+                var ra = i < a[key].Count ? a[key][i] : "<missing>"; var rb = i < b[key].Count ? b[key][i] : "<missing>";
+                if (ra == rb) continue;
+                var ca = ra.Split(';').ToDictionary(x => x.Split('=')[0], x => x.Contains('=') ? x[(x.IndexOf('=') + 1)..] : "");
+                var cb = rb.Split(';').ToDictionary(x => x.Split('=')[0], x => x.Contains('=') ? x[(x.IndexOf('=') + 1)..] : "");
+                diffs.Add($"{key}[{i}]: " + string.Join(", ", ca.Keys.Where(k => !cb.ContainsKey(k) || cb[k] != ca[k]).Select(k => $"{k}: A={ca[k]} B={(cb.TryGetValue(k, out var v) ? v : "<missing>")}")));
+            }
+        }
+    }
+
+    return new() { ["allEqual"] = allEqual, ["tables"] = tables, ["structuralDiff"] = diffs };
+}
+
+
+async Task<(Dictionary<string, List<string>> PreClose, Dictionary<string, List<string>> PostClose, Dictionary<string, object> Info)> RestartRunAsync(
+    DayData d, Staged staged, string template, string runDb, CrashCase? crash, DateTimeOffset start, DateTimeOffset horizon)
+{
+    await CloneObserverAsync(template, runDb);
+    await ClearTicksAsync();
+    var feeder = new Feeder(staged, DbCs(SourceDb));
+    var (worker, provider) = NewWorkerWithProvider(runDb);
+    await feeder.FeedAsync(start);
+    var live = await worker.TryStartOrRecoverAsync(d.Day, start, default) ?? throw new InvalidOperationException("Session did not start.");
+    var info = new Dictionary<string, object> { ["run"] = crash?.Name ?? "uninterrupted" };
+    var clock = start; var crashed = false;
+    int Complete(AdaptiveObserverWorker.LiveState l) => l.Engine.FutureBars.Count(x => x.IsComplete);
+    var pollNow = start;
+    while (clock < horizon - TimeSpan.FromSeconds(5))
+    {
+        await feeder.FeedAsync(clock);
+        var barsBefore = Complete(live); pollNow = clock;
+        var sw = Stopwatch.StartNew();
+        await worker.PollLiveAsync(live, clock, default);
+        var cost = sw.Elapsed;
+        if (!crashed && crash is not null && crash.When(live, barsBefore, Complete(live), clock))
+        {
+            crashed = true;
+            var baseVolume = live.Context.Session.BaseBarVolume;
+            var before = new Dictionary<string, object>
+            {
+                ["restartPointIst"] = (clock + ist).ToString("HH:mm:ss.fff"), ["completedBarsBeforeCrash"] = Complete(live), ["partialVolume"] = live.Engine.PartialBar.AccumulatedVolume,
+                ["baseBarVolume"] = baseVolume, ["partialFractionOfBase"] = Math.Round(live.Engine.PartialBar.AccumulatedVolume / (double)baseVolume, 3), ["pendingTicksLost"] = live.Pending.Count,
+                ["rawTicksVisibleInSource"] = feeder.Inserted, ["lastProcessedTickId"] = live.LastProcessedTickId ?? -1,
+            };
+
+            // ---- ABRUPT PROCESS DEATH: no CloseCurrentSessionAsync, no flush; every in-memory object is dropped, the DI container and all pooled connections die.
+            live = null!; worker = null!; await provider.DisposeAsync(); provider = null!;
+            NpgsqlConnection.ClearAllPools();
+            GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+
+            var restartAt = clock + TimeSpan.FromSeconds(3);                   // downtime; ticks keep being persisted by ingestion
+            await feeder.FeedAsync(restartAt);
+            long Count(string table) { using var c = new NpgsqlConnection(DbCs(runDb)); c.Open(); using var cmd = new NpgsqlCommand($"SELECT count(*) FROM {table}", c); return (long)cmd.ExecuteScalar()!; }
+            var barsPersisted = Count("adaptive_future_bars"); var futSideBefore = Count("adaptive_futures_supplemental_bars"); var optSideBefore = Count("adaptive_options_supplemental_bars");
+            var eventsBefore = Count("adaptive_commentary_events");
+            recorder.Reset();
+            GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
+            var heapBefore = GC.GetTotalMemory(true); var obsBefore = observerCounter.Snapshot(); var srcBefore = sourceCounter.Snapshot();
+            using var mem = new MemorySampler();
+            var recoverySw = Stopwatch.StartNew();
+            (worker, provider) = NewWorkerWithProvider(runDb);                  // brand-new service provider and worker: nothing carried over
+            live = await worker.TryStartOrRecoverAsync(d.Day, restartAt, default) ?? throw new InvalidOperationException("Recovery did not return to Live.");
+            recoverySw.Stop();
+            string status; long reconciled;
+            await using (var chk = new AdaptiveObserverDbContext(observerOptions(runDb)))
+            {
+                var rt = await chk.Runtime.AsNoTracking().SingleAsync(x => x.SessionId == live.Context.Session.Id);
+                status = rt.RuntimeStatus.ToString(); reconciled = rt.LastRecoveryReconciledBars;
+            }
+
+            var barsAfter = Count("adaptive_future_bars"); var futSideAfter = Count("adaptive_futures_supplemental_bars"); var optSideAfter = Count("adaptive_options_supplemental_bars");
+            var eventsAfter = Count("adaptive_commentary_events"); var obsAfter = observerCounter.Snapshot();
+            var stageMs = recorder.DurationsMs.Where(k => k.Key.StartsWith("recovery.", StringComparison.Ordinal)).ToDictionary(k => k.Key, k => Math.Round(k.Value.Sum(), 1));
+            before["downtimeSeconds"] = 3;
+            info["crash"] = before;
+            info["recovery"] = new Dictionary<string, object>
+            {
+                ["wallMs"] = Math.Round(recoverySw.Elapsed.TotalMilliseconds, 1), ["stageMs"] = stageMs, ["runtimeStatusAfterRecovery"] = status, ["barsVerifiedAgainstPersisted"] = reconciled,
+                ["barsPersistedBefore"] = barsPersisted, ["barsPersistedAfter"] = barsAfter,
+                ["futuresSidecarsInserted"] = futSideAfter - futSideBefore, ["futuresSidecarsVerified"] = Math.Min(futSideBefore, barsAfter),
+                ["optionsSidecarsInserted"] = optSideAfter - optSideBefore, ["optionsSidecarsVerified"] = Math.Min(optSideBefore, barsAfter),
+                ["commentaryEventsBefore"] = eventsBefore, ["commentaryEventsAfter"] = eventsAfter, ["commentaryEventsBackfilled"] = eventsAfter - eventsBefore,
+                ["pendingTicksRetainedBehindStableLag"] = live.Pending.Count, ["recoveredCompletedBars"] = Complete(live), ["recoveredPartialVolume"] = live.Engine.PartialBar.AccumulatedVolume,
+                ["recoveredPartialStartIst"] = live.Engine.PartialBar.StartedAtUtc is { } ps ? (ps + ist).ToString("HH:mm:ss.fff") : "none",
+                ["workingSetPeakMb"] = Mb(mem.PeakWorkingSet), ["managedHeapBeforeMb"] = Mb(heapBefore), ["managedHeapPeakMb"] = Mb(mem.PeakManagedHeap),
+                ["observerSqlCommands"] = obsAfter.Total - obsBefore.Total, ["sourceSqlCommands"] = sourceCounter.Snapshot().Total - srcBefore.Total,
+            };
+            clock = restartAt;
+            continue;
+        }
+
+        clock += cost + TimeSpan.FromMilliseconds(250);
+    }
+
+    // Deterministic synchronization point: every tick received by the horizon is visible and one poll at exactly the horizon clock settles the state.
+    await feeder.FeedAsync(horizon);
+    await worker.PollLiveAsync(live, horizon, default, forceRuntimeFlush: true);
+    var sessionId = live.Context.Session.Id;
+    info["horizonIst"] = (horizon + ist).ToString("HH:mm:ss");
+    info["finalPartialVolume"] = live.Engine.PartialBar.AccumulatedVolume;
+    info["finalPartialStartedUtc"] = live.Engine.PartialBar.StartedAtUtc?.ToString("O") ?? "none";
+    info["finalCompletedBars"] = Complete(live);
+    info["finalPendingTicks"] = live.Pending.Count;
+    info["finalPendingFingerprint"] = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(string.Join('|', live.Pending
+        .OrderBy(x => x.Tick.AvailableAt).ThenBy(x => x.Tick.Id).Select(x => $"{x.Token}:{x.Tick.Id}:{x.Tick.AvailableAt.UtcTicks}:{x.Tick.Last:R}"))))) [..16];
+    info["lastProcessedAvailableAtUtc"] = live.LastProcessedAvailableAt?.ToString("O") ?? "none";
+    info["lastProcessedTickId"] = live.LastProcessedTickId ?? -1;
+    info["lastFetchedRawId"] = live.LastFetchedRawId;
+    info["ticksInSource"] = feeder.Inserted;
+    var preClose = await DumpAsync(runDb, sessionId);
+    await worker.CloseCurrentSessionAsync(live, default);
+    var postClose = await DumpAsync(runDb, sessionId);
+    await provider.DisposeAsync();
+    return (preClose, postClose, info);
+}
+
+static Dictionary<string, object> LiveState(Dictionary<string, object> i) => new[] { "finalPartialVolume", "finalPartialStartedUtc", "finalPendingTicks", "finalPendingFingerprint", "lastProcessedTickId", "lastProcessedAvailableAtUtc", "finalCompletedBars", "lastFetchedRawId" }
+    .ToDictionary(k => k, k => i[k]);
+
+async Task<List<Dictionary<string, object>>> RestartValidationAsync(DayData d, Staged staged)
+{
+    var results = new List<Dictionary<string, object>>();
+    var day = d.Day;
+    var template = $"perf_tpl_{day:yyyyMMdd}";
+    Console.WriteLine($"RESTART {day:yyyy-MM-dd}: seeding prior-session history with the real production bootstrap ...");
+    await BuildPriorsTemplateAsync(day, template);
+    var start = U(day, 9, 30, 5); var horizon = U(day, 15, 35, 30);
+
+    if (Env("ADAPTIVE_PERF_RESTART_MODE", "full") == "scan")
+    {
+        var scanDb = $"perf_scan_{day:yyyyMMdd}";
+        await CloneObserverAsync(template, scanDb); await LoadTicksAsync(null);
+        var w = NewWorkerWithProvider(scanDb);
+        var live = await w.Worker.TryStartOrRecoverAsync(day, U(day, 15, 36), default);
+        await using var db = new AdaptiveObserverDbContext(observerOptions(scanDb));
+        var session = await db.Sessions.AsNoTracking().SingleAsync(x => x.TradeDate == day && !x.IsHistoricalSeed);
+        var weak = await db.Weak2Observations.AsNoTracking().Where(x => x.SessionId == session.Id).OrderBy(x => x.TriggerBarSeq).ToListAsync();
+        results.Add(new() { ["day"] = day.ToString("yyyy-MM-dd"), ["mode"] = "scan", ["strongThreshold"] = session.StrongThreshold?.ToString("R") ?? "null", ["weak2Observations"] = weak.Count,
+            ["triggerBars"] = weak.Select(x => x.TriggerBarSeq).ToArray(), ["statuses"] = weak.GroupBy(x => x.Status.ToString()).ToDictionary(g => g.Key, g => g.Count()) });
+        Console.WriteLine($"SCAN {day:yyyy-MM-dd}: strongThreshold={session.StrongThreshold} weak2={weak.Count} bars=[{string.Join(',', weak.Select(x => x.TriggerBarSeq))}]");
+        await w.Provider.DisposeAsync();
+        return results;
+    }
+
+    // ---- RUN A: uninterrupted
+    var a = await RestartRunAsync(d, staged, template, $"perf_restarta_{day:yyyyMMdd}", null, start, horizon);
+    Console.WriteLine($"RUN A uninterrupted: bars={a.Info["finalCompletedBars"]} pending={a.Info["finalPendingTicks"]} weak2Rows={a.PostClose["Weak2Observations"].Count}");
+
+    // ---- derive the difficult restart points from the data of run A
+    var runA = $"perf_restarta_{day:yyyyMMdd}";
+    List<(DateTimeOffset End, int Bars)> multi; List<(DateTimeOffset End, double Seconds, long Volume)> fastest;
+    await using (var db = new AdaptiveObserverDbContext(observerOptions(runA)))
+    {
+        var bars = await db.FutureBars.AsNoTracking().Where(x => x.EndAvailableAtUtc > start.AddMinutes(20) && x.EndAvailableAtUtc < horizon.AddMinutes(-30)).OrderBy(x => x.BarSeq).ToListAsync();
+        multi = bars.GroupBy(x => x.EndAvailableAtUtc).Where(g => g.Count() > 1).Select(g => (g.Key, g.Count())).OrderByDescending(x => x.Item2).ToList();
+        fastest = bars.Where(x => x.DurationSeconds > 0).OrderBy(x => x.DurationSeconds).Take(3).Select(x => (x.EndAvailableAtUtc, x.DurationSeconds, x.Volume)).ToList();
+    }
+
+    var cases = new List<CrashCase>
+    {
+        new("A: incomplete adaptive bar", "restart when the partial futures volume is 40-60% of BaseBarVolume (mid-bar), after 11:30 IST, with unprocessed ticks still in the ordering buffer",
+            (l, bb, bn, now) => now > U(day, 11, 30) && l.Engine.PartialBar.AccumulatedVolume >= 0.4 * l.Context.Session.BaseBarVolume
+                && l.Engine.PartialBar.AccumulatedVolume <= 0.6 * l.Context.Session.BaseBarVolume && l.Pending.Count > 0),
+        new("B: immediately after a completed bar", "restart on the first poll after 12:30 IST that completed an adaptive bar (bar rows committed, runtime cursor just advanced)",
+            (l, bb, bn, now) => now > U(day, 12, 30) && bn > bb),
+    };
+    if (multi.Count > 0)
+    {
+        var (end, n) = multi[0];
+        cases.Add(new($"C1: before a multi-bar boundary ({n} bars close at {(end + ist):HH:mm:ss} IST)", "restart after the boundary's ticks are fetched but BEFORE they are processed (they sit in the lost ordering buffer)",
+            (l, bb, bn, now) => l.Pending.Any(p => p.Tick.AvailableAt == end) && bn == bb));
+        cases.Add(new($"C2: after a multi-bar boundary ({n} bars close at {(end + ist):HH:mm:ss} IST)", "restart on the poll that completes the multi-bar boundary", (l, bb, bn, now) => bn - bb >= n));
+    }
+    else
+    {
+        var (end, secs, vol) = fastest[0];
+        Console.WriteLine($"No timestamp in this session closes more than one exact volume bar; using the fastest-closing (highest-volume-rate) boundary: {(end + ist):HH:mm:ss} IST, {secs}s, volume {vol}.");
+        cases.Add(new($"C1: before the highest-volume boundary (bar closing {(end + ist):HH:mm:ss} IST, {secs}s)", "no real multi-bar-close exists; restart before the fastest-closing bar's ticks are processed",
+            (l, bb, bn, now) => l.Pending.Any(p => p.Tick.AvailableAt == end) && bn == bb));
+        cases.Add(new($"C2: after the highest-volume boundary (bar closing {(end + ist):HH:mm:ss} IST)", "restart on the poll that completes that bar", (l, bb, bn, now) => now > end && bn > bb && l.LastProcessedAvailableAt >= end));
+    }
+
+    var weak2Rows = a.PostClose["Weak2Observations"];
+    foreach (var c in cases)
+    {
+        var tag = new string(c.Name.TakeWhile(ch => ch != ':').ToArray()).ToLowerInvariant();
+        var b = await RestartRunAsync(d, staged, template, $"perf_restartb{tag}_{day:yyyyMMdd}", c, start, horizon);
+        if (!b.Info.ContainsKey("crash")) { results.Add(new() { ["day"] = day.ToString("yyyy-MM-dd"), ["case"] = c.Name, ["error"] = "restart condition never occurred in this session" }); continue; }
+        var pre = Compare(a.PreClose, b.PreClose); var post = Compare(a.PostClose, b.PostClose);
+        var sameState = a.Info["finalPartialVolume"].Equals(b.Info["finalPartialVolume"]) && a.Info["finalPartialStartedUtc"].Equals(b.Info["finalPartialStartedUtc"]) && a.Info["finalPendingFingerprint"].Equals(b.Info["finalPendingFingerprint"])
+            && a.Info["lastProcessedTickId"].Equals(b.Info["lastProcessedTickId"]) && a.Info["lastProcessedAvailableAtUtc"].Equals(b.Info["lastProcessedAvailableAtUtc"]) && a.Info["finalCompletedBars"].Equals(b.Info["finalCompletedBars"]);
+        var jobs = b.PostClose["CommentaryNotificationJobs"].Count;
+        var health = b.PostClose["ProjectionHealth"].Count;
+        results.Add(new()
+        {
+            ["day"] = day.ToString("yyyy-MM-dd"), ["case"] = c.Name, ["why"] = c.Why, ["crash"] = b.Info["crash"], ["recovery"] = b.Info["recovery"],
+            ["equalAtHorizon"] = pre["allEqual"], ["equalAfterClose"] = post["allEqual"], ["liveStateEqualAtHorizon"] = sameState, ["tablesAfterClose"] = post["tables"], ["tablesAtHorizon"] = pre["tables"],
+            ["structuralDiff"] = ((List<string>)post["structuralDiff"]).Concat((List<string>)pre["structuralDiff"]).ToList(),
+            ["liveStateA"] = LiveState(a.Info), ["liveStateB"] = LiveState(b.Info),
+            ["notificationJobs"] = jobs, ["projectionHealthRows"] = health, ["weak2RowsA"] = weak2Rows.Count, ["weak2RowsB"] = b.PostClose["Weak2Observations"].Count,
+        });
+        Console.WriteLine($"RESTART CASE {c.Name}: horizon-equal={pre["allEqual"]} after-close-equal={post["allEqual"]} liveState-equal={sameState} jobs={jobs} health={health} recoveryMs={((Dictionary<string, object>)b.Info["recovery"])["wallMs"]}");
+        foreach (var line in ((List<string>)post["structuralDiff"]).Take(5)) Console.WriteLine("   DIFF " + line);
+    }
+
+    // Negative controls: the comparator must flag a one-column change and a missing row (proves the equality results above are not vacuous).
+    var mutated = a.PostClose.ToDictionary(k => k.Key, k => k.Value.ToList());
+    mutated["FutureBars"][mutated["FutureBars"].Count / 2] = mutated["FutureBars"][mutated["FutureBars"].Count / 2].Replace("Volume=", "Volume=1");
+    mutated["OptionBandBars"].RemoveAt(mutated["OptionBandBars"].Count / 3);
+    var control = Compare(a.PostClose, mutated);
+    Console.WriteLine($"NEGATIVE CONTROL (mutated copy of run A): comparator reports equal={control["allEqual"]} (must be False); {string.Join(" | ", ((List<string>)control["structuralDiff"]).Take(2))}");
+
+    results.Insert(0, new() { ["negativeControlDetected"] = !(bool)control["allEqual"], ["day"] = day.ToString("yyyy-MM-dd"), ["run"] = "A uninterrupted", ["finalCompletedBars"] = a.Info["finalCompletedBars"], ["weak2Rows"] = weak2Rows.Count,
+        ["weak2TriggerRows"] = weak2Rows.Take(10).ToList(), ["tables"] = a.PostClose.ToDictionary(k => k.Key, k => new { rows = k.Value.Count, hash = HashRows(k.Value) }), ["multiBarBoundaries"] = multi.Select(m => new { endIst = (m.End + ist).ToString("HH:mm:ss"), m.Bars }).ToList(),
+        ["strongThreshold"] = a.PostClose["Sessions(frozen definition)"].FirstOrDefault()?.Split(';').FirstOrDefault(x => x.StartsWith("StrongThreshold="))?.Split('=')[1] ?? "?" });
+    return results;
+}
+
 // ---------------------------------------------------------------- run
 var liveResults = new List<Dictionary<string, object>>();
 var recoveryResults = new List<Dictionary<string, object>>();
@@ -495,7 +815,7 @@ var stressResults = new List<Dictionary<string, object>>();
 var planResults = new List<string>();
 var equivalence = new List<Dictionary<string, object>>();
 
-if (stages.Overlaps(["live", "recovery", "dashboard", "stress", "digest"]))
+if (stages.Overlaps(["live", "recovery", "dashboard", "stress", "digest"]) && !stages.Contains("restart"))
 {
     await EnsureSourceSchemaAsync();
     var simDays = liveDays.Concat(coldDays).Distinct().ToList();
@@ -555,15 +875,28 @@ if (stages.Overlaps(["live", "recovery", "dashboard", "stress", "digest"]))
     }
 }
 
+var restartReports = new List<Dictionary<string, object>>();
+if (stages.Contains("restart"))
+{
+    await EnsureSourceSchemaAsync();
+    foreach (var day in ParseDays(Env("ADAPTIVE_PERF_RESTART_DAYS")))
+    {
+        var d = await LoadDayAsync(day);
+        if (d is null) continue;
+        var staged = await StageAsync(d);
+        restartReports.AddRange(await RestartValidationAsync(d, staged));
+    }
+}
+
 if (stages.Contains("plans")) planResults.AddRange(await QueryPlansAsync());
 
 report["live"] = liveResults; report["recovery"] = recoveryResults; report["digests"] = digests; report["dashboard"] = dashboardResults; report["stress"] = stressResults;
-report["equivalence"] = equivalence; report["queryPlans"] = planResults;
+report["restartContinuation"] = restartReports; report["equivalence"] = equivalence; report["queryPlans"] = planResults;
 var json = JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true });
 var path = Path.Combine(outDir, $"summary-{label}.json");
 await File.WriteAllTextAsync(path, json);
 Console.WriteLine($"WROTE {path}");
-return equivalence.Any(e => e["equal"] is false) ? 1 : 0;
+return equivalence.Any(e => e["equal"] is false) || restartReports.Any(r => r.TryGetValue("equalAfterClose", out var e) && e is false) ? 1 : 0;
 
 static string Fmt(object stats) => stats is Dictionary<string, double> s ? $"{s.GetValueOrDefault("p50")}/{s.GetValueOrDefault("p99")}/{s.GetValueOrDefault("max")}" : "?";
 

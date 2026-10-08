@@ -3,6 +3,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using Npgsql;
 using NiftySignal.AdaptiveObserver;
+using NiftySignal.Host;
 using NiftySignal.Domain.Entities;
 
 sealed record DayData(DateOnly Day, Instrument Future, List<Instrument> Options, DateOnly Weekly, List<ObserverOptionInstrument> Chain, string[] Tokens,
@@ -70,3 +71,5 @@ sealed class LambdaFactory<T>(Func<T> create) : IDbContextFactory<T> where T : D
     public T CreateDbContext() => create();
     public Task<T> CreateDbContextAsync(CancellationToken cancellationToken = default) => Task.FromResult(create());
 }
+
+sealed record CrashCase(string Name, string Why, Func<AdaptiveObserverWorker.LiveState, int, int, DateTimeOffset, bool> When);
