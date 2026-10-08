@@ -181,6 +181,7 @@ public sealed class AdaptiveObserverWorker(
                 // Supplemental sidecar rows are inserted/verified before the Dashboard is told, so a push never races ahead of them.
                 // The call never throws into the core observer (sidecar problems are logged and counted).
                 await supplemental.PersistOrVerifyFuturesAsync(observer, live.Context.Session.Id, package, ct);
+                await supplemental.PersistOrVerifyOptionsAsync(observer, live.Context.Session, package, ct);
                 if (saved.Inserted)
                 {
                     // Signal only after the DB transaction committed. Failure to notify must not

@@ -324,8 +324,17 @@ public sealed class AdaptiveCompactGridTests
                     SessionId = 1, BarSeq = seq, Variant = variant, EndAvailableAtUtc = end, Relationship = "ALIGN", IsAvailable = seq != 11,
                     UnavailableReason = "fixture diagnostic quote missing", CenterStrike = 25000, FutureChangeFrom0930 = 12.5,
                     CEResidualPct = 1.25, PEResidualPct = -2.5, DirectionalResidualPct = 3.75, ResidualDelta = 0.5, ResidualDirection = 1, MaxQuoteAgeSeconds = 0.75,
+                    CEResidual = 2, PEResidual = 3,
                 });
         }
+        // Frozen 09:30 anchor: 5 CE + 5 PE components at 20 each (center flagged), so the ATM±2 baselines are 100 + 100 and ATM 20 + 20.
+        foreach (var side in new[] { OptionType.Call, OptionType.Put })
+            for (var k = 0; k < 5; k++)
+                db.ResidualAnchorComponents.Add(new() { SessionId = 1, Side = side, Strike = 24900 + 50 * k, Token = $"{side}{k}", TradingSymbol = $"{side}{k}",
+                    QuoteTimestampUtc = Open930, Price0930 = 20, IsCenterStrike = k == 2 });
+        db.OptionsSupplemental.Add(new() { SessionId = 1, BarSeq = 12, MetricsVersion = OptionsSupplementalBar.MetricsVersion,
+            CeOiDelta = 100, PeOiDelta = -100, CePosition = "CallLongBuild", PePosition = "PutShortCover", CeDeltaIv = 3.0, PeDeltaIv = 2.75,
+            IvSkewEnd = 1.25, VolPcr = 0.8, RollVolPcr = 1.1, DayCeVolume = 1000, DayPeVolume = 900, UniverseTokenCount = 40, TokensObserved = 38 });
         db.FuturesSupplemental.Add(new() { SessionId = 1, BarSeq = 12, MetricsVersion = FuturesMicrostructureBar.MetricsVersion, MicroDevTimeWeighted = 0.1234, Ofi = -400 });
         db.FuturesSupplemental.Add(new() { SessionId = 1, BarSeq = 11, MetricsVersion = "some-other-version", MicroDevTimeWeighted = 9.9, Ofi = 999 }); // another contract: never shown
         await db.SaveChangesAsync();
@@ -368,11 +377,13 @@ public sealed class AdaptiveCompactGridTests
         Assert.Equal(["Seq", "End IST", "Dur s", "Urgency", "Bar ΔPx", "Roll ΔPx", "Strict Δ", "Enriched Δ", "Roll Strict", "Roll Enriched",
             "|Strict| Δ", "MicroDev", "OFI", "Roll OI Δ", "Roll Efficiency", "Evolution", "State"], Headers(html, 0));
         Assert.Equal(["Seq", "End IST", "Center", "Roll?", "CE ΔPx", "PE ΔPx", "CE Roll ΔPx", "PE Roll ΔPx", "CE Strict Δ", "PE Strict Δ",
-            "CE Enriched Δ", "PE Enriched Δ", "CE Roll Strict", "PE Roll Strict"], Headers(html, 1));
-        Assert.Equal(["Seq", "End IST", "Future Δ09:30", "CE Res %", "PE Res %", "Directional Res %", "Direction", "Relation", "Quote Age"], Headers(html, 2));
+            "CE Enriched Δ", "PE Enriched Δ", "CE Roll Strict", "PE Roll Strict", "CE OI Δ", "PE OI Δ", "CE Position", "PE Position",
+            "CE ΔIV", "PE ΔIV", "IV Skew", "Vol PCR", "Roll Vol PCR"], Headers(html, 1));
+        Assert.Equal(["Seq", "End IST", "Future Δ09:30", "CE Res %", "CE Res Δ%", "PE Res %", "PE Res Δ%", "Directional Res %",
+            "Adjacent Directional Res Δ", "Straddle Res %", "Direction", "Relation", "Quote Age"], Headers(html, 2));
 
         // No columns from later slices, no legacy bridged delta, no diagnostic wide-table headers, no diagnostic toggle in a capture.
-        foreach (var absent in new[] { "ΔBasis", "Position", "ΔIV", "Skew", "Vol PCR", "Res Δ%", "Legacy Bridged", "Strict ratio", "Diagnostic view" })
+        foreach (var absent in new[] { "ΔBasis", "Day Vol PCR", "Legacy Bridged", "Strict ratio", "Diagnostic view" })
             Assert.DoesNotContain(absent, html);
     }
 
@@ -400,8 +411,11 @@ public sealed class AdaptiveCompactGridTests
         { ["CaptureMode"] = true, ["CaptureSessionId"] = 1L, ["CaptureBarSeq"] = 12 });
 
         var rows = FirstRows(html, 1, 2);
-        Assert.Equal(["12", "09:42:00", "25000", "—", "+2.50", "-3.50", "+10.50", "-20.50", "+321", "-654", "+111", "-222", "+5555", "-6666"], rows[0]);
+        // Bar 12 has a sidecar row: center OI Δ, positions, ΔIV, skew (end of bar) and PCRs; bar 10 has none, so those cells are unavailable (never zero).
+        Assert.Equal(["12", "09:42:00", "25000", "—", "+2.50", "-3.50", "+10.50", "-20.50", "+321", "-654", "+111", "-222", "+5555", "-6666",
+            "+100", "-100", "CallLongBuild", "PutShortCover", "+3.00", "+2.75", "+1.25", "0.80", "1.10"], rows[0]);
         Assert.Equal(["11", "09:41:00", "Unavailable: fixture option quotes missing"], rows[1]);
+        Assert.Equal(["—", "—", "—", "—", "—", "—", "—", "—", "—"], FirstRows(html, 1, 3)[2][14..23]);
     }
 
     [Fact]
@@ -411,9 +425,13 @@ public sealed class AdaptiveCompactGridTests
         var html = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new()
         { ["CaptureMode"] = true, ["CaptureSessionId"] = 1L, ["CaptureBarSeq"] = 12 });
 
-        var rows = FirstRows(html, 2, 2);
-        Assert.Equal(["12", "09:42:00", "+12.50", "+1.25%", "-2.50%", "+3.75%", "UP", "ALIGN", "0.75"], rows[0]);
+        var rows = FirstRows(html, 2, 4);
+        // Bar 12: the previous bar (11) is unavailable, so every adjacent delta is unavailable even though bar 10 was valid (no bridging).
+        // The straddle value uses the frozen 09:30 baselines (5 CE + 5 PE anchors at 20 each = 200): 100 * (2 + 3) / 200.
+        Assert.Equal(["12", "09:42:00", "+12.50", "+1.25%", "—", "-2.50%", "—", "+3.75%", "—", "+2.50%", "UP", "ALIGN", "0.75"], rows[0]);
         Assert.Equal(["11", "09:41:00", "Unavailable: fixture diagnostic quote missing"], rows[1]);
+        // Bar 10 follows valid bar 9 with identical readings: adjacent deltas are zero and the identity holds.
+        Assert.Equal(["10", "09:40:00", "+12.50", "+1.25%", "0.00%", "-2.50%", "0.00%", "+3.75%", "0.00%", "+2.50%", "UP", "ALIGN", "0.75"], rows[2]);
     }
 
     [Fact]

@@ -65,6 +65,7 @@ static class RelationalRestartParity
                 if(golden[package.FutureBar.BarSeq]!=JsonSerializer.Serialize(package))throw new Exception("PostgreSQL restart changed an emitted package.");
                 await persistence.PersistOrVerifyAsync(db,row,package,group[0].Tick.AvailableAt,default);
                 await supplemental.PersistOrVerifyFuturesAsync(db,row.Id,package,default);
+                await supplemental.PersistOrVerifyOptionsAsync(db,row,package,default);
                 await observations.ProcessPackageAsync(source,db,context,package,default);
             }
             var time=group[0].Tick.AvailableAt;
@@ -85,11 +86,17 @@ static class RelationalRestartParity
             throw new Exception($"Sidecar restart parity failed: mismatches={supplemental.MismatchCount}, failures={supplemental.FailureCount}.");
         // Mid-session deployment: delete the earliest sidecar rows (as if the Host were deployed after those bars) and replay.
         db.ChangeTracker.Clear();
+        if(await db.OptionsSupplemental.CountAsync(x=>x.SessionId==row.Id && x.MetricsVersion==OptionsSupplementalBar.MetricsVersion)!=expected.Count)
+            throw new Exception("Options sidecar row count differs from completed bars after restarts.");
+        var optionsAvailable=expected.Count(x=>x.OptionsSupplemental?.CePosition is not null && x.OptionsSupplemental.CeIvEnd is not null);
+        if(optionsAvailable==0)throw new Exception("The PostgreSQL fixture produced no center-contract options observations.");
+        var removedOptions=await db.OptionsSupplemental.Where(x=>x.SessionId==row.Id && x.BarSeq<=5).ExecuteDeleteAsync();
         var removed=await db.FuturesSupplemental.Where(x=>x.SessionId==row.Id && x.BarSeq<=5).ExecuteDeleteAsync();
         var backfillRecovery=new AdaptiveStateRecoveryService(new(),persistence,new AdaptiveWeak2ObservationService(NullLogger<AdaptiveWeak2ObservationService>.Instance),
             NullLogger<AdaptiveStateRecoveryService>.Instance,supplemental);
         await backfillRecovery.RecoverAsync(source,db,context,groups[^1][0].Tick.AvailableAt,default);
-        if(removed!=5 || await db.FuturesSupplemental.CountAsync(x=>x.SessionId==row.Id)!=expected.Count || supplemental.MismatchCount!=0)
+        if(removed!=5 || removedOptions!=5 || await db.FuturesSupplemental.CountAsync(x=>x.SessionId==row.Id)!=expected.Count
+            || await db.OptionsSupplemental.CountAsync(x=>x.SessionId==row.Id)!=expected.Count || supplemental.MismatchCount!=0)
             throw new Exception("Sidecar backfill after a mid-session deployment failed.");
         db.ChangeTracker.Clear();
         var completed=await db.Weak2Observations.FirstAsync(x=>x.SessionId==row.Id && x.Status==AdaptiveObservationStatus.Completed);
@@ -100,7 +107,7 @@ static class RelationalRestartParity
             throw new Exception("Restart overwrote corrupted persisted history.");
         await File.WriteAllTextAsync(Path.Combine(evidence,"postgres-restart.json"),JsonSerializer.Serialize(new {
             sourceSha=sha,restarts,completedBars=expected.Count,trigger=trigger.FutureBar.BarSeq,
-            bandRoll=rolled.FutureBar.BarSeq,corruptionRejected=true,sidecarRows=expected.Count,sidecarBackfilledBars=removed,scope="PostgreSQL source, package persistence, Weak2/OI/H5 reconciliation and partial-state restarts" },new JsonSerializerOptions { WriteIndented=true }));
+            bandRoll=rolled.FutureBar.BarSeq,corruptionRejected=true,sidecarRows=expected.Count,optionsRows=expected.Count,optionsBarsWithPositionAndIv=optionsAvailable,sidecarBackfilledBars=removed,scope="PostgreSQL source, package persistence, Weak2/OI/H5 reconciliation and partial-state restarts" },new JsonSerializerOptions { WriteIndented=true }));
         Console.WriteLine($"POSTGRES RESTART PASS: {restarts} process-state resets, {expected.Count} completed bars, Weak2/H5 and band roll, corruption rejected without overwrite.");
     }
     static Tick Quote(string token,DateTimeOffset time,double last,double bid,double ask,long volume,long oi)=>new() {

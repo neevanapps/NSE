@@ -93,7 +93,10 @@ public sealed class AdaptiveStateRecoveryService(
                     observer, context.Session, package, DateTimeOffset.UtcNow, ct);
                 // Replay recomputes the supplemental metrics: verify rows that exist, insert the ones that do not (mid-session backfill).
                 if (supplemental is not null)
+                {
                     await supplemental.PersistOrVerifyFuturesAsync(observer, context.Session.Id, package, ct);
+                    await supplemental.PersistOrVerifyOptionsAsync(observer, context.Session, package, ct);
+                }
                 await observations.ProcessPackageAsync(source, observer, context, package, ct);
                 if (result.VerifiedExisting)
                 {

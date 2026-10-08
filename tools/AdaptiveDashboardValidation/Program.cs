@@ -101,26 +101,43 @@ try {
     await Expect(page.Locator(".adaptive-table[data-grid='futures-compact'] thead th")).ToHaveTextAsync(new[] { "Seq","End IST","Dur s","Urgency",
         "Bar ΔPx","Roll ΔPx","Strict Δ","Enriched Δ","Roll Strict","Roll Enriched","|Strict| Δ","MicroDev","OFI","Roll OI Δ","Roll Efficiency","Evolution","State" });
     await Expect(page.Locator(".adaptive-table[data-grid='options-compact'] thead th")).ToHaveTextAsync(new[] { "Seq","End IST","Center","Roll?",
-        "CE ΔPx","PE ΔPx","CE Roll ΔPx","PE Roll ΔPx","CE Strict Δ","PE Strict Δ","CE Enriched Δ","PE Enriched Δ","CE Roll Strict","PE Roll Strict" });
+        "CE ΔPx","PE ΔPx","CE Roll ΔPx","PE Roll ΔPx","CE Strict Δ","PE Strict Δ","CE Enriched Δ","PE Enriched Δ","CE Roll Strict","PE Roll Strict",
+        "CE OI Δ","PE OI Δ","CE Position","PE Position","CE ΔIV","PE ΔIV","IV Skew","Vol PCR","Roll Vol PCR" });
     await Expect(page.Locator(".adaptive-table[data-grid='residual-compact'] thead th")).ToHaveTextAsync(new[] { "Seq","End IST","Future Δ09:30",
-        "CE Res %","PE Res %","Directional Res %","Direction","Relation","Quote Age" });
+        "CE Res %","CE Res Δ%","PE Res %","PE Res Δ%","Directional Res %","Adjacent Directional Res Δ","Straddle Res %","Direction","Relation","Quote Age" });
     // Fixture bars: 3250 volume in 60 s => Urgency 54.2 (derived on read, not persisted).
     await Expect(page.Locator(".adaptive-table[data-grid='futures-compact'] tbody tr").First.Locator("td").Nth(3)).ToHaveTextAsync("54.2");
     await Expect(page.Locator(".adaptive-table[data-grid='options-compact'] tbody tr").First.Locator("td").Nth(2)).ToHaveTextAsync("23000");
+    // Options sidecar (adaptive_options_supplemental_bars) values shown in the compact options grid; residual deltas are adjacent-bar and need no table.
+    var optionsFirst=page.Locator(".adaptive-table[data-grid='options-compact'] tbody tr").First.Locator("td");
+    await Expect(optionsFirst.Nth(14)).ToHaveTextAsync("+100"); await Expect(optionsFirst.Nth(15)).ToHaveTextAsync("-100");
+    await Expect(optionsFirst.Nth(16)).ToHaveTextAsync("CallLongBuild"); await Expect(optionsFirst.Nth(17)).ToHaveTextAsync("PutShortCover");
+    await Expect(optionsFirst.Nth(18)).ToHaveTextAsync("+1.50"); await Expect(optionsFirst.Nth(19)).ToHaveTextAsync("-0.50");
+    await Expect(optionsFirst.Nth(20)).ToHaveTextAsync("+0.75"); await Expect(optionsFirst.Nth(21)).ToHaveTextAsync("0.90"); await Expect(optionsFirst.Nth(22)).ToHaveTextAsync("1.20");
+    var residualFirst=page.Locator(".adaptive-table[data-grid='residual-compact'] tbody tr").First.Locator("td");
+    await Expect(residualFirst.Nth(4)).ToHaveTextAsync("0.00%");   // CE Res Δ%: bar 19 is valid, so the adjacent delta exists
+    await Expect(residualFirst.Nth(8)).ToHaveTextAsync("0.00%");   // Adjacent Directional Res Δ
+    await Expect(residualFirst.Nth(9)).ToHaveTextAsync("—");       // Straddle Res %: this fixture has no frozen anchor baselines
     // Sidecar metrics come from adaptive_futures_supplemental_bars (bar 20: MicroDev +0.125, OFI -420).
     await Expect(page.Locator(".adaptive-table[data-grid='futures-compact'] tbody tr").First.Locator("td").Nth(11)).ToHaveTextAsync("+0.125");
     await Expect(page.Locator(".adaptive-table[data-grid='futures-compact'] tbody tr").First.Locator("td").Nth(12)).ToHaveTextAsync("-420");
     // Deployment-order safety: a Dashboard that starts before the Host migrated has no sidecar table; the panel must still render, with MicroDev/OFI unavailable.
     await db.Database.ExecuteSqlRawAsync("ALTER TABLE adaptive_futures_supplemental_bars RENAME TO adaptive_futures_supplemental_bars_hidden");
+    await db.Database.ExecuteSqlRawAsync("ALTER TABLE adaptive_options_supplemental_bars RENAME TO adaptive_options_supplemental_bars_hidden");
     try
     {
         await page.ReloadAsync();
         await Expect(page.Locator(".adaptive-table[data-grid='futures-compact'] tbody tr").First.Locator("td").Nth(11)).ToHaveTextAsync("—");
         await Expect(page.Locator(".adaptive-table[data-grid='futures-compact'] tbody tr").First.Locator("td").Nth(12)).ToHaveTextAsync("—");
         await Expect(page.Locator(".adaptive-table")).ToHaveCountAsync(3);
+        await Expect(page.Locator(".adaptive-table[data-grid='options-compact'] tbody tr").First.Locator("td").Nth(14)).ToHaveTextAsync("—");
         await Expect(page.Locator(".adaptive-alert-error")).ToHaveCountAsync(0);
     }
-    finally { await db.Database.ExecuteSqlRawAsync("ALTER TABLE adaptive_futures_supplemental_bars_hidden RENAME TO adaptive_futures_supplemental_bars"); }
+    finally
+    {
+        await db.Database.ExecuteSqlRawAsync("ALTER TABLE adaptive_futures_supplemental_bars_hidden RENAME TO adaptive_futures_supplemental_bars");
+        await db.Database.ExecuteSqlRawAsync("ALTER TABLE adaptive_options_supplemental_bars_hidden RENAME TO adaptive_options_supplemental_bars");
+    }
     await page.ReloadAsync();
     await Expect(page.Locator(".adaptive-table[data-grid='futures-compact'] tbody tr").First.Locator("td").Nth(11)).ToHaveTextAsync("+0.125");
     await Expect(page.GetByLabel("Completed rows",new() { Exact=true })).ToBeEnabledAsync();
@@ -319,6 +336,9 @@ void AddRows(int seq) {
     var end=at.AddMinutes(seq-43);var begin=end.AddMinutes(-1);
     db.FutureBars.Add(new AdaptiveFutureBarRow { SessionId=session.Id,BarSeq=seq,StartAvailableAtUtc=begin,EndAvailableAtUtc=end,
         Open=23000,High=23001,Low=23000,Close=23001,Volume=3250,TradeUpdates=1,DurationSeconds=60 });
+    db.OptionsSupplemental.Add(new AdaptiveOptionsSupplementalRow { SessionId=session.Id,BarSeq=seq,MetricsVersion=OptionsSupplementalBar.MetricsVersion,
+        CenterStrike=23000,CeOiDelta=100,PeOiDelta=-100,CePosition="CallLongBuild",PePosition="PutShortCover",CeDeltaIv=1.5,PeDeltaIv=-.5,
+        IvSkewEnd=.75,VolPcr=.9,RollVolPcr=1.2,DayCeVolume=1000,DayPeVolume=900,UniverseTokenCount=2,TokensObserved=2 });
     db.FuturesSupplemental.Add(new AdaptiveFuturesSupplementalRow { SessionId=session.Id,BarSeq=seq,MetricsVersion=FuturesMicrostructureBar.MetricsVersion,
         MicroDevTimeWeighted=.125,Ofi=-400L-seq,ValidBookSeconds=60 });
     foreach(var side in new[] { OptionType.Call,OptionType.Put })

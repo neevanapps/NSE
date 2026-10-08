@@ -29,6 +29,8 @@ public sealed class AdaptiveObserverEngine
     readonly Dictionary<ResidualVariant, double> _previousResidual = [];
     // Supplemental Level-1 book observation. Separate state: it never influences bar construction or any core output.
     readonly FuturesMicrostructureTracker _microstructure = new();
+    // Level-1 book of every universe option, observed only to summarize the bar's center CE/PE (MicroDev/OFI). Never read by core logic.
+    readonly Dictionary<string, FuturesMicrostructureTracker> _optionBooks = new(StringComparer.Ordinal);
 
     BandContext? _currentBand;
     IReadOnlyList<double>? _previousBandStrikes;
@@ -81,6 +83,8 @@ public sealed class AdaptiveObserverEngine
                 _quoteAtDiagnosticBoundary[token]=previous;
             _latestOptionQuotes[token] = new OptionQuoteSnapshot(
                 token, tick.AvailableAt, tick.Last, tick.Bid, tick.Ask, tick.OpenInterest);
+            if (!_optionBooks.TryGetValue(token, out var book)) _optionBooks[token] = book = new FuturesMicrostructureTracker();
+            book.Observe(tick);
         }
 
         return Array.Empty<AdaptiveCompletedBarPackage>();
@@ -131,6 +135,7 @@ public sealed class AdaptiveObserverEngine
         var packages = new List<AdaptiveCompletedBarPackage>(completed.Count);
         foreach (var bar in completed)
         {
+            var finishedBand = _currentBand;
             var optionBand = FinalizeBand(bar);
             var flowStates = AdaptiveFlowEvolutionTracker.Build(_futureBars.Bars);
             if (_strongThreshold.HasValue)
@@ -151,10 +156,36 @@ public sealed class AdaptiveObserverEngine
             // that exact timestamp; zero-duration follow-on bars therefore correctly see zero
             // option activity rather than duplicating the preceding interval.
             _currentBand = SelectBandContext(bar.EndAvailableAtUtc, bar.Close);
+            // The supplemental needs the NEXT selection's synthetic underlying (the same instant as the bar end) for end-of-bar IV,
+            // so it is attached after the core package and the next band context exist. It reads state; it changes none.
+            packages[^1] = packages[^1] with { OptionsSupplemental = BuildOptionsSupplemental(bar, finishedBand, optionBand, _currentBand) };
         }
 
         return packages;
     }
+
+    OptionsSupplementalBar BuildOptionsSupplemental(ExactAdaptiveBar bar, BandContext? start, OptionBandBarResult band, BandContext? next) =>
+        OptionsSupplementalCalculator.Build(new OptionsSupplementalInput
+        {
+            Selection = start?.Selection,
+            UnavailableReason = start is null ? "Band context was not initialized." : start.UnavailableReason,
+            Start = bar.StartAvailableAtUtc,
+            End = bar.EndAvailableAtUtc,
+            DurationSeconds = bar.DurationSeconds,
+            RiskFreeRate = _riskFreeRate,
+            StartUnderlying = start?.Selection?.SyntheticUnderlying,
+            EndUnderlying = next?.Selection?.SyntheticUnderlying,
+            StartSnapshot = token => start is not null && start.StartSnapshots.TryGetValue(token, out var s) ? s : null,
+            EndSnapshot = _optionFlow.Snapshot,
+            CallBand = band.Call,
+            PutBand = band.Put,
+            CallHistory = _callBandHistory,
+            PutHistory = _putBandHistory,
+            RollingWindowBars = _session.RollingWindowBars,
+            Universe = _options,
+            CenterBook = token => _optionBooks.TryGetValue(token, out var tracker)
+                ? tracker.Complete(bar.StartAvailableAtUtc, bar.EndAvailableAtUtc) : null,
+        });
 
     OptionBandBarResult FinalizeBand(ExactAdaptiveBar bar)
     {

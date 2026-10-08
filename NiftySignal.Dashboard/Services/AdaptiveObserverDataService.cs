@@ -140,7 +140,29 @@ public sealed class AdaptiveObserverDataService(
 
         return new AdaptiveObserverSnapshot(session, runtime, futures, options, residuals, anchors,
             await LoadValidBarCountAsync(db, session, runtime.LastCompletedBarSeq, ct),
-            await LoadFuturesSupplementalAsync(db, session.Id, seqs, ct));
+            await LoadFuturesSupplementalAsync(db, session.Id, seqs, ct),
+            await LoadOptionsSupplementalAsync(db, session.Id, seqs, ct),
+            seqs.Length == 0 ? [] : await db.OptionResidualBars.AsNoTracking()
+                .Where(x => x.SessionId == session.Id && x.BarSeq == seqs.Min() - 1).ToListAsync(ct));
+    }
+
+    /// <summary>Options sidecar read; same missing-relation tolerance as <see cref="LoadFuturesSupplementalAsync"/>.</summary>
+    static async Task<IReadOnlyDictionary<int, AdaptiveOptionsSupplementalRow>> LoadOptionsSupplementalAsync(
+        AdaptiveObserverDbContext db, long sessionId, int[] seqs, CancellationToken ct)
+    {
+        if (seqs.Length == 0) return new Dictionary<int, AdaptiveOptionsSupplementalRow>();
+        try
+        {
+            var version = OptionsSupplementalBar.MetricsVersion;
+            var rows = await db.OptionsSupplemental.AsNoTracking()
+                .Where(x => x.SessionId == sessionId && x.MetricsVersion == version && seqs.Contains(x.BarSeq))
+                .ToListAsync(ct);
+            return rows.ToDictionary(x => x.BarSeq);
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedTable)
+        {
+            return new Dictionary<int, AdaptiveOptionsSupplementalRow>();
+        }
     }
 
     /// <summary>

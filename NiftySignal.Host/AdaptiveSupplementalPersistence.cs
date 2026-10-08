@@ -97,6 +97,120 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
         }
     }
 
+    /// <summary>Same insert-if-missing / verify-if-present contract for the options sidecar.</summary>
+    public async Task<SupplementalOutcome> PersistOrVerifyOptionsAsync(
+        AdaptiveObserverDbContext db,
+        AdaptiveSessionStateRow session,
+        AdaptiveCompletedBarPackage package,
+        CancellationToken ct)
+    {
+        if (package.OptionsSupplemental is not { } options)
+        {
+            return SupplementalOutcome.Skipped;
+        }
+
+        var expected = MapOptions(session.Id, package.FutureBar.BarSeq, options, session.ObservationStartUtc ?? session.OpeningWindowStartUtc);
+        try
+        {
+            var existing = await db.OptionsSupplemental.AsNoTracking()
+                .SingleOrDefaultAsync(x => x.SessionId == session.Id && x.BarSeq == expected.BarSeq
+                    && x.MetricsVersion == expected.MetricsVersion, ct);
+            if (existing is null)
+            {
+                db.OptionsSupplemental.Add(expected);
+                await db.SaveChangesAsync(ct);
+                return SupplementalOutcome.Inserted;
+            }
+
+            var difference = FirstDifference(existing, expected);
+            if (difference is null)
+            {
+                return SupplementalOutcome.Verified;
+            }
+
+            Interlocked.Increment(ref _mismatches);
+            logger.LogError(
+                "Adaptive options supplemental metrics mismatch (row left untouched): session={SessionId}, bar={BarSeq}, version={Version}, {Difference}",
+                session.Id, expected.BarSeq, expected.MetricsVersion, difference);
+            return SupplementalOutcome.Mismatch;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                if (db.Entry(expected).State != EntityState.Detached)
+                {
+                    db.Entry(expected).State = EntityState.Detached;
+                }
+            }
+            catch (Exception)
+            {
+                // The context itself is unusable; nothing more to protect.
+            }
+
+            Interlocked.Increment(ref _failures);
+            logger.LogError(ex, "Adaptive options supplemental write failed (core observer unaffected): session={SessionId}, bar={BarSeq}",
+                session.Id, expected.BarSeq);
+            return SupplementalOutcome.Failed;
+        }
+    }
+
+    public static AdaptiveOptionsSupplementalRow MapOptions(long sessionId, int barSeq, OptionsSupplementalBar b, DateTimeOffset observationStartUtc) => new()
+    {
+        SessionId = sessionId,
+        BarSeq = barSeq,
+        MetricsVersion = OptionsSupplementalBar.MetricsVersion,
+        ObservationStartUtc = observationStartUtc,
+        CenterStrike = b.CenterStrike,
+        UnavailableReason = b.UnavailableReason,
+        CeOiStart = b.CeOiStart,
+        CeOiEnd = b.CeOiEnd,
+        CeOiDelta = b.CeOiDelta,
+        PeOiStart = b.PeOiStart,
+        PeOiEnd = b.PeOiEnd,
+        PeOiDelta = b.PeOiDelta,
+        CeMidStart = b.CeMidStart,
+        CeMidEnd = b.CeMidEnd,
+        CeMidDelta = b.CeMidDelta,
+        PeMidStart = b.PeMidStart,
+        PeMidEnd = b.PeMidEnd,
+        PeMidDelta = b.PeMidDelta,
+        CePosition = b.CePosition,
+        PePosition = b.PePosition,
+        CeIvStart = b.CeIvStart,
+        CeIvEnd = b.CeIvEnd,
+        CeDeltaIv = b.CeDeltaIv,
+        PeIvStart = b.PeIvStart,
+        PeIvEnd = b.PeIvEnd,
+        PeDeltaIv = b.PeDeltaIv,
+        IvSkewStart = b.IvSkewStart,
+        IvSkewEnd = b.IvSkewEnd,
+        DeltaSkew = b.DeltaSkew,
+        BarCeQuantity = b.BarCeQuantity,
+        BarPeQuantity = b.BarPeQuantity,
+        VolPcr = b.VolPcr,
+        RollCeQuantity = b.RollCeQuantity,
+        RollPeQuantity = b.RollPeQuantity,
+        RollVolPcr = b.RollVolPcr,
+        DayCeVolume = b.DayCeVolume,
+        DayPeVolume = b.DayPeVolume,
+        UniverseTokenCount = b.UniverseTokenCount,
+        TokensObserved = b.TokensObserved,
+        CeMicroDevTimeWeighted = b.CeMicroDevTimeWeighted,
+        CeOfi = b.CeOfi,
+        PeMicroDevTimeWeighted = b.PeMicroDevTimeWeighted,
+        PeOfi = b.PeOfi,
+        CeActivityPerSecond = b.CeActivityPerSecond,
+        PeActivityPerSecond = b.PeActivityPerSecond,
+        StraddleMidStart = b.StraddleMidStart,
+        StraddleMidEnd = b.StraddleMidEnd,
+        StraddleDelta = b.StraddleDelta,
+    };
+
     public static AdaptiveFuturesSupplementalRow MapFutures(long sessionId, int barSeq, FuturesMicrostructureBar m) => new()
     {
         SessionId = sessionId,
@@ -120,11 +234,11 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
         InvalidBookSeconds = m.InvalidBookSeconds,
     };
 
-    static string? FirstDifference(AdaptiveFuturesSupplementalRow actual, AdaptiveFuturesSupplementalRow expected)
+    static string? FirstDifference<TRow>(TRow actual, TRow expected) where TRow : class
     {
-        foreach (var property in typeof(AdaptiveFuturesSupplementalRow).GetProperties())
+        foreach (var property in typeof(TRow).GetProperties())
         {
-            if (property.Name == nameof(AdaptiveFuturesSupplementalRow.Id)) continue;
+            if (property.Name == "Id") continue;
             var a = property.GetValue(actual);
             var e = property.GetValue(expected);
             if (a is double av && e is double ev && double.IsFinite(av) && double.IsFinite(ev) && Math.Abs(av - ev) <= DoubleTolerance) continue;

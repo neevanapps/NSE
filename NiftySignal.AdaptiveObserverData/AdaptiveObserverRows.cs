@@ -381,3 +381,58 @@ public sealed class AdaptiveFuturesSupplementalRow
     public double ValidBookSeconds { get; set; }
     public double InvalidBookSeconds { get; set; }
 }
+
+/// <summary>Sidecar projection of supplemental options observations per completed adaptive bar (08-Oct plan section 71; metrics contract options-supp-v1).</summary>
+public sealed class AdaptiveOptionsSupplementalRow
+{
+    public long Id { get; set; }
+    public long SessionId { get; set; }
+    public int BarSeq { get; set; }
+    public required string MetricsVersion { get; set; }
+    /// <summary>Frozen session observation start the subscribed-universe day volumes are counted since.</summary>
+    public DateTimeOffset? ObservationStartUtc { get; set; }
+    public double? CenterStrike { get; set; }
+    public string? UnavailableReason { get; set; }
+    public long? CeOiStart { get; set; }
+    public long? CeOiEnd { get; set; }
+    public long? CeOiDelta { get; set; }
+    public long? PeOiStart { get; set; }
+    public long? PeOiEnd { get; set; }
+    public long? PeOiDelta { get; set; }
+    public double? CeMidStart { get; set; }
+    public double? CeMidEnd { get; set; }
+    public double? CeMidDelta { get; set; }
+    public double? PeMidStart { get; set; }
+    public double? PeMidEnd { get; set; }
+    public double? PeMidDelta { get; set; }
+    public string? CePosition { get; set; }
+    public string? PePosition { get; set; }
+    public double? CeIvStart { get; set; }
+    public double? CeIvEnd { get; set; }
+    public double? CeDeltaIv { get; set; }
+    public double? PeIvStart { get; set; }
+    public double? PeIvEnd { get; set; }
+    public double? PeDeltaIv { get; set; }
+    public double? IvSkewStart { get; set; }
+    public double? IvSkewEnd { get; set; }
+    public double? DeltaSkew { get; set; }
+    public long? BarCeQuantity { get; set; }
+    public long? BarPeQuantity { get; set; }
+    public double? VolPcr { get; set; }
+    public long? RollCeQuantity { get; set; }
+    public long? RollPeQuantity { get; set; }
+    public double? RollVolPcr { get; set; }
+    public long DayCeVolume { get; set; }
+    public long DayPeVolume { get; set; }
+    public int UniverseTokenCount { get; set; }
+    public int TokensObserved { get; set; }
+    public double? CeMicroDevTimeWeighted { get; set; }
+    public long? CeOfi { get; set; }
+    public double? PeMicroDevTimeWeighted { get; set; }
+    public long? PeOfi { get; set; }
+    public double? CeActivityPerSecond { get; set; }
+    public double? PeActivityPerSecond { get; set; }
+    public double? StraddleMidStart { get; set; }
+    public double? StraddleMidEnd { get; set; }
+    public double? StraddleDelta { get; set; }
+}

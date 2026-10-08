@@ -206,6 +206,8 @@
                         <th>CE Strict Δ</th><th>PE Strict Δ</th>
                         <th>CE Enriched Δ</th><th>PE Enriched Δ</th>
                         <th>CE Roll Strict</th><th>PE Roll Strict</th>
+                        <th>CE OI Δ</th><th>PE OI Δ</th><th>CE Position</th><th>PE Position</th>
+                        <th>CE ΔIV</th><th>PE ΔIV</th><th>IV Skew</th><th>Vol PCR</th><th>Roll Vol PCR</th>
                     </tr>
                     </thead>
                     <tbody>
@@ -218,10 +220,11 @@
                             <td>@FmtIst(x.EndAvailableAtUtc)</td>
                             @if (ce is null || pe is null || !ce.BandAvailable || !pe.BandAvailable)
                             {
-                                <td colspan="12" class="adaptive-pending">Unavailable: @(ce?.UnavailableReason ?? pe?.UnavailableReason ?? "dependent option rows pending")</td>
+                                <td colspan="21" class="adaptive-pending">Unavailable: @(ce?.UnavailableReason ?? pe?.UnavailableReason ?? "dependent option rows pending")</td>
                             }
                             else
                             {
+                                var os = OptionsSupplemental(x.BarSeq);
                                 <td>@FmtStrike(ce.CenterStrike)</td>
                                 <td>@BoolMark(ce.BandRolled || pe.BandRolled)</td>
                                 <td>@FmtSigned(ce.BarBandPriceChange, 2)</td>
@@ -234,6 +237,15 @@
                                 <td>@FmtSigned(pe.ContractEnrichedDelta)</td>
                                 <td>@FmtSigned(ce.ContractRollingStrictDelta)</td>
                                 <td>@FmtSigned(pe.ContractRollingStrictDelta)</td>
+                                <td>@FmtSigned(os?.CeOiDelta)</td>
+                                <td>@FmtSigned(os?.PeOiDelta)</td>
+                                <td>@(os?.CePosition ?? "—")</td>
+                                <td>@(os?.PePosition ?? "—")</td>
+                                <td>@FmtSigned(os?.CeDeltaIv, 2)</td>
+                                <td>@FmtSigned(os?.PeDeltaIv, 2)</td>
+                                <td>@FmtSigned(os?.IvSkewEnd, 2)</td>
+                                <td>@Fmt(os?.VolPcr, 2)</td>
+                                <td>@Fmt(os?.RollVolPcr, 2)</td>
                             }
                         </tr>
                     }
@@ -243,6 +255,15 @@
             }
             else
             {
+            @if (OptionsSupplemental(_snapshot.Options.FirstOrDefault()?.BarSeq ?? 0) is { } day)
+            {
+                <div class="adaptive-note" data-testid="subscribed-universe-pcr">
+                    Subscribed-Universe Day Vol PCR (not full chain): @Fmt(day.DayCeVolume > 0 ? (double)day.DayPeVolume / day.DayCeVolume : null, 2)
+                    · CE vol @FmtInt(day.DayCeVolume) · PE vol @FmtInt(day.DayPeVolume)
+                    · @day.TokensObserved/@day.UniverseTokenCount tokens observed
+                    · Since: @(day.ObservationStartUtc is { } since ? FmtIst(since) + " IST" : "—")
+                </div>
+            }
             <div class="adaptive-grid-toolbar">
                 <label>
                     Side
@@ -408,7 +429,8 @@
                     <thead>
                     <tr>
                         <th>Seq</th><th>End IST</th><th>Future Δ09:30</th>
-                        <th>CE Res %</th><th>PE Res %</th><th>Directional Res %</th>
+                        <th>CE Res %</th><th>CE Res Δ%</th><th>PE Res %</th><th>PE Res Δ%</th>
+                        <th>Directional Res %</th><th>Adjacent Directional Res Δ</th><th>Straddle Res %</th>
                         <th>Direction</th><th>Relation</th><th>Quote Age</th>
                     </tr>
                     </thead>
@@ -420,14 +442,19 @@
                             <td>@FmtIst(r.EndAvailableAtUtc)</td>
                             @if (!r.IsAvailable)
                             {
-                                <td colspan="7" class="adaptive-pending">Unavailable: @(r.UnavailableReason ?? "diagnostic quotes pending")</td>
+                                <td colspan="11" class="adaptive-pending">Unavailable: @(r.UnavailableReason ?? "diagnostic quotes pending")</td>
                             }
                             else
                             {
+                                var d = DerivedResidual(r.BarSeq);
                                 <td>@FmtSigned(r.FutureChangeFrom0930, 2)</td>
                                 <td>@FmtSigned(r.CEResidualPct, 2)%</td>
+                                <td>@FmtPctPoints(d?.CeResidualDeltaPct)</td>
                                 <td>@FmtSigned(r.PEResidualPct, 2)%</td>
+                                <td>@FmtPctPoints(d?.PeResidualDeltaPct)</td>
                                 <td>@FmtSigned(r.DirectionalResidualPct, 2)%</td>
+                                <td>@FmtPctPoints(d?.AdjacentDirectionalResidualDelta)</td>
+                                <td>@FmtPctPoints(d?.StraddleResidualPct)</td>
                                 <td>@DirectionText(r.ResidualDirection)</td>
                                 <td>@r.Relationship</td>
                                 <td>@r.MaxQuoteAgeSeconds.ToString("0.00")</td>
@@ -667,6 +694,36 @@
         _measurement == "NOTIONAL" ? x.NotionalRollingStrictCoverage : x.ContractRollingStrictCoverage;
     double? ActivityPerSecond(AdaptiveOptionBandBarRow? x) => x is null ? null :
         _measurement == "NOTIONAL" ? x.NotionalRollingActivityPerSecond : x.ContractRollingActivityPerSecond;
+
+    AdaptiveOptionsSupplementalRow? OptionsSupplemental(int barSeq) =>
+        _snapshot?.OptionsSupplemental is { } map && map.TryGetValue(barSeq, out var row) ? row : null;
+
+    // New residual metrics come from the shared pure projection over persisted rows + frozen anchor baselines (adjacent-bar semantics).
+    Dictionary<int, ResidualDerivedPoint> _derivedResidual = [];
+    string? _derivedKey;
+
+    ResidualDerivedPoint? DerivedResidual(int barSeq)
+    {
+        if (_snapshot is null) return null;
+        var key = $"{_snapshot.Session.Id}|{_residualVariant}|{_snapshot.Runtime.LastCompletedBarSeq}|{_snapshot.Residuals.Count}|{_snapshot.PreviousResiduals?.Count}";
+        if (_derivedKey != key)
+        {
+            var variant = _residualVariant == "ATM" ? ResidualVariant.Atm : ResidualVariant.AtmPlusMinus2;
+            var rows = _snapshot.Residuals.Concat(_snapshot.PreviousResiduals ?? []).Where(x => x.Variant == variant);
+            var anchors = _residualVariant == "ATM" ? _snapshot.ResidualAnchors.Where(x => x.IsCenterStrike) : _snapshot.ResidualAnchors;
+            var bases = new ResidualBases(
+                anchors.Where(x => x.Side == OptionType.Call).Sum(x => x.Price0930),
+                anchors.Where(x => x.Side == OptionType.Put).Sum(x => x.Price0930));
+            _derivedResidual = AdaptiveResidualProjection.Derive(rows.Select(x => new ResidualReadingPoint(
+                x.BarSeq, x.IsAvailable, x.CEResidual, x.PEResidual, x.CEResidualPct, x.PEResidualPct, x.DirectionalResidualPct)), bases)
+                .ToDictionary(x => x.BarSeq);
+            _derivedKey = key;
+        }
+
+        return _derivedResidual.TryGetValue(barSeq, out var point) ? point : null;
+    }
+
+    static string FmtPctPoints(double? x) => x.HasValue ? FmtSigned(x, 2) + "%" : "—";
 
     // Sidecar metrics (futures Level-1 microstructure). Missing row => rendered as unavailable.
     AdaptiveFuturesSupplementalRow? Supplemental(int barSeq) =>

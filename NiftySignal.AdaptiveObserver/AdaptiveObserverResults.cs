@@ -29,7 +29,9 @@ public sealed record AdaptiveCompletedBarPackage(
     bool IsActionableWeak2,
     // Supplemental observation only (sidecar-persisted, section 71 of the 08-Oct plan). Never part of the
     // parity-protected core rows; null when the producer did not compute it.
-    FuturesMicrostructureBar? Microstructure = null);
+    FuturesMicrostructureBar? Microstructure = null,
+    // Supplemental center-contract options observations (sidecar-persisted). Never part of the parity-protected core rows.
+    OptionsSupplementalBar? OptionsSupplemental = null);
 
 public sealed record AdaptivePartialBarStatus(
     long AccumulatedVolume,

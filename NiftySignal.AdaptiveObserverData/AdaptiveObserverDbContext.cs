@@ -16,6 +16,7 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
     public DbSet<AdaptiveObserverRuntimeRow> Runtime => Set<AdaptiveObserverRuntimeRow>();
     public DbSet<AdaptiveScreenshotJobRow> ScreenshotJobs => Set<AdaptiveScreenshotJobRow>();
     public DbSet<AdaptiveFuturesSupplementalRow> FuturesSupplemental => Set<AdaptiveFuturesSupplementalRow>();
+    public DbSet<AdaptiveOptionsSupplementalRow> OptionsSupplemental => Set<AdaptiveOptionsSupplementalRow>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -123,6 +124,16 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
             e.ToTable("adaptive_futures_supplemental_bars");
             e.HasIndex(x => new { x.SessionId, x.BarSeq, x.MetricsVersion }).IsUnique();
             e.Property(x => x.MetricsVersion).HasMaxLength(64);
+            e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
+        });
+        modelBuilder.Entity<AdaptiveOptionsSupplementalRow>(e =>
+        {
+            e.ToTable("adaptive_options_supplemental_bars");
+            e.HasIndex(x => new { x.SessionId, x.BarSeq, x.MetricsVersion }).IsUnique();
+            e.Property(x => x.MetricsVersion).HasMaxLength(64);
+            e.Property(x => x.UnavailableReason).HasMaxLength(256);
+            e.Property(x => x.CePosition).HasMaxLength(32);
+            e.Property(x => x.PePosition).HasMaxLength(32);
             e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
         });
     }

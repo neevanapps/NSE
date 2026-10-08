@@ -1402,6 +1402,21 @@ Examples:
 
 Retain in V1 diagnostics; do not expose in compact grid yet.
 
+## 26.5 Implementation contract — `options-supp-v1` (Slice 3, implemented)
+
+Computed by `OptionsSupplementalCalculator` once per completed bar and stored in `adaptive_options_supplemental_bars` (unique on `SessionId, BarSeq, MetricsVersion`; insert-if-missing / verify-if-present; never overwritten). The shared residual projection (section 32.4) needs no table.
+
+- **Center contract.** The center CE and PE of the ATM±2 band selected at the bar's start, fixed for the whole bar. Wings are the band's strikes one and two below (PE) and above (CE) the center. Without a selection every contract-level value is unavailable (the row still records the subscribed-universe volumes).
+- **Freshness.** A boundary quote is usable only if a two-sided book (`Bid > 0`, `Ask >= Bid`), available at or before the boundary and at most **5 seconds** old (exactly 5 s is fresh). This is the existing adaptive convention; a guard test pins it to `AdaptiveOptionBandCalculator`'s default.
+- **Mid / OI.** Midpoint start/end/Δ per center contract (never LTP); OI start/end/Δ per center contract from the last known open interest at each boundary (OI is not subject to the 5 s rule and updates sparsely, which is why zero OI change, and therefore `Neutral`, is expected to be common).
+- **Position.** `OI Δ` and midpoint Δ must both exist; if either is zero the label is `Neutral` (no inference); otherwise OI↑ + mid↓ = Writing, OI↑ + mid↑ = LongBuild, OI↓ + mid↑ = ShortCover, OI↓ + mid↓ = LongUnwind, prefixed `Call` / `Put`. Missing input = unavailable (null). Labels are behaviour-compatible descriptions, not actor identity, and not entry gates.
+- **IV.** `AdaptiveResearchPricing.SolveIv` (the frozen research solver; returns null when the solution is unreliable, never clamped) on the fresh mid, the contract's own strike/expiry, the existing time-to-expiry convention and the session risk-free rate. The underlying is the synthetic weekly underlying of the band selection at the same instant (start: the bar's selection; end: the next selection formed at the bar end). Stored in IV points (×100). ΔIV = end − start.
+- **IV Skew.** `[(IV_PE-1 − IV_CE+1) + (IV_PE-2 − IV_CE+2)] / 2`; all four wing IVs are required. The visible value is the **end-of-bar** skew; start and ΔSkew are retained internally.
+- **PCR.** Vol PCR = ATM±2 PE contract quantity / CE contract quantity of the bar (null when CE is 0). Roll Vol PCR = Σ PE quantity / Σ CE quantity over the existing rolling window and requires every bar of the window to have a band (one gap blanks it), never an average of ratios.
+- **Internal.** Center CE/PE MicroDev (time-weighted) and OFI from each option's own Level-1 book (same tracker as the futures sidecar); CE/PE ATM±2 Activity/s (contract quantity / bar seconds); center straddle mid start/end/Δ.
+- **Subscribed-Universe Day Vol PCR (diagnostic only).** Σ traded quantity of the session's frozen option universe split CE/PE since the session observation start (stored with the universe token count and how many tokens had data). It is shown only in the Diagnostic view under that exact name, never in the compact grid, and never described as full chain.
+- **Residual metrics.** CE Res Δ%, PE Res Δ%, Adjacent Directional Res Δ and Straddle Res % are shown in the compact residual grid from the shared pure projection over persisted rows plus the frozen anchor baselines (adjacent-bar semantics). The legacy persisted bridged `ResidualDelta` is untouched and shown only in the Diagnostic view.
+
 # 27. Options fields to hide, not remove
 
 Keep existing functionality/data for:
