@@ -646,6 +646,13 @@ Basis quality depends on spot freshness. The plan records, per basis state:
 
 Until approved, Basis/ΔBasis is unavailable and the Basis family is neither support nor contradiction in commentary.
 
+## 9.7 Implementation contract — `futures-basis-v1` (Slice 2B, plumbing implemented; display and commentary use BLOCKED)
+
+- **Instrument identity.** `adaptive_session_supplemental` (key `SessionId` + `MetricsVersion = session-supplemental-v1`) freezes the NIFTY spot instrument once per session from the trade date's instrument master (`Underlying = NIFTY`, `InstrumentType = Index`, exactly one distinct token). Zero or several candidates freeze an explicit "unresolved" outcome (`SpotToken` null). The outcome, resolved or not, is reused unchanged on every restart; it is never re-resolved even if the master later changes.
+- **Isolation.** Spot ticks go only to `FuturesBasisTracker`. They bypass `EnsureOrder`, `_lastAvailableAt`/`_lastId`, the availability-group ordering check and the exact-volume bar builder, so no core output and no core ordering strictness changes. Proven by value-equivalence tests (identical serialized core packages with and without spot, including spot at the same instants as futures ticks) and on real PostgreSQL-sourced ticks in the validation harness. A spot tick older than an already-seen spot tick is ignored and counted (`LateSpotTicks`); it can only diverge the supplemental basis, never the core ledger.
+- **Basis.** `Basis_t = FuturePrice_t − SpotPrice_t` from the latest future and spot ticks available at or before `t`; a state is recorded whenever either price updates once both exist. Per bar `(start, end]`: start/end basis, interval-time-weighted basis, ΔBasis = end − start, spot age at start, at end and maximum, count of state changes, covered and uncovered seconds.
+- **No freshness rule.** Raw values and spot ages are stored; no stale/fresh classification is applied. ΔBasis is not displayed and the Basis evidence family stays Unavailable until the owner approves a rule (section 9.6).
+
 # 10. Why MicroDev, OFI and ΔBasis are not duplicates
 
 These fields answer different questions:
@@ -3182,7 +3189,7 @@ No undocumented fallback or silently different calculation is acceptable.
 Conceptual tables (final column lists are recorded in the migrations and in each slice report):
 
 - `adaptive_session_supplemental` — one row per session (section 71.3).
-- `adaptive_futures_supplemental_bars` — Slice 2A: TOB start / time-weighted / end / change / min / max, MicroDev start / time-weighted / end / change, raw OFI, OFI transition count, valid-book coverage duration, invalid/crossed-book count and duration. Slice 2B adds basis start / time-weighted / end, ΔBasis, spot ages and a basis status.
+- `adaptive_futures_supplemental_bars` — Slice 2A: TOB start / time-weighted / end / change / min / max, MicroDev start / time-weighted / end / change, raw OFI, OFI transition count, valid-book coverage duration, invalid/crossed-book count and duration. Basis is **not** added to this table (new columns would not match rows written earlier under the same `MetricsVersion`); it lives in its own versioned sidecar `adaptive_basis_supplemental_bars` (Slice 2B).
 - `adaptive_options_supplemental_bars` — Slice 3: center OI start/end/Δ and midpoints per side, Position per side, IV start/end/Δ per side, IV skew start/end/ΔSkew, Vol PCR and its rolling components, center CE/PE MicroDev and OFI, ATM±2 CE/PE Activity/s, center Straddle Δ, and the Subscribed-Universe Day Vol PCR fields (cumulative CE volume, cumulative PE volume, token/strike universe count, observation start, coverage status).
 - Commentary tables (Slice 4B) are separate (sections 56–57, 61).
 - No residual sidecar (section 32.4); no Urgency column (section 5.2).

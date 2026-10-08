@@ -188,6 +188,7 @@ try
     builder.Services.AddSingleton<AdaptiveSessionCoordinator>();
     builder.Services.AddSingleton<AdaptiveObserverPersistence>();
     builder.Services.AddSingleton<AdaptiveSupplementalPersistence>();
+    builder.Services.AddSingleton<AdaptiveSessionSupplementalService>();
     builder.Services.AddSingleton<AdaptiveWeak2ObservationService>();
     builder.Services.AddSingleton<AdaptiveStateRecoveryService>();
     builder.Services.AddSingleton<AdaptiveEndedSessionRecoveryService>();

@@ -37,6 +37,7 @@ public sealed class AdaptiveStateRecoveryService(
 
         var tokens = context.Options.Select(x => x.Token)
             .Append(context.Definition.FutureToken)
+            .Concat(string.IsNullOrWhiteSpace(context.SpotToken) ? [] : [context.SpotToken!])
             .Distinct(StringComparer.Ordinal)
             .ToArray();
 
@@ -73,7 +74,8 @@ public sealed class AdaptiveStateRecoveryService(
             context.Session.StrongThreshold,
             context.SignalStartUtc,
             context.Options,
-            context.ResidualAnchor);
+            context.ResidualAnchor,
+            context.SpotToken);
 
         var reconciled = 0;
         var replayTriggers = new HashSet<int>();
@@ -93,7 +95,10 @@ public sealed class AdaptiveStateRecoveryService(
                     observer, context.Session, package, DateTimeOffset.UtcNow, ct);
                 // Replay recomputes the supplemental metrics: verify rows that exist, insert the ones that do not (mid-session backfill).
                 if (supplemental is not null)
+                {
                     await supplemental.PersistOrVerifyFuturesAsync(observer, context.Session.Id, package, ct);
+                    await supplemental.PersistOrVerifyBasisAsync(observer, context.Session.Id, package, ct);
+                }
                 await observations.ProcessPackageAsync(source, observer, context, package, ct);
                 if (result.VerifiedExisting)
                 {

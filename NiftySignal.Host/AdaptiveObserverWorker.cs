@@ -18,6 +18,7 @@ public sealed class AdaptiveObserverWorker(
     AdaptiveWeak2ObservationService observations,
     AdaptiveEndedSessionRecoveryService endedSessionRecovery,
     AdaptiveSupplementalPersistence supplemental,
+    AdaptiveSessionSupplementalService sessionSupplemental,
     DashboardPushClient dashboardPush,
     ILogger<AdaptiveObserverWorker> logger) : BackgroundService
 {
@@ -124,6 +125,13 @@ public sealed class AdaptiveObserverWorker(
             return null;
         }
 
+        // Freeze (or reload) the supplemental spot identity; a failure here must not stop the core observer.
+        try { context = context with { SpotToken = await sessionSupplemental.GetOrFreezeSpotTokenAsync(source, observer, context.Session, ct) }; }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogError(ex, "Adaptive supplemental spot identity unavailable; basis disabled for this process (core observer unaffected).");
+        }
+
         // Hold back a small causal-ordering window; the existing raw persistence can itself lag
         // by up to ~1s, and exchange timestamps are second-granularity.
         var through = nowUtc - StableOrderingLag;
@@ -181,6 +189,7 @@ public sealed class AdaptiveObserverWorker(
                 // Supplemental sidecar rows are inserted/verified before the Dashboard is told, so a push never races ahead of them.
                 // The call never throws into the core observer (sidecar problems are logged and counted).
                 await supplemental.PersistOrVerifyFuturesAsync(observer, live.Context.Session.Id, package, ct);
+                await supplemental.PersistOrVerifyBasisAsync(observer, live.Context.Session.Id, package, ct);
                 if (saved.Inserted)
                 {
                     // Signal only after the DB transaction committed. Failure to notify must not

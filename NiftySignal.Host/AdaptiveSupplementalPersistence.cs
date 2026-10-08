@@ -97,6 +97,85 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
         }
     }
 
+    /// <summary>Same insert-if-missing / verify-if-present contract for the futures-minus-spot basis sidecar (separate table, own MetricsVersion).</summary>
+    public async Task<SupplementalOutcome> PersistOrVerifyBasisAsync(
+        AdaptiveObserverDbContext db,
+        long sessionId,
+        AdaptiveCompletedBarPackage package,
+        CancellationToken ct)
+    {
+        if (package.Basis is not { } basis)
+        {
+            return SupplementalOutcome.Skipped;
+        }
+
+        var expected = MapBasis(sessionId, package.FutureBar.BarSeq, basis);
+        try
+        {
+            var existing = await db.BasisSupplemental.AsNoTracking()
+                .SingleOrDefaultAsync(x => x.SessionId == sessionId && x.BarSeq == expected.BarSeq
+                    && x.MetricsVersion == expected.MetricsVersion, ct);
+            if (existing is null)
+            {
+                db.BasisSupplemental.Add(expected);
+                await db.SaveChangesAsync(ct);
+                return SupplementalOutcome.Inserted;
+            }
+
+            var difference = FirstDifference(existing, expected);
+            if (difference is null)
+            {
+                return SupplementalOutcome.Verified;
+            }
+
+            Interlocked.Increment(ref _mismatches);
+            logger.LogError(
+                "Adaptive basis supplemental metrics mismatch (row left untouched): session={SessionId}, bar={BarSeq}, version={Version}, {Difference}",
+                sessionId, expected.BarSeq, expected.MetricsVersion, difference);
+            return SupplementalOutcome.Mismatch;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                if (db.Entry(expected).State != EntityState.Detached)
+                {
+                    db.Entry(expected).State = EntityState.Detached;
+                }
+            }
+            catch (Exception)
+            {
+                // The context itself is unusable; nothing more to protect.
+            }
+
+            Interlocked.Increment(ref _failures);
+            logger.LogError(ex, "Adaptive basis supplemental write failed (core observer unaffected): session={SessionId}, bar={BarSeq}",
+                sessionId, expected.BarSeq);
+            return SupplementalOutcome.Failed;
+        }
+    }
+
+    public static AdaptiveBasisSupplementalRow MapBasis(long sessionId, int barSeq, FuturesBasisBar b) => new()
+    {
+        SessionId = sessionId,
+        BarSeq = barSeq,
+        MetricsVersion = FuturesBasisBar.MetricsVersion,
+        BasisStart = b.BasisStart,
+        BasisTimeWeighted = b.BasisTimeWeighted,
+        BasisEnd = b.BasisEnd,
+        DeltaBasis = b.DeltaBasis,
+        SpotAgeStartSeconds = b.SpotAgeStartSeconds,
+        SpotAgeEndSeconds = b.SpotAgeEndSeconds,
+        SpotAgeMaxSeconds = b.SpotAgeMaxSeconds,
+        BasisStateChanges = b.BasisStateChanges,
+        CoveredSeconds = b.CoveredSeconds,
+        UncoveredSeconds = b.UncoveredSeconds,
+    };
+
     public static AdaptiveFuturesSupplementalRow MapFutures(long sessionId, int barSeq, FuturesMicrostructureBar m) => new()
     {
         SessionId = sessionId,
@@ -120,11 +199,11 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
         InvalidBookSeconds = m.InvalidBookSeconds,
     };
 
-    static string? FirstDifference(AdaptiveFuturesSupplementalRow actual, AdaptiveFuturesSupplementalRow expected)
+    static string? FirstDifference<TRow>(TRow actual, TRow expected) where TRow : class
     {
-        foreach (var property in typeof(AdaptiveFuturesSupplementalRow).GetProperties())
+        foreach (var property in typeof(TRow).GetProperties())
         {
-            if (property.Name == nameof(AdaptiveFuturesSupplementalRow.Id)) continue;
+            if (property.Name == "Id") continue;
             var a = property.GetValue(actual);
             var e = property.GetValue(expected);
             if (a is double av && e is double ev && double.IsFinite(av) && double.IsFinite(ev) && Math.Abs(av - ev) <= DoubleTolerance) continue;

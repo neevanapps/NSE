@@ -29,6 +29,10 @@ public sealed class AdaptiveObserverEngine
     readonly Dictionary<ResidualVariant, double> _previousResidual = [];
     // Supplemental Level-1 book observation. Separate state: it never influences bar construction or any core output.
     readonly FuturesMicrostructureTracker _microstructure = new();
+    // Spot enters only the basis tracker. It bypasses EnsureOrder/_lastAvailableAt/_lastId and the exact-volume bar builder, so adding
+    // spot input cannot change any core output or the engine's ordering strictness (08-Oct plan section 9.6).
+    readonly string? _spotToken;
+    readonly FuturesBasisTracker _basis = new();
 
     BandContext? _currentBand;
     IReadOnlyList<double>? _previousBandStrikes;
@@ -48,8 +52,10 @@ public sealed class AdaptiveObserverEngine
         double? strongThreshold,
         DateTimeOffset signalStartUtc,
         IReadOnlyList<ObserverOptionInstrument> options,
-        OptionResidualAnchor? residualAnchor)
+        OptionResidualAnchor? residualAnchor,
+        string? spotToken = null)
     {
+        _spotToken = string.IsNullOrWhiteSpace(spotToken) ? null : spotToken;
         _session = session;
         _optionExpiry = optionExpiry;
         _riskFreeRate = riskFreeRate;
@@ -65,8 +71,17 @@ public sealed class AdaptiveObserverEngine
     public AdaptivePartialBarStatus PartialBar =>
         new(_futureBars.PartialVolume, _session.BaseBarVolume, _futureBars.PartialBarStartedAtUtc);
 
+    /// <summary>Spot ticks ignored because an equal-or-later spot tick had already been seen (always 0 on ordered replay).</summary>
+    public int LateSpotTicks => _basis.LateSpotTicks;
+
     public IReadOnlyList<AdaptiveCompletedBarPackage> Process(string token, CleanObserverTick tick)
     {
+        if (_spotToken is not null && string.Equals(token, _spotToken, StringComparison.Ordinal))
+        {
+            _basis.ObserveSpot(tick);
+            return Array.Empty<AdaptiveCompletedBarPackage>();
+        }
+
         EnsureOrder(tick);
         if (string.Equals(token, _session.FutureToken, StringComparison.Ordinal))
         {
@@ -94,6 +109,13 @@ public sealed class AdaptiveObserverEngine
     public IReadOnlyList<AdaptiveCompletedBarPackage> ProcessAvailabilityGroup(
         IReadOnlyList<(string Token,CleanObserverTick Tick)> group)
     {
+        if (_spotToken is not null && group.Any(x => x.Token == _spotToken))
+        {
+            // Spot is applied first (it is available at this instant) and never takes part in the core ordering/identity checks below.
+            foreach (var spot in group.Where(x => x.Token == _spotToken).OrderBy(x => x.Tick.Id)) Process(spot.Token, spot.Tick);
+            group = group.Where(x => x.Token != _spotToken).ToArray();
+        }
+
         if(group.Count==0)return Array.Empty<AdaptiveCompletedBarPackage>();
         var availableAt=group[0].Tick.AvailableAt;
         if(group.Any(x=>x.Tick.AvailableAt!=availableAt))throw new ArgumentException("Expected one stable availability boundary.",nameof(group));
@@ -114,6 +136,7 @@ public sealed class AdaptiveObserverEngine
     IReadOnlyList<AdaptiveCompletedBarPackage> ProcessFuture(CleanObserverTick tick)
     {
         _microstructure.Observe(tick);
+        _basis.ObserveFuture(tick);
         var e = _futureEnricher.Process(tick);
         var hadStarted = _futureBars.PartialBarStartedAtUtc.HasValue;
         var completed = _futureBars.Add(e);
@@ -144,7 +167,8 @@ public sealed class AdaptiveObserverEngine
                 >= AdaptiveReadinessPolicy.RequiredBars;
             var actionable = ready && flow.State == AdaptiveStateKind.Weak2 && bar.EndAvailableAtUtc >= _signalStartUtc;
             packages.Add(new AdaptiveCompletedBarPackage(bar, flow, optionBand, residuals, actionable,
-                _microstructure.Complete(bar.StartAvailableAtUtc, bar.EndAvailableAtUtc)));
+                _microstructure.Complete(bar.StartAvailableAtUtc, bar.EndAvailableAtUtc),
+                _spotToken is null ? null : _basis.Complete(bar.StartAvailableAtUtc, bar.EndAvailableAtUtc)));
 
             // A crossing futures update can close multiple exact bars at the same timestamp.
             // After each close, start the next interval with a fresh causal band/snapshot at
