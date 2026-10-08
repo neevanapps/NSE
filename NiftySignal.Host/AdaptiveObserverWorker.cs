@@ -18,6 +18,7 @@ public sealed class AdaptiveObserverWorker(
     AdaptiveWeak2ObservationService observations,
     AdaptiveEndedSessionRecoveryService endedSessionRecovery,
     AdaptiveSupplementalPersistence supplemental,
+    AdaptiveCommentaryService commentary,
     DashboardPushClient dashboardPush,
     ILogger<AdaptiveObserverWorker> logger) : BackgroundService
 {
@@ -133,6 +134,8 @@ public sealed class AdaptiveObserverWorker(
         }
 
         var recovered = await recovery.RecoverAsync(source, observer, context, through, ct);
+        // Catch the commentary checkpoint up to every persisted completed bar (restart or mid-session deployment); idempotent by event identity.
+        await commentary.ProcessAllCompletedAsync(observer, context.Session, ct);
         return new LiveState(context, recovered);
     }
 
@@ -182,6 +185,8 @@ public sealed class AdaptiveObserverWorker(
                 // The call never throws into the core observer (sidecar problems are logged and counted).
                 await supplemental.PersistOrVerifyFuturesAsync(observer, live.Context.Session.Id, package, ct);
                 await supplemental.PersistOrVerifyOptionsAsync(observer, live.Context.Session, package, ct);
+                // Commentary reads the PERSISTED core + sidecar rows of this bar (identical inputs to a later replay) and never throws into the core observer.
+                await commentary.ProcessThroughAsync(observer, live.Context.Session, package.FutureBar.BarSeq, ct);
                 if (saved.Inserted)
                 {
                     // Signal only after the DB transaction committed. Failure to notify must not

@@ -99,6 +99,23 @@ static class RelationalRestartParity
             || await db.OptionsSupplemental.CountAsync(x=>x.SessionId==row.Id)!=expected.Count || supplemental.MismatchCount!=0)
             throw new Exception("Sidecar backfill after a mid-session deployment failed.");
         db.ChangeTracker.Clear();
+        // Commentary (Slice 4B) on real PostgreSQL: jsonb evidence columns, unique event identity, FK, per-bar transaction, restart replay.
+        var commentary=new AdaptiveCommentaryService(new AdaptiveCommentaryFrameLoader(),NullLogger<AdaptiveCommentaryService>.Instance);
+        var evaluatedFirst=await commentary.ProcessAllCompletedAsync(db,row,default);
+        string Digest(List<AdaptiveCommentaryEventRow> rows)=>JsonSerializer.Serialize(rows.OrderBy(x=>x.BarSeq).ThenBy(x=>x.EventIdentity)
+            .Select(x=>new { x.EventIdentity,x.Lifecycle,x.EvidenceAgreement,x.MarketRegime,x.RenderedCommentary,x.CreatedAtUtc,x.ShouldNotifyTelegram }));
+        var commentaryFirst=await db.CommentaryEvents.AsNoTracking().Where(x=>x.SessionId==row.Id).ToListAsync();
+        var runtimeFirst=await db.CommentaryRuntime.AsNoTracking().SingleAsync(x=>x.SessionId==row.Id);
+        if(evaluatedFirst!=expected.Count || runtimeFirst.LastEvaluatedBarSeq!=expected.Count)throw new Exception("Commentary checkpoint did not reach the last completed bar.");
+        if(commentaryFirst.Count!=commentaryFirst.Select(x=>x.EventIdentity).Distinct().Count())throw new Exception("Commentary produced duplicate event identities.");
+        db.ChangeTracker.Clear();
+        await db.CommentaryRuntime.Where(x=>x.SessionId==row.Id).ExecuteDeleteAsync();      // the checkpoint is rebuildable: full replay must verify, not duplicate
+        var commentaryReplay=new AdaptiveCommentaryService(new AdaptiveCommentaryFrameLoader(),NullLogger<AdaptiveCommentaryService>.Instance);
+        await commentaryReplay.ProcessAllCompletedAsync(db,row,default);
+        var commentarySecond=await db.CommentaryEvents.AsNoTracking().Where(x=>x.SessionId==row.Id).ToListAsync();
+        if(Digest(commentaryFirst)!=Digest(commentarySecond) || commentaryReplay.MismatchCount!=0 || commentaryReplay.FailureCount!=0 || commentary.FailureCount!=0)
+            throw new Exception($"Commentary replay changed or duplicated events: before={commentaryFirst.Count}, after={commentarySecond.Count}, mismatches={commentaryReplay.MismatchCount}.");
+        db.ChangeTracker.Clear();
         var completed=await db.Weak2Observations.FirstAsync(x=>x.SessionId==row.Id && x.Status==AdaptiveObservationStatus.Completed);
         completed.PnlPoints=999;await db.SaveChangesAsync();db.ChangeTracker.Clear();
         try { await observations.VerifyCompletedAsync(source,db,context,default);throw new Exception("Relational corruption went undetected."); }
@@ -107,7 +124,7 @@ static class RelationalRestartParity
             throw new Exception("Restart overwrote corrupted persisted history.");
         await File.WriteAllTextAsync(Path.Combine(evidence,"postgres-restart.json"),JsonSerializer.Serialize(new {
             sourceSha=sha,restarts,completedBars=expected.Count,trigger=trigger.FutureBar.BarSeq,
-            bandRoll=rolled.FutureBar.BarSeq,corruptionRejected=true,sidecarRows=expected.Count,optionsRows=expected.Count,optionsBarsWithPositionAndIv=optionsAvailable,sidecarBackfilledBars=removed,scope="PostgreSQL source, package persistence, Weak2/OI/H5 reconciliation and partial-state restarts" },new JsonSerializerOptions { WriteIndented=true }));
+            bandRoll=rolled.FutureBar.BarSeq,corruptionRejected=true,sidecarRows=expected.Count,optionsRows=expected.Count,commentaryEvents=commentaryFirst.Count,commentaryBarsEvaluated=evaluatedFirst,optionsBarsWithPositionAndIv=optionsAvailable,sidecarBackfilledBars=removed,scope="PostgreSQL source, package persistence, Weak2/OI/H5 reconciliation and partial-state restarts" },new JsonSerializerOptions { WriteIndented=true }));
         Console.WriteLine($"POSTGRES RESTART PASS: {restarts} process-state resets, {expected.Count} completed bars, Weak2/H5 and band roll, corruption rejected without overwrite.");
     }
     static Tick Quote(string token,DateTimeOffset time,double last,double bid,double ask,long volume,long oi)=>new() {

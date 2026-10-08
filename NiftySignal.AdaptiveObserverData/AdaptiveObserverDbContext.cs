@@ -16,6 +16,8 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
     public DbSet<AdaptiveObserverRuntimeRow> Runtime => Set<AdaptiveObserverRuntimeRow>();
     public DbSet<AdaptiveScreenshotJobRow> ScreenshotJobs => Set<AdaptiveScreenshotJobRow>();
     public DbSet<AdaptiveFuturesSupplementalRow> FuturesSupplemental => Set<AdaptiveFuturesSupplementalRow>();
+    public DbSet<AdaptiveCommentaryEventRow> CommentaryEvents => Set<AdaptiveCommentaryEventRow>();
+    public DbSet<AdaptiveCommentaryRuntimeRow> CommentaryRuntime => Set<AdaptiveCommentaryRuntimeRow>();
     public DbSet<AdaptiveOptionsSupplementalRow> OptionsSupplemental => Set<AdaptiveOptionsSupplementalRow>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
@@ -124,6 +126,45 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
             e.ToTable("adaptive_futures_supplemental_bars");
             e.HasIndex(x => new { x.SessionId, x.BarSeq, x.MetricsVersion }).IsUnique();
             e.Property(x => x.MetricsVersion).HasMaxLength(64);
+            e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
+        });
+        modelBuilder.Entity<AdaptiveCommentaryEventRow>(e =>
+        {
+            e.ToTable("adaptive_commentary_events");
+            e.HasIndex(x => x.EventIdentity).IsUnique();
+            e.HasIndex(x => new { x.SessionId, x.BarSeq });
+            e.HasIndex(x => new { x.TradeDate, x.OccurredAtUtc });
+            e.HasIndex(x => new { x.SessionId, x.EventBias, x.OccurredAtUtc });
+            e.HasIndex(x => new { x.SessionId, x.EventType, x.OccurredAtUtc });
+            e.Property(x => x.EventType).HasConversion<string>().HasMaxLength(40);
+            e.Property(x => x.EventBias).HasConversion<string>().HasMaxLength(16);
+            e.Property(x => x.MarketRegime).HasConversion<string>().HasMaxLength(16);
+            e.Property(x => x.Lifecycle).HasConversion<string>().HasMaxLength(16);
+            e.Property(x => x.EvidenceAgreement).HasConversion<string>().HasMaxLength(16);
+            e.Property(x => x.Severity).HasConversion<string>().HasMaxLength(16);
+            e.Property(x => x.PreviousBias).HasConversion<string>().HasMaxLength(16);
+            e.Property(x => x.PrimaryEvidenceJson).HasColumnType("jsonb");
+            e.Property(x => x.ConfirmationEvidenceJson).HasColumnType("jsonb");
+            e.Property(x => x.ContradictionEvidenceJson).HasColumnType("jsonb");
+            e.Property(x => x.DataQualityJson).HasColumnType("jsonb");
+            e.Property(x => x.NotificationReason).HasMaxLength(64);
+            e.Property(x => x.CommentaryVersion).HasMaxLength(32);
+            e.Property(x => x.EventIdentity).HasMaxLength(128);
+            e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
+        });
+        modelBuilder.Entity<AdaptiveCommentaryRuntimeRow>(e =>
+        {
+            e.ToTable("adaptive_commentary_runtime");
+            e.HasIndex(x => x.SessionId).IsUnique();
+            e.Property(x => x.CurrentEventType).HasConversion<string>().HasMaxLength(40);
+            e.Property(x => x.CurrentBias).HasConversion<string>().HasMaxLength(16);
+            e.Property(x => x.CurrentRegime).HasConversion<string>().HasMaxLength(16);
+            e.Property(x => x.CurrentLifecycle).HasConversion<string>().HasMaxLength(16);
+            e.Property(x => x.ActiveBias).HasConversion<string>().HasMaxLength(16);
+            e.Property(x => x.ActiveAgreement).HasConversion<string>().HasMaxLength(16);
+            e.Property(x => x.ActivePhase).HasConversion<string>().HasMaxLength(16);
+            e.Property(x => x.ActiveSupportingFamilies).HasMaxLength(128);
+            e.Property(x => x.CommentaryVersion).HasMaxLength(32);
             e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
         });
         modelBuilder.Entity<AdaptiveOptionsSupplementalRow>(e =>

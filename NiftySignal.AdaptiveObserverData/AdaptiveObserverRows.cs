@@ -436,3 +436,62 @@ public sealed class AdaptiveOptionsSupplementalRow
     public double? StraddleMidEnd { get; set; }
     public double? StraddleDelta { get; set; }
 }
+
+/// <summary>
+/// Persisted commentary lifecycle event (08-Oct plan section 56). PostgreSQL is the authoritative commentary store. Only lifecycle events are
+/// stored: NoMaterialEvent and unchanged continuation bars never create a row. Immutable once written; outcomes are attached elsewhere, later.
+/// </summary>
+public sealed class AdaptiveCommentaryEventRow
+{
+    public long Id { get; set; }
+    public long SessionId { get; set; }
+    public DateOnly TradeDate { get; set; }
+    public int BarSeq { get; set; }
+    public DateTimeOffset OccurredAtUtc { get; set; }
+    public NiftySignal.AdaptiveObserver.Commentary.CommentaryEventType EventType { get; set; }
+    public NiftySignal.AdaptiveObserver.Commentary.EventBias EventBias { get; set; }
+    public NiftySignal.AdaptiveObserver.Commentary.MarketRegime MarketRegime { get; set; }
+    public NiftySignal.AdaptiveObserver.Commentary.CommentaryLifecycle Lifecycle { get; set; }
+    public NiftySignal.AdaptiveObserver.Commentary.EvidenceAgreement EvidenceAgreement { get; set; }
+    public NiftySignal.AdaptiveObserver.Commentary.CommentarySeverity Severity { get; set; }
+    public long? PreviousEventId { get; set; }
+    public NiftySignal.AdaptiveObserver.Commentary.EventBias PreviousBias { get; set; }
+    public bool BiasChanged { get; set; }
+    public required string PrimaryEvidenceJson { get; set; }
+    public required string ConfirmationEvidenceJson { get; set; }
+    public required string ContradictionEvidenceJson { get; set; }
+    public required string DataQualityJson { get; set; }
+    public required string RenderedCommentary { get; set; }
+    public bool ShouldNotifyTelegram { get; set; }
+    public string? NotificationReason { get; set; }
+    public required string CommentaryVersion { get; set; }
+    /// <summary>SessionId:BarSeq:EventType:Lifecycle:Bias. Unique, so replaying a bar can never create a duplicate event.</summary>
+    public required string EventIdentity { get; set; }
+    public DateTimeOffset CreatedAtUtc { get; set; }
+}
+
+/// <summary>
+/// Per-session commentary checkpoint (plan section 57). Operational state, NOT market history: it is rebuildable by replaying persisted
+/// completed bars, and it advances on every evaluated bar including the many that persist no event.
+/// </summary>
+public sealed class AdaptiveCommentaryRuntimeRow
+{
+    public long Id { get; set; }
+    public long SessionId { get; set; }
+    public int LastEvaluatedBarSeq { get; set; }
+    /// <summary>Id of the most recently persisted event row for the session.</summary>
+    public long? CurrentEventId { get; set; }
+    public NiftySignal.AdaptiveObserver.Commentary.CommentaryEventType? CurrentEventType { get; set; }
+    public NiftySignal.AdaptiveObserver.Commentary.EventBias CurrentBias { get; set; }
+    public NiftySignal.AdaptiveObserver.Commentary.MarketRegime CurrentRegime { get; set; }
+    public NiftySignal.AdaptiveObserver.Commentary.CommentaryLifecycle? CurrentLifecycle { get; set; }
+    public int? LastTelegramBarSeq { get; set; }
+    // Active-event detail needed to continue exactly after a restart (null when no event is active).
+    public NiftySignal.AdaptiveObserver.Commentary.EventBias? ActiveBias { get; set; }
+    public int? ActiveStartedBarSeq { get; set; }
+    public NiftySignal.AdaptiveObserver.Commentary.EvidenceAgreement? ActiveAgreement { get; set; }
+    public string? ActiveSupportingFamilies { get; set; }
+    public NiftySignal.AdaptiveObserver.Commentary.CommentaryLifecycle? ActivePhase { get; set; }
+    public DateTimeOffset UpdatedAtUtc { get; set; }
+    public required string CommentaryVersion { get; set; }
+}

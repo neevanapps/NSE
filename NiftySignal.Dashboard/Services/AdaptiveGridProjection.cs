@@ -12,5 +12,5 @@ public static class AdaptiveGridProjection
     /// than infinite. Derived on read; deliberately not persisted.
     /// </summary>
     public static double? Urgency(long volume, double durationSeconds) =>
-        double.IsFinite(durationSeconds) && durationSeconds > 0d ? volume / durationSeconds : null;
+        NiftySignal.AdaptiveObserver.AdaptiveMetricMath.Urgency(volume, durationSeconds);
 }
