@@ -2548,27 +2548,15 @@ Do not persist an event row for every ordinary continuation bar.
 
 An event classification appears while no event is active, or a different EventType replaces the active event without an opposite directional bias (section 55.7). The same event reappearing after it was Resolved is New.
 
-## 55.2 Strengthening
+## 55.2 Strengthening and 55.3 Weakening — edge-triggered phase changes (implemented in `CommentaryEvaluator`)
 
-The same event remains in force (its type conditions still hold) and at least one of these explicit changes occurs:
+An active event carries a phase (`New`, `Strengthening`, `Weakening` or `Confirmed`). While the same event type and bias remain in force, each bar yields a **target phase**:
 
-- Evolution changes toward Strengthening;
-- RollingStrictAbsDeltaChange > 0;
-- a previously absent independent confirmation family becomes supportive;
-- EvidenceAgreement improves LOW -> MEDIUM or MEDIUM -> HIGH.
+- **Weakening** if any of: Evolution is `Weakening`; `RollingStrictAbsDeltaChange < 0`; a previously supporting external family stopped supporting; EvidenceAgreement fell.
+- **Strengthening** (only if not Weakening) if any of: Evolution is `Strengthening`; `RollingStrictAbsDeltaChange > 0`; a new external family now supports; EvidenceAgreement rose.
+- Otherwise the phase is unchanged.
 
-Do not generate Strengthening repeatedly only because raw magnitudes drift.
-
-## 55.3 Weakening
-
-The same event remains in force (its type conditions still hold) and at least one of these explicit deteriorations occurs:
-
-- Evolution becomes Weakening;
-- RollingStrictAbsDeltaChange < 0;
-- a previously supporting independent family becomes Neutral or opposing;
-- EvidenceAgreement falls (HIGH -> MEDIUM or MEDIUM -> LOW).
-
-No magnitude threshold is introduced. Strengthening/Weakening are not generated merely because raw magnitudes drift.
+A lifecycle row is persisted **only when the target phase differs from the current phase**; bars that stay in the same phase are unchanged continuations (no row, no notification). This is what prevents a row per bar when a raw magnitude merely stays positive or negative. Weakening takes precedence when both directions are present. No magnitude threshold exists. FlowConflict and FamilyConflict have no Strengthening/Weakening. Because the rule has no hysteresis, alternating signs can alternate rows; the notification-noise replay (section 73) measures this before any Telegram expansion.
 
 ## 55.4 Confirmed
 
