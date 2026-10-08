@@ -21,6 +21,13 @@
                     <option value="15">15</option>
                 </select>
             </label>
+            @if (!CaptureMode)
+            {
+                <label title="Restore the full pre-existing wide tables. The compact grids are the default.">
+                    <input type="checkbox" disabled="@(!_interactiveReady)" aria-label="Diagnostic view" @bind="_diagnostic" />
+                    Diagnostic view
+                </label>
+            }
         </div>
     </div>
 
@@ -87,6 +94,48 @@
 
         }
         <GridSection Title="Futures — exact adaptive bars">
+            @if (!ShowDiagnostic)
+            {
+            <div class="adaptive-table-wrap">
+                <table class="adaptive-table adaptive-table-compact" data-grid="futures-compact">
+                    <thead>
+                    <tr>
+                        <th>Seq</th><th>End IST</th><th>Dur s</th><th>Urgency</th>
+                        <th>Bar ΔPx</th><th>Roll ΔPx</th>
+                        <th>Strict Δ</th><th>Enriched Δ</th>
+                        <th>Roll Strict</th><th>Roll Enriched</th><th>|Strict| Δ</th>
+                        <th>Roll OI Δ</th><th>Roll Efficiency</th>
+                        <th>Evolution</th><th>State</th>
+                    </tr>
+                    </thead>
+                    <tbody>
+                    @foreach (var x in _snapshot.Futures)
+                    {
+                        var r = x.Rolling;
+                        <tr class="@StateClass(r?.State)">
+                            <td class="sticky-col">@x.Bar.BarSeq</td>
+                            <td>@FmtIst(x.Bar.EndAvailableAtUtc)</td>
+                            <td>@x.Bar.DurationSeconds.ToString("0.0")</td>
+                            <td>@Fmt(AdaptiveGridProjection.Urgency(x.Bar.Volume, x.Bar.DurationSeconds), 1)</td>
+                            <td>@FmtSigned(x.Bar.BarPriceDisplacement, 2)</td>
+                            <td>@FmtSigned(r?.PriceDisplacement, 2)</td>
+                            <td>@FmtSigned(x.Bar.StrictDelta)</td>
+                            <td>@FmtSigned(x.Bar.EnrichedDelta)</td>
+                            <td>@FmtSigned(r?.StrictDelta)</td>
+                            <td>@FmtSigned(r?.EnrichedDelta)</td>
+                            <td>@FmtSigned(r?.RollingStrictAbsDeltaChange)</td>
+                            <td>@FmtSigned(r?.OiChange)</td>
+                            <td>@Fmt(r?.Efficiency, 3)</td>
+                            <td>@(r?.StrictDominanceEvolution ?? "—")</td>
+                            <td><span class="state-badge">@((r?.State).ToString() ?? "—")</span></td>
+                        </tr>
+                    }
+                    </tbody>
+                </table>
+            </div>
+            }
+            else
+            {
             <div class="adaptive-table-wrap">
                 <table class="adaptive-table">
                     <thead>
@@ -96,7 +145,7 @@
                         <th>Enriched Δ</th><th>Enriched ratio</th><th>Updates</th>
                         <th>Roll ΔPx</th><th>Roll strict Δ</th><th>Roll strict ratio</th><th>Roll quote cov</th>
                         <th>Roll enriched Δ</th><th>Roll enriched ratio</th><th>|Strict| Δ</th><th>Enriched Δchg</th>
-                        <th>Efficiency</th><th>Return bps</th><th>OI Δ</th><th>OI Δ%</th><th>Vol/sec</th>
+                        <th>Efficiency</th><th>Return bps</th><th>Roll OI Δ</th><th>Roll OI Δ%</th><th>Vol/sec</th>
                         <th>Evolution</th><th>State</th>
                     </tr>
                     </thead>
@@ -135,9 +184,62 @@
                     </tbody>
                 </table>
             </div>
+            }
         </GridSection>
 
         <GridSection Title="Options — ATM ±2 inside the same futures bar timestamps">
+            @if (!ShowDiagnostic)
+            {
+            <div class="adaptive-grid-toolbar">
+                <span class="adaptive-note">BOTH · contract quantity · ATM±2. CE and PE are shown side by side, not as a composite score.</span>
+            </div>
+            <div class="adaptive-table-wrap">
+                <table class="adaptive-table adaptive-table-compact" data-grid="options-compact">
+                    <thead>
+                    <tr>
+                        <th>Seq</th><th>End IST</th><th>Center</th><th>Roll?</th>
+                        <th>CE ΔPx</th><th>PE ΔPx</th>
+                        <th>CE Roll ΔPx</th><th>PE Roll ΔPx</th>
+                        <th>CE Strict Δ</th><th>PE Strict Δ</th>
+                        <th>CE Enriched Δ</th><th>PE Enriched Δ</th>
+                        <th>CE Roll Strict</th><th>PE Roll Strict</th>
+                    </tr>
+                    </thead>
+                    <tbody>
+                    @foreach (var x in _snapshot.Options)
+                    {
+                        var ce = x.Call;
+                        var pe = x.Put;
+                        <tr>
+                            <td class="sticky-col">@x.BarSeq</td>
+                            <td>@FmtIst(x.EndAvailableAtUtc)</td>
+                            @if (ce is null || pe is null || !ce.BandAvailable || !pe.BandAvailable)
+                            {
+                                <td colspan="12" class="adaptive-pending">Unavailable: @(ce?.UnavailableReason ?? pe?.UnavailableReason ?? "dependent option rows pending")</td>
+                            }
+                            else
+                            {
+                                <td>@FmtStrike(ce.CenterStrike)</td>
+                                <td>@BoolMark(ce.BandRolled || pe.BandRolled)</td>
+                                <td>@FmtSigned(ce.BarBandPriceChange, 2)</td>
+                                <td>@FmtSigned(pe.BarBandPriceChange, 2)</td>
+                                <td>@FmtSigned(ce.RollingBandPriceChange, 2)</td>
+                                <td>@FmtSigned(pe.RollingBandPriceChange, 2)</td>
+                                <td>@FmtSigned(ce.ContractStrictDelta)</td>
+                                <td>@FmtSigned(pe.ContractStrictDelta)</td>
+                                <td>@FmtSigned(ce.ContractEnrichedDelta)</td>
+                                <td>@FmtSigned(pe.ContractEnrichedDelta)</td>
+                                <td>@FmtSigned(ce.ContractRollingStrictDelta)</td>
+                                <td>@FmtSigned(pe.ContractRollingStrictDelta)</td>
+                            }
+                        </tr>
+                    }
+                    </tbody>
+                </table>
+            </div>
+            }
+            else
+            {
             <div class="adaptive-grid-toolbar">
                 <label>
                     Side
@@ -274,6 +376,7 @@
                     </table>
                 </div>
             }
+            }
         </GridSection>
 
         <GridSection Title="CE / PE theoretical residual — fixed 09:30 diagnostic">
@@ -295,6 +398,45 @@
                 <Metric Label="Components" Value="@ResidualComponentText" />
             </div>
 
+            @if (!ShowDiagnostic)
+            {
+            <div class="adaptive-table-wrap">
+                <table class="adaptive-table adaptive-table-compact" data-grid="residual-compact">
+                    <thead>
+                    <tr>
+                        <th>Seq</th><th>End IST</th><th>Future Δ09:30</th>
+                        <th>CE Res %</th><th>PE Res %</th><th>Directional Res %</th>
+                        <th>Direction</th><th>Relation</th><th>Quote Age</th>
+                    </tr>
+                    </thead>
+                    <tbody>
+                    @foreach (var r in SelectedResidualRows)
+                    {
+                        <tr>
+                            <td class="sticky-col">@r.BarSeq</td>
+                            <td>@FmtIst(r.EndAvailableAtUtc)</td>
+                            @if (!r.IsAvailable)
+                            {
+                                <td colspan="7" class="adaptive-pending">Unavailable: @(r.UnavailableReason ?? "diagnostic quotes pending")</td>
+                            }
+                            else
+                            {
+                                <td>@FmtSigned(r.FutureChangeFrom0930, 2)</td>
+                                <td>@FmtSigned(r.CEResidualPct, 2)%</td>
+                                <td>@FmtSigned(r.PEResidualPct, 2)%</td>
+                                <td>@FmtSigned(r.DirectionalResidualPct, 2)%</td>
+                                <td>@DirectionText(r.ResidualDirection)</td>
+                                <td>@r.Relationship</td>
+                                <td>@r.MaxQuoteAgeSeconds.ToString("0.00")</td>
+                            }
+                        </tr>
+                    }
+                    </tbody>
+                </table>
+            </div>
+            }
+            else
+            {
             <div class="adaptive-table-wrap">
                 <table class="adaptive-table">
                     <thead>
@@ -302,7 +444,7 @@
                         <th>Seq</th><th>End IST</th><th>Future Δ09:30</th><th>Center</th>
                         <th>CE actual Δ</th><th>CE expected Δ</th><th>CE residual</th><th>CE residual %</th>
                         <th>PE actual Δ</th><th>PE expected Δ</th><th>PE residual</th><th>PE residual %</th>
-                        <th>Directional residual %</th><th>Residual Δ</th><th>Direction</th>
+                        <th>Directional residual %</th><th>Legacy Bridged Directional Δ</th><th>Direction</th>
                         <th>Future roll dir</th><th>Relation</th><th>Common residual %</th><th>Quote age s</th>
                     </tr>
                     </thead>
@@ -341,6 +483,7 @@
                     </tbody>
                 </table>
             </div>
+            }
         </GridSection>
     }
 </section>
@@ -355,6 +498,9 @@
     // Audit finding F71: SSR controls must wait for the circuit; refreshes must not drop selector changes.
     bool _interactiveReady;
     bool _disposed;
+    // Compact grids are the default; the pre-existing wide tables are kept behind this toggle (never in captures).
+    bool _diagnostic;
+    bool ShowDiagnostic => _diagnostic && !CaptureMode;
     AdaptiveObserverSnapshot? _snapshot;
     string? _loadError;
     int _rowCount = 10;

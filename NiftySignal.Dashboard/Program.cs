@@ -90,6 +90,7 @@ builder.Services.AddHttpClient<FlatTradeAuthClient>();
 
 builder.Services.AddSingleton<LiveDataService>();
 builder.Services.AddSingleton<AdaptiveObserverDataService>();
+builder.Services.AddSingleton<AdaptiveQuoteAsOfService>();
 builder.Services.Configure<AdaptiveScreenshotOptions>(builder.Configuration.GetSection(AdaptiveScreenshotOptions.SectionName));
 builder.Services.Configure<TelegramOptions>(builder.Configuration.GetSection(TelegramOptions.SectionName));
 builder.Services.AddSingleton<IAdaptiveScreenshotRenderer, AdaptiveScreenshotRenderer>();

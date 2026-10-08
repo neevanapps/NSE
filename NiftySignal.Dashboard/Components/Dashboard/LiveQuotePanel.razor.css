@@ -78,3 +78,13 @@
         min-width: 0;
     }
 }
+
+/* Pinned (Telegram capture) mode: strike is a fixed label, and each quote shows the availability time of its source tick. */
+.quote-strike {
+    display: inline-block;
+}
+
+.quote-asof {
+    font-size: 11px;
+    font-family: var(--font-mono);
+}

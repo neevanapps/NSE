@@ -1,35 +1,53 @@
 @implements IDisposable
 @using Microsoft.EntityFrameworkCore
+@using Microsoft.Extensions.DependencyInjection
 @using NiftySignal.Dashboard.Services
 @using NiftySignal.Domain.Entities
 @using NiftySignal.Domain.Enums
 @using NiftySignal.Persistence
 @inject IDbContextFactory<NiftySignalDbContext> DbFactory
 @inject LiveDataService Live
+@* Resolved lazily and only in capture mode, so normal Dashboard behaviour has no new dependency. *@
+@inject IServiceProvider Services
 
-    <div class="panel quote-panel" data-testid="live-quote">
+    <div class="panel quote-panel" data-testid="live-quote" data-capture-ready="@(CaptureMode ? (_captureReady ? "true" : "false") : null)">
         <div class="panel-title">NIFTY Live Quote
-            @if (!_sessionValid) { <span class="badge badge-warn">Session metadata stale — check login</span> }
+            @if (CaptureMode)
+            {
+                <span class="text-faint quote-asof">pinned as of @AsOfBoundaryText · bar @CaptureBarSeq</span>
+            }
+            else if (!_sessionValid) { <span class="badge badge-warn">Session metadata stale — check login</span> }
         </div>
+        @if (CaptureMode && _pinned?.UnavailableReason is { } reason)
+        {
+            <div class="text-faint quote-unavailable">@reason</div>
+        }
 
         <div class="quote-row">
             <div class="quote-group">
                 <div class="quote-stat">
                     <span class="text-faint">Spot</span>
-                    <span class="mono quote-value">@FormatPriceWithChange(Live.SpotLtp, Live.SpotChange)</span>
+                    <span class="mono quote-value">@FormatPriceWithChange(SpotPrice, SpotChangeValue)</span>
+                    @if (CaptureMode) { <span class="text-faint quote-asof">@AsOfText(_pinned?.Spot)</span> }
                 </div>
                 <div class="quote-stat">
                     <span class="text-faint">Future</span>
-                    <span class="mono quote-value">@FormatPriceWithChange(Live.FutureLtp, Live.FutureChange)</span>
+                    <span class="mono quote-value">@FormatPriceWithChange(FuturePrice, FutureChangeValue)</span>
+                    @if (CaptureMode) { <span class="text-faint quote-asof">@AsOfText(_pinned?.Future)</span> }
                 </div>
                 <div class="quote-stat">
                     <span class="text-faint">VIX</span>
-                    <span class="mono quote-value">@FormatPriceWithChange(Live.VixLtp, Live.VixChange)</span>
+                    <span class="mono quote-value">@FormatPriceWithChange(VixPrice, VixChangeValue)</span>
+                    @if (CaptureMode) { <span class="text-faint quote-asof">@AsOfText(_pinned?.Vix)</span> }
                 </div>
-                <div class="quote-stat" title="Spot level where net Gamma Exposure crosses zero -- above it, dealer hedging tends to dampen moves; below it, to accelerate them.">
-                    <span class="text-faint">Gamma Flip</span>
-                    <span class="mono quote-value">@FormatGammaFlip()</span>
-                </div>
+                @* Gamma Flip is derived from the current live option chain; it cannot be reproduced as of a past bar, so a pinned capture omits it. *@
+                @if (!CaptureMode)
+                {
+                    <div class="quote-stat" title="Spot level where net Gamma Exposure crosses zero -- above it, dealer hedging tends to dampen moves; below it, to accelerate them.">
+                        <span class="text-faint">Gamma Flip</span>
+                        <span class="mono quote-value">@FormatGammaFlip()</span>
+                    </div>
+                }
             </div>
 
             <div class="quote-spacer"></div>
@@ -37,24 +55,40 @@
             <div class="quote-group quote-group-right">
                 <div class="quote-stat">
                     <span class="badge badge-bull">CE</span>
-                    <select class="quote-select" aria-label="Nifty call strike" @bind="_selectedCallStrike" @bind:after="OnCallStrikeChanged">
-                        @foreach (var strike in Strikes)
-                        {
-                            <option @key="strike" value="@strike" selected="@(strike == _selectedCallStrike)">@strike.ToString("0")</option>
-                        }
-                    </select>
-                    <span class="mono quote-value">@FormatQuote(CallRow, _callPending)</span>
+                    @if (CaptureMode)
+                    {
+                        <span class="quote-select quote-strike" aria-label="Nifty call strike">@FormatStrike(_pinned?.CallStrike)</span>
+                    }
+                    else
+                    {
+                        <select class="quote-select" aria-label="Nifty call strike" @bind="_selectedCallStrike" @bind:after="OnCallStrikeChanged">
+                            @foreach (var strike in Strikes)
+                            {
+                                <option @key="strike" value="@strike" selected="@(strike == _selectedCallStrike)">@strike.ToString("0")</option>
+                            }
+                        </select>
+                    }
+                    <span class="mono quote-value">@FormatQuote(CallRow, _callPending, CaptureMode ? "unavailable" : "waiting for data…")</span>
+                    @if (CaptureMode) { <span class="text-faint quote-asof">@AsOfText(_pinned?.Call)</span> }
                 </div>
 
                 <div class="quote-stat">
                     <span class="badge badge-bear">PE</span>
-                    <select class="quote-select" aria-label="Nifty put strike" @bind="_selectedPutStrike" @bind:after="OnPutStrikeChanged">
-                        @foreach (var strike in Strikes)
-                        {
-                            <option @key="strike" value="@strike" selected="@(strike == _selectedPutStrike)">@strike.ToString("0")</option>
-                        }
-                    </select>
-                    <span class="mono quote-value">@FormatQuote(PutRow, _putPending)</span>
+                    @if (CaptureMode)
+                    {
+                        <span class="quote-select quote-strike" aria-label="Nifty put strike">@FormatStrike(_pinned?.PutStrike)</span>
+                    }
+                    else
+                    {
+                        <select class="quote-select" aria-label="Nifty put strike" @bind="_selectedPutStrike" @bind:after="OnPutStrikeChanged">
+                            @foreach (var strike in Strikes)
+                            {
+                                <option @key="strike" value="@strike" selected="@(strike == _selectedPutStrike)">@strike.ToString("0")</option>
+                            }
+                        </select>
+                    }
+                    <span class="mono quote-value">@FormatQuote(PutRow, _putPending, CaptureMode ? "unavailable" : "waiting for data…")</span>
+                    @if (CaptureMode) { <span class="text-faint quote-asof">@AsOfText(_pinned?.Put)</span> }
                 </div>
             </div>
         </div>
@@ -72,6 +106,27 @@
     bool _sessionValid;
 
     bool _disposed;
+
+    // Capture mode (Telegram screenshot): the same component, fed by deterministic as-of data pinned to a
+    // completed bar instead of live state. See docs/FUTURES_GRID_PLAN_2026-10-08.md section 18.
+    [Parameter] public bool CaptureMode { get; set; }
+    [Parameter] public long? CaptureSessionId { get; set; }
+    [Parameter] public int CaptureBarSeq { get; set; }
+    PinnedQuoteSnapshot? _pinned;
+    bool _captureReady;
+
+    decimal? SpotPrice => CaptureMode ? _pinned?.Spot?.Quote.Ltp : Live.SpotLtp;
+    decimal? SpotChangeValue => CaptureMode ? _pinned?.Spot?.Quote.Change : Live.SpotChange;
+    decimal? FuturePrice => CaptureMode ? _pinned?.Future?.Quote.Ltp : Live.FutureLtp;
+    decimal? FutureChangeValue => CaptureMode ? _pinned?.Future?.Quote.Change : Live.FutureChange;
+    decimal? VixPrice => CaptureMode ? _pinned?.Vix?.Quote.Ltp : Live.VixLtp;
+    decimal? VixChangeValue => CaptureMode ? _pinned?.Vix?.Quote.Change : Live.VixChange;
+
+    string AsOfBoundaryText => _pinned?.BoundaryUtc is { } b ? IstText(b) + " IST" : "—";
+    static string IstText(DateTimeOffset x) => x.ToOffset(TimeSpan.FromHours(5.5)).ToString("HH:mm:ss");
+    // Each pinned quote shows the availability time of the tick it came from, so staleness is visible without a threshold.
+    static string AsOfText(PinnedQuote? q) => q is null ? string.Empty : "@ " + IstText(q.AvailableAtUtc);
+    static string FormatStrike(decimal? strike) => strike is { } s ? s.ToString("0") : "—";
 
     IEnumerable<decimal> Strikes => BuildStrikes(Live.SpotLtp,
         Live.QuickQuotes.Keys.Select(x => x.Strike), _selectedCallStrike, _selectedPutStrike);
@@ -101,12 +156,20 @@
         _selectedPutStrike ??= initial;
     }
 
-    QuickQuote? CallRow => _selectedCallStrike is { } s && Live.QuickQuotes.TryGetValue((s, OptionType.Call), out var q) ? q : null;
+    QuickQuote? CallRow => CaptureMode ? _pinned?.Call?.Quote : _selectedCallStrike is { } s && Live.QuickQuotes.TryGetValue((s, OptionType.Call), out var q) ? q : null;
 
-    QuickQuote? PutRow => _selectedPutStrike is { } s && Live.QuickQuotes.TryGetValue((s, OptionType.Put), out var q) ? q : null;
+    QuickQuote? PutRow => CaptureMode ? _pinned?.Put?.Quote : _selectedPutStrike is { } s && Live.QuickQuotes.TryGetValue((s, OptionType.Put), out var q) ? q : null;
 
     protected override async Task OnInitializedAsync()
     {
+        if (CaptureMode)
+        {
+            try { _pinned = await Services.GetRequiredService<AdaptiveQuoteAsOfService>().LoadAsync(CaptureSessionId, CaptureBarSeq); }
+            catch (Exception ex) { _pinned = PinnedQuoteSnapshot.Unavailable($"Pinned quote failed ({ex.GetType().Name})."); }
+            _captureReady = true;
+            return;
+        }
+
         await RefreshSessionValidityAsync();
         SeedSelection();
         Live.Updated += OnLiveUpdated;
@@ -186,7 +249,7 @@
         return $"{flip:0.0}{regime}";
     }
 
-    static string FormatQuote(QuickQuote? row, bool pending)
+    static string FormatQuote(QuickQuote? row, bool pending, string missing = "waiting for data…")
     {
         if (pending)
         {
@@ -198,7 +261,7 @@
         // state here, not an error.
         if (row is null)
         {
-            return "waiting for data…";
+            return missing;
         }
 
         return $"{FormatPriceWithChange(row.Ltp, row.Change)} · {FormatPrice(row.Bid)} / {FormatPrice(row.Ask)}";

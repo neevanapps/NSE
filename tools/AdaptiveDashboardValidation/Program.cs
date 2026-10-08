@@ -20,9 +20,13 @@ if (BuildIdentity.Current().CommitSha != args[1]
 var root = Path.GetFullPath(args[0]);
 var evidence = Path.Combine(root, "artifacts", "adaptive-dashboard-validation");
 Directory.CreateDirectory(evidence);
-const string baseConnection = "Host=localhost;Database=niftysignal;Username=postgres;Password=postgres";
+// CI uses the default port. ADAPTIVE_VALIDATION_PGPORT lets a developer point the run at a throwaway local cluster
+// (the harness writes synthetic rows) instead of their working database.
+var pgPort = Environment.GetEnvironmentVariable("ADAPTIVE_VALIDATION_PGPORT");
+var portPart = string.IsNullOrWhiteSpace(pgPort) ? "" : $";Port={pgPort}";
+var baseConnection = "Host=localhost;Database=niftysignal;Username=postgres;Password=postgres" + portPart;
 var options = new DbContextOptionsBuilder<AdaptiveObserverDbContext>().UseNpgsql(
-    "Host=localhost;Database=niftysignal_adaptive_observer;Username=postgres;Password=postgres").Options;
+    "Host=localhost;Database=niftysignal_adaptive_observer;Username=postgres;Password=postgres" + portPart).Options;
 await using var db = new AdaptiveObserverDbContext(options);
 await db.Database.MigrateAsync();
 await using (var source = new NiftySignalDbContext(new DbContextOptionsBuilder<NiftySignalDbContext>().UseNpgsql(baseConnection).Options))
@@ -37,7 +41,9 @@ var session = new AdaptiveSessionStateRow {
     SourceCommitSha=args[1], BuildUtc=at, FutureToken="VALIDATION", FutureSymbol="NIFTYFUT",
     FutureExpiry=day.AddDays(4), OpeningWindowStartUtc=at.AddMinutes(-45), OpeningWindowEndUtc=at.AddMinutes(-30),
     EstimatorName=nameof(OpeningVolumeProjectionV1), CreatedAtUtc=at, BaseBarVolume=3250, OpeningVolume=30000,
-    RollingWindowVolume=32500, OptionUniverseJson="[]" };
+    RollingWindowVolume=32500, OptionUniverseJson=JsonSerializer.Serialize(new[] {
+        new ObserverOptionInstrument("PIN-CE","PIN-CE",OptionType.Call,23000,day.AddDays(4),65),
+        new ObserverOptionInstrument("PIN-PE","PIN-PE",OptionType.Put,23000,day.AddDays(4),65) }) };
 db.Sessions.Add(session); await db.SaveChangesAsync();
 var runtime = new AdaptiveObserverRuntimeRow { SessionId=session.Id, LastHeartbeatUtc=at,
     RuntimeStatus=AdaptiveRuntimeStatus.Live, LastCompletedBarSeq=20, CurrentPartialBarVolume=1625,
@@ -91,6 +97,16 @@ try {
     await Expect(page.Locator(".adaptive-dashboard-build")).ToContainTextAsync(args[1]);
     await Expect(page.Locator(".adaptive-current-bar")).ToContainTextAsync("50.0%");
     await Expect(page.GetByLabel("Completed rows",new() { Exact=true })).ToBeEnabledAsync();
+    // Slice 1: compact grids are the default; only columns whose slice has landed are shown.
+    await Expect(page.Locator(".adaptive-table[data-grid='futures-compact'] thead th")).ToHaveTextAsync(new[] { "Seq","End IST","Dur s","Urgency",
+        "Bar ΔPx","Roll ΔPx","Strict Δ","Enriched Δ","Roll Strict","Roll Enriched","|Strict| Δ","Roll OI Δ","Roll Efficiency","Evolution","State" });
+    await Expect(page.Locator(".adaptive-table[data-grid='options-compact'] thead th")).ToHaveTextAsync(new[] { "Seq","End IST","Center","Roll?",
+        "CE ΔPx","PE ΔPx","CE Roll ΔPx","PE Roll ΔPx","CE Strict Δ","PE Strict Δ","CE Enriched Δ","PE Enriched Δ","CE Roll Strict","PE Roll Strict" });
+    await Expect(page.Locator(".adaptive-table[data-grid='residual-compact'] thead th")).ToHaveTextAsync(new[] { "Seq","End IST","Future Δ09:30",
+        "CE Res %","PE Res %","Directional Res %","Direction","Relation","Quote Age" });
+    // Fixture bars: 3250 volume in 60 s => Urgency 54.2 (derived on read, not persisted).
+    await Expect(page.Locator(".adaptive-table[data-grid='futures-compact'] tbody tr").First.Locator("td").Nth(3)).ToHaveTextAsync("54.2");
+    await Expect(page.Locator(".adaptive-table[data-grid='options-compact'] tbody tr").First.Locator("td").Nth(2)).ToHaveTextAsync("23000");
     // Reproduce the lost-selector race with a real in-flight PostgreSQL read.
     await using(var blocker=new AdaptiveObserverDbContext(options))
     await using(var transaction=await blocker.Database.BeginTransactionAsync())
@@ -111,6 +127,11 @@ try {
     }
     foreach(var table in await page.Locator(".adaptive-table").AllAsync())
         await Expect(table.Locator("tbody tr")).ToHaveCountAsync(5);
+    await page.GetByLabel("Diagnostic view",new() { Exact=true }).CheckAsync();
+    await Expect(page.Locator(".adaptive-table[data-grid]")).ToHaveCountAsync(0); // diagnostic tables replace the compact ones
+    await Expect(page.Locator(".adaptive-table")).ToHaveCountAsync(3);
+    await Expect(page.Locator(".adaptive-table").First.Locator("thead")).ToContainTextAsync("Roll OI Δ");
+    await Expect(page.Locator(".adaptive-table").Nth(2).Locator("thead")).ToContainTextAsync("Legacy Bridged Directional Δ");
     foreach(var count in new[] { 5,10,15 }) {
         await page.GetByLabel("Completed rows",new() { Exact=true }).SelectOptionAsync(count.ToString());
         foreach(var side in new[] { "BOTH","CE","PE" }) {
@@ -148,6 +169,16 @@ try {
     await using var push=new HubConnectionBuilder().WithUrl(url+"/hubs/market-data").Build();
     await push.StartAsync();
     await LiveQuoteBrowserValidation.CheckAsync(page, push, baseConnection, evidence);
+    // Pinned Live Quote fixtures. Target bar 43 ends at `at`; ticks after `at` (including the live quote ticks above) must never appear in it.
+    await using(var pinnedDb=new NiftySignalDbContext(new DbContextOptionsBuilder<NiftySignalDbContext>().UseNpgsql(baseConnection).Options))
+    {
+        pinnedDb.Ticks.AddRange(
+            PinTick("QUOTE-SPOT",24900m,at.AddMinutes(-40)), PinTick("QUOTE-SPOT",24987.50m,at.AddSeconds(-10)),
+            PinTick("VALIDATION",23000m,at.AddMinutes(-40)), PinTick("VALIDATION",23044m,at.AddSeconds(-15)),
+            PinTick("PIN-CE",100m,at.AddMinutes(-40)), PinTick("PIN-CE",150.25m,at.AddSeconds(-20),true), PinTick("PIN-CE",999m,at.AddSeconds(3),true),
+            PinTick("PIN-PE",120m,at.AddMinutes(-40)), PinTick("PIN-PE",140.75m,at.AddSeconds(-25),true));
+        await pinnedDb.SaveChangesAsync();
+    }
     var samples=new List<double>();
     for(var seq=21;seq<=43;seq++) {
         AddRows(seq); runtime.LastCompletedBarSeq=seq;runtime.LastHeartbeatUtc=DateTimeOffset.UtcNow;
@@ -162,6 +193,8 @@ try {
     await page.ReloadAsync();
     await Expect(page.Locator(".adaptive-table").First.Locator("tbody tr td:first-child").First).ToHaveTextAsync("43");
     await Expect(page.GetByLabel("Completed rows",new() { Exact=true })).ToHaveValueAsync("10");
+    await Expect(page.Locator(".adaptive-table[data-grid]")).ToHaveCountAsync(3); // reload returns to the compact default
+    await page.GetByLabel("Diagnostic view",new() { Exact=true }).CheckAsync();
     await Expect(page.GetByLabel("Option side",new() { Exact=true })).ToHaveValueAsync("BOTH");
     await Expect(page.GetByLabel("Option measurement",new() { Exact=true })).ToHaveValueAsync("NOTIONAL");
     await Expect(page.GetByLabel("Residual variant",new() { Exact=true })).ToHaveValueAsync("BAND");
@@ -223,6 +256,23 @@ try {
     await File.WriteAllTextAsync(Path.Combine(evidence,"telegram-screenshots.json"),JsonSerializer.Serialize(new { targets=expectedTargets,uploads=telegramStub.Uploads.Count,
         jobIds=screenshotJobs.Select(x=>x.Id),messageIds=screenshotJobs.Select(x=>x.TelegramMessageId),environment="loopback Telegram emulator, not real account" }));
     Console.WriteLine("Telegram screenshot PASS: seven pinned initial/five-bar snapshots, full-width PNG multipart delivery, real worker restart without resends, pre-live UI test; no real Telegram call.");
+    var job43=screenshotJobs.Single(x=>x.TargetBarSeq==43);
+    await page.GotoAsync(url+$"/adaptive-screenshot/{job43.Id}");
+    var pinnedPanel=page.Locator(".quote-panel[data-capture-ready='true']");
+    await Expect(pinnedPanel).ToBeVisibleAsync();
+    await Expect(pinnedPanel).ToContainTextAsync("24987.50 (+87.50)");
+    await Expect(pinnedPanel).ToContainTextAsync("23044.00");
+    await Expect(pinnedPanel).ToContainTextAsync("150.25 (+50.25) · 149.75 / 150.75");
+    await Expect(pinnedPanel).ToContainTextAsync("140.75 (+20.75) · 140.25 / 141.25");
+    await Expect(pinnedPanel.GetByLabel("Nifty call strike",new() { Exact=true })).ToHaveTextAsync("23000");
+    await Expect(pinnedPanel.GetByLabel("Nifty put strike",new() { Exact=true })).ToHaveTextAsync("23000");
+    await Expect(pinnedPanel.Locator("select")).ToHaveCountAsync(0);
+    await Expect(pinnedPanel).Not.ToContainTextAsync("27000.00"); // the later live spot push
+    await Expect(pinnedPanel).Not.ToContainTextAsync("999.00");   // the CE tick after the boundary
+    await Expect(pinnedPanel).Not.ToContainTextAsync("Gamma Flip");
+    await Expect(page.Locator(".adaptive-table")).ToHaveCountAsync(3);
+    await page.ScreenshotAsync(new() { Path=Path.Combine(evidence,"pinned-quote-capture-page.png"),FullPage=true });
+    Console.WriteLine("PINNED LIVE QUOTE BROWSER PASS: capture page shows boundary-pinned spot/future/center CE+PE with strike labels; later ticks and live-only controls absent.");
     await page.GotoAsync(url+"/legacy");
     await Expect(page.Locator(".dashboard-shell")).ToBeVisibleAsync();
 
@@ -244,6 +294,9 @@ try {
     await server.WaitForExitAsync();
     await File.WriteAllTextAsync(Path.Combine(evidence,"dashboard.log"),previousDashboardLog+(await output)+(await errors));
 }
+NiftySignal.Domain.Entities.Tick PinTick(string token,decimal price,DateTimeOffset when,bool depth=false) => new() {
+    Token=token,Exchange=Exchange.Nfo,ExchangeTimestamp=when,ReceivedAt=when,LastPrice=price,
+    Depth=depth ? new NiftySignal.Domain.ValueObjects.MarketDepth(price-.5m,65,0,0,0,0,0,0,0,0,price+.5m,65,0,0,0,0,0,0,0,0) : null };
 void AddRows(int seq) {
     var end=at.AddMinutes(seq-43);var begin=end.AddMinutes(-1);
     db.FutureBars.Add(new AdaptiveFutureBarRow { SessionId=session.Id,BarSeq=seq,StartAvailableAtUtc=begin,EndAvailableAtUtc=end,

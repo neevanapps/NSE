@@ -44,6 +44,9 @@ public sealed class AdaptiveScreenshotRenderer(IOptions<AdaptiveScreenshotOption
         if (response is null || response.Status >= 400)
             throw new InvalidOperationException($"Capture page returned HTTP {response?.Status}; check Dashboard server logs.");
         await page.Locator(".adaptive-observer[data-capture-ready='true']").WaitForAsync();
+        // The pinned Live Quote panel must be present in the image (08-Oct plan section 18).
+        await page.Locator(".quote-panel[data-capture-ready='true']").WaitForAsync();
+        await Microsoft.Playwright.Assertions.Expect(page.Locator(".quote-panel")).ToHaveCountAsync(1);
         await Microsoft.Playwright.Assertions.Expect(page.Locator(".adaptive-capture")).ToHaveAttributeAsync("data-job-id", job.Id.ToString());
         if (job.SessionId is not null)
         {
