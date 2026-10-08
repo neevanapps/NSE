@@ -541,6 +541,19 @@ Preferred conservative behaviour for implementation review:
 
 This policy must be unit-tested.
 
+## 8.6 Implementation contract — `futures-micro-v1` (Slice 2A, implemented)
+
+This records the exact rules the code applies (`FuturesMicrostructureTracker`), so the contract is auditable without reading the code. Any change to a rule below requires a new `MetricsVersion`.
+
+- **Input.** Every futures tick's top of book `(Bid, Ask, BidQty, AskQty)` stamped with the tick's `AvailableAt`, in the engine's causal processing order. A state identical to the previous unique state is collapsed (repeated snapshots are not independent evidence).
+- **Valid book.** `Bid > 0`, `Ask > 0`, `Ask >= Bid` (locked is valid, crossed is not), `BidQty >= 0`, `AskQty >= 0`, all finite. TOB and MicroDev additionally need `BidQty + AskQty > 0`; a valid book with zero total quantity counts as valid time but contributes to neither TOB nor MicroDev.
+- **Bar boundary.** For a completed bar `(start, end]` the reference state is the last unique state with `At <= start`; the bar's own book changes are the states with `start < At <= end`. A state is effective from its `At` to the next unique state, clipped to the bar. Consecutive bars therefore partition book transitions with none lost or double counted (tested by additivity of OFI).
+- **TOB / MicroDev.** Start = reference state, End = state effective at `end`, Change = End − Start, Min/Max over the reference state and every in-bar state, and the time-weighted average over the seconds where the metric is defined (null when that is zero seconds, e.g. a zero-duration split bar).
+- **OFI.** Sum of the Level-1 event contribution over consecutive valid unique states inside the bar, using the reference state as the first baseline when it is valid. An invalid/crossed state clears the baseline and counts as an invalid-book event; the first valid state afterwards only re-establishes the baseline (no transition across the gap). `Ofi` is null only when no valid baseline exists at any point in the bar; a bar with a valid baseline but no book change has `Ofi = 0` and `OfiTransitions = 0`.
+- **Coverage.** `ValidBookSeconds` and `InvalidBookSeconds` (including time before any book was seen) are stored per bar.
+- **Persistence.** Table `adaptive_futures_supplemental_bars`, unique on `(SessionId, BarSeq, MetricsVersion)`. Recovery inserts missing rows and verifies existing rows (tolerance 1e-9 on doubles). A mismatch or a write failure is logged and counted (`AdaptiveSupplementalPersistence.MismatchCount` / `FailureCount`), never overwrites a stored row, and never throws into core adaptive processing. A persisted per-session sidecar health flag is not implemented; the counters and error logs are the current signal.
+- **Display.** The compact futures grid shows MicroDev (time-weighted, raw price points, 3 decimals) and OFI (raw quantity) from the current `MetricsVersion` row; a missing row, a missing table, or an unavailable value renders as unavailable, never zero.
+
 # 9. Spot–futures basis — calculate continuously, display ΔBasis
 
 ## 9.1 Goal

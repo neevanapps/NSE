@@ -19,7 +19,9 @@ public sealed record AdaptiveObserverSnapshot(
     IReadOnlyList<AdaptiveOptionPairGridRow> Options,
     IReadOnlyList<AdaptiveOptionResidualBarRow> Residuals,
     IReadOnlyList<AdaptiveResidualAnchorComponentRow> ResidualAnchors,
-    int ConsecutiveValidBars = 0)
+    int ConsecutiveValidBars = 0,
+    // Sidecar rows (current MetricsVersion) keyed by BarSeq. Absent bars simply have no supplemental metrics.
+    IReadOnlyDictionary<int, AdaptiveFuturesSupplementalRow>? FuturesSupplemental = null)
 {
     public bool CanUseForDecisions => ConsecutiveValidBars >= NiftySignal.AdaptiveObserver.AdaptiveReadinessPolicy.RequiredBars
         && Runtime.RuntimeStatus == AdaptiveRuntimeStatus.Live;

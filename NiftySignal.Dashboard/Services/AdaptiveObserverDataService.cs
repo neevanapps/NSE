@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using NiftySignal.AdaptiveObserver;
 using NiftySignal.AdaptiveObserverData;
+using Npgsql;
 
 namespace NiftySignal.Dashboard.Services;
 
@@ -138,7 +139,30 @@ public sealed class AdaptiveObserverDataService(
             .ToListAsync(ct);
 
         return new AdaptiveObserverSnapshot(session, runtime, futures, options, residuals, anchors,
-            await LoadValidBarCountAsync(db, session, runtime.LastCompletedBarSeq, ct));
+            await LoadValidBarCountAsync(db, session, runtime.LastCompletedBarSeq, ct),
+            await LoadFuturesSupplementalAsync(db, session.Id, seqs, ct));
+    }
+
+    /// <summary>
+    /// Sidecar read (08-Oct plan section 71.4): supplemental metrics are optional, so a missing relation (Dashboard started before the
+    /// Host migrated) means "no supplemental metrics", never a failed panel.
+    /// </summary>
+    static async Task<IReadOnlyDictionary<int, AdaptiveFuturesSupplementalRow>> LoadFuturesSupplementalAsync(
+        AdaptiveObserverDbContext db, long sessionId, int[] seqs, CancellationToken ct)
+    {
+        if (seqs.Length == 0) return new Dictionary<int, AdaptiveFuturesSupplementalRow>();
+        try
+        {
+            var version = FuturesMicrostructureBar.MetricsVersion;
+            var rows = await db.FuturesSupplemental.AsNoTracking()
+                .Where(x => x.SessionId == sessionId && x.MetricsVersion == version && seqs.Contains(x.BarSeq))
+                .ToListAsync(ct);
+            return rows.ToDictionary(x => x.BarSeq);
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedTable)
+        {
+            return new Dictionary<int, AdaptiveFuturesSupplementalRow>();
+        }
     }
 
     static async Task<int> LoadValidBarCountAsync(AdaptiveObserverDbContext db, AdaptiveSessionStateRow session,

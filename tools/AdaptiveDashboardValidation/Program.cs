@@ -99,7 +99,7 @@ try {
     await Expect(page.GetByLabel("Completed rows",new() { Exact=true })).ToBeEnabledAsync();
     // Slice 1: compact grids are the default; only columns whose slice has landed are shown.
     await Expect(page.Locator(".adaptive-table[data-grid='futures-compact'] thead th")).ToHaveTextAsync(new[] { "Seq","End IST","Dur s","Urgency",
-        "Bar ΔPx","Roll ΔPx","Strict Δ","Enriched Δ","Roll Strict","Roll Enriched","|Strict| Δ","Roll OI Δ","Roll Efficiency","Evolution","State" });
+        "Bar ΔPx","Roll ΔPx","Strict Δ","Enriched Δ","Roll Strict","Roll Enriched","|Strict| Δ","MicroDev","OFI","Roll OI Δ","Roll Efficiency","Evolution","State" });
     await Expect(page.Locator(".adaptive-table[data-grid='options-compact'] thead th")).ToHaveTextAsync(new[] { "Seq","End IST","Center","Roll?",
         "CE ΔPx","PE ΔPx","CE Roll ΔPx","PE Roll ΔPx","CE Strict Δ","PE Strict Δ","CE Enriched Δ","PE Enriched Δ","CE Roll Strict","PE Roll Strict" });
     await Expect(page.Locator(".adaptive-table[data-grid='residual-compact'] thead th")).ToHaveTextAsync(new[] { "Seq","End IST","Future Δ09:30",
@@ -107,6 +107,24 @@ try {
     // Fixture bars: 3250 volume in 60 s => Urgency 54.2 (derived on read, not persisted).
     await Expect(page.Locator(".adaptive-table[data-grid='futures-compact'] tbody tr").First.Locator("td").Nth(3)).ToHaveTextAsync("54.2");
     await Expect(page.Locator(".adaptive-table[data-grid='options-compact'] tbody tr").First.Locator("td").Nth(2)).ToHaveTextAsync("23000");
+    // Sidecar metrics come from adaptive_futures_supplemental_bars (bar 20: MicroDev +0.125, OFI -420).
+    await Expect(page.Locator(".adaptive-table[data-grid='futures-compact'] tbody tr").First.Locator("td").Nth(11)).ToHaveTextAsync("+0.125");
+    await Expect(page.Locator(".adaptive-table[data-grid='futures-compact'] tbody tr").First.Locator("td").Nth(12)).ToHaveTextAsync("-420");
+    // Deployment-order safety: a Dashboard that starts before the Host migrated has no sidecar table; the panel must still render, with MicroDev/OFI unavailable.
+    await db.Database.ExecuteSqlRawAsync("ALTER TABLE adaptive_futures_supplemental_bars RENAME TO adaptive_futures_supplemental_bars_hidden");
+    try
+    {
+        await page.ReloadAsync();
+        await Expect(page.Locator(".adaptive-table[data-grid='futures-compact'] tbody tr").First.Locator("td").Nth(11)).ToHaveTextAsync("—");
+        await Expect(page.Locator(".adaptive-table[data-grid='futures-compact'] tbody tr").First.Locator("td").Nth(12)).ToHaveTextAsync("—");
+        await Expect(page.Locator(".adaptive-table")).ToHaveCountAsync(3);
+        await Expect(page.Locator(".adaptive-alert-error")).ToHaveCountAsync(0);
+    }
+    finally { await db.Database.ExecuteSqlRawAsync("ALTER TABLE adaptive_futures_supplemental_bars_hidden RENAME TO adaptive_futures_supplemental_bars"); }
+    await page.ReloadAsync();
+    await Expect(page.Locator(".adaptive-table[data-grid='futures-compact'] tbody tr").First.Locator("td").Nth(11)).ToHaveTextAsync("+0.125");
+    await Expect(page.GetByLabel("Completed rows",new() { Exact=true })).ToBeEnabledAsync();
+    Console.WriteLine("SIDECAR BROWSER PASS: MicroDev/OFI rendered from the versioned sidecar; missing sidecar table degrades to unavailable without an error banner.");
     // Reproduce the lost-selector race with a real in-flight PostgreSQL read.
     await using(var blocker=new AdaptiveObserverDbContext(options))
     await using(var transaction=await blocker.Database.BeginTransactionAsync())
@@ -301,6 +319,8 @@ void AddRows(int seq) {
     var end=at.AddMinutes(seq-43);var begin=end.AddMinutes(-1);
     db.FutureBars.Add(new AdaptiveFutureBarRow { SessionId=session.Id,BarSeq=seq,StartAvailableAtUtc=begin,EndAvailableAtUtc=end,
         Open=23000,High=23001,Low=23000,Close=23001,Volume=3250,TradeUpdates=1,DurationSeconds=60 });
+    db.FuturesSupplemental.Add(new AdaptiveFuturesSupplementalRow { SessionId=session.Id,BarSeq=seq,MetricsVersion=FuturesMicrostructureBar.MetricsVersion,
+        MicroDevTimeWeighted=.125,Ofi=-400L-seq,ValidBookSeconds=60 });
     foreach(var side in new[] { OptionType.Call,OptionType.Put })
         db.OptionBandBars.Add(new AdaptiveOptionBandBarRow { SessionId=session.Id,BarSeq=seq,Side=side,
             StartAvailableAtUtc=begin,EndAvailableAtUtc=end,BandStrikes="22900,22950,23000,23050,23100",

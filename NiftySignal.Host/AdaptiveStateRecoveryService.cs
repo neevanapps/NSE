@@ -19,7 +19,8 @@ public sealed class AdaptiveStateRecoveryService(
     AdaptiveSourceTickReader tickReader,
     AdaptiveObserverPersistence persistence,
     AdaptiveWeak2ObservationService observations,
-    ILogger<AdaptiveStateRecoveryService> logger)
+    ILogger<AdaptiveStateRecoveryService> logger,
+    AdaptiveSupplementalPersistence? supplemental = null)
 {
     public async Task<AdaptiveRecoveryResult> RecoverAsync(
         NiftySignalDbContext source,
@@ -90,6 +91,9 @@ public sealed class AdaptiveStateRecoveryService(
                 if (package.IsActionableWeak2) replayTriggers.Add(package.FutureBar.BarSeq);
                 var result = await persistence.PersistOrVerifyAsync(
                     observer, context.Session, package, DateTimeOffset.UtcNow, ct);
+                // Replay recomputes the supplemental metrics: verify rows that exist, insert the ones that do not (mid-session backfill).
+                if (supplemental is not null)
+                    await supplemental.PersistOrVerifyFuturesAsync(observer, context.Session.Id, package, ct);
                 await observations.ProcessPackageAsync(source, observer, context, package, ct);
                 if (result.VerifiedExisting)
                 {

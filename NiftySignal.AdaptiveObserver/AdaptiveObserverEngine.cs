@@ -27,6 +27,8 @@ public sealed class AdaptiveObserverEngine
     readonly List<OptionBandSideMetrics?> _putBandHistory = [];
     readonly List<double> _bandDurations = [];
     readonly Dictionary<ResidualVariant, double> _previousResidual = [];
+    // Supplemental Level-1 book observation. Separate state: it never influences bar construction or any core output.
+    readonly FuturesMicrostructureTracker _microstructure = new();
 
     BandContext? _currentBand;
     IReadOnlyList<double>? _previousBandStrikes;
@@ -111,6 +113,7 @@ public sealed class AdaptiveObserverEngine
 
     IReadOnlyList<AdaptiveCompletedBarPackage> ProcessFuture(CleanObserverTick tick)
     {
+        _microstructure.Observe(tick);
         var e = _futureEnricher.Process(tick);
         var hadStarted = _futureBars.PartialBarStartedAtUtc.HasValue;
         var completed = _futureBars.Add(e);
@@ -140,7 +143,8 @@ public sealed class AdaptiveObserverEngine
             var ready = AdaptiveReadinessPolicy.ConsecutiveValidBars(_futureBars.Bars, _session.BaseBarVolume, bar.BarSeq)
                 >= AdaptiveReadinessPolicy.RequiredBars;
             var actionable = ready && flow.State == AdaptiveStateKind.Weak2 && bar.EndAvailableAtUtc >= _signalStartUtc;
-            packages.Add(new AdaptiveCompletedBarPackage(bar, flow, optionBand, residuals, actionable));
+            packages.Add(new AdaptiveCompletedBarPackage(bar, flow, optionBand, residuals, actionable,
+                _microstructure.Complete(bar.StartAvailableAtUtc, bar.EndAvailableAtUtc)));
 
             // A crossing futures update can close multiple exact bars at the same timestamp.
             // After each close, start the next interval with a fresh causal band/snapshot at

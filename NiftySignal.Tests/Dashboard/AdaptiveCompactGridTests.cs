@@ -326,6 +326,8 @@ public sealed class AdaptiveCompactGridTests
                     CEResidualPct = 1.25, PEResidualPct = -2.5, DirectionalResidualPct = 3.75, ResidualDelta = 0.5, ResidualDirection = 1, MaxQuoteAgeSeconds = 0.75,
                 });
         }
+        db.FuturesSupplemental.Add(new() { SessionId = 1, BarSeq = 12, MetricsVersion = FuturesMicrostructureBar.MetricsVersion, MicroDevTimeWeighted = 0.1234, Ofi = -400 });
+        db.FuturesSupplemental.Add(new() { SessionId = 1, BarSeq = 11, MetricsVersion = "some-other-version", MicroDevTimeWeighted = 9.9, Ofi = 999 }); // another contract: never shown
         await db.SaveChangesAsync();
         return factory;
     }
@@ -364,13 +366,13 @@ public sealed class AdaptiveCompactGridTests
 
         Assert.Equal(3, Regex.Matches(html, "<table[ >]").Count);
         Assert.Equal(["Seq", "End IST", "Dur s", "Urgency", "Bar ΔPx", "Roll ΔPx", "Strict Δ", "Enriched Δ", "Roll Strict", "Roll Enriched",
-            "|Strict| Δ", "Roll OI Δ", "Roll Efficiency", "Evolution", "State"], Headers(html, 0));
+            "|Strict| Δ", "MicroDev", "OFI", "Roll OI Δ", "Roll Efficiency", "Evolution", "State"], Headers(html, 0));
         Assert.Equal(["Seq", "End IST", "Center", "Roll?", "CE ΔPx", "PE ΔPx", "CE Roll ΔPx", "PE Roll ΔPx", "CE Strict Δ", "PE Strict Δ",
             "CE Enriched Δ", "PE Enriched Δ", "CE Roll Strict", "PE Roll Strict"], Headers(html, 1));
         Assert.Equal(["Seq", "End IST", "Future Δ09:30", "CE Res %", "PE Res %", "Directional Res %", "Direction", "Relation", "Quote Age"], Headers(html, 2));
 
         // No columns from later slices, no legacy bridged delta, no diagnostic wide-table headers, no diagnostic toggle in a capture.
-        foreach (var absent in new[] { "MicroDev", "OFI", "ΔBasis", "Position", "ΔIV", "Skew", "Vol PCR", "Res Δ%", "Legacy Bridged", "Strict ratio", "Diagnostic view" })
+        foreach (var absent in new[] { "ΔBasis", "Position", "ΔIV", "Skew", "Vol PCR", "Res Δ%", "Legacy Bridged", "Strict ratio", "Diagnostic view" })
             Assert.DoesNotContain(absent, html);
     }
 
@@ -383,9 +385,11 @@ public sealed class AdaptiveCompactGridTests
 
         var rows = FirstRows(html, 0, 2);
         // Bar 12: zero duration => Urgency unavailable; rolling values from the persisted rolling row.
-        Assert.Equal(["12", "09:42:00", "0.0", "—", "+1.50", "-7.25", "+123", "-456", "-777", "-888", "-99", "+4242", "0.500", "Weakening", "Weak2"], rows[0]);
-        // Bar 11: 1000 / 50s = 20.0 volume per second.
+        // MicroDev / OFI come from the versioned sidecar row for that bar.
+        Assert.Equal(["12", "09:42:00", "0.0", "—", "+1.50", "-7.25", "+123", "-456", "-777", "-888", "-99", "+0.123", "-400", "+4242", "0.500", "Weakening", "Weak2"], rows[0]);
+        // Bar 11: 1000 / 50s = 20.0 volume per second; it has no sidecar row, so MicroDev / OFI are unavailable (not zero).
         Assert.Equal("20.0", rows[1][3]);
+        Assert.Equal(["—", "—"], rows[1][11..13]);
     }
 
     [Fact]
@@ -427,7 +431,7 @@ public sealed class AdaptiveCompactGridTests
 
         Assert.Contains("Diagnostic view", html);
         Assert.Equal(3, Regex.Matches(html, "<table[ >]").Count);
-        Assert.Equal(15, Headers(html, 0).Length);
+        Assert.Equal(17, Headers(html, 0).Length);
         Assert.DoesNotContain("Strict ratio", html);                   // diagnostic wide tables are not rendered by default
         Assert.DoesNotContain("Legacy Bridged", html);
     }

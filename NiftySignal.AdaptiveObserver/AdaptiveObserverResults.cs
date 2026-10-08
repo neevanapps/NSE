@@ -26,7 +26,10 @@ public sealed record AdaptiveCompletedBarPackage(
     AdaptiveFlowState FlowState,
     OptionBandBarResult OptionBand,
     IReadOnlyList<ResidualBarResult> Residuals,
-    bool IsActionableWeak2);
+    bool IsActionableWeak2,
+    // Supplemental observation only (sidecar-persisted, section 71 of the 08-Oct plan). Never part of the
+    // parity-protected core rows; null when the producer did not compute it.
+    FuturesMicrostructureBar? Microstructure = null);
 
 public sealed record AdaptivePartialBarStatus(
     long AccumulatedVolume,

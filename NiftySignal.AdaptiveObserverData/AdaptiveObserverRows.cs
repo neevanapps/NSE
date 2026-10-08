@@ -351,3 +351,33 @@ public sealed class AdaptiveObserverRuntimeRow
     public int LastRecoveryReconciledBars { get; set; }
     public string? LastError { get; set; }
 }
+
+/// <summary>
+/// Sidecar projection of futures Level-1 microstructure per completed adaptive bar (08-Oct plan, section 71).
+/// Deliberately a separate table: the core adaptive rows are the parity-protected restart ledger and are never
+/// extended with new observational fields. One row per (SessionId, BarSeq, MetricsVersion).
+/// </summary>
+public sealed class AdaptiveFuturesSupplementalRow
+{
+    public long Id { get; set; }
+    public long SessionId { get; set; }
+    public int BarSeq { get; set; }
+    /// <summary>Calculation contract that produced this row; a row from another version is never overwritten.</summary>
+    public required string MetricsVersion { get; set; }
+    public double? TobStart { get; set; }
+    public double? TobTimeWeighted { get; set; }
+    public double? TobEnd { get; set; }
+    public double? TobChange { get; set; }
+    public double? TobMin { get; set; }
+    public double? TobMax { get; set; }
+    public double? MicroDevStart { get; set; }
+    public double? MicroDevTimeWeighted { get; set; }
+    public double? MicroDevEnd { get; set; }
+    public double? MicroDevChange { get; set; }
+    public long? Ofi { get; set; }
+    public int OfiTransitions { get; set; }
+    public int BookStateChanges { get; set; }
+    public int InvalidBookEvents { get; set; }
+    public double ValidBookSeconds { get; set; }
+    public double InvalidBookSeconds { get; set; }
+}

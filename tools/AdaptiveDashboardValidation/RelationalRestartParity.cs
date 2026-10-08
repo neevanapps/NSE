@@ -56,6 +56,7 @@ static class RelationalRestartParity
         var golden=expected.ToDictionary(x=>x.FutureBar.BarSeq,x=>JsonSerializer.Serialize(x));
         var persistence=new AdaptiveObserverPersistence(NullLogger<AdaptiveObserverPersistence>.Instance);
         var observations=new AdaptiveWeak2ObservationService(NullLogger<AdaptiveWeak2ObservationService>.Instance);
+        var supplemental=new AdaptiveSupplementalPersistence(NullLogger<AdaptiveSupplementalPersistence>.Instance);
         var engine=NewEngine();var restarts=0;
         foreach(var group in groups)
         {
@@ -63,13 +64,14 @@ static class RelationalRestartParity
             {
                 if(golden[package.FutureBar.BarSeq]!=JsonSerializer.Serialize(package))throw new Exception("PostgreSQL restart changed an emitted package.");
                 await persistence.PersistOrVerifyAsync(db,row,package,group[0].Tick.AvailableAt,default);
+                await supplemental.PersistOrVerifyFuturesAsync(db,row.Id,package,default);
                 await observations.ProcessPackageAsync(source,db,context,package,default);
             }
             var time=group[0].Tick.AvailableAt;
             if(!checkpoints.Contains(time))continue;
             var partial=engine.PartialBar;db.ChangeTracker.Clear();
             observations=new AdaptiveWeak2ObservationService(NullLogger<AdaptiveWeak2ObservationService>.Instance);
-            var recovery=new AdaptiveStateRecoveryService(new(),persistence,observations,NullLogger<AdaptiveStateRecoveryService>.Instance);
+            var recovery=new AdaptiveStateRecoveryService(new(),persistence,observations,NullLogger<AdaptiveStateRecoveryService>.Instance,supplemental);
             var rebuilt=await recovery.RecoverAsync(source,db,context,time,default);
             if(rebuilt.Engine.PartialBar!=partial)throw new Exception("PostgreSQL recovery changed partial volume/start.");
             engine=rebuilt.Engine;restarts++;
@@ -77,6 +79,19 @@ static class RelationalRestartParity
         await observations.FinalizeSessionAsync(source,db,context,default);
         await observations.VerifyCompletedAsync(source,db,context,default);
         if(await db.FutureBars.CountAsync(x=>x.SessionId==row.Id)!=expected.Count)throw new Exception("Relational restart duplicated/dropped bars.");
+        // Sidecar (08-Oct plan section 71): one versioned row per completed bar, verified across every restart, never a mismatch.
+        if(await db.FuturesSupplemental.CountAsync(x=>x.SessionId==row.Id && x.MetricsVersion==FuturesMicrostructureBar.MetricsVersion)!=expected.Count
+            || supplemental.MismatchCount!=0 || supplemental.FailureCount!=0)
+            throw new Exception($"Sidecar restart parity failed: mismatches={supplemental.MismatchCount}, failures={supplemental.FailureCount}.");
+        // Mid-session deployment: delete the earliest sidecar rows (as if the Host were deployed after those bars) and replay.
+        db.ChangeTracker.Clear();
+        var removed=await db.FuturesSupplemental.Where(x=>x.SessionId==row.Id && x.BarSeq<=5).ExecuteDeleteAsync();
+        var backfillRecovery=new AdaptiveStateRecoveryService(new(),persistence,new AdaptiveWeak2ObservationService(NullLogger<AdaptiveWeak2ObservationService>.Instance),
+            NullLogger<AdaptiveStateRecoveryService>.Instance,supplemental);
+        await backfillRecovery.RecoverAsync(source,db,context,groups[^1][0].Tick.AvailableAt,default);
+        if(removed!=5 || await db.FuturesSupplemental.CountAsync(x=>x.SessionId==row.Id)!=expected.Count || supplemental.MismatchCount!=0)
+            throw new Exception("Sidecar backfill after a mid-session deployment failed.");
+        db.ChangeTracker.Clear();
         var completed=await db.Weak2Observations.FirstAsync(x=>x.SessionId==row.Id && x.Status==AdaptiveObservationStatus.Completed);
         completed.PnlPoints=999;await db.SaveChangesAsync();db.ChangeTracker.Clear();
         try { await observations.VerifyCompletedAsync(source,db,context,default);throw new Exception("Relational corruption went undetected."); }
@@ -85,7 +100,7 @@ static class RelationalRestartParity
             throw new Exception("Restart overwrote corrupted persisted history.");
         await File.WriteAllTextAsync(Path.Combine(evidence,"postgres-restart.json"),JsonSerializer.Serialize(new {
             sourceSha=sha,restarts,completedBars=expected.Count,trigger=trigger.FutureBar.BarSeq,
-            bandRoll=rolled.FutureBar.BarSeq,corruptionRejected=true,scope="PostgreSQL source, package persistence, Weak2/OI/H5 reconciliation and partial-state restarts" },new JsonSerializerOptions { WriteIndented=true }));
+            bandRoll=rolled.FutureBar.BarSeq,corruptionRejected=true,sidecarRows=expected.Count,sidecarBackfilledBars=removed,scope="PostgreSQL source, package persistence, Weak2/OI/H5 reconciliation and partial-state restarts" },new JsonSerializerOptions { WriteIndented=true }));
         Console.WriteLine($"POSTGRES RESTART PASS: {restarts} process-state resets, {expected.Count} completed bars, Weak2/H5 and band roll, corruption rejected without overwrite.");
     }
     static Tick Quote(string token,DateTimeOffset time,double last,double bid,double ask,long volume,long oi)=>new() {

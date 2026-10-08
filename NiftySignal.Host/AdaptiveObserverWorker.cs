@@ -17,6 +17,7 @@ public sealed class AdaptiveObserverWorker(
     AdaptiveObserverPersistence persistence,
     AdaptiveWeak2ObservationService observations,
     AdaptiveEndedSessionRecoveryService endedSessionRecovery,
+    AdaptiveSupplementalPersistence supplemental,
     DashboardPushClient dashboardPush,
     ILogger<AdaptiveObserverWorker> logger) : BackgroundService
 {
@@ -177,6 +178,9 @@ public sealed class AdaptiveObserverWorker(
             {
                 var saved = await persistence.PersistOrVerifyAsync(
                     observer, live.Context.Session, package, nowUtc, ct);
+                // Supplemental sidecar rows are inserted/verified before the Dashboard is told, so a push never races ahead of them.
+                // The call never throws into the core observer (sidecar problems are logged and counted).
+                await supplemental.PersistOrVerifyFuturesAsync(observer, live.Context.Session.Id, package, ct);
                 if (saved.Inserted)
                 {
                     // Signal only after the DB transaction committed. Failure to notify must not

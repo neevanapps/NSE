@@ -104,6 +104,7 @@
                         <th>Bar ΔPx</th><th>Roll ΔPx</th>
                         <th>Strict Δ</th><th>Enriched Δ</th>
                         <th>Roll Strict</th><th>Roll Enriched</th><th>|Strict| Δ</th>
+                        <th>MicroDev</th><th>OFI</th>
                         <th>Roll OI Δ</th><th>Roll Efficiency</th>
                         <th>Evolution</th><th>State</th>
                     </tr>
@@ -124,6 +125,8 @@
                             <td>@FmtSigned(r?.StrictDelta)</td>
                             <td>@FmtSigned(r?.EnrichedDelta)</td>
                             <td>@FmtSigned(r?.RollingStrictAbsDeltaChange)</td>
+                            <td>@FmtSigned(Supplemental(x.Bar.BarSeq)?.MicroDevTimeWeighted, 3)</td>
+                            <td>@FmtSigned(Supplemental(x.Bar.BarSeq)?.Ofi)</td>
                             <td>@FmtSigned(r?.OiChange)</td>
                             <td>@Fmt(r?.Efficiency, 3)</td>
                             <td>@(r?.StrictDominanceEvolution ?? "—")</td>
@@ -664,6 +667,10 @@
         _measurement == "NOTIONAL" ? x.NotionalRollingStrictCoverage : x.ContractRollingStrictCoverage;
     double? ActivityPerSecond(AdaptiveOptionBandBarRow? x) => x is null ? null :
         _measurement == "NOTIONAL" ? x.NotionalRollingActivityPerSecond : x.ContractRollingActivityPerSecond;
+
+    // Sidecar metrics (futures Level-1 microstructure). Missing row => rendered as unavailable.
+    AdaptiveFuturesSupplementalRow? Supplemental(int barSeq) =>
+        _snapshot?.FuturesSupplemental is { } map && map.TryGetValue(barSeq, out var row) ? row : null;
 
     static double? Relative(double? a, double? b) => a.HasValue && b.HasValue ? a.Value - b.Value : null;
     static string BoolMark(bool x) => x ? "YES" : "—";

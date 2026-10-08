@@ -15,6 +15,7 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
     public DbSet<AdaptiveWeak2ObservationRow> Weak2Observations => Set<AdaptiveWeak2ObservationRow>();
     public DbSet<AdaptiveObserverRuntimeRow> Runtime => Set<AdaptiveObserverRuntimeRow>();
     public DbSet<AdaptiveScreenshotJobRow> ScreenshotJobs => Set<AdaptiveScreenshotJobRow>();
+    public DbSet<AdaptiveFuturesSupplementalRow> FuturesSupplemental => Set<AdaptiveFuturesSupplementalRow>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -115,5 +116,14 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
             .HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
         modelBuilder.Entity<AdaptiveObserverRuntimeRow>().HasOne<AdaptiveSessionStateRow>().WithMany()
             .HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
+
+        // Sidecar (08-Oct plan section 71): versioned, keyed by session + bar, outside the parity-protected core rows.
+        modelBuilder.Entity<AdaptiveFuturesSupplementalRow>(e =>
+        {
+            e.ToTable("adaptive_futures_supplemental_bars");
+            e.HasIndex(x => new { x.SessionId, x.BarSeq, x.MetricsVersion }).IsUnique();
+            e.Property(x => x.MetricsVersion).HasMaxLength(64);
+            e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
+        });
     }
 }
