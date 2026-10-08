@@ -18,6 +18,7 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
     public DbSet<AdaptiveFuturesSupplementalRow> FuturesSupplemental => Set<AdaptiveFuturesSupplementalRow>();
     public DbSet<AdaptiveCommentaryEventRow> CommentaryEvents => Set<AdaptiveCommentaryEventRow>();
     public DbSet<AdaptiveCommentaryRuntimeRow> CommentaryRuntime => Set<AdaptiveCommentaryRuntimeRow>();
+    public DbSet<AdaptiveCommentaryNotificationJobRow> CommentaryNotificationJobs => Set<AdaptiveCommentaryNotificationJobRow>();
     public DbSet<AdaptiveOptionsSupplementalRow> OptionsSupplemental => Set<AdaptiveOptionsSupplementalRow>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
@@ -151,6 +152,15 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
             e.Property(x => x.CommentaryVersion).HasMaxLength(32);
             e.Property(x => x.EventIdentity).HasMaxLength(128);
             e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
+        });
+        modelBuilder.Entity<AdaptiveCommentaryNotificationJobRow>(e =>
+        {
+            e.ToTable("adaptive_commentary_notification_jobs");
+            e.HasIndex(x => x.EventId).IsUnique();
+            e.HasIndex(x => new { x.Status, x.NextAttemptUtc });
+            e.Property(x => x.Status).HasConversion<string>().HasMaxLength(24);
+            e.Property(x => x.LastError).HasMaxLength(512);
+            e.HasOne<AdaptiveCommentaryEventRow>().WithMany().HasForeignKey(x => x.EventId).OnDelete(DeleteBehavior.Restrict);
         });
         modelBuilder.Entity<AdaptiveCommentaryRuntimeRow>(e =>
         {

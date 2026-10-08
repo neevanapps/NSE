@@ -90,6 +90,7 @@ builder.Services.AddHttpClient<FlatTradeAuthClient>();
 
 builder.Services.AddSingleton<LiveDataService>();
 builder.Services.AddSingleton<AdaptiveObserverDataService>();
+builder.Services.AddSingleton<AdaptiveCommentaryDataService>();
 builder.Services.AddSingleton<AdaptiveQuoteAsOfService>();
 builder.Services.Configure<AdaptiveScreenshotOptions>(builder.Configuration.GetSection(AdaptiveScreenshotOptions.SectionName));
 builder.Services.Configure<TelegramOptions>(builder.Configuration.GetSection(TelegramOptions.SectionName));
@@ -109,6 +110,24 @@ builder.Services.AddSingleton<ITelegramDocumentSender>(sp =>
         sp.GetRequiredService<IOptions<TelegramOptions>>(), emulator);
 });
 builder.Services.AddSingleton<AdaptiveScreenshotProcessor>();
+// Commentary Telegram outbox (08-Oct plan section 61). Explicit opt-in: AdaptiveCommentaryTelegram:Enabled (default false) AND Dashboard Telegram settings.
+builder.Services.Configure<AdaptiveCommentaryTelegramOptions>(builder.Configuration.GetSection(AdaptiveCommentaryTelegramOptions.SectionName));
+builder.Services.AddSingleton<ITelegramTextSender>(sp =>
+{
+    // Same rules as the document sender: no HTTP logging handler (URLs contain the bot token); loopback emulator is Development-only.
+    Uri? emulator = null;
+    var testUrl = builder.Configuration["AdaptiveScreenshotValidationApiUrl"];
+    if (builder.Environment.IsDevelopment() && !string.IsNullOrEmpty(testUrl))
+    {
+        emulator = new Uri(testUrl);
+        if (!emulator.IsLoopback || emulator.Scheme != "http") throw new InvalidOperationException("Validation API must be loopback HTTP.");
+    }
+    return new TelegramTextSender(new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false,
+        PooledConnectionLifetime = TimeSpan.FromMinutes(5) }) { Timeout = TimeSpan.FromSeconds(30) },
+        sp.GetRequiredService<IOptions<TelegramOptions>>(), emulator);
+});
+builder.Services.AddSingleton<AdaptiveCommentaryNotificationProcessor>();
+builder.Services.AddHostedService<AdaptiveCommentaryNotificationWorker>();
 builder.Services.AddHostedService<AdaptiveScreenshotWorker>();
 
 // Single-user cookie auth (2026-09-05) -- see DashboardAuthOptions for why this is deliberately

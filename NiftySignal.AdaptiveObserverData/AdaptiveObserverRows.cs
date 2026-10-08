@@ -495,3 +495,23 @@ public sealed class AdaptiveCommentaryRuntimeRow
     public DateTimeOffset UpdatedAtUtc { get; set; }
     public required string CommentaryVersion { get; set; }
 }
+
+public enum AdaptiveCommentaryNotificationStatus { Pending = 0, Sending = 1, Sent = 2, DeliveryUncertain = 3 }
+
+/// <summary>
+/// Durable Telegram outbox for commentary (08-Oct plan section 61). One job per event (unique <see cref="EventId"/>); never written by the
+/// detector's send path, only enqueued with the event. Telegram acknowledgement and the database commit are not atomic, so exactly-once delivery
+/// is not claimed: Sent jobs are never resent and DeliveryUncertain jobs are never retried automatically.
+/// </summary>
+public sealed class AdaptiveCommentaryNotificationJobRow
+{
+    public long Id { get; set; }
+    public long EventId { get; set; }
+    public AdaptiveCommentaryNotificationStatus Status { get; set; }
+    public DateTimeOffset CreatedAtUtc { get; set; }
+    public DateTimeOffset NextAttemptUtc { get; set; }
+    public DateTimeOffset? SentAtUtc { get; set; }
+    public long? TelegramMessageId { get; set; }
+    public int Attempts { get; set; }
+    public string? LastError { get; set; }
+}

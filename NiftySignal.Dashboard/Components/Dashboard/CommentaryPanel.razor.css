@@ -1,0 +1,63 @@
+.commentary-panel {
+    margin: 16px 20px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.commentary-title-row {
+    display: flex;
+    gap: 14px;
+    align-items: baseline;
+    justify-content: space-between;
+    flex-wrap: wrap;
+}
+
+.commentary-title-row h2 {
+    margin: 0;
+    font-size: 1.05rem;
+}
+
+.commentary-state,
+.commentary-note,
+.commentary-empty {
+    color: var(--text-dim);
+    font-size: .8rem;
+}
+
+.commentary-event {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 8px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.commentary-event header {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+}
+
+.commentary-time {
+    font-family: var(--font-mono);
+    color: var(--text-dim);
+}
+
+.commentary-chip {
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1px 8px;
+    font-size: .72rem;
+}
+
+.commentary-bias-long { color: var(--bull); }
+.commentary-bias-short { color: var(--bear); }
+
+.commentary-line {
+    font-size: .82rem;
+    overflow-wrap: anywhere;
+}

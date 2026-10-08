@@ -51,6 +51,10 @@ var runtime = new AdaptiveObserverRuntimeRow { SessionId=session.Id, LastHeartbe
 db.Runtime.Add(runtime);
 for (var seq=1;seq<=20;seq++) AddRows(seq);
 await db.SaveChangesAsync();
+// Commentary exactly as the Host drives it: evaluate persisted completed bars in order (frames come from persisted rows only).
+var commentary=new NiftySignal.Host.AdaptiveCommentaryService(new NiftySignal.Host.AdaptiveCommentaryFrameLoader(),
+    Microsoft.Extensions.Logging.Abstractions.NullLogger<NiftySignal.Host.AdaptiveCommentaryService>.Instance);
+await commentary.ProcessThroughAsync(db,session,20,default);
 const string url="http://127.0.0.1:5089";
 const string password="isolated-ci-validation-password";
 var start=new ProcessStartInfo("dotnet") {
@@ -63,6 +67,7 @@ start.Environment["ConnectionStrings__NiftySignalDb"]=baseConnection;
 start.Environment["DashboardAuth__Username"]="validation-user";
 start.Environment["DashboardAuth__PasswordSha256"]=Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(password)));
 start.Environment["AdaptiveScreenshots__Enabled"]="true";
+start.Environment["AdaptiveCommentaryTelegram__Enabled"]="true";   // explicit opt-in for the commentary outbox (loopback emulator only)
 start.Environment["AdaptiveScreenshots__BaseUrl"]=url;
 start.Environment["AdaptiveScreenshots__OutputDirectory"]=Path.Combine(evidence,"screenshots");
 start.Environment["Telegram__BotToken"]="123456:ci-no-real-token";
@@ -218,6 +223,7 @@ try {
     for(var seq=21;seq<=43;seq++) {
         AddRows(seq); runtime.LastCompletedBarSeq=seq;runtime.LastHeartbeatUtc=DateTimeOffset.UtcNow;
         await db.SaveChangesAsync(); // Starts only after the database commit returns.
+        await commentary.ProcessThroughAsync(db,session,seq,default);   // like the Host: commentary is written before the push
         var timer=Stopwatch.StartNew();
         await push.InvokeAsync("PushAdaptiveStateChanged",session.Id,seq);
         foreach(var table in await page.Locator(".adaptive-table").AllAsync())
@@ -260,6 +266,29 @@ try {
     lastFixtureBar.TradeUpdates=1; await db.SaveChangesAsync();
     await Expect(page.Locator("[data-readiness='ready']")).ToBeVisibleAsync();
     Console.WriteLine("READINESS BROWSER PASS: nine bars provisional, ten-plus valid bars ready, invalid latest bar revokes readiness.");
+    // Commentary (Slice 4C): events are persisted, shown newest first, and only the eligible ones (Flipped, BiasChanged) were queued and delivered once.
+    await page.GotoAsync(url+"/");
+    var panel=page.GetByTestId("live-commentary");
+    await Expect(panel).ToBeVisibleAsync();
+    await Expect(panel.Locator(".commentary-event")).ToHaveCountAsync(4);
+    await Expect(panel.Locator(".commentary-event").First).ToContainTextAsync("Seller absorption");
+    await Expect(panel.Locator(".commentary-event").First).ToContainTextAsync("Resolved");
+    await Expect(panel.Locator(".commentary-event[data-lifecycle='Flipped']")).ToContainTextAsync("Short covering");
+    await Expect(panel).Not.ToContainTextAsync("onfidence");
+    await Expect(panel).ToContainTextAsync("not a probability or a validated signal");
+    for(var attempt=0;attempt<60;attempt++) {
+        if(await db.CommentaryNotificationJobs.AsNoTracking().CountAsync(x=>x.Status==AdaptiveCommentaryNotificationStatus.Sent)==2)break;
+        await Task.Delay(500);
+    }
+    var commentaryJobs=await db.CommentaryNotificationJobs.AsNoTracking().OrderBy(x=>x.Id).ToListAsync();
+    if(commentaryJobs.Count!=2 || commentaryJobs.Any(x=>x.Status!=AdaptiveCommentaryNotificationStatus.Sent || x.TelegramMessageId is null))
+        throw new Exception("Commentary outbox did not deliver exactly the two eligible events: "+JsonSerializer.Serialize(commentaryJobs.Select(x=>new { x.EventId,x.Status,x.Attempts,x.LastError })));
+    var commentaryMessages=telegramStub.Messages.ToArray();
+    if(commentaryMessages.Length!=2 || !commentaryMessages[0].Contains("Short covering flipped.") || !commentaryMessages[1].Contains("Seller absorption started.")
+        || commentaryMessages.Any(x=>!x.StartsWith("NIFTY adaptive commentary |") || x.Contains("onfidence")))
+        throw new Exception("Commentary Telegram messages were not the two expected eligible events: "+JsonSerializer.Serialize(commentaryMessages));
+    await page.ScreenshotAsync(new() { Path=Path.Combine(evidence,"commentary-panel.png"),FullPage=true });
+    Console.WriteLine("COMMENTARY BROWSER PASS: persisted events newest first with bias/regime/lifecycle/EvidenceAgreement, only Flipped and BiasChanged queued, delivered once through the loopback Telegram emulator.");
     // Restart the real worker against the same PostgreSQL outbox; acknowledged images must not resend.
     await push.StopAsync();
     server.Kill(entireProcessTree:true);
@@ -277,6 +306,8 @@ try {
     await Task.Delay(3000);
     if(telegramStub.Uploads.Count!=7 || await db.ScreenshotJobs.AsNoTracking().CountAsync(x=>x.SessionId==session.Id)!=7)
         throw new Exception("Dashboard worker restart duplicated acknowledged screenshots.");
+    if(telegramStub.Messages.Count!=2 || await db.CommentaryNotificationJobs.AsNoTracking().CountAsync(x=>x.Status==AdaptiveCommentaryNotificationStatus.Sent)!=2)
+        throw new Exception("Dashboard restart resent or lost an acknowledged commentary notification.");
     await page.GotoAsync(url+"/adaptive-screenshots");
     await Expect(page.GetByRole(AriaRole.Button,new() { Name="Send pre-live test",Exact=true })).ToBeEnabledAsync();
     await page.GetByRole(AriaRole.Button,new() { Name="Send pre-live test",Exact=true }).ClickAsync();
@@ -332,10 +363,19 @@ try {
 NiftySignal.Domain.Entities.Tick PinTick(string token,decimal price,DateTimeOffset when,bool depth=false) => new() {
     Token=token,Exchange=Exchange.Nfo,ExchangeTimestamp=when,ReceivedAt=when,LastPrice=price,
     Depth=depth ? new NiftySignal.Domain.ValueObjects.MarketDepth(price-.5m,65,0,0,0,0,0,0,0,0,price+.5m,65,0,0,0,0,0,0,0,0) : null };
+// Scripted flow so the real commentary evaluator produces: bar 10 SellerExpansion (New), 21 ShortCovering (Flipped), 22 SellerAbsorption (bias change), 23 Resolved.
+(int Flow,long OiChange,double BarMove,double RollMove) CommentaryPattern(int seq) => seq switch {
+    < 10 => (-1,50,-2,-5), <= 20 => (-1,50,-2,-5), 21 => (1,-5,2,5), 22 => (-1,50,.5,-5), _ => (0,0,0,0) };
 void AddRows(int seq) {
     var end=at.AddMinutes(seq-43);var begin=end.AddMinutes(-1);
+    var (flow,oiChange,barMove,rollMove)=CommentaryPattern(seq);
     db.FutureBars.Add(new AdaptiveFutureBarRow { SessionId=session.Id,BarSeq=seq,StartAvailableAtUtc=begin,EndAvailableAtUtc=end,
-        Open=23000,High=23001,Low=23000,Close=23001,Volume=3250,TradeUpdates=1,DurationSeconds=60 });
+        Open=23000,High=23001,Low=23000,Close=23001,Volume=3250,TradeUpdates=1,DurationSeconds=60,
+        BarPriceDisplacement=barMove,StrictDelta=flow*100,EnrichedDelta=flow*110 });
+    if(seq>=10)
+        db.RollingStates.Add(new AdaptiveRollingStateRow { SessionId=session.Id,StartBarSeq=seq-9,EndBarSeq=seq,StartAvailableAtUtc=begin.AddMinutes(-9),
+            EndAvailableAtUtc=end,PriceDisplacement=rollMove,StrictDelta=flow*1000,EnrichedDelta=flow*1100,OiChange=oiChange,Efficiency=.5,
+            RollingStrictAbsDeltaChange=0,State=AdaptiveStateKind.Normal });
     db.OptionsSupplemental.Add(new AdaptiveOptionsSupplementalRow { SessionId=session.Id,BarSeq=seq,MetricsVersion=OptionsSupplementalBar.MetricsVersion,
         CenterStrike=23000,CeOiDelta=100,PeOiDelta=-100,CePosition="CallLongBuild",PePosition="PutShortCover",CeDeltaIv=1.5,PeDeltaIv=-.5,
         IvSkewEnd=.75,VolPcr=.9,RollVolPcr=1.2,DayCeVolume=1000,DayPeVolume=900,UniverseTokenCount=2,TokensObserved=2 });

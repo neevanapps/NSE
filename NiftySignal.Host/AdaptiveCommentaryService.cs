@@ -36,12 +36,17 @@ public sealed class AdaptiveCommentaryService(
                 var step = CommentaryEvaluator.Evaluate(state, frame);
                 await using var transaction = await db.Database.BeginTransactionAsync(ct);
                 long? lastEventId = runtime?.CurrentEventId;
+                var enqueuedAtBar = (int?)null;
                 if (step.Event is { } e)
                 {
-                    lastEventId = await PersistOrVerifyEventAsync(db, e, lastEventId, ct);
+                    var (id, inserted) = await PersistOrVerifyEventAsync(db, e, lastEventId, ct);
+                    lastEventId = id;
+                    // Only a newly inserted event may queue a notification: replaying/verifying existing events never re-queues (no flood after a restart).
+                    if (inserted && await TryEnqueueNotificationAsync(db, e, id, ct)) enqueuedAtBar = e.BarSeq;
                 }
 
                 runtime = Upsert(db, runtime, session.Id, step.State, lastEventId);
+                if (enqueuedAtBar is { } queued) runtime.LastTelegramBarSeq = queued;
                 await db.SaveChangesAsync(ct);
                 await transaction.CommitAsync(ct);
                 state = step.State;
@@ -69,7 +74,25 @@ public sealed class AdaptiveCommentaryService(
         return last == 0 ? 0 : await ProcessThroughAsync(db, session, last, ct);
     }
 
-    async Task<long?> PersistOrVerifyEventAsync(AdaptiveObserverDbContext db, CommentaryEvent e, long? previousEventId, CancellationToken ct)
+    /// <summary>Queues at most one Telegram job per event, applying the same-event cooldown (V1: every eligible class bypasses it). Never sends.</summary>
+    static async Task<bool> TryEnqueueNotificationAsync(AdaptiveObserverDbContext db, CommentaryEvent e, long eventId, CancellationToken ct)
+    {
+        if (!e.ShouldNotifyTelegram) return false;
+        var last = await (from job in db.CommentaryNotificationJobs
+                          join ev in db.CommentaryEvents on job.EventId equals ev.Id
+                          where ev.SessionId == e.SessionId
+                          orderby ev.BarSeq descending, ev.Id descending
+                          select new LastCommentaryNotification(ev.EventType, ev.EventBias, ev.BarSeq)).FirstOrDefaultAsync(ct);
+        if (!CommentaryNotificationPolicy.ShouldEnqueue(e, last)) return false;
+        if (await db.CommentaryNotificationJobs.AnyAsync(x => x.EventId == eventId, ct)) return false;
+        db.CommentaryNotificationJobs.Add(new AdaptiveCommentaryNotificationJobRow
+        {
+            EventId = eventId, Status = AdaptiveCommentaryNotificationStatus.Pending, CreatedAtUtc = e.OccurredAtUtc, NextAttemptUtc = e.OccurredAtUtc,
+        });
+        return true;
+    }
+
+    async Task<(long Id, bool Inserted)> PersistOrVerifyEventAsync(AdaptiveObserverDbContext db, CommentaryEvent e, long? previousEventId, CancellationToken ct)
     {
         var expected = MapEvent(e, previousEventId);
         var existing = await db.CommentaryEvents.SingleOrDefaultAsync(x => x.EventIdentity == expected.EventIdentity, ct);
@@ -77,7 +100,7 @@ public sealed class AdaptiveCommentaryService(
         {
             db.CommentaryEvents.Add(expected);
             await db.SaveChangesAsync(ct);                      // assigns the Id used as the next event's PreviousEventId
-            return expected.Id;
+            return (expected.Id, true);
         }
 
         var difference = FirstDifference(existing, expected);
@@ -87,7 +110,7 @@ public sealed class AdaptiveCommentaryService(
             logger.LogError("Adaptive commentary event mismatch on replay (stored row left untouched): {Identity}, {Difference}", expected.EventIdentity, difference);
         }
 
-        return existing.Id;
+        return (existing.Id, false);
     }
 
     public static AdaptiveCommentaryEventRow MapEvent(CommentaryEvent e, long? previousEventId) => new()

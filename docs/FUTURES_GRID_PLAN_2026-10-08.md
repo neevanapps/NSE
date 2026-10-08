@@ -2878,6 +2878,15 @@ It applies to repeated notifications for the same EventType + Bias. The followin
 
 In V1 every Telegram-eligible class (Confirmed, Flipped, actual bias change) is in the bypass list, so the cooldown currently has no practical effect. It is implemented as configuration so that enabling additional eligible classes later cannot flood Telegram. It is an operational notification throttle, not a trading parameter.
 
+## 61.1 Implementation contract (Slice 4C, implemented)
+
+- **Outbox.** `adaptive_commentary_notification_jobs` (unique `EventId`; `Pending`, `Sending`, `Sent`, `DeliveryUncertain`). A job is queued by the commentary service in the **same transaction** as the event, and **only when the event row is newly inserted** and the V1 policy (section 60.1) plus the cooldown allow it. Verifying an existing event on replay never queues anything, so a restart or a mid-session deployment cannot flood Telegram. The detector never sends.
+- **Delivery.** `AdaptiveCommentaryNotificationProcessor` (Dashboard, same lease pattern and Telegram settings as the screenshot outbox, its own advisory lock): `Sending` is saved before the first byte leaves; `Sent` requires an acknowledged Telegram `message_id` and is never resent; an exception, timeout or unacknowledged response becomes `DeliveryUncertain` and is never retried automatically; an interrupted `Sending` becomes `DeliveryUncertain` on restart; a definitive Telegram refusal returns to `Pending` after its `retry_after` and holds other jobs meanwhile. Exactly-once delivery is **not** claimed.
+- **Message.** `CommentaryNotificationPolicy.FormatMessage`: a one-line identification (date, bar, IST time) + the deterministic rendered commentary + a one-line reminder that it is an interpretation hypothesis, not a probability or trade signal; bounded to 4000 characters.
+- **Explicit opt-in.** Delivery runs only when `AdaptiveCommentaryTelegram:Enabled = true` (default **false**) and Dashboard Telegram settings exist, so a deployment can never start messaging a real account by surprise. Events are persisted and shown on the Dashboard regardless. (This switch is an addition to the plan, recorded here.)
+- **Cooldown.** `MinimumBarsBetweenSameEventTelegram = 5` is implemented in `CommentaryNotificationPolicy.ShouldEnqueue`; every V1 eligible reason (`Confirmed`, `Flipped`, `BiasChanged`) bypasses it, so it currently has no practical effect.
+- **Dashboard panel.** `CommentaryPanel` shows the current regime/bias/last evaluated bar and the latest **five** persisted events newest first (time, event, Bias, Regime, lifecycle, EvidenceAgreement, deterministic text), the standing EvidenceAgreement note, an empty state, and tolerates a missing commentary table. It is not part of the Telegram screenshot composition.
+
 # 62. Commentary examples
 
 ## 62.1 Seller expansion begins

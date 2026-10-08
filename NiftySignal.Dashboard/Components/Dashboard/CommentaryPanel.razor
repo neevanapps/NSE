@@ -1,0 +1,82 @@
+@using NiftySignal.AdaptiveObserver.Commentary
+@using NiftySignal.AdaptiveObserverData
+@using NiftySignal.Dashboard.Services
+@implements IDisposable
+@inject AdaptiveCommentaryDataService Commentary
+@inject AdaptiveObserverDataService AdaptiveData
+
+<section class="commentary-panel" data-testid="live-commentary">
+    <div class="commentary-title-row">
+        <h2>Live Market Commentary</h2>
+        @if (_model.Runtime is { } runtime)
+        {
+            <div class="commentary-state">
+                Regime <strong>@runtime.CurrentRegime.ToString().ToUpperInvariant()</strong>
+                · Bias <strong>@runtime.CurrentBias.ToString().ToUpperInvariant()</strong>
+                · evaluated through bar @runtime.LastEvaluatedBarSeq
+            </div>
+        }
+    </div>
+    <div class="commentary-note">
+        Deterministic interpretation of completed bars under stated hypotheses. EvidenceAgreement = how many independent evidence families agree;
+        it is not a probability or a validated signal. Watch-only: no orders.
+    </div>
+
+    @if (_model.Events.Count == 0)
+    {
+        <div class="commentary-empty">No commentary events yet today.</div>
+    }
+    else
+    {
+        @foreach (var e in _model.Events)
+        {
+            <article class="commentary-event" data-event-id="@e.Id" data-lifecycle="@e.Lifecycle" data-bias="@e.EventBias">
+                <header>
+                    <span class="commentary-time">@Ist(e.OccurredAtUtc)</span>
+                    <strong>@CommentaryRenderer.Title(e.EventType)</strong>
+                    <span class="commentary-chip commentary-bias-@e.EventBias.ToString().ToLowerInvariant()">Bias @e.EventBias.ToString().ToUpperInvariant()</span>
+                    <span class="commentary-chip">Regime @e.MarketRegime.ToString().ToUpperInvariant()</span>
+                    <span class="commentary-chip">@e.Lifecycle</span>
+                    <span class="commentary-chip">EvidenceAgreement @e.EvidenceAgreement.ToString().ToUpperInvariant()</span>
+                </header>
+                @foreach (var line in Lines(e.RenderedCommentary))
+                {
+                    <div class="commentary-line">@line</div>
+                }
+            </article>
+        }
+    }
+</section>
+
+@code {
+    const int VisibleEvents = 5;                         // DashboardCommentaryRows (plan section 69)
+    AdaptiveCommentaryPanelModel _model = new(null, null, []);
+    bool _disposed;
+
+    protected override async Task OnInitializedAsync()
+    {
+        AdaptiveData.Updated += OnAdaptiveUpdated;
+        await ReloadAsync();
+    }
+
+    void OnAdaptiveUpdated() => _ = InvokeAsync(ReloadAsync);
+
+    async Task ReloadAsync()
+    {
+        if (_disposed) return;
+        try { _model = await Commentary.LoadLatestAsync(VisibleEvents); }
+        catch (Exception) { /* commentary is observational: a read failure must not break the page */ }
+        if (!_disposed) await InvokeAsync(StateHasChanged);
+    }
+
+    static string Ist(DateTimeOffset at) => at.ToOffset(TimeSpan.FromHours(5.5)).ToString("HH:mm:ss");
+
+    // The first two rendered lines repeat the header chips; show the explanatory and evidence lines.
+    static IEnumerable<string> Lines(string rendered) => rendered.Split('\n').Skip(2).Where(x => x.Length > 0);
+
+    public void Dispose()
+    {
+        _disposed = true;
+        AdaptiveData.Updated -= OnAdaptiveUpdated;
+    }
+}
