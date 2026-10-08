@@ -882,10 +882,12 @@ At the target bar end boundary `B`:
 - **NIFTY spot** = latest valid spot value available at or before `B`.
 - **NIFTY future** = latest valid value of the session's selected (frozen) future available at or before `B`.
 - **VIX** = latest valid value available at or before `B`, when available.
+- Spot is resolved from the trade date's instrument master (the single NIFTY `Index` instrument; if the master does not contain exactly one, spot is rendered unavailable). Until Slice 2B freezes a supplemental session spot identity, this read-time resolution from the immutable instrument master is the capture-mode rule.
 - **CE / PE** = the **center CE and center PE** of the target completed option-band row (`CenterStrike`), resolved from the session's frozen option universe and weekly expiry. The exact strike labels are displayed.
 - **LTP / bid / ask / change** come only from ticks available at or before `B`. Day change uses the same day-open baseline definition as live mode.
 - Each quote shows the available-at time of the tick it came from, so staleness is visible without inventing a freshness threshold. If no tick exists at or before `B`, the value is rendered unavailable (`—`); an older unrelated quote is never substituted and a later quote is never used.
 - The wall-clock-based "Session metadata stale — check login" badge is not rendered in capture mode.
+- **Gamma Flip** is derived from the current live option chain (`LiveDataService.GammaFlipLevel`) and cannot be reproduced as of a past bar, so the pinned capture omits it (amendment found during Slice 1 implementation). The live Dashboard still shows it.
 - The quote box is **never** re-centered using the wall-clock time at which Chromium ran.
 
 ## 18.3 Difference between browser and pinned capture (documented behaviour)
