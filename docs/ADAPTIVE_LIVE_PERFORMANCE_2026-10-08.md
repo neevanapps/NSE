@@ -369,3 +369,36 @@ Limit  (cost=3189.43..3189.43 rows=1 width=16) (actual time=36.654..36.655 rows=
 **Memory (distinguish the two numbers).** The table gives the process **working-set** peak and the **managed-heap** peak during recovery. The harness process itself holds one session's staged ticks (about 0.4 GB of managed heap), so absolute values overstate the Host. Mid-session restarts peak at about 0.9-1.7 GB working set; the earlier full-day recovery table reached up to about 1.9 GB working set (1.49-1.62 GB managed heap). Recovery memory was not redesigned.
 
 **Limitations.** Downtime is modelled as a 3-second gap during which ticks were still persisted; a longer outage only enlarges the backfill, which is the same code path (C1 backfills 15 bars). Telegram is disabled, so job creation during live continuation after the restart is not exercised here (it is covered by the unit tests and the earlier Chromium/outbox validation). Wall-clock timestamps (heartbeat, recovery start/end) are deliberately excluded from the comparison.
+
+
+## Slice 2B (spot / basis) integration validation
+
+**Spot load added.** 2026-10-01: the frozen NIFTY spot adds 191,944 normalized ticks (mean 8.5/s, maximum 201 in one second) to 1,213,071 option+future ticks (+16%); the busiest 1-second window of the whole universe is 1,335 ticks and the largest availability group 50.
+
+**Focused A/B (same build, same session, run back-to-back on the same machine).** `Basis off` = the s4c behaviour (spot ticks are present in the source with their real ids but the session-supplemental service is not registered, so spot is not in the observer universe); `Basis on` = Slice 2B. The machine was noticeably slower during this A/B than during the earlier campaign (the off run itself shows poll p50 0.90 ms vs 0.55 ms before), so only the off/on comparison is meaningful, not the comparison with the earlier tables.
+
+| Run | PollLive ms p50 / p95 / p99 / max | Completed-bar pipeline ms p50 / p99 / max | SQL per bar poll (mean) | Max pending | Warm full-day recovery ms | Recovery WS peak / heap peak MB | Stress input ticks/s | Stress poll p99 / max ms | Stress cycles >275 ms | Stress max pending | Drain |
+|---|---|---|---:|---:|---:|---|---:|---|---:|---:|---|
+| Basis off (s4c behaviour) | 0.9029 / 4.3657 / 8.4127 / 167.0499 | 13.1326 / 62.8103 / 74.6103 | 25.5 | 1,198 | 14,558 | 1,774 / 1,628 | 3,710 | 55.4452 / 67.8755 | 9.51% | 4,911 | 2.29 s |
+| Basis on (Slice 2B) | 0.6299 / 2.0437 / 4.9313 / 132.9346 | 12.3357 / 48.211 / 73.9425 | 27.5 | 1,402 | 13,763 | 1,971 / 1,836 | 3,711 | 47.8061 / 68.2264 | 8.357% | 5,689 | 2.28 s |
+
+Result: enabling Basis adds 2 SQL commands per completed bar (25 -> 27: the basis sidecar insert/verify; the sidecar stage p50 2.2 -> 3.0 ms) and 16% more ticks. The poll, bar-pipeline, stress and drain figures are no worse than the Basis-off run in the same conditions (differences between the two runs are within the machine drift visible between any two runs). In the 1x live session 0.02-0.07% of cycles exceeded 275 ms; in the 41x stress, 8-10% of cycles did in BOTH runs (on the faster machine of the earlier campaign it was 0.6%), so that overrun is environmental rather than a Basis effect. The pending buffer drains in 2.3 s after the burst, and live output equals restart-replay and the stress run equals an unthrottled replay in both runs. Recovery working set is +11% (1,971 vs 1,774 MB), consistent with the extra spot rows read. No optimization was needed.
+
+**Core parity (adding spot changes zero pre-existing deterministic values).** For each session the uninterrupted run with Basis was compared with the same run without Basis (identical staged source rows and ids). Every pre-existing table hashes identically - frozen session definition, FutureBars, RollingStates, OptionBandBars, OptionResidualBars, ResidualAnchorComponents, Weak2Observations (33 / 32 rows with H5 outcomes), FuturesSupplemental, OptionsSupplemental, ProjectionHealth, derived Urgency and residual adjacent deltas - and so does the deterministic runtime state including the last processed tick id. Only the new Basis tables and the commentary differ.
+
+**Basis availability under the approved 5-second rule.** 2026-09-29: DeltaBasis available on 249 of 260 bars (95.8%; unavailable bars: 1 and 232-260 near the 15:15-15:30 stale window); 2026-10-01: 283 of 288 (98.3%). Spot age at bar end: p50 0.05 s, p99 19.3 s (09-29) / 1.9 s (10-01). ΔBasis ranged -29.4 to +22.7 index points.
+
+**Abrupt restart-continuation including Basis.** Both sessions, four restart points each (mid-bar, just after a completed bar, before and after a real multi-bar close: 15 bars at 10:07:41 IST on 09-29, 7 bars at 13:43:29 IST on 10-01); process state destroyed without a graceful close, brand-new provider/worker, recovery from persisted data only, continuation to the horizon. Compared exactly (additionally to the earlier list): the frozen spot identity (identical after recovery; never re-resolved), BasisSupplemental (BasisStart/TimeWeighted/End/DeltaBasis, spot ages, coverage, status) and CommentaryEvents including the Basis family.
+
+| Case | Session | Restart IST | Completed bars before | Partial vol at crash | Recovery ms | Bars / partial vol after | Futures sidecars backfilled | Commentary events backfilled | WS / heap peak MB | Final equality | ProjectionHealth | Notification jobs |
+|---|---|---|---:|---|---:|---|---:|---:|---|---|---:|---:|
+| A | 2026-09-29 | 11:30:12.791 | 105 | 8,905 (46%) | 4,047 | 105 / 13,975 | 0 | 0 | 1,508 / 1,383 | IDENTICAL | 0 | 0 |
+| B | 2026-09-29 | 12:30:35.443 | 137 | 3,445 (18%) | 5,649 | 137 / 8,125 | 0 | 0 | 1,899 / 1,787 | IDENTICAL | 0 | 0 |
+| C1 | 2026-09-29 | 10:07:41.453 | 49 | 12,415 (64%) | 1,687 | 64 / 15,925 | 15 | 3 | 1,027 / 779 | IDENTICAL | 0 | 0 |
+| C2 | 2026-09-29 | 10:07:43.542 | 64 | 15,925 (82%) | 1,593 | 64 / 17,160 | 0 | 0 | 1,037 / 782 | IDENTICAL | 0 | 0 |
+| A | 2026-10-01 | 11:36:16.550 | 58 | 8,840 (45%) | 3,894 | 58 / 8,840 | 0 | 0 | 1,284 / 1,063 | IDENTICAL | 0 | 0 |
+| B | 2026-10-01 | 12:30:17.429 | 83 | 1,690 (9%) | 5,254 | 83 / 1,885 | 0 | 0 | 1,843 / 1,730 | IDENTICAL | 0 | 0 |
+| C1 | 2026-10-01 | 13:43:29.492 | 172 | 9,555 (49%) | 7,966 | 179 / 6,500 | 7 | 1 | 1,731 / 1,562 | IDENTICAL | 0 | 0 |
+| C2 | 2026-10-01 | 13:43:31.670 | 179 | 6,500 (33%) | 7,595 | 179 / 10,010 | 0 | 0 | 1,912 / 1,773 | IDENTICAL | 0 | 0 |
+
+All 8 restarts are identical to the uninterrupted run (negative control flagged in both sessions).

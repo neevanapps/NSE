@@ -244,6 +244,34 @@ public sealed class AdaptiveCompactGridTests
     }
 
     [Fact]
+    public async Task PinnedQuote_UsesTheFrozenSessionSpotIdentity_NotAnIndependentResolution()
+    {
+        var (source, observer, boundary) = await SeedPinnedAsync();
+        await using (var s = source.CreateDbContext())
+        {
+            s.Ticks.Add(Px("FROZEN", 20000m, boundary.AddSeconds(-4)));               // a different token than the instrument master's unique Index ("SPOT")
+            await s.SaveChangesAsync();
+        }
+
+        await using (var o = observer.CreateDbContext())
+        {
+            o.SessionSupplemental.Add(new() { SessionId = 1, MetricsVersion = "session-supplemental-v1", SpotToken = "FROZEN", SpotSymbol = "Nifty 50", ResolutionProvenance = "frozen", ResolvedAtUtc = boundary });
+            await o.SaveChangesAsync();
+        }
+
+        var snap = await new AdaptiveQuoteAsOfService(source, observer).LoadAsync(1, 3);
+        Assert.Equal(20000m, snap.Spot!.Quote.Ltp);                                    // the frozen identity, never re-resolved to "SPOT" (24987.5)
+
+        // A frozen "unresolved" outcome stays unavailable even though the instrument master now has a unique Index.
+        await using (var o = observer.CreateDbContext())
+        {
+            var row = await o.SessionSupplemental.SingleAsync(); row.SpotToken = null; await o.SaveChangesAsync();
+        }
+
+        Assert.Null((await new AdaptiveQuoteAsOfService(source, observer).LoadAsync(1, 3)).Spot);
+    }
+
+    [Fact]
     public async Task PinnedQuote_EarlierBarIsNotRecenteredOrBackfilledFromLaterData()
     {
         var (source, observer, boundary) = await SeedPinnedAsync();
