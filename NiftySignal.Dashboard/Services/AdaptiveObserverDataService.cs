@@ -138,12 +138,38 @@ public sealed class AdaptiveObserverDataService(
             .ThenBy(x => x.Strike)
             .ToListAsync(ct);
 
+        var invalidFutures = await LoadInvalidBarsAsync(db, session.Id, AdaptiveProjectionComponents.FuturesSupplemental, FuturesMicrostructureBar.MetricsVersion, seqs, ct);
+        var invalidOptions = await LoadInvalidBarsAsync(db, session.Id, AdaptiveProjectionComponents.OptionsSupplemental, OptionsSupplementalBar.MetricsVersion, seqs, ct);
+        // Known-invalid sidecar bars are withheld (shown unavailable), never displayed as trustworthy values.
+        var futuresSupplemental = (await LoadFuturesSupplementalAsync(db, session.Id, seqs, ct))
+            .Where(x => !invalidFutures.Contains(x.Key)).ToDictionary(x => x.Key, x => x.Value);
+        var optionsSupplemental = (await LoadOptionsSupplementalAsync(db, session.Id, seqs, ct))
+            .Where(x => !invalidOptions.Contains(x.Key)).ToDictionary(x => x.Key, x => x.Value);
         return new AdaptiveObserverSnapshot(session, runtime, futures, options, residuals, anchors,
             await LoadValidBarCountAsync(db, session, runtime.LastCompletedBarSeq, ct),
-            await LoadFuturesSupplementalAsync(db, session.Id, seqs, ct),
-            await LoadOptionsSupplementalAsync(db, session.Id, seqs, ct),
+            futuresSupplemental,
+            optionsSupplemental,
             seqs.Length == 0 ? [] : await db.OptionResidualBars.AsNoTracking()
-                .Where(x => x.SessionId == session.Id && x.BarSeq == seqs.Min() - 1).ToListAsync(ct));
+                .Where(x => x.SessionId == session.Id && x.BarSeq == seqs.Min() - 1).ToListAsync(ct),
+            invalidFutures, invalidOptions);
+    }
+
+    /// <summary>Bars (of the displayed range) whose sidecar carries a durable failed-verification marker. Tolerates a not-yet-migrated schema.</summary>
+    static async Task<IReadOnlySet<int>> LoadInvalidBarsAsync(
+        AdaptiveObserverDbContext db, long sessionId, string component, string version, int[] seqs, CancellationToken ct)
+    {
+        if (seqs.Length == 0) return new HashSet<int>();
+        try
+        {
+            var bars = await db.ProjectionHealth.AsNoTracking()
+                .Where(x => x.SessionId == sessionId && x.Component == component && x.Version == version && seqs.Contains(x.BarSeq))
+                .Select(x => x.BarSeq).ToListAsync(ct);
+            return bars.ToHashSet();
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedTable)
+        {
+            return new HashSet<int>();
+        }
     }
 
     /// <summary>Options sidecar read; same missing-relation tolerance as <see cref="LoadFuturesSupplementalAsync"/>.</summary>

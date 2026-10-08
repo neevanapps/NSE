@@ -45,10 +45,16 @@ public sealed record FuturesMicrostructureBar(
     int BookStateChanges,
     int InvalidBookEvents,
     double ValidBookSeconds,
-    double InvalidBookSeconds)
+    double InvalidBookSeconds,
+    double TobUsableSeconds,
+    double MicroDevUsableSeconds)
 {
-    /// <summary>Identifies the calculation contract. Change it whenever any formula or boundary rule changes.</summary>
-    public const string MetricsVersion = "futures-micro-v1";
+    /// <summary>
+    /// Identifies the calculation contract. Change it whenever any formula or boundary rule changes.
+    /// v2: OFI is null (not 0) unless at least one valid baseline-to-next transition happened inside the bar, and TOB/MicroDev coverage is
+    /// reported separately from structurally-valid-price time.
+    /// </summary>
+    public const string MetricsVersion = "futures-micro-v2";
 }
 
 /// <summary>
@@ -87,7 +93,7 @@ public sealed class FuturesMicrostructureTracker
         var reference = current;
 
         double validSeconds = 0d, invalidSeconds = 0d;
-        double tobSeconds = 0d, tobSum = 0d, microSeconds = 0d, microSum = 0d;
+        double tobSeconds = 0d, tobSum = 0d, microSeconds = 0d, microSum = 0d;   // seconds with a USABLE TOB / MicroDev (non-zero quantity)
         double? tobMin = null, tobMax = null;
 
         void Extent(FuturesBookState? s)
@@ -117,7 +123,6 @@ public sealed class FuturesMicrostructureTracker
         Extent(reference);
         var cursor = start;
         var baseline = reference is { IsValid: true } ? reference : null;
-        var established = baseline is not null;
         long ofi = 0;
         var transitions = 0;
         var invalidEvents = 0;
@@ -142,7 +147,6 @@ public sealed class FuturesMicrostructureTracker
                 }
 
                 baseline = next;
-                established = true;
             }
 
             current = next;
@@ -166,12 +170,14 @@ public sealed class FuturesMicrostructureTracker
             microSeconds > 0d ? microSum / microSeconds : null,
             microEnd,
             microStart.HasValue && microEnd.HasValue ? microEnd - microStart : null,
-            established ? ofi : null,
+            transitions > 0 ? ofi : null,   // a baseline alone is not evidence: zero valid transitions means "no OFI evidence", never 0
             transitions,
             lastInside - firstInside,
             invalidEvents,
             validSeconds,
-            invalidSeconds);
+            invalidSeconds,
+            tobSeconds,
+            microSeconds);
     }
 
     /// <summary>

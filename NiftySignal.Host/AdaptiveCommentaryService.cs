@@ -5,10 +5,24 @@ using NiftySignal.AdaptiveObserverData;
 namespace NiftySignal.Host;
 
 /// <summary>
+/// Whether commentary processing may queue Telegram jobs. Catch-up/rebuild work reconstructs events and the checkpoint only; it must never
+/// create a notification backlog, so only the bar the live observer has just completed may enqueue.
+/// </summary>
+public enum CommentaryNotificationMode
+{
+    /// <summary>Restart/first-deployment catch-up, rebuild and replay: persist events and the checkpoint, create no notification job.</summary>
+    Suppress,
+    /// <summary>Live forward processing: a NEWLY inserted eligible event on the final (just completed) bar of the call may enqueue; earlier bars of the same call are catch-up and never do.</summary>
+    EnqueueFinalBar,
+}
+
+/// <summary>
 /// Runs the pure <see cref="CommentaryEvaluator"/> over completed bars in strict BarSeq order and persists lifecycle events plus the
 /// per-session checkpoint atomically (08-Oct plan sections 56-57). Silent bars (NoMaterialEvent, unchanged continuation) still advance the
 /// checkpoint. Replaying a bar can never duplicate an event (unique <c>EventIdentity</c>; an existing row is verified, never overwritten).
 /// Failures are logged and never thrown into the core observer: commentary is observational only.
+/// A replay mismatch (a stored event that the recomputation disagrees with) never mutates history: processing stops at that bar, a durable
+/// <see cref="AdaptiveProjectionHealthRow"/> is written, and later calls do nothing until the marker is reconciled.
 /// </summary>
 public sealed class AdaptiveCommentaryService(
     AdaptiveCommentaryFrameLoader frames,
@@ -21,12 +35,21 @@ public sealed class AdaptiveCommentaryService(
     public int FailureCount => Volatile.Read(ref _failures);
 
     /// <summary>Evaluates every completed persisted bar after the checkpoint up to <paramref name="throughBarSeq"/>. Returns the number of bars evaluated.</summary>
-    public async Task<int> ProcessThroughAsync(AdaptiveObserverDbContext db, AdaptiveSessionStateRow session, int throughBarSeq, CancellationToken ct)
+    public async Task<int> ProcessThroughAsync(
+        AdaptiveObserverDbContext db, AdaptiveSessionStateRow session, int throughBarSeq, CommentaryNotificationMode mode, CancellationToken ct)
     {
         var evaluated = 0;
         try
         {
-            var runtime = await db.CommentaryRuntime.SingleOrDefaultAsync(x => x.SessionId == session.Id, ct);
+            var version = CommentaryEvaluator.Version;
+            if (await db.ProjectionHealth.AsNoTracking().AnyAsync(x => x.SessionId == session.Id
+                    && x.Component == AdaptiveProjectionComponents.Commentary && x.Version == version, ct))
+            {
+                logger.LogDebug("Adaptive commentary is stopped by a durable replay-mismatch marker (session={SessionId}); not processing.", session.Id);
+                return 0;
+            }
+
+            var runtime = await db.CommentaryRuntime.SingleOrDefaultAsync(x => x.SessionId == session.Id && x.CommentaryVersion == version, ct);
             var state = runtime is null ? CommentaryState.Initial : ToState(runtime);
             for (var seq = state.LastEvaluatedBarSeq + 1; seq <= throughBarSeq; seq++)
             {
@@ -39,10 +62,19 @@ public sealed class AdaptiveCommentaryService(
                 var enqueuedAtBar = (int?)null;
                 if (step.Event is { } e)
                 {
-                    var (id, inserted) = await PersistOrVerifyEventAsync(db, e, lastEventId, ct);
-                    lastEventId = id;
-                    // Only a newly inserted event may queue a notification: replaying/verifying existing events never re-queues (no flood after a restart).
-                    if (inserted && await TryEnqueueNotificationAsync(db, e, id, ct)) enqueuedAtBar = e.BarSeq;
+                    var persisted = await PersistOrVerifyEventAsync(db, e, lastEventId, ct);
+                    if (persisted.Mismatch is { } mismatch)
+                    {
+                        await transaction.RollbackAsync(ct);
+                        await StopOnMismatchAsync(db, session.Id, version, seq, mismatch, ct);
+                        return evaluated;
+                    }
+
+                    lastEventId = persisted.Id;
+                    // Only a newly inserted event may queue a notification: replaying/verifying existing events never re-queues, and catch-up
+                    // (mode Suppress, or any bar before the final bar of a live call) never queues, so a restart cannot create a backlog.
+                    if (persisted.Inserted && mode == CommentaryNotificationMode.EnqueueFinalBar && seq == throughBarSeq
+                        && await TryEnqueueNotificationAsync(db, e, persisted.Id, ct)) enqueuedAtBar = e.BarSeq;
                 }
 
                 runtime = Upsert(db, runtime, session.Id, step.State, lastEventId);
@@ -67,11 +99,28 @@ public sealed class AdaptiveCommentaryService(
         return evaluated;
     }
 
-    /// <summary>Catches the checkpoint up to the latest persisted completed bar (restart / mid-session deployment).</summary>
+    /// <summary>
+    /// Catches the checkpoint up to the latest persisted completed bar (restart / mid-session deployment / rebuild). Always a non-notifying
+    /// backfill: history is reconstructed and persisted, but no Telegram job is created for it.
+    /// </summary>
     public async Task<int> ProcessAllCompletedAsync(AdaptiveObserverDbContext db, AdaptiveSessionStateRow session, CancellationToken ct)
     {
         var last = await db.FutureBars.AsNoTracking().Where(x => x.SessionId == session.Id).Select(x => (int?)x.BarSeq).MaxAsync(ct) ?? 0;
-        return last == 0 ? 0 : await ProcessThroughAsync(db, session, last, ct);
+        return last == 0 ? 0 : await ProcessThroughAsync(db, session, last, CommentaryNotificationMode.Suppress, ct);
+    }
+
+    async Task StopOnMismatchAsync(AdaptiveObserverDbContext db, long sessionId, string version, int barSeq, string detail, CancellationToken ct)
+    {
+        Interlocked.Increment(ref _mismatches);
+        db.ChangeTracker.Clear();                                // discard the rolled-back unit of work; nothing of it may be saved
+        db.ProjectionHealth.Add(new AdaptiveProjectionHealthRow
+        {
+            SessionId = sessionId, Component = AdaptiveProjectionComponents.Commentary, Version = version, BarSeq = barSeq,
+            Detail = detail.Length > 512 ? detail[..512] : detail, DetectedAtUtc = DateTimeOffset.UtcNow,
+        });
+        await db.SaveChangesAsync(ct);
+        logger.LogError("Adaptive commentary STOPPED at bar {Bar} (session={SessionId}, version={Version}); the checkpoint was not advanced and history was not modified. {Detail}",
+            barSeq, sessionId, version, detail);
     }
 
     /// <summary>Queues at most one Telegram job per event, applying the same-event cooldown (V1: every eligible class bypasses it). Never sends.</summary>
@@ -92,7 +141,7 @@ public sealed class AdaptiveCommentaryService(
         return true;
     }
 
-    async Task<(long Id, bool Inserted)> PersistOrVerifyEventAsync(AdaptiveObserverDbContext db, CommentaryEvent e, long? previousEventId, CancellationToken ct)
+    async Task<(long Id, bool Inserted, string? Mismatch)> PersistOrVerifyEventAsync(AdaptiveObserverDbContext db, CommentaryEvent e, long? previousEventId, CancellationToken ct)
     {
         var expected = MapEvent(e, previousEventId);
         var existing = await db.CommentaryEvents.SingleOrDefaultAsync(x => x.EventIdentity == expected.EventIdentity, ct);
@@ -100,17 +149,16 @@ public sealed class AdaptiveCommentaryService(
         {
             db.CommentaryEvents.Add(expected);
             await db.SaveChangesAsync(ct);                      // assigns the Id used as the next event's PreviousEventId
-            return (expected.Id, true);
+            return (expected.Id, true, null);
         }
 
         var difference = FirstDifference(existing, expected);
         if (difference is not null)
         {
-            Interlocked.Increment(ref _mismatches);
-            logger.LogError("Adaptive commentary event mismatch on replay (stored row left untouched): {Identity}, {Difference}", expected.EventIdentity, difference);
+            return (existing.Id, false, $"{expected.EventIdentity}: {difference}");
         }
 
-        return (existing.Id, false);
+        return (existing.Id, false, null);
     }
 
     public static AdaptiveCommentaryEventRow MapEvent(CommentaryEvent e, long? previousEventId) => new()

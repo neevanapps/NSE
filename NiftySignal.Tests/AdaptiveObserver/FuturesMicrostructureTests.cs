@@ -121,7 +121,7 @@ public sealed class FuturesMicrostructureTests
         var tracker = Track(ticks.ToArray());
         var cuts = new[] { 0d, 37.5, 90.0, 91.0, 91.0, 150.2, 279.3 };
         long sum = 0;
-        for (var i = 1; i < cuts.Length; i++) sum += tracker.Complete(T0.AddSeconds(cuts[i - 1]), T0.AddSeconds(cuts[i])).Ofi!.Value;
+        for (var i = 1; i < cuts.Length; i++) sum += tracker.Complete(T0.AddSeconds(cuts[i - 1]), T0.AddSeconds(cuts[i])).Ofi ?? 0;   // a bar without transitions has NO evidence (null), contributing nothing
         Assert.Equal(tracker.Complete(T0, T0.AddSeconds(cuts[^1])).Ofi, sum); // no transition lost or double counted at boundaries
     }
 
@@ -133,7 +133,7 @@ public sealed class FuturesMicrostructureTests
             Book(2, 2, 102, 101, 50, 50),   // crossed => invalid
             Book(3, 5, 100, 101, 15, 8));   // valid again: re-baseline, NOT +7 against the stale pre-gap book
         var bar = tracker.Complete(T0, T0.AddSeconds(10));
-        Assert.Equal(0, bar.Ofi);
+        Assert.Null(bar.Ofi);                                       // re-baselined only: no valid baseline-to-next transition, so no OFI evidence
         Assert.Equal(0, bar.OfiTransitions);
         Assert.Equal(1, bar.InvalidBookEvents);
         Assert.Equal(3d, bar.InvalidBookSeconds, 12);
@@ -166,7 +166,55 @@ public sealed class FuturesMicrostructureTests
         Assert.Null(bar.TobTimeWeighted); Assert.Null(bar.MicroDevTimeWeighted);
         Assert.Equal(0d, bar.ValidBookSeconds);
         Assert.Equal(0, bar.OfiTransitions);
-        Assert.Equal(0, bar.Ofi);                                  // the 5s state is this bar's reference, not its own change
+        Assert.Null(bar.Ofi);                                      // the 5s state is this bar's reference, not its own change; a zero-duration bar invents nothing
+    }
+
+    [Fact]
+    public void ValidBaselineButNoTransition_IsNoEvidence_NotZeroOfi()
+    {
+        // A valid reference book exists and never changes inside the bar: 0 transitions => Ofi is null (unavailable), never a measured 0.
+        var quiet = Track(Book(1, -5, 100, 101, 10, 10)).Complete(T0, T0.AddSeconds(10));
+        Assert.Null(quiet.Ofi); Assert.Equal(0, quiet.OfiTransitions);
+        Assert.NotNull(quiet.TobTimeWeighted);                      // the book itself is still observed
+
+        // A genuine transition whose contribution happens to be zero IS evidence: Ofi is 0 with one transition.
+        var zero = Track(Book(1, -5, 100, 101, 10, 10), Book(2, 3, 100, 101, 10, 10 + 0)).Complete(T0, T0.AddSeconds(10));
+        Assert.Null(zero.Ofi);                                      // identical book collapses into the carried state: still no transition
+        var offsetting = Track(Book(1, -5, 100, 101, 10, 10), Book(2, 3, 100, 101, 12, 12)).Complete(T0, T0.AddSeconds(10));
+        Assert.Equal(1, offsetting.OfiTransitions);
+        Assert.Equal(FuturesMicrostructureTracker.Contribution(new FuturesBookState(T0, 1, 100, 101, 10, 10), new FuturesBookState(T0, 2, 100, 101, 12, 12)), offsetting.Ofi);
+    }
+
+    [Fact]
+    public void InvalidGapStillResetsTheBaseline_SoOnlyPostGapTransitionsCount()
+    {
+        var bar = Track(
+            Book(1, 0, 100, 101, 10, 10),
+            Book(2, 2, 100, 101, 15, 8),     // +7: a real transition before the gap
+            Book(3, 4, 102, 101, 1, 1),      // crossed
+            Book(4, 6, 100, 101, 20, 8)).Complete(T0, T0.AddSeconds(10));   // re-baseline only
+        Assert.Equal(1, bar.OfiTransitions);
+        Assert.Equal(7, bar.Ofi);
+    }
+
+    [Fact]
+    public void ValidBookSeconds_IsPriceValidity_WhileTobAndMicroDevUsableSecondsCountOnlyNonZeroQuantity()
+    {
+        // 0..4s: valid prices with quantity (usable TOB); 4..10s: valid prices but BidQty+AskQty == 0 (no TOB / MicroDev); 10..12s: crossed.
+        var tracker = Track(Book(1, 0, 100, 101, 10, 10), Book(2, 4, 100, 101, 0, 0), Book(3, 10, 102, 101, 5, 5));
+        var bar = tracker.Complete(T0, T0.AddSeconds(12));
+        Assert.Equal(10d, bar.ValidBookSeconds, 12);                // structurally valid prices
+        Assert.Equal(2d, bar.InvalidBookSeconds, 12);
+        Assert.Equal(4d, bar.TobUsableSeconds, 12);                 // real TOB coverage
+        Assert.Equal(4d, bar.MicroDevUsableSeconds, 12);
+        Assert.Equal(0d, bar.TobTimeWeighted!.Value, 12);           // weighted over the 4 usable seconds only (balanced book)
+    }
+
+    [Fact]
+    public void MetricsVersionsAreBumped_ForTheChangedOfiSemantics()
+    {
+        Assert.Equal("futures-micro-v2", FuturesMicrostructureBar.MetricsVersion);
+        Assert.Equal("options-supp-v2", OptionsSupplementalBar.MetricsVersion);
     }
 
     // ---- Through the engine ----

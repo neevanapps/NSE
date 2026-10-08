@@ -186,7 +186,7 @@ public sealed class AdaptiveObserverWorker(
                 await supplemental.PersistOrVerifyFuturesAsync(observer, live.Context.Session.Id, package, ct);
                 await supplemental.PersistOrVerifyOptionsAsync(observer, live.Context.Session, package, ct);
                 // Commentary reads the PERSISTED core + sidecar rows of this bar (identical inputs to a later replay) and never throws into the core observer.
-                await commentary.ProcessThroughAsync(observer, live.Context.Session, package.FutureBar.BarSeq, ct);
+                await commentary.ProcessThroughAsync(observer, live.Context.Session, package.FutureBar.BarSeq, CommentaryNotificationMode.EnqueueFinalBar, ct);
                 if (saved.Inserted)
                 {
                     // Signal only after the DB transaction committed. Failure to notify must not

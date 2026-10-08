@@ -16,10 +16,10 @@ public static class CommentaryNotificationPolicy
 
     /// <summary>
     /// Reasons that are materially new and therefore bypass the cooldown. In V1 every Telegram-eligible class (Confirmed, Flipped,
-    /// BiasChanged) is in this set, so the cooldown currently has no practical effect; it exists so that enabling more eligible classes later
+    /// DirectReversal) is in this set, so the cooldown currently has no practical effect; it exists so that enabling more eligible classes later
     /// cannot flood Telegram.
     /// </summary>
-    static readonly HashSet<string> BypassReasons = new(StringComparer.Ordinal) { "Confirmed", "Flipped", "BiasChanged" };
+    static readonly HashSet<string> BypassReasons = new(StringComparer.Ordinal) { "Confirmed", "Flipped", "DirectReversal" };
 
     public static bool ShouldEnqueue(CommentaryEvent e, LastCommentaryNotification? last, int cooldownBars = MinimumBarsBetweenSameEventTelegram)
     {

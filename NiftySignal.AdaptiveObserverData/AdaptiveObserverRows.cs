@@ -378,11 +378,16 @@ public sealed class AdaptiveFuturesSupplementalRow
     public int OfiTransitions { get; set; }
     public int BookStateChanges { get; set; }
     public int InvalidBookEvents { get; set; }
+    /// <summary>Seconds the book was structurally valid (positive, uncrossed prices). Includes seconds with zero quantity, which have no TOB/MicroDev.</summary>
     public double ValidBookSeconds { get; set; }
     public double InvalidBookSeconds { get; set; }
+    /// <summary>Seconds with a usable TOB (valid prices AND non-zero total quantity): the real coverage of the TOB metrics.</summary>
+    public double TobUsableSeconds { get; set; }
+    /// <summary>Seconds with a usable MicroDev (same condition as TOB; kept separate so the two can diverge in a later version).</summary>
+    public double MicroDevUsableSeconds { get; set; }
 }
 
-/// <summary>Sidecar projection of supplemental options observations per completed adaptive bar (08-Oct plan section 71; metrics contract options-supp-v1).</summary>
+/// <summary>Sidecar projection of supplemental options observations per completed adaptive bar (08-Oct plan section 71; metrics contract options-supp-v2).</summary>
 public sealed class AdaptiveOptionsSupplementalRow
 {
     public long Id { get; set; }
@@ -465,7 +470,7 @@ public sealed class AdaptiveCommentaryEventRow
     public bool ShouldNotifyTelegram { get; set; }
     public string? NotificationReason { get; set; }
     public required string CommentaryVersion { get; set; }
-    /// <summary>SessionId:BarSeq:EventType:Lifecycle:Bias. Unique, so replaying a bar can never create a duplicate event.</summary>
+    /// <summary>CommentaryVersion:SessionId:BarSeq:EventType:Lifecycle:Bias. Unique and version-keyed: replaying a bar never duplicates an event, and a later version can coexist with v1 history.</summary>
     public required string EventIdentity { get; set; }
     public DateTimeOffset CreatedAtUtc { get; set; }
 }
@@ -494,6 +499,30 @@ public sealed class AdaptiveCommentaryRuntimeRow
     public NiftySignal.AdaptiveObserver.Commentary.CommentaryLifecycle? ActivePhase { get; set; }
     public DateTimeOffset UpdatedAtUtc { get; set; }
     public required string CommentaryVersion { get; set; }
+}
+
+/// <summary>Projection components whose durable health is tracked outside the parity-protected core rows.</summary>
+public static class AdaptiveProjectionComponents
+{
+    public const string FuturesSupplemental = "futures-supplemental";
+    public const string OptionsSupplemental = "options-supplemental";
+    public const string Commentary = "commentary";
+}
+
+/// <summary>
+/// Durable record that a derived projection disagreed with what was already persisted for one bar (sidecar replay mismatch, or commentary
+/// replay mismatch). It is the restart-surviving distinction between "missing" and "known invalid": consumers must not trust the bar's sidecar
+/// values, and commentary processing does not proceed past a commentary mismatch until the row is reconciled. Core rows are never involved.
+/// </summary>
+public sealed class AdaptiveProjectionHealthRow
+{
+    public long Id { get; set; }
+    public long SessionId { get; set; }
+    public required string Component { get; set; }
+    public required string Version { get; set; }
+    public int BarSeq { get; set; }
+    public required string Detail { get; set; }
+    public DateTimeOffset DetectedAtUtc { get; set; }
 }
 
 public enum AdaptiveCommentaryNotificationStatus { Pending = 0, Sending = 1, Sent = 2, DeliveryUncertain = 3 }

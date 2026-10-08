@@ -61,3 +61,11 @@
     font-size: .82rem;
     overflow-wrap: anywhere;
 }
+
+.commentary-degraded {
+    margin: .4rem 0;
+    padding: .45rem .6rem;
+    border: 1px solid #b54;
+    border-radius: 4px;
+    font-size: .85rem;
+}

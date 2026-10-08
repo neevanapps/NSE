@@ -54,7 +54,7 @@ await db.SaveChangesAsync();
 // Commentary exactly as the Host drives it: evaluate persisted completed bars in order (frames come from persisted rows only).
 var commentary=new NiftySignal.Host.AdaptiveCommentaryService(new NiftySignal.Host.AdaptiveCommentaryFrameLoader(),
     Microsoft.Extensions.Logging.Abstractions.NullLogger<NiftySignal.Host.AdaptiveCommentaryService>.Instance);
-await commentary.ProcessThroughAsync(db,session,20,default);
+await commentary.ProcessThroughAsync(db,session,20,NiftySignal.Host.CommentaryNotificationMode.Suppress,default);
 const string url="http://127.0.0.1:5089";
 const string password="isolated-ci-validation-password";
 var start=new ProcessStartInfo("dotnet") {
@@ -223,7 +223,7 @@ try {
     for(var seq=21;seq<=43;seq++) {
         AddRows(seq); runtime.LastCompletedBarSeq=seq;runtime.LastHeartbeatUtc=DateTimeOffset.UtcNow;
         await db.SaveChangesAsync(); // Starts only after the database commit returns.
-        await commentary.ProcessThroughAsync(db,session,seq,default);   // like the Host: commentary is written before the push
+        await commentary.ProcessThroughAsync(db,session,seq,NiftySignal.Host.CommentaryNotificationMode.EnqueueFinalBar,default);   // like the Host: commentary is written before the push
         var timer=Stopwatch.StartNew();
         await push.InvokeAsync("PushAdaptiveStateChanged",session.Id,seq);
         foreach(var table in await page.Locator(".adaptive-table").AllAsync())
@@ -266,7 +266,7 @@ try {
     lastFixtureBar.TradeUpdates=1; await db.SaveChangesAsync();
     await Expect(page.Locator("[data-readiness='ready']")).ToBeVisibleAsync();
     Console.WriteLine("READINESS BROWSER PASS: nine bars provisional, ten-plus valid bars ready, invalid latest bar revokes readiness.");
-    // Commentary (Slice 4C): events are persisted, shown newest first, and only the eligible ones (Flipped, BiasChanged) were queued and delivered once.
+    // Commentary (Slice 4C): events are persisted, shown newest first, and only the eligible one (Flipped; the later move to NEUTRAL is Dashboard-only) was queued and delivered once.
     await page.GotoAsync(url+"/");
     var panel=page.GetByTestId("live-commentary");
     await Expect(panel).ToBeVisibleAsync();
@@ -277,18 +277,18 @@ try {
     await Expect(panel).Not.ToContainTextAsync("onfidence");
     await Expect(panel).ToContainTextAsync("not a probability or a validated signal");
     for(var attempt=0;attempt<60;attempt++) {
-        if(await db.CommentaryNotificationJobs.AsNoTracking().CountAsync(x=>x.Status==AdaptiveCommentaryNotificationStatus.Sent)==2)break;
+        if(await db.CommentaryNotificationJobs.AsNoTracking().CountAsync(x=>x.Status==AdaptiveCommentaryNotificationStatus.Sent)==1)break;
         await Task.Delay(500);
     }
     var commentaryJobs=await db.CommentaryNotificationJobs.AsNoTracking().OrderBy(x=>x.Id).ToListAsync();
-    if(commentaryJobs.Count!=2 || commentaryJobs.Any(x=>x.Status!=AdaptiveCommentaryNotificationStatus.Sent || x.TelegramMessageId is null))
-        throw new Exception("Commentary outbox did not deliver exactly the two eligible events: "+JsonSerializer.Serialize(commentaryJobs.Select(x=>new { x.EventId,x.Status,x.Attempts,x.LastError })));
+    if(commentaryJobs.Count!=1 || commentaryJobs.Any(x=>x.Status!=AdaptiveCommentaryNotificationStatus.Sent || x.TelegramMessageId is null))
+        throw new Exception("Commentary outbox did not deliver exactly the one eligible event: "+JsonSerializer.Serialize(commentaryJobs.Select(x=>new { x.EventId,x.Status,x.Attempts,x.LastError })));
     var commentaryMessages=telegramStub.Messages.ToArray();
-    if(commentaryMessages.Length!=2 || !commentaryMessages[0].Contains("Short covering flipped.") || !commentaryMessages[1].Contains("Seller absorption started.")
+    if(commentaryMessages.Length!=1 || !commentaryMessages[0].Contains("Short covering flipped.")
         || commentaryMessages.Any(x=>!x.StartsWith("NIFTY adaptive commentary |") || x.Contains("onfidence")))
-        throw new Exception("Commentary Telegram messages were not the two expected eligible events: "+JsonSerializer.Serialize(commentaryMessages));
+        throw new Exception("Commentary Telegram message was not the one expected eligible event: "+JsonSerializer.Serialize(commentaryMessages));
     await page.ScreenshotAsync(new() { Path=Path.Combine(evidence,"commentary-panel.png"),FullPage=true });
-    Console.WriteLine("COMMENTARY BROWSER PASS: persisted events newest first with bias/regime/lifecycle/EvidenceAgreement, only Flipped and BiasChanged queued, delivered once through the loopback Telegram emulator.");
+    Console.WriteLine("COMMENTARY BROWSER PASS: persisted events newest first with bias/regime/lifecycle/EvidenceAgreement, only the Flipped event queued (NEUTRAL moves are Dashboard-only), delivered once through the loopback Telegram emulator.");
     // Restart the real worker against the same PostgreSQL outbox; acknowledged images must not resend.
     await push.StopAsync();
     server.Kill(entireProcessTree:true);
@@ -306,7 +306,7 @@ try {
     await Task.Delay(3000);
     if(telegramStub.Uploads.Count!=7 || await db.ScreenshotJobs.AsNoTracking().CountAsync(x=>x.SessionId==session.Id)!=7)
         throw new Exception("Dashboard worker restart duplicated acknowledged screenshots.");
-    if(telegramStub.Messages.Count!=2 || await db.CommentaryNotificationJobs.AsNoTracking().CountAsync(x=>x.Status==AdaptiveCommentaryNotificationStatus.Sent)!=2)
+    if(telegramStub.Messages.Count!=1 || await db.CommentaryNotificationJobs.AsNoTracking().CountAsync(x=>x.Status==AdaptiveCommentaryNotificationStatus.Sent)!=1)
         throw new Exception("Dashboard restart resent or lost an acknowledged commentary notification.");
     await page.GotoAsync(url+"/adaptive-screenshots");
     await Expect(page.GetByRole(AriaRole.Button,new() { Name="Send pre-live test",Exact=true })).ToBeEnabledAsync();

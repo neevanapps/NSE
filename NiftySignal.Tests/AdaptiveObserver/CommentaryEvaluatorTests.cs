@@ -368,17 +368,17 @@ public sealed class CommentaryEvaluatorTests
     // ---- bias change / Telegram policy ----
 
     [Fact]
-    public void TelegramPolicy_IsLimitedToConfirmedFlippedAndActualBiasChange()
+    public void TelegramPolicy_IsLimitedToConfirmedFlippedAndDirectReversal()
     {
         // Ordinary New expansion from silence: bias Neutral -> Short is recorded, but is NOT Telegram-eligible.
         var started = Step(CommentaryState.Initial, SellerExpansion(1)).Event!;
         Assert.True(started.BiasChanged); Assert.False(started.ShouldNotifyTelegram);
         Assert.Equal(CommentarySeverity.Medium, started.Severity);
 
-        // Directional -> Neutral through a persisted neutral event (absorption) is eligible.
+        // Directional -> Neutral through a persisted neutral event (absorption) is recorded for the Dashboard but is NOT sent (review finding 5).
         var s1 = Step(CommentaryState.Initial, SellerExpansion(1)).State;
         var absorbed = Step(s1, SellerAbsorption(2)).Event!;
-        Assert.Equal(EventBias.Short, absorbed.PreviousBias); Assert.True(absorbed.ShouldNotifyTelegram); Assert.Equal("BiasChanged", absorbed.NotificationReason);
+        Assert.Equal(EventBias.Short, absorbed.PreviousBias); Assert.False(absorbed.ShouldNotifyTelegram); Assert.Null(absorbed.NotificationReason);
         Assert.Equal(CommentarySeverity.High, absorbed.Severity);
 
         // Flipped is eligible; Resolved is never eligible by itself; Strengthening/Weakening are Dashboard-only.

@@ -17,6 +17,13 @@
             </div>
         }
     </div>
+    @if (_model.IsDegraded)
+    {
+        <div class="commentary-degraded" data-testid="commentary-degraded" role="alert">
+            Commentary is DEGRADED and stopped: replay disagreed with stored history at bar @_model.Degraded![0].BarSeq.
+            Stored events were not modified; nothing after that bar is evaluated until this is reconciled. The market data above is unaffected.
+        </div>
+    }
     <div class="commentary-note">
         Deterministic interpretation of completed bars under stated hypotheses. EvidenceAgreement = how many independent evidence families agree;
         it is not a probability or a validated signal. Watch-only: no orders.

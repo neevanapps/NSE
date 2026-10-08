@@ -69,6 +69,7 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
             logger.LogError(
                 "Adaptive futures supplemental metrics mismatch (row left untouched): session={SessionId}, bar={BarSeq}, version={Version}, {Difference}",
                 sessionId, expected.BarSeq, expected.MetricsVersion, difference);
+            await RecordInvalidAsync(db, sessionId, AdaptiveProjectionComponents.FuturesSupplemental, expected.MetricsVersion, expected.BarSeq, difference, ct);
             return SupplementalOutcome.Mismatch;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -132,6 +133,7 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
             logger.LogError(
                 "Adaptive options supplemental metrics mismatch (row left untouched): session={SessionId}, bar={BarSeq}, version={Version}, {Difference}",
                 session.Id, expected.BarSeq, expected.MetricsVersion, difference);
+            await RecordInvalidAsync(db, session.Id, AdaptiveProjectionComponents.OptionsSupplemental, expected.MetricsVersion, expected.BarSeq, difference, ct);
             return SupplementalOutcome.Mismatch;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -156,6 +158,49 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
             logger.LogError(ex, "Adaptive options supplemental write failed (core observer unaffected): session={SessionId}, bar={BarSeq}",
                 session.Id, expected.BarSeq);
             return SupplementalOutcome.Failed;
+        }
+    }
+
+    /// <summary>
+    /// Durably marks a bar's sidecar as known-invalid (insert-if-missing; the sidecar row itself is never touched). A failure to write the
+    /// marker is logged and swallowed: the core observer must never be affected by sidecar health bookkeeping.
+    /// </summary>
+    async Task RecordInvalidAsync(AdaptiveObserverDbContext db, long sessionId, string component, string version, int barSeq, string detail, CancellationToken ct)
+    {
+        AdaptiveProjectionHealthRow? marker = null;
+        try
+        {
+            if (await db.ProjectionHealth.AsNoTracking().AnyAsync(x => x.SessionId == sessionId && x.Component == component
+                    && x.Version == version && x.BarSeq == barSeq, ct))
+            {
+                return;
+            }
+
+            marker = new AdaptiveProjectionHealthRow
+            {
+                SessionId = sessionId, Component = component, Version = version, BarSeq = barSeq,
+                Detail = detail.Length > 512 ? detail[..512] : detail, DetectedAtUtc = DateTimeOffset.UtcNow,
+            };
+            db.ProjectionHealth.Add(marker);
+            await db.SaveChangesAsync(ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Increment(ref _failures);
+            logger.LogError(ex, "Could not record supplemental invalid marker: session={SessionId}, bar={BarSeq}, component={Component}", sessionId, barSeq, component);
+            try
+            {
+                // Detach only the marker: the context is shared with core persistence and must not lose anything else.
+                if (marker is not null && db.Entry(marker).State != EntityState.Detached) db.Entry(marker).State = EntityState.Detached;
+            }
+            catch (Exception)
+            {
+                // The context itself is unusable; nothing more to protect.
+            }
         }
     }
 
@@ -232,6 +277,8 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
         InvalidBookEvents = m.InvalidBookEvents,
         ValidBookSeconds = m.ValidBookSeconds,
         InvalidBookSeconds = m.InvalidBookSeconds,
+        TobUsableSeconds = m.TobUsableSeconds,
+        MicroDevUsableSeconds = m.MicroDevUsableSeconds,
     };
 
     static string? FirstDifference<TRow>(TRow actual, TRow expected) where TRow : class

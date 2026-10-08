@@ -24,8 +24,13 @@ public sealed record AdaptiveObserverSnapshot(
     IReadOnlyDictionary<int, AdaptiveFuturesSupplementalRow>? FuturesSupplemental = null,
     IReadOnlyDictionary<int, AdaptiveOptionsSupplementalRow>? OptionsSupplemental = null,
     // The residual rows of the bar immediately before the oldest displayed bar, so the adjacent delta of the oldest row is computable.
-    IReadOnlyList<AdaptiveOptionResidualBarRow>? PreviousResiduals = null)
+    IReadOnlyList<AdaptiveOptionResidualBarRow>? PreviousResiduals = null,
+    // Bars whose sidecar failed replay verification (durable marker). Their stored values are withheld, which is different from "missing".
+    IReadOnlySet<int>? InvalidFuturesSupplementalBars = null,
+    IReadOnlySet<int>? InvalidOptionsSupplementalBars = null)
 {
+    public int InvalidSupplementalBarCount => (InvalidFuturesSupplementalBars?.Count ?? 0) + (InvalidOptionsSupplementalBars?.Count ?? 0);
+
     public bool CanUseForDecisions => ConsecutiveValidBars >= NiftySignal.AdaptiveObserver.AdaptiveReadinessPolicy.RequiredBars
         && Runtime.RuntimeStatus == AdaptiveRuntimeStatus.Live;
 }

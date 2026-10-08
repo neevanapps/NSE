@@ -22,7 +22,7 @@ It does **not** authorize any change to live trading, entry/exit logic, scoring,
 
 1. **Sidecar persistence.** New observational metrics are stored in separate, versioned sidecar tables keyed by `SessionId + BarSeq (+ MetricsVersion)`. They are never added as columns to the parity-protected rows `AdaptiveFutureBarRow`, `AdaptiveRollingStateRow`, `AdaptiveOptionBandBarRow`, `AdaptiveOptionResidualBarRow`. `AdaptiveObserverPersistence.VerifyRow` is not weakened or exempted. Details: section 71.
 2. **Residual deltas.** The persisted `AdaptiveOptionResidualBarRow.ResidualDelta` keeps its legacy gap-bridging behaviour unchanged (renamed "Legacy Bridged Directional Δ" in diagnostic presentation). All NEW residual deltas and all commentary use adjacent-bar semantics (sections 34, 35). Residual supplemental values are derived by one shared pure projection, not a sidecar table (section 32.4).
-3. **Day Vol PCR.** Nothing is labelled or displayed as full-chain Day Vol PCR until full-chain coverage is proven. A diagnostic "Subscribed-Universe Day Vol PCR" may be computed and persisted (sections 25.3–25.5).
+3. **Day Vol PCR.** Nothing is labelled or displayed as full-chain Day Vol PCR until full-chain coverage is proven. A diagnostic "Observer-Universe Day Vol PCR" may be computed and persisted (sections 25.3–25.5).
 4. **Option freshness.** New Position / ΔIV / IV Skew metrics reuse the existing 5-second option quote freshness (section 24.5). No second threshold.
 5. **Basis / spot.** Spot enters the observer as an isolated causal input that must not change any existing adaptive output. ΔBasis stays hidden/unavailable until the spot freshness rule has been measured and approved by the project owner (section 9.6).
 6. **Rolling-input availability.** Commentary primary events never fire when their mandatory rolling futures inputs are unavailable; missing external evidence is neither support nor contradiction (sections 48, 53).
@@ -48,7 +48,7 @@ The Dashboard keeps the full pre-existing wide tables available behind an explic
 ## 0.4 IMPLEMENTATION BLOCKERS / DEFERRED ITEMS
 
 1. **ΔBasis display** — blocked until (a) spot is plumbed with proof that no existing adaptive output changes, (b) the spot age/inter-arrival distribution (p50/p90/p95/p99/max during market hours) is reported, and (c) the project owner approves one explicit freshness rule. Until then ΔBasis is hidden/unavailable and the Basis evidence family counts as neither support nor contradiction.
-2. **Full-chain Day Vol PCR** — blocked until full nearest-expiry option-chain cumulative-volume coverage is proven. Only the explicitly labelled Subscribed-Universe diagnostic may exist meanwhile.
+2. **Full-chain Day Vol PCR** — blocked until full nearest-expiry option-chain cumulative-volume coverage is proven. Only the explicitly labelled Observer-Universe diagnostic may exist meanwhile.
 3. **Deployment** — nothing in this plan is deployed; no VM change is authorized. The migration/deploy ordering contract is in section 71.
 4. **Telegram commentary beyond the V1 conservative set** (ordinary New / Strengthening / Weakening / Absorption) — deferred until the notification-noise replay report (section 73) has been reviewed.
 5. **Commentary reliance on Options Position / ΔIV / IV Skew** — those metrics are implemented under the 5-second rule, but their measured availability must be reported (section 73) before they are treated as a meaningful evidence source. The 5-second rule is not loosened to improve availability.
@@ -541,7 +541,7 @@ Preferred conservative behaviour for implementation review:
 
 This policy must be unit-tested.
 
-## 8.6 Implementation contract — `futures-micro-v1` (Slice 2A, implemented)
+## 8.6 Implementation contract — `futures-micro-v2` (Slice 2A, implemented; v2 supersedes v1 after the review correction pass, section 74)
 
 This records the exact rules the code applies (`FuturesMicrostructureTracker`), so the contract is auditable without reading the code. Any change to a rule below requires a new `MetricsVersion`.
 
@@ -549,8 +549,8 @@ This records the exact rules the code applies (`FuturesMicrostructureTracker`), 
 - **Valid book.** `Bid > 0`, `Ask > 0`, `Ask >= Bid` (locked is valid, crossed is not), `BidQty >= 0`, `AskQty >= 0`, all finite. TOB and MicroDev additionally need `BidQty + AskQty > 0`; a valid book with zero total quantity counts as valid time but contributes to neither TOB nor MicroDev.
 - **Bar boundary.** For a completed bar `(start, end]` the reference state is the last unique state with `At <= start`; the bar's own book changes are the states with `start < At <= end`. A state is effective from its `At` to the next unique state, clipped to the bar. Consecutive bars therefore partition book transitions with none lost or double counted (tested by additivity of OFI).
 - **TOB / MicroDev.** Start = reference state, End = state effective at `end`, Change = End − Start, Min/Max over the reference state and every in-bar state, and the time-weighted average over the seconds where the metric is defined (null when that is zero seconds, e.g. a zero-duration split bar).
-- **OFI.** Sum of the Level-1 event contribution over consecutive valid unique states inside the bar, using the reference state as the first baseline when it is valid. An invalid/crossed state clears the baseline and counts as an invalid-book event; the first valid state afterwards only re-establishes the baseline (no transition across the gap). `Ofi` is null only when no valid baseline exists at any point in the bar; a bar with a valid baseline but no book change has `Ofi = 0` and `OfiTransitions = 0`.
-- **Coverage.** `ValidBookSeconds` and `InvalidBookSeconds` (including time before any book was seen) are stored per bar.
+- **OFI.** Sum of the Level-1 event contribution over consecutive valid unique states inside the bar, using the reference state as the first baseline when it is valid. An invalid/crossed state clears the baseline and counts as an invalid-book event; the first valid state afterwards only re-establishes the baseline (no transition across the gap). `Ofi` is **null unless at least one valid baseline-to-next transition happened inside the bar** (`OfiTransitions >= 1`): a valid baseline alone, a bar with no book change, a zero-duration bar, or a bar whose only valid state follows an invalid gap is "no OFI evidence", never a measured 0. (v1 returned 0 in those cases; that was a defect found in review.)
+- **Coverage.** `ValidBookSeconds` is the time the book had structurally valid prices (positive, uncrossed), **including** states with `BidQty + AskQty == 0`, which have no TOB/MicroDev. `InvalidBookSeconds` (including time before any book was seen) is the rest. `TobUsableSeconds` / `MicroDevUsableSeconds` are the seconds with a usable TOB / MicroDev (valid prices AND non-zero total quantity) and are the true coverage of the time-weighted TOB/MicroDev values.
 - **Persistence.** Table `adaptive_futures_supplemental_bars`, unique on `(SessionId, BarSeq, MetricsVersion)`. Recovery inserts missing rows and verifies existing rows (tolerance 1e-9 on doubles). A mismatch or a write failure is logged and counted (`AdaptiveSupplementalPersistence.MismatchCount` / `FailureCount`), never overwrites a stored row, and never throws into core adaptive processing. A persisted per-session sidecar health flag is not implemented; the counters and error logs are the current signal.
 - **Display.** The compact futures grid shows MicroDev (time-weighted, raw price points, 3 decimals) and OFI (raw quantity) from the current `MetricsVersion` row; a missing row, a missing table, or an unavailable value renders as unavailable, never zero.
 
@@ -982,7 +982,7 @@ Visible order:
 
 Above the grid, **no Day Vol PCR is shown in V1** because full-chain coverage is not proven (sections 25.3–25.4). Once Slice 3 persists the diagnostic, the header may show a clearly named line:
 
-    Subscribed-Universe Day Vol PCR: x.xx   (CE vol x | PE vol x | N tokens | Since HH:mm:ss IST)
+    Observer-Universe Day Vol PCR: x.xx   (CE vol x | PE vol x | N tokens | Since HH:mm:ss IST)
 
 Row-level Vol PCR and Roll Vol PCR are **ATM±2 band** metrics and are labelled as such.
 
@@ -1326,14 +1326,14 @@ Nothing may be displayed or labelled "Full Chain Day Vol PCR" unless full neares
 
 Before any full-chain label can be used, prove that cumulative volume is available for the full intended nearest-expiry universe, with a persisted, auditable coverage diagnostic. Otherwise the figure stays hidden. This is blocker 0.4.2.
 
-## 25.5 Subscribed-Universe Day Vol PCR — diagnostic
+## 25.5 Observer-Universe Day Vol PCR — diagnostic
 
 An internal diagnostic may be computed from the option tokens actually present in the session's frozen option universe:
 
-    SubscribedUniverseDayVolPCR(t) = cumulative PE volume / cumulative CE volume over the subscribed universe
+    ObserverUniverseDayVolPCR(t) = cumulative PE volume / cumulative CE volume over the session's frozen option universe
 
 - **Baseline:** the session `ObservationStart` (frozen). For a normal complete session this is the frozen session start (09:15); for a late-start/fallback session it is the first valid observed point used by that session. It never implies activity before `ObservationStart`.
-- **Label (mandatory):** `Subscribed-Universe Day Vol PCR` with `Since: HH:mm:ss IST`.
+- **Label (mandatory):** `Observer-Universe Day Vol PCR` with `Since: HH:mm:ss IST`.
 - **Persisted per bar (options sidecar):** cumulative CE volume, cumulative PE volume, option token/strike universe count, observation start, coverage status.
 - If CE cumulative volume is zero the ratio is unavailable (never infinity).
 - It is never presented as, or silently substituted for, a full-chain figure.
@@ -1402,11 +1402,11 @@ Examples:
 
 Retain in V1 diagnostics; do not expose in compact grid yet.
 
-## 26.5 Implementation contract — `options-supp-v1` (Slice 3, implemented)
+## 26.5 Implementation contract — `options-supp-v2` (Slice 3, implemented; v2 inherits the OFI semantics of section 8.6)
 
 Computed by `OptionsSupplementalCalculator` once per completed bar and stored in `adaptive_options_supplemental_bars` (unique on `SessionId, BarSeq, MetricsVersion`; insert-if-missing / verify-if-present; never overwritten). The shared residual projection (section 32.4) needs no table.
 
-- **Center contract.** The center CE and PE of the ATM±2 band selected at the bar's start, fixed for the whole bar. Wings are the band's strikes one and two below (PE) and above (CE) the center. Without a selection every contract-level value is unavailable (the row still records the subscribed-universe volumes).
+- **Center contract.** The center CE and PE of the ATM±2 band selected at the bar's start, fixed for the whole bar. Wings are the band's strikes one and two below (PE) and above (CE) the center. Without a selection every contract-level value is unavailable (the row still records the observer-universe volumes).
 - **Freshness.** A boundary quote is usable only if a two-sided book (`Bid > 0`, `Ask >= Bid`), available at or before the boundary and at most **5 seconds** old (exactly 5 s is fresh). This is the existing adaptive convention; a guard test pins it to `AdaptiveOptionBandCalculator`'s default.
 - **Mid / OI.** Midpoint start/end/Δ per center contract (never LTP); OI start/end/Δ per center contract from the last known open interest at each boundary (OI is not subject to the 5 s rule and updates sparsely, which is why zero OI change, and therefore `Neutral`, is expected to be common).
 - **Position.** `OI Δ` and midpoint Δ must both exist; if either is zero the label is `Neutral` (no inference); otherwise OI↑ + mid↓ = Writing, OI↑ + mid↑ = LongBuild, OI↓ + mid↑ = ShortCover, OI↓ + mid↓ = LongUnwind, prefixed `Call` / `Put`. Missing input = unavailable (null). Labels are behaviour-compatible descriptions, not actor identity, and not entry gates.
@@ -1414,7 +1414,7 @@ Computed by `OptionsSupplementalCalculator` once per completed bar and stored in
 - **IV Skew.** `[(IV_PE-1 − IV_CE+1) + (IV_PE-2 − IV_CE+2)] / 2`; all four wing IVs are required. The visible value is the **end-of-bar** skew; start and ΔSkew are retained internally.
 - **PCR.** Vol PCR = ATM±2 PE contract quantity / CE contract quantity of the bar (null when CE is 0). Roll Vol PCR = Σ PE quantity / Σ CE quantity over the existing rolling window and requires every bar of the window to have a band (one gap blanks it), never an average of ratios.
 - **Internal.** Center CE/PE MicroDev (time-weighted) and OFI from each option's own Level-1 book (same tracker as the futures sidecar); CE/PE ATM±2 Activity/s (contract quantity / bar seconds); center straddle mid start/end/Δ.
-- **Subscribed-Universe Day Vol PCR (diagnostic only).** Σ traded quantity of the session's frozen option universe split CE/PE since the session observation start (stored with the universe token count and how many tokens had data). It is shown only in the Diagnostic view under that exact name, never in the compact grid, and never described as full chain.
+- **Observer-Universe Day Vol PCR (diagnostic only).** Σ traded quantity of the session's frozen option universe split CE/PE since the session observation start (stored with the universe token count and how many tokens had data). It is shown only in the Diagnostic view under that exact name, never in the compact grid, and never described as full chain.
 - **Residual metrics.** CE Res Δ%, PE Res Δ%, Adjacent Directional Res Δ and Straddle Res % are shown in the compact residual grid from the shared pure projection over persisted rows plus the frozen anchor baselines (adjacent-bar semantics). The legacy persisted bridged `ResidualDelta` is untouched and shown only in the Diagnostic view.
 
 # 27. Options fields to hide, not remove
@@ -1454,7 +1454,7 @@ Implementation must prove:
 10. IV Skew compares symmetric OTM wings and requires all wing inputs.
 11. Current Vol PCR uses ATM±2 contract traded quantity.
 12. Roll Vol PCR is ratio-of-summed-volumes, never average-of-PCRs.
-13. Day Vol PCR is never presented as full-chain unless coverage is proven; the subscribed-universe diagnostic is always labelled with its universe and "Since" time.
+13. Day Vol PCR is never presented as full-chain unless coverage is proven; the observer-universe diagnostic is always labelled with its universe and "Since" time.
 14. Band-roll semantics are explicit; rolling metrics never pretend the basket stayed physically unchanged.
 15. Restart/replay reproduces the same metrics from persisted causal data via sidecar insert-if-missing / verify-if-present semantics (section 71.2).
 16. New metrics do not change trading/scoring/execution behaviour.
@@ -1479,7 +1479,7 @@ As of **08 October 2026**:
 - Retain ΔSkew internally.
 - Add ATM±2 current-bar Vol PCR.
 - Add ATM±2 Roll Vol PCR as ratio of summed volumes.
-- Full-chain Day Vol PCR is deferred/hidden until coverage is proven; only the labelled Subscribed-Universe diagnostic may exist.
+- Full-chain Day Vol PCR is deferred/hidden until coverage is proven; only the labelled Observer-Universe diagnostic may exist.
 - Do not interpret PCR alone as bullish/bearish.
 - Calculate center CE/PE MicroDev and OFI internally, not V1 visible.
 - Calculate option Activity/s and center Straddle Δ internally, not V1 visible.
@@ -1490,7 +1490,7 @@ As of **08 October 2026**:
 
 1. **Futures basis spot freshness** — measured-then-approved process (section 9.6); blocker 0.4.1.
 2. **Option quote freshness** — 5 seconds, reused (section 24.5).
-3. **Day PCR coverage** — full-chain deferred; Subscribed-Universe diagnostic only (sections 25.3–25.5).
+3. **Day PCR coverage** — full-chain deferred; Observer-Universe diagnostic only (sections 25.3–25.5).
 4. **Persistence vs recomputation** — versioned sidecar tables; residual supplemental values via a shared pure projection (sections 32.4, 71).
 5. **Compact vs diagnostic UX** — compact default plus Diagnostic view toggle (section 0.3).
 6. **Telegram composition** — section 18.4.
@@ -2819,15 +2819,15 @@ The Dashboard shows every persisted lifecycle event. Telegram is stricter and, i
 
 1. `Lifecycle == Confirmed` (SellerRejectionConfirmed / BuyerRejectionConfirmed).
 2. `Lifecycle == Flipped`.
-3. An **actual bias change**: `PreviousBias` is directional (LONG or SHORT) and `CurrentBias` differs, produced by a persisted non-Resolved event — that is LONG <-> SHORT (always Flipped) or directional -> NEUTRAL through a persisted NEUTRAL-bias event (absorption, FlowConflict, FamilyConflict).
+3. A **true direct LONG <-> SHORT reversal** (`PreviousBias` and `CurrentBias` are both directional and different) that is not already a Flipped event, from a non-Resolved event (reason `DirectReversal`).
 
-A Neutral -> directional change caused by an ordinary New expansion/covering/liquidation is **not** a Telegram-eligible bias change. A Resolved row is never Telegram-eligible by itself.
+A move **to or from NEUTRAL** is never Telegram-eligible: LONG -> NEUTRAL, SHORT -> NEUTRAL, NEUTRAL -> directional by an ordinary New event, Strengthening, Weakening, absorption, FlowConflict, FamilyConflict and Resolved are persisted and shown on the Dashboard only. (The earlier `BiasChanged` Telegram rule, which sent directional -> NEUTRAL, was replaced in the review correction pass, section 74.)
 
 ## 60.2 Not sent to Telegram in V1
 
 - ordinary New BuyerExpansion / SellerExpansion / ShortCovering / LongLiquidation;
 - Strengthening and Weakening;
-- absorption alone (unless it caused an eligible bias change under 60.1.3);
+- absorption, FlowConflict and FamilyConflict (including when they move the bias to NEUTRAL);
 - Resolved rows;
 - critical data-quality events (persisted and shown on the Dashboard only);
 - everything else.
@@ -2874,17 +2874,17 @@ Cooldown:
 
     MinimumBarsBetweenSameEventTelegram = 5   (completed bars)
 
-It applies to repeated notifications for the same EventType + Bias. The following bypass the cooldown because they are materially new: BiasChanged, Flipped, Confirmed, newly HIGH EvidenceAgreement caused by a new independent confirmation family, and a critical data-quality event.
+It applies to repeated notifications for the same EventType + Bias. The following bypass the cooldown because they are materially new: DirectReversal, Flipped, Confirmed, newly HIGH EvidenceAgreement caused by a new independent confirmation family, and a critical data-quality event.
 
 In V1 every Telegram-eligible class (Confirmed, Flipped, actual bias change) is in the bypass list, so the cooldown currently has no practical effect. It is implemented as configuration so that enabling additional eligible classes later cannot flood Telegram. It is an operational notification throttle, not a trading parameter.
 
 ## 61.1 Implementation contract (Slice 4C, implemented)
 
-- **Outbox.** `adaptive_commentary_notification_jobs` (unique `EventId`; `Pending`, `Sending`, `Sent`, `DeliveryUncertain`). A job is queued by the commentary service in the **same transaction** as the event, and **only when the event row is newly inserted** and the V1 policy (section 60.1) plus the cooldown allow it. Verifying an existing event on replay never queues anything, so a restart or a mid-session deployment cannot flood Telegram. The detector never sends.
+- **Outbox.** `adaptive_commentary_notification_jobs` (unique `EventId`; `Pending`, `Sending`, `Sent`, `DeliveryUncertain`). A job is queued by the commentary service in the **same transaction** as the event, and **only when the event row is newly inserted, the call is live forward processing (`CommentaryNotificationMode.EnqueueFinalBar`) and the event is on the final bar of that call** and the V1 policy (section 60.1) plus the cooldown allow it. Restart / first-deployment catch-up (`ProcessAllCompletedAsync`, always `Suppress`), checkpoint rebuilds and replays reconstruct events and the checkpoint but never create a job, and verifying an existing event never queues anything, so a restart or a mid-session deployment cannot flood Telegram (section 74). The detector never sends.
 - **Delivery.** `AdaptiveCommentaryNotificationProcessor` (Dashboard, same lease pattern and Telegram settings as the screenshot outbox, its own advisory lock): `Sending` is saved before the first byte leaves; `Sent` requires an acknowledged Telegram `message_id` and is never resent; an exception, timeout or unacknowledged response becomes `DeliveryUncertain` and is never retried automatically; an interrupted `Sending` becomes `DeliveryUncertain` on restart; a definitive Telegram refusal returns to `Pending` after its `retry_after` and holds other jobs meanwhile. Exactly-once delivery is **not** claimed.
 - **Message.** `CommentaryNotificationPolicy.FormatMessage`: a one-line identification (date, bar, IST time) + the deterministic rendered commentary + a one-line reminder that it is an interpretation hypothesis, not a probability or trade signal; bounded to 4000 characters.
 - **Explicit opt-in.** Delivery runs only when `AdaptiveCommentaryTelegram:Enabled = true` (default **false**) and Dashboard Telegram settings exist, so a deployment can never start messaging a real account by surprise. Events are persisted and shown on the Dashboard regardless. (This switch is an addition to the plan, recorded here.)
-- **Cooldown.** `MinimumBarsBetweenSameEventTelegram = 5` is implemented in `CommentaryNotificationPolicy.ShouldEnqueue`; every V1 eligible reason (`Confirmed`, `Flipped`, `BiasChanged`) bypasses it, so it currently has no practical effect.
+- **Cooldown.** `MinimumBarsBetweenSameEventTelegram = 5` is implemented in `CommentaryNotificationPolicy.ShouldEnqueue`; every V1 eligible reason (`Confirmed`, `Flipped`, `DirectReversal`) bypasses it, so it currently has no practical effect.
 - **Dashboard panel.** `CommentaryPanel` shows the current regime/bias/last evaluated bar and the latest **five** persisted events newest first (time, event, Bias, Regime, lifecycle, EvidenceAgreement, deterministic text), the standing EvidenceAgreement note, an empty state, and tolerates a missing commentary table. It is not part of the Telegram screenshot composition.
 
 # 62. Commentary examples
@@ -3083,7 +3083,7 @@ Implementation is not complete until automated/replay tests prove:
 12. FamilyConflict follows section 54.1 exactly; one unavailable family is never a conflict.
 13. Regime transitions follow section 54 exactly; there is no time-based decay.
 14. Lifecycle rules (New/Strengthening/Weakening/Confirmed/Resolved/Flipped, continuation, replacement, precedence) follow section 55 exactly; no `Active` lifecycle exists.
-15. BiasChanged is persisted correctly and the Telegram bias-change rule (60.1.3) is applied exactly.
+15. BiasChanged is persisted correctly; the Telegram rule (60.1.3, direct LONG <-> SHORT only) is applied exactly.
 16. Adjacent residual delta is used; the legacy bridged delta is never used.
 17. Same bar replay cannot duplicate an event (identity: SessionId + BarSeq + EventType + Lifecycle + Bias).
 18. Bars with no persisted event still advance the commentary runtime checkpoint.
@@ -3195,7 +3195,7 @@ Conceptual tables (final column lists are recorded in the migrations and in each
 
 - `adaptive_session_supplemental` — one row per session (section 71.3).
 - `adaptive_futures_supplemental_bars` — Slice 2A: TOB start / time-weighted / end / change / min / max, MicroDev start / time-weighted / end / change, raw OFI, OFI transition count, valid-book coverage duration, invalid/crossed-book count and duration. Slice 2B adds basis start / time-weighted / end, ΔBasis, spot ages and a basis status.
-- `adaptive_options_supplemental_bars` — Slice 3: center OI start/end/Δ and midpoints per side, Position per side, IV start/end/Δ per side, IV skew start/end/ΔSkew, Vol PCR and its rolling components, center CE/PE MicroDev and OFI, ATM±2 CE/PE Activity/s, center Straddle Δ, and the Subscribed-Universe Day Vol PCR fields (cumulative CE volume, cumulative PE volume, token/strike universe count, observation start, coverage status).
+- `adaptive_options_supplemental_bars` — Slice 3: center OI start/end/Δ and midpoints per side, Position per side, IV start/end/Δ per side, IV skew start/end/ΔSkew, Vol PCR and its rolling components, center CE/PE MicroDev and OFI, ATM±2 CE/PE Activity/s, center Straddle Δ, and the Observer-Universe Day Vol PCR fields (cumulative CE volume, cumulative PE volume, token/strike universe count, observation start, coverage status).
 - Commentary tables (Slice 4B) are separate (sections 56–57, 61).
 - No residual sidecar (section 32.4); no Urgency column (section 5.2).
 
@@ -3206,7 +3206,7 @@ On recovery / replay, for every completed bar:
 - if the sidecar row exists → recompute the expected supplemental metrics and **verify** the stored row against them;
 - if it does not exist → **insert** the deterministic missing row.
 
-A mid-session deployment therefore backfills earlier bars from persisted raw data. Sidecar calculation is a deterministic function of the same causal inputs the core replay uses. A sidecar verification failure is logged and flagged on the sidecar status, never overwrites a stored row, and does not block or alter core adaptive recovery (the sidecar is observational; the core ledger remains the restart authority).
+A mid-session deployment therefore backfills earlier bars from persisted raw data. Sidecar calculation is a deterministic function of the same causal inputs the core replay uses. A sidecar verification failure is logged, **durably marked** in `adaptive_projection_health` (component, version, bar; section 74), never overwrites a stored row, and does not block or alter core adaptive recovery (the sidecar is observational; the core ledger remains the restart authority). A marked bar is "known invalid", which is different from "missing": commentary and the Dashboard treat it as unavailable and the Dashboard says so.
 
 ## 71.3 Supplemental session identity (spot token freezing)
 
@@ -3237,7 +3237,7 @@ Slice contents:
 - **Slice 1:** compact Futures/Options/Residual grids from existing persisted fields only; `OI Δ` renamed `Roll OI Δ`; Dashboard-derived Urgency (`DurationSeconds <= 0` ⇒ unavailable); Diagnostic view toggle; pinned/as-of `LiveQuotePanel` capture support (separate sub-step, section 18); Telegram screenshot tests; restart parity unchanged.
 - **Slice 2A:** futures sidecar with versioned replay/backfill verification (sections 6–8, 71).
 - **Slice 2B:** frozen supplemental spot identity, causal spot plumbing, proof that no existing adaptive output changes, spot-age distribution report; **stop for threshold approval**.
-- **Slice 3:** options sidecar, Subscribed-Universe PCR diagnostic, shared pure residual projection, availability report.
+- **Slice 3:** options sidecar, Observer-Universe PCR diagnostic, shared pure residual projection, availability report.
 - **Slices 4A–4C:** section 67.
 
 **Stop conditions.** Stop and ask only if (1) current code proves a decision here cannot be implemented safely as specified; (2) a new market threshold/constant not already approved is needed; (3) the ΔBasis spot-freshness decision is reached; (4) an implementation would alter existing adaptive bar or restart semantics; (5) an implementation would touch trading/scoring/execution/risk. When stopping, give the exact code location, the conflict, alternatives and a recommendation.
@@ -3250,3 +3250,16 @@ Slice contents:
 - **Spot freshness (Slice 2B):** p50 / p90 / p95 / p99 / max spot age during market hours and a recommended rule; owner approval required (section 9.6).
 - **Commentary notification noise (after Slice 4C):** replay existing sessions and report events/day, lifecycle counts/day, BiasChanged/day and Telegram-eligible events/day. This validates notification volume only; it is not a profitability test, and event directions/signs are never changed because of how outcomes turned out.
 
+# 74. Review correction pass (post Slice 4C)
+
+An independent review of the eight slice commits found the defects below; each was verified against the code before it was changed. The finalized Futures / Options / Residual / Commentary architecture is unchanged.
+
+1. **No Telegram backlog from catch-up.** `AdaptiveCommentaryService.ProcessThroughAsync` takes an explicit `CommentaryNotificationMode`. `Suppress` (restart / first mid-session deployment catch-up, rebuild, replay, verification) persists events and the checkpoint and creates **no** notification job. `EnqueueFinalBar` (live forward processing, one completed bar per call) may enqueue only a **newly inserted** eligible event on the final bar of the call; earlier bars processed inside the same call are catch-up. No wall-clock heuristic. Deleting the checkpoint and rebuilding still queues nothing.
+2. **Known-invalid sidecars are durable and not consumed.** A sidecar replay mismatch writes an `adaptive_projection_health` row (`SessionId, Component, Version, BarSeq, Detail`). The commentary frame loader treats a marked bar's sidecar exactly like a missing one (unavailable evidence), and the Dashboard withholds the marked bar's sidecar values (shown as unavailable, not zero) with a visible notice. The stored sidecar row is never touched; core rows are unaffected; the marker survives restarts.
+3. **Pinned quote is truly causal.** `AdaptiveQuoteAsOfService` no longer uses a fixed candidate window. A tick is eligible iff both `ExchangeTimestamp` and `ReceivedAt` are <= the boundary; the latest by `max(Exchange, Received)` is found exactly with two ordered index probes (greatest eligible `ExchangeTimestamp`, then greatest eligible `ReceivedAt` within `[availability of the first winner, boundary]`) and ties are broken by the highest source Id. The day-open baseline is the first tick of the trade day that was available by the boundary.
+4. **OFI without evidence is null.** See section 8.6 (`futures-micro-v2`, `options-supp-v2`). The version bump keeps v1 rows (which stored 0) from being mixed with v2 rows; readers use the current version.
+5. **Conservative Telegram policy.** Section 60.1: Confirmed, Flipped and a true direct LONG <-> SHORT reversal only. Notification-volume replay over the same 18 historical sessions (3,179 completed bars, ~131.8 persisted events/day, identical before and after): Telegram-eligible events per day went from a mean of 25.9 (13-57; 466 total) to a mean of 2.7 (0-7; 49 total). The remaining 49 are 44 Confirmed (32 SellerRejectionConfirmed, 12 BuyerRejectionConfirmed) and 5 Flipped (4 SellerExpansion, 1 LongLiquidation, all Long -> Short); no direct non-Flipped reversal occurred. Per day (before -> after): 09-04 32->2, 09-08 13->0, 09-09 25->6, 09-10 21->5, 09-11 26->1, 09-15 25->2, 09-16 14->2, 09-17 22->4, 09-18 15->5, 09-21 15->0, 09-22 39->7, 09-23 19->1, 09-24 29->2, 09-25 31->0, 09-28 19->0, 09-29 32->4, 09-30 32->4, 10-01 57->4. No market rule or sign was tuned; the persisted Dashboard events are unchanged.
+6. **Commentary is version-keyed.** `EventIdentity = {CommentaryVersion}:{SessionId}:{BarSeq}:{EventType}:{Lifecycle}:{Bias}` and the runtime row is unique by `(SessionId, CommentaryVersion)`. v1 events are immutable; a later version coexists and rebuilds without collision. The migration prefixes existing identities with their version.
+7. **Commentary replay mismatch stops projection.** When a stored event disagrees with the recomputation, the unit of work is rolled back, the stored event is not modified, the checkpoint does not advance past the mismatched bar, a `commentary` row is written to `adaptive_projection_health`, and every later call (including after a restart) does nothing until the marker is reconciled. The Dashboard commentary panel shows the degraded state. Core adaptive processing is unaffected.
+8. **Per-token option book trackers (measured, left unchanged).** `AdaptiveObserverEngine._optionBooks` keeps one `FuturesMicrostructureTracker` per option token with every unique book state of the session. Measured over the 18 historical sessions (40-41 universe tokens, ~1.1 M ticks per day): at most ~560 000 retained unique states per session (~31 MB at 56 B/state, ~60 MB with `List` growth slack), and a full-day engine replay of ~1-2 s. That is bounded and small for a single-day process, so no pruning was added. If it ever matters, the safe design is `PruneBefore(barEnd)` after each bar completes (keep the last state at/before the end as the next bar's reference and baseline, drop earlier ones); it is not implemented because it would add a stateful mutation to a parity-protected replay path for no measured benefit.
+9. **Observer-Universe Day Vol PCR.** `OptionUniverseJson` is the session's frozen option universe selected at 09:30; it does not prove that every token was subscribed or ticked. The diagnostic is therefore labelled **Observer-Universe Day Vol PCR (frozen observer option universe, not the full chain)** and keeps `observed/total` token coverage visible. Nothing is called full-chain.

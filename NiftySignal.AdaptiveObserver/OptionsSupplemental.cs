@@ -28,7 +28,7 @@ public sealed record OptionsSupplementalBar(
     double? StraddleMidStart, double? StraddleMidEnd, double? StraddleDelta)
 {
     /// <summary>Identifies the calculation contract. Change it whenever any formula, boundary or freshness rule changes.</summary>
-    public const string MetricsVersion = "options-supp-v1";
+    public const string MetricsVersion = "options-supp-v2";
 
     /// <summary>
     /// Option quote freshness, REUSED from the existing adaptive convention (<see cref="AdaptiveOptionBandCalculator.Select"/>'s

@@ -30,11 +30,17 @@ public sealed class AdaptiveCommentaryDeliveryTests
         CommentaryEvaluatorProxy.Make(type, bias, lifecycle, previous, bar);
 
     [Fact]
-    public void TelegramEligibility_IsLimitedToConfirmedFlippedAndActualBiasChange()
+    public void TelegramEligibility_IsLimitedToConfirmedFlippedAndDirectReversal()
     {
         Assert.Equal((true, "Confirmed"), CommentaryEvaluator.TelegramPolicy(CommentaryLifecycle.Confirmed, EventBias.Neutral, EventBias.Long));
         Assert.Equal((true, "Flipped"), CommentaryEvaluator.TelegramPolicy(CommentaryLifecycle.Flipped, EventBias.Short, EventBias.Long));
-        Assert.Equal((true, "BiasChanged"), CommentaryEvaluator.TelegramPolicy(CommentaryLifecycle.New, EventBias.Short, EventBias.Neutral));
+        // A true direct LONG<->SHORT reversal that is not already Flipped is eligible; any move to/from NEUTRAL is not.
+        Assert.Equal((true, "DirectReversal"), CommentaryEvaluator.TelegramPolicy(CommentaryLifecycle.New, EventBias.Short, EventBias.Long));
+        Assert.Equal((true, "DirectReversal"), CommentaryEvaluator.TelegramPolicy(CommentaryLifecycle.Strengthening, EventBias.Long, EventBias.Short));
+        Assert.Equal((false, null), CommentaryEvaluator.TelegramPolicy(CommentaryLifecycle.New, EventBias.Short, EventBias.Neutral));          // SHORT -> NEUTRAL
+        Assert.Equal((false, null), CommentaryEvaluator.TelegramPolicy(CommentaryLifecycle.New, EventBias.Long, EventBias.Neutral));           // LONG -> NEUTRAL
+        Assert.Equal((false, null), CommentaryEvaluator.TelegramPolicy(CommentaryLifecycle.Weakening, EventBias.Neutral, EventBias.Long));
+        Assert.Equal((false, null), CommentaryEvaluator.TelegramPolicy(CommentaryLifecycle.Resolved, EventBias.Short, EventBias.Long));         // Resolved is never sent
         Assert.Equal((false, null), CommentaryEvaluator.TelegramPolicy(CommentaryLifecycle.New, EventBias.Neutral, EventBias.Short));          // ordinary New expansion
         Assert.Equal((false, null), CommentaryEvaluator.TelegramPolicy(CommentaryLifecycle.Resolved, EventBias.Short, EventBias.Neutral));       // resolution alone
         Assert.Equal((false, null), CommentaryEvaluator.TelegramPolicy(CommentaryLifecycle.Strengthening, EventBias.Short, EventBias.Short));
@@ -46,7 +52,7 @@ public sealed class AdaptiveCommentaryDeliveryTests
     {
         var last = new LastCommentaryNotification(CommentaryEventType.SellerExpansion, EventBias.Short, 20);
         // The three V1 eligible reasons bypass the cooldown even for the identical event type and bias one bar later.
-        foreach (var reason in new[] { "Confirmed", "Flipped", "BiasChanged" })
+        foreach (var reason in new[] { "Confirmed", "Flipped", "DirectReversal" })
             Assert.True(CommentaryNotificationPolicy.ShouldEnqueue(Event(CommentaryEventType.SellerExpansion, EventBias.Short, CommentaryLifecycle.New, EventBias.Short, 21) with
             { ShouldNotifyTelegram = true, NotificationReason = reason }, last));
         // A hypothetical future class (no bypass reason) is throttled for the same type + bias for 5 bars, then allowed; a different event is never throttled.
@@ -139,7 +145,7 @@ public sealed class AdaptiveCommentaryDeliveryTests
             EventBias = EventBias.Long, MarketRegime = MarketRegime.Transition, Lifecycle = CommentaryLifecycle.Confirmed, EvidenceAgreement = EvidenceAgreement.High,
             Severity = CommentarySeverity.High, PreviousBias = EventBias.Neutral, BiasChanged = true, PrimaryEvidenceJson = "[]", ConfirmationEvidenceJson = "[]",
             ContradictionEvidenceJson = "[]", DataQualityJson = "[]", RenderedCommentary = "Seller rejection confirmed.\nBias LONG | Regime TRANSITION | EvidenceAgreement HIGH.",
-            ShouldNotifyTelegram = true, NotificationReason = "Confirmed", CommentaryVersion = "commentary-v1", EventIdentity = "1:16:SellerRejectionConfirmed:Confirmed:Long",
+            ShouldNotifyTelegram = true, NotificationReason = "Confirmed", CommentaryVersion = "commentary-v1", EventIdentity = "commentary-v1:1:16:SellerRejectionConfirmed:Confirmed:Long",
         };
         db.CommentaryEvents.Add(ev); await db.SaveChangesAsync();
         var job = new AdaptiveCommentaryNotificationJobRow { EventId = ev.Id, Status = AdaptiveCommentaryNotificationStatus.Pending, CreatedAtUtc = T0, NextAttemptUtc = T0 };
@@ -222,7 +228,7 @@ public sealed class AdaptiveCommentaryDeliveryTests
             SessionId = 1, TradeDate = ev.TradeDate, BarSeq = 17, OccurredAtUtc = ev.OccurredAtUtc.AddMinutes(1), EventType = CommentaryEventType.SellerExpansion, EventBias = EventBias.Short,
             MarketRegime = MarketRegime.Bearish, Lifecycle = CommentaryLifecycle.Flipped, EvidenceAgreement = EvidenceAgreement.Medium, Severity = CommentarySeverity.High,
             PreviousBias = EventBias.Long, PrimaryEvidenceJson = "[]", ConfirmationEvidenceJson = "[]", ContradictionEvidenceJson = "[]", DataQualityJson = "[]",
-            RenderedCommentary = "second", ShouldNotifyTelegram = true, NotificationReason = "Flipped", CommentaryVersion = "commentary-v1", EventIdentity = "1:17:SellerExpansion:Flipped:Short",
+            RenderedCommentary = "second", ShouldNotifyTelegram = true, NotificationReason = "Flipped", CommentaryVersion = "commentary-v1", EventIdentity = "commentary-v1:1:17:SellerExpansion:Flipped:Short",
         });
         await db.SaveChangesAsync();
         db.CommentaryNotificationJobs.Add(new AdaptiveCommentaryNotificationJobRow { EventId = db.CommentaryEvents.Local.Last().Id, Status = AdaptiveCommentaryNotificationStatus.Pending, CreatedAtUtc = T0, NextAttemptUtc = T0 });
@@ -296,24 +302,25 @@ public sealed class AdaptiveCommentaryDeliveryTests
             [.. Enumerable.Range(1, 9).Select(i => new Spec(i, -1, 50, -2, -5)),
              new(10, -1, 50, -2, -5),     // SellerExpansion New            : not eligible (Neutral -> Short from silence)
              new(11, 1, -5, 2, 5),        // ShortCovering                  : Flipped (Short -> Long)               => queued
-             new(12, -1, 50, 0.5, -5),    // SellerAbsorption               : Long -> Neutral through an event      => queued (BiasChanged)
+             new(12, -1, 50, 0.5, -5),    // SellerAbsorption               : Long -> Neutral through an event      => NOT queued (review finding 5)
              new(13, 0, 0, 0, 0)]);       // nothing material               : Resolved                              => not queued
         var service = new AdaptiveCommentaryService(new AdaptiveCommentaryFrameLoader(), NullLogger<AdaptiveCommentaryService>.Instance);
         var session = await db.Sessions.AsNoTracking().SingleAsync();
-        await service.ProcessThroughAsync(db, session, 13, default);
+        // Live forward processing: one bar per call, exactly as the observer worker drives it.
+        for (var seq = 1; seq <= 13; seq++) await service.ProcessThroughAsync(db, session, seq, CommentaryNotificationMode.EnqueueFinalBar, default);
 
         var events = await db.CommentaryEvents.AsNoTracking().OrderBy(x => x.BarSeq).ToListAsync();
         Assert.Equal([CommentaryLifecycle.New, CommentaryLifecycle.Flipped, CommentaryLifecycle.New, CommentaryLifecycle.Resolved], events.Select(x => x.Lifecycle));
-        Assert.Equal([false, true, true, false], events.Select(x => x.ShouldNotifyTelegram));
+        Assert.Equal([false, true, false, false], events.Select(x => x.ShouldNotifyTelegram));   // all four still persisted for the Dashboard
         var jobs = await db.CommentaryNotificationJobs.AsNoTracking().OrderBy(x => x.EventId).ToListAsync();
-        Assert.Equal([events[1].Id, events[2].Id], jobs.Select(x => x.EventId));
+        Assert.Equal([events[1].Id], jobs.Select(x => x.EventId));
         Assert.All(jobs, j => Assert.Equal(AdaptiveCommentaryNotificationStatus.Pending, j.Status));
-        Assert.Equal(12, (await db.CommentaryRuntime.AsNoTracking().SingleAsync()).LastTelegramBarSeq);
+        Assert.Equal(11, (await db.CommentaryRuntime.AsNoTracking().SingleAsync()).LastTelegramBarSeq);
 
         // Replaying everything (checkpoint lost) verifies the events and queues nothing new.
         db.CommentaryRuntime.RemoveRange(db.CommentaryRuntime); await db.SaveChangesAsync(); db.ChangeTracker.Clear();
-        await service.ProcessThroughAsync(db, session, 13, default);
-        Assert.Equal(2, await db.CommentaryNotificationJobs.CountAsync());
+        await service.ProcessThroughAsync(db, session, 13, CommentaryNotificationMode.Suppress, default);
+        Assert.Equal(1, await db.CommentaryNotificationJobs.CountAsync());
         Assert.Equal(4, await db.CommentaryEvents.CountAsync());
         Assert.Equal(0, service.MismatchCount);
     }
@@ -362,7 +369,7 @@ public sealed class AdaptiveCommentaryDeliveryTests
                     SessionId = 1, TradeDate = today, BarSeq = 10 + i, OccurredAtUtc = T0.AddMinutes(i), EventType = i % 2 == 0 ? CommentaryEventType.SellerExpansion : CommentaryEventType.BuyerExpansion,
                     EventBias = i % 2 == 0 ? EventBias.Short : EventBias.Long, MarketRegime = MarketRegime.Bearish, Lifecycle = CommentaryLifecycle.New,
                     EvidenceAgreement = EvidenceAgreement.High, Severity = CommentarySeverity.Medium, PreviousBias = EventBias.Neutral, PrimaryEvidenceJson = "[]",
-                    ConfirmationEvidenceJson = "[]", ContradictionEvidenceJson = "[]", DataQualityJson = "[]", CommentaryVersion = "commentary-v1", EventIdentity = $"1:{10 + i}:x:New:y",
+                    ConfirmationEvidenceJson = "[]", ContradictionEvidenceJson = "[]", DataQualityJson = "[]", CommentaryVersion = "commentary-v1", EventIdentity = $"commentary-v1:1:{10 + i}:x:New:y",
                     RenderedCommentary = $"Title {i} started.\nBias X | Regime Y | EvidenceAgreement HIGH.\nMeaning {i}.\nEvidence: Strict Δ -{i}.",
                 });
             db.CommentaryRuntime.Add(new AdaptiveCommentaryRuntimeRow { SessionId = 1, LastEvaluatedBarSeq = 17, CurrentRegime = MarketRegime.Bearish, CurrentBias = EventBias.Short, CommentaryVersion = "commentary-v1" });
@@ -379,6 +386,38 @@ public sealed class AdaptiveCommentaryDeliveryTests
         Assert.Contains("not a probability or a validated signal", html);
         Assert.DoesNotContain("onfidence", html, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("Bias X | Regime Y", html);                       // the header chips replace the first two rendered lines
+    }
+
+    [Fact]
+    public async Task Panel_ShowsADegradedBanner_WhenReplayStoppedCommentary_AndOnlyReadsTheCurrentVersion()
+    {
+        var options = new DbContextOptionsBuilder<AdaptiveObserverDbContext>().UseInMemoryDatabase(Guid.NewGuid().ToString()).Options;
+        var today = DateOnly.FromDateTime(DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromHours(5.5)).DateTime);
+        await using (var db = new AdaptiveObserverDbContext(options))
+        {
+            db.Sessions.Add(new AdaptiveSessionStateRow
+            {
+                Id = 1, TradeDate = today, ModelVersion = OpeningVolumeProjectionV1.ModelVersion, SourceBranch = "t", SourceCommitSha = "t", BuildUtc = T0, FutureToken = "F", FutureSymbol = "F",
+                FutureExpiry = today, OpeningWindowStartUtc = T0, OpeningWindowEndUtc = T0, EstimatorName = "V1", CreatedAtUtc = T0,
+            });
+            AdaptiveCommentaryEventRow Event(string version, int bar, string text) => new()
+            {
+                SessionId = 1, TradeDate = today, BarSeq = bar, OccurredAtUtc = T0, EventType = CommentaryEventType.SellerExpansion, EventBias = EventBias.Short,
+                MarketRegime = MarketRegime.Bearish, Lifecycle = CommentaryLifecycle.New, EvidenceAgreement = EvidenceAgreement.High, Severity = CommentarySeverity.Medium,
+                PreviousBias = EventBias.Neutral, PrimaryEvidenceJson = "[]", ConfirmationEvidenceJson = "[]", ContradictionEvidenceJson = "[]", DataQualityJson = "[]",
+                CommentaryVersion = version, EventIdentity = $"{version}:1:{bar}:x:New:y", RenderedCommentary = $"Title.\nBias.\nMeaning {text}.\nEvidence: none.",
+            };
+            db.CommentaryEvents.AddRange(Event("commentary-v1", 11, "current"), Event("commentary-v0", 12, "foreign"));
+            db.CommentaryRuntime.Add(new AdaptiveCommentaryRuntimeRow { SessionId = 1, LastEvaluatedBarSeq = 9, CurrentRegime = MarketRegime.Neutral, CurrentBias = EventBias.Neutral, CommentaryVersion = "commentary-v1" });
+            db.ProjectionHealth.Add(new AdaptiveProjectionHealthRow { SessionId = 1, Component = AdaptiveProjectionComponents.Commentary, Version = CommentaryEvaluator.Version, BarSeq = 10, Detail = "x", DetectedAtUtc = T0 });
+            await db.SaveChangesAsync();
+        }
+
+        var html = await Render(PanelServices(new Factory(options)));
+        Assert.Contains("data-testid=\"commentary-degraded\"", html);
+        Assert.Contains("DEGRADED and stopped", html); Assert.Contains("at bar 10", html);
+        Assert.Contains("Meaning current.", html);
+        Assert.DoesNotContain("Meaning foreign.", html);                         // another commentary version never mixes into this panel
     }
 
     [Fact]

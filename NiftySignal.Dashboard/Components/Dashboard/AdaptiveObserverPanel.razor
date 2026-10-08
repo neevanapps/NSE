@@ -76,6 +76,11 @@
             <div class="adaptive-subtitle" data-readiness="@(_snapshot.CanUseForDecisions ? "ready" : "unavailable")">10-bar warm-up complete · runtime @_snapshot.Runtime.RuntimeStatus · watch-only</div>
         }
 
+        @if (_snapshot.InvalidSupplementalBarCount > 0)
+        {
+            <div class="adaptive-alert" data-testid="supplemental-invalid">Supplemental metrics for @_snapshot.InvalidSupplementalBarCount bar(s) failed replay verification and are withheld (shown as unavailable, not as zero). Core adaptive rows are unaffected.</div>
+        }
+
         @if (!CaptureMode)
         {
         <div class="adaptive-current-bar">
@@ -257,8 +262,8 @@
             {
             @if (OptionsSupplemental(_snapshot.Options.FirstOrDefault()?.BarSeq ?? 0) is { } day)
             {
-                <div class="adaptive-note" data-testid="subscribed-universe-pcr">
-                    Subscribed-Universe Day Vol PCR (not full chain): @Fmt(day.DayCeVolume > 0 ? (double)day.DayPeVolume / day.DayCeVolume : null, 2)
+                <div class="adaptive-note" data-testid="observer-universe-pcr">
+                    Observer-Universe Day Vol PCR (frozen observer option universe, not the full chain): @Fmt(day.DayCeVolume > 0 ? (double)day.DayPeVolume / day.DayCeVolume : null, 2)
                     · CE vol @FmtInt(day.DayCeVolume) · PE vol @FmtInt(day.DayPeVolume)
                     · @day.TokensObserved/@day.UniverseTokenCount tokens observed
                     · Since: @(day.ObservationStartUtc is { } since ? FmtIst(since) + " IST" : "—")

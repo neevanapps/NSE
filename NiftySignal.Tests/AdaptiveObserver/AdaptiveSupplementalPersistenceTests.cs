@@ -83,6 +83,62 @@ public sealed class AdaptiveSupplementalPersistenceTests
     }
 
     [Fact]
+    public async Task Mismatch_IsRecordedDurably_SurvivesARestart_AndIsDistinctFromMissing()
+    {
+        await using var db = Database(); var service = Service(); var packages = Packages();
+        foreach (var p in packages.Take(3)) await service.PersistOrVerifyFuturesAsync(db, 1, p, default);
+        var stored = await db.FuturesSupplemental.OrderBy(x => x.BarSeq).FirstAsync();
+        stored.Ofi = (stored.Ofi ?? 0) + 99; await db.SaveChangesAsync(); db.ChangeTracker.Clear();
+        var badBar = stored.BarSeq;
+
+        Assert.Equal(SupplementalOutcome.Mismatch, await service.PersistOrVerifyFuturesAsync(db, 1, packages[0], default));
+        var marker = await db.ProjectionHealth.AsNoTracking().SingleAsync();
+        Assert.Equal((AdaptiveProjectionComponents.FuturesSupplemental, FuturesMicrostructureBar.MetricsVersion, badBar), (marker.Component, marker.Version, marker.BarSeq));
+        Assert.Contains("Ofi", marker.Detail);
+
+        // "Restart": a new service instance with no memory sees the same mismatch again; the durable marker is not duplicated and the row is untouched.
+        db.ChangeTracker.Clear();
+        var restarted = Service();
+        Assert.Equal(SupplementalOutcome.Mismatch, await restarted.PersistOrVerifyFuturesAsync(db, 1, packages[0], default));
+        Assert.Single(await db.ProjectionHealth.ToListAsync());
+        Assert.Equal(stored.Ofi, (await db.FuturesSupplemental.AsNoTracking().SingleAsync(x => x.BarSeq == badBar)).Ofi);
+
+        // Other bars still verify (the degradation is per bar, core is unaffected) and a bar never written is simply missing: no marker for it.
+        Assert.Equal(SupplementalOutcome.Verified, await restarted.PersistOrVerifyFuturesAsync(db, 1, packages[1], default));
+        Assert.Equal(SupplementalOutcome.Inserted, await restarted.PersistOrVerifyFuturesAsync(db, 1, packages[3], default));
+        Assert.Equal(1, await db.ProjectionHealth.CountAsync());
+    }
+
+    [Fact]
+    public async Task OptionsMismatch_AlsoRecordsADurableMarker()
+    {
+        await using var db = Database(); var service = Service();
+        var session = new AdaptiveSessionStateRow
+        {
+            Id = 1, TradeDate = new DateOnly(2026, 10, 8), ModelVersion = "adaptive-v1", SourceBranch = "t", SourceCommitSha = "t", BuildUtc = T0,
+            FutureToken = "FUT", FutureSymbol = "FUT", FutureExpiry = new DateOnly(2026, 10, 29), OpeningWindowStartUtc = T0, OpeningWindowEndUtc = T0,
+            EstimatorName = "V1", CreatedAtUtc = T0, OptionUniverseJson = "[]",
+        };
+        var bar = new OptionsSupplementalBar(
+            CenterStrike: 23000, UnavailableReason: null,
+            CeOiStart: 1, CeOiEnd: 2, CeOiDelta: 1, PeOiStart: 1, PeOiEnd: 2, PeOiDelta: 1,
+            CeMidStart: null, CeMidEnd: null, CeMidDelta: null, PeMidStart: null, PeMidEnd: null, PeMidDelta: null,
+            CePosition: null, PePosition: null, CeIvStart: null, CeIvEnd: null, CeDeltaIv: null, PeIvStart: null, PeIvEnd: null, PeDeltaIv: null,
+            IvSkewStart: null, IvSkewEnd: null, DeltaSkew: null, BarCeQuantity: null, BarPeQuantity: null, VolPcr: null,
+            RollCeQuantity: null, RollPeQuantity: null, RollVolPcr: null, DayCeVolume: 0, DayPeVolume: 0, UniverseTokenCount: 0, TokensObserved: 0,
+            CeMicroDevTimeWeighted: null, CeOfi: null, PeMicroDevTimeWeighted: null, PeOfi: null, CeActivityPerSecond: null, PeActivityPerSecond: null,
+            StraddleMidStart: null, StraddleMidEnd: null, StraddleDelta: null);
+        var package = Packages()[0] with { OptionsSupplemental = bar };
+        Assert.Equal(SupplementalOutcome.Inserted, await service.PersistOrVerifyOptionsAsync(db, session, package, default));
+        var stored = await db.OptionsSupplemental.SingleAsync(); stored.CeOiDelta = 777; await db.SaveChangesAsync(); db.ChangeTracker.Clear();
+
+        Assert.Equal(SupplementalOutcome.Mismatch, await service.PersistOrVerifyOptionsAsync(db, session, package, default));
+        var marker = await db.ProjectionHealth.AsNoTracking().SingleAsync();
+        Assert.Equal((AdaptiveProjectionComponents.OptionsSupplemental, OptionsSupplementalBar.MetricsVersion), (marker.Component, marker.Version));
+        Assert.Equal(777, (await db.OptionsSupplemental.AsNoTracking().SingleAsync()).CeOiDelta);
+    }
+
+    [Fact]
     public async Task RowFromAnotherMetricsVersion_IsNotOverwritten_AndTheCurrentVersionIsInsertedAlongside()
     {
         await using var db = Database(); var service = Service(); var package = Packages()[0];

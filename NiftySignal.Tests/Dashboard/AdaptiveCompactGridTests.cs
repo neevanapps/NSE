@@ -169,6 +169,80 @@ public sealed class AdaptiveCompactGridTests
         Assert.Equal(140.75m, snap.Put!.Quote.Ltp);
     }
 
+    static Tick PxRecv(string token, decimal price, DateTimeOffset exchange, DateTimeOffset received) => new()
+    { Token = token, Exchange = Exchange.Nfo, ExchangeTimestamp = exchange.ToUniversalTime(), ReceivedAt = received.ToUniversalTime(), LastPrice = price };
+
+    static async Task AddTicksAsync(SourceFactory source, params Tick[] ticks)
+    {
+        await using var s = source.CreateDbContext();
+        s.Ticks.AddRange(ticks);
+        await s.SaveChangesAsync();
+    }
+
+    [Fact]
+    public async Task PinnedQuote_DelayedOlderExchangeTick_IsTheLatestCausallyAvailable_EvenBeyondAnyCandidateWindow()
+    {
+        var (source, observer, boundary) = await SeedPinnedAsync();
+        // 400 fresher-by-exchange ticks (all available by B-3s) sit between the delayed tick's exchange time and the boundary, which would
+        // have pushed it out of a fixed 200-row exchange-ordered window. It was RECEIVED at B-2s, so it is the latest available state.
+        var fillers = Enumerable.Range(0, 400).Select(i =>
+        {
+            var at = boundary.AddSeconds(-14).AddMilliseconds(i * 25);
+            return PxRecv("FUT", 25050, at, at);
+        });
+        await AddTicksAsync(source, [.. fillers, PxRecv("FUT", 25111, boundary.AddSeconds(-40), boundary.AddSeconds(-2))]);
+
+        var snap = await new AdaptiveQuoteAsOfService(source, observer).LoadAsync(1, 3);
+        Assert.Equal(25111m, snap.Future!.Quote.Ltp);
+        Assert.Equal(boundary.AddSeconds(-2), snap.Future.AvailableAtUtc);
+    }
+
+    [Fact]
+    public async Task PinnedQuote_ExcludesRowsLaterThanTheBoundaryOnEitherTimestamp()
+    {
+        var (source, observer, boundary) = await SeedPinnedAsync();
+        await AddTicksAsync(source,
+            PxRecv("FUT", 26000, boundary.AddSeconds(1), boundary.AddSeconds(1)),                 // exchange after B
+            PxRecv("FUT", 26100, boundary.AddSeconds(-1), boundary.AddSeconds(1)),                // received after B (exchange before B)
+            PxRecv("FUT", 26200, boundary.AddSeconds(-1), boundary));                             // received exactly at B: available
+        var snap = await new AdaptiveQuoteAsOfService(source, observer).LoadAsync(1, 3);
+        Assert.Equal(26200m, snap.Future!.Quote.Ltp);
+        Assert.Equal(boundary, snap.Future.AvailableAtUtc);
+
+    }
+
+    [Fact]
+    public async Task PinnedQuote_EqualAvailability_IsBrokenByTheHighestSourceId_OnEitherAxis()
+    {
+        var (source, observer, boundary) = await SeedPinnedAsync();
+        var at = boundary.AddSeconds(-1);
+        // Three ticks all available exactly at B-1s: by exchange (lowest Id), by receive time (middle) and again by exchange (highest Id).
+        await AddTicksAsync(source,
+            PxRecv("FUT", 27001, at, at.AddSeconds(-3)),
+            PxRecv("FUT", 27002, at.AddSeconds(-3), at),
+            PxRecv("FUT", 27003, at, at));
+        var snap = await new AdaptiveQuoteAsOfService(source, observer).LoadAsync(1, 3);
+        Assert.Equal(27003m, snap.Future!.Quote.Ltp);
+
+        // Reverse the insertion order for a second token: the highest Id (inserted last) is the receive-axis tick this time.
+        await AddTicksAsync(source,
+            PxRecv("VIX", 15.1m, at, at),
+            PxRecv("VIX", 15.2m, at.AddSeconds(-4), at));
+        Assert.Equal(15.2m, (await new AdaptiveQuoteAsOfService(source, observer).LoadAsync(1, 3)).Vix!.Quote.Ltp);
+    }
+
+    [Fact]
+    public async Task PinnedQuote_DayOpenBaseline_CannotComeFromDataUnavailableAtTheBoundary()
+    {
+        var (source, observer, boundary) = await SeedPinnedAsync();
+        var dayOpen = Open930.AddMinutes(-20);
+        // A wildly different day-open tick with the EARLIEST exchange time that was only received after the boundary (late backfill).
+        await AddTicksAsync(source, PxRecv("SPOT", 20000, dayOpen.AddSeconds(-30), boundary.AddMinutes(1)));
+        var snap = await new AdaptiveQuoteAsOfService(source, observer).LoadAsync(1, 3);
+        Assert.Equal(24987.5m, snap.Spot!.Quote.Ltp);
+        Assert.Equal(87.5m, snap.Spot.Quote.Change);                // still versus the 24900 tick that WAS available at B, not the later-received 20000
+    }
+
     [Fact]
     public async Task PinnedQuote_EarlierBarIsNotRecenteredOrBackfilledFromLaterData()
     {
@@ -416,6 +490,30 @@ public sealed class AdaptiveCompactGridTests
             "+100", "-100", "CallLongBuild", "PutShortCover", "+3.00", "+2.75", "+1.25", "0.80", "1.10"], rows[0]);
         Assert.Equal(["11", "09:41:00", "Unavailable: fixture option quotes missing"], rows[1]);
         Assert.Equal(["—", "—", "—", "—", "—", "—", "—", "—", "—"], FirstRows(html, 1, 3)[2][14..23]);
+    }
+
+    [Fact]
+    public async Task KnownInvalidSidecarBars_AreWithheldAsUnavailable_WithAVisibleNotice_AndCoreRowsAreUnaffected()
+    {
+        var factory = await SeedGridAsync();
+        await using (var db = factory.CreateDbContext())
+        {
+            db.ProjectionHealth.Add(new() { SessionId = 1, Component = AdaptiveProjectionComponents.FuturesSupplemental, Version = FuturesMicrostructureBar.MetricsVersion, BarSeq = 12, Detail = "Ofi differs", DetectedAtUtc = Open930 });
+            db.ProjectionHealth.Add(new() { SessionId = 1, Component = AdaptiveProjectionComponents.OptionsSupplemental, Version = OptionsSupplementalBar.MetricsVersion, BarSeq = 12, Detail = "CeOiDelta differs", DetectedAtUtc = Open930 });
+            await db.SaveChangesAsync();
+        }
+
+        var html = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new()
+        { ["CaptureMode"] = true, ["CaptureSessionId"] = 1L, ["CaptureBarSeq"] = 12 });
+
+        Assert.Contains("failed replay verification and are withheld", html);
+        var futures = FirstRows(html, 0, 1)[0];
+        Assert.Equal(["—", "—"], futures[11..13]);                          // MicroDev / OFI withheld, never shown as stored values or zero
+        Assert.Equal("-777", futures[8]);                                   // core rolling values for the same bar are untouched
+        var options = FirstRows(html, 1, 1)[0];
+        Assert.Equal(["—", "—", "—", "—", "—", "—", "—", "—", "—"], options[14..23]);   // options sidecar columns withheld
+        Assert.Equal("+321", options[8]);                                   // core band values for the same bar are untouched
+        Assert.DoesNotContain("-400", html);
     }
 
     [Fact]

@@ -9,7 +9,12 @@ namespace NiftySignal.Dashboard.Services;
 public sealed record AdaptiveCommentaryPanelModel(
     long? SessionId,
     AdaptiveCommentaryRuntimeRow? Runtime,
-    IReadOnlyList<AdaptiveCommentaryEventRow> Events);
+    IReadOnlyList<AdaptiveCommentaryEventRow> Events,
+    // Durable replay-mismatch markers: when present, commentary is stopped and must not be read as healthy.
+    IReadOnlyList<AdaptiveProjectionHealthRow>? Degraded = null)
+{
+    public bool IsDegraded => Degraded is { Count: > 0 };
+}
 
 /// <summary>Read-only projection of the persisted commentary store. A missing commentary table means "nothing to show", never a failed Dashboard.</summary>
 public sealed class AdaptiveCommentaryDataService(IDbContextFactory<AdaptiveObserverDbContext> dbFactory)
@@ -27,10 +32,14 @@ public sealed class AdaptiveCommentaryDataService(IDbContextFactory<AdaptiveObse
                 .OrderByDescending(x => x.Id).FirstOrDefaultAsync(ct);
             if (session is null) return new AdaptiveCommentaryPanelModel(null, null, []);
 
-            var runtime = await db.CommentaryRuntime.AsNoTracking().SingleOrDefaultAsync(x => x.SessionId == session.Id, ct);
-            var events = await db.CommentaryEvents.AsNoTracking().Where(x => x.SessionId == session.Id)
+            var version = NiftySignal.AdaptiveObserver.Commentary.CommentaryEvaluator.Version;
+            var runtime = await db.CommentaryRuntime.AsNoTracking().SingleOrDefaultAsync(x => x.SessionId == session.Id && x.CommentaryVersion == version, ct);
+            var events = await db.CommentaryEvents.AsNoTracking().Where(x => x.SessionId == session.Id && x.CommentaryVersion == version)
                 .OrderByDescending(x => x.BarSeq).ThenByDescending(x => x.Id).Take(Math.Clamp(count, 1, 50)).ToListAsync(ct);
-            return new AdaptiveCommentaryPanelModel(session.Id, runtime, events);
+            var degraded = await db.ProjectionHealth.AsNoTracking()
+                .Where(x => x.SessionId == session.Id && x.Component == AdaptiveProjectionComponents.Commentary && x.Version == version)
+                .OrderBy(x => x.BarSeq).ToListAsync(ct);
+            return new AdaptiveCommentaryPanelModel(session.Id, runtime, events, degraded);
         }
         catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedTable)
         {

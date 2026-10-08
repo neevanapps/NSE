@@ -368,18 +368,26 @@ public static class CommentaryEvaluator
     {
         var changed = previousBias != bias;
         var (notify, reason) = TelegramPolicy(lifecycle, previousBias, bias);
-        var severity = notify ? CommentarySeverity.High : lifecycle == CommentaryLifecycle.New ? CommentarySeverity.Medium : CommentarySeverity.Info;
+        // Severity is Dashboard presentation and is deliberately independent of Telegram eligibility: narrowing what Telegram sends must not change what the Dashboard shows.
+        var high = lifecycle is CommentaryLifecycle.Confirmed or CommentaryLifecycle.Flipped
+            || (lifecycle != CommentaryLifecycle.Resolved && previousBias != EventBias.Neutral && bias != previousBias);
+        var severity = high ? CommentarySeverity.High : lifecycle == CommentaryLifecycle.New ? CommentarySeverity.Medium : CommentarySeverity.Info;
         var draft = new CommentaryEvent(f.SessionId, f.TradeDate, f.BarSeq, f.BarEndAvailableAtUtc, type, bias, regime, lifecycle, agreement, severity,
             previousBias, changed, primary, confirmations, contradictions, quality, notify, reason, Version, string.Empty);
         return draft with { RenderedCommentary = CommentaryRenderer.Render(draft) };
     }
 
-    /// <summary>V1 conservative Telegram eligibility (plan section 60.1): Confirmed, Flipped, or a directional-to-different bias change from a non-Resolved event.</summary>
+    /// <summary>
+    /// V1 conservative Telegram eligibility (plan section 60.1): Confirmed, Flipped, or a true direct LONG&lt;-&gt;SHORT reversal that is not
+    /// already a Flipped event. A move to or from Neutral (LONG/SHORT to NEUTRAL, ordinary New, Strengthening, Weakening, absorption,
+    /// FlowConflict, FamilyConflict, Resolved) is never sent; the Dashboard still persists and shows every event.
+    /// </summary>
     public static (bool Notify, string? Reason) TelegramPolicy(CommentaryLifecycle lifecycle, EventBias previousBias, EventBias bias)
     {
         if (lifecycle == CommentaryLifecycle.Confirmed) return (true, "Confirmed");
         if (lifecycle == CommentaryLifecycle.Flipped) return (true, "Flipped");
-        if (lifecycle != CommentaryLifecycle.Resolved && previousBias != EventBias.Neutral && bias != previousBias) return (true, "BiasChanged");
+        if (lifecycle != CommentaryLifecycle.Resolved && previousBias is EventBias.Long or EventBias.Short
+            && bias is EventBias.Long or EventBias.Short && bias != previousBias) return (true, "DirectReversal");
         return (false, null);
     }
 }

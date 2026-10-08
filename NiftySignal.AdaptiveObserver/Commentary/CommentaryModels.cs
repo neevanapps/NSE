@@ -133,7 +133,7 @@ public sealed record CommentaryEvent(
     string RenderedCommentary)
 {
     /// <summary>Deterministic idempotency identity: SessionId + BarSeq + EventType + Lifecycle + Bias.</summary>
-    public string Identity => $"{SessionId}:{BarSeq}:{EventType}:{Lifecycle}:{EventBias}";
+    public string Identity => $"{CommentaryVersion}:{SessionId}:{BarSeq}:{EventType}:{Lifecycle}:{EventBias}";
 }
 
 /// <summary>Result of evaluating one bar. <see cref="Event"/> is null for NoMaterialEvent and for unchanged continuation; the state still advances.</summary>

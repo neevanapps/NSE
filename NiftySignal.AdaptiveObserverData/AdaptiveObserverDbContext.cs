@@ -16,6 +16,7 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
     public DbSet<AdaptiveObserverRuntimeRow> Runtime => Set<AdaptiveObserverRuntimeRow>();
     public DbSet<AdaptiveScreenshotJobRow> ScreenshotJobs => Set<AdaptiveScreenshotJobRow>();
     public DbSet<AdaptiveFuturesSupplementalRow> FuturesSupplemental => Set<AdaptiveFuturesSupplementalRow>();
+    public DbSet<AdaptiveProjectionHealthRow> ProjectionHealth => Set<AdaptiveProjectionHealthRow>();
     public DbSet<AdaptiveCommentaryEventRow> CommentaryEvents => Set<AdaptiveCommentaryEventRow>();
     public DbSet<AdaptiveCommentaryRuntimeRow> CommentaryRuntime => Set<AdaptiveCommentaryRuntimeRow>();
     public DbSet<AdaptiveCommentaryNotificationJobRow> CommentaryNotificationJobs => Set<AdaptiveCommentaryNotificationJobRow>();
@@ -129,6 +130,15 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
             e.Property(x => x.MetricsVersion).HasMaxLength(64);
             e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
         });
+        modelBuilder.Entity<AdaptiveProjectionHealthRow>(e =>
+        {
+            e.ToTable("adaptive_projection_health");
+            e.HasIndex(x => new { x.SessionId, x.Component, x.Version, x.BarSeq }).IsUnique();
+            e.Property(x => x.Component).HasMaxLength(32);
+            e.Property(x => x.Version).HasMaxLength(64);
+            e.Property(x => x.Detail).HasMaxLength(512);
+            e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
+        });
         modelBuilder.Entity<AdaptiveCommentaryEventRow>(e =>
         {
             e.ToTable("adaptive_commentary_events");
@@ -165,7 +175,7 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
         modelBuilder.Entity<AdaptiveCommentaryRuntimeRow>(e =>
         {
             e.ToTable("adaptive_commentary_runtime");
-            e.HasIndex(x => x.SessionId).IsUnique();
+            e.HasIndex(x => new { x.SessionId, x.CommentaryVersion }).IsUnique();
             e.Property(x => x.CurrentEventType).HasConversion<string>().HasMaxLength(40);
             e.Property(x => x.CurrentBias).HasConversion<string>().HasMaxLength(16);
             e.Property(x => x.CurrentRegime).HasConversion<string>().HasMaxLength(16);

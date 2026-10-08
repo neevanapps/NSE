@@ -55,12 +55,6 @@ public sealed class AdaptiveQuoteAsOfService(
 {
     static readonly TimeSpan IstOffset = TimeSpan.FromHours(5.5);
 
-    /// <summary>
-    /// Candidate window per token, newest exchange timestamps first. Option/index ticks arrive a few per second at most, so the
-    /// window comfortably spans the second containing the boundary; it exists to keep the query on the (Token, ExchangeTimestamp) index.
-    /// </summary>
-    const int CandidateWindow = 200;
-
     public async Task<PinnedQuoteSnapshot> LoadAsync(long? sessionId, int targetBarSeq, CancellationToken ct = default)
     {
         if (sessionId is not { } id) return PinnedQuoteSnapshot.Unavailable("No adaptive session is pinned to this capture.");
@@ -116,20 +110,44 @@ public sealed class AdaptiveQuoteAsOfService(
         return new PinnedQuoteSnapshot(boundary, null, spot, future, vix, centerStrike, centerStrike, call, put);
     }
 
+    /// <summary>
+    /// Latest tick causally available at <paramref name="boundary"/> (AvailableAt = max(Exchange, Received) &lt;= boundary), deterministic Id
+    /// tie-break, with no candidate window. Exact and index-friendly: a tick is eligible iff BOTH timestamps are &lt;= boundary, and the maximum
+    /// of max(E,R) over the eligible set is always reached by either the eligible tick with the greatest ExchangeTimestamp or the eligible tick
+    /// with the greatest ReceivedAt (whichever of a row's two timestamps is larger, the top row on that same axis is at least as available).
+    /// Each is a single ordered probe on its own index; the Id tie-break is then resolved among rows whose availability equals that maximum.
+    /// </summary>
+    internal static async Task<Tick?> LatestAvailableAsync(NiftySignalDbContext db, string token, DateTimeOffset dayStartUtc, DateTimeOffset boundary, CancellationToken ct)
+    {
+        IQueryable<Tick> Eligible() => db.Ticks.AsNoTracking()
+            .Where(t => t.Token == token && t.LastPrice > 0m && t.ExchangeTimestamp >= dayStartUtc
+                && t.ExchangeTimestamp <= boundary && t.ReceivedAt <= boundary);
+
+        var byExchange = await Eligible().OrderByDescending(t => t.ExchangeTimestamp).ThenByDescending(t => t.Id).FirstOrDefaultAsync(ct);
+        if (byExchange is null) return null;                    // nothing eligible at all
+        // Only a tick received at/after the exchange-ordered winner's availability can beat it, so the ReceivedAt probe is confined to the
+        // short [availability, boundary] range of the (non-token-prefixed) ReceivedAt index instead of walking back through other tokens.
+        var floor = AsOfTickSelector.AvailableAt(byExchange);
+        var byReceived = await Eligible().Where(t => t.ReceivedAt >= floor).OrderByDescending(t => t.ReceivedAt).ThenByDescending(t => t.Id).FirstOrDefaultAsync(ct);
+        var maxAvailable = byReceived is null ? floor : new[] { floor, AsOfTickSelector.AvailableAt(byReceived) }.Max();
+
+        // Rows whose availability equals the maximum have ExchangeTimestamp == max (ReceivedAt <= max) or ReceivedAt == max (ExchangeTimestamp <= max).
+        var atExchange = await Eligible().Where(t => t.ExchangeTimestamp == maxAvailable && t.ReceivedAt <= maxAvailable)
+            .OrderByDescending(t => t.Id).FirstOrDefaultAsync(ct);
+        var atReceived = await Eligible().Where(t => t.ReceivedAt == maxAvailable && t.ExchangeTimestamp <= maxAvailable)
+            .OrderByDescending(t => t.Id).FirstOrDefaultAsync(ct);
+        return new[] { atExchange, atReceived }.Where(t => t is not null).OrderByDescending(t => t!.Id).FirstOrDefault();
+    }
+
     static async Task<PinnedQuote?> QuoteAsync(NiftySignalDbContext db, string token,
         DateTimeOffset dayStartUtc, DateTimeOffset boundary, CancellationToken ct)
     {
-        var candidates = await db.Ticks.AsNoTracking()
-            .Where(t => t.Token == token && t.ExchangeTimestamp >= dayStartUtc && t.ExchangeTimestamp <= boundary
-                && t.ReceivedAt <= boundary)
-            .OrderByDescending(t => t.ExchangeTimestamp).ThenByDescending(t => t.Id)
-            .Take(CandidateWindow).ToListAsync(ct);
-        var latest = AsOfTickSelector.Latest(candidates, boundary);
+        var latest = await LatestAvailableAsync(db, token, dayStartUtc, boundary, ct);
         if (latest is null) return null;
 
-        // Same day-open baseline definition as live mode: the first tick of the trade day.
+        // Day-open baseline: the first tick of the trade day THAT WAS AVAILABLE by the boundary (a tick received after it is unknown to this capture).
         var open = await db.Ticks.AsNoTracking()
-            .Where(t => t.Token == token && t.ExchangeTimestamp >= dayStartUtc && t.ExchangeTimestamp <= boundary)
+            .Where(t => t.Token == token && t.ExchangeTimestamp >= dayStartUtc && t.ExchangeTimestamp <= boundary && t.ReceivedAt <= boundary)
             .OrderBy(t => t.ExchangeTimestamp).ThenBy(t => t.Id)
             .Select(t => (decimal?)t.LastPrice).FirstOrDefaultAsync(ct);
         var depth = latest.Depth;

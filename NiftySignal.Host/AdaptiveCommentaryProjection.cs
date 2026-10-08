@@ -28,6 +28,16 @@ public sealed class AdaptiveCommentaryFrameLoader
         var optionsSupplemental = await db.OptionsSupplemental.AsNoTracking()
             .SingleOrDefaultAsync(x => x.SessionId == session.Id && x.BarSeq == barSeq && x.MetricsVersion == optionsVersion, ct);
 
+        // A sidecar bar that failed its replay verification is known-invalid (durable marker): commentary treats it exactly like a missing
+        // sidecar (unavailable evidence), never as trustworthy input. The stored row is left untouched.
+        var invalid = await db.ProjectionHealth.AsNoTracking()
+            .Where(x => x.SessionId == session.Id && x.BarSeq == barSeq
+                && ((x.Component == AdaptiveProjectionComponents.FuturesSupplemental && x.Version == futuresVersion)
+                    || (x.Component == AdaptiveProjectionComponents.OptionsSupplemental && x.Version == optionsVersion)))
+            .Select(x => x.Component).ToListAsync(ct);
+        if (invalid.Contains(AdaptiveProjectionComponents.FuturesSupplemental)) futuresSupplemental = null;
+        if (invalid.Contains(AdaptiveProjectionComponents.OptionsSupplemental)) optionsSupplemental = null;
+
         // Primary residual view for commentary is ATM±2 (plan section 69). The previous bar is needed for adjacent-bar deltas.
         var residuals = await db.OptionResidualBars.AsNoTracking()
             .Where(x => x.SessionId == session.Id && x.Variant == ResidualVariant.AtmPlusMinus2 && (x.BarSeq == barSeq || x.BarSeq == barSeq - 1))

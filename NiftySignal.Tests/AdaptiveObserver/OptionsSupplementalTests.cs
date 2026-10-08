@@ -9,7 +9,7 @@ using NiftySignal.Pricing;
 
 namespace NiftySignal.Tests.AdaptiveObserver;
 
-/// <summary>08-Oct plan Slice 3: center-contract options observations (options-supp-v1) and the shared residual projection.</summary>
+/// <summary>08-Oct plan Slice 3: center-contract options observations (options-supp-v2) and the shared residual projection.</summary>
 public sealed class OptionsSupplementalTests
 {
     // ---- freshness rule is the existing one, not a second threshold ----
