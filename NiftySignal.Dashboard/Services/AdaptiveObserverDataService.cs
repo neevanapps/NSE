@@ -156,13 +156,16 @@ public sealed class AdaptiveObserverDataService(
             .Where(x => !invalidFutures.Contains(x.Key)).ToDictionary(x => x.Key, x => x.Value);
         var optionsSupplemental = (await LoadOptionsSupplementalAsync(db, session.Id, seqs, ct))
             .Where(x => !invalidOptions.Contains(x.Key)).ToDictionary(x => x.Key, x => x.Value);
+        var invalidBasis = await LoadInvalidBarsAsync(db, session.Id, AdaptiveProjectionComponents.BasisSupplemental, FuturesBasisBar.MetricsVersion, seqs, ct);
+        var basisSupplemental = (await LoadBasisSupplementalAsync(db, session.Id, seqs, ct))
+            .Where(x => !invalidBasis.Contains(x.Key)).ToDictionary(x => x.Key, x => x.Value);
         return new AdaptiveObserverSnapshot(session, runtime, futures, options, residuals, anchors,
             await LoadValidBarCountAsync(db, session, runtime.LastCompletedBarSeq, ct),
             futuresSupplemental,
             optionsSupplemental,
             seqs.Length == 0 ? [] : await db.OptionResidualBars.AsNoTracking()
                 .Where(x => x.SessionId == session.Id && x.BarSeq == seqs.Min() - 1).ToListAsync(ct),
-            invalidFutures, invalidOptions);
+            invalidFutures, invalidOptions, basisSupplemental, invalidBasis);
     }
 
     /// <summary>Bars (of the displayed range) whose sidecar carries a durable failed-verification marker. Tolerates a not-yet-migrated schema.</summary>
@@ -180,6 +183,25 @@ public sealed class AdaptiveObserverDataService(
         catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedTable)
         {
             return new HashSet<int>();
+        }
+    }
+
+    /// <summary>Basis sidecar read (approved 5-second freshness already applied to the stored values); same missing-relation tolerance.</summary>
+    static async Task<IReadOnlyDictionary<int, AdaptiveBasisSupplementalRow>> LoadBasisSupplementalAsync(
+        AdaptiveObserverDbContext db, long sessionId, int[] seqs, CancellationToken ct)
+    {
+        if (seqs.Length == 0) return new Dictionary<int, AdaptiveBasisSupplementalRow>();
+        try
+        {
+            var version = FuturesBasisBar.MetricsVersion;
+            var rows = await db.BasisSupplemental.AsNoTracking()
+                .Where(x => x.SessionId == sessionId && x.MetricsVersion == version && seqs.Contains(x.BarSeq))
+                .ToListAsync(ct);
+            return rows.ToDictionary(x => x.BarSeq);
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedTable)
+        {
+            return new Dictionary<int, AdaptiveBasisSupplementalRow>();
         }
     }
 

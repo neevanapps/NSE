@@ -24,7 +24,7 @@ It does **not** authorize any change to live trading, entry/exit logic, scoring,
 2. **Residual deltas.** The persisted `AdaptiveOptionResidualBarRow.ResidualDelta` keeps its legacy gap-bridging behaviour unchanged (renamed "Legacy Bridged Directional Δ" in diagnostic presentation). All NEW residual deltas and all commentary use adjacent-bar semantics (sections 34, 35). Residual supplemental values are derived by one shared pure projection, not a sidecar table (section 32.4).
 3. **Day Vol PCR.** Nothing is labelled or displayed as full-chain Day Vol PCR until full-chain coverage is proven. A diagnostic "Observer-Universe Day Vol PCR" may be computed and persisted (sections 25.3–25.5).
 4. **Option freshness.** New Position / ΔIV / IV Skew metrics reuse the existing 5-second option quote freshness (section 24.5). No second threshold.
-5. **Basis / spot.** Spot enters the observer as an isolated causal input that must not change any existing adaptive output. ΔBasis stays hidden/unavailable until the spot freshness rule has been measured and approved by the project owner (section 9.6).
+5. **Basis / spot.** Spot enters the observer as an isolated causal input that must not change any existing adaptive output. The project owner approved the spot freshness rule: **5 seconds, inclusive, no late-session exception** (section 9.6). ΔBasis is shown, and the Basis evidence family is available, only when both bar boundaries have a spot no older than 5 seconds; otherwise it is unavailable.
 6. **Rolling-input availability.** Commentary primary events never fire when their mandatory rolling futures inputs are unavailable; missing external evidence is neither support nor contradiction (sections 48, 53).
 7. **Pinned screenshot.** The Telegram screenshot uses one shared `LiveQuotePanel` component with a deterministic as-of data source pinned to `TargetBarSeq` (section 18).
 8. **Commentary.** `NoMaterialEvent`, exact regime/lifecycle rules, no time-based regime expiry, `EvidenceAgreement` (never "Confidence"), conservative Telegram policy (sections 44–69).
@@ -39,7 +39,7 @@ The grids described in sections 2/15 (Futures), 20 (Options) and 32 (Residual) a
 |---|---|---|---|
 | 1 | Seq, End IST, Dur s, Urgency (derived), Bar ΔPx, Roll ΔPx, Strict Δ, Enriched Δ, Roll Strict, Roll Enriched, \|Strict\| Δ, Roll OI Δ (renamed), Roll Efficiency, Evolution, State | Seq, End IST, Center, Roll?, CE/PE ΔPx, CE/PE Roll ΔPx, CE/PE contract Strict Δ, CE/PE contract Enriched Δ, CE/PE contract Roll Strict | Seq, End IST, Future Δ09:30, CE Res %, PE Res %, Directional Res %, Direction, Relation, Quote Age |
 | 2A | MicroDev, OFI | — | — |
-| 2B | ΔBasis — only after the freshness rule is approved | — | — |
+| 2B | ΔBasis (5-second spot freshness rule approved) | | |
 | 3 | — | center CE/PE OI Δ, CE/PE Position, CE/PE ΔIV, IV Skew, Vol PCR, Roll Vol PCR | CE Res Δ%, PE Res Δ%, Adjacent Directional Res Δ, Straddle Res % |
 | 4A–4C | Commentary domain, persistence, Dashboard panel, Telegram policy | | |
 
@@ -47,7 +47,7 @@ The Dashboard keeps the full pre-existing wide tables available behind an explic
 
 ## 0.4 IMPLEMENTATION BLOCKERS / DEFERRED ITEMS
 
-1. **ΔBasis display** — blocked until (a) spot is plumbed with proof that no existing adaptive output changes, (b) the spot age/inter-arrival distribution (p50/p90/p95/p99/max during market hours) is reported, and (c) the project owner approves one explicit freshness rule. Until then ΔBasis is hidden/unavailable and the Basis evidence family counts as neither support nor contradiction.
+1. **ΔBasis display — RESOLVED (Slice 2B).** Spot is plumbed with replay proof that no existing adaptive output changes; the spot age distribution was reported (spot_age_report2: p50 0.07 s, p99 11.3 s, stale only around 15:15-15:20 and 15:28-15:30 IST); the project owner approved **one explicit freshness rule: spot age <= 5 seconds, no late-window exception, no nearest-future spot selection**. ΔBasis is displayed and the Basis evidence family is wired from the persisted `futures-basis-v2` sidecar; a stale or missing boundary leaves it unavailable (neither support nor contradiction).
 2. **Full-chain Day Vol PCR** — blocked until full nearest-expiry option-chain cumulative-volume coverage is proven. Only the explicitly labelled Observer-Universe diagnostic may exist meanwhile.
 3. **Deployment** — nothing in this plan is deployed; no VM change is authorized. The migration/deploy ordering contract is in section 71.
 4. **Telegram commentary beyond the V1 conservative set** (ordinary New / Strengthening / Weakening / Absorption) — deferred until the notification-noise replay report (section 73) has been reviewed.
@@ -96,7 +96,7 @@ This is the final target layout. The grid displays only the columns whose slice 
 | 12 | **MicroDev** | New (Slice 2A) | Time-weighted microprice deviation from midpoint inside the bar |
 | 13 | **OFI** | New (Slice 2A) | Raw top-of-book order-flow imbalance accumulated inside the bar |
 | 14 | **Roll OI Δ** | Existing, rename label | Net futures OI change across the rolling window |
-| 15 | **ΔBasis** | New (Slice 2B; hidden until freshness rule approved) | Change in futures-minus-spot basis during the bar |
+| 15 | **ΔBasis** | New (Slice 2B; shown only when both boundaries pass the approved 5-second spot freshness rule) | Change in futures-minus-spot basis during the bar |
 | 16 | **Roll Efficiency** | Existing | How efficiently the rolling path converts movement into net displacement |
 | 17 | **Evolution** | Existing | Existing Strict-dominance evolution label |
 | 18 | **State** | Existing | Existing adaptive state label |
@@ -631,20 +631,21 @@ Retain:
 - ΔBasis;
 - spot age/freshness diagnostics.
 
-## 9.6 Spot freshness — BLOCKER (section 0.4 item 1)
+## 9.6 Spot freshness — APPROVED: 5 seconds
 
-Basis quality depends on spot freshness. The plan records, per basis state:
+Basis quality depends on spot freshness. For every basis state:
 
     SpotAge_t = BasisStateTime_t - LastSpotAvailableAt_t
 
-**No freshness threshold is frozen.** Implementation must not invent one. The required sequence is:
+**Approved threshold: 5 seconds (inclusive). No late-window exception (no different threshold at 15:15+). No nearest-future / look-ahead spot selection.** A basis state is usable at an instant only when `0 <= SpotAge <= 5 s`; otherwise Basis/ΔBasis is unavailable (null, never zero).
 
-1. Identify the correct persisted NIFTY spot/index instrument and freeze it per session in the supplemental session table (section 71.3). If a unique valid spot instrument cannot be resolved, Basis is unavailable for that session; the instrument is never silently switched mid-session.
-2. Add spot to the causal observer projection **without letting it influence futures exact-volume bar construction**, and prove with tests/replay that bar boundaries, `BarSeq`, OHLC, volume, Strict/Enriched, rolling state and option-bar boundaries are value-equivalent before and after spot is added.
-3. Report the actual persisted spot age / inter-arrival distribution (p50, p90, p95, p99, max) during market hours from the available sessions, and recommend a freshness rule based on that evidence.
-4. **Stop and obtain the project owner's approval of the threshold.** Only then may ΔBasis be shown and enabled as a commentary evidence family.
+Required properties (all implemented in Slice 2B):
 
-Until approved, Basis/ΔBasis is unavailable and the Basis family is neither support nor contradiction in commentary.
+1. **Frozen spot identity.** The unique NIFTY Index instrument of the trade date is resolved once per session and frozen in `adaptive_session_supplemental` (key `SessionId` + `MetricsVersion = session-supplemental-v1`; `SpotToken`, `SpotSymbol`, `ResolutionProvenance`, `ResolvedAtUtc`). If a unique valid instrument cannot be resolved, Basis is unavailable for the session; the identity (including the "unresolved" outcome) is reused unchanged after every restart and the instrument is never switched mid-session. The pinned Telegram capture uses this frozen spot identity (sessions without one fall back to the unique Index in the instrument master).
+2. **Isolated causal input.** The frozen spot token joins the observer's read/replay universe, but spot ticks bypass the engine's ordering/identity checks and the exact-volume bar builder: bar boundaries, `BarSeq`, OHLC, volume, Strict/Enriched, rolling state, Weak2, option bands and residuals are value-equivalent with and without spot (proved by unit tests and by full-session replay hashes; section 77). Sequencing stays `AvailableAt`, then source Id; spot at the same instant as a futures tick is applied first.
+3. **Basis state.** `Basis = FuturePrice - SpotPrice` from the latest causally available future and spot; a new state is recorded whenever either price changes (once both exist).
+4. **Per completed bar (`futures-basis-v2`, table `adaptive_basis_supplemental_bars`).** `BasisStart` / `BasisEnd` are the states in force at the bar boundaries, each unavailable when the spot is older than 5 s at that boundary; `DeltaBasis = BasisEnd - BasisStart` only when both are available; `BasisTimeWeighted` averages only the fresh part of each interval (a state is fresh until its spot turns 5 s old); spot age at start/end/max, state changes, covered/uncovered seconds and a boundary `Status` (Usable / NoState / StaleStart / StaleEnd / StaleBoth) are stored. Mismatch handling reuses `adaptive_projection_health` (component `basis-supplemental`); unknown integrity caps commentary exactly like the other sidecars.
+5. **Display and commentary.** Only `ΔBasis` (signed raw index points, `—` when unavailable) is shown in the compact Futures grid (after Roll OI Δ, before Roll Efficiency); the Diagnostic view adds basis status, spot age and covered seconds. The InterMarketBasis commentary family reads the persisted current-version `DeltaBasis` (Long if > 0, Short if < 0, otherwise unavailable/neutral per section 54); no other commentary rule changed.
 
 # 10. Why MicroDev, OFI and ΔBasis are not duplicates
 
@@ -815,7 +816,7 @@ When implementation eventually starts, it must prove:
 
 # 15. FINAL TARGET compact futures-grid layout
 
-Displayed only as slices land (section 0.3). ΔBasis is omitted until its freshness rule is approved.
+Displayed only as slices land (section 0.3). ΔBasis is shown only when both bar boundaries pass the approved 5-second spot freshness rule; otherwise it is unavailable.
 
 Recommended visible order:
 
@@ -858,7 +859,7 @@ As of **08 October 2026**:
 - Calculate TOB on every unique valid book state, time-weighted per bar, but do not display it initially.
 - Show **MicroDev** instead of TOB to avoid redundant live columns.
 - Show raw **OFI** from Level-1 book changes.
-- Calculate spot–futures basis causally through the bar; show **ΔBasis** only after its spot freshness rule is measured and approved (section 9.6); retain absolute/time-weighted basis internally.
+- Calculate spot–futures basis causally through the bar; show **ΔBasis** only when both boundaries satisfy the approved 5-second spot freshness rule (section 9.6); retain absolute/time-weighted basis internally.
 - Show **Roll Efficiency**.
 - Do not add RSI/MACD/Bollinger/ADX or similar technical-indicator columns.
 - Do not add a composite score.
@@ -868,7 +869,7 @@ As of **08 October 2026**:
 
 The open items listed here on 08 Oct have been resolved as follows:
 
-1. **Spot freshness rule** — not frozen; measured-then-approved process in section 9.6 (blocker 0.4.1).
+1. **Spot freshness rule** — approved and frozen at 5 seconds (section 9.6; former blocker 0.4.1 is resolved).
 2. **MicroDev display precision** — raw futures price points only in V1.
 3. **Persistence of new metrics** — versioned sidecar tables with insert-if-missing / verify-if-present recovery (section 71). Urgency is not persisted; residual supplemental values come from a shared pure projection (section 32.4).
 4. **Dashboard UX** — compact grid by default plus an explicit Diagnostic view toggle that restores the existing wide tables (section 0.3).
@@ -1488,7 +1489,7 @@ As of **08 October 2026**:
 
 # 30. Former open items — resolutions
 
-1. **Futures basis spot freshness** — measured-then-approved process (section 9.6); blocker 0.4.1.
+1. **Futures basis spot freshness** — approved at 5 seconds, no late-window exception (section 9.6).
 2. **Option quote freshness** — 5 seconds, reused (section 24.5).
 3. **Day PCR coverage** — full-chain deferred; Observer-Universe diagnostic only (sections 25.3–25.5).
 4. **Persistence vs recomputation** — versioned sidecar tables; residual supplemental values via a shared pure projection (sections 32.4, 71).
@@ -2445,7 +2446,7 @@ Each family has a direction in {Long, Short, Neutral} or is Unavailable. Definit
 
 - **FuturesCore** — Long if `BuyAligned`; Short if `SellAligned`; otherwise Neutral. Price response and OI are part of the primary-event definitions, not of the family direction. Unavailable if an alignment input is unavailable.
 - **Book** — Long if (OFI > 0 or MicroDev > 0) and neither is < 0; Short if (OFI < 0 or MicroDev < 0) and neither is > 0; Neutral if they disagree or both are zero; Unavailable if both are unavailable. OFI and MicroDev together count as one family.
-- **InterMarketBasis** — Long if ΔBasis > 0; Short if < 0; Neutral if 0; Unavailable while ΔBasis is unavailable (including until the spot freshness rule is approved, section 9.6).
+- **InterMarketBasis** — Long if ΔBasis > 0; Short if < 0; Neutral if 0; Unavailable while ΔBasis is unavailable (a boundary missing or its spot older than the approved 5 seconds, section 9.6).
 - **Options** — Long if strong LONG options support (section 50.1) holds and strong SHORT support (50.2) does not; Short if 50.2 holds and 50.1 does not; Neutral if both hold, or neither holds while Position/flow inputs are available; Unavailable if no Position/flow inputs are available for either side.
 - **Residual** — Long if `DirectionalResidualPct` > 0; Short if < 0; Neutral if 0; Unavailable if the residual reading is unavailable. The adjacent delta is explanatory context and does not change the family direction.
 
@@ -3200,7 +3201,8 @@ No undocumented fallback or silently different calculation is acceptable.
 Conceptual tables (final column lists are recorded in the migrations and in each slice report):
 
 - `adaptive_session_supplemental` — one row per session (section 71.3).
-- `adaptive_futures_supplemental_bars` — Slice 2A: TOB start / time-weighted / end / change / min / max, MicroDev start / time-weighted / end / change, raw OFI, OFI transition count, valid-book coverage duration, invalid/crossed-book count and duration. Slice 2B adds basis start / time-weighted / end, ΔBasis, spot ages and a basis status.
+- `adaptive_futures_supplemental_bars` — Slice 2A: TOB start / time-weighted / end / change / min / max, MicroDev start / time-weighted / end / change, raw OFI, OFI transition count, valid-book coverage duration, invalid/crossed-book count and duration. Slice 2B adds basis in its own table (below).
+- `adaptive_basis_supplemental_bars` — Slice 2B (`futures-basis-v2`): basis start / time-weighted / end, ΔBasis, spot age start/end/max, state changes, covered/uncovered seconds and boundary status; the 5-second spot freshness rule is applied to the stored boundary values (section 9.6).
 - `adaptive_options_supplemental_bars` — Slice 3: center OI start/end/Δ and midpoints per side, Position per side, IV start/end/Δ per side, IV skew start/end/ΔSkew, Vol PCR and its rolling components, center CE/PE MicroDev and OFI, ATM±2 CE/PE Activity/s, center Straddle Δ, and the Observer-Universe Day Vol PCR fields (cumulative CE volume, cumulative PE volume, token/strike universe count, observation start, coverage status).
 - Commentary tables (Slice 4B) are separate (sections 56–57, 61).
 - No residual sidecar (section 32.4); no Urgency column (section 5.2).
@@ -3232,7 +3234,7 @@ Work is split into independently shippable, stacked branches (names may vary; ea
     adaptive-08oct-plan          this plan (plan-only commit)
       adaptive-08oct-s1          Slice 1 — safe Dashboard compaction + pinned Live Quote
         adaptive-08oct-s2a       Slice 2A — futures microstructure sidecar (TOB, MicroDev, OFI)
-          adaptive-08oct-s2b-basis   Slice 2B — spot plumbing / audit (STOP before the freshness threshold)
+          adaptive-08oct-s2b-basis   Slice 2B original (raw basis sidecar, preserved); re-implemented with the approved 5-second rule on the integration branch
           adaptive-08oct-s3      Slice 3 — options sidecar + shared pure residual projection (not blocked by 2B)
             adaptive-08oct-s4a   Slice 4A — commentary pure domain
               adaptive-08oct-s4b   Slice 4B — commentary persistence + projection integration
@@ -3253,7 +3255,7 @@ Slice contents:
 # 73. Availability and noise reports
 
 - **Options availability (Slice 3):** for the available historical/live replay sessions report CE Position, PE Position, CE ΔIV, PE ΔIV and IV Skew availability %, broken down by DTE where practical. The 5-second rule is not loosened.
-- **Spot freshness (Slice 2B):** p50 / p90 / p95 / p99 / max spot age during market hours and a recommended rule; owner approval required (section 9.6).
+- **Spot freshness (Slice 2B):** p50 / p90 / p95 / p99 / max spot age during market hours was measured (spot_age_report2); the owner approved the 5-second rule (section 9.6). Basis availability under the rule is reported in section 77.
 - **Commentary notification noise (after Slice 4C):** replay existing sessions and report events/day, lifecycle counts/day, BiasChanged/day and Telegram-eligible events/day. This validates notification volume only; it is not a profitability test, and event directions/signs are never changed because of how outcomes turned out.
 
 # 74. Review correction pass (post Slice 4C)
@@ -3288,3 +3290,9 @@ The observer must not fall behind the market. Correctness and determinism outran
 - **Not optimized (measured, left simple):** completed-bar pipeline round trips (about 177 bars/day), poll cadence (processing time is negligible against 250 ms), per-token option book retention (bounded, ~30 MB), full-day recovery materialization.
 - **Measurement.** `tools/AdaptiveLivePerformance` drives the real `PollLiveAsync` / `TryStartOrRecoverAsync` / `CloseCurrentSessionAsync` and `AdaptiveStateRecoveryService` against an isolated PostgreSQL cluster (read-only historical source; Telegram disabled; no Dashboard connection) with SQL-command counting and stage timing; `docs/ADAPTIVE_LIVE_PERFORMANCE_2026-10-08.md` records the numbers. Timing assertions never appear in unit tests.
 - **Acceptance.** No steadily growing pending backlog at normal load; temporary backlog at the historical maximum burst must drain; sustained 2x the observed peak 1-second rate must not accumulate backlog; completed-bar p99 must stay well under the 250 ms poll cadence; no data may be dropped; live and restart-replay outputs must be value-identical.
+
+# 77. Slice 2B integration record (spot / basis)
+
+- **Origin.** The original Slice 2B work existed only as local commit `89e7a4a` on branch `adaptive-08oct-s2b-basis` (raw basis sidecar `futures-basis-v1`, no freshness rule, display blocked). It was preserved on the remote under that branch name and re-implemented against the finalized s4c architecture rather than cherry-picked (its migration was generated against a pre-correction schema snapshot). Reused unchanged in spirit: `FuturesBasisTracker` structure, the isolated spot path in the engine, the frozen session-supplemental identity, the separate basis sidecar table, the late-spot counter. New in the integration: the approved 5-second rule (`futures-basis-v2`), the boundary `Status`, integration with `PersistAndVerifyAsync`/projection-health/commentary capping, the commentary Basis family, the Dashboard column, the frozen spot in the pinned capture, and the freeze inside `AdaptiveStateRecoveryService` so ended-session recovery, the live worker and the validation harness share one path.
+- **Migration.** `AddBasisSidecarAndSessionSupplemental` (two new tables only; no change to any pre-existing table).
+- **Validation results** are recorded in `docs/ADAPTIVE_LIVE_PERFORMANCE_2026-10-08.md` (spot load, restart continuation including Basis, core-parity hashes) and in the integration checkpoint report.

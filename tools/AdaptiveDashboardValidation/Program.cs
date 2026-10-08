@@ -104,7 +104,7 @@ try {
     await Expect(page.GetByLabel("Completed rows",new() { Exact=true })).ToBeEnabledAsync();
     // Slice 1: compact grids are the default; only columns whose slice has landed are shown.
     await Expect(page.Locator(".adaptive-table[data-grid='futures-compact'] thead th")).ToHaveTextAsync(new[] { "Seq","End IST","Dur s","Urgency",
-        "Bar ΔPx","Roll ΔPx","Strict Δ","Enriched Δ","Roll Strict","Roll Enriched","|Strict| Δ","MicroDev","OFI","Roll OI Δ","Roll Efficiency","Evolution","State" });
+        "Bar ΔPx","Roll ΔPx","Strict Δ","Enriched Δ","Roll Strict","Roll Enriched","|Strict| Δ","MicroDev","OFI","Roll OI Δ","ΔBasis","Roll Efficiency","Evolution","State" });
     await Expect(page.Locator(".adaptive-table[data-grid='options-compact'] thead th")).ToHaveTextAsync(new[] { "Seq","End IST","Center","Roll?",
         "CE ΔPx","PE ΔPx","CE Roll ΔPx","PE Roll ΔPx","CE Strict Δ","PE Strict Δ","CE Enriched Δ","PE Enriched Δ","CE Roll Strict","PE Roll Strict",
         "CE OI Δ","PE OI Δ","CE Position","PE Position","CE ΔIV","PE ΔIV","IV Skew","Vol PCR","Roll Vol PCR" });
@@ -126,7 +126,12 @@ try {
     // Sidecar metrics come from adaptive_futures_supplemental_bars (bar 20: MicroDev +0.125, OFI -420).
     await Expect(page.Locator(".adaptive-table[data-grid='futures-compact'] tbody tr").First.Locator("td").Nth(11)).ToHaveTextAsync("+0.125");
     await Expect(page.Locator(".adaptive-table[data-grid='futures-compact'] tbody tr").First.Locator("td").Nth(12)).ToHaveTextAsync("-420");
+    // Slice 2B: ΔBasis comes from adaptive_basis_supplemental_bars (bar 20 usable +1.25; bar 19 stale spot => unavailable, never zero).
+    var firstRowCells=page.Locator(".adaptive-table[data-grid='futures-compact'] tbody tr").First.Locator("td");
+    await Expect(firstRowCells.Nth(14)).ToHaveTextAsync("+1.25");
+    await Expect(page.Locator(".adaptive-table[data-grid='futures-compact'] tbody tr").Nth(1).Locator("td").Nth(14)).ToHaveTextAsync("—");
     // Deployment-order safety: a Dashboard that starts before the Host migrated has no sidecar table; the panel must still render, with MicroDev/OFI unavailable.
+    await db.Database.ExecuteSqlRawAsync("ALTER TABLE adaptive_basis_supplemental_bars RENAME TO adaptive_basis_supplemental_bars_hidden");
     await db.Database.ExecuteSqlRawAsync("ALTER TABLE adaptive_futures_supplemental_bars RENAME TO adaptive_futures_supplemental_bars_hidden");
     await db.Database.ExecuteSqlRawAsync("ALTER TABLE adaptive_options_supplemental_bars RENAME TO adaptive_options_supplemental_bars_hidden");
     try
@@ -134,17 +139,20 @@ try {
         await page.ReloadAsync();
         await Expect(page.Locator(".adaptive-table[data-grid='futures-compact'] tbody tr").First.Locator("td").Nth(11)).ToHaveTextAsync("—");
         await Expect(page.Locator(".adaptive-table[data-grid='futures-compact'] tbody tr").First.Locator("td").Nth(12)).ToHaveTextAsync("—");
+        await Expect(page.Locator(".adaptive-table[data-grid='futures-compact'] tbody tr").First.Locator("td").Nth(14)).ToHaveTextAsync("—");
         await Expect(page.Locator(".adaptive-table")).ToHaveCountAsync(3);
         await Expect(page.Locator(".adaptive-table[data-grid='options-compact'] tbody tr").First.Locator("td").Nth(14)).ToHaveTextAsync("—");
         await Expect(page.Locator(".adaptive-alert-error")).ToHaveCountAsync(0);
     }
     finally
     {
+        await db.Database.ExecuteSqlRawAsync("ALTER TABLE adaptive_basis_supplemental_bars_hidden RENAME TO adaptive_basis_supplemental_bars");
         await db.Database.ExecuteSqlRawAsync("ALTER TABLE adaptive_futures_supplemental_bars_hidden RENAME TO adaptive_futures_supplemental_bars");
         await db.Database.ExecuteSqlRawAsync("ALTER TABLE adaptive_options_supplemental_bars_hidden RENAME TO adaptive_options_supplemental_bars");
     }
     await page.ReloadAsync();
     await Expect(page.Locator(".adaptive-table[data-grid='futures-compact'] tbody tr").First.Locator("td").Nth(11)).ToHaveTextAsync("+0.125");
+    await Expect(page.Locator(".adaptive-table[data-grid='futures-compact'] tbody tr").First.Locator("td").Nth(14)).ToHaveTextAsync("+1.25");
     await Expect(page.GetByLabel("Completed rows",new() { Exact=true })).ToBeEnabledAsync();
     Console.WriteLine("SIDECAR BROWSER PASS: MicroDev/OFI rendered from the versioned sidecar; missing sidecar table degrades to unavailable without an error banner.");
     // Reproduce the lost-selector race with a real in-flight PostgreSQL read.
@@ -386,6 +394,8 @@ void AddRows(int seq) {
     db.OptionsSupplemental.Add(new AdaptiveOptionsSupplementalRow { SessionId=session.Id,BarSeq=seq,MetricsVersion=OptionsSupplementalBar.MetricsVersion,
         CenterStrike=23000,CeOiDelta=100,PeOiDelta=-100,CePosition="CallLongBuild",PePosition="PutShortCover",CeDeltaIv=1.5,PeDeltaIv=-.5,
         IvSkewEnd=.75,VolPcr=.9,RollVolPcr=1.2,DayCeVolume=1000,DayPeVolume=900,UniverseTokenCount=2,TokensObserved=2 });
+    db.BasisSupplemental.Add(new AdaptiveBasisSupplementalRow { SessionId=session.Id,BarSeq=seq,MetricsVersion=FuturesBasisBar.MetricsVersion,
+        DeltaBasis=seq==20 ? 1.25 : null,BasisStart=seq==20 ? 100 : null,BasisEnd=seq==20 ? 101.25 : null,Status=seq==20 ? "Usable" : "StaleEnd" });
     db.FuturesSupplemental.Add(new AdaptiveFuturesSupplementalRow { SessionId=session.Id,BarSeq=seq,MetricsVersion=FuturesMicrostructureBar.MetricsVersion,
         MicroDevTimeWeighted=.125,Ofi=-400L-seq,ValidBookSeconds=60 });
     foreach(var side in new[] { OptionType.Call,OptionType.Put })

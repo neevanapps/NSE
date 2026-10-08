@@ -27,9 +27,12 @@ public sealed record AdaptiveObserverSnapshot(
     IReadOnlyList<AdaptiveOptionResidualBarRow>? PreviousResiduals = null,
     // Bars whose sidecar failed replay verification (durable marker). Their stored values are withheld, which is different from "missing".
     IReadOnlySet<int>? InvalidFuturesSupplementalBars = null,
-    IReadOnlySet<int>? InvalidOptionsSupplementalBars = null)
+    IReadOnlySet<int>? InvalidOptionsSupplementalBars = null,
+    // Basis sidecar (current MetricsVersion) keyed by BarSeq, with known-invalid bars withheld.
+    IReadOnlyDictionary<int, AdaptiveBasisSupplementalRow>? BasisSupplemental = null,
+    IReadOnlySet<int>? InvalidBasisSupplementalBars = null)
 {
-    public int InvalidSupplementalBarCount => (InvalidFuturesSupplementalBars?.Count ?? 0) + (InvalidOptionsSupplementalBars?.Count ?? 0);
+    public int InvalidSupplementalBarCount => (InvalidFuturesSupplementalBars?.Count ?? 0) + (InvalidOptionsSupplementalBars?.Count ?? 0) + (InvalidBasisSupplementalBars?.Count ?? 0);
 
     public bool CanUseForDecisions => ConsecutiveValidBars >= NiftySignal.AdaptiveObserver.AdaptiveReadinessPolicy.RequiredBars
         && Runtime.RuntimeStatus == AdaptiveRuntimeStatus.Live;

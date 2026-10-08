@@ -7,7 +7,7 @@ using NiftySignal.Host;
 using NiftySignal.Domain.Entities;
 
 sealed record DayData(DateOnly Day, Instrument Future, List<Instrument> Options, DateOnly Weekly, List<ObserverOptionInstrument> Chain, string[] Tokens,
-    IReadOnlyList<(string Token, ObserverRawTick Tick)> Raw);
+    IReadOnlyList<(string Token, ObserverRawTick Tick)> Raw, Instrument? Spot = null);
 
 sealed record Staged(DayData Day, DateTimeOffset[] ReceivedAt);
 

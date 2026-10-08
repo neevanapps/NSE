@@ -31,7 +31,9 @@ public sealed record AdaptiveCompletedBarPackage(
     // parity-protected core rows; null when the producer did not compute it.
     FuturesMicrostructureBar? Microstructure = null,
     // Supplemental center-contract options observations (sidecar-persisted). Never part of the parity-protected core rows.
-    OptionsSupplementalBar? OptionsSupplemental = null);
+    OptionsSupplementalBar? OptionsSupplemental = null,
+    // Supplemental futures-minus-spot basis observation with the approved 5-second spot freshness rule (null when the session has no frozen spot instrument).
+    FuturesBasisBar? Basis = null);
 
 public sealed record AdaptivePartialBarStatus(
     long AccumulatedVolume,

@@ -110,7 +110,7 @@
                         <th>Strict Δ</th><th>Enriched Δ</th>
                         <th>Roll Strict</th><th>Roll Enriched</th><th>|Strict| Δ</th>
                         <th>MicroDev</th><th>OFI</th>
-                        <th>Roll OI Δ</th><th>Roll Efficiency</th>
+                        <th>Roll OI Δ</th><th>ΔBasis</th><th>Roll Efficiency</th>
                         <th>Evolution</th><th>State</th>
                     </tr>
                     </thead>
@@ -133,6 +133,7 @@
                             <td>@FmtSigned(Supplemental(x.Bar.BarSeq)?.MicroDevTimeWeighted, 3)</td>
                             <td>@FmtSigned(Supplemental(x.Bar.BarSeq)?.Ofi)</td>
                             <td>@FmtSigned(r?.OiChange)</td>
+                            <td>@FmtSigned(Basis(x.Bar.BarSeq)?.DeltaBasis, 2)</td>
                             <td>@Fmt(r?.Efficiency, 3)</td>
                             <td>@(r?.StrictDominanceEvolution ?? "—")</td>
                             <td><span class="state-badge">@((r?.State).ToString() ?? "—")</span></td>
@@ -154,6 +155,7 @@
                         <th>Roll ΔPx</th><th>Roll strict Δ</th><th>Roll strict ratio</th><th>Roll quote cov</th>
                         <th>Roll enriched Δ</th><th>Roll enriched ratio</th><th>|Strict| Δ</th><th>Enriched Δchg</th>
                         <th>Efficiency</th><th>Return bps</th><th>Roll OI Δ</th><th>Roll OI Δ%</th><th>Vol/sec</th>
+                        <th>ΔBasis</th><th>Basis status</th><th>Spot age end s</th><th>Basis covered s</th>
                         <th>Evolution</th><th>State</th>
                     </tr>
                     </thead>
@@ -185,6 +187,10 @@
                             <td>@FmtSigned(r?.OiChange)</td>
                             <td>@FmtPct01(r?.OiChangePct)</td>
                             <td>@Fmt(r?.VolumePerSecond, 1)</td>
+                            <td>@FmtSigned(Basis(x.Bar.BarSeq)?.DeltaBasis, 2)</td>
+                            <td>@(Basis(x.Bar.BarSeq)?.Status ?? "—")</td>
+                            <td>@Fmt(Basis(x.Bar.BarSeq)?.SpotAgeEndSeconds, 1)</td>
+                            <td>@Fmt(Basis(x.Bar.BarSeq)?.CoveredSeconds, 1)</td>
                             <td>@(r?.StrictDominanceEvolution ?? "—")</td>
                             <td><span class="state-badge">@((r?.State).ToString() ?? "—")</span></td>
                         </tr>
@@ -741,6 +747,9 @@
     static string FmtPctPoints(double? x) => x.HasValue ? FmtSigned(x, 2) + "%" : "—";
 
     // Sidecar metrics (futures Level-1 microstructure). Missing row => rendered as unavailable.
+    AdaptiveBasisSupplementalRow? Basis(int barSeq) =>
+        _snapshot?.BasisSupplemental is { } map && map.TryGetValue(barSeq, out var row) ? row : null;
+
     AdaptiveFuturesSupplementalRow? Supplemental(int barSeq) =>
         _snapshot?.FuturesSupplemental is { } map && map.TryGetValue(barSeq, out var row) ? row : null;
 

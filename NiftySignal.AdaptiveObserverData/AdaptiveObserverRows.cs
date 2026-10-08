@@ -387,6 +387,43 @@ public sealed class AdaptiveFuturesSupplementalRow
     public double MicroDevUsableSeconds { get; set; }
 }
 
+/// <summary>
+/// Supplemental per-session identity (08-Oct plan section 71.3). Frozen once; recovery always reuses it and never re-resolves a different
+/// instrument, including the "unresolved" outcome (<see cref="SpotToken"/> null), so sidecar values replay identically.
+/// </summary>
+public sealed class AdaptiveSessionSupplementalRow
+{
+    public long Id { get; set; }
+    public long SessionId { get; set; }
+    public required string MetricsVersion { get; set; }
+    /// <summary>The NIFTY spot/index instrument token, or null when no unique valid instrument could be resolved (Basis then stays unavailable).</summary>
+    public string? SpotToken { get; set; }
+    public string? SpotSymbol { get; set; }
+    public required string ResolutionProvenance { get; set; }
+    public DateTimeOffset ResolvedAtUtc { get; set; }
+}
+
+/// <summary>Sidecar projection of futures-minus-spot basis per completed adaptive bar, with the approved 5-second spot freshness rule applied (separate table: new columns on the futures sidecar would not match rows written earlier).</summary>
+public sealed class AdaptiveBasisSupplementalRow
+{
+    public long Id { get; set; }
+    public long SessionId { get; set; }
+    public int BarSeq { get; set; }
+    public required string MetricsVersion { get; set; }
+    public double? BasisStart { get; set; }
+    public double? BasisTimeWeighted { get; set; }
+    public double? BasisEnd { get; set; }
+    public double? DeltaBasis { get; set; }
+    public double? SpotAgeStartSeconds { get; set; }
+    public double? SpotAgeEndSeconds { get; set; }
+    public double? SpotAgeMaxSeconds { get; set; }
+    public int BasisStateChanges { get; set; }
+    public double CoveredSeconds { get; set; }
+    public double UncoveredSeconds { get; set; }
+    /// <summary>Usable / NoState / StaleStart / StaleEnd / StaleBoth.</summary>
+    public required string Status { get; set; }
+}
+
 /// <summary>Sidecar projection of supplemental options observations per completed adaptive bar (08-Oct plan section 71; metrics contract options-supp-v2).</summary>
 public sealed class AdaptiveOptionsSupplementalRow
 {
@@ -507,6 +544,7 @@ public static class AdaptiveProjectionComponents
     public const string FuturesSupplemental = "futures-supplemental";
     public const string OptionsSupplemental = "options-supplemental";
     public const string Commentary = "commentary";
+    public const string BasisSupplemental = "basis-supplemental";
 }
 
 /// <summary>

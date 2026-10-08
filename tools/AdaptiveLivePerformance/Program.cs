@@ -92,9 +92,17 @@ async Task<DayData?> LoadDayAsync(DateOnly day)
     var weekly = optRows.Select(x => x.ExpiryDate!.Value).Min();
     var chainRows = optRows.Where(x => x.ExpiryDate == weekly).OrderBy(x => x.StrikePrice).ToList();
     var chain = chainRows.Select(i => new ObserverOptionInstrument(i.Token, i.TradingSymbol, i.OptionType, (double)i.StrikePrice!.Value, i.ExpiryDate!.Value, i.LotSize)).ToList();
-    var tokens = chain.Select(x => x.Token).Append(fut.Token).Distinct().ToArray();
+    // Slice 2B: the unique NIFTY Index instrument is the frozen spot. Its ticks are ALWAYS staged with their real ordering (so source ids are identical with and
+    // without Basis); ADAPTIVE_PERF_BASIS=0 simply does not register the session-supplemental service, which reproduces the pre-Slice-2B (s4c) behaviour.
+    Instrument? spot = null;
+    {
+        var indexRows = await src.Instruments.AsNoTracking().Where(i => i.AsOfDate == day && i.Underlying == "NIFTY" && i.InstrumentType == InstrumentType.Index).ToListAsync();
+        if (indexRows.Select(x => x.Token).Distinct().Count() == 1) spot = indexRows[0];
+    }
+
+    var tokens = chain.Select(x => x.Token).Append(fut.Token).Concat(spot is null ? [] : [spot.Token]).Distinct().ToArray();
     var raw = await reader.ReadRawSessionAsync(src, day, tokens, U(day, 15, 35), default, includeBeyondThrough: true);
-    return new DayData(day, fut, chainRows, weekly, chain, tokens, raw);
+    return new DayData(day, fut, chainRows, weekly, chain, tokens, raw, spot);
 }
 
 // ---------------------------------------------------------------- input characteristics
@@ -130,6 +138,8 @@ Dictionary<string, object> InputStats(DayData d)
     return new()
     {
         ["day"] = d.Day.ToString("yyyy-MM-dd"), ["rawRows"] = d.Raw.Count, ["cleanTicks"] = clean.Count, ["tokens"] = d.Tokens.Length,
+        ["spotCleanTicks"] = d.Spot is null ? 0 : clean.Count(x => x.Token == d.Spot.Token),
+        ["spotMax1s"] = d.Spot is null ? 0 : clean.Where(x => x.Token == d.Spot.Token).GroupBy(x => (long)(x.Tick.AvailableAt - open).TotalSeconds).Select(g => g.Count()).DefaultIfEmpty(0).Max(),
         ["ticksPerSecMean"] = Math.Round(clean.Count / session, 2), ["ticksPerSecP50"] = Stats.Percentile(sortedSec, 50), ["ticksPerSecP90"] = Stats.Percentile(sortedSec, 90),
         ["ticksPerSecP95"] = Stats.Percentile(sortedSec, 95), ["ticksPerSecP99"] = Stats.Percentile(sortedSec, 99), ["maxTicksIn1sAvailableAt"] = perSecond.Max(),
         ["maxTicksIn250msReceivedAt"] = buckets.Count == 0 ? 0 : buckets.Values.Max(), ["maxAvailabilityGroupTicks"] = availGroups.Count == 0 ? 0 : availGroups.Values.Max(),
@@ -214,7 +224,7 @@ async Task<Staged> StageAsync(DayData d)
     {
         await db.Database.ExecuteSqlRawAsync("TRUNCATE ticks, instruments, ticks_all RESTART IDENTITY");
         db.ChangeTracker.AutoDetectChangesEnabled = false;
-        foreach (var i in new[] { d.Future }.Concat(d.Options))
+        foreach (var i in new[] { d.Future }.Concat(d.Options).Concat(d.Spot is null ? [] : [d.Spot]))
             db.Instruments.Add(new Instrument { Token = i.Token, Exchange = i.Exchange, TradingSymbol = i.TradingSymbol, InstrumentType = i.InstrumentType, OptionType = i.OptionType,
                 StrikePrice = i.StrikePrice, ExpiryDate = i.ExpiryDate, Underlying = i.Underlying, LotSize = i.LotSize, TickSize = i.TickSize, AsOfDate = i.AsOfDate });
         await db.SaveChangesAsync();
@@ -265,6 +275,7 @@ AdaptiveObserverWorker NewWorker(string observerDb)
     s.AddSingleton<AdaptiveObserverPersistence>(); s.AddSingleton<AdaptiveSupplementalPersistence>(); s.AddSingleton<AdaptiveCommentaryFrameLoader>();
     s.AddSingleton<AdaptiveCommentaryService>(); s.AddSingleton<AdaptiveWeak2ObservationService>();
     s.AddSingleton<AdaptiveStateRecoveryService>(); s.AddSingleton<AdaptiveEndedSessionRecoveryService>(); s.AddSingleton<DashboardPushClient>();
+    if (Env("ADAPTIVE_PERF_BASIS", "1") != "0") s.AddSingleton<AdaptiveSessionSupplementalService>();
     s.AddSingleton<AdaptiveObserverWorker>();
     return s.BuildServiceProvider().GetRequiredService<AdaptiveObserverWorker>();
 }
@@ -508,6 +519,7 @@ async Task<SimResult> SimulateAsync(DayData d, Staged staged, string observerDb,
     s.AddSingleton<AdaptiveObserverPersistence>(); s.AddSingleton<AdaptiveSupplementalPersistence>(); s.AddSingleton<AdaptiveCommentaryFrameLoader>();
     s.AddSingleton<AdaptiveCommentaryService>(); s.AddSingleton<AdaptiveWeak2ObservationService>();
     s.AddSingleton<AdaptiveStateRecoveryService>(); s.AddSingleton<AdaptiveEndedSessionRecoveryService>(); s.AddSingleton<DashboardPushClient>();
+    if (Env("ADAPTIVE_PERF_BASIS", "1") != "0") s.AddSingleton<AdaptiveSessionSupplementalService>();
     s.AddSingleton<AdaptiveObserverWorker>();
     var provider = s.BuildServiceProvider();
     return (provider.GetRequiredService<AdaptiveObserverWorker>(), provider);
@@ -531,7 +543,7 @@ async Task CloneObserverAsync(string template, string name)
     await using (var create = new NpgsqlCommand($"CREATE DATABASE {name} TEMPLATE {template}", admin)) await create.ExecuteNonQueryAsync();
 }
 
-var volatileColumns = new HashSet<string> {"Id", "LastHeartbeatUtc", "LastRecoveryStartedUtc", "LastRecoveryCompletedUtc", "LastRecoveryReconciledBars", "UpdatedAtUtc", "DetectedAtUtc" };
+var volatileColumns = new HashSet<string> {"Id", "LastHeartbeatUtc", "LastRecoveryStartedUtc", "LastRecoveryCompletedUtc", "LastRecoveryReconciledBars", "UpdatedAtUtc", "DetectedAtUtc", "ResolvedAtUtc" };
 
 async Task<Dictionary<string, List<string>>> DumpAsync(string observerDb, long sessionId)
 {
@@ -555,6 +567,8 @@ async Task<Dictionary<string, List<string>>> DumpAsync(string observerDb, long s
         ["Weak2Observations"] = Rows(await db.Weak2Observations.AsNoTracking().Where(x => x.SessionId == sessionId).OrderBy(x => x.TriggerBarSeq).ToListAsync()),
         ["FuturesSupplemental"] = Rows(await db.FuturesSupplemental.AsNoTracking().Where(x => x.SessionId == sessionId).OrderBy(x => x.BarSeq).ThenBy(x => x.MetricsVersion).ToListAsync()),
         ["OptionsSupplemental"] = Rows(await db.OptionsSupplemental.AsNoTracking().Where(x => x.SessionId == sessionId).OrderBy(x => x.BarSeq).ThenBy(x => x.MetricsVersion).ToListAsync()),
+        ["SessionSupplemental(frozen spot identity)"] = Rows(await db.SessionSupplemental.AsNoTracking().Where(x => x.SessionId == sessionId).ToListAsync()),
+        ["BasisSupplemental"] = Rows(await db.BasisSupplemental.AsNoTracking().Where(x => x.SessionId == sessionId).OrderBy(x => x.BarSeq).ThenBy(x => x.MetricsVersion).ToListAsync()),
         ["ProjectionHealth"] = Rows(await db.ProjectionHealth.AsNoTracking().Where(x => x.SessionId == sessionId).OrderBy(x => x.BarSeq).ToListAsync()),
         ["CommentaryEvents"] = Rows(await db.CommentaryEvents.AsNoTracking().Where(x => x.SessionId == sessionId).OrderBy(x => x.BarSeq).ThenBy(x => x.EventIdentity).ToListAsync()),
         ["CommentaryRuntime"] = Rows(await db.CommentaryRuntime.AsNoTracking().Where(x => x.SessionId == sessionId).ToListAsync()),
@@ -641,6 +655,8 @@ async Task<(Dictionary<string, List<string>> PreClose, Dictionary<string, List<s
             var restartAt = clock + TimeSpan.FromSeconds(3);                   // downtime; ticks keep being persisted by ingestion
             await feeder.FeedAsync(restartAt);
             long Count(string table) { using var c = new NpgsqlConnection(DbCs(runDb)); c.Open(); using var cmd = new NpgsqlCommand($"SELECT count(*) FROM {table}", c); return (long)cmd.ExecuteScalar()!; }
+            string Identity() { using var c = new NpgsqlConnection(DbCs(runDb)); c.Open(); using var cmd = new NpgsqlCommand("SELECT coalesce(string_agg(\"SpotToken\" || '|' || \"SpotSymbol\" || '|' || \"ResolutionProvenance\" || '|' || \"ResolvedAtUtc\"::text, ';'), 'none') FROM adaptive_session_supplemental", c); return (string)cmd.ExecuteScalar()!; }
+            var identityBefore = Identity();
             var barsPersisted = Count("adaptive_future_bars"); var futSideBefore = Count("adaptive_futures_supplemental_bars"); var optSideBefore = Count("adaptive_options_supplemental_bars");
             var eventsBefore = Count("adaptive_commentary_events");
             recorder.Reset();
@@ -662,6 +678,8 @@ async Task<(Dictionary<string, List<string>> PreClose, Dictionary<string, List<s
             var eventsAfter = Count("adaptive_commentary_events"); var obsAfter = observerCounter.Snapshot();
             var stageMs = recorder.DurationsMs.Where(k => k.Key.StartsWith("recovery.", StringComparison.Ordinal)).ToDictionary(k => k.Key, k => Math.Round(k.Value.Sum(), 1));
             before["downtimeSeconds"] = 3;
+            var identityAfter = Identity();
+            before["spotIdentityBeforeCrash"] = identityBefore; before["spotIdentityAfterRecoveryIdentical"] = identityBefore == identityAfter;
             info["crash"] = before;
             info["recovery"] = new Dictionary<string, object>
             {
@@ -736,6 +754,14 @@ async Task<List<Dictionary<string, object>>> RestartValidationAsync(DayData d, S
     var a = await RestartRunAsync(d, staged, template, $"perf_restarta_{day:yyyyMMdd}", null, start, horizon);
     Console.WriteLine($"RUN A uninterrupted: bars={a.Info["finalCompletedBars"]} pending={a.Info["finalPendingTicks"]} weak2Rows={a.PostClose["Weak2Observations"].Count}");
 
+    await File.WriteAllTextAsync(Path.Combine(outDir, $"dump-{label}-{day:yyyyMMdd}.json"), JsonSerializer.Serialize(a.PostClose));
+    if (Env("ADAPTIVE_PERF_RESTART_MODE", "full") == "parity")
+    {
+        results.Add(new() { ["day"] = day.ToString("yyyy-MM-dd"), ["run"] = "A uninterrupted (parity mode)", ["spot"] = d.Spot?.Token ?? "none", ["basisEnabled"] = Env("ADAPTIVE_PERF_BASIS", "1") != "0", ["finalCompletedBars"] = a.Info["finalCompletedBars"],
+            ["tables"] = a.PostClose.ToDictionary(k => k.Key, k => new { rows = k.Value.Count, hash = HashRows(k.Value) }) });
+        return results;
+    }
+
     // ---- derive the difficult restart points from the data of run A
     var runA = $"perf_restarta_{day:yyyyMMdd}";
     List<(DateTimeOffset End, int Bars)> multi; List<(DateTimeOffset End, double Seconds, long Volume)> fastest;
@@ -791,6 +817,12 @@ async Task<List<Dictionary<string, object>>> RestartValidationAsync(DayData d, S
         });
         Console.WriteLine($"RESTART CASE {c.Name}: horizon-equal={pre["allEqual"]} after-close-equal={post["allEqual"]} liveState-equal={sameState} jobs={jobs} health={health} recoveryMs={((Dictionary<string, object>)b.Info["recovery"])["wallMs"]}");
         foreach (var line in ((List<string>)post["structuralDiff"]).Take(5)) Console.WriteLine("   DIFF " + line);
+    }
+
+    {
+        var dumpPath = Path.Combine(outDir, $"dump-{label}-{day:yyyyMMdd}.json");
+        await File.WriteAllTextAsync(dumpPath, JsonSerializer.Serialize(a.PostClose));
+        Console.WriteLine($"WROTE {dumpPath}");
     }
 
     // Negative controls: the comparator must flag a one-column change and a missing row (proves the equality results above are not vacuous).

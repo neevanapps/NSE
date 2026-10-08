@@ -21,7 +21,8 @@ public sealed class AdaptiveStateRecoveryService(
     AdaptiveObserverPersistence persistence,
     AdaptiveWeak2ObservationService observations,
     ILogger<AdaptiveStateRecoveryService> logger,
-    AdaptiveSupplementalPersistence? supplemental = null)
+    AdaptiveSupplementalPersistence? supplemental = null,
+    AdaptiveSessionSupplementalService? sessionSupplemental = null)
 {
     public async Task<AdaptiveRecoveryResult> RecoverAsync(
         NiftySignalDbContext source,
@@ -36,8 +37,22 @@ public sealed class AdaptiveStateRecoveryService(
         runtime.LastError = null;
         await observer.SaveChangesAsync(ct);
 
+        // Frozen supplemental spot identity (resolved once per session, reused on every restart). Failure to freeze it never stops the core
+        // observer: Basis is simply unavailable for this process.
+        string? spotToken = context.SpotToken;
+        if (sessionSupplemental is not null && spotToken is null)
+        {
+            try { spotToken = await sessionSupplemental.GetOrFreezeSpotTokenAsync(source, observer, context.Session, ct); }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                logger.LogError(ex, "Adaptive supplemental spot identity unavailable; basis disabled for this process (core observer unaffected).");
+                observer.ChangeTracker.Clear();
+            }
+        }
+
         var tokens = context.Options.Select(x => x.Token)
             .Append(context.Definition.FutureToken)
+            .Concat(string.IsNullOrWhiteSpace(spotToken) ? [] : [spotToken!])
             .Distinct(StringComparer.Ordinal)
             .ToArray();
 
@@ -78,7 +93,8 @@ public sealed class AdaptiveStateRecoveryService(
             context.Session.StrongThreshold,
             context.SignalStartUtc,
             context.Options,
-            context.ResidualAnchor);
+            context.ResidualAnchor,
+            spotToken);
 
         var reconciled = 0;
         var replayTriggers = new HashSet<int>();

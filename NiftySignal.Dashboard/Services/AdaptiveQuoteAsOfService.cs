@@ -101,8 +101,20 @@ public sealed class AdaptiveQuoteAsOfService(
             putToken = options.FirstOrDefault(x => x.OptionType == OptionType.Put && (decimal)x.Strike == strike)?.Token;
         }
 
-        // A non-unique spot instrument is ambiguous: show it unavailable rather than guess.
-        var spot = spotTokens.Length == 1 ? await QuoteAsync(source, spotTokens[0], dayStartUtc, boundary, ct) : null;
+        // The session's FROZEN spot identity (Slice 2B) wins: the capture never independently re-resolves a different spot instrument, and a frozen
+        // "unresolved" outcome stays unavailable. Sessions without a frozen identity (older sessions / table not migrated) fall back to the unique
+        // NIFTY Index in the instrument master; a non-unique spot instrument is ambiguous and is shown unavailable rather than guessed.
+        string? frozenToken = null; var hasFrozen = false;
+        try
+        {
+            var frozen = await observer.SessionSupplemental.AsNoTracking().Where(x => x.SessionId == id).OrderBy(x => x.Id)
+                .Select(x => new { x.SpotToken }).FirstOrDefaultAsync(ct);
+            if (frozen is not null) { hasFrozen = true; frozenToken = frozen.SpotToken; }
+        }
+        catch (Npgsql.PostgresException ex) when (ex.SqlState == Npgsql.PostgresErrorCodes.UndefinedTable) { }
+
+        var spotToken = hasFrozen ? frozenToken : spotTokens.Length == 1 ? spotTokens[0] : null;
+        var spot = spotToken is null ? null : await QuoteAsync(source, spotToken, dayStartUtc, boundary, ct);
         var future = await QuoteAsync(source, session.FutureToken, dayStartUtc, boundary, ct);
         var vix = vixTokens.Length == 1 ? await QuoteAsync(source, vixTokens[0], dayStartUtc, boundary, ct) : null;
         var call = callToken is null ? null : await QuoteAsync(source, callToken, dayStartUtc, boundary, ct);

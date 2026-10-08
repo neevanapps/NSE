@@ -28,15 +28,21 @@ public sealed class AdaptiveCommentaryFrameLoader
         var optionsSupplemental = await db.OptionsSupplemental.AsNoTracking()
             .SingleOrDefaultAsync(x => x.SessionId == session.Id && x.BarSeq == barSeq && x.MetricsVersion == optionsVersion, ct);
 
+        var basisVersion = FuturesBasisBar.MetricsVersion;
+        var basisSupplemental = await db.BasisSupplemental.AsNoTracking()
+            .SingleOrDefaultAsync(x => x.SessionId == session.Id && x.BarSeq == barSeq && x.MetricsVersion == basisVersion, ct);
+
         // A sidecar bar that failed its replay verification is known-invalid (durable marker): commentary treats it exactly like a missing
         // sidecar (unavailable evidence), never as trustworthy input. The stored row is left untouched.
         var invalid = await db.ProjectionHealth.AsNoTracking()
             .Where(x => x.SessionId == session.Id && x.BarSeq == barSeq
                 && ((x.Component == AdaptiveProjectionComponents.FuturesSupplemental && x.Version == futuresVersion)
-                    || (x.Component == AdaptiveProjectionComponents.OptionsSupplemental && x.Version == optionsVersion)))
+                    || (x.Component == AdaptiveProjectionComponents.OptionsSupplemental && x.Version == optionsVersion)
+                    || (x.Component == AdaptiveProjectionComponents.BasisSupplemental && x.Version == basisVersion)))
             .Select(x => x.Component).ToListAsync(ct);
         if (invalid.Contains(AdaptiveProjectionComponents.FuturesSupplemental)) futuresSupplemental = null;
         if (invalid.Contains(AdaptiveProjectionComponents.OptionsSupplemental)) optionsSupplemental = null;
+        if (invalid.Contains(AdaptiveProjectionComponents.BasisSupplemental)) basisSupplemental = null;
 
         // Primary residual view for commentary is ATM±2 (plan section 69). The previous bar is needed for adjacent-bar deltas.
         var residuals = await db.OptionResidualBars.AsNoTracking()
@@ -52,7 +58,7 @@ public sealed class AdaptiveCommentaryFrameLoader
                 x.StartAvailableAtUtc, x.EndAvailableAtUtc))), barSeq);
 
         return AdaptiveCommentaryFrameBuilder.Build(session, bar, rolling, bands, futuresSupplemental, optionsSupplemental, residuals, anchors,
-            validBars >= AdaptiveReadinessPolicy.RequiredBars);
+            validBars >= AdaptiveReadinessPolicy.RequiredBars, basisSupplemental);
     }
 }
 
@@ -68,7 +74,8 @@ public static class AdaptiveCommentaryFrameBuilder
         AdaptiveOptionsSupplementalRow? optionsSupplemental,
         IReadOnlyList<AdaptiveOptionResidualBarRow> residualCurrentAndPrevious,
         IReadOnlyList<AdaptiveResidualAnchorComponentRow> anchors,
-        bool readinessMet)
+        bool readinessMet,
+        AdaptiveBasisSupplementalRow? basisSupplemental = null)
     {
         var call = bands.FirstOrDefault(x => x.Side == NiftySignal.Domain.Enums.OptionType.Call);
         var put = bands.FirstOrDefault(x => x.Side == NiftySignal.Domain.Enums.OptionType.Put);
@@ -105,8 +112,9 @@ public static class AdaptiveCommentaryFrameBuilder
             Urgency = AdaptiveMetricMath.Urgency(bar.Volume, bar.DurationSeconds),
             MicroDev = futuresSupplemental?.MicroDevTimeWeighted,
             Ofi = futuresSupplemental?.Ofi,
-            // Basis stays unavailable until the owner approves a spot-freshness rule (plan section 9.6). Deliberately not wired.
-            DeltaBasis = null,
+            // Basis family: the persisted current-version sidecar, whose DeltaBasis is already null when either boundary is missing or the spot is
+            // older than the approved 5-second rule (plan section 9.6), so stale/missing basis is neither support nor contradiction.
+            DeltaBasis = basisSupplemental?.DeltaBasis,
             RollingEfficiency = rolling?.Efficiency,
             Evolution = rolling?.StrictDominanceEvolution,
             State = rolling?.State.ToString(),

@@ -40,7 +40,7 @@ public sealed record EvidenceItem(EvidenceFamily Family, string Metric, string V
 
 /// <summary>
 /// Immutable per-completed-bar input assembled from the finalized Futures, Options and Residual observations. All values are as available at the
-/// bar boundary; null means unavailable (never zero). Basis stays null until the owner approves a spot-freshness rule (plan section 9.6).
+/// bar boundary; null means unavailable (never zero). Basis is null when either boundary is missing or the spot is older than the approved 5-second freshness rule (plan section 9.6).
 /// </summary>
 public sealed record CommentaryFrame
 {

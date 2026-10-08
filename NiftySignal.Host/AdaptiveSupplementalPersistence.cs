@@ -99,6 +99,87 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
         }
     }
 
+    /// <summary>Same insert-if-missing / verify-if-present contract for the futures-minus-spot basis sidecar (separate table, own MetricsVersion).</summary>
+    public async Task<SupplementalOutcome> PersistOrVerifyBasisAsync(
+        AdaptiveObserverDbContext db,
+        long sessionId,
+        AdaptiveCompletedBarPackage package,
+        CancellationToken ct)
+    {
+        if (package.Basis is not { } basis)
+        {
+            return SupplementalOutcome.Skipped;
+        }
+
+        var expected = MapBasis(sessionId, package.FutureBar.BarSeq, basis);
+        try
+        {
+            var existing = await db.BasisSupplemental.AsNoTracking()
+                .SingleOrDefaultAsync(x => x.SessionId == sessionId && x.BarSeq == expected.BarSeq
+                    && x.MetricsVersion == expected.MetricsVersion, ct);
+            if (existing is null)
+            {
+                db.BasisSupplemental.Add(expected);
+                await db.SaveChangesAsync(ct);
+                return SupplementalOutcome.Inserted;
+            }
+
+            var difference = FirstDifference(existing, expected);
+            if (difference is null)
+            {
+                return SupplementalOutcome.Verified;
+            }
+
+            Interlocked.Increment(ref _mismatches);
+            logger.LogError(
+                "Adaptive basis supplemental metrics mismatch (row left untouched): session={SessionId}, bar={BarSeq}, version={Version}, {Difference}",
+                sessionId, expected.BarSeq, expected.MetricsVersion, difference);
+            return await RecordInvalidAsync(db, sessionId, AdaptiveProjectionComponents.BasisSupplemental, expected.MetricsVersion, expected.BarSeq, difference, ct)
+                ? SupplementalOutcome.Mismatch : SupplementalOutcome.Failed;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                if (db.Entry(expected).State != EntityState.Detached)
+                {
+                    db.Entry(expected).State = EntityState.Detached;
+                }
+            }
+            catch (Exception)
+            {
+                // The context itself is unusable; nothing more to protect.
+            }
+
+            Interlocked.Increment(ref _failures);
+            logger.LogError(ex, "Adaptive basis supplemental write failed (core observer unaffected): session={SessionId}, bar={BarSeq}",
+                sessionId, expected.BarSeq);
+            return SupplementalOutcome.Failed;
+        }
+    }
+
+    public static AdaptiveBasisSupplementalRow MapBasis(long sessionId, int barSeq, FuturesBasisBar b) => new()
+    {
+        SessionId = sessionId,
+        BarSeq = barSeq,
+        MetricsVersion = FuturesBasisBar.MetricsVersion,
+        BasisStart = b.BasisStart,
+        BasisTimeWeighted = b.BasisTimeWeighted,
+        BasisEnd = b.BasisEnd,
+        DeltaBasis = b.DeltaBasis,
+        SpotAgeStartSeconds = b.SpotAgeStartSeconds,
+        SpotAgeEndSeconds = b.SpotAgeEndSeconds,
+        SpotAgeMaxSeconds = b.SpotAgeMaxSeconds,
+        BasisStateChanges = b.BasisStateChanges,
+        CoveredSeconds = b.CoveredSeconds,
+        UncoveredSeconds = b.UncoveredSeconds,
+        Status = b.Status,
+    };
+
     /// <summary>Same insert-if-missing / verify-if-present contract for the options sidecar.</summary>
     public async Task<SupplementalOutcome> PersistOrVerifyOptionsAsync(
         AdaptiveObserverDbContext db,
@@ -219,7 +300,8 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
         {
             var futures = await PersistOrVerifyFuturesAsync(db, session.Id, package, ct);
             var options = await PersistOrVerifyOptionsAsync(db, session, package, ct);
-            if (futures != SupplementalOutcome.Failed && options != SupplementalOutcome.Failed) return true;
+            var basis = await PersistOrVerifyBasisAsync(db, session.Id, package, ct);
+            if (futures != SupplementalOutcome.Failed && options != SupplementalOutcome.Failed && basis != SupplementalOutcome.Failed) return true;
         }
 
         return false;

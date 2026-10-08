@@ -16,7 +16,9 @@ public sealed record AdaptiveObserverSessionContext(
     DateOnly WeeklyOptionExpiry,
     IReadOnlyList<ObserverOptionInstrument> Options,
     OptionResidualAnchor? ResidualAnchor,
-    DateTimeOffset SignalStartUtc);
+    DateTimeOffset SignalStartUtc,
+    // Frozen supplemental spot instrument (section 71.3); null = not yet resolved by this process or unresolved (Basis unavailable). Never feeds core calculations.
+    string? SpotToken = null);
 
 /// <summary>
 /// Creates exactly one immutable daily adaptive configuration after persisted source data has

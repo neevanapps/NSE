@@ -16,6 +16,8 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
     public DbSet<AdaptiveObserverRuntimeRow> Runtime => Set<AdaptiveObserverRuntimeRow>();
     public DbSet<AdaptiveScreenshotJobRow> ScreenshotJobs => Set<AdaptiveScreenshotJobRow>();
     public DbSet<AdaptiveFuturesSupplementalRow> FuturesSupplemental => Set<AdaptiveFuturesSupplementalRow>();
+    public DbSet<AdaptiveSessionSupplementalRow> SessionSupplemental => Set<AdaptiveSessionSupplementalRow>();
+    public DbSet<AdaptiveBasisSupplementalRow> BasisSupplemental => Set<AdaptiveBasisSupplementalRow>();
     public DbSet<AdaptiveProjectionHealthRow> ProjectionHealth => Set<AdaptiveProjectionHealthRow>();
     public DbSet<AdaptiveCommentaryEventRow> CommentaryEvents => Set<AdaptiveCommentaryEventRow>();
     public DbSet<AdaptiveCommentaryRuntimeRow> CommentaryRuntime => Set<AdaptiveCommentaryRuntimeRow>();
@@ -128,6 +130,24 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
             e.ToTable("adaptive_futures_supplemental_bars");
             e.HasIndex(x => new { x.SessionId, x.BarSeq, x.MetricsVersion }).IsUnique();
             e.Property(x => x.MetricsVersion).HasMaxLength(64);
+            e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
+        });
+        modelBuilder.Entity<AdaptiveBasisSupplementalRow>(e =>
+        {
+            e.ToTable("adaptive_basis_supplemental_bars");
+            e.HasIndex(x => new { x.SessionId, x.BarSeq, x.MetricsVersion }).IsUnique();
+            e.Property(x => x.MetricsVersion).HasMaxLength(64);
+            e.Property(x => x.Status).HasMaxLength(16);
+            e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
+        });
+        modelBuilder.Entity<AdaptiveSessionSupplementalRow>(e =>
+        {
+            e.ToTable("adaptive_session_supplemental");
+            e.HasIndex(x => new { x.SessionId, x.MetricsVersion }).IsUnique();
+            e.Property(x => x.MetricsVersion).HasMaxLength(64);
+            e.Property(x => x.SpotToken).HasMaxLength(32);
+            e.Property(x => x.SpotSymbol).HasMaxLength(64);
+            e.Property(x => x.ResolutionProvenance).HasMaxLength(256);
             e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
         });
         modelBuilder.Entity<AdaptiveProjectionHealthRow>(e =>
