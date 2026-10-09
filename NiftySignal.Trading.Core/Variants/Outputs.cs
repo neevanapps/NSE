@@ -42,6 +42,12 @@ public enum CancelReason
 {
     StrategyInvalidated = 0,
     EntryClose = 1,
+
+    /// <summary>A global feed fault: the attempt is cancelled and the opportunity is re-armed once the engine is Healthy again (if still valid).</summary>
+    IntegrityDegraded = 2,
+
+    /// <summary>Manual kill: the attempt is cancelled and the opportunity ends (it is not resurrected by a reset).</summary>
+    KillSwitch = 3,
 }
 
 /// <summary>Base of everything the variant engine emits. Outputs are plain data; the engine performs no I/O.</summary>

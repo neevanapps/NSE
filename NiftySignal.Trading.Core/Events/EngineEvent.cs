@@ -10,6 +10,12 @@ namespace NiftySignal.Trading.Core.Events;
 /// </summary>
 public enum EventKind
 {
+    /// <summary>Operator command (kill / reset). Ranks before everything else at the same instant, so a kill at T applies before the data of T.</summary>
+    Control = -2,
+
+    /// <summary>Global feed-health transition. Ranks after Control and before data events of the same instant.</summary>
+    FeedHealth = -1,
+
     SpotQuote = 0,
     OptionQuote = 1,
     FutureQuote = 2,
@@ -60,9 +66,9 @@ public sealed record QuoteEvent : EngineEvent
     public QuoteEvent(DateTimeOffset availableAt, EventKind kind, long sourceTickId, string token, decimal? bid, decimal? ask, decimal? last = null, long? bidQty = null, long? askQty = null)
         : base(availableAt, kind, sourceTickId, token)
     {
-        if (kind is EventKind.BarCompleted)
+        if (kind is not (EventKind.SpotQuote or EventKind.OptionQuote or EventKind.FutureQuote))
         {
-            throw new ArgumentException("A quote event cannot have kind BarCompleted.", nameof(kind));
+            throw new ArgumentException("A quote event must have a quote kind.", nameof(kind));
         }
 
         Bid = bid;

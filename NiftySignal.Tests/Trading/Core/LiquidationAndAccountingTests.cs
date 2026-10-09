@@ -143,7 +143,7 @@ public class SessionLiquidationTests
 
         var later = new CostsConfig
         {
-            Schedules = new[] { NseIndexOptionsCostSchedules.From20260401(new FlatPerOrderBrokerage { Amount = 20m }) with { EffectiveFrom = new DateOnly(2026, 10, 1) } },
+            Schedules = new[] { NseIndexOptionsCostSchedules.From20260401(new FlatBrokerage { Amount = 20m, Unit = BrokerageUnit.PerOrder }) with { EffectiveFrom = new DateOnly(2026, 10, 1) } },
         };
         Assert.Throws<ArgumentException>(() => new TradeKit(TradeKit.MakeConfig(costs: later, variants: TradeKit.Immediate())));
     }
@@ -241,8 +241,8 @@ public class CostAndLedgerTests
     [Fact]
     public void EffectiveDating_PicksTheScheduleByTradeDate_AndNeverFallsBackToZero()
     {
-        var v1 = NseIndexOptionsCostSchedules.From20260401(new FlatPerOrderBrokerage { Amount = 20m }) with { Version = "v1", EffectiveTo = new DateOnly(2026, 9, 21) };
-        var v2 = NseIndexOptionsCostSchedules.From20260401(new FlatPerOrderBrokerage { Amount = 20m }) with { Version = "v2", EffectiveFrom = new DateOnly(2026, 9, 22), SttSellRate = 0.002m };
+        var v1 = NseIndexOptionsCostSchedules.From20260401(new FlatBrokerage { Amount = 20m, Unit = BrokerageUnit.PerOrder }) with { Version = "v1", EffectiveTo = new DateOnly(2026, 9, 21) };
+        var v2 = NseIndexOptionsCostSchedules.From20260401(new FlatBrokerage { Amount = 20m, Unit = BrokerageUnit.PerOrder }) with { Version = "v2", EffectiveFrom = new DateOnly(2026, 9, 22), SttSellRate = 0.002m };
         var config = new CostsConfig { Schedules = new[] { v2, v1 } };
         Assert.Empty(config.Validate());
 
@@ -260,7 +260,7 @@ public class CostAndLedgerTests
     [Fact]
     public void OverlappingSchedules_AreInvalid()
     {
-        var a = NseIndexOptionsCostSchedules.From20260401(new FlatPerOrderBrokerage { Amount = 20m }) with { Version = "a" };
+        var a = NseIndexOptionsCostSchedules.From20260401(new FlatBrokerage { Amount = 20m, Unit = BrokerageUnit.PerOrder }) with { Version = "a" };
         var b = a with { Version = "b", EffectiveFrom = new DateOnly(2026, 6, 1) };
 
         Assert.NotEmpty(new CostsConfig { Schedules = new[] { a, b } }.Validate());
@@ -290,7 +290,7 @@ public class CostAndLedgerTests
     {
         var pct = new CostsConfig
         {
-            Schedules = new[] { NseIndexOptionsCostSchedules.From20260401(new PercentOfTurnoverBrokerage { Rate = 0.0003m, CapPerFill = 20m }) },
+            Schedules = new[] { NseIndexOptionsCostSchedules.From20260401(new PercentOfTurnoverBrokerage { Rate = 0.0003m, Cap = 20m, Unit = BrokerageUnit.PerFill }) },
         };
         var model = new CostModel(pct, Clock.Day);
 

@@ -54,6 +54,9 @@ public sealed class Opportunity
 
     internal string? LastEvaluationKey { get; set; }
 
+    /// <summary>Per evaluation result: how often it occurred and when (the audit trail logs only the first occurrence; the count is flushed as an EvaluationSummary).</summary>
+    internal Dictionary<string, (int Count, DateTimeOffset First, DateTimeOffset Last)> NoteCounts { get; } = new(StringComparer.Ordinal);
+
     public bool IsTerminal => State is OpportunityState.Consumed or OpportunityState.Cancelled or OpportunityState.Expired or OpportunityState.Rejected;
 }
 

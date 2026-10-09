@@ -4,6 +4,7 @@ using NiftySignal.Trading.Core.Costs;
 using NiftySignal.Trading.Core.Entry;
 using NiftySignal.Trading.Core.Events;
 using NiftySignal.Trading.Core.Ids;
+using NiftySignal.Trading.Core.Integrity;
 using NiftySignal.Trading.Core.Instruments;
 using NiftySignal.Trading.Core.Quotes;
 using NiftySignal.Trading.Core.Scheduling;
@@ -100,6 +101,9 @@ public sealed class VariantEngine : IEngineHandler
     }
 
     public SessionSchedule Schedule { get; }
+
+    /// <summary>Optional veto on NEW entries (feed integrity, kill switch, risk profile). Checked before every entry intent; never consulted by exits.</summary>
+    public IEntryGate? EntryGate { get; set; }
 
     public ConfigHash ConfigHash => _configHash;
 
@@ -310,6 +314,13 @@ public sealed class VariantEngine : IEngineHandler
             return;
         }
 
+        var gateBlock = EntryGate?.BlockReason(v.VariantId, now);
+        if (gateBlock is not null)
+        {
+            Note(v, opportunity, now, "Blocked:" + gateBlock, "new entries are blocked for this scope");
+            return;
+        }
+
         var age = quote.Age(now);
         if (age < TimeSpan.Zero)
         {
@@ -473,16 +484,23 @@ public sealed class VariantEngine : IEngineHandler
         slot.OwnerOpportunityId = null;
         if (opportunity.CancelRequested)
         {
-            if (opportunity.CancelReason == CancelReason.EntryClose)
+            switch (opportunity.CancelReason)
             {
-                Terminal(v, opportunity, OpportunityState.Expired, now, "EntryClose");
+                case CancelReason.EntryClose:
+                    Terminal(v, opportunity, OpportunityState.Expired, now, "EntryClose");
+                    return;
+                case CancelReason.KillSwitch:
+                    Terminal(v, opportunity, OpportunityState.Cancelled, now, "KillSwitch");
+                    return;
+                case CancelReason.IntegrityDegraded:
+                    // A feed fault cancels the attempt but not the idea: fall through to the re-arm checks; entries stay blocked until Healthy.
+                    opportunity.CancelRequested = false;
+                    opportunity.CancelReason = null;
+                    break;
+                default:
+                    Terminal(v, opportunity, OpportunityState.Cancelled, now, "StrategyInvalidated");
+                    return;
             }
-            else
-            {
-                Terminal(v, opportunity, OpportunityState.Cancelled, now, "StrategyInvalidated");
-            }
-
-            return;
         }
 
         if (_entryClosed || !Schedule.IsEntryEligible(now))
@@ -595,6 +613,68 @@ public sealed class VariantEngine : IEngineHandler
         }
     }
 
+    // ------------------------------------------------------------------ safety actions (integrity / kill switch)
+
+    private IEnumerable<VariantState> InScope(string scope)
+        => scope == "*" ? _variants : _variants.Where(x => string.Equals(x.VariantId, scope, StringComparison.Ordinal));
+
+    /// <summary>Requests cancellation of the pending entry attempts (OrderPending) of the scope. Reservations stay until the outcome is reported. Returns how many requests were issued.</summary>
+    public int RequestCancelPending(string scope, CancelReason reason, DateTimeOffset at)
+    {
+        var count = 0;
+        foreach (var v in InScope(scope))
+        {
+            if (v.Active is { State: OpportunityState.OrderPending, CancelRequested: false } opportunity)
+            {
+                opportunity.CancelRequested = true;
+                opportunity.CancelReason = reason;
+                _outputs.Add(new CancelRequest(at, v.VariantId, opportunity.ActiveIntentId!, opportunity.Id, reason));
+                Audit(at, v, opportunity.Id, "EntryIntent", "CancelRequested", reason + "; reservation retained until the outcome is reported");
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    /// <summary>Ends the not-yet-ordered opportunities (AwaitingContract / Waiting) of the scope as Cancelled with the given reason. Returns how many ended.</summary>
+    public int CancelWaiting(string scope, string reason, DateTimeOffset at)
+    {
+        var count = 0;
+        foreach (var v in InScope(scope).ToList())
+        {
+            if (v.Active is { State: OpportunityState.AwaitingContract or OpportunityState.Waiting } opportunity)
+            {
+                Terminal(v, opportunity, OpportunityState.Cancelled, at, reason);
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    /// <summary>Emits the pending evaluation-count summaries of every still-active opportunity (call at session end).</summary>
+    public void FlushAllSummaries(DateTimeOffset at)
+    {
+        foreach (var v in _variants)
+        {
+            if (v.Active is { } opportunity)
+            {
+                FlushSummaries(v, opportunity, at);
+            }
+        }
+    }
+
+    private void FlushSummaries(VariantState v, Opportunity opportunity, DateTimeOffset at)
+    {
+        foreach (var (reason, info) in opportunity.NoteCounts.OrderBy(x => x.Key, StringComparer.Ordinal).ToList())
+        {
+            _outputs.Add(new EvaluationSummary(at, v.VariantId, opportunity.Id, "Opportunity", opportunity.Id, reason, info.Count, info.First, info.Last));
+        }
+
+        opportunity.NoteCounts.Clear();
+    }
+
     // ------------------------------------------------------------------ helpers
 
     private VariantState FindVariant(string variantId)
@@ -612,6 +692,7 @@ public sealed class VariantEngine : IEngineHandler
     {
         opportunity.TerminalReason = reason;
         Transition(v, opportunity, to, at, reason);
+        FlushSummaries(v, opportunity, at);
         v.Active = null;
         v.History.Add(opportunity);
         if (v.EpisodeId == opportunity.EpisodeId)
@@ -623,6 +704,7 @@ public sealed class VariantEngine : IEngineHandler
     /// <summary>Audit only when the evaluation outcome of an opportunity changes, so per-quote evaluation does not flood the trail.</summary>
     private void Note(VariantState v, Opportunity opportunity, DateTimeOffset at, string key, string detail)
     {
+        opportunity.NoteCounts[key] = opportunity.NoteCounts.TryGetValue(key, out var seen) ? (seen.Count + 1, seen.First, at) : (1, at, at);
         if (string.Equals(opportunity.LastEvaluationKey, key, StringComparison.Ordinal))
         {
             return;

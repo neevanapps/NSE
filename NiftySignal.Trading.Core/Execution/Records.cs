@@ -6,15 +6,18 @@ namespace NiftySignal.Trading.Core.Execution;
 
 /// <summary>
 /// Why a position is being sold. The order of the members is the priority when several triggers qualify on the same event:
-/// SessionLiquidation &gt; TradeSl &gt; StrategyExit &gt; FinalTarget &gt; Tp1 (lowest value = highest priority).
+/// SessionLiquidation &gt; ManualKill &gt; TradeSl &gt; StrategyExit &gt; FinalTarget &gt; Tp1 (lowest value = highest priority).
 /// </summary>
 public enum ExitReason
 {
     SessionLiquidation = 0,
-    TradeSl = 1,
-    StrategyExit = 2,
-    FinalTarget = 3,
-    Tp1 = 4,
+
+    /// <summary>Operator kill with liquidation (contract section A.14.3). Same execution path as every other exit.</summary>
+    ManualKill = 1,
+    TradeSl = 2,
+    StrategyExit = 3,
+    FinalTarget = 4,
+    Tp1 = 5,
 }
 
 public enum OrderStatus
@@ -64,6 +67,8 @@ public sealed class EntryOrder
 
     internal string? LastNote { get; set; }
 
+    internal Dictionary<string, (int Count, DateTimeOffset First, DateTimeOffset Last)> NoteCounts { get; } = new(StringComparer.Ordinal);
+
     internal List<Scheduling.DeadlineHandle> Handles { get; } = new();
 }
 
@@ -100,7 +105,12 @@ public sealed class ExitOrder
 
     public OrderStatus Status { get; internal set; } = OrderStatus.Working;
 
+    /// <summary>Fills, cumulative turnover and brokerage already charged on this order (drives per-order brokerage).</summary>
+    public Costs.OrderChargeState Charged { get; internal set; }
+
     internal string? LastNote { get; set; }
+
+    internal Dictionary<string, (int Count, DateTimeOffset First, DateTimeOffset Last)> NoteCounts { get; } = new(StringComparer.Ordinal);
 
     internal Scheduling.DeadlineHandle? AttemptHandle { get; set; }
 }
@@ -165,6 +175,28 @@ public sealed class Position
     public long Tp1FilledQuantity { get; internal set; }
 
     public int ExitSeq { get; internal set; }
+
+    // ---- bid-based excursion tracking (contract section A.14.5). Units: premium rupees per unit; the series is the contract's executable bid
+    // observed on quote events of the held contract (plus the entry-fill quote), from the entry fill until the position closes or the session ends.
+    // It is a property of the contract price path, so it keeps running after TP1 and is not split by partial exits.
+    public int BidObservations { get; internal set; }
+
+    public decimal? MaxBid { get; internal set; }
+
+    public decimal? MinBid { get; internal set; }
+
+    public DateTimeOffset? FirstBidObservationAt { get; internal set; }
+
+    public DateTimeOffset? LastBidObservationAt { get; internal set; }
+
+    /// <summary>Number of times two consecutive eligible-bid observations were further apart than the quote-age limit (the bid path was unobserved in between).</summary>
+    public int BidObservationGaps { get; internal set; }
+
+    public DateTimeOffset? FirstExitFillAt { get; internal set; }
+
+    public decimal? MaxBidAtFirstExit { get; internal set; }
+
+    public decimal? MinBidAtFirstExit { get; internal set; }
 
     public List<ExitOrder> ExitOrders { get; } = new();
 

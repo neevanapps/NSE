@@ -3,6 +3,7 @@ using NiftySignal.Trading.Core.Costs;
 using NiftySignal.Trading.Core.Exits;
 using NiftySignal.Trading.Core.Events;
 using NiftySignal.Trading.Core.Ids;
+using NiftySignal.Trading.Core.Integrity;
 using NiftySignal.Trading.Core.Quotes;
 using NiftySignal.Trading.Core.Scheduling;
 using NiftySignal.Trading.Core.Session;
@@ -66,6 +67,8 @@ public sealed class ExecutionEngine
 
         public decimal? WorstDailyPnl { get; set; }
 
+        public decimal PeakExposure { get; set; }
+
         public long Fills { get; set; }
 
         public long BelowBandFills { get; set; }
@@ -108,6 +111,25 @@ public sealed class ExecutionEngine
 
     public bool Ended => _ended;
 
+    /// <summary>The cost schedule in force for the trade date.</summary>
+    public CostScheduleEntry CostSchedule => _costs.Entry;
+
+    /// <summary>Re-checked when an entry order matures and on every later evaluation (feed integrity, kill switch, risk profile). Never consulted for exits.</summary>
+    public IEntryGate? EntryGate { get; set; }
+
+    /// <summary>Trades opened so far by the variant (positions; a partial exit is not a trade).</summary>
+    public int TradesOf(string variantId) => BookOf(variantId).Positions.Count;
+
+    public decimal PeakPremiumOf(string variantId) => BookOf(variantId).PeakExposure;
+
+    public decimal CommittedPremiumOf(string variantId) => Committed(BookOf(variantId));
+
+    public (bool Breached, decimal? Worst) DailySlOf(string variantId)
+    {
+        var book = BookOf(variantId);
+        return (book.Breached, book.WorstDailyPnl);
+    }
+
     public IReadOnlyList<EntryOrder> EntryOrders => _entryOrders;
 
     public IReadOnlyList<Position> PositionsOf(string variantId) => BookOf(variantId).Positions;
@@ -131,6 +153,7 @@ public sealed class ExecutionEngine
         var ordinal = BookOf(intent.VariantId).Ordinal;
         order.Handles.Add(s.Schedule(order.MaturityAt, DeadlineClass.ExecutionMaturity, ordinal, MaturePrefix + order.Id));
         order.Handles.Add(s.Schedule(order.ExpiresAt, DeadlineClass.ExecutionMaturity, ordinal, ExpirePrefix + order.Id));
+        Touch(BookOf(intent.VariantId));
     }
 
     public void RequestCancel(CancelRequest request, IEngineScheduler s)
@@ -199,11 +222,24 @@ public sealed class ExecutionEngine
             return;
         }
 
+        var gateBlock = EntryGate?.BlockReason(intent.VariantId, execTime);
+        if (gateBlock is not null)
+        {
+            Resolve(order, EntryOutcomeKind.Cancelled, "Gate:" + gateBlock, s);
+            return;
+        }
+
         // Quote-quality conditions that keep the order WORKING (they may improve before expiry).
         var rejection = CheckEntryQuote(quote, execTime);
         if (rejection is not null)
         {
             NoteEntry(order, rejection, execTime);
+            return;
+        }
+
+        if (_x.SignalQuoteReuse == SignalQuoteReusePolicy.RequireQuoteAfterDecision && quote!.AvailableAt <= intent.At)
+        {
+            NoteEntry(order, "AwaitingNewerQuote", execTime);
             return;
         }
 
@@ -241,6 +277,7 @@ public sealed class ExecutionEngine
         Consume(book, quote.Token, TradeSide.Buy, ask, quote.AskQty, quantity);
         OpenPosition(book, order, quantity, ask, belowBand, quote, execTime);
         Resolve(order, lots == intent.Lots ? EntryOutcomeKind.Filled : EntryOutcomeKind.PartiallyFilled, belowBand ? "FilledBelowBand" : "Filled", s);
+        Touch(book);
     }
 
     private string? CheckEntryQuote(QuoteSnapshot? quote, DateTimeOffset execTime)
@@ -296,6 +333,7 @@ public sealed class ExecutionEngine
         var costs = _costs.Compute(TradeSide.Buy, notional);
         position.EntryCosts = costs.Total;
         book.Positions.Add(position);
+        ObserveBid(position, quote, execTime);
         book.Cash -= notional + costs.Total;
         book.Fills++;
         if (belowBand)
@@ -343,12 +381,14 @@ public sealed class ExecutionEngine
         }
 
         order.Handles.Clear();
+        FlushNotes(order.NoteCounts, order.Intent.VariantId, order.Intent.OpportunityId, "EntryOrder", order.Id, s.Now);
         _out.Add(new AuditRecord(s.Now, order.Intent.VariantId, order.Intent.OpportunityId, "EntryOrder", kind.ToString(), reason));
         _variants.ReportEntryOutcome(new EntryOutcome(order.Intent.VariantId, order.Intent.OpportunityId, order.Id, kind), s);
     }
 
     private void NoteEntry(EntryOrder order, string note, DateTimeOffset at)
     {
+        order.NoteCounts[note] = order.NoteCounts.TryGetValue(note, out var seen) ? (seen.Count + 1, seen.First, at) : (1, at, at);
         if (order.LastNote == note)
         {
             return;
@@ -412,6 +452,7 @@ public sealed class ExecutionEngine
             {
                 if (position.State == PositionState.Open && position.Contract.Token == quote.Token)
                 {
+                    ObserveBid(position, snapshot, s.Now);
                     EvaluateExitTriggers(book, position, snapshot, s);
                 }
             }
@@ -561,6 +602,11 @@ public sealed class ExecutionEngine
 
         if (order.Status == OrderStatus.Working)
         {
+            if (failure is not null)
+            {
+                order.NoteCounts[failure] = order.NoteCounts.TryGetValue(failure, out var seen) ? (seen.Count + 1, seen.First, execTime) : (1, execTime, execTime);
+            }
+
             if (failure is not null && order.LastNote != failure)
             {
                 order.LastNote = failure;
@@ -596,7 +642,8 @@ public sealed class ExecutionEngine
     {
         var position = order.Position;
         var notional = bid * quantity;
-        var costs = _costs.Compute(TradeSide.Sell, notional);
+        var costs = _costs.Compute(TradeSide.Sell, notional, order.Charged);
+        order.Charged = new OrderChargeState(order.Charged.Fills + 1, order.Charged.Turnover + notional, order.Charged.BrokerageCharged + costs.Brokerage);
         Consume(book, quote.Token, TradeSide.Sell, bid, quote.BidQty, quantity);
         position.OpenQuantity -= quantity;
         position.ReservedExitQuantity -= quantity;
@@ -604,6 +651,13 @@ public sealed class ExecutionEngine
         position.ExitProceeds += notional;
         position.ExitCosts += costs.Total;
         order.FilledQuantity += quantity;
+        if (position.FirstExitFillAt is null)
+        {
+            position.FirstExitFillAt = execTime;
+            position.MaxBidAtFirstExit = position.MaxBid;
+            position.MinBidAtFirstExit = position.MinBid;
+        }
+
         book.Cash += notional - costs.Total;
         book.Fills++;
         var late = execTime >= _schedule.FinalCloseUtc;
@@ -642,6 +696,7 @@ public sealed class ExecutionEngine
         if (order.RemainingQuantity == 0)
         {
             order.Status = OrderStatus.Filled;
+            FlushNotes(order.NoteCounts, position.VariantId, position.OpportunityId, "ExitOrder", order.Id, execTime);
         }
 
         if (position.OpenQuantity == 0)
@@ -653,6 +708,7 @@ public sealed class ExecutionEngine
             _variants.ReportPositionClosed(position.VariantId, position.OpportunityId, s);
         }
 
+        Touch(book);
         if (book.DailySl is not null)
         {
             UpdateDailySl(book, execTime);
@@ -705,6 +761,65 @@ public sealed class ExecutionEngine
         }
     }
 
+    /// <summary>Requests an exit of the unreserved quantity of every open position of the scope ("*" or a variant) through the normal exit path. Returns the number of orders created.</summary>
+    public int LiquidateScope(string scope, ExitReason reason, long triggerSeq, IEngineScheduler s)
+    {
+        var count = 0;
+        foreach (var book in _books.Where(b => scope == "*" || string.Equals(b.VariantId, scope, StringComparison.Ordinal)))
+        {
+            foreach (var position in book.Positions.Where(p => p.State == PositionState.Open).ToList())
+            {
+                var available = position.OpenQuantity - position.ReservedExitQuantity;
+                if (available > 0)
+                {
+                    CreateExit(book, position, reason, available, null, triggerSeq, s);
+                    count++;
+                }
+            }
+        }
+
+        return count;
+    }
+
+    private static decimal Committed(Book book, IEnumerable<EntryOrder> working)
+        => book.Positions.Where(p => p.State == PositionState.Open).Sum(p => p.AvgEntryPrice * p.OpenQuantity)
+           + working.Sum(o => o.Intent.LimitPrice * o.Intent.RequestedQuantity);
+
+    private decimal Committed(Book book)
+        => Committed(book, _entryOrders.Where(o => o.Status == OrderStatus.Working && o.Intent.VariantId == book.VariantId));
+
+    private void Touch(Book book) => book.PeakExposure = Math.Max(book.PeakExposure, Committed(book));
+
+    private void ObserveBid(Position position, QuoteSnapshot quote, DateTimeOffset now)
+    {
+        if (!IsEligibleBid(quote, now))
+        {
+            return;
+        }
+
+        var bid = quote.Bid!.Value;
+        if (position.LastBidObservationAt is { } last && now - last > _x.MaxQuoteAge)
+        {
+            position.BidObservationGaps++;
+        }
+
+        position.BidObservations++;
+        position.MaxBid = position.MaxBid is { } max ? Math.Max(max, bid) : bid;
+        position.MinBid = position.MinBid is { } min ? Math.Min(min, bid) : bid;
+        position.FirstBidObservationAt ??= now;
+        position.LastBidObservationAt = now;
+    }
+
+    private void FlushNotes(Dictionary<string, (int Count, DateTimeOffset First, DateTimeOffset Last)> counts, string variantId, string? opportunityId, string scope, string subject, DateTimeOffset at)
+    {
+        foreach (var (reason, info) in counts.OrderBy(x => x.Key, StringComparer.Ordinal).ToList())
+        {
+            _out.Add(new EvaluationSummary(at, variantId, opportunityId, scope, subject, reason, info.Count, info.First, info.Last));
+        }
+
+        counts.Clear();
+    }
+
     private void EndSession(IEngineScheduler s)
     {
         foreach (var order in _entryOrders.Where(o => o.Status == OrderStatus.Working).ToList())
@@ -722,6 +837,7 @@ public sealed class ExecutionEngine
                 foreach (var order in position.ExitOrders.Where(o => o.Status == OrderStatus.Working))
                 {
                     order.Status = OrderStatus.Cancelled;
+                    FlushNotes(order.NoteCounts, position.VariantId, position.OpportunityId, "ExitOrder", order.Id, s.Now);
                     if (order.AttemptHandle is { } handle)
                     {
                         s.Cancel(handle);

@@ -19,6 +19,19 @@ public enum BelowBandMode
     BrokerRealisticBelowBand = 1,
 }
 
+/// <summary>
+/// Whether the quote that generated the signal (or any quote not newer than the decision) may be used to fill the order. A positive latency
+/// only guarantees that execution happens LATER; it does not by itself force a NEWER quote. With the default a still-fresh signal quote can fill.
+/// </summary>
+public enum SignalQuoteReusePolicy
+{
+    /// <summary>Default (the actual CP3 behaviour): the execution quote is the latest delivered quote at or before the execution time. It may be the very quote that triggered the intent, provided it is still fresh (age at the execution time &lt;= MaxQuoteAge) and its displayed liquidity has not been consumed by this book.</summary>
+    AllowFreshSignalQuote = 0,
+
+    /// <summary>Conservative sensitivity: the execution quote must have AvailableAt strictly AFTER the decision time; until one arrives the order keeps working (note AwaitingNewerQuote).</summary>
+    RequireQuoteAfterDecision = 1,
+}
+
 /// <summary>Initial partial-entry policy: keep what filled (whole lots) and cancel the remaining entry quantity; a partial fill consumes the opportunity.</summary>
 public enum PartialEntryPolicy
 {
@@ -41,7 +54,7 @@ public sealed record ExecutionConfig
 {
     public ExecutionAdapter Adapter { get; init; } = ExecutionAdapter.Simulated;
 
-    /// <summary>Time from decision to the simulated exchange (must be positive so that a fill can never use the quote that generated the signal). PLACEHOLDER.</summary>
+    /// <summary>Time from decision to the simulated exchange; must be positive so that execution happens strictly after the decision. It does NOT by itself exclude the signal quote (see <see cref="SignalQuoteReusePolicy"/>). PLACEHOLDER.</summary>
     public TimeSpan Latency { get; init; } = TimeSpan.FromSeconds(1);
 
     /// <summary>A cancellation requested at t takes effect at t + CancelLatency (except the 15:00 entry-close cancel, which is immediate). PLACEHOLDER.</summary>
@@ -69,6 +82,8 @@ public sealed record ExecutionConfig
     public TimeSpan ExitRetryInterval { get; init; } = TimeSpan.FromSeconds(1);
 
     public BelowBandMode BelowBand { get; init; } = BelowBandMode.ResearchEnforceBand;
+
+    public SignalQuoteReusePolicy SignalQuoteReuse { get; init; } = SignalQuoteReusePolicy.AllowFreshSignalQuote;
 
     public PartialEntryPolicy PartialEntry { get; init; } = PartialEntryPolicy.KeepFilledCancelRemainder;
 
@@ -122,7 +137,7 @@ public sealed record ExecutionConfig
             errors.Add("Execution.ExitRetryInterval must be positive.");
         }
 
-        if (!Enum.IsDefined(BelowBand) || !Enum.IsDefined(PartialEntry) || !Enum.IsDefined(Books))
+        if (!Enum.IsDefined(BelowBand) || !Enum.IsDefined(PartialEntry) || !Enum.IsDefined(Books) || !Enum.IsDefined(SignalQuoteReuse))
         {
             errors.Add("Execution mode enum value is not defined.");
         }

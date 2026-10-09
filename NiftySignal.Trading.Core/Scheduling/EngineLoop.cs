@@ -84,6 +84,22 @@ public sealed class EngineLoop : IEngineScheduler
 
     public DateTimeOffset Now => _clock.Now;
 
+    /// <summary>AvailableAt of the last delivered group (null before the first).</summary>
+    public DateTimeOffset? LastGroupTime => _lastGroupTime;
+
+    /// <summary>True when an event with this identity was already delivered; <paramref name="seen"/> is the delivered event.</summary>
+    public bool TryGetSeen(EventIdentity identity, out EngineEvent seen)
+    {
+        if (_seen.TryGetValue(identity, out var found))
+        {
+            seen = found;
+            return true;
+        }
+
+        seen = null!;
+        return false;
+    }
+
     public EngineLoopStats Stats => new(_eventsDelivered, _duplicatesIgnored, _groupsProcessed, _deadlinesFired, _queue.Count, _clock.Now, _finished);
 
     public IReadOnlyList<ScheduledDeadline> PendingDeadlines => _queue.Snapshot();

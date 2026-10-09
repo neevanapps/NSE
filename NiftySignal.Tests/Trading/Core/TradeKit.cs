@@ -39,8 +39,8 @@ internal sealed class TradeKit
     public EngineLoop Loop { get; }
 
     /// <summary>TEST brokerage (flat Rs 20 per fill): not the user's plan, chosen only so that the golden ledger is easy to recompute.</summary>
-    public static CostsConfig TestCosts(decimal brokerage = 20m)
-        => new() { Schedules = new[] { NseIndexOptionsCostSchedules.From20260401(new FlatPerOrderBrokerage { Amount = brokerage }) } };
+    public static CostsConfig TestCosts(decimal brokerage = 20m, BrokerageUnit unit = BrokerageUnit.PerOrder)
+        => new() { Schedules = new[] { NseIndexOptionsCostSchedules.From20260401(new FlatBrokerage { Amount = brokerage, Unit = unit }) } };
 
     public static TradingConfig MakeConfig(ExecutionConfig? execution = null, CostsConfig? costs = null, SessionConfig? session = null, ContractSelectionConfig? selection = null, params VariantSpec[] variants)
         => new()
