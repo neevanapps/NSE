@@ -1,16 +1,19 @@
+using NiftySignal.Trading.Core.Candles;
+using NiftySignal.Trading.Core.Selection;
 using NiftySignal.Trading.Core.Session;
+using NiftySignal.Trading.Core.Variants;
 
 namespace NiftySignal.Trading.Core.Config;
 
 /// <summary>
-/// Versioned, immutable engine configuration (contract section 7). CP1 contains only the session policy; later checkpoints add
-/// variants, risk profiles, execution and cost settings as further properties and bump <see cref="CurrentSchemaVersion"/> when the
-/// meaning of an existing property changes. The hash is over the canonical serialisation, so it is independent of property or
-/// dictionary order, machine culture, time zone and anything generated at run time.
+/// Versioned, immutable engine configuration (contract section 7). Schema 2 (CP2) adds contract selection / entry premium band, candle
+/// construction and the variant set to the CP1 session policy. The hash is over the canonical serialisation, so it is independent of
+/// property or dictionary order, machine culture, time zone and anything generated at run time. Variants are a dictionary keyed by
+/// VariantId, so the order in which they are declared never affects the hash.
 /// </summary>
 public sealed record TradingConfig
 {
-    public const int CurrentSchemaVersion = 1;
+    public const int CurrentSchemaVersion = 2;
 
     public int SchemaVersion { get; init; } = CurrentSchemaVersion;
 
@@ -18,6 +21,13 @@ public sealed record TradingConfig
     public required string ConfigVersion { get; init; }
 
     public SessionConfig Session { get; init; } = new();
+
+    /// <summary>Entry premium band (default 100..150 inclusive), expiry policy, quote freshness and ranking. Entries only, never exits.</summary>
+    public ContractSelectionConfig Selection { get; init; } = new();
+
+    public CandleConfig Candles { get; init; } = new();
+
+    public IReadOnlyDictionary<string, VariantSpec> Variants { get; init; } = new Dictionary<string, VariantSpec>();
 
     public IReadOnlyList<string> Validate()
     {
@@ -33,10 +43,36 @@ public sealed record TradingConfig
         }
 
         errors.AddRange(Session.Validate());
+        errors.AddRange(Selection.Validate());
+        errors.AddRange(Candles.Validate());
+        foreach (var (key, spec) in Variants)
+        {
+            if (!string.Equals(key, spec.VariantId, StringComparison.Ordinal))
+            {
+                errors.Add($"Variant key '{key}' does not match its VariantId '{spec.VariantId}'.");
+            }
+
+            errors.AddRange(spec.Validate(Candles.HistoryDepth));
+        }
+
         return errors;
     }
 
     public string ToCanonicalJson() => CanonicalJson.Serialize(this);
 
     public ConfigHash ComputeHash() => CanonicalJson.Hash(this);
+
+    /// <summary>
+    /// Hash of everything that determines one variant's behaviour: its spec plus the shared selection, candle and session policy. Two
+    /// variants with different specs therefore never share an opportunity or order id namespace.
+    /// </summary>
+    public ConfigHash ComputeVariantHash(string variantId)
+    {
+        if (!Variants.TryGetValue(variantId, out var spec))
+        {
+            throw new KeyNotFoundException($"Unknown variant '{variantId}'.");
+        }
+
+        return CanonicalJson.Hash(new { SchemaVersion, Variant = spec, Selection, Candles, Session });
+    }
 }

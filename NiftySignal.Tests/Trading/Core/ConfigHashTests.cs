@@ -7,12 +7,11 @@ public class ConfigHashTests
 {
     // Golden values: if one of these changes, the canonical serialisation or the default session policy changed, which silently
     // re-versions every persisted decision. Update deliberately, together with TradingConfig.SchemaVersion where meaning changed.
-    private const string GoldenCanonicalJson =
-        "{\"ConfigVersion\":\"cp1-test\",\"SchemaVersion\":1,\"Session\":{\"EntryClose\":\"15:00:00.0000000\",\"EntryOpen\":\"09:30:00.0000000\",\"FinalClose\":\"15:10:00.0000000\",\"LiquidationStart\":null,\"SessionEnd\":\"15:35:00.0000000\",\"TimeZoneId\":\"Asia/Kolkata\"}}";
+    private const string GoldenCanonicalJson = """{"Candles":{"Clock":"AdaptiveFuturesBars","HistoryDepth":64,"MaxCloseAge":null,"MinObservationsPerCandle":1},"ConfigVersion":"cp2-test","SchemaVersion":2,"Selection":{"ExpiryPolicy":"NearestExpiryOnOrAfterTradeDate","MaxQuoteAge":"00:00:02","MaximumEntryPremium":150,"MinCalendarDaysToExpiry":0,"MinimumEntryPremium":100,"Ranking":["AskNearestBandMidpoint","SmallestSpread"]},"Session":{"EntryClose":"15:00:00.0000000","EntryOpen":"09:30:00.0000000","FinalClose":"15:10:00.0000000","LiquidationStart":null,"SessionEnd":"15:35:00.0000000","TimeZoneId":"Asia/Kolkata"},"Variants":{}}""";
 
-    private const string GoldenHash = "dcc184480f2550f94c971631722b46b324eae92613441143470c7d8a427d01de";
+    private const string GoldenHash = "dd87e0188dd81bfe67be22c74ceb3f8618be15920ede8b16c9d4e73ec01092f5";
 
-    private static TradingConfig Default() => new() { ConfigVersion = "cp1-test" };
+    private static TradingConfig Default() => new() { ConfigVersion = "cp2-test" };
 
     [Fact]
     public void DefaultConfig_HasAStableCanonicalFormAndHash()
@@ -154,7 +153,7 @@ public class ConfigHashTests
     public void Validation_ReportsProblems()
     {
         Assert.Empty(Default().Validate());
-        Assert.NotEmpty((Default() with { SchemaVersion = 2 }).Validate());
+        Assert.NotEmpty((Default() with { SchemaVersion = 1 }).Validate());
         Assert.NotEmpty((Default() with { ConfigVersion = " " }).Validate());
         Assert.NotEmpty((Default() with { Session = new SessionConfig { EntryClose = new TimeOnly(9, 0, 0) } }).Validate());
     }

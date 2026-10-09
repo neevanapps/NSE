@@ -104,7 +104,7 @@ internal static class Scenarios
         return result;
     }
 
-    public static string[] Run(Scenario scenario, Dictionary<int, List<DateTimeOffset>>? heartbeats)
+    public static string[] Run(Scenario scenario, Dictionary<int, List<DateTimeOffset>>? heartbeats, Action<EngineLoop>? afterStep = null)
     {
         var handler = new RecordingHandler();
         handler.EventHook = (e, s) =>
@@ -147,10 +147,12 @@ internal static class Scenarios
                 foreach (var beat in beats)
                 {
                     loop.AdvanceTo(beat);
+                    afterStep?.Invoke(loop);
                 }
             }
 
             loop.ProcessGroup(scenario.Groups[i]);
+            afterStep?.Invoke(loop);
         }
 
         if (heartbeats is not null && heartbeats.TryGetValue(scenario.Groups.Count, out var tail))
@@ -158,10 +160,12 @@ internal static class Scenarios
             foreach (var beat in tail)
             {
                 loop.AdvanceTo(beat);
+                afterStep?.Invoke(loop);
             }
         }
 
         loop.Finish(scenario.Horizon);
+        afterStep?.Invoke(loop);
         return handler.Log.ToArray();
     }
 }

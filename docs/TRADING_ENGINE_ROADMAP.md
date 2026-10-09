@@ -14,10 +14,10 @@ One deterministic strategy + risk + simulated-execution engine that is executed 
 |---|---|---|
 | CP0 — re-verify & scaffold | **Done 2026-10-09** | `NiftySignal.Trading.Core` + `NiftySignal.Tests/Trading/Core`; audited facts re-read (availability definition, group ordering, 2 s stable lag, `IstTime`); banned-API metadata guard |
 | CP1 — time, events, timers | **Done 2026-10-09** | Event/deadline total orders, `EngineLoop`, `ReplayDriver` with explicit horizon, session boundaries, canonical config hash, deterministic ids. 75 new tests; full suite 1399/1399; no new warnings. Exact contract: contract §A.11 |
-| CP2 — variants, accounts, opportunities | Not started | Awaiting review |
-| CP3–CP7 | Not started | |
+| CP2 — variants, accounts, opportunities | **Done 2026-10-10** | Entry premium band (₹100–150 inclusive) with pure contract selection; per-contract candle histories on the adaptive bar clock; Immediate and AskBelowCandleMA conditions; opportunity lifecycle, capacity, re-arm, 15:00 behaviour; plumbing strategy; CP1 clock invariant review (no defect). 94 new tests; full suite 1493/1493; no new warnings. Contract §A.12 |
+| CP3–CP7 | Not started | CP3 scope proposed in contract §15 (execution, sizing, exits, costs, ResearchV1 risk) |
 
-Implementation boundary today: only `Trading.Core` time/events/scheduling/session/config/id primitives exist. There is no strategy, execution simulator, cost model, sizing, risk profile, persistence, adapter, database, `Host` registration or deployment.
+Implementation boundary today: `Trading.Core` has time/events/scheduling/session/config/id primitives (CP1) and the entry engine (CP2: premium band and contract selection, candle histories, entry conditions, opportunities, capacity); `Trading.Signals` has one plumbing strategy with no edge claim. There is no execution simulator, cost model, sizing execution, exits, risk profile, persistence, adapter, database, `Host` registration or deployment.
 
 ## Confirmed requirements now in the contract (Amendment 1)
 
