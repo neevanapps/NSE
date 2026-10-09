@@ -45,8 +45,23 @@ public static class RunIdentity
             FreezeText(spec.Freeze),
             spec.SourceManifest,
             horizon,
+            VariantsOf(spec),
             string.Empty));
     }
+
+    /// <summary>The ownership account of a variant: one independent virtual book per variant (the engine's own label).</summary>
+    public static string AccountOf(string variantId) => "independent-virtual-book:" + variantId;
+
+    private static IReadOnlyList<VariantIdentity> VariantsOf(DurableRunSpec spec)
+        => spec.Config.Variants
+            .OrderBy(v => v.Key, StringComparer.Ordinal)
+            .Select(v => new VariantIdentity(
+                v.Key,
+                spec.Config.ComputeVariantHash(v.Key).Value,
+                v.Value.StrategyId,
+                spec.Strategies.TryGetValue(v.Value.StrategyId, out var strategy) ? strategy.Version : "unregistered",
+                AccountOf(v.Key)))
+            .ToList();
 
     /// <summary>Canonical text of the frozen session: dictionaries are written in key order so equal freezes give equal text.</summary>
     public static string FreezeText(SessionFreeze freeze)
