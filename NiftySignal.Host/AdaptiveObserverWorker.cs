@@ -92,7 +92,12 @@ public sealed class AdaptiveObserverWorker(
                     }
 
                     _live = null;
-                    await FinalizeEndedSessionsAsync(day, time >= MarketHardClose, stoppingToken);
+                    // Not preemptible: once started a slow reconstruction cannot notice 09:15, so it never starts on weekday mornings.
+                    if (ShouldRunEndedSessionRecovery(weekday, time))
+                    {
+                        await FinalizeEndedSessionsAsync(day, time >= MarketHardClose, stoppingToken);
+                    }
+
                     await DelayAsync(OutsideMarketPoll, stoppingToken);
                     continue;
                 }
@@ -131,6 +136,9 @@ public sealed class AdaptiveObserverWorker(
     /// weekends), so old unfinished sessions never compete with today's live start/recovery.
     /// </summary>
     internal static bool IsLiveMarketWindow(bool weekday, TimeOnly time) => weekday && time >= MarketOpen && time < MarketHardClose;
+
+    /// <summary>Old ended-session repair runs only on weekends or on a weekday at/after the 15:35 IST hard close; never on a weekday morning or during market hours.</summary>
+    internal static bool ShouldRunEndedSessionRecovery(bool weekday, TimeOnly time) => !weekday || time >= MarketHardClose;
 
     async Task FinalizeEndedSessionsAsync(DateOnly todayIst, bool includeToday, CancellationToken ct)
     {
