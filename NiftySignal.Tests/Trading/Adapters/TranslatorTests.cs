@@ -185,6 +185,68 @@ public class TranslatorTests
     }
 
     [Fact]
+    public void OnlyARowIdenticalInEveryComparedFieldIsSuppressed_AnyDifferenceInTradeVolumeQuoteSizeOrExchangeSecondSurvives()
+    {
+        // AdaptiveTickCleaner.SamePayload compares exchange stamp, last, bid, ask, both sizes, cumulative volume and open interest with the PREVIOUS row of the token.
+        var baseRow = Tk.Row("CE23900", 1, Tk.T, 125m, 124m, 125m, volume: 500, bidQty: 100, askQty: 200, oi: 5_000);
+        var variants = new (string What, SourceTick Row)[]
+        {
+            ("exchange second", baseRow with { Id = 2, ReceivedAt = Tk.T.AddSeconds(2), ExchangeTimestamp = Tk.T.AddSeconds(1) }),
+            ("last price", baseRow with { Id = 2, ReceivedAt = Tk.T.AddSeconds(1), Last = 126m }),
+            ("bid", baseRow with { Id = 2, ReceivedAt = Tk.T.AddSeconds(1), Bid = 123.95m }),
+            ("ask", baseRow with { Id = 2, ReceivedAt = Tk.T.AddSeconds(1), Ask = 125.05m }),
+            ("bid size", baseRow with { Id = 2, ReceivedAt = Tk.T.AddSeconds(1), BidQty = 101 }),
+            ("ask size", baseRow with { Id = 2, ReceivedAt = Tk.T.AddSeconds(1), AskQty = 199 }),
+            ("traded volume", baseRow with { Id = 2, ReceivedAt = Tk.T.AddSeconds(1), Volume = 501 }),
+            ("open interest", baseRow with { Id = 2, ReceivedAt = Tk.T.AddSeconds(1), OpenInterest = 5_001 }),
+        };
+
+        foreach (var (what, row) in variants)
+        {
+            var translator = Tk.Translator(lag: TimeSpan.Zero);
+            translator.Offer(baseRow);
+            Assert.True(translator.Offer(row) == RowDisposition.Accepted, $"a change in {what} must not be suppressed");
+        }
+
+        // identical in every field, same exchange second: suppressed, and the first quote's availability is NOT refreshed by the repeat
+        var t = Tk.Translator(lag: TimeSpan.Zero);
+        t.Offer(baseRow);
+        Assert.Equal(RowDisposition.PayloadDuplicate, t.Offer(baseRow with { Id = 2, ReceivedAt = Tk.T.AddMilliseconds(900) }));
+        t.Offer(Tk.Row("PE23900", 3, Tk.T.AddSeconds(5), 100m, 99m, 100m));
+        var quotes = t.Finish().SelectMany(g => g.Quotes).Where(q => q.Event.Token == "CE23900").ToList();
+        var only = Assert.Single(quotes);
+        Assert.Equal(Tk.T, only.Event.AvailableAt);                                                                // the quote keeps its first availability: its age grows, it is never refreshed by a suppressed repeat
+
+        // the comparison is with the PREVIOUS row only: A, B, A is three observations
+        var abab = Tk.Translator(lag: TimeSpan.Zero);
+        var a = Tk.Row("CE23900", 1, Tk.T, 125m, 124m, 125m, volume: 500);
+        var b = a with { Id = 2, ReceivedAt = Tk.T.AddSeconds(1), Bid = 123m };
+        Assert.Equal(RowDisposition.Accepted, abab.Offer(a));
+        Assert.Equal(RowDisposition.Accepted, abab.Offer(b));
+        Assert.Equal(RowDisposition.Accepted, abab.Offer(a with { Id = 3, ReceivedAt = Tk.T.AddSeconds(2) }));      // back to A's prices at a later second: a distinct observation
+    }
+
+    [Fact]
+    public void ClampedAvailability_ReportsTheSkewBetweenTheExchangeStampAndTheReceiveTime()
+    {
+        var rows = new[]
+        {
+            Tk.Row("CE23900", 1, Tk.T, 125m, 124m, 125m, received: Tk.T, exchange: Tk.T.AddMilliseconds(500)),
+            Tk.Row("PE23900", 2, Tk.T.AddSeconds(3), 120m, 119m, 120m, received: Tk.T.AddSeconds(3), exchange: Tk.T.AddSeconds(3).AddMilliseconds(900)),
+            Tk.Row("CE23900", 3, Tk.T.AddSeconds(6), 126m, 125m, 126m),
+        };
+        var translator = Tk.Translator();
+
+        Tk.All(translator, rows);
+
+        var c = translator.Counters;
+        Assert.Equal(2, c.ClampedAvailability);
+        Assert.Equal(TimeSpan.FromMilliseconds(900), c.MaxClampSkew);
+        Assert.Equal(700d, c.MeanClampSkewMilliseconds, 6);
+        Assert.Equal(0, c.PayloadDuplicatesFuture + c.PayloadDuplicatesOption);
+    }
+
+    [Fact]
     public void AvailabilityProvenance_KeepsBothTimestamps_AndNamesTheBasis_NothingIsRepaired()
     {
         var received = Tk.T;

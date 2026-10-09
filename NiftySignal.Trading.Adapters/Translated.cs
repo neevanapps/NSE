@@ -119,7 +119,11 @@ public sealed record TranslatorCounters(
     long GroupsReleased,
     long BarsReleased,
     int MaxBufferedRows,
-    int SeenIdCount)
+    int SeenIdCount,
+    long PayloadDuplicatesFuture,
+    long PayloadDuplicatesOption,
+    TimeSpan MaxClampSkew,
+    double MeanClampSkewMilliseconds)
 {
     /// <summary>Every offered row is accounted for exactly once: <c>Input = Translated + Redelivered + PayloadDuplicates + OutsideWindow + Quarantined</c>.</summary>
     public bool Balanced => Input == Translated + Redelivered + PayloadDuplicates + OutsideWindow + Quarantined;

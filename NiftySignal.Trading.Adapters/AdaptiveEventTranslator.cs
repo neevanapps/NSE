@@ -61,6 +61,9 @@ public sealed class AdaptiveEventTranslator
     private long _outsideWindow;
     private long _quarantined;
     private long _clamped;
+    private long _payloadDuplicatesFuture;
+    private long _clampSkewTicks;
+    private TimeSpan _maxClampSkew;
     private long _exchangeEqualsReceived;
     private long _bars;
     private int _maxBuffered;
@@ -126,7 +129,11 @@ public sealed class AdaptiveEventTranslator
         _groupOrdinal,
         _bars,
         _maxBuffered,
-        _seen.Count);
+        _seen.Count,
+        _payloadDuplicatesFuture,
+        _payloadDuplicates - _payloadDuplicatesFuture,
+        _maxClampSkew,
+        _clamped == 0 ? 0d : _clampSkewTicks / (double)_clamped / TimeSpan.TicksPerMillisecond);
 
     /// <summary>
     /// Source progress proof: "every row with ReceivedAt before <paramref name="through"/> has been offered". Raises the stable boundary to
@@ -213,6 +220,11 @@ public sealed class AdaptiveEventTranslator
         if (clean is not { } tick)
         {
             _payloadDuplicates++;
+            if (row.Token == _freeze.FutureToken)
+            {
+                _payloadDuplicatesFuture++;
+            }
+
             return RowDisposition.PayloadDuplicate;
         }
 
@@ -226,6 +238,12 @@ public sealed class AdaptiveEventTranslator
         if (basis == AvailabilityBasis.ExchangeTimestampClamp)
         {
             _clamped++;
+            var skew = row.ExchangeTimestamp - row.ReceivedAt;
+            _clampSkewTicks += skew.Ticks;
+            if (skew > _maxClampSkew)
+            {
+                _maxClampSkew = skew;
+            }
         }
 
         _buffer.Add(new Buffered(row.Token, tick, row, basis));

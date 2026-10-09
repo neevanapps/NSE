@@ -31,6 +31,26 @@ public sealed record TransportDiagnostics(
     long GroupsAfterHorizon,
     long ControlEventsDelivered);
 
+/// <summary>Per-variant activity of a run (engineering coverage evidence, not performance).</summary>
+public sealed record VariantReport(
+    string VariantId,
+    int OpportunitiesCreated,
+    int EntryIntents,
+    int FilledEntries,
+    IReadOnlyDictionary<string, int> ExitFillsByReason,
+    int ClosedPositions,
+    int UnresolvedPositions);
+
+/// <summary>When the adaptive readiness evidence first said Ready, and how the bars were classified.</summary>
+public sealed record ReadinessReport(
+    int Bars,
+    int ValidBars,
+    int SignalStartedBars,
+    int ReadyBars,
+    DateTimeOffset? FirstBarEnd,
+    DateTimeOffset? FirstReadyBarEnd,
+    long? FirstReadyBarSeq);
+
 public sealed record RunResult(
     IReadOnlyDictionary<string, ChannelDigest> Channels,
     TranslatorCounters Translator,
@@ -42,7 +62,9 @@ public sealed record RunResult(
     int EngineQuarantines,
     int SeenInLoop,
     TransportDiagnostics Transport,
-    IReadOnlyDictionary<string, IReadOnlyList<CapturedLine>> Captured);
+    IReadOnlyDictionary<string, IReadOnlyList<CapturedLine>> Captured,
+    IReadOnlyList<VariantReport> Variants,
+    ReadinessReport Readiness);
 
 /// <summary>
 /// One trading run: translator + trading engine + loop + recorders, driven by an adapter (contract section A.16.2). The adapter decides how rows arrive;
@@ -65,6 +87,13 @@ public sealed class TradingRun
     private long _maxBatch;
     private readonly Dictionary<string, string> _opportunityLines = new(StringComparer.Ordinal);
     private bool _finished;
+    private int _barCount;
+    private int _validBars;
+    private int _signalStartedBars;
+    private int _readyBars;
+    private DateTimeOffset? _firstBarEnd;
+    private DateTimeOffset? _firstReadyEnd;
+    private long? _firstReadySeq;
 
     public TradingRun(
         SessionFreeze freeze,
@@ -264,6 +293,20 @@ public sealed class TradingRun
         foreach (var b in group.Bars)
         {
             var info = b.Event.Info!;
+            _barCount++;
+            _validBars += info.IsValid ? 1 : 0;
+            _signalStartedBars += info.SignalStarted ? 1 : 0;
+            _firstBarEnd ??= info.EndAvailableAt;
+            if (info.Ready)
+            {
+                _readyBars++;
+                if (_firstReadyEnd is null)
+                {
+                    _firstReadyEnd = info.EndAvailableAt;
+                    _firstReadySeq = b.Event.BarSeq;
+                }
+            }
+
             bars.Add($"b{b.Event.BarSeq}", $"{Canonical.Time(b.Event.AvailableAt)}|b{b.Event.BarSeq}|{Canonical.Json(info)}|{Canonical.Json(b.Metrics)}");
             readiness.Add($"b{b.Event.BarSeq}", FormattableString.Invariant($"{Canonical.Time(b.Event.AvailableAt)}|b{b.Event.BarSeq}|ready={info.Ready}|valid={info.IsValid}|consecutive={info.ConsecutiveValidBars}/{info.RequiredValidBars}|signalStarted={info.SignalStarted}|{info.ReadinessSpec}"));
         }
@@ -331,7 +374,33 @@ public sealed class TradingRun
             Engine.Admission.QuarantinedCount,
             Loop.SeenCount,
             new TransportDiagnostics(_pages, _polls, _failedPolls, _heartbeats, _maxBatch, _groupsAfterHorizon, _controlsDelivered),
-            captured);
+            captured,
+            VariantReports(),
+            new ReadinessReport(_barCount, _validBars, _signalStartedBars, _readyBars, _firstBarEnd, _firstReadyEnd, _firstReadySeq));
+    }
+
+    private List<VariantReport> VariantReports()
+    {
+        var list = new List<VariantReport>();
+        foreach (var v in Engine.Variants.Variants.OrderBy(x => x.VariantId, StringComparer.Ordinal))
+        {
+            var positions = Engine.Execution.PositionsOf(v.VariantId);
+            var fills = Engine.Outputs.OfType<FillRecord>().Where(f => f.VariantId == v.VariantId).ToList();
+            var exits = fills.Where(f => f.Side == NiftySignal.Trading.Core.Costs.TradeSide.Sell)
+                .GroupBy(f => f.Reason?.ToString() ?? "Unspecified")
+                .OrderBy(g => g.Key, StringComparer.Ordinal)
+                .ToDictionary(g => g.Key, g => g.Count(), StringComparer.Ordinal);
+            list.Add(new VariantReport(
+                v.VariantId,
+                Engine.Variants.AllOpportunities.Count(o => o.VariantId == v.VariantId),
+                Engine.Outputs.OfType<EntryIntent>().Count(i => i.VariantId == v.VariantId),
+                positions.Count,
+                exits,
+                positions.Count(p => p.State == PositionState.Closed),
+                positions.Count(p => p.State == PositionState.Unresolved)));
+        }
+
+        return list;
     }
 
     private IReadOnlyDictionary<string, IReadOnlyList<CapturedLine>> RunRecordersCaptured()

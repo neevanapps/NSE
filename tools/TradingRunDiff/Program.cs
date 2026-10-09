@@ -251,6 +251,35 @@ IReadOnlyList<PollStep> Steps() => scriptName switch
     },
 };
 
+string Sha(string text) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(text)))[..16];
+string DllIdentity(System.Reflection.Assembly a) => $"{Path.GetFileName(a.Location)} sha256 {Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(a.Location)))[..16]}";
+string Git(string args)
+{
+    try
+    {
+        var psi = new ProcessStartInfo("git", args) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
+        using var p = Process.Start(psi)!;
+        var text = p.StandardOutput.ReadToEnd().Trim();
+        return p.WaitForExit(10_000) ? text : "unavailable";
+    }
+    catch (Exception)
+    {
+        return "unavailable";
+    }
+}
+
+Say();
+Say("Build identity (source and binaries that produced this report):");
+Say($"  git commit {Git("rev-parse HEAD")}; working tree {(Git("status --porcelain").Length == 0 ? "clean" : "HAS UNCOMMITTED CHANGES: " + Git("status --porcelain").Replace("\n", "; "))}");
+foreach (var assembly in new[] { typeof(TradingRun).Assembly, typeof(NiftySignal.Trading.Core.Trading.TradingEngine).Assembly, typeof(AdaptiveObserverEngine).Assembly, typeof(PlumbingEveryNthBarStrategy).Assembly, System.Reflection.Assembly.GetExecutingAssembly() })
+{
+    Say("  " + DllIdentity(assembly));
+}
+
+Say();
+Say("Input manifest (identical for both adapters: the same Stream() function, tokens, window and predicates):");
+Say($"  tokens {tokens.Length} sha256 {Sha(string.Join(",", tokens.Order(StringComparer.Ordinal)))}; option universe sha256 {Sha(string.Join(";", descriptors.Select(d => $"{d.Token}|{d.OptionType}|{d.Strike}|{d.ExpiryDate:yyyy-MM-dd}|{d.LotSize}|{tickSizes[d.Token]}")))}");
+Say($"  rows: ReceivedAt and ExchangeTimestamp in [{open.AddMinutes(-1):O}, {sessionEnd:O}], id order, keyset pages of {pageSize}; source is opened read-only");
 Say();
 Say("Configuration (confirmed contract + labelled harness inputs):");
 Say($"  config version  : {config.ConfigVersion}");
@@ -324,7 +353,7 @@ foreach (var (name, elapsed) in times.OrderBy(x => x.Key, StringComparer.Ordinal
 
 using (var self = Process.GetCurrentProcess())
 {
-    Say($"process peak working set: {self.PeakWorkingSet64 / (1024d * 1024d):F0} MiB; peak virtual {self.PeakVirtualMemorySize64 / (1024d * 1024d):F0} MiB (whole process, all runs of this invocation)");
+    Say($"process peak working set: {self.PeakWorkingSet64 / (1024d * 1024d):F0} MiB (whole process, all runs of this invocation; virtual address space is not reported because it is not memory use)");
 }
 
 File.WriteAllText(Path.Combine(outDir, $"trading-run-diff-{day:yyyy-MM-dd}-{mode}-{scriptName}.txt"), report.ToString());
@@ -335,10 +364,18 @@ void PrintRun(string name, RunResult r)
     var c = r.Translator;
     Say($"[{name}]");
     Say($"  rows offered {c.Input}: translated {c.Translated}, per-token payload duplicates {c.PayloadDuplicates}, outside window {c.OutsideWindow}, re-deliveries {c.Redelivered}, quarantined {c.Quarantined} {string.Join(", ", c.QuarantinedByReason.Select(q => q.Key + "=" + q.Value))}; balanced={c.Balanced}");
-    Say($"  availability: clamped to exchange stamp {c.ClampedAvailability}, exchange==received {c.ExchangeEqualsReceived}");
+    Say($"  payload duplicates by instrument: future {c.PayloadDuplicatesFuture}, options {c.PayloadDuplicatesOption}");
+    Say($"  availability: clamped to exchange stamp {c.ClampedAvailability} (skew exchange - received: max {c.MaxClampSkew.TotalMilliseconds:F0} ms, mean {c.MeanClampSkewMilliseconds:F1} ms), exchange==received {c.ExchangeEqualsReceived}");
     Say($"  groups {c.GroupsReleased}, bars {c.BarsReleased}, max buffered rows {c.MaxBufferedRows}, remembered ids at end {c.SeenIdCount}");
     Say($"  engine: events delivered {r.Loop.EventsDelivered}, duplicates ignored {r.Loop.DuplicatesIgnored}, deadlines fired {r.Loop.DeadlinesFired}, engine quarantines {r.EngineQuarantines}, loop memory at end {r.SeenInLoop} events");
     Say($"  outputs {r.Outputs}, fills {r.Fills}, positions {r.Positions}, UNRESOLVED positions {r.UnresolvedPositions}");
+    foreach (var v in r.Variants)
+    {
+        Say($"  variant {v.VariantId}: opportunities {v.OpportunitiesCreated}, entry intents {v.EntryIntents}, filled entries {v.FilledEntries}, exit fills [{string.Join(", ", v.ExitFillsByReason.Select(e => e.Key + "=" + e.Value))}], closed {v.ClosedPositions}, unresolved {v.UnresolvedPositions}");
+    }
+
+    var rd = r.Readiness;
+    Say($"  readiness: bars {rd.Bars} (valid {rd.ValidBars}, after signal start {rd.SignalStartedBars}, READY {rd.ReadyBars}); first bar ends {rd.FirstBarEnd:O}; first ready bar b{rd.FirstReadyBarSeq} ends {rd.FirstReadyBarEnd:O} ({(rd.FirstReadyBarEnd is { } t ? t.ToOffset(ist).ToString("HH:mm:ss", CultureInfo.InvariantCulture) : "n/a")} IST)");
     Say($"  transport (excluded from equivalence): pages {r.Transport.Pages}, polls {r.Transport.Polls}, failed polls {r.Transport.FailedPolls}, heartbeats {r.Transport.Heartbeats}, max batch {r.Transport.MaxBatchRows}, groups after horizon {r.Transport.GroupsAfterHorizon}");
     foreach (var (channel, digest) in r.Channels.OrderBy(x => x.Key, StringComparer.Ordinal))
     {
