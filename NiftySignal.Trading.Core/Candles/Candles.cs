@@ -317,6 +317,14 @@ public sealed class CandleStore
         LatestBarSeq = barSeq;
     }
 
+    /// <summary>The candles published for bar <paramref name="barSeq"/> (one per known token, ordinal token order), as long as the bar is still inside the history depth. For run comparison.</summary>
+    public IReadOnlyList<Candle> CandlesPublishedFor(long barSeq)
+        => _history.OrderBy(x => x.Key, StringComparer.Ordinal)
+            .Select(x => x.Value.TryGetValue(barSeq, out var candle) ? candle : null)
+            .Where(c => c is not null)
+            .Select(c => c!)
+            .ToList();
+
     internal long? FirstSeqFor(string token)
         => _history.TryGetValue(token, out var series) && series.Count > 0 ? series.Keys.First() : null;
 

@@ -1,6 +1,7 @@
 using NiftySignal.Trading.Core.Candles;
 using NiftySignal.Trading.Core.Costs;
 using NiftySignal.Trading.Core.Execution;
+using NiftySignal.Trading.Core.Integrity;
 using NiftySignal.Trading.Core.Risk;
 using NiftySignal.Trading.Core.Selection;
 using NiftySignal.Trading.Core.Session;
@@ -16,7 +17,7 @@ namespace NiftySignal.Trading.Core.Config;
 /// </summary>
 public sealed record TradingConfig
 {
-    public const int CurrentSchemaVersion = 4;
+    public const int CurrentSchemaVersion = 5;
 
     public int SchemaVersion { get; init; } = CurrentSchemaVersion;
 
@@ -39,6 +40,9 @@ public sealed record TradingConfig
     /// <summary>Named, versioned risk profile. Default ResearchV1 (no trade cap, daily SL observed only). RealOrder is configurable but unstartable.</summary>
     public RiskProfile Risk { get; init; } = RiskProfile.ResearchV1();
 
+    /// <summary>What evidence completes a recovery from a reported feed fault (schema 5; CP5 correction of the CP4 "first option quote" rule).</summary>
+    public IntegrityPolicy Integrity { get; init; } = new();
+
     public IReadOnlyDictionary<string, VariantSpec> Variants { get; init; } = new Dictionary<string, VariantSpec>();
 
     public IReadOnlyList<string> Validate()
@@ -60,6 +64,7 @@ public sealed record TradingConfig
         errors.AddRange(Execution.Validate());
         errors.AddRange(Costs.Validate());
         errors.AddRange(Risk.Validate());
+        errors.AddRange(Integrity.Validate());
         foreach (var (key, spec) in Variants)
         {
             if (!string.Equals(key, spec.VariantId, StringComparison.Ordinal))
@@ -88,6 +93,6 @@ public sealed record TradingConfig
             throw new KeyNotFoundException($"Unknown variant '{variantId}'.");
         }
 
-        return CanonicalJson.Hash(new { SchemaVersion, Variant = spec, Selection, Candles, Session, Execution, Costs, Risk });
+        return CanonicalJson.Hash(new { SchemaVersion, Variant = spec, Selection, Candles, Session, Execution, Costs, Risk, Integrity });
     }
 }

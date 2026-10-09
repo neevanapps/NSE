@@ -12,8 +12,41 @@ public enum IntegrityState
     /// <summary>A global feed fault was reported: new entries are blocked and pending entries are cancelled; exits and liquidation continue on eligible quotes.</summary>
     Degraded = 1,
 
-    /// <summary>The adapter reported recovery, but entries stay blocked until the first option quote at or after the recovery instant is accepted.</summary>
+    /// <summary>The adapter reported recovery, but entries stay blocked until the configured recovery evidence (futures quote, ready bar; see <see cref="IntegrityPolicy"/>) has been delivered.</summary>
     Recovering = 2,
+}
+
+/// <summary>
+/// What counts as evidence that the feed and the adaptive state are usable again after a reported fault (hashed configuration). Defaults demand
+/// both a futures quote and a ready bar that started after the recovery instant. At least one requirement must stay on: recovery is never
+/// granted from "any update".
+/// </summary>
+public sealed record IntegrityPolicy
+{
+    /// <summary>A futures quote must be delivered at or after the recovery instant.</summary>
+    public bool RequireFutureQuoteAfterRecovery { get; init; } = true;
+
+    /// <summary>A completed bar with <c>BarInfo.Ready</c> must be delivered at or after the recovery instant.</summary>
+    public bool RequireReadyBarAfterRecovery { get; init; } = true;
+
+    /// <summary>That ready bar must also have started at or after the recovery instant (all its ticks post-recovery).</summary>
+    public bool ReadyBarMustStartAfterRecovery { get; init; } = true;
+
+    public IReadOnlyList<string> Validate()
+    {
+        var errors = new List<string>();
+        if (!RequireFutureQuoteAfterRecovery && !RequireReadyBarAfterRecovery)
+        {
+            errors.Add("At least one recovery evidence requirement (futures quote or ready bar) must be enabled.");
+        }
+
+        if (ReadyBarMustStartAfterRecovery && !RequireReadyBarAfterRecovery)
+        {
+            errors.Add("ReadyBarMustStartAfterRecovery needs RequireReadyBarAfterRecovery.");
+        }
+
+        return errors;
+    }
 }
 
 /// <summary>Anything that can veto NEW entries (feed integrity, manual kill switch, risk profile). Returns a reason code or null when entries are allowed.</summary>
@@ -47,7 +80,21 @@ public sealed record EvaluationSummary(DateTimeOffset At, string VariantId, stri
 public sealed class IntegrityManager : IEntryGate
 {
     private readonly HashSet<string> _killedVariants = new(StringComparer.Ordinal);
+    private readonly IntegrityPolicy _policy;
     private DateTimeOffset? _recoveryRequestedAt;
+    private bool _futureQuoteSeen;
+    private bool _readyBarSeen;
+    private long _evidenceBarSeq;
+
+    public IntegrityManager(IntegrityPolicy? policy = null)
+    {
+        _policy = policy ?? new IntegrityPolicy();
+        var errors = _policy.Validate();
+        if (errors.Count > 0)
+        {
+            throw new ArgumentException("Invalid integrity policy: " + string.Join(" ", errors), nameof(policy));
+        }
+    }
 
     public IntegrityState State { get; private set; } = IntegrityState.Healthy;
 
@@ -98,13 +145,54 @@ public sealed class IntegrityManager : IEntryGate
 
         State = IntegrityState.Recovering;
         _recoveryRequestedAt = e.AvailableAt;
+        _futureQuoteSeen = false;
+        _readyBarSeen = false;
+        _evidenceBarSeq = 0;
         return new IntegrityTransition(e.AvailableAt, from, State, FaultReason, e.Detail, e.SourceId);
     }
 
-    /// <summary>Called for every accepted option quote: completes a recovery once a quote at or after the recovery instant arrives.</summary>
-    public IntegrityTransition? OnAcceptedOptionQuote(DateTimeOffset at, long sourceId)
+    /// <summary>
+    /// Recovery evidence (contract section A.16.2). A futures quote delivered at or after the recovery instant proves the futures stream is alive
+    /// again. An option quote is NOT evidence (it says nothing about the futures / adaptive state); option-quote quality is checked per contract at
+    /// entry time as always.
+    /// </summary>
+    public IntegrityTransition? OnFutureQuote(QuoteEvent quote)
     {
-        if (State != IntegrityState.Recovering || _recoveryRequestedAt is not { } requested || at < requested)
+        ArgumentNullException.ThrowIfNull(quote);
+        if (State != IntegrityState.Recovering || _recoveryRequestedAt is not { } requested || quote.Kind != EventKind.FutureQuote || quote.AvailableAt < requested)
+        {
+            return null;
+        }
+
+        _futureQuoteSeen = true;
+        return TryComplete(quote.AvailableAt, quote.SourceId);
+    }
+
+    /// <summary>
+    /// Recovery evidence: a completed bar whose readiness evidence says <c>Ready</c> (frozen session, enough consecutive valid bars, signal started)
+    /// and — by default — that also STARTED at or after the recovery instant, so every tick of the bar was observed after the feed came back.
+    /// A bar without readiness information is never evidence.
+    /// </summary>
+    public IntegrityTransition? OnBar(BarCompletedEvent bar)
+    {
+        ArgumentNullException.ThrowIfNull(bar);
+        if (State != IntegrityState.Recovering || _recoveryRequestedAt is not { } requested || bar.AvailableAt < requested)
+        {
+            return null;
+        }
+
+        if (bar.Info is { Ready: true } info && (!_policy.ReadyBarMustStartAfterRecovery || info.StartAvailableAt >= requested))
+        {
+            _readyBarSeen = true;
+            _evidenceBarSeq = bar.BarSeq;
+        }
+
+        return TryComplete(bar.AvailableAt, bar.SourceId);
+    }
+
+    private IntegrityTransition? TryComplete(DateTimeOffset at, long sourceId)
+    {
+        if ((_policy.RequireFutureQuoteAfterRecovery && !_futureQuoteSeen) || (_policy.RequireReadyBarAfterRecovery && !_readyBarSeen))
         {
             return null;
         }
@@ -113,8 +201,9 @@ public sealed class IntegrityManager : IEntryGate
         State = IntegrityState.Healthy;
         var reason = FaultReason;
         FaultReason = FeedFaultReason.None;
+        var detail = FormattableString.Invariant($"recovery evidence: futureQuote={(_futureQuoteSeen ? "yes" : "n/a")} readyBar={(_readyBarSeen ? "b" + _evidenceBarSeq : "n/a")} since {_recoveryRequestedAt:O}");
         _recoveryRequestedAt = null;
-        return new IntegrityTransition(at, from, State, reason, "first accepted option quote after recovery", sourceId);
+        return new IntegrityTransition(at, from, State, reason, detail, sourceId);
     }
 
     /// <summary>Marks a scope killed. Returns false when it already was (idempotent).</summary>

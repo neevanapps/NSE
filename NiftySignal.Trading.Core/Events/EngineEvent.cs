@@ -92,15 +92,51 @@ public sealed record QuoteEvent : EngineEvent
 }
 
 /// <summary>
+/// Identity, quality and readiness evidence of a completed bar (contract section A.16.3). All members are value types or strings so that the
+/// record has value equality (re-delivery of an identical bar is recognised). <see cref="Ready"/> is computed by the translator from the
+/// adaptive readiness policy and the frozen session; the core never recomputes it.
+/// </summary>
+/// <param name="StartAvailableAt">Availability of the first tick of the bar (the bar spans [start, end] in availability time).</param>
+/// <param name="EndAvailableAt">Availability of the closing tick; equals the event's AvailableAt.</param>
+/// <param name="Volume">Volume accumulated in the bar (equals the session base bar volume for a valid bar).</param>
+/// <param name="TradeUpdates">Number of trade updates in the bar.</param>
+/// <param name="IsValid">The bar passes <c>AdaptiveReadinessPolicy.IsValid</c>.</param>
+/// <param name="ConsecutiveValidBars">Length of the valid suffix ending at this bar, capped at <paramref name="RequiredValidBars"/>.</param>
+/// <param name="RequiredValidBars">The policy's required number of consecutive valid bars.</param>
+/// <param name="SignalStarted">The bar ended at or after the session's frozen signal start (09:30, or the frozen observation start of a late-start session).</param>
+/// <param name="Ready"><c>ConsecutiveValidBars &gt;= RequiredValidBars &amp;&amp; SignalStarted</c> — trading eligibility from the adaptive side.</param>
+/// <param name="ReadinessSpec">Version label of the readiness definition (policy and session model) that produced the flags.</param>
+public sealed record BarInfo(
+    DateTimeOffset StartAvailableAt,
+    DateTimeOffset EndAvailableAt,
+    long Volume,
+    int TradeUpdates,
+    bool IsValid,
+    int ConsecutiveValidBars,
+    int RequiredValidBars,
+    bool SignalStarted,
+    bool Ready,
+    string ReadinessSpec);
+
+/// <summary>
 /// A completed adaptive bar. <see cref="EngineEvent.AvailableAt"/> is the bar's closing-tick availability time, so the
-/// event is ordered after every quote of the group that completed it.
+/// event is ordered after every quote of the group that completed it. <see cref="Info"/> carries readiness evidence; null means
+/// "not supplied" (CP0–CP4 test harnesses), in which case the core applies no readiness gate to entries.
 /// </summary>
 public sealed record BarCompletedEvent : EngineEvent
 {
-    public BarCompletedEvent(DateTimeOffset endAvailableAt, long barSeq, string token)
+    public BarCompletedEvent(DateTimeOffset endAvailableAt, long barSeq, string token, BarInfo? info = null)
         : base(endAvailableAt, EventKind.BarCompleted, barSeq, token)
     {
+        if (info is not null && info.EndAvailableAt != endAvailableAt)
+        {
+            throw new ArgumentException("BarInfo.EndAvailableAt must equal the bar event's AvailableAt.", nameof(info));
+        }
+
+        Info = info;
     }
 
     public long BarSeq => SourceId;
+
+    public BarInfo? Info { get; }
 }

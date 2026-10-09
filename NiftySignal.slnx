@@ -18,6 +18,7 @@
   <Project Path="NiftySignal.Rules/NiftySignal.Rules.csproj" />
   <Project Path="NiftySignal.ScoreReplay/NiftySignal.ScoreReplay.csproj" />
   <Project Path="NiftySignal.Scoring/NiftySignal.Scoring.csproj" />
+  <Project Path="NiftySignal.Trading.Adapters/NiftySignal.Trading.Adapters.csproj" />
   <Project Path="NiftySignal.Trading.Core/NiftySignal.Trading.Core.csproj" />
   <Project Path="NiftySignal.Trading.Signals/NiftySignal.Trading.Signals.csproj" />
   <Project Path="NiftySignal.Tests/NiftySignal.Tests.csproj" />
@@ -28,4 +29,5 @@
   <Project Path="NiftySignal.VolumeBarData/NiftySignal.VolumeBarData.csproj" />
   <Project Path="tools/AdaptiveDashboardValidation/AdaptiveDashboardValidation.csproj" />
   <Project Path="tools/AdaptiveLivePerformance/AdaptiveLivePerformance.csproj" />
+  <Project Path="tools/TradingRunDiff/TradingRunDiff.csproj" />
 </Solution>

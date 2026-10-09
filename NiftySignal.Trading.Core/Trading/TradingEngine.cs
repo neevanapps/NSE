@@ -24,6 +24,23 @@ namespace NiftySignal.Trading.Core.Trading;
 /// A runnable configuration must state a liquidation start (no 15:05 is assumed), at or after the entry close, and have a cost schedule covering the
 /// trade date.
 /// </summary>
+/// <summary>
+/// Memory retention of the engine's history structures (contract section A.16.7). These settings affect resources only, never results, as long as
+/// the retention is not shorter than the processing needs documented there; tests prove equivalence with <see cref="Unbounded"/>.
+/// </summary>
+public sealed record RetentionPolicy
+{
+    /// <summary>Delivered-event memory of the <c>EngineLoop</c> (duplicate / conflict recognition window). Used by adapters when they create the loop.</summary>
+    public TimeSpan? LoopSeenRetention { get; init; } = TimeSpan.FromMinutes(10);
+
+    /// <summary>Per-token option quote history behind the latest quote. <c>null</c> = <c>MaxQuoteAge + 1 minute</c>.</summary>
+    public TimeSpan? QuoteHistoryRetention { get; init; }
+
+    public static RetentionPolicy Default { get; } = new();
+
+    public static RetentionPolicy Unbounded { get; } = new() { LoopSeenRetention = null, QuoteHistoryRetention = TimeSpan.FromDays(2) };
+}
+
 public sealed class TradingEngine : IEngineHandler
 {
     private sealed class CompositeGate(TradingEngine owner) : IEntryGate
@@ -59,7 +76,8 @@ public sealed class TradingEngine : IEngineHandler
         IReadOnlyList<OptionContract> universe,
         IReadOnlyDictionary<string, IBaseStrategy> strategies,
         string runId = "run-unspecified",
-        string runMode = "Historical")
+        string runMode = "Historical",
+        RetentionPolicy? retention = null)
     {
         ArgumentNullException.ThrowIfNull(config);
         var errors = new List<string>(config.Validate());
@@ -71,6 +89,10 @@ public sealed class TradingEngine : IEngineHandler
         else if (liquidation < config.Session.EntryClose)
         {
             errors.Add("LiquidationStart must not be before EntryClose.");
+        }
+        else if (liquidation.ToTimeSpan() + config.Execution.Latency >= config.Session.FinalClose.ToTimeSpan())
+        {
+            errors.Add($"LiquidationStart {liquidation:HH:mm:ss} plus the order latency {config.Execution.Latency} reaches FinalClose {config.Session.FinalClose:HH:mm:ss}: no close attempt could execute before the final close.");
         }
 
         if (!CostModel.IsConfigured(config.Costs, tradeDate))
@@ -88,8 +110,9 @@ public sealed class TradingEngine : IEngineHandler
         RunId = runId;
         RunMode = runMode;
         Variants = new VariantEngine(config, tradeDate, universe, strategies, _outputs);
-        Execution = new ExecutionEngine(config, tradeDate, Variants.Schedule, Variants, new CostModel(config.Costs, tradeDate), _outputs);
-        Integrity = new IntegrityManager();
+        Retention = retention ?? RetentionPolicy.Default;
+        Execution = new ExecutionEngine(config, tradeDate, Variants.Schedule, Variants, new CostModel(config.Costs, tradeDate), _outputs, Retention.QuoteHistoryRetention);
+        Integrity = new IntegrityManager(config.Integrity);
         var gate = new CompositeGate(this);
         Variants.EntryGate = gate;
         Execution.EntryGate = gate;
@@ -103,6 +126,8 @@ public sealed class TradingEngine : IEngineHandler
     public string RunId { get; }
 
     public string RunMode { get; }
+
+    public RetentionPolicy Retention { get; }
 
     public VariantEngine Variants { get; }
 
@@ -136,14 +161,22 @@ public sealed class TradingEngine : IEngineHandler
                 return;
         }
 
+        // Recovery evidence comes from the futures / adaptive side only (never from an option quote), and is applied before the variants see this
+        // event, so a ready bar that completes the recovery can already be acted on.
+        IntegrityTransition? recovery = engineEvent switch
+        {
+            QuoteEvent { Kind: EventKind.FutureQuote } futureQuote => Integrity.OnFutureQuote(futureQuote),
+            BarCompletedEvent bar => Integrity.OnBar(bar),
+            _ => null,
+        };
+        if (recovery is not null)
+        {
+            _outputs.Add(recovery);
+        }
+
         var option = engineEvent is QuoteEvent { Kind: EventKind.OptionQuote } optionQuote ? optionQuote : null;
         if (option is not null)
         {
-            if (Integrity.OnAcceptedOptionQuote(option.AvailableAt, option.SourceId) is { } recovered)
-            {
-                _outputs.Add(recovered);
-            }
-
             Execution.AppendQuote(option);
             Execution.OnQuoteForOrders(option, scheduler);
         }

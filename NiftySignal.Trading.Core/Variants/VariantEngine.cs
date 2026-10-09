@@ -183,6 +183,13 @@ public sealed class VariantEngine : IEngineHandler
     {
         var now = bar.AvailableAt;
         var validity = v.Strategy.OnBar(bar);
+        if (validity.IsValid && bar.Info is { Ready: false })
+        {
+            // Trading eligibility = the strategy's validity AND the adaptive readiness evidence carried by the bar (frozen session, enough
+            // consecutive valid bars, signal start reached). The strategy still sees every bar (its own warm-up state is unaffected).
+            validity = new StrategyValidity(false, validity.Side, "ReadinessNotMet");
+        }
+
         if (!validity.IsValid)
         {
             if (v.Active is { } ending)

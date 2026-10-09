@@ -19,6 +19,17 @@ internal static class Ctl
     public static OperatorCommandEvent Reset(DateTimeOffset at, long seq, string scope = "*") => new(at, seq, OperatorCommand.Reset, scope, "tester", "test");
 }
 
+/// <summary>Recovery-evidence builders: a futures quote and bars with readiness information (CP5 correction of the CP4 recovery rule).</summary>
+internal static class Rec
+{
+    public static QuoteEvent Fut(DateTimeOffset at, long id) => Ev.Fut(at, 7000 + id);
+
+    public static BarCompletedEvent Bar(DateTimeOffset start, DateTimeOffset end, long seq, bool ready)
+        => new(end, seq, "FUT", new BarInfo(start, end, 100, 12, ready, ready ? 10 : 4, 10, true, ready, "test-readiness"));
+
+    public static BarCompletedEvent ReadyBar(DateTimeOffset start, DateTimeOffset end, long seq) => Bar(start, end, seq, ready: true);
+}
+
 public class IntegrityTests
 {
     private static TradeKit NewKit(ExecutionConfig? execution = null, params VariantSpec[] variants)
@@ -36,17 +47,19 @@ public class IntegrityTests
         kit.Feed(Ctl.Degraded(kit.At(20), 2));                                          // already degraded: no new transition
         kit.Feed(Ctl.Healthy(kit.At(30), 3));
         Assert.Equal(IntegrityState.Recovering, kit.Engine.Integrity.State);
-        Assert.Equal("IntegrityRecovering", kit.Engine.Integrity.BlockReason("A", kit.At(30)));    // still blocked until a quote is accepted
-        kit.Feed(kit.Q(kit.At(40), 124m, 125m));
+        Assert.Equal("IntegrityRecovering", kit.Engine.Integrity.BlockReason("A", kit.At(30)));    // still blocked until the evidence arrives
+        kit.Feed(Rec.Fut(kit.At(40), 1));
+        kit.Feed(Rec.ReadyBar(kit.At(35), kit.At(41), 5));                              // ready bar that started after the recovery instant
 
         Assert.Equal(IntegrityState.Healthy, kit.Engine.Integrity.State);
-        Assert.Null(kit.Engine.Integrity.BlockReason("A", kit.At(40)));
+        Assert.Null(kit.Engine.Integrity.BlockReason("A", kit.At(41)));
         var t = Transitions(kit);
         Assert.Equal(
             new[] { (IntegrityState.Healthy, IntegrityState.Degraded), (IntegrityState.Degraded, IntegrityState.Recovering), (IntegrityState.Recovering, IntegrityState.Healthy) },
             t.Select(x => (x.From, x.To)).ToArray());
         Assert.Equal(FeedFaultReason.NoMessageWatchdog, t[0].Reason);
-        Assert.Equal(kit.At(40), t[2].At);
+        Assert.Equal(kit.At(41), t[2].At);
+        Assert.Contains("readyBar=b5", t[2].Detail, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -61,9 +74,82 @@ public class IntegrityTests
         kit.Feed(Ctl.Degraded(kit.At(4), 4));
         Assert.Equal(IntegrityState.Degraded, kit.Engine.Integrity.State);              // a new fault during recovery is a fresh Degraded
 
-        kit.Feed(Ctl.Healthy(kit.At(5), 5), kit.Q(kit.At(5), 124m, 125m));             // health ranks before data at one instant: this quote completes the recovery
+        // health ranks before data at one instant: a futures quote and a ready bar that START at the recovery instant complete it.
+        kit.Feed(Ctl.Healthy(kit.At(5), 5), Rec.Fut(kit.At(5), 1));
+        Assert.Equal(IntegrityState.Recovering, kit.Engine.Integrity.State);
+        kit.Feed(Rec.ReadyBar(kit.At(5), kit.At(6), 3));
         Assert.Equal(IntegrityState.Healthy, kit.Engine.Integrity.State);
-        Assert.Equal(kit.At(5), Transitions(kit).Last().At);
+        Assert.Equal(kit.At(6), Transitions(kit).Last().At);
+    }
+
+    [Fact]
+    public void Recovery_IsNeverGrantedByAnUnrelatedOptionQuote()
+    {
+        var kit = NewKit();
+        kit.Feed(Ctl.Degraded(kit.At(10), 1));
+        kit.Feed(Ctl.Healthy(kit.At(30), 2));
+
+        kit.Feed(kit.Q(kit.At(31), 124m, 125m));                                        // the contract's own option quotes, any number of them
+        kit.Feed(kit.Q(kit.At(32), 124m, 125m, token: "PE23900"));
+        kit.Feed(kit.Q(kit.At(33), 124m, 125m));
+
+        Assert.Equal(IntegrityState.Recovering, kit.Engine.Integrity.State);
+        Assert.Equal("IntegrityRecovering", kit.Engine.Integrity.BlockReason("A", kit.At(33)));
+        Assert.Equal(2, Transitions(kit).Count);
+    }
+
+    [Fact]
+    public void Recovery_NeedsFreshFuturesState_AStaleFuturesQuoteIsNotEvidence()
+    {
+        var kit = NewKit();
+        kit.Feed(Rec.Fut(kit.At(5), 1));                                                // futures quote BEFORE the fault: stale
+        kit.Feed(Ctl.Degraded(kit.At(10), 1));
+        kit.Feed(Ctl.Healthy(kit.At(30), 2));
+
+        kit.Feed(Rec.ReadyBar(kit.At(31), kit.At(32), 6));                              // a ready bar, but no futures quote since the recovery instant
+        Assert.Equal(IntegrityState.Recovering, kit.Engine.Integrity.State);
+
+        kit.Feed(Rec.Fut(kit.At(33), 2));                                               // the futures stream is now demonstrably alive: both pieces of post-recovery evidence exist
+        Assert.Equal(IntegrityState.Healthy, kit.Engine.Integrity.State);
+        Assert.Equal(kit.At(33), Transitions(kit).Last().At);
+        Assert.Contains("readyBar=b6", Transitions(kit).Last().Detail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Recovery_NeedsAReadyBar_IncompleteWarmUpOrABarThatStartedBeforeTheRecoveryDoesNotCount()
+    {
+        var kit = NewKit();
+        kit.Feed(Ctl.Degraded(kit.At(10), 1));
+        kit.Feed(Ctl.Healthy(kit.At(30), 2));
+        kit.Feed(Rec.Fut(kit.At(31), 1));
+
+        kit.Feed(Rec.Bar(kit.At(31), kit.At(32), 8, ready: false));                    // warm-up incomplete (fewer than the required consecutive valid bars)
+        Assert.Equal(IntegrityState.Recovering, kit.Engine.Integrity.State);
+        kit.Feed(Rec.ReadyBar(kit.At(20), kit.At(33), 9));                              // ready, but it started during the outage: ticks from the gap are inside it
+        Assert.Equal(IntegrityState.Recovering, kit.Engine.Integrity.State);
+        kit.Feed(Ev.Bar(kit.At(34), 10));                                               // a bar without readiness information is never evidence
+        Assert.Equal(IntegrityState.Recovering, kit.Engine.Integrity.State);
+
+        kit.Feed(Rec.ReadyBar(kit.At(33.5), kit.At(35), 11));
+        Assert.Equal(IntegrityState.Healthy, kit.Engine.Integrity.State);
+        Assert.Contains("readyBar=b11", Transitions(kit).Last().Detail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RecoveryPolicy_IsConfigurable_ButNeverEmpty()
+    {
+        var relaxed = TradeKit.MakeConfig(variants: TradeKit.Immediate()) with { Integrity = new IntegrityPolicy { RequireReadyBarAfterRecovery = false, ReadyBarMustStartAfterRecovery = false } };
+        var kit = new TradeKit(relaxed);
+        kit.Feed(Ctl.Degraded(kit.At(10), 1));
+        kit.Feed(Ctl.Healthy(kit.At(30), 2));
+        kit.Feed(kit.Q(kit.At(31), 124m, 125m));
+        Assert.Equal(IntegrityState.Recovering, kit.Engine.Integrity.State);            // still no option-quote recovery
+        kit.Feed(Rec.Fut(kit.At(32), 1));
+        Assert.Equal(IntegrityState.Healthy, kit.Engine.Integrity.State);
+
+        Assert.NotEmpty(new IntegrityPolicy { RequireFutureQuoteAfterRecovery = false, RequireReadyBarAfterRecovery = false }.Validate());
+        Assert.NotEmpty(new IntegrityPolicy { RequireReadyBarAfterRecovery = false }.Validate());   // "must start after" without a bar requirement
+        Assert.NotEqual(TradeKit.MakeConfig(variants: TradeKit.Immediate()).ComputeHash(), relaxed.ComputeHash());
     }
 
     [Fact]
@@ -93,11 +179,17 @@ public class IntegrityTests
         kit.Feed(Ctl.Healthy(kit.At(3), 2));
         Assert.Single(kit.Out<EntryIntent>("A"));                                      // Recovering still blocks
 
-        kit.Feed(kit.Q(kit.At(3.5), 124m, 125m));                                      // first accepted quote: Healthy, and this very quote may enter
+        kit.Feed(kit.Q(kit.At(3.5), 124m, 125m));                                      // an option quote is not recovery evidence
+        Assert.Equal(IntegrityState.Recovering, kit.Engine.Integrity.State);
+        Assert.Single(kit.Out<EntryIntent>("A"));
+
+        kit.Feed(Rec.Fut(kit.At(3.6), 1));
+        kit.Feed(Rec.ReadyBar(kit.At(3.2), kit.At(3.8), 2));                           // evidence complete: Healthy, from the next quote on entries resume
         Assert.Equal(IntegrityState.Healthy, kit.Engine.Integrity.State);
+        kit.Feed(kit.Q(kit.At(4), 124m, 125m));
         var intents = kit.Out<EntryIntent>("A").ToList();
         Assert.Equal(2, intents.Count);
-        Assert.Equal(kit.At(3.5), intents[1].At);
+        Assert.Equal(kit.At(4), intents[1].At);
     }
 
     [Fact]

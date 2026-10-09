@@ -92,7 +92,7 @@ public sealed class ExecutionEngine
     private readonly Dictionary<string, ExitOrder> _exitById = new(StringComparer.Ordinal);
     private bool _ended;
 
-    public ExecutionEngine(TradingConfig config, DateOnly tradeDate, SessionSchedule schedule, VariantEngine variants, CostModel costs, List<EngineOutput> sink)
+    public ExecutionEngine(TradingConfig config, DateOnly tradeDate, SessionSchedule schedule, VariantEngine variants, CostModel costs, List<EngineOutput> sink, TimeSpan? quoteHistoryRetention = null)
     {
         ArgumentNullException.ThrowIfNull(config);
         _config = config;
@@ -102,7 +102,7 @@ public sealed class ExecutionEngine
         _variants = variants;
         _costs = costs;
         _out = sink;
-        _history = new QuoteHistory(_x.MaxQuoteAge + TimeSpan.FromMinutes(1));
+        _history = new QuoteHistory(quoteHistoryRetention ?? _x.MaxQuoteAge + TimeSpan.FromMinutes(1));
         foreach (var v in variants.Variants)
         {
             _books.Add(new Book(v.VariantId, v.Ordinal, v.Spec.DailySl));

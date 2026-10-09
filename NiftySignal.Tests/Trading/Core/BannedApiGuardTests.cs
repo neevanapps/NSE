@@ -99,6 +99,21 @@ public class BannedApiGuardTests
     }
 
     [Fact]
+    public void TradingAdaptersAssembly_ReferencesNoBannedApi_NoDatabase_AndDependsOnlyOnCoreAdaptiveObserverAndDomain()
+    {
+        var assembly = typeof(NiftySignal.Trading.Adapters.AdaptiveEventTranslator).Assembly;
+
+        var hits = Scan(assembly.Location);
+
+        Assert.True(hits.Count == 0, "Banned API references in Trading.Adapters: " + string.Join(", ", hits));
+        var references = assembly.GetReferencedAssemblies().Select(a => a.Name!).ToList();
+        Assert.Equal(
+            new[] { "NiftySignal.AdaptiveObserver", "NiftySignal.Domain", "NiftySignal.Trading.Core" },
+            references.Where(n => n.StartsWith("NiftySignal.", StringComparison.Ordinal)).Order(StringComparer.Ordinal).ToArray());
+        Assert.DoesNotContain(references, r => r.StartsWith("Microsoft.EntityFramework", StringComparison.Ordinal) || r.StartsWith("Npgsql", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void Scanner_DetectsEachBannedFamily_InAFixtureAssembly()
     {
         var hits = Scan(typeof(BannedApiFixtures).Assembly.Location);

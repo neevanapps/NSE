@@ -66,6 +66,8 @@ public sealed class EngineLoop : IEngineScheduler
     private readonly EngineClock _clock;
     private readonly DeadlineQueue _queue = new();
     private readonly Dictionary<EventIdentity, EngineEvent> _seen = new();
+    private readonly Queue<(DateTimeOffset At, EventIdentity Identity)> _seenOrder = new();
+    private readonly TimeSpan? _seenRetention;
     private DateTimeOffset? _lastGroupTime;
     private long _nextCreationSeq = 1;
     private long _eventsDelivered;
@@ -75,12 +77,28 @@ public sealed class EngineLoop : IEngineScheduler
     private bool _finished;
     private bool _busy;
 
-    public EngineLoop(IEngineHandler handler, DateTimeOffset start)
+    /// <param name="handler">The consumer of the ordered stream.</param>
+    /// <param name="start">Initial engine time.</param>
+    /// <param name="seenRetention">
+    /// How long delivered events are remembered for duplicate / conflict detection, measured in availability time behind the last delivered group.
+    /// <c>null</c> (default) keeps them all. A bounded value only changes how a re-delivery OLDER than the retention is classified: it is no longer
+    /// recognised as a duplicate and is rejected as late (admission quarantines it). Recognition inside the retention is unchanged.
+    /// </param>
+    public EngineLoop(IEngineHandler handler, DateTimeOffset start, TimeSpan? seenRetention = null)
     {
         ArgumentNullException.ThrowIfNull(handler);
+        if (seenRetention is { } retention && retention <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(seenRetention), "Retention must be positive.");
+        }
+
         _handler = handler;
         _clock = new EngineClock(start);
+        _seenRetention = seenRetention;
     }
+
+    /// <summary>Number of delivered events currently remembered for duplicate detection (bounded when a retention is configured).</summary>
+    public int SeenCount => _seen.Count;
 
     public DateTimeOffset Now => _clock.Now;
 
@@ -191,6 +209,7 @@ public sealed class EngineLoop : IEngineScheduler
             foreach (var e in fresh)
             {
                 _seen.Add(e.Identity, e);
+                _seenOrder.Enqueue((e.AvailableAt, e.Identity));
                 _eventsDelivered++;
                 _handler.OnEvent(e, this);
             }
@@ -198,6 +217,7 @@ public sealed class EngineLoop : IEngineScheduler
             _lastGroupTime = time;
             _groupsProcessed++;
             RunDeadlines(time, inclusive: true);
+            PruneSeen(time);
         }
         finally
         {
@@ -251,6 +271,20 @@ public sealed class EngineLoop : IEngineScheduler
         finally
         {
             _busy = false;
+        }
+    }
+
+    private void PruneSeen(DateTimeOffset now)
+    {
+        if (_seenRetention is not { } retention)
+        {
+            return;
+        }
+
+        var cutoff = now - retention;
+        while (_seenOrder.Count > 0 && _seenOrder.Peek().At < cutoff)
+        {
+            _seen.Remove(_seenOrder.Dequeue().Identity);
         }
     }
 
