@@ -84,7 +84,7 @@ public sealed class AdaptiveObserverWorker(
                 var time = TimeOnly.FromDateTime(nowIst.DateTime);
                 var weekday = nowIst.DayOfWeek is not (DayOfWeek.Saturday or DayOfWeek.Sunday);
 
-                if (!weekday || time < MarketOpen || time >= MarketHardClose)
+                if (!IsLiveMarketWindow(weekday, time))
                 {
                     if (_live is not null && time >= MarketHardClose)
                     {
@@ -99,7 +99,8 @@ public sealed class AdaptiveObserverWorker(
 
                 if (_live is null || _live.Context.Session.TradeDate != day)
                 {
-                    await FinalizeEndedSessionsAsync(day, includeToday: false, stoppingToken);
+                    // Live priority: no ended-session reconstruction in this branch (it can be very slow and would delay today's start).
+                    // Unfinished older sessions are retried only outside the live window (see IsLiveMarketWindow).
                     _live = await TryStartOrRecoverAsync(day, nowUtc, stoppingToken);
                     if (_live is null)
                     {
@@ -124,6 +125,12 @@ public sealed class AdaptiveObserverWorker(
             }
         }
     }
+
+    /// <summary>
+    /// True on a weekday in [09:15, 15:35) IST. Ended-session recovery runs only when this is false (pre-market, at/after the hard close,
+    /// weekends), so old unfinished sessions never compete with today's live start/recovery.
+    /// </summary>
+    internal static bool IsLiveMarketWindow(bool weekday, TimeOnly time) => weekday && time >= MarketOpen && time < MarketHardClose;
 
     async Task FinalizeEndedSessionsAsync(DateOnly todayIst, bool includeToday, CancellationToken ct)
     {
