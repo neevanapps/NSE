@@ -8,6 +8,17 @@ Companion: [`TRADING_ENGINE_PHASE1_CONTRACT.md`](TRADING_ENGINE_PHASE1_CONTRACT.
 
 One deterministic strategy + risk + simulated-execution engine that is executed **unchanged** by (a) historical replay and (b) live paper trading, hosting **several strategies and entry variants concurrently**, so the same recorded events produce the same features, decisions, order intents, fills, positions, risk counters and P&L. The execution adapter is chosen by configuration; a future broker adapter replaces only execution. Using the 18 recorded **development** sessions we later discover explicit, standalone-signal-family rules for NIFTY weekly-option buying and test them forward. No composite score. No forced trade count.
 
+## Progress
+
+| Checkpoint | Status | Notes |
+|---|---|---|
+| CP0 — re-verify & scaffold | **Done 2026-10-09** | `NiftySignal.Trading.Core` + `NiftySignal.Tests/Trading/Core`; audited facts re-read (availability definition, group ordering, 2 s stable lag, `IstTime`); banned-API metadata guard |
+| CP1 — time, events, timers | **Done 2026-10-09** | Event/deadline total orders, `EngineLoop`, `ReplayDriver` with explicit horizon, session boundaries, canonical config hash, deterministic ids. 75 new tests; full suite 1399/1399; no new warnings. Exact contract: contract §A.11 |
+| CP2 — variants, accounts, opportunities | Not started | Awaiting review |
+| CP3–CP7 | Not started | |
+
+Implementation boundary today: only `Trading.Core` time/events/scheduling/session/config/id primitives exist. There is no strategy, execution simulator, cost model, sizing, risk profile, persistence, adapter, database, `Host` registration or deployment.
+
 ## Confirmed requirements now in the contract (Amendment 1)
 
 - **Session (Asia/Kolkata):** entries `[09:30:00, 15:00:00)`; at 15:00 waiting opportunities expire and unfilled entry quantity is cancelled; every position targeted flat by 15:10 with an earlier liquidation start (placeholder 15:05), retry/escalation, explicit `UnresolvedAtClose` reporting, never "closed" without a fill; stops, targets and deadlines independent of bars (§A.1).
@@ -30,7 +41,7 @@ One deterministic strategy + risk + simulated-execution engine that is executed 
 | Phase | Scope | Exit gate |
 |---|---|---|
 | **1 — Audit & contract** (this; amended) | Code audit, contract, research-data inventory, acceptance tests, bounded Phase 2 checkpoints. Docs only. | Naveen resolves or accepts the open decisions in contract §14 (notably D-1, D-12, D-13, D-9 before CP6). |
-| **2 — Engine skeleton + plumbing proof** | Checkpoints **CP0–CP7** (contract §15): scaffold + determinism guard; time/events/timers; variants/opportunities/entry conditions; execution/costs/sizing/exits; risk profiles & audit; adapters & equivalence; persistence & recovery (needs D-9); close-out. Plumbing strategy only (no edge claim). | Acceptance tests T1–T48 green; zero warnings in new projects; adaptive tests unchanged. Each checkpoint stops for review. |
+| **2 — Engine skeleton + plumbing proof** *(in progress: CP0, CP1 done)* | Checkpoints **CP0–CP7** (contract §15): scaffold + determinism guard; time/events/timers; variants/opportunities/entry conditions; execution/costs/sizing/exits; risk profiles & audit; adapters & equivalence; persistence & recovery (needs D-9); close-out. Plumbing strategy only (no edge claim). | Acceptance tests T1–T48 green; zero warnings in new projects; adaptive tests unchanged. Each checkpoint stops for review. |
 | **3 — Signal bridge & execution calibration** | Wire adaptive bar/Weak2 events as signal sources; measure per-contract quote coverage and feed-delay distributions; calibrate/sensitivity-grid execution placeholders; confirm the cost schedule from primary documents and the actual brokerage plan; replace the zero-latency Weak2/H5 observation with engine-executed paper fills for research. | Coverage and execution-feasibility report approved; cost schedule confirmed. |
 | **4 — Research** | Standalone signal families + explicit gates on `Development` data, every variant registered before running, negatives recorded, sensitivity grid mandatory, `BACKTEST_RULES.md` applies. | Candidate rules documented; forward validation plan using ledger-eligible sessions. |
 | **5 — Hosted live paper** | Host the engine (paper only) in the Windows service; weeks of forward paper vs replay reconciliation. | Reconciliation inside tolerance; VM verification. |

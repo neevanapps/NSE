@@ -18,6 +18,7 @@
   <Project Path="NiftySignal.Rules/NiftySignal.Rules.csproj" />
   <Project Path="NiftySignal.ScoreReplay/NiftySignal.ScoreReplay.csproj" />
   <Project Path="NiftySignal.Scoring/NiftySignal.Scoring.csproj" />
+  <Project Path="NiftySignal.Trading.Core/NiftySignal.Trading.Core.csproj" />
   <Project Path="NiftySignal.Tests/NiftySignal.Tests.csproj" />
   <!-- Audit finding F69: include every root project in the full solution release build. -->
   <Project Path="NiftySignal.BacktestData/NiftySignal.BacktestData.csproj" />
