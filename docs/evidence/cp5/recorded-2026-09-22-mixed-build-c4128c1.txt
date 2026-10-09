@@ -1,0 +1,92 @@
+Recorded-session validation: trade date 2026-09-22
+Future 68407 (NIFTY29SEP26F) lot 65; weekly expiry 2026-09-22; option universe 40 contracts; tokens read 41
+Frozen session: opening volume 159965, base bar volume 13000, signal start 2026-09-22T04:00:00.0000000+00:00, residual anchor center 23450, 5 CE + 5 PE components, strong threshold unavailable (labels only; bars and readiness do not use it)
+
+Build identity (source and binaries that produced this report):
+  git commit c4128c1dd0f1248b8460ee4eebab334dfacc4d5e; working tree clean
+  NiftySignal.Trading.Adapters.dll sha256 DE4C391C4E0EA865
+  NiftySignal.Trading.Core.dll sha256 DE3DF1C0CF0B929B
+  NiftySignal.AdaptiveObserver.dll sha256 987502F371F10614
+  NiftySignal.Trading.Signals.dll sha256 026BD8FBA75367C0
+  TradingRunDiff.dll sha256 14295A598D4CCA60
+
+Input manifest (identical for both adapters: the same Stream() function, tokens, window and predicates):
+  tokens 41 sha256 5C540FC61FB4A476; option universe sha256 37A820E7533247DC
+  rows: ReceivedAt and ExchangeTimestamp in [2026-09-22T03:44:00.0000000+00:00, 2026-09-22T10:05:00.0000000+00:00], id order, keyset pages of 20000; source is opened read-only
+
+Configuration (confirmed contract + labelled harness inputs):
+  config version  : HARNESS-TEST-ONLY:recorded-session-validation
+  config hash     : cedf97d89e97971f6c45ae3a1ca75dad8c162ac65f2ef661c1b8dda1930f943e
+  - Brokerage: TEST-ONLY: flat Rs 20 per ORDER; the user's brokerage plan is unknown and unresolved
+  - Liquidation start: TEST-ONLY: liquidation start 15:05:00; the real value is an unresolved decision (D-14)
+  - Watchdog thresholds: TEST-ONLY harness values (WatchdogOptions.TestOnly); not approved
+  - Execution placeholders (latency 1 s, quote age 2 s, entry lifetime 5 s, spreads, fill fraction, retry 1 s): contract defaults D-8, calibration pending
+  - StableOrderingLag 2 s: the existing AdaptiveObserverWorker constant, not a new tuning
+  variants        : A = Immediate on plumbing P6 (3 valid bars of 6); B = AskBelowCandleMA(N=3, AskClose) on plumbing P4 (2 of 4), TP1 5% x 50%, per-trade SL 10%
+  risk profile    : ResearchV1/1 (no trade cap, daily SL observation only)
+  translator      : StableOrderingLag 2s, accept [2026-09-22T03:45:00.0000000+00:00, 2026-09-22T10:05:00.0000000+00:00], seen-id retention 00:10:00
+  retention       : loop 00:10:00 / quote history MaxQuoteAge+1m, db page 20000 rows, poll script 'mixed'
+  horizon         : session end 2026-09-22T10:05:00.0000000+00:00
+  PLUMBING STRATEGIES ONLY: nothing here is a profitability claim.
+
+EQUIVALENT: every compared channel is identical.
+  quotes         equal     lines A=1152734 B=1152734 hashA=142BF7C0FFAA hashB=142BF7C0FFAA
+  bars           equal     lines A=215 B=215 hashA=F95E3FBF3F3E hashB=F95E3FBF3F3E
+  readiness      equal     lines A=215 B=215 hashA=7C8FC9BA1D95 hashB=7C8FC9BA1D95
+  candles        equal     lines A=215 B=215 hashA=7DBA5EB6D45F hashB=7DBA5EB6D45F
+  opportunities  equal     lines A=125 B=125 hashA=CEC683FDC558 hashB=CEC683FDC558
+  outputs        equal     lines A=711 B=711 hashA=E6A39152CEDF hashB=E6A39152CEDF
+  rowQuarantine  equal     lines A=0 B=0 hashA=E3B0C44298FC hashB=E3B0C44298FC
+  audit          equal     lines A=711 B=711 hashA=CE69C91F7E5E hashB=CE69C91F7E5E
+  summaries      equal     lines A=2 B=2 hashA=1DE350984A77 hashB=1DE350984A77
+Excluded from the comparison:
+  - Transport diagnostics: pages, polls, failed polls, heartbeats, batch sizes, group-release timing (TransportDiagnostics).
+  - Exact re-deliveries of already accepted rows (overlapping polls): counted as Redelivered, never an event.
+  - Row quarantines caused by delivery order (IdOutOfOrder, LateAvailability): classified as transport; their effect (a missing quote) is still compared through the quotes channel. Row quarantines caused by the data itself are compared (rowQuarantine channel).
+  - Run labels: RunId and RunMode in audit rows and summaries.
+  - Resource figures: loop seen-event memory size, buffered rows.
+
+[historical (A)]
+  rows offered 2372841: translated 1152734, per-token payload duplicates 1220107, outside window 0, re-deliveries 0, quarantined 0 ; balanced=True
+  payload duplicates by instrument: future 21174, options 1198933
+  availability: clamped to exchange stamp 13523 (skew exchange - received: max 136 ms, mean 26.0 ms), exchange==received 0
+  groups 1143489, bars 215, max buffered rows 2579, remembered ids at end 56954
+  engine: events delivered 1152949, duplicates ignored 0, deadlines fired 14, engine quarantines 0, loop memory at end 27087 events
+  outputs 711, fills 8, positions 3, UNRESOLVED positions 0
+  variant A: opportunities 30, entry intents 1, filled entries 1, exit fills [SessionLiquidation=1], closed 1, unresolved 0
+  variant B: opportunities 45, entry intents 3, filled entries 2, exit fills [SessionLiquidation=1, Tp1=2, TradeSl=1], closed 2, unresolved 0
+  readiness: bars 215 (valid 215, after signal start 203, READY 203); first bar ends 2026-09-22T03:45:07.8823220+00:00; first ready bar b13 ends 2026-09-22T04:01:11.4041230+00:00 (09:31:11 IST)
+  transport (excluded from equivalence): pages 475, polls 0, failed polls 0, heartbeats 0, max batch 5000, groups after horizon 0
+  channel audit          lines       711  sha256 CE69C91F7E5E47AA
+  channel bars           lines       215  sha256 F95E3FBF3F3E3B98
+  channel candles        lines       215  sha256 7DBA5EB6D45F5427
+  channel opportunities  lines       125  sha256 CEC683FDC55882A0
+  channel outputs        lines       711  sha256 E6A39152CEDF63BF
+  channel quotes         lines   1152734  sha256 142BF7C0FFAA7740
+  channel readiness      lines       215  sha256 7C8FC9BA1D95C945
+  channel rowQuarantine  lines         0  sha256 E3B0C44298FC1C14
+  channel summaries      lines         2  sha256 1DE350984A771D14
+[live-paper (B)]
+  rows offered 2372841: translated 1152734, per-token payload duplicates 1220107, outside window 0, re-deliveries 0, quarantined 0 ; balanced=True
+  payload duplicates by instrument: future 21174, options 1198933
+  availability: clamped to exchange stamp 13523 (skew exchange - received: max 136 ms, mean 26.0 ms), exchange==received 0
+  groups 1143489, bars 215, max buffered rows 458, remembered ids at end 56954
+  engine: events delivered 1152949, duplicates ignored 0, deadlines fired 14, engine quarantines 0, loop memory at end 27087 events
+  outputs 711, fills 8, positions 3, UNRESOLVED positions 0
+  variant A: opportunities 30, entry intents 1, filled entries 1, exit fills [SessionLiquidation=1], closed 1, unresolved 0
+  variant B: opportunities 45, entry intents 3, filled entries 2, exit fills [SessionLiquidation=1, Tp1=2, TradeSl=1], closed 2, unresolved 0
+  readiness: bars 215 (valid 215, after signal start 203, READY 203); first bar ends 2026-09-22T03:45:07.8823220+00:00; first ready bar b13 ends 2026-09-22T04:01:11.4041230+00:00 (09:31:11 IST)
+  transport (excluded from equivalence): pages 0, polls 12195, failed polls 0, heartbeats 12195, max batch 698, groups after horizon 0
+  channel audit          lines       711  sha256 CE69C91F7E5E47AA
+  channel bars           lines       215  sha256 F95E3FBF3F3E3B98
+  channel candles        lines       215  sha256 7DBA5EB6D45F5427
+  channel opportunities  lines       125  sha256 CEC683FDC55882A0
+  channel outputs        lines       711  sha256 E6A39152CEDF63BF
+  channel quotes         lines   1152734  sha256 142BF7C0FFAA7740
+  channel readiness      lines       215  sha256 7C8FC9BA1D95C945
+  channel rowQuarantine  lines         0  sha256 E3B0C44298FC1C14
+  channel summaries      lines         2  sha256 1DE350984A771D14
+
+runtime historical: 430.3 s (last run of that path)
+runtime livepaper : 434.0 s (last run of that path)
+process peak working set: 250 MiB (whole process, all runs of this invocation; virtual address space is not reported because it is not memory use)
