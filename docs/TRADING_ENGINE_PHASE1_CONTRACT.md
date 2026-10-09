@@ -3,7 +3,161 @@
 Baseline: `origin/master` = `1ef645be330d1d864ba50b6eb2dc614c744f9674` (fetched 2026-10-09; local `master` was identical, tree clean).
 Branch: `trading-engine-phase1-contract` (worktree `D:\Projects\NSE-phase1`). Roadmap: [`TRADING_ENGINE_ROADMAP.md`](TRADING_ENGINE_ROADMAP.md).
 
+**Amendment 1 (2026-10-09) incorporates Naveen's confirmed requirements** (session times, concurrent variants, waiting entries, sizing/TP1, research risk policy, execution adapters, research labelling, cost verification). §A is authoritative and supersedes any conflicting older text; revised decisions are in §14. Still a contract only: no implementation, no database created, no migration, no deploy, no merge.
+
 This document is a contract and an audit. **Nothing here is implemented.** Every constant marked `PLACEHOLDER` or `PAPER-DEFAULT (unapproved)` is a starting guess, not a decision (project rule: no invented thresholds).
+
+## Amendment 1 — confirmed requirements (2026-10-09). **Authoritative; supersedes any conflicting text elsewhere in this document.**
+
+Contract update only. No implementation, no database created, no migration, no deploy, no merge. Section numbers below (§A.x) are new; older sections (§1–§16) were patched where they conflicted, and each patched place says "Amendment 1".
+
+### A.0 Requirement → contract mapping
+
+| Req. | Confirmed requirement (short) | Where specified |
+|---|---|---|
+| R1 | Asia/Kolkata; entries 09:30:00 ≤ t < 15:00:00; warm-up earlier; at 15:00 invalidate waiting opportunities + cancel unfilled entry qty; all positions closed by 15:10 target; earlier liquidation-start setting with retry/escalation; never claim closed without a fill; stops/targets/deadlines independent of bars | §A.1, §6.3, §9.2, T22–T26 |
+| R2 | Concurrent strategies/variants; each owns opportunities, orders, positions, accounting, config; 1 position per variant in V1 incl. pending reservations; ids support many positions later; uniqueness scoped to run/account/variant (no DB-wide constraint); independent comparative research = separate virtual accounting | §A.3, §8.1, §A.7, T27–T29 |
+| R3 | Base-strategy validity separate from extra entry condition (A immediate; A2 ask < MA of selected option's completed candles, N configurable, recalculated); same contract throughout; evaluated on eligible quote updates; invalidation cancels; re-arm/re-entry explicit; never compare to ATM basket; limit-vs-recheck flagged | §A.4, T30–T35, D-12 |
+| R4 | Default requested quantity 650; validate against date-specific lot size, report invalid, never alter silently; fixed-quantity and premium-budget modes; budget valuation/rounding/insufficiency; TP1 % + proportion with lot rounding, avg-entry reference, remainder SL/final exit, partial fills, restart-safe idempotency; no guessed ₹50k limit | §A.5, §A.6, T36–T41 |
+| R5 | V1 research risk policy: no max-trades, no daily-loss lockout or liquidation; configurable daily SL per variant recorded only; per-trade SL separate; optional enforcement + separate real-order profile later; integrity/duplicate/session rules still apply; no invented monetary limits | §A.7, §10, T42–T44 |
+| R6 | Shared strategy/risk across replay/live paper/future broker; adapter by config; real orders disabled; replay advances clock through every deadline before a later event; deterministic tie order; quote freshness at execution time; no LTP/entry-price substitution | §A.8, §A.2, §4.4, §9.1, T45–T48 |
+| R7 | All 18 sessions = development data; post-10-01 not automatically out-of-sample; measure per-contract quote coverage first; costs verified from official sources with dates; execution placeholders + sensitivity; historical quotes don't measure broker latency | §A.9, §A.10, §11, §14 |
+
+### A.1 Trading session and deadlines (Asia/Kolkata; R1)
+
+All session times are wall times in `Asia/Kolkata` (UTC+05:30, no DST), converted once at the adapter boundary to the UTC `AvailableAt` axis; Core compares instants only. Times are `SessionConfig` values (versioned, in the config hash).
+
+| Setting | Value | Status |
+|---|---|---|
+| `WarmupStart` | engine consumes events from the adaptive observer's collection start (09:15 today; may be earlier) | existing behaviour; decisions are rejected `Warmup` until ready |
+| `EntryOpen` | **09:30:00.000 inclusive** | confirmed |
+| `EntryClose` | **15:00:00.000 exclusive** (a decision with `DecisionTime == 15:00:00.000` is rejected `EntryClosed`) | confirmed |
+| `TargetFlatBy` | **15:10:00.000** (goal: every position closed by then) | confirmed (goal, not a guarantee) |
+| `LiquidationStart` | **15:05:00.000** | PLACEHOLDER (proposal): earlier than `TargetFlatBy` to leave retry room |
+| `ExitRetryMs`, `ExitEscalation*` | see below | PLACEHOLDER |
+| `SessionEnd` | the adaptive hard close / feed stop (15:35 today) | existing |
+The legacy expiry-day 14:00 entry cutoff is **dropped**; one cutoff applies on all days unless a later amendment adds a per-DTE setting.
+
+Behaviour at `EntryClose` (a deadline, class `SessionBoundary`, §A.2):
+1. Every `Opportunity` in `Waiting` or `Triggered` becomes `Expired(EntryClose)`; no new opportunity can be created or triggered.
+2. Every entry order that is `Submitted`/`Working` is cancelled for its **unfilled quantity** (`CancelRequested → Cancelled`); quantity already filled remains a position and is managed normally. Because simulated cancellation is evaluated at `ExecutionTime`, a fill that was already matured at an `ExecutionTime < 15:00:00` is honoured; one that would mature at `>= 15:00:00` is not.
+3. Reservations are released to the filled amount. Exits, stops and targets are unaffected by `EntryClose`.
+
+Liquidation (`LiquidationStart` → `TargetFlatBy`): at `LiquidationStart` every non-flat position (including `PartiallyOpen`, `ExitPending`) receives a forced exit decision `SessionLiquidation` for its remaining quantity unless an exit order for it is already working (then that order is re-priced per escalation). Exit attempt `k` (k = 0,1,…) is a marketable limit at the executable bid minus `collar_k`, where `collar_k = min(k × ExitCollarStepTicks, MaxExitCollarTicks) × tickSize`, repeated every `ExitRetryMs` (all PLACEHOLDER; tick size from the instrument snapshot, 0.05 on all 18 sessions). An attempt with no executable bid (missing/stale/one-sided quote) is **not** executed and **not** substituted; it is recorded `NoExecutableBid` and retried. Escalation: at `TargetFlatBy` with the position not flat → `Fault(LiquidationOverdue)`, alert, retries continue at the same cadence until flat or `SessionEnd`. At `SessionEnd` any non-flat position is reported `UnresolvedAtClose` (last executable bid and its age, remaining quantity, attempts) in the session summary and the audit; it is **not** closed in the books, **not** given a realised P&L, and is carried as an explicit open item in the report. A position is `Flat` only after fills sum to its quantity.
+
+Stops, targets and deadlines are independent of completed bars (R1): stop-loss, TP1, final target and the trailing/remainder rule are evaluated on every eligible quote event of the held token and on timers (§A.2, §A.6); bars are never needed for exits. If no new quote arrives, there is no new price information and no trigger; the position becomes `Unmarkable` when its last quote ages beyond `MaxQuoteAgeMs`, an alert is raised, and the session deadlines still run.
+
+### A.2 Deterministic timers in replay (R6; replaces the "flush" wording)
+
+1. **Replay advances through every deadline before a later event.** For each next input event with `AvailableAt = T`, the engine repeatedly pops the earliest queued deadline `D` with `D <= T` and executes it (with `DecisionTime = D`) **before** the event is handled. The loop continues because a deadline handler may enqueue a new deadline (order maturity, expiry, retry) that is itself `<= T`. A deadline equal to `T` runs before the event at `T`. This makes the exclusive `EntryClose` correct (a quote at exactly 15:00:00 cannot create an entry) and removes the earlier "equal-to-T after the event" rule.
+2. **No dependence on end-of-stream flush.** The end-of-stream `AdvanceTo(SessionEnd)` call is still made so trailing deadlines fire, but a gap of any length between two events is processed by (1); a deadline in the middle of a quiet gap is never deferred to the next market event or to the final flush. (Test T26/T47 fails if a deadline is observed with `DecisionTime` later than its deadline, or if outputs differ between a stream with a synthetic heartbeat in the gap and one without.)
+3. **Deterministic tie order** for deadlines with equal time: `(DeadlineTime, ClassRank, VariantOrdinal, OrderOrOpportunityId, CreationSeq)` with `ClassRank`: 0 = execution maturities (order reaches `ExecutionTime`, expiry, cancel evaluation), 1 = session boundaries (`EntryClose`, `LiquidationStart`, `TargetFlatBy`, `SessionEnd`), 2 = risk/exit retries, 3 = strategy/opportunity timers. `VariantOrdinal` is the variant's position in the sorted `VariantId` list of the config. `CreationSeq` is the engine's monotonically increasing counter (deterministic because event handling is).
+4. **Live parity.** The live adapter's heartbeats (§4.4) only cause (1) to run earlier in wall time; they cannot change `DecisionTime`, ordering or outputs.
+5. **Executions are evaluated at execution time.** An order's `ExecutionTime` is a class-0 deadline. At that deadline the model reads the latest quote with `AvailableAt <= ExecutionTime` (never a later one), checks freshness (`ExecutionTime − AvailableAt <= MaxQuoteAgeMs`), two-sidedness, spread and size. A quote that arrives after `ExecutionTime` cannot be used even if it is processed before the deadline in wall time. No LTP, last mid, trigger price or entry price may be substituted for a missing bid/ask.
+
+### A.3 Strategies, variants, accounts and positions (R2)
+
+- **Entities.** `Strategy` (a signal family, version) → `Variant` (`VariantId` = stable string, e.g. `A`, `A2-ma10`; owns `EntryConditionSpec`, `SizingSpec`, `ExitSpec`, `RiskProfileRef`, `AccountRef`, its own config hash). The engine hosts **N variants over the same ordered event stream**; each event is offered to variants in `VariantOrdinal` order. A variant's `Opportunity`, `Order`, `Position`, `RiskCounters` and ledger are never read or written by another variant.
+- **Accounting.** Each variant has its own `VirtualAccount` (default `AccountId == VariantId`): cash/exposure/P&L ledger, daily counters, daily SL record. Independent comparative research always uses separate virtual accounts, so one variant's fills never reduce another's capacity or quote availability. (Consequence stated plainly: with independent accounts every variant can fill against the *same displayed size*, so summing variants overstates what one real account could get; sums across variants are therefore never reported as achievable P&L.)
+- **Shared-account policy** (capital/exposure constraints across variants, a single broker account) is a *separate execution policy layer* (`AccountPolicy`) selected by config; it is out of Phase 2 beyond the interface and a pass-through "Independent" implementation.
+- **V1 capacity.** `MaxPositionsPerVariant = 1`. Capacity counts positions in any non-flat state **and** reservations for pending entry orders (and a `Triggered` opportunity whose order is in flight), so a second entry cannot be created while an order is pending.
+- **Identity for the future.** `PositionId = H(ConfigHash, VariantId, TradeDate, EntryDecisionId)`; each position carries `VariantId` and `SlotNo` (always 0 in V1). Uniqueness constraints (§8.1) are scoped `(RunId, AccountId, VariantId, SlotNo)`; raising capacity later means allowing `SlotNo` 0..N−1, not changing keys. **There is no database-wide single-position constraint.**
+- **Per-variant config.** Each variant's full spec is part of the config hash; two variants with different parameters have different `VariantConfigHash` and may not share an `OpportunityId`/`OrderId` namespace (ids include `VariantId`).
+
+### A.4 Entry variants, waiting entries and quote-triggered conditions (R3)
+
+**Separation.** `BaseStrategy` answers one question — *is the setup valid, and for which contract?* — by emitting `StrategyValidity` changes on completed-bar (and optionally timer) events. `EntryCondition` answers *given a valid opportunity, may we place the entry now?* It is a pluggable pure function with a declared input set. Variants are `(BaseStrategy, EntryCondition, Sizing, Exit, Risk)` tuples: A = `(S, Immediate)`, A2 = `(S, AskBelowOptionCandleMA(N))`; both can run concurrently.
+
+**Opportunity lifecycle** (one `OpportunityId = H(VariantConfigHash, TradeDate, EpisodeId)`, where an *episode* starts when the base strategy goes from not-valid to valid):
+
+`Created → Waiting → Triggered → OrderPending → {Filled | Waiting (re-armed) | Expired | Cancelled}`
+
+1. **Creation.** At the validity-making `DecisionTime`, if `EntryOpen <= DecisionTime < EntryClose` and warm-up complete, the **contract is selected once** (§6.1) and stored on the opportunity. The same token is used for the condition, the order, the position and every exit. It is never re-selected during the opportunity, the trade, or a re-arm.
+2. **Immediate condition (A).** Evaluated once at creation. If capacity is busy → `Rejected(CapacityBusy)` and the opportunity ends (`OnCapacityBlocked = Reject`, per-variant, default for Immediate). Otherwise an entry order is created.
+3. **Waiting condition (A2).** The opportunity enters `Waiting`. The condition is evaluated on **every eligible quote update of the selected token** using the latest causally available state: the quote's own executable ask and the moving average as of that event. *Eligible* means all of: opportunity `Waiting`; base strategy still valid; `EntryOpen <= t < EntryClose`; feed healthy; the quote is fresh, two-sided and passes spread/size checks; capacity free (if capacity is busy the opportunity keeps waiting, `OnCapacityBlocked = Wait`, default for waiting conditions). No evaluation happens on quotes of other tokens.
+4. **A2 definition.** `AskBelowOptionCandleMA(N, priceField, maType)`: condition true iff `executableAsk(token, t) < MA_N(token, t)` (strict), where `MA_N` is the arithmetic mean (`maType = Simple`; others are separate named conditions) of the `priceField` of the **last N completed candles of the selected option token only**. `N` is configuration (10 is only an example; no default is approved). The MA is recalculated whenever a candle completes; a candle is available to the condition only for events ordered **after** the candle-completion output in the total order (§4.3), i.e. a quote in the same availability group as the candle's closing tick does not see that candle. If fewer than N valid completed candles exist for the token, the condition is `NotEvaluable(InsufficientCandles)` (waiting continues, audited), never filled with LTP, zeros or other tokens' data. A rolling-ATM-basket average, a futures average, or any series not built from the selected token's own quotes is **rejected by construction**: the condition declares its input token, and the engine asserts `inputToken == opportunity.Token` (test T31).
+5. **Candle definition (unresolved, D-13).** Proposed: option candles are built per token from fresh two-sided quotes on the **same completed-bar boundaries** as the adaptive futures bars (so the candle clock is the strategy's own bar clock), `priceField = close = last fresh ask in the bar` (same side as the comparison), tick-time ordering by `(AvailableAt, Id)`. A bar with no fresh two-sided quote for the token yields an invalid candle (counts toward neither N nor the MA; the MA window then spans earlier candles—flagged by `CandleGapCount` in the audit). Sensitivity variants (mid close; time-based candles) are separate named conditions, not parameters.
+6. **Invalidation.** When the base strategy becomes not-valid (a bar or timer says so) the opportunity is `Cancelled(StrategyInvalidated)`; an entry order created from it and not yet filled is cancelled for its unfilled quantity; a filled part remains a position governed by its exit rules. `EntryClose`, feed `Degraded`, or contract unquotability beyond `HaltStaleSeconds` also end/suspend it (`Expired(EntryClose)`, suspended-not-cancelled for data validity, cancelled for `Degraded`).
+7. **What a satisfied condition creates (unresolved, D-12).** Observing a qualifying ask does not guarantee a later fill at that price. Options: (a) condition creates a **marketable limit order at the observed qualifying ask** (plus `EntryLimitTolerance` ticks, default 0); it fills only if the executable ask at `ExecutionTime` is `<= limit` (fill at the actual ask — price improvement allowed); (b) the condition is **re-checked at `ExecutionTime`** and the order fills at the then-current ask if it still holds (no price bound); (c) fill at whatever the ask is at `ExecutionTime` (rejected: not a condition). **Recommendation: (a)**, no MA re-check, because it bounds slippage to the price that satisfied the rule, is how a real limit order would behave, and makes "trigger → fill" a measurable miss rate. Under (a), if the order expires unfilled while the opportunity is still valid and in session, the opportunity is **re-armed** to `Waiting` (below). Phase 2 implements both (a) and (b) behind `EntryOrderPolicy` so the sensitivity can be measured; the default is whichever Naveen approves.
+8. **Re-arming and re-entry (explicit).**
+   - *Unfilled expiry, no fill at all:* re-arm to `Waiting` if still valid/in session/capacity free, counting `AttemptNo`; `MaxAttemptsPerOpportunity` is configurable, **default unlimited** (attempts are not trades; there is no trade-count cap in V1). Minimum spacing between attempts is the order expiry itself because only one order may be outstanding.
+   - *Partial fill then expiry:* remainder cancelled; opportunity is **consumed** (no re-arm to top-up) — the position is managed on what filled.
+   - *Filled:* opportunity consumed. One entry per opportunity.
+   - *After the trade exits:* no re-entry on the same opportunity/episode (`ReentryPolicy = NewEpisodeRequired`, recommended default). A new opportunity requires the base strategy to go not-valid → valid again. Alternative `SameEpisodeAfterExit` exists as a named policy, not default, and would create a new `OpportunityId` with `EpisodeId` suffix `r<k>` and a fresh contract selection (never reusing the old contract silently).
+   - *Valid → invalid → valid within the same bar processing:* treated as two episodes in event order.
+9. **Audit.** Every evaluation outcome that changes state (and every N-th `NotEvaluable` per opportunity, bounded) writes `decision_audit` with ask, MA, N, candle count, quote age, spread, capacity, the rule that blocked it; per-quote "ask ≥ MA, still waiting" evaluations are summarised (counters + first/last timestamps + min ask-minus-MA), not one row per quote, to bound volume (~1.1 M ticks/session, existing measurement).
+
+### A.5 Sizing and quantity validation (R4)
+
+- **Modes (per variant):** `FixedQuantity { Units }` — **default `Units = 650`** (= 10 lots of 65); `PremiumBudget { Rupees, ValuationPrice, MaxLots? }`. One mode per variant; the mode and its parameters are in the variant config hash.
+- **Lot size validation.** Lot size is read per trading date from the instrument snapshot for the selected token (`instruments.LotSize` as of the session's `AsOfDate`). *Verified:* all NIFTY option instruments on all 18 `AsOfDate` snapshots have `LotSize = 65` and `TickSize = 0.05`, so 650 = 10 whole lots on every development session. A run-level **pre-run validator** checks every session/variant before trading and reports a table `(date, variant, requested units, lot size, valid?)`; an invalid combination (`units % lotSize != 0`, `units <= 0`, missing lot size) marks that variant-day `InvalidQuantity`, the entry decision is `Rejected(InvalidQuantity)` with the numbers, and the run report lists it. **Quantities are never silently rounded or altered** in `FixedQuantity` mode.
+- **Premium budget.** Valuation: `lotCost = lotSize × ValuationPrice + estimatedEntryCostsPerLot`, where `ValuationPrice` is the **order limit price** at order creation (the observed qualifying ask for waiting entries; the executable ask at decision time for immediate entries) — not the later fill price — and entry costs come from the `CostSchedule` (§A.9). `lots = floor(Rupees / lotCost)`, capped by `MaxLots` if set. **Round down only.** If `lots < 1` → `Rejected(InsufficientBudget)` with `required = lotCost`, `budget = Rupees`; the entry is not attempted at a smaller size by rounding up and not silently skipped (the rejection is audited). Because a fill can only be at or below the limit, the budget is not exceeded by price (costs excepted, being estimated).
+- **Capital.** No approved capital exists. The earlier ₹50,000 paper-capital / ₹16,250 exposure proposals are **withdrawn**. `AccountCapital` is nullable; `null` (the research default) means *not enforced*. Exposure is **recorded** (peak premium committed per variant/day, never used to reject) so research is not silently restricted. Enforcement is available only when a capital value is configured, and then only in a profile that enables it (§A.7).
+- Illustration (my arithmetic, not a decision): 650 units × a ₹100–150 premium = ₹65,000–₹97,500 of premium per entry, i.e. larger than the withdrawn ₹50k guess; that is why capital must not be a hidden default.
+
+### A.6 Exits: per-trade SL, TP1 partial exit, remainder, final exit (R4/R5)
+
+All prices below are **premium (option) prices**; percentage triggers compare the **executable bid** (what liquidation would receive) with the **average entry fill price** (volume-weighted over actual entry fills, price only, excluding costs; `EntryReference = AvgEntryFillPrice`). Triggers are evaluated on every eligible quote event of the held token and on timers (independent of bars). Costs enter P&L, not trigger prices (configurable `TriggerBasis = Price | NetOfCosts` is a named option, default `Price`).
+
+- **Per-trade SL** (`TradeSLPct`, nullable): trigger when `bid <= AvgEntry × (1 − TradeSLPct)`. It is an **exit rule**, separate from the daily SL (§A.7), applies to all open quantity (and to the remainder after TP1 per `RemainderSL`), and creates a marketable-limit exit (§A.1 escalation applies). The fill is whatever is executable at `ExecutionTime`, so it can be worse than the trigger (gap risk) — recorded as `ExitSlippageVsTrigger`.
+- **TP1** (`Tp1Pct`, `Tp1Proportion` p with 0 < p < 1; both nullable = disabled): armed on the first entry fill. Trigger when `bid >= AvgEntry × (1 + Tp1Pct)`.
+  - `Tp1TargetQty = floorToLot(p × OpenQtyAtTrigger)` computed **once** at the first trigger and stored. If it rounds to 0 lots → TP1 state `Skipped(RoundsToZeroLots)`, audited, and the position continues under SL/final/session rules (no silent alteration to 1 lot). Because p < 1 and fills are whole lots, `Tp1TargetQty < OpenQty` always, leaving a remainder.
+  - Lot rounding: all order and fill quantities are whole multiples of lot size (partial fills are rounded **down** to whole lots; less than one lot of displayed size ⇒ no fill).
+  - TP1 order = marketable limit at the bid (collar 0 for TP1, `Tp1CollarTicks` configurable). It may fill partially; the order rests until `OrderExpiryMs`. If it expires with `TargetQty − Filled > 0` the state returns to `Armed(remaining)` and may re-trigger when the condition holds again for **only the remaining TP1 quantity** — total TP1 quantity never exceeds `Tp1TargetQty`.
+  - If the entry order is still working when TP1 triggers, the unfilled entry quantity is cancelled first (no accumulation after an exit began).
+  - **Restart-safe idempotency.** `Tp1State ∈ {NotArmed, Armed, TriggeredOrderWorking, PartiallyFilled, Done, Skipped}` is part of position state and is *derived deterministically by replay*; the TP1 order id is `OrderId = H(PositionId, "TP1", AttemptNo)` and `Tp1TargetQty` is stored on the first trigger event. Replay re-derives the same ids; inserts are `ON CONFLICT DO NOTHING` + verify; a recovery that finds a persisted TP1 order does not create a second one (T39–T40).
+- **Remainder after TP1:** `RemainderSL ∈ {Unchanged, MoveToBreakeven (AvgEntry), FixedPct x}` — default `Unchanged` (research-neutral); `FinalTPPct` (nullable) is the final target; the remainder is also subject to session liquidation (§A.1). The average-entry reference does **not** change after TP1 (it is the entry average, not a re-averaged cost basis).
+- **Exit priority when several fire on one event** (deterministic): `SessionLiquidation > TradeSL > FinalTP > TP1`. An exit order in flight blocks creating a second exit order for the same quantity (duplicate-order prevention).
+- No discretionary exit parameter has an approved value; every `*Pct`/`*Ticks`/`*Ms` is a research parameter or PLACEHOLDER, recorded with its variant.
+
+### A.7 Risk policy: `ResearchV1` and a separate real-order profile (R5)
+
+Two named profiles. The profile is part of every variant's config hash.
+
+| Control | `ResearchV1` (the only profile in Phase 2) | `RealOrder` (future; separately configured; **disabled**) |
+|---|---|---|
+| Max trades per day | **none** (the earlier cap of 5 is withdrawn) | configurable, nullable |
+| Concurrent positions | per-variant capacity (V1 = 1, incl. pending reservations) | per-variant and per-account |
+| Daily SL | **configurable per variant; recorded only** — see below | configurable enforcement: `None | BlockEntries | BlockEntriesAndLiquidate` |
+| Per-trade SL | exit rule (§A.6), independent of daily SL | same |
+| Capital/exposure limit | not enforced; peak exposure recorded | configurable, requires approved values |
+| Kill switch | manual operator flag and integrity faults only (no daily-loss auto-trip) | adds configurable auto-trip |
+| Quantity/lot validation, duplicate-order prevention, session restrictions, data-integrity gates (stale/disconnect/degraded, late event), one outstanding order per quantity | **always on** | always on |
+| Approved monetary limits | **none exist**; any value shown is PLACEHOLDER and unapproved | to be approved explicitly |
+
+**Daily SL in `ResearchV1` (non-enforcing).** `DailySL` (monetary amount, nullable, per variant) is evaluated on every state change and quote event of the variant's open position as `DailyPnL_v = RealisedNet_v + UnrealisedLiquidationNet_v` (definitions in §10.4: net of all costs; unrealised at the executable bid less estimated exit costs; `Unmarkable` handled as in §10.4 *for the record only*). When `DailyPnL_v <= −DailySL` the engine writes a `DailySlBreached` event (first breach time, `DailyPnL` at breach, worst `DailyPnL` of the day, still-breached flag, subsequent entries/exits count). It **does not** block entries, cancel opportunities, liquidate, or trip the kill switch. The report prints breaches next to results and a counterfactual summary "trades/P&L after first breach" so enforcement can be evaluated later without having constrained the run. `EnforcementMode` exists in config with default `None`; enabling it is a `RealOrder`/later-version decision.
+
+### A.8 Execution adapter selection (R6)
+
+- Strategy, opportunity, sizing, exit, risk and order-management logic run in `Trading.Core` and are identical for replay, live paper and a future broker.
+- `Execution.Adapter` (config, in the hash): `Simulated` (replay **and** live paper — same `SimulatedExecutionModel`, §9) or `Broker` (future). `RealOrdersEnabled` is a separate constant-false guard: selecting `Broker` while it is false, or running any profile other than an explicitly approved `RealOrder` profile, makes engine start-up **refuse**. Phase 2 contains no broker code beyond the `IExecutionGateway` interface and a "not enabled" stub that throws.
+- The broker adapter would receive `OrderIntent`s with deterministic client order ids and return `ExecutionUpdateEvent`s on the same event stream; it is never allowed to touch strategy or risk state.
+
+### A.9 Transaction costs — verification of current rates (R7; **PROVISIONAL**)
+
+Authorised check performed 2026-10-09. **Honest status:** my attempts to open the NSE primary documents directly (`FA73061.pdf`, `FATAX73524.pdf`, the NSE STT and levies pages) **timed out three times**, so I could not read the primary text. The rates below come from search-engine extracts of those NSE pages plus broker/aggregator pages. They are therefore *provisional* until the primary PDFs are read (action item, D-7).
+
+All 18 development sessions (2026-09-04 … 2026-10-01) fall **after** every effective date below, so the *current* schedule is applicable to all of them; no earlier rate applies to this dataset. Do not apply this schedule to sessions before the stated effective dates.
+
+| Charge (index option, intraday round trip) | Rate | Base / payer | Effective | Applies to 18 sessions | Source (status) |
+|---|---|---|---|---|---|
+| STT on sale of an option | **0.15 %** (was 0.10 % up to 31 Mar 2026) | sell-side premium | 2026-04-01 (Finance Act 2026; assent 2026-03-30) | yes | NSE STT page and NSE circular `NSE/FATAX/73524` (31 Mar 2026), as returned by search extracts; secondary: taxguru, Arihant (**primary not read**) |
+| NSE exchange transaction charge, index options | ≈ **₹3,553 per crore** of premium (≈ 0.03553 %) each side, i.e. ₹3,503 + ₹50 IPFT per crore before 2026-03-01; the 2026-02-27 circular rolls the IPFT contribution back and "no impact in overall outflow" | premium turnover, both sides | 2024-10-01 (₹35.03/lakh); revision effective 2026-03-01 | yes | NSE circulars `NSE/FA/73061` (27 Feb 2026) and the Oct-2024 transaction-charge circular via search extract — **the per-crore split was garbled in the extract; the total is provisional** |
+| SEBI turnover fee | ₹10 per crore (0.0001 %) | turnover, both sides | long-standing | yes | broker/aggregator tables, NSE levies page (extract) — primary not read |
+| GST | 18 % | on brokerage + exchange charges + SEBI fee (not on STT or stamp duty) | long-standing | yes | broker tables; BSE notice on SEBI-fee GST — primary not read |
+| Stamp duty | **0.003 %** (₹300/crore) | buy-side premium only | 2020-07-01 | yes | NSE levies page (extract), Zerodha bulletin — gazette not read |
+| Brokerage | **unknown** (existing config assumes ₹20/order; current broker plan not verified) | per order | — | — | **needs Naveen's actual plan (D-7)** |
+
+Consequences: (i) the research calculator's **STT 0.0625 % is stale by a factor of 2.4** for these dates and must not be reused; (ii) the schedule must be a **versioned `CostSchedule` with effective dates**, selected per trade date, never hard-coded; (iii) each fill stores its cost components; (iv) results are reported **with and without** the provisional components so the dependence is visible.
+Illustrative magnitude (my arithmetic, 650 units, buy at ₹125.00 and sell at ₹130.00, ₹20/order): STT ≈ ₹126.75, exchange ≈ ₹58.89, brokerage ₹40, GST ≈ ₹17.83, stamp ≈ ₹2.44, SEBI ≈ ₹0.17 → **≈ ₹246 round trip ≈ 0.38 index points per unit**, comparable to the whole 5-point gain in that example and larger than the two-tick (0.10) slippage per side modelled today. Costs therefore materially affect any short-hold premium strategy.
+
+### A.10 Research data labelling and execution sensitivity (R7)
+
+- **All 18 sessions (2026-09-04 … 2026-10-01) are labelled `Development`.** The earlier "discovery / validation-1" split of these dates is withdrawn: 09-28 … 10-01 are *not* a clean validation set (they were examined by diagnostics, §11.2), so no pass/fail claim may use them as out-of-sample.
+- **Sessions after 10-01 are not automatically out-of-sample.** A `session_ledger` (append-only, one row per session per examination: date, purpose `diagnostic | discovery | rule-selection | validation | forward`, experiment id, date of first viewing, who/what) decides eligibility. A post-10-01 session is `ForwardEligible` only if the ledger shows it was neither examined for, nor influenced, rule selection before the rule freeze; the live watch-only sessions of 10-05 … 10-08 are `Unknown` until the ledger is reconstructed (they were observed live and referenced in recent performance work).
+- **Per-contract quote coverage is measured before any feasibility claim.** Phase 3 deliverable, per session and contract: share of time with a fresh two-sided quote at the 5 s and `MaxQuoteAgeMs` thresholds, spread distribution (₹ and % of mid), touch sizes, quote-update intensity, and the same conditioned on the moments strategies would act (bar completions, ask-below-MA events). The existing "bid/ask present" percentages (89–95 %) are row-level, all-token, and **not** evidence of executable coverage.
+- **Execution placeholders are explicit and tested for sensitivity.** `ExecutionLatencyMs`, `MaxQuoteAgeMs`, spread/size limits, `EntryOrderPolicy`, collars and fill fraction are PLACEHOLDERs. Every research result is reported at a **low / base / high** placeholder set (grid proposed in Phase 3, e.g. latency {250, 1000, 3000} ms, quote age {1, 2, 5} s) and a conclusion counts only if it survives the grid. Recorded quotes show *feed* timing (`ReceivedAt − ExchangeTimestamp`, 1-second exchange resolution) and book state, **not** broker order round-trip latency, acknowledgement delay, queue position or rejection behaviour; those can only be measured from real broker paper/live interaction later. Reports must say so.
+
 
 ## 0. How the evidence was gathered
 
@@ -42,7 +196,7 @@ Only `MarketDataIngestionWorker`, `LiveVolumeBarWriter`, `AdaptiveObserverWorker
 | `MetricTrials/CoreScoreOptionSimulator`, `FutureDirectSimulator`; `VolumeBarData/TradeSimulator` etc. | Research simulators; mark fills, no slippage/spread, **exit falls back to entry price when no quote**, duplicated copies of rule logic. | replay | **Keep as research history; results are not live-equivalent** | A |
 | `Backtest/PerformanceReportBuilder` | Per-trade closed-trade metrics; profit factor returns 0 for all-win; trades/day uses calendar span; no per-day/exit-reason/gross-vs-net/unrealised. | replay | **Extend** | A |
 | `Domain` `PaperTrade`, `KillSwitchState`; `Persistence` `paper_trades` | One row = whole trade lifecycle; partial leg overwrites fields; no orders/fills tables; indexes on `EntryTime`, `ExitTime` only; **no unique/idempotency key, no `StrategyId` index**. Kill switch is a DB row toggled by Dashboard only; **nothing auto-trips it**; `Ruleset.KillSwitch` config is read by nothing. | partly | **Replace** with new trading schema (§8) | A |
-| `VolumeBarData/TransactionCostCalculator` | Only code with STT/GST (STT 0.0625 % of exit premium, GST 18 % of brokerage per tests). Rates not independently verified. | research | **Reuse as a starting point only**; schedule must be verified (§14 D-7) | A |
+| `VolumeBarData/TransactionCostCalculator` | Only code with STT/GST (STT 0.0625 % of exit premium, GST 18 % of brokerage per tests). Rates not independently verified. | research | **Do not reuse its rates** (its STT 0.0625 % is stale; 0.15 % applies to all 18 sessions, §A.9); at most reuse its structure | A |
 
 ### 1.3 Wall-clock and time handling (V/A)
 - No injected clock in ingestion/trading/adaptive paths; `TimeProvider.System` is registered (`Program.cs:84`) but only notifiers use it (A).
@@ -60,7 +214,7 @@ Only `MarketDataIngestionWorker`, `LiveVolumeBarWriter`, `AdaptiveObserverWorker
 | G4 | **Exits are cadence/bar driven.** Legacy: evaluated every 15 s, skipped when `CompositeScore == null` or when the held token has never ticked (SquareOff skipped). Dormant volume-bar path: 15:15 cutoff fires only on a bar close, else at 15:35 flush. A quiet market can delay a required exit. | High | A (`LiveTradingEngine.cs:39-42,234`; `LiveFuturesCrossoverEngine.cs:60-64`) |
 | G5 | **LTP/entry-price substitution.** Legacy mark = bid ?? LTP; `MidPrice` falls back to LTP; `LivePaperTradeExecutor` is LTP-only; `CoreScoreOptionSimulator` exits at entry price when no quote. | High | A |
 | G6 | **Incomplete execution & cost model.** No latency, partial fills, rejections, expiry, quote age (legacy `InstrumentState` has no timestamp). Only brokerage ₹20/order + 2-tick slippage in Host; no STT/exchange/GST/stamp (only in a research calculator). | High | V (`PaperTradeSimulator`), A |
-| G7 | **Risk gaps.** Daily loss is realised-only and gates new entries only (V `LiveTradingEngine.cs:103-105`); kill switch never auto-trips and `Ruleset.KillSwitch` config is dead; no pending-order exposure reservation; no DB uniqueness for open positions; F48 capital sum over-reserves after a partial; legacy `MaxTradesPerDay` default 30 (project target is 5–10/day; requested cap now 5). | High | A |
+| G7 | **Risk gaps.** Daily loss is realised-only and gates new entries only (V `LiveTradingEngine.cs:103-105`); kill switch never auto-trips and `Ruleset.KillSwitch` config is dead; no pending-order exposure reservation; no DB uniqueness for open positions; F48 capital sum over-reserves after a partial; legacy `MaxTradesPerDay` default 30 (project target is 5–10/day; the 5-trade cap was withdrawn in Amendment 1). | High | A |
 | G8 | **Ingestion integrity.** No broker sequence; per-tick exception path drops a tick silently; no unique tick key; no inbound watchdog (stalled-but-connected socket undetected); `DataGap` end time is auth-ack not first tick; adaptive path does not consume `DataGap`; several readers order by `ExchangeTimestamp` only (not `(AvailableAt, Id)`); `BacktestTickSource` orders by `(ExchangeTimestamp, Id)` – a different order from the adaptive path. | Medium-High | A |
 | G9 | **Recovery model.** Replay-whole-session only (no checkpoint): measured 7.6–15.5 s and ~1.9 GB working set for a full day (`ADAPTIVE_LIVE_PERFORMANCE_2026-10-08.md`, existing doc); multi-table persistence is not atomic (relies on recovery to back-fill); a late row with lower `Id` than the cursor is either never seen or loops the degrade/rebuild cycle. | Medium | A |
 | G10 | **Constants & thresholds not derived.** ₹100–150 ask band, ₹125 target, delta 0.30–0.60, OI ≥ 100 000, 2 % spread, opening-volume regression are fixed numbers; conflicts with BACKTEST/CLAUDE "dynamic or DTE-based" rule if reused as decision thresholds. | Medium | A |
@@ -123,7 +277,7 @@ The engine's input order is **`(AvailableAt, GroupRank, SourceTickId)`**, where 
 
 ### 4.4 Injected clock and timers
 - `ITradingClock` exposes only `Now` = *engine time* = `AvailableAt` of the last processed event or fired deadline. Core has no other time source.
-- Timers are **deadline-stamped**: `DeadlineQueue` holds `(deadline, kind, id)`. Before handling any event with `AvailableAt = T`, the engine fires, in `(deadline, id)` order, every deadline `< T` (and `== T` after the event for session boundaries, §6.3), with `DecisionTime = deadline` (not `T`). The outcome therefore does not depend on *when* it is processed, only on the event stream and deadlines.
+- Timers are **deadline-stamped**: `DeadlineQueue` holds `(deadline, kind, id)`. Before handling any event with `AvailableAt = T`, the engine fires, in `(deadline, id)` order, every deadline `<= T` (a deadline equal to `T` also fires **before** the event; tie order, chaining and gap handling in §A.2), with `DecisionTime = deadline` (not `T`). The outcome therefore does not depend on *when* it is processed, only on the event stream and deadlines.
 - Live heartbeats: the LivePaper adapter injects `HeartbeatEvent(AvailableAt = wallNow − stableLag)` once per poll (even when no ticks arrive). A heartbeat can only cause due deadlines to be processed *earlier in wall time*; because decisions use the deadline as `DecisionTime`, replay without heartbeats produces identical outputs. Heartbeats are journaled (`engine_inputs`) for audit but are not required for replay equality. This is how a quiet market cannot block a required exit: session-close and risk deadlines fire on heartbeats in live, and on the next event or an explicit end-of-stream `Flush(sessionEnd)` in replay.
 - The stable-ordering lag (existing 2 s) is a property of the adapter's *watermark* (`watermark = wallNow − stableLag`); the engine sees only watermark-ordered events. It is configuration (`StableOrderingLagSeconds`), versioned, and the historical adapter emulates it by processing groups strictly in `AvailableAt` order (equal to the live outcome whenever no late tick is injected).
 - Banned in Core: `DateTime(Offset).Now/UtcNow`, `Stopwatch`, `TimeProvider.System`, `Task.Delay`, `Random`, `Guid.NewGuid` (ids are deterministic hashes, §8.3). Enforced by a test scanning the assembly's IL/source.
@@ -145,6 +299,8 @@ record StrategyDecision(DecisionKind Kind /*None|Enter|Exit*/, Side, ContractReq
 ```
 `EngineView` is read-only: positions, pending orders, risk counters, latest quotes with ages. Strategies **cannot** place orders; they emit decisions. Risk and execution are separate stages and cannot be bypassed.
 
+**Amendment 1 (§A.4):** `IStrategy` above is the *base strategy* (validity + contract); the extra entry rule is a separate pure `IEntryCondition` (declares its input token; evaluated on eligible quote events of that token). Exits (SL, TP1, final, session liquidation) are `IExitRule`s evaluated on quotes and timers, never on bars only (§A.6).
+
 ### 5.2 Decision pipeline (every decision audited, accepted or rejected)
 `StrategyDecision` → `ContractSelector` (entries only; §6) → `RiskEngine.PreTrade` (§10) → `OrderIntent` → `OrderManager` → `IExecutionModel` → `ExecutionUpdate` → `PositionBook`/`RiskCounters` update. Each hop writes a `DecisionAudit` row with stage, outcome (`Accepted`/`Rejected`/`Deferred`), reason code(s) and the exact input values (quote ages, spreads, counters) that determined the outcome.
 
@@ -152,7 +308,7 @@ record StrategyDecision(DecisionKind Kind /*None|Enter|Exit*/, Side, ContractReq
 `Created → Submitted → {Working → PartiallyFilled}* → {Filled | Cancelled | Expired | Rejected}`; `CancelRequested` is an intermediate. Illegal transitions throw (fault). An order's identity is deterministic (§8.3). Order types in the paper model: **marketable limit** only (limit = opposite-side top-of-book at ExecutionTime ± configured collar); no market orders, so a missing/wide book cannot create unbounded fills.
 
 ### 5.4 Position states
-`Flat → EntryPending → (Open | PartiallyOpen) → ExitPending → Flat`; plus `ExitFailed` (see §9.5) which is **not** `Flat`. One logical position at a time: the state machine admits no second `EntryPending` unless `Flat`. A partially filled entry is `PartiallyOpen`: the unfilled remainder is cancelled at the entry-expiry deadline (default policy: cancel remainder, manage the filled part as the position; alternative: all-or-none, §14 D-5). An exit may itself be partial: the position stays `ExitPending` with remaining quantity until flat.
+`Flat → EntryPending → (Open | PartiallyOpen) → ExitPending → Flat`; plus `ExitFailed` (see §9.5) which is **not** `Flat`. One logical position at a time **per variant** (Amendment 1 §A.3): the state machine admits no second `EntryPending` unless `Flat`. A partially filled entry is `PartiallyOpen`: the unfilled remainder is cancelled at the entry-expiry deadline (default policy: cancel remainder, manage the filled part as the position; alternative: all-or-none, §14 D-5). An exit may itself be partial: the position stays `ExitPending` with remaining quantity until flat.
 
 ## 6. Contract selection, session phases, faults
 
@@ -163,15 +319,15 @@ Selection constants (premium window, preferred delta, OI/spread minimums) are **
 ### 6.2 Rolling ATM baskets
 Rolling ATM±k baskets (band flows, residual anchors) are **diagnostic features only**. They are never a held position, never an `OrderIntent` target. Only a fixed single contract can be held.
 
-### 6.3 Session phases (engine-time, from versioned `SessionConfig`)
+### 6.3 Session phases (engine-time, from versioned `SessionConfig`; Amendment 1 / §A.1)
 | Phase | Rule |
 |---|---|
-| Pre-open / Warm-up | Events are processed (features advance); decisions are `Rejected(reason=Warmup)`. Warm-up complete when `AdaptiveReadinessPolicy` (10 consecutive valid bars, A) **and** the adaptive session is frozen (09:30 or the persisted late-start fallback, A) |
-| Trading | Entries allowed while `EngineTime < EntryCutoff` |
-| Entry cutoff | `EntryCutoff` (PLACEHOLDER, unapproved; legacy 15:00 / 14:00 on expiry day) – after it all entry decisions are `Rejected(EntryCutoff)`; pending entry orders are cancelled at the cutoff deadline |
-| Compulsory close | At `CloseStart` (PLACEHOLDER; legacy 15:15) a `TimerEvent` forces `Exit(reason=SessionClose)` for any position or pending entry; retried every `ExitRetryMs` until flat or `CloseDeadline` |
-| Session end | `SessionEnd` (≤ adaptive hard close 15:35, A). Anything not flat is `ExitFailed` → fault alert; **never** marked flat without a fill |
-The deadlines are `TimerEvent`s created at session start from config, so they fire in a quiet market (§4.4).
+| Warm-up / data collection | Events are processed from `WarmupStart` (features advance); entry decisions are `Rejected(Warmup)` until `AdaptiveReadinessPolicy` (10 consecutive valid bars, A) **and** the adaptive session is frozen (09:30 or the persisted late-start fallback, A) |
+| Trading | `09:30:00.000 <= DecisionTime < 15:00:00.000` Asia/Kolkata (inclusive/exclusive as stated) |
+| Entry close (15:00:00) | Waiting/triggered opportunities become `Expired(EntryClose)`; unfilled entry quantity cancelled; filled quantity stays a position; exits, stops, targets unaffected |
+| Liquidation start (15:05:00, PLACEHOLDER) | Forced `SessionLiquidation` exits with retry/escalation; target is every position flat by **15:10:00** |
+| Session end (adaptive hard close, 15:35 today) | Anything not flat is reported `UnresolvedAtClose` and is **never** marked closed without fills |
+All boundaries are `SessionBoundary` deadlines (§A.2) created at session start, so they fire in a quiet market and are not tied to completed bars. The expiry-day 14:00 cutoff is dropped.
 
 ### 6.4 Restart recovery
 Recovery is *replay-and-verify*, the pattern already proven for the adaptive observer (A: `AdaptiveStateRecoveryService`):
@@ -199,15 +355,19 @@ All tables: `bigint Id` surrogate PK; natural unique keys below carry idempotenc
 | Table | Unique key | Other indexes / notes |
 |---|---|---|
 | `trading_config_versions` | `ConfigHash` | canonical JSON, created-at |
+| `variants` | `(RunId, VariantId)` | variant spec JSON, `VariantConfigHash`, risk profile, sizing mode, entry-condition spec |
+| `virtual_accounts` | `(RunId, AccountId)` | one per variant by default; ledger totals; `AccountPolicy` ref |
+| `opportunities` | `(RunId, VariantId, OpportunityId)` | state, contract token (fixed), episode id, attempt count, expiry reason |
+| `session_ledger` | `(SessionDate, Purpose, ExperimentId)` | examination history for development/forward eligibility (§A.10) |
 | `trading_sessions` | `(TradeDate, RunMode, RunId)` | FK adaptive session id (logical, other DB), `ConfigHash`, `EngineVersion`, status, started/ended |
 | `engine_checkpoints` *(optional, later)* | `(SessionId, Seq)` | source cursor `(AvailableAt, TickId)`, state hash; never required for correctness |
 | `decision_audit` | `(SessionId, DecisionId, Stage)` | `(SessionId, DecisionTime)`, `(SessionId, Outcome)`; reason codes array; inputs JSONB |
 | `orders` | `(SessionId, OrderId)` | `(SessionId, State)`; DecisionId FK; side, qty, limit, expiry, contract token |
 | `order_events` (append-only) | `(OrderId, EventSeq)` | state transition, qty, price, `ExecutionTime`, quote ref (`SourceTickId`, age, bid, ask, sizes) |
 | `fills` | `(OrderId, FillSeq)` | qty, price, per-fill cost breakdown (brokerage, STT, exchange, GST, stamp, slippage), quote ref |
-| `positions` | `(SessionId, PositionId)` **plus partial unique index `(SessionId) WHERE State <> 'Flat'`** (one open position) | entry/exit decision ids, contract, qty, avg prices, realised/unrealised, state |
+| `positions` | `(RunId, PositionId)` **plus partial unique index `(RunId, AccountId, VariantId, SlotNo) WHERE State <> 'Flat'`** (V1: `SlotNo = 0`, so one non-flat position per variant; many variants may be open at once; **no database-wide single-position constraint**) | `VariantId`, entry/exit decision ids, contract, qty, avg prices, `Tp1State`/`Tp1TargetQty`, realised/unrealised, state |
 | `position_events` (append-only) | `(PositionId, EventSeq)` | transitions |
-| `risk_counters` | `(SessionId, Seq)` | trades-today, reserved exposure, realised net, unrealised liquidation value, daily-loss state; snapshot after each state-changing output |
+| `risk_counters` | `(RunId, VariantId, Seq)` | trades-today (recorded, not capped in ResearchV1), reserved exposure, realised net, unrealised liquidation value, daily-loss state; snapshot after each state-changing output |
 | `engine_faults` | `(SessionId, FaultSeq)` | kind, details |
 | `engine_inputs` (optional) | `(SessionId, Seq)` | journaled heartbeats / config-change attempts (raw ticks stay in `ticks`) |
 
@@ -228,14 +388,14 @@ Not required. If added: a checkpoint is a *cache* (state blob + `StateHash` + so
 6. **Spread / liquidity checks (pre-trade, on the quote at `ExecutionTime`)**: `Spread <= MaxSpread` (absolute ₹ and % of mid, both PLACEHOLDER), `AskQty >= requested qty` (or partial per §9.2), bid ≥ `MinBid`.
 7. **Partial fills**: fill quantity at each quote = `min(remaining, displayed level-1 qty × FillFractionOfDisplayed)`; the remainder rests until expiry; subsequent fills use later quotes. Quantities are lot multiples. (`FillFractionOfDisplayed` PLACEHOLDER; D-5.)
 8. **Order expiry** `OrderExpiryMs` (entry) and `ExitRetryMs` (exit) PLACEHOLDER; entry never outlives the entry cutoff.
-9. **Costs** from a versioned `CostSchedule`: brokerage per order (existing ₹20, V), STT, exchange transaction charge, SEBI, stamp duty, GST, and slippage in ticks. Existing Host path lacks all but brokerage+slippage (G6). The schedule values are **unresolved (D-7)**; the research calculator's STT 0.0625 % is *not* adopted until verified. Costs are computed per fill and stored per fill.
+9. **Costs** from a versioned, dated `CostSchedule` (§A.9, PROVISIONAL): brokerage per order, STT (0.15 % of sell-side premium for all 18 sessions), exchange transaction charge, SEBI fee, stamp duty (buy side), GST, plus slippage in ticks. Computed and stored per fill; reports show results with and without the provisional components. Never the stale 0.0625 % STT.
 10. Fill price per fill = quote price ± `SlippageTicks × tickSize` (existing mechanism, V; slippage default PLACEHOLDER).
 
 ### 9.2 Pending entries / partial positions / cancellation / rejected exits
 - Pending entry holds a risk reservation (§10.3) until `Filled/Cancelled/Expired/Rejected`; reservation is released by the **actual** unfilled remainder.
 - Partial entry at expiry: cancel remainder; position quantity = filled quantity; strategy exit rules apply to it.
 - A signal to exit while the entry is still `Working`: cancel the entry first; if any part filled, exit that part.
-- Exit rejected/expired: the position stays `ExitPending`→`ExitFailed`; the engine retries every `ExitRetryMs` with the then-executable bid, escalates alerts at N failures, keeps `Degraded`. **A position is never closed in the books without a fill** and P&L is never "assumed" at session end; an unfilled position at `SessionEnd` is reported as `UnliquidatedAtClose` with last executable bid/time and excluded from realised P&L but included in the daily summary as a risk event.
+- Exit rejected/expired: the position stays `ExitPending`→`ExitFailed`; the engine retries every `ExitRetryMs` with the then-executable bid, escalates alerts at N failures, keeps `Degraded`. **A position is never closed in the books without a fill** and P&L is never "assumed" at session end; an unfilled position at `SessionEnd` is reported as `UnresolvedAtClose` with last executable bid/time and excluded from realised P&L but included in the daily summary as a risk event.
 
 ### 9.3 Stale data, disconnect
 - `QuoteAge > MaxQuoteAgeMs` for the held token ⇒ no fills and no marks from it; position risk uses §10.4.
@@ -252,43 +412,45 @@ Not required. If added: a checkpoint is a *cache* (state blob + `StateHash` + so
 | Live paper vs. a *real broker* (future) | **Reconcile**, don't expect equality: latency, queue position, partial-fill behaviour, rejections, exchange charges, quote-snapshot vs. true book | per-order slippage-vs-model report; drift alarms |
 | Live paper vs. historical **when the live feed dropped/reordered ticks** | Reconcile: ticks lost on the live path (G8) or arrival-order differences change `AvailableAt` | compare persisted ticks used by the historical run vs. the live run's consumed ticks (tick-id sets + hash) |
 
-## 10. Risk controls
+## 10. Risk controls (revised by Amendment 1 — R5)
 
-### 10.1 Configuration (all in `TradingConfig.Risk`; **no approved values exist** — see §14)
-`LotsPerTrade`/sizing rule, `PaperCapital`, `MaxPremiumExposure`, `MaxLossPerTrade`, `MaxDailyLoss`, `MaxTradesPerDay = 5` (requested), `MaxOpenPositions = 1` (requested), `EntryCutoff`, `CompulsoryCloseStart`, `KillSwitch` source.
+The earlier 5-trade cap, ₹50k capital, ₹5,000 daily-loss, daily-loss force-exit and daily-loss kill-switch proposals are **withdrawn**. See §A.7 for the profile table; this section keeps the definitions that the profiles use.
 
-### 10.2 Hard rules (not configurable below these)
-- Maximum 5 *entry orders that reach a fill* per trading day; one position at a time (including pending, partial, exit-pending states). No minimum trade count is ever enforced.
-- A stronger signal never bypasses a risk gate. Gates are evaluated in a fixed order and **all** failing reasons are recorded.
+### 10.1 Configuration (`TradingConfig.Variants[*].Risk`; **no approved monetary values exist**)
+`RiskProfile` (`ResearchV1` | `RealOrder`), `DailySL` (₹, nullable), `DailySlEnforcement` (`None` default | `BlockEntries` | `BlockEntriesAndLiquidate`), `TradeSLPct` (exit rule, §A.6), `MaxTradesPerDay` (nullable; **null in ResearchV1**), `MaxPositionsPerVariant` (1 in V1), `AccountCapital` (nullable; null = not enforced), `MaxPremiumExposure` (nullable; not enforced unless set in an enforcing profile), `KillSwitchSource`. Session times and liquidation settings: §A.1.
 
-### 10.3 Reservation / duplicate prevention
-At entry intent creation the engine atomically reserves: `reservedTrades += 1`, `reservedPremium = qty × limitPrice + estimatedEntryCosts`. Reservation counts against `MaxTradesPerDay`, exposure and "one position". It is released (or reduced to the filled amount) on `Cancelled/Expired/Rejected` or partial fill remainder. A new entry decision while any of `{EntryPending, PartiallyOpen, Open, ExitPending, ExitFailed}` exists is rejected `Rejected(PositionActive)`. A decision whose `DecisionId` already exists is a no-op (duplicate). DB-level partial unique index (§8.1) is the last line of defence.
+### 10.2 Always-on rules (every profile)
+- Quantity/lot validation, no silent quantity alteration (§A.5).
+- Duplicate-order and duplicate-entry prevention: deterministic ids; one outstanding order per quantity; capacity counts reservations (§10.3).
+- Session restrictions: entries only in `[EntryOpen, EntryClose)`; waiting opportunities and unfilled entry quantity die at `EntryClose` (§A.1).
+- Data-integrity gates: stale/disconnected feed, late event, parity mismatch, persistence failure ⇒ `Degraded` (entries disabled; exits, stops, targets and liquidation continue; §6.5, §9.3).
+- No LTP/entry-price substitution anywhere (§A.2 item 5, §9.1).
+- A stronger signal never bypasses any enabled gate; all failing reasons are recorded in a fixed order.
 
-### 10.4 Daily-loss definition (recommendation, D-3)
-`DailyPnL = RealisedNet + UnrealisedLiquidationNet`
-- `RealisedNet` = Σ closed-fill proceeds − cost of closed quantity − **all costs** (brokerage, taxes, slippage already in fill prices).
-- `UnrealisedLiquidationNet` = open qty × (**current executable bid** − avg entry fill price) − **estimated exit costs** (using the cost schedule), i.e. what liquidation would net now, not mid/LTP.
-- If the open contract has no fresh executable bid (`Unmarkable`): conservatively mark at **zero bid value** (full premium lost) for limit evaluation, until a fresh bid arrives. This is a risk-side conservatism only; it is not written to realised P&L.
-- Breach (`DailyPnL <= −MaxDailyLoss`): entries disabled for the day **and** the open position is force-exited (not just "no new entries" as in the existing realised-only gate, G7). Evaluated on every quote event for the held token and at timers (between bars).
-- Per-trade loss control (`MaxLossPerTrade`) uses the same liquidation-value definition and triggers a force exit; it is a *safety control*, not a research stop-loss (research SL/TP stay out of discovery runs per project rule; the control's value is a documented safety parameter and its trigger is reported as exit reason `RiskPerTrade`).
-- Kill switch: engine-owned flag, set by (a) operator via Dashboard writes to a `kill_switch` row read at timers/heartbeats, (b) automatic trip on daily-loss breach or `Degraded`. Effect: entries off, exits and compulsory close remain on. (Existing DB row + dead config are not reused as-is.)
+### 10.3 Reservation / duplicate prevention (per variant)
+At entry-order creation the variant atomically reserves a position slot (`SlotNo 0`) and `reservedPremium = qty × limitPrice + estimatedEntryCosts` (recorded, not enforced unless a capital limit is configured). The reservation lives while the opportunity is `Triggered/OrderPending` or the position is in any non-flat state (`EntryPending, PartiallyOpen, Open, ExitPending, ExitFailed`), and is reduced to the filled amount on cancel/expiry/reject. A new entry decision for a variant whose slot is occupied is `Rejected(CapacityBusy)` (immediate conditions) or keeps waiting (waiting conditions), per §A.4. A decision whose `DecisionId` already exists is a no-op. The DB backstop is a partial unique index scoped to `(RunId, AccountId, VariantId, SlotNo) WHERE State <> 'Flat'` (§8.1) — **never** database-wide, so different variants (and, later, more slots) coexist.
+
+### 10.4 Daily P&L definition (recorded in ResearchV1; enforced only if a later profile enables it)
+`DailyPnL_v = RealisedNet_v + UnrealisedLiquidationNet_v`
+- `RealisedNet_v` = Σ closed-fill proceeds − cost of closed quantity − all costs (§A.9; slippage is already in fill prices).
+- `UnrealisedLiquidationNet_v` = open qty × (**current executable bid** − average entry fill price) − estimated exit costs (cost schedule), i.e. what liquidation would net now. Not mid, not LTP.
+- `Unmarkable` (no fresh executable bid): for the daily-SL record the value is marked conservatively at **zero bid value** and flagged `MarkedConservatively`; this never alters realised P&L or triggers anything in ResearchV1.
+- Daily SL is separate from per-trade SL (§A.6). Breach handling in ResearchV1 is record-only (§A.7).
 
 ### 10.5 Capital/exposure
-`CommittedPremium = Σ open (avg entry × remaining qty) + reservations ≤ MaxPremiumExposure ≤ PaperCapital`; partial exits reduce commitment (fixing the over-reservation noted in G7). Costs included in the check.
+Not enforced by default. `PeakCommittedPremium_v` and `PeakCommittedPremium_run` are recorded per day. If `AccountCapital` is configured **and** the profile enables enforcement, `CommittedPremium = Σ open (avg entry × remaining qty) + reservations (+ estimated costs) ≤ AccountCapital`, with partial exits reducing the commitment. Independent virtual accounts never share capital; shared-account constraints belong to the separate `AccountPolicy` (§A.3).
 
-### 10.6 Unresolved risk values and labelled **paper-only** proposals
-| Item | Status | Paper-only proposal (UNAPPROVED, derived only for plumbing tests) |
-|---|---|---|
-| Paper capital | unresolved | ₹50,000 *(legacy default, V in `CapitalConfigOptions` per audit)* |
-| Lot size | verified from instruments table | 65 (V: `instruments.LotSize` for NIFTY on all 18 `AsOfDate`s) |
-| Lots per trade | unresolved | 1 lot |
-| Max premium exposure | unresolved | ₹16,250 (= 2 lots × ₹125 × 65; sized for a ~₹125 premium and the legacy 130-unit size) – recompute with D-2 |
-| Max loss per trade | unresolved | — leave **disabled** (null) in discovery; enable only after a signal has edge |
-| Max daily loss | unresolved | ₹5,000 (10 % of paper capital; legacy was 20 %/₹10,000) |
-| Max trades/day | requested | 5 |
-| Entry cutoff / close start | unresolved | 15:00 (14:00 on weekly-expiry days) / 15:15, from legacy rules (placeholders) |
-| Latency, quote age, spread, fill fraction, expiries | unresolved | latency 1000 ms, quote age 2000 ms (< the 5 s adaptive freshness rule), spread ≤ 3 % of mid and ≤ ₹2, fill fraction 1.0 with level-1 cap, entry expiry 5 s, exit retry 1 s — all **PLACEHOLDER** pending Phase 3 calibration |
-| Costs | unresolved | brokerage ₹20/order (existing); STT/exchange/GST/stamp schedule must be supplied/verified (D-7) |
+### 10.6 Unresolved risk values (no proposals of monetary limits)
+| Item | Status |
+|---|---|
+| Account capital | unresolved — not enforced; **no default** |
+| Daily SL per variant | unresolved — null until Naveen supplies; recorded only |
+| Per-trade SL %, TP1 %, TP1 proportion, final TP %, remainder SL | research parameters per variant; none approved |
+| Max premium exposure, max trades/day (RealOrder profile) | unresolved |
+| Lot size / tick size | verified: 65 / ₹0.05 on all 18 sessions |
+| Default quantity | **650 units (10 lots)**, confirmed requested simulation default |
+| Latency, quote age, spread/size limits, expiries, collars, liquidation start, retry cadence | PLACEHOLDERs with a sensitivity grid (§A.10); proposed starting values only for plumbing tests: latency 1000 ms, quote age 2000 ms (below the 5 s adaptive freshness), spread ≤ 3 % of mid and ≤ ₹2, fill fraction 1.0 of displayed level-1 size, entry expiry 5 s, exit retry 1 s, `LiquidationStart` 15:05:00, `ExitCollarStepTicks` 1, `MaxExitCollarTicks` 10 |
+| Costs | schedule provisional (§A.9); brokerage plan unknown |
 
 ## 11. Research contract (Phase 4; fixed now so Phase 2/3 do not leak into it)
 
@@ -323,15 +485,16 @@ Notes: token counts ≈ double from 09-22, consistent with SENSEX/BANKNIFTY coll
 - 09-04 and **09-28, 09-29, 09-30, 10-01** were not adaptive discovery dates and the roadmap states "no sealed dates used" for the historical gate (A, doc), **but** all 18 sessions have been viewed by diagnostics: live-loop performance validation used 09-21, 09-23, 10-01; the tick-rate table and notification-volume replay used all 18 (`ADAPTIVE_LIVE_PERFORMANCE_2026-10-08.md`, `FUTURES_GRID_PLAN_2026-10-08.md`); volume-bar research used 09-08…09-21 for tuning and 09-18/09-21 as held-out days (`VOLUME_BAR_FINDINGS.md`). Neither those documents nor git history gives a complete per-experiment ledger of which dates were inspected for *strategy* questions.
 - **Consequence (contract):** no session is "untouched" for the purposes of rule discovery. The five non-discovery adaptive dates are only *less contaminated*, and shall be labelled "examined for diagnostics, not used for adaptive rule discovery" in every report. True out-of-sample evidence can only come from sessions recorded after the rule freeze (forward validation).
 
-### 11.3 Chronological splits (proposal; D-6)
-Discovery = 09-04…09-25 minus any exclusion for data quality (13 adaptive-discovery dates + 09-04 if usable); Validation = 09-28…10-01 (4 sessions: *within-sample for the project but not adaptive-discovery*; labelled as "validation-1, contaminated by diagnostics"); **Forward** = every session recorded after the rules are frozen (sessions 10-05+ on the VM; their availability to the researcher is U). Rules: no look-ahead; rolling/expanding normalisation only from prior sessions; splits are chronological only; one hypothesis per experiment; expiry days analysed as a stratum (4 of 18, DTE=0); hold-out consumption is permanent (`BACKTEST_RULES.md` rule 15).
+### 11.3 Labels and splits (revised by Amendment 1 / §A.10; D-6)
+All 18 sessions (2026-09-04 … 2026-10-01) are **`Development`** data. The earlier discovery/validation partition of these dates is withdrawn: they cannot provide out-of-sample evidence for any rule. Out-of-sample evidence comes only from sessions recorded after a rule freeze **and** shown by the `session_ledger` not to have been examined for, or to have influenced, rule selection; sessions after 10-01 are `Unknown` until that ledger is reconstructed. Within development data, any internal chronological split used for model development must be declared before the run and is a development split, not a validation claim. Other rules unchanged: no look-ahead; rolling/expanding normalisation only from prior sessions; one hypothesis per experiment; expiry days (09-08, 09-15, 09-22, 09-29) analysed as a stratum; consumed hold-out data is permanently consumed (`BACKTEST_RULES.md` rule 15).
 
 ### 11.4 Research constraints
-- Standalone signal families with explicit gates; **no composite score**; no forced daily trade count (the 5-trade cap is a ceiling). Every threshold dynamic/DTE-based or labelled as an approved structural constant.
-- Rolling ATM baskets are diagnostics only (§6.2).
+- Standalone signal families with explicit gates; **no composite score**; no forced daily trade count (ResearchV1 has no trade-count cap). Every threshold dynamic/DTE-based or labelled as an approved structural constant.
+- Rolling ATM baskets are diagnostics only (§6.2); an entry condition may never compare an option ask with a basket average (§A.4).
+- Concurrent variants are compared on separate virtual accounts; cross-variant sums are not achievable P&L (§A.3).
 - Every tested variant is registered *before* running (id, hypothesis, parameters, split, date) in an append-only `research_variants` ledger (Phase 4 table/CSV, with user approval for new datasets per CLAUDE.md) and reported including negatives, each result a single data point in an accumulating series.
 - Results are produced by the shared engine only (replay path), with costs and executable-quote fills; no point-P&L-only or mark-fill results count as evidence.
-- A rule that passes discovery+validation is only a candidate; it requires forward paper validation with replay reconciliation.
+- A rule that survives development-data analysis and the execution-sensitivity grid (§A.10) is only a candidate; it requires forward paper validation (ledger-eligible sessions) with replay reconciliation.
 
 ## 12. Acceptance tests (Phase 2 gate)
 
@@ -350,16 +513,43 @@ Use a **plumbing strategy** `PlumbingEveryNthBarStrategy` (enter on every k-th c
 | T9 | Rejection (spread/size/min-bid) | Order `Rejected`, reservation released, trade counter not consumed, audit row with exact inputs |
 | T10 | Exit rejection / no bid | Position `ExitFailed`, retries at `ExitRetryMs`, never flat without fill, alert fault |
 | T11 | Disconnect: events stop for the held token | Entries off; compulsory-close timer fires at deadline in a quiet market (no events) using heartbeat in live, `Flush` in replay; outputs equal |
-| T12 | Session close | Entry cutoff cancels pending entries; close-start forces exit; `SessionEnd` with unfilled position records `UnliquidatedAtClose`, never fabricates a fill |
+| T12 | Session close | Entry cutoff cancels pending entries; close-start forces exit; `SessionEnd` with unfilled position records `UnresolvedAtClose`, never fabricates a fill |
 | T13 | Crash/restart with **pending entry order** | Recovery replays to identical pending order; no second order; persisted order events verified; ids unchanged |
 | T14 | Crash/restart with **open position** (and with `ExitPending`) | State identical to uninterrupted run; exit still occurs once; no duplicate fills |
 | T15 | Restart at many arbitrary tick/bar boundaries (adaptive "restart-parity" style) | Final persisted tables equal the uninterrupted run field-for-field |
-| T16 | Risk: 5-trade cap, one position, duplicate-entry attempt, pending reservation counts, cutoff, daily-loss incl. unrealised liquidation and costs, per-trade loss, kill switch | Each gate rejects with correct reason; ordering of reasons deterministic |
+| T16 | Risk gates that remain in ResearchV1: capacity per variant incl. pending reservation, duplicate-entry attempt, entry-window boundaries, quantity validation, integrity gates (no 5-trade cap, no daily-loss lockout) | Each gate rejects with the correct ordered reasons; absent gates do not reject |
 | T17 | Determinism guard: banned APIs absent from Core; same run twice in-process and in separate processes → identical outputs; culture/timezone changed → identical | Pass |
 | T18 | Config: hash stable; mid-session change rejected; restart with different hash refuses to trade | Pass |
 | T19 | Contract fixation: exit for a different token rejected; selection uses only quotes ≤ DecisionTime (inject a better future quote → must not be chosen) | Pass |
 | T20 | DB: unique keys and partial unique "one open position" index reject duplicates; transaction atomicity (kill between rows) | Pass |
 | T21 | Regression oracle: engine adaptive feature outputs unchanged vs. current master on the existing frozen fixtures | Existing adaptive tests (1324 total pass at baseline) stay green |
+| T22 | Entry-open boundary: decisions at 09:29:59.999 and 09:30:00.000 IST (Asia/Kolkata → UTC conversion, on a fixture date from the data) | 09:29:59.999 rejected (`Warmup`/`EntryClosed`); 09:30:00.000 accepted when ready |
+| T23 | Entry-close boundary: 14:59:59.999 accepted; 15:00:00.000 rejected; waiting opportunity expired at 15:00; unfilled entry quantity cancelled, partially filled quantity kept; an order whose `ExecutionTime >= 15:00:00` does not fill | Exact outcomes; exits/stops still operate after 15:00 |
+| T24 | Liquidation: `LiquidationStart` forces exits; retry cadence and collar escalation; no executable bid ⇒ `NoExecutableBid` and retry (no substitution); `TargetFlatBy` overdue ⇒ fault; `SessionEnd` unresolved ⇒ `UnresolvedAtClose` | Never flat without fills; report lists unresolved positions explicitly |
+| T25 | Stops/targets independent of bars: no bar completes for a long period; SL, TP1 and final target trigger on quote events; session deadlines fire | Triggers occur on quotes/timers; identical to a run with bars |
+| T26 | **Timer gap:** quiet gap spanning several deadlines (entry close, liquidation start, retries) before the next market event; chained deadlines (maturity → expiry → retry) | Every deadline runs before the later event with `DecisionTime == deadline`; output identical with/without synthetic heartbeats and independent of the end-of-stream flush |
+| T27 | Concurrent variants A and A2 (and a third with different sizing) on one stream | Each variant has its own opportunities/orders/positions/ledger/config hash; removing or reordering the declaration of one variant does not change another's outputs |
+| T28 | Capacity: second entry in the same variant while an order is pending/position open; two different variants open at the same time; DB unique index scoped `(RunId, AccountId, VariantId, SlotNo)` | Same-variant duplicate rejected (logic and DB); cross-variant coexistence allowed; no database-wide constraint |
+| T29 | Independent virtual accounts vs shared-account policy interface | Independent default isolates P&L/exposure; pass-through shared policy changes nothing in Phase 2 |
+| T30 | Immediate (A) vs waiting (A2) entries from the same base-strategy validity | A orders at creation; A2 waits; `OnCapacityBlocked` Reject vs Wait behave as specified |
+| T31 | Condition input guard: attempt to feed a rolling-ATM-basket (or another token's) average to `AskBelowOptionCandleMA` | Rejected at configuration/assertion time; audit shows `inputToken == opportunity.Token` otherwise |
+| T32 | Waiting entry evaluation: only quotes of the selected token; MA recomputed when a candle completes; a candle is invisible to quotes ordered before its completion; `N` configurable (e.g. 3 and 10); insufficient candles ⇒ `NotEvaluable` | Exact trigger instants; no use of other tokens, LTP or future candles |
+| T33 | Invalidation: base strategy invalid ⇒ waiting opportunity cancelled and unfilled pending order cancelled; filled part remains under exit rules; feed `Degraded` ⇒ cancelled; stale selected-token quotes ⇒ suspended | As specified in §A.4 item 6 |
+| T34 | Quote-triggered entry (D-12): trigger ask X; at `ExecutionTime` ask > X (policy a: no fill, re-arm), ask ≤ X (fill at actual ask), policy b (recheck); better future quote injected after `ExecutionTime` | Never filled at the observed price retrospectively; future quote unused; miss rate counted |
+| T35 | Re-arm / re-entry: unfilled expiry ⇒ re-arm with `AttemptNo`; partial fill ⇒ opportunity consumed; after exit no re-entry until a new episode (`NewEpisodeRequired`); alternative policy gets a fresh contract selection | Exact opportunity ids/states |
+| T36 | Quantity validation: 650 with lot 65 valid on all 18 dates; 600 or 645 invalid ⇒ `Rejected(InvalidQuantity)` with numbers, never altered; pre-run validator report lists variant-days | No silent rounding |
+| T37 | Premium budget: valuation at order limit price + estimated entry costs; round down to whole lots; `MaxLots`; budget below one lot ⇒ `Rejected(InsufficientBudget)` | Exact lot counts; no round-up |
+| T38 | No hidden capital: `AccountCapital = null`, 650 units at ₹150 (₹97,500) not restricted; peak exposure recorded; with capital configured in an enforcing profile ⇒ rejected | Both behaviours |
+| T39 | TP1: average entry fill over multiple fills; `Tp1TargetQty = floorToLot(p × open)` stored once; rounds-to-zero ⇒ `Skipped`; remainder under `RemainderSL` (Unchanged / MoveToBreakeven / FixedPct) and final TP; priority `SessionLiquidation > TradeSL > FinalTP > TP1` | Exact quantities/prices; remainder is whole lots |
+| T40 | TP1 partial fill, expiry and re-trigger for the remaining TP1 quantity only; entry still working when TP1 triggers ⇒ remaining entry quantity cancelled | Total TP1 never exceeds target quantity |
+| T41 | **TP1 restart idempotency:** crash before/after TP1 trigger, mid-order, after a partial fill; replay | Same `OrderId`/`Tp1TargetQty`, no second TP1 order, no duplicate fill |
+| T42 | Non-enforcing daily SL: breach recorded (first time, worst, still-breached) while entries continue, nothing liquidated or cancelled, kill switch untouched; counterfactual summary produced | Behaviour identical to the same run with daily SL unset, except the record |
+| T43 | Per-trade SL independent of daily SL: trade SL fires with daily SL null; daily SL breach alone causes no exit | As specified |
+| T44 | No trade-count cap: more than 5 entries per day permitted in ResearchV1; `RealOrder` enforcement flags unit-tested but that profile cannot start | Pass |
+| T45 | Adapter by configuration: `Simulated` for replay and live paper yields identical outputs; `Broker` or a non-approved profile refuses start-up; `RealOrdersEnabled=false` | Pass |
+| T46 | Execution-time quote rules: a quote arriving after `ExecutionTime` is unused even if processed earlier in wall time; stale quote; one-sided/missing bid or ask; no LTP/entry-price/trigger-price substitution anywhere | No fill / `NoExecutableBid`; static scan finds no LTP read in execution/exit code |
+| T47 | Tie ordering: equal-time deadlines across classes and variants; a deadline equal to the event time runs first; result independent of variant declaration order and of run-to-run | Identical across 100 randomised declaration orders |
+| T48 | Cost schedule: effective-date selection by trade date; per-fill components stored; STT 0.15 % sell-side for all 18 dates; schedule version is in the config hash; with/without-taxes report | Exact rupee amounts for a hand-computed fixture |
 
 ## 13. Risks
 
@@ -373,35 +563,53 @@ Use a **plumbing strategy** `PlumbingEveryNthBarStrategy` (enter on every k-th c
 8. **Audit-pass claims** marked A may contain errors; Phase 2 starts by re-verifying the A-items it depends on.
 9. **Costs schedule** uncertainty can flip conclusions for low-premium weekly options (₹100–150 premium, brokerage ₹40 round trip + taxes ≈ material fraction of a 1-lot P&L).
 
-## 14. Decisions requiring Naveen's input (with recommendations)
+10. **Waiting-entry optimism:** a quote-triggered entry only counts if the order policy (D-12) fills; the miss rate between "condition observed" and "filled" can dominate A2 results and must be reported.
+11. **Candle-definition sensitivity (D-13):** A2 outcomes depend on candle clock, price field and N; each is a named variant, tested at several N, and logged in the variant ledger.
+12. **Independent-account overstatement:** concurrent variants all see the same displayed size; cross-variant sums are not achievable.
+13. **Unenforced daily SL** in ResearchV1 can produce large uncapped losses in research; it is recorded, and a real-order profile must be a separate approved configuration.
+14. **Provisional costs:** until the NSE primary documents are read, cost components are provisional; low-premium weekly options are cost-sensitive (§A.9 illustration).
+15. **Unresolved-at-close positions** can exist when no executable bid is available in the liquidation window; they are reported, not hidden, and distort daily P&L comparisons unless flagged.
 
-| ID | Decision | Recommendation |
+## 14. Decisions (revised by Amendment 1)
+
+Status: **Confirmed** = given by Naveen (2026-10-09 amendment); **Revised** = earlier recommendation changed; **Open** = still needs Naveen, with recommendation.
+
+| ID | Decision | Status | Resolution / recommendation |
+|---|---|---|---|
+| D-1 | Architecture: pure `Trading.Core` + adapters wrapping (not modifying) `AdaptiveObserverEngine`; legacy engines retired from live path | Open (not addressed in the amendment; reinforced by R2/R6) | Approve. The core hosts N variants over one stream; execution adapter selected by config; strategy/risk shared. |
+| D-2 | Capital, lots, exposure | **Revised** | Default requested quantity **650 units** (10 × 65) confirmed. Capital **not approved**: the ₹50k default and ₹16,250 exposure proposal are withdrawn; capital is nullable/unenforced. Still open: whether any capital limit applies to the later real-order profile. |
+| D-3 | Daily-loss definition and enforcement | **Revised** | Definition retained for *recording* (realised net + unrealised liquidation at executable bid, net of costs). Enforcement in ResearchV1 = **none** (no lockout, no liquidation); per-variant daily SL value is configurable and currently unset. |
+| D-4 | Contract-selection policy values | Open | Mechanism fixed (§6.1, §A.4: selected once per opportunity, fixed through exit). Values (premium window, spread/OI minima, delta preference) must be dynamic/DTE-derived or explicitly approved; recommend deriving in Phase 3, with a labelled placeholder policy for Phase 2 plumbing only. |
+| D-5 | Partial-entry policy | Open | Keep the filled part and cancel the remainder (default); all-or-none remains a named alternative for sensitivity. |
+| D-6 | Research split labels | **Revised** | All 18 sessions = `Development`; no discovery/validation split among them; forward eligibility via the `session_ledger` (§A.10). |
+| D-7 | Cost schedule | **Partially resolved** | Verification done and recorded (§A.9) but **provisional**: NSE primary PDFs could not be opened (timeouts). Open: (a) read `NSE/FA/73061` and `NSE/FATAX/73524` and the SEBI/stamp-duty notifications and confirm the table; (b) Naveen's actual brokerage plan. Recommendation: treat the table as a versioned, dated `CostSchedule`; run reports with and without taxes/fees. |
+| D-8 | Execution placeholders and sensitivity | Open | Approve the low/base/high sensitivity approach (§A.10); calibrate feed-delay components in Phase 3; broker latency cannot be measured from recorded quotes. |
+| D-9 | New database `niftysignal_trading` | Open — **not created** | Approve only when Phase 2 checkpoint CP6 starts; local dev DB only; no migration applied until then. |
+| D-10 | Cutoffs | **Confirmed / Revised** | Entry `[09:30:00, 15:00:00)`, target flat by 15:10:00 confirmed; expiry-day 14:00 cutoff dropped. Open only: `LiquidationStart` (proposal 15:05:00). |
+| D-11 | Kill switch | **Revised** | Manual operator flag + data-integrity faults only; **no** daily-loss auto-trip in ResearchV1. Dashboard wiring still deferred. |
+| D-12 | What a satisfied waiting condition creates (limit at observed ask vs recheck at execution) | **Open — flagged** | Recommend (a): marketable limit at the observed qualifying ask (tolerance 0 ticks), fills at actual ask if ≤ limit, otherwise expires and re-arms. Phase 2 implements both policies for sensitivity. |
+| D-13 | Option-candle definition for A2: candle clock, price field, MA type, warm-up behaviour | Open | Recommend candles on the adaptive-bar boundaries, `close = last fresh ask in the bar`, simple MA of N completed valid candles of the selected token only; insufficient candles ⇒ not evaluable. `N` per variant (no default). Mid-based/time-based candles as separate sensitivity conditions. |
+| D-14 | Liquidation/escalation placeholders (`LiquidationStart`, retry cadence, collar steps, overdue behaviour) | Open | Approve the §A.1 mechanism; values stay placeholders until calibrated. |
+| D-15 | Exit defaults: `RemainderSL` default, `TriggerBasis`, reference price | Open | `RemainderSL = Unchanged`, `TriggerBasis = Price`, reference = average entry fill price (price only). |
+| D-16 | Per-variant opportunity defaults | Open | `OnCapacityBlocked`: Reject (Immediate) / Wait (waiting); `MaxAttemptsPerOpportunity` unlimited; `ReentryPolicy = NewEpisodeRequired`; partial fill consumes the opportunity. |
+| D-17 | Session ledger for post-10-01 sessions | Open | Reconstruct which sessions were viewed/used (incl. 10-05…10-08 live watch-only) before any is called forward data; until then `Unknown`. Provide VM data export when ready. |
+
+## 15. Phase 2 bounded scope — implementation checkpoints
+
+Still: no edge claims, no `Host` registration, no deployment, no merge, no strategy sweeps, no real orders, no broker code beyond an interface and a throwing stub. **Prerequisite:** Naveen resolves D-1, D-12, D-13 (or accepts the recommendations) and approves D-9 before CP6. Each checkpoint ends with `dotnet build` (0 warnings in touched projects) and `dotnet test` green, and a short status note appended to this document; work stops at the checkpoint gate for review.
+
+| CP | Content | Gate (must pass before the next) |
 |---|---|---|
-| D-1 | Approve architecture: new `Trading.Core` pure library + adapters, wrapping (not modifying) `AdaptiveObserverEngine`; legacy engines retired from live path | Approve |
-| D-2 | Paper capital, lots per trade, max premium exposure | Start 1 lot, ₹50k capital as paper-only; confirm or supply real values |
-| D-3 | Daily-loss definition: realised + unrealised liquidation value (executable bid, after estimated exit costs) + costs; breach also force-exits | Approve (stricter than today) |
-| D-4 | Contract-selection policy values (premium window, delta preference, spread/OI minima): dynamic/DTE-based vs. approved fixed structural constants | Derive from data in Phase 3; use no premium band hard-coding; for Phase 2 plumbing use a clearly labelled placeholder |
-| D-5 | Partial-fill policy: keep filled part & cancel remainder (default) vs. all-or-none | Keep-and-cancel |
-| D-6 | Research split labels (§11.3) and whether post-10-01 VM sessions will be made available as forward data | Approve; provide 10-05+ session data access/export when ready |
-| D-7 | Cost schedule: supply or authorise verification of current STT/exchange/SEBI/stamp/GST rates and broker brokerage | Required before Phase 3; research STT figure in code not adopted |
-| D-8 | Latency/quote-age/spread/expiry placeholders (§10.6) – calibrate in Phase 3 from recorded data | Approve calibration plan |
-| D-9 | New database `niftysignal_trading` (schema §8) – CLAUDE.md requires approval for new datasets/tables | Approve creation (local dev DB only in Phase 2; no VM migration) |
-| D-10 | Entry cutoff / compulsory close times and weekly-expiry-day treatment | Keep 15:00/14:00 and 15:15 as placeholders until research says otherwise |
-| D-11 | Kill switch: engine-owned with Dashboard write, auto-trip on daily-loss/Degraded | Approve; Dashboard change deferred until an edge exists (project rule) |
+| **CP0 — Re-verify & scaffold** | Re-verify the audit-pass (A) items the plan depends on; create empty `Trading.Core` / `Trading.Signals` / tests projects with the banned-API determinism test (no `DateTime*.Now/UtcNow`, `Stopwatch`, `TimeProvider.System`, `Task.Delay`, `Random`, `Guid.NewGuid`) | build/test green; banned-API test green; no change to existing projects |
+| **CP1 — Time, events, timers** | Event types, `Sequencer`, `DeadlineQueue` with class-rank tie order, `AdvanceTo`, replay loop that runs every deadline `<= T` before an event, deterministic ids/hash, `TradingConfig` + hash, session phases incl. `EntryOpen/EntryClose/LiquidationStart/TargetFlatBy/SessionEnd` (Asia/Kolkata → UTC at the boundary) | T17, T18, T22, T23 (timer parts), T26, T47 |
+| **CP2 — Variants, accounts, opportunities** | Variant/account model, per-variant isolation, capacity + reservations + `SlotNo`, base-strategy validity vs `EntryCondition` (Immediate, `AskBelowOptionCandleMA`), candle builder for selected token, opportunity lifecycle, re-arm/re-entry, plumbing strategy, contract fixation | T19, T27–T35 |
+| **CP3 — Execution, costs, sizing, exits** | `SimulatedExecutionModel` (latency, execution-time quote, freshness/spread/size, partials, expiry, cancel, `EntryOrderPolicy` a/b), `CostSchedule` with effective dates + per-fill components, sizing modes + lot validator + pre-run report, SL/TP1/remainder/final/session-liquidation with idempotent TP1, liquidation escalation and `UnresolvedAtClose` | T3, T6–T10, T12, T24, T25, T36–T41, T46, T48 |
+| **CP4 — Risk profiles & audit** | `ResearchV1` profile (non-enforcing daily SL, no max trades), always-on rules, `RealOrder` profile as unit-tested-but-unstartable config, kill switch (manual/integrity), `DecisionAudit` with bounded per-quote summaries | T16, T42–T45 |
+| **CP5 — Adapters & equivalence** | `AdaptiveEventTranslator`, Historical adapter, LivePaper adapter library with fake poll source and journaled heartbeats, adapter selection by config, run-diff tool | T1, T2, T4, T5, T11, T21 |
+| **CP6 — Persistence & recovery** *(needs D-9 approval)* | `Trading.Data` EF model, scoped unique indexes, atomic per-step writes, replay-and-verify, crash/restart cases; migrations applied to a local dev database only | T13–T15, T20 |
+| **CP7 — Close-out** | Full T1–T48 run, `ARCHITECTURE.md` module-map update, contract status notes, findings as `PENDING/DEFERRED (audit finding FNN)` comments, final report | all tests green; no warnings in new projects; adaptive tests unchanged |
 
-## 15. Phase 2 bounded checklist (implementation, still no edge claims, no Host registration, no deploy)
-
-1. Re-verify the A-items this plan depends on (list in PR description).
-2. Create `NiftySignal.Trading.Core` (+ tests): events, `Sequencer`, `DeadlineQueue`, `ITradingClock`, `TradingEngine.Handle`, ids (deterministic hashes), `TradingConfig` + hash.
-3. `SimulatedExecutionModel` + `CostModel` + order/position state machines + `RiskEngine` + `ContractSelector` (mechanism only; plumbing selection policy labelled placeholder) + `DecisionAudit`.
-4. `NiftySignal.Trading.Signals` with `PlumbingEveryNthBarStrategy` only.
-5. `AdaptiveEventTranslator` and the Historical adapter; LivePaper adapter library (class library, **not** hosted) with a fake poll source for tests.
-6. `NiftySignal.Trading.Data` EF model + migration for `niftysignal_trading` (local DB; approval D-9), replay-and-verify persistence, partial unique index.
-7. Acceptance tests T1–T21; a fixture builder from the recorded `niftysignal_vm_copy` ticks (read-only extraction of a bounded slice into test resources or a read-only DB test; no new dataset beyond approved fixtures).
-8. Differ tool (`TradingRunDiff`) comparing two runs table-by-table (used by T1/T15).
-9. `dotnet build` 0 warnings (also fix the 3 baseline warnings only if touching those files; otherwise record) and `dotnet test` green; adaptive tests unchanged.
-10. Docs: update `ARCHITECTURE.md` module map; contract changes recorded here; `PENDING/DEFERRED (audit finding FNN)` comments for any newly found defect.
-Out of Phase 2: broker adapter, Host registration/deploy, Dashboard changes, strategy sweeps, calibration of placeholders, any signal-family evaluation.
+Out of Phase 2: broker adapter, Host registration/deploy, Dashboard changes, calibration of placeholders, per-contract coverage study, signal-family evaluation, any research run, shared-account policy beyond the pass-through interface.
 
 ## 16. Checks run (baseline, worktree `D:\Projects\NSE-phase1`, Windows, .NET SDK 10.0.401)
 
@@ -413,3 +621,15 @@ Out of Phase 2: broker adapter, Host registration/deploy, Dashboard changes, str
 | `dotnet test NiftySignal.Tests -c Release --no-build -nologo` | **Passed 1324 / Failed 0 / Skipped 0**, 6 s |
 | Read-only SQL (psql 18, `default_transaction_read_only=on`) on local `niftysignal_vm_copy`: `pg_database`, `information_schema.columns/pg_indexes` for `ticks`, per-date `ticks` aggregates, `instruments` per `AsOfDate` | results in §1.2, §11.1 (per-date aggregate query took ≈5 min) |
 | Not run (by instruction): relational/Chromium/CI gates, VM checks, any replay/sweep | — |
+
+### 16.1 Amendment 1 verification log (2026-10-09; documents only)
+
+| Action | Result |
+|---|---|
+| Read-only SQL: `instruments` for NIFTY options across all `AsOfDate`s (`count(distinct AsOfDate)`, `min/max LotSize`, `TickSize`) | 18 snapshots; `LotSize = 65` and `TickSize = 0.05` for every NIFTY option instrument on every date |
+| Web search: NSE equity-derivatives transaction charges (circular `NSE/FA/73061`, 27 Feb 2026, effective 2026-03-01; earlier Oct-2024 circular) | Total ≈ ₹3,553/crore options premium each side (provisional; the per-crore split was garbled in the extract) |
+| Web search: STT (Finance Act 2026, NSE STT page, circular `NSE/FATAX/73524`) | Option sale 0.15 % from 2026-04-01 (0.10 % before) |
+| Web search: SEBI turnover fee, GST base, stamp duty | ₹10/crore; GST 18 % on brokerage + exchange + SEBI fee; stamp 0.003 % buy side since 2020-07-01 (secondary sources + NSE-page extracts) |
+| `WebFetch` of `FA73061.pdf` (twice), `FATAX73524.pdf`, NSE STT page, NSE levies page | **All timed out (60 s); primary documents not read** |
+| Build/test | Not re-run (documents only; no code changed). Baseline results in §16 stand |
+| Database / migrations / deploy / merge | None performed |
