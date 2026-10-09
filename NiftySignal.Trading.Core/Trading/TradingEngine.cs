@@ -8,6 +8,7 @@ using NiftySignal.Trading.Core.Reporting;
 using NiftySignal.Trading.Core.Risk;
 using NiftySignal.Trading.Core.Scheduling;
 using NiftySignal.Trading.Core.Session;
+using NiftySignal.Trading.Core.State;
 using NiftySignal.Trading.Core.Variants;
 
 namespace NiftySignal.Trading.Core.Trading;
@@ -142,6 +143,22 @@ public sealed class TradingEngine : IEngineHandler
     public IReadOnlyList<EngineOutput> Outputs => _outputs;
 
     public void Start(IEngineScheduler scheduler) => Variants.Start(scheduler);
+
+    /// <summary>
+    /// Writes the whole trading engine's behaviour-relevant state (variants, execution, integrity, admission and the routing cursor) in a fixed
+    /// order. The configuration, run labels and the retention setting are not state (they are part of the run's identity and header).
+    /// </summary>
+    public void WriteState(StateWriter w)
+    {
+        using var scope = w.Scope("engine");
+        w.Line("tradeDate", TradeDate.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture));
+        w.Line("routed", _routed);
+        w.Line("outputs", _outputs.Count);
+        Variants.WriteState(w);
+        Execution.WriteState(w);
+        Integrity.WriteState(w);
+        Admission.WriteState(w);
+    }
 
     /// <summary>Per-variant daily summaries as of <paramref name="asOf"/> (see <see cref="DailySummaryBuilder"/>).</summary>
     public IReadOnlyList<VariantDailySummary> DailySummaries(DateTimeOffset asOf) => DailySummaryBuilder.Build(this, asOf);

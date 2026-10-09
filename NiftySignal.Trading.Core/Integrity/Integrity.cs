@@ -1,5 +1,6 @@
 using NiftySignal.Trading.Core.Events;
 using NiftySignal.Trading.Core.Scheduling;
+using NiftySignal.Trading.Core.State;
 using NiftySignal.Trading.Core.Variants;
 
 namespace NiftySignal.Trading.Core.Integrity;
@@ -105,6 +106,20 @@ public sealed class IntegrityManager : IEntryGate
     public IReadOnlyCollection<string> KilledVariants => _killedVariants;
 
     public bool IsKilled(string variantId) => KillAll || _killedVariants.Contains(variantId);
+
+    /// <summary>Integrity state, kill switch and the recovery-evidence progress.</summary>
+    public void WriteState(StateWriter w)
+    {
+        using var scope = w.Scope("integrity");
+        w.Line("state", State);
+        w.Line("fault", FaultReason);
+        w.Line("killAll", KillAll);
+        w.Line("killedVariants", string.Join(",", _killedVariants.Order(StringComparer.Ordinal)));
+        w.Line("recoveryRequestedAt", _recoveryRequestedAt);
+        w.Line("futureQuoteSeen", _futureQuoteSeen);
+        w.Line("readyBarSeen", _readyBarSeen);
+        w.Line("evidenceBarSeq", _evidenceBarSeq);
+    }
 
     public string? BlockReason(string variantId, DateTimeOffset now)
     {
@@ -258,6 +273,13 @@ public sealed class EventAdmission
     }
 
     public int QuarantinedCount { get; private set; }
+
+    public void WriteState(StateWriter w)
+    {
+        using var scope = w.Scope("admission");
+        w.Line("quarantined", QuarantinedCount);
+        w.Line("lastBarSeq", _lastBarSeq);
+    }
 
     /// <summary>Returns the events of <paramref name="group"/> that may be given to <c>loop.ProcessGroup</c>.</summary>
     public IReadOnlyList<EngineEvent> Admit(EngineLoop loop, IReadOnlyList<EngineEvent> group)

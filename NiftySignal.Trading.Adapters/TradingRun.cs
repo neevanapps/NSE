@@ -3,6 +3,7 @@ using NiftySignal.Trading.Core.Events;
 using NiftySignal.Trading.Core.Execution;
 using NiftySignal.Trading.Core.Reporting;
 using NiftySignal.Trading.Core.Scheduling;
+using NiftySignal.Trading.Core.State;
 using NiftySignal.Trading.Core.Trading;
 using NiftySignal.Trading.Core.Variants;
 
@@ -30,6 +31,24 @@ public sealed record TransportDiagnostics(
     long MaxBatchRows,
     long GroupsAfterHorizon,
     long ControlEventsDelivered);
+
+public enum UnitKind
+{
+    DataGroup = 0,
+    ControlOnly = 1,
+    Advance = 2,
+    Finish = 3,
+}
+
+/// <summary>One completed unit of work, reported to <see cref="TradingRun.UnitObserver"/>.</summary>
+/// <param name="Kind">What was done.</param>
+/// <param name="EngineNow">Engine time at the end of the unit.</param>
+/// <param name="GroupOrdinal">Translator group ordinal for a data group.</param>
+/// <param name="GroupAt">Availability instant of the data group.</param>
+/// <param name="MaxSourceId">Highest source id among the group's quotes.</param>
+/// <param name="OutputCount">Total engine outputs so far.</param>
+/// <param name="Controls">Control / feed-health events delivered in this unit.</param>
+public sealed record UnitInfo(UnitKind Kind, DateTimeOffset EngineNow, long? GroupOrdinal, DateTimeOffset? GroupAt, long? MaxSourceId, int OutputCount, IReadOnlyList<EngineEvent> Controls);
 
 /// <summary>Per-variant activity of a run (engineering coverage evidence, not performance).</summary>
 public sealed record VariantReport(
@@ -208,6 +227,7 @@ public sealed class TradingRun
         Loop.Finish(_horizon);
         RecordOutputs();
         RecordFinalChannels();
+        NotifyUnit(UnitKind.Finish, null, Array.Empty<EngineEvent>());
         _finished = true;
         return BuildResult();
     }
@@ -272,6 +292,67 @@ public sealed class TradingRun
                 Recorders[RunRecorders.Names.Candles].Add($"b{bar.Event.BarSeq}", $"{Canonical.Time(group.AvailableAt)}|b{bar.Event.BarSeq}|" + Canonical.Json(candles.ToArray()));
             }
         }
+
+        NotifyUnit(
+            group is null ? UnitKind.ControlOnly : UnitKind.DataGroup,
+            group,
+            events.Where(e => e.Kind is EventKind.Control or EventKind.FeedHealth).ToList());
+    }
+
+    // ------------------------------------------------------------------ units (the durable layer's commit boundaries)
+
+    /// <summary>
+    /// Called after every complete unit of work: a delivered availability group, a control-only delivery, an effective clock advance and the final
+    /// finish. At that moment all recorders, the engine and the translator are consistent, so it is the only place where a cursor, a digest or a state
+    /// capture is meaningful (contract section A.18.4).
+    /// </summary>
+    public Action<UnitInfo>? UnitObserver { get; set; }
+
+    private void NotifyUnit(UnitKind kind, TranslatedGroup? group, IReadOnlyList<EngineEvent> controls)
+        => UnitObserver?.Invoke(new UnitInfo(
+            kind,
+            Loop.Now,
+            group?.Ordinal,
+            group?.AvailableAt,
+            group is null || group.Quotes.Count == 0 ? null : group.Quotes.Max(q => q.Event.SourceId),
+            Engine.Outputs.Count,
+            controls));
+
+    /// <summary>True when advancing the engine clock to <paramref name="watermark"/> would fire at least one deadline (an "effective" advance that must be journaled).</summary>
+    public bool AdvanceWouldFire(DateTimeOffset watermark)
+    {
+        var next = Loop.PendingDeadlines.FirstOrDefault();
+        return next is not null && next.Time < (watermark < _horizon ? watermark : _horizon);
+    }
+
+    /// <summary>
+    /// Advances the engine clock to the watermark (capped at the horizon) and fires the deadlines strictly before it, but ONLY when at least one
+    /// deadline fires: an advance that fires nothing changes no output and is deliberately not applied, so replay (which cannot know about it) and
+    /// the live run keep exactly the same state. Every group before the watermark must already have been released. Returns whether it was applied.
+    /// </summary>
+    public bool AdvanceClock(DateTimeOffset watermark)
+    {
+        EnsureOpen();
+        if (!AdvanceWouldFire(watermark))
+        {
+            return false;
+        }
+
+        Loop.AdvanceTo(watermark < _horizon ? watermark : _horizon);
+        _heartbeats++;
+        RecordOutputs();
+        NotifyUnit(UnitKind.Advance, null, Array.Empty<EngineEvent>());
+        return true;
+    }
+
+    /// <summary>The canonical behaviour-relevant state of the whole run (loop, engine, translator). See <see cref="StateWriter"/> for what is included and excluded.</summary>
+    public StateWriter CaptureState()
+    {
+        var writer = new StateWriter();
+        Loop.WriteState(writer);
+        Engine.WriteState(writer);
+        Translator.WriteState(writer);
+        return writer;
     }
 
     // ------------------------------------------------------------------ recording
@@ -338,6 +419,18 @@ public sealed class TradingRun
                 opportunities.Add($"{o.VariantId}:{o.Id}", $"{Canonical.Time(Loop.Now)}|{line}");
             }
         }
+    }
+
+    /// <summary>The lines of the two channels that are only complete at the end (audit trail and daily summaries), in channel order. Used by the recorders and by the durable final record.</summary>
+    public (IReadOnlyList<string> Audit, IReadOnlyList<string> Summaries) FinalChannelLines()
+    {
+        var audit = Engine.AuditTrailEntries()
+            .Select(a =>
+                // RunId and RunMode are labels of the run, not behaviour: they are the one documented exclusion in the audit comparison.
+                $"{Canonical.Time(a.At)}|{a.AccountId}|{a.VariantId}|{a.OpportunityId}|{a.OrderId}|{a.PositionId}|{a.ConfigHash}|{a.VariantHash}|{a.Category}|{a.Reason}|{a.Event}|{a.Detail}")
+            .ToList();
+        var summaries = Engine.DailySummaries(_horizon).Select(s => Canonical.Json(s with { RunId = string.Empty })).ToList();
+        return (audit, summaries);
     }
 
     private void RecordFinalChannels()

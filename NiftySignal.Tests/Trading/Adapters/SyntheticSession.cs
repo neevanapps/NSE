@@ -46,6 +46,11 @@ internal static class SyntheticSession
 
         /// <summary>Intervals in which nothing at all is emitted (a data gap).</summary>
         public IReadOnlyList<(DateTimeOffset From, DateTimeOffset To)> Gaps { get; init; } = Array.Empty<(DateTimeOffset, DateTimeOffset)>();
+
+        /// <summary>Displayed option bid / ask quantity range per row. Equal bounds (the default, 2,000) draw nothing from the generator, so existing sessions are unchanged; a wider range makes partial entries and multi-fill exits possible.</summary>
+        public int OptionQtyMin { get; init; } = 2_000;
+
+        public int OptionQtyMax { get; init; } = 2_000;
     }
 
     public static IReadOnlyList<SourceTick> Rows(Options? options = null)
@@ -92,7 +97,9 @@ internal static class SyntheticSession
                     }
                     else
                     {
-                        rows.Add(Stamp(rng, o, ref id, instrument.Token, t, (decimal)mid, bid, ask, 2_000, 2_000, 1_000 + id, 5_000 + (id % 50)));
+                        var bidQty = o.OptionQtyMin == o.OptionQtyMax ? o.OptionQtyMin : rng.Next(o.OptionQtyMin, o.OptionQtyMax + 1);
+                        var askQty = o.OptionQtyMin == o.OptionQtyMax ? o.OptionQtyMin : rng.Next(o.OptionQtyMin, o.OptionQtyMax + 1);
+                        rows.Add(Stamp(rng, o, ref id, instrument.Token, t, (decimal)mid, bid, ask, bidQty, askQty, 1_000 + id, 5_000 + (id % 50)));
                     }
 
                     last[instrument.Token] = rows[^1];

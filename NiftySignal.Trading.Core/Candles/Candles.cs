@@ -1,3 +1,4 @@
+using NiftySignal.Trading.Core.State;
 using NiftySignal.Trading.Core.Events;
 
 namespace NiftySignal.Trading.Core.Candles;
@@ -218,6 +219,29 @@ public sealed class CandleStore
     }
 
     public CandleConfig Config { get; }
+
+    /// <summary>Open accumulators (only while they hold observations) and the retained published candles, in token / bar order.</summary>
+    public void WriteState(StateWriter w)
+    {
+        using var scope = w.Scope("candles");
+        w.Line("latestBarSeq", LatestBarSeq);
+        w.Line("firstPublishedBarSeq", FirstPublishedBarSeq);
+        foreach (var token in _open.Keys.Order(StringComparer.Ordinal))
+        {
+            var a = _open[token];
+            w.Line($"open[{token}]", a.Count == 0 ? "empty" : $"{a.Count}|{StateWriter.Dec(a.LastBid)}|{StateWriter.Dec(a.LastAsk)}|{a.LastAt.UtcTicks}|{StateWriter.Dec(a.MidHigh)}|{StateWriter.Dec(a.MidLow)}");
+        }
+
+        foreach (var token in _history.Keys.Order(StringComparer.Ordinal))
+        {
+            foreach (var (seq, c) in _history[token])
+            {
+                w.Line(
+                    $"history[{token}][{seq}]",
+                    $"{c.PublishedAt.UtcTicks}|{c.IsValid}|{c.InvalidReason}|{c.Observations}|{c.LastBid.Dec()}|{c.LastAsk.Dec()}|{c.LastQuoteAt?.UtcTicks.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "~"}|{c.MidHigh.Dec()}|{c.MidLow.Dec()}");
+            }
+        }
+    }
 
     public long? LatestBarSeq { get; private set; }
 

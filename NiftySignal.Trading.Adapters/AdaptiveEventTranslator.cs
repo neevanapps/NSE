@@ -1,6 +1,7 @@
 using NiftySignal.AdaptiveObserver;
 using NiftySignal.Domain.Enums;
 using NiftySignal.Trading.Core.Events;
+using NiftySignal.Trading.Core.State;
 
 namespace NiftySignal.Trading.Adapters;
 
@@ -49,6 +50,8 @@ public sealed class AdaptiveEventTranslator
     private readonly List<RowQuarantine> _quarantines = new();
     private readonly Dictionary<string, long> _quarantineCounts = new(StringComparer.Ordinal);
     private readonly string _readinessSpec;
+    private readonly Dictionary<string, string> _lastReleasedRow = new(StringComparer.Ordinal);
+    private long _highestReleasedId = long.MinValue;
     private long _highestId = long.MinValue;
     private DateTimeOffset _highWater = DateTimeOffset.MinValue;
     private DateTimeOffset _lastReleasedGroup = DateTimeOffset.MinValue;
@@ -311,7 +314,53 @@ public sealed class AdaptiveEventTranslator
         }
 
         _bars += bars.Count;
+        foreach (var r in rows)
+        {
+            _lastReleasedRow[r.Token] = r.Source.Fingerprint();
+            _highestReleasedId = Math.Max(_highestReleasedId, r.Source.Id);
+        }
+
         return new TranslatedGroup(at, _groupOrdinal++, quotes, bars);
+    }
+
+    /// <summary>
+    /// Writes the translator's behaviour-relevant state AS OF THE RELEASED GROUPS: the last released row per token (the released-order mirror of the
+    /// normaliser's "previous payload"), the highest released id, the last released group, the group ordinal, the residual readings kept for adjacent
+    /// deltas, every completed bar and the partial bar. Rows that were offered but not yet released (the buffer), the stable-boundary high water, the
+    /// remembered-id window and all counters depend on how the input was paged or polled, not on behaviour, and are excluded on purpose.
+    /// <para>
+    /// Limit: the adaptive engine's own accumulators (option flow books, band histories, microstructure trackers) are private to the parity-frozen
+    /// observer and are not read here; they are covered through the completed bars, the readings above and, above all, by the continuation
+    /// comparison after a resume (hidden-state divergence must surface in later bar metrics).
+    /// </para>
+    /// </summary>
+    public void WriteState(StateWriter w)
+    {
+        using var scope = w.Scope("translator");
+        w.Line("finished", _finished);
+        w.Line("lastReleasedGroup", _lastReleasedGroup == DateTimeOffset.MinValue ? null : _lastReleasedGroup.UtcTicks.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        w.Line("groupOrdinal", _groupOrdinal);
+        w.Line("highestReleasedId", _highestReleasedId == long.MinValue ? null : _highestReleasedId.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        foreach (var token in _lastReleasedRow.Keys.Order(StringComparer.Ordinal))
+        {
+            w.Line($"lastRow[{token}]", _lastReleasedRow[token]);
+        }
+
+        foreach (var name in _previousResidual.Keys.Order(StringComparer.Ordinal))
+        {
+            var p = _previousResidual[name];
+            w.Line($"previousResidual[{name}]", string.Create(System.Globalization.CultureInfo.InvariantCulture, $"{p.BarSeq}|{p.IsAvailable}|{p.CeResidual:R}|{p.PeResidual:R}|{p.CeResidualPct:R}|{p.PeResidualPct:R}|{p.DirectionalResidualPct:R}"));
+        }
+
+        foreach (var b in _engine.FutureBars)
+        {
+            w.Line(
+                $"bar[{b.BarSeq}]",
+                string.Create(System.Globalization.CultureInfo.InvariantCulture, $"{b.IsComplete}|{b.StartAvailableAtUtc.UtcTicks}|{b.EndAvailableAtUtc.UtcTicks}|{b.Open:R}|{b.High:R}|{b.Low:R}|{b.Close:R}|{b.Volume}|{b.TradeUpdates}|{b.FirstSourceTickId}|{b.LastSourceTickId}|{b.StrictBuyVolume}|{b.StrictSellVolume}|{b.StrictUnknownVolume}|{b.EnrichedBuyVolume}|{b.EnrichedSellVolume}|{b.EnrichedUnknownVolume}"));
+        }
+
+        var partial = _engine.PartialBar;
+        w.Line("partialBar", $"{partial.AccumulatedVolume}|{partial.TargetVolume}|{partial.StartedAtUtc?.UtcTicks.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "~"}");
     }
 
     private static TranslatedQuote ToQuote(DateTimeOffset at, EventKind kind, Buffered r)

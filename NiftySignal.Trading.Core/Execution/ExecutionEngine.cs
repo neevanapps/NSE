@@ -7,6 +7,7 @@ using NiftySignal.Trading.Core.Integrity;
 using NiftySignal.Trading.Core.Quotes;
 using NiftySignal.Trading.Core.Scheduling;
 using NiftySignal.Trading.Core.Session;
+using NiftySignal.Trading.Core.State;
 using NiftySignal.Trading.Core.Variants;
 
 namespace NiftySignal.Trading.Core.Execution;
@@ -142,6 +143,102 @@ public sealed class ExecutionEngine
     public string BookLabel(string variantId) => "independent-virtual-book:" + variantId;
 
     public void AppendQuote(QuoteEvent quote) => _history.Append(quote);
+
+    /// <summary>
+    /// Writes the simulated exchange's mutable state: per variant book (cash, counters, consumed displayed liquidity, every position with its TP1
+    /// progress, reservations and exit orders including the per-order charge state), every entry order with its deadline handles, the ended flag
+    /// and the retained quote history.
+    /// </summary>
+    public void WriteState(StateWriter w)
+    {
+        using var scope = w.Scope("execution");
+        w.Line("ended", _ended);
+        foreach (var book in _books)
+        {
+            using var bs = w.Scope("book/" + book.VariantId);
+            w.Line("cash", book.Cash);
+            w.Line("breached", book.Breached);
+            w.Line("worstDailyPnl", book.WorstDailyPnl);
+            w.Line("peakExposure", book.PeakExposure);
+            w.Line("fills", book.Fills);
+            w.Line("belowBandFills", book.BelowBandFills);
+            w.Line("lateFills", book.LateFills);
+            w.Line("fillSeq", book.FillSeq);
+            foreach (var ((token, side), l) in book.Liquidity.OrderBy(x => x.Key.Token, StringComparer.Ordinal).ThenBy(x => (int)x.Key.Side))
+            {
+                w.Line($"liquidity[{token}][{side}]", $"{StateWriter.Dec(l.Price)}|{l.Displayed}|{l.Consumed}");
+            }
+
+            foreach (var p in book.Positions)
+            {
+                using var ps = w.Scope("position/" + p.Id);
+                w.Line("opportunity", p.OpportunityId);
+                w.Line("entryDecision", p.EntryDecisionId);
+                w.Line("contract", $"{p.Contract.Token}|{p.Contract.Side}|{StateWriter.Dec(p.Contract.Strike)}|{p.Contract.Expiry:yyyy-MM-dd}|{p.Contract.LotSize}|{StateWriter.Dec(p.Contract.TickSize)}");
+                w.Line("slot", p.SlotNo);
+                w.Line("openedAt", p.OpenedAt);
+                w.Line("closedAt", p.ClosedAt);
+                w.Line("state", p.State);
+                w.Line("entryQuantity", p.EntryQuantity);
+                w.Line("entryCostBasis", p.EntryCostBasis);
+                w.Line("openQuantity", p.OpenQuantity);
+                w.Line("reservedExitQuantity", p.ReservedExitQuantity);
+                w.Line("exitedQuantity", p.ExitedQuantity);
+                w.Line("exitProceeds", p.ExitProceeds);
+                w.Line("entryCosts", p.EntryCosts);
+                w.Line("exitCosts", p.ExitCosts);
+                w.Line("tp1", p.Tp1);
+                w.Line("tp1Target", p.Tp1TargetQuantity);
+                w.Line("tp1Filled", p.Tp1FilledQuantity);
+                w.Line("exitSeq", p.ExitSeq);
+                w.Line("bidObservations", p.BidObservations);
+                w.Line("maxBid", p.MaxBid);
+                w.Line("minBid", p.MinBid);
+                w.Line("firstBidAt", p.FirstBidObservationAt);
+                w.Line("lastBidAt", p.LastBidObservationAt);
+                w.Line("bidGaps", p.BidObservationGaps);
+                w.Line("firstExitFillAt", p.FirstExitFillAt);
+                w.Line("maxBidAtFirstExit", p.MaxBidAtFirstExit);
+                w.Line("minBidAtFirstExit", p.MinBidAtFirstExit);
+                foreach (var x in p.ExitOrders)
+                {
+                    using var xs = w.Scope("exit/" + x.Id);
+                    w.Line("reason", x.Reason);
+                    w.Line("requested", x.RequestedQuantity);
+                    w.Line("filled", x.FilledQuantity);
+                    w.Line("threshold", x.TriggerThreshold);
+                    w.Line("createdAt", x.CreatedAt);
+                    w.Line("attempts", x.Attempts);
+                    w.Line("status", x.Status);
+                    w.Line("charged", $"{x.Charged.Fills}|{StateWriter.Dec(x.Charged.Turnover)}|{StateWriter.Dec(x.Charged.BrokerageCharged)}");
+                    w.Line("lastNote", x.LastNote);
+                    w.Line("attemptHandle", x.AttemptHandle?.Id);
+                    foreach (var (key, n) in x.NoteCounts.OrderBy(k => k.Key, StringComparer.Ordinal))
+                    {
+                        w.Line($"note[{key}]", $"{n.Count}|{n.First.UtcTicks}|{n.Last.UtcTicks}");
+                    }
+                }
+            }
+        }
+
+        foreach (var o in _entryOrders)
+        {
+            using var os = w.Scope("entry/" + o.Id);
+            var i = o.Intent;
+            w.Line("intent", $"{i.DecisionId}|{i.OpportunityId}|{i.Attempt}|{i.SlotNo}|{i.Contract.Token}|{i.RequestedQuantity}|{i.Lots}|{i.LotSize}|{StateWriter.Dec(i.LimitPrice)}|{StateWriter.Dec(i.QualifyingAsk)}|{StateWriter.Dec(i.MinimumEntryPremium)}|{StateWriter.Dec(i.MaximumEntryPremium)}|{i.QuoteAvailableAt.UtcTicks}|{i.QuoteSourceId}|{i.ConditionKind}");
+            w.Line("maturityAt", o.MaturityAt);
+            w.Line("expiresAt", o.ExpiresAt);
+            w.Line("status", o.Status);
+            w.Line("lastNote", o.LastNote);
+            w.Line("handles", string.Join(",", o.Handles.Select(h => h.Id.ToString(System.Globalization.CultureInfo.InvariantCulture))));
+            foreach (var (key, n) in o.NoteCounts.OrderBy(k => k.Key, StringComparer.Ordinal))
+            {
+                w.Line($"note[{key}]", $"{n.Count}|{n.First.UtcTicks}|{n.Last.UtcTicks}");
+            }
+        }
+
+        _history.WriteState(w);
+    }
 
     // ------------------------------------------------------------------ entry orders
 

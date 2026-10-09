@@ -11,6 +11,7 @@ using NiftySignal.Trading.Core.Scheduling;
 using NiftySignal.Trading.Core.Selection;
 using NiftySignal.Trading.Core.Sizing;
 using NiftySignal.Trading.Core.Session;
+using NiftySignal.Trading.Core.State;
 
 namespace NiftySignal.Trading.Core.Variants;
 
@@ -119,6 +120,66 @@ public sealed class VariantEngine : IEngineHandler
 
     /// <summary>Registers the session-boundary deadlines on the scheduler. Call once, before the first event.</summary>
     public void Start(IEngineScheduler scheduler) => Schedule.ScheduleBoundaries(scheduler);
+
+    /// <summary>
+    /// Writes every variant's episode, capacity and opportunity state, the latest quotes and the candle store. The opportunity's contract-selection
+    /// evaluation list is audit-only (nothing reads it after selection) and is excluded. A strategy that owns state contributes it through
+    /// <see cref="IStateContributor"/>; a stateless one adds nothing.
+    /// </summary>
+    public void WriteState(StateWriter w)
+    {
+        using var scope = w.Scope("variants");
+        w.Line("entryClosed", _entryClosed);
+        foreach (var v in _variants)
+        {
+            using var vs = w.Scope(v.VariantId);
+            w.Line("ordinal", v.Ordinal);
+            w.Line("valid", v.Valid);
+            w.Line("episodeSide", v.EpisodeSide);
+            w.Line("episodeId", v.EpisodeId);
+            w.Line("episodeStartBarSeq", v.EpisodeStartBarSeq);
+            w.Line("episodeSpent", v.EpisodeSpent);
+            w.Line("episodeBlockNoted", v.EpisodeBlockNoted);
+            w.Line("active", v.Active?.Id);
+            foreach (var slot in v.Slots)
+            {
+                w.Line($"slot[{slot.SlotNo}]", $"{slot.State}|{slot.OwnerOpportunityId ?? "~"}");
+            }
+
+            if (v.Strategy is IStateContributor contributor)
+            {
+                using var ss = w.Scope("strategy");
+                contributor.WriteState(w);
+            }
+        }
+
+        foreach (var o in _allOpportunities)
+        {
+            using var os = w.Scope("opportunity/" + o.Id);
+            w.Line("variant", o.VariantId);
+            w.Line("episode", o.EpisodeId);
+            w.Line("episodeStart", o.EpisodeStartBarSeq);
+            w.Line("side", o.Side);
+            w.Line("createdAt", o.CreatedAt);
+            w.Line("state", o.State);
+            w.Line("contract", o.Contract is null ? null : $"{o.Contract.Token}|{o.Contract.Side}|{StateWriter.Dec(o.Contract.Strike)}|{o.Contract.Expiry:yyyy-MM-dd}|{o.Contract.LotSize}|{StateWriter.Dec(o.Contract.TickSize)}");
+            w.Line("attempts", o.Attempts);
+            w.Line("activeIntent", o.ActiveIntentId);
+            w.Line("cancelRequested", o.CancelRequested);
+            w.Line("cancelReason", o.CancelReason);
+            w.Line("terminalReason", o.TerminalReason);
+            w.Line("selectionAttempts", o.SelectionAttempts);
+            w.Line("evaluations", o.Evaluations);
+            w.Line("lastEvaluationKey", o.LastEvaluationKey);
+            foreach (var (key, n) in o.NoteCounts.OrderBy(x => x.Key, StringComparer.Ordinal))
+            {
+                w.Line($"note[{key}]", $"{n.Count}|{n.First.UtcTicks}|{n.Last.UtcTicks}");
+            }
+        }
+
+        _quotes.WriteState(w);
+        _candles.WriteState(w);
+    }
 
     public void OnEvent(EngineEvent engineEvent, IEngineScheduler scheduler)
     {

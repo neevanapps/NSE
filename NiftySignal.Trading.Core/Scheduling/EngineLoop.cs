@@ -1,3 +1,4 @@
+using NiftySignal.Trading.Core.State;
 using NiftySignal.Trading.Core.Events;
 using NiftySignal.Trading.Core.Time;
 
@@ -121,6 +122,28 @@ public sealed class EngineLoop : IEngineScheduler
     public EngineLoopStats Stats => new(_eventsDelivered, _duplicatesIgnored, _groupsProcessed, _deadlinesFired, _queue.Count, _clock.Now, _finished);
 
     public IReadOnlyList<ScheduledDeadline> PendingDeadlines => _queue.Snapshot();
+
+    /// <summary>
+    /// Writes the loop's behaviour-relevant state: engine time, the last group time, the creation-sequence counter and every pending deadline with its
+    /// full ordering key. The duplicate-detection memory is excluded (it depends on the retention setting, not on behaviour).
+    /// </summary>
+    public void WriteState(StateWriter w)
+    {
+        using var scope = w.Scope("loop");
+        w.Line("now", _clock.Now);
+        w.Line("lastGroup", _lastGroupTime);
+        w.Line("nextCreationSeq", _nextCreationSeq);
+        w.Line("eventsDelivered", _eventsDelivered);
+        w.Line("duplicatesIgnored", _duplicatesIgnored);
+        w.Line("groups", _groupsProcessed);
+        w.Line("deadlinesFired", _deadlinesFired);
+        w.Line("finished", _finished);
+        var i = 0;
+        foreach (var d in _queue.Snapshot())
+        {
+            w.Line($"deadline[{i++}]", $"{d.Time.UtcTicks}|{(int)d.Class}|{d.VariantOrdinal}|{d.Key}|{d.CreationSeq}");
+        }
+    }
 
     public DeadlineHandle Schedule(DateTimeOffset time, DeadlineClass deadlineClass, int variantOrdinal, string key)
     {

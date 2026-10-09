@@ -1,3 +1,4 @@
+using NiftySignal.Trading.Core.State;
 using NiftySignal.Trading.Core.Events;
 
 namespace NiftySignal.Trading.Core.Quotes;
@@ -31,6 +32,17 @@ public sealed class QuoteBook
     }
 
     public QuoteSnapshot? Get(string token) => _latest.TryGetValue(token, out var q) ? q : null;
+
+    /// <summary>The latest quote per token (token order).</summary>
+    public void WriteState(StateWriter w)
+    {
+        using var scope = w.Scope("quoteBook");
+        foreach (var token in _latest.Keys.Order(StringComparer.Ordinal))
+        {
+            var q = _latest[token];
+            w.Line(token, $"{q.Bid.Dec()}|{q.Ask.Dec()}|{q.AvailableAt.UtcTicks}|{q.SourceId}|{q.BidQty?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "~"}|{q.AskQty?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "~"}");
+        }
+    }
 }
 
 /// <summary>
@@ -109,4 +121,18 @@ public sealed class QuoteHistory
     }
 
     public int Count(string token) => _byToken.TryGetValue(token, out var list) ? list.Count : 0;
+
+    /// <summary>The retained quotes of every token. Retention is part of a run's identity, so a resumed run retains the identical window.</summary>
+    public void WriteState(StateWriter w)
+    {
+        using var scope = w.Scope("quoteHistory");
+        foreach (var token in _byToken.Keys.Order(StringComparer.Ordinal))
+        {
+            var i = 0;
+            foreach (var q in _byToken[token])
+            {
+                w.Line($"{token}[{i++}]", $"{q.Bid.Dec()}|{q.Ask.Dec()}|{q.AvailableAt.UtcTicks}|{q.SourceId}|{q.BidQty?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "~"}|{q.AskQty?.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "~"}");
+            }
+        }
+    }
 }

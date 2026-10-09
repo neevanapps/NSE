@@ -7,7 +7,8 @@
 // Environment (connection strings are never printed):
 //   NSE_RECORDED_SOURCE   read-only tick database (the NiftySignal tick database copy)
 //   NSE_RUN_DAY           trade date, yyyy-MM-dd (required)
-//   NSE_RUN_MODE          both (default) | hist | live
+//   NSE_RUN_MODE          both (default) | hist | live | durable   (durable = historical vs the CP6.1 DurableRun over an IN-MEMORY store; no database is written)
+//   NSE_DURABLE_KILL_AFTER_ROWS   durable mode only: simulate abrupt death of a first incarnation after this many rows, then recover (default 0 = no death)
 //   NSE_OUT               output directory (default artifacts/trading-run-diff)
 //   NSE_PAGE_SIZE         rows per database page (default 20000)
 //   NSE_POLL_SCRIPT       mixed (default) | coarse | tiny | delayed | overlap
@@ -26,6 +27,7 @@ using NiftySignal.Trading.Core.Config;
 using NiftySignal.Trading.Core.Entry;
 using NiftySignal.Trading.Core.Exits;
 using NiftySignal.Trading.Core.Variants;
+using NiftySignal.Trading.Recovery;
 using NiftySignal.Trading.Signals;
 
 static string Env(string name, string fallback = "") => Environment.GetEnvironmentVariable(name) is { Length: > 0 } v ? v : fallback;
@@ -327,10 +329,96 @@ RunResult Live(RecorderOptions rec)
     return r;
 }
 
+// CP6.1: the durable run over an in-memory run store (contract section A.18). Nothing is written to any database.
+InMemoryRunStore? lastStore = null;
+var durableStats = new List<string>();
+RunResult DurableScenario(RecorderOptions rec)
+{
+    var killAfter = long.Parse(Env("NSE_DURABLE_KILL_AFTER_ROWS", "0"), CultureInfo.InvariantCulture);
+    var horizon = NewRun(new RecorderOptions(), "probe").Horizon;
+    var manifest = $"recorded-session day={day:yyyy-MM-dd}; tokens {tokens.Length} sha256 {Sha(string.Join(",", tokens.Order(StringComparer.Ordinal)))}; window [{open.AddMinutes(-1):O}, {sessionEnd:O}]";
+    var spec = new DurableRunSpec(
+        freeze,
+        translatorOptions,
+        config,
+        Strategies(),
+        new RunSettings { RunMode = "Historical", RunId = "cp61-" + day.ToString("yyyyMMdd", CultureInfo.InvariantCulture), Horizon = horizon },
+        manifest,
+        rec,
+        null,
+        new DurableOptions());
+    var store = new InMemoryRunStore();
+    lastStore = store;
+    durableStats.Clear();
+    if (killAfter > 0)
+    {
+        var sw0 = Stopwatch.StartNew();
+        var first = DurableRun.Open(store, "incarnation-1", spec);
+        long fed = 0;
+        foreach (var row in Stream(sessionEnd))
+        {
+            first.Offer(row);
+            if (++fed >= killAfter)
+            {
+                break;
+            }
+        }
+
+        store.SimulateProcessDeath("incarnation-1");
+        var durable = store.Load(spec.Settings.RunId);
+        durableStats.Add($"incarnation 1 died abruptly after {fed} rows: {durable.Steps.Count} steps, {durable.Outputs.Count} outputs durable ({sw0.Elapsed.TotalSeconds:F1} s)");
+    }
+
+    var sw = Stopwatch.StartNew();
+    using var run = DurableRun.Open(store, "incarnation-2", spec);
+    foreach (var row in Stream(sessionEnd))
+    {
+        run.Offer(row);
+    }
+
+    var result = run.Finish();
+    durableStats.Add($"final incarnation: durable steps at open {run.DurableStepsAtOpen}, steps replayed and verified {run.StepsReplayed}, state checkpoints verified {run.CheckpointsVerified}, steps committed {run.CommitsMade}, {sw.Elapsed.TotalSeconds:F1} s");
+    return result;
+}
+
+void PrintDurableMeasurement()
+{
+    if (lastStore is null)
+    {
+        return;
+    }
+
+    var s = lastStore.Load("cp61-" + day.ToString("yyyyMMdd", CultureInfo.InvariantCulture));
+    string J(object o) => System.Text.Json.JsonSerializer.Serialize(o);
+    long steps = s.Steps.Sum(x => (long)Encoding.UTF8.GetByteCount(J(x)));
+    long outputs = s.Outputs.Sum(x => (long)x.Payload.Length);
+    long projections = s.Projections.Sum(x => (long)x.Payload.Length);
+    Say("Durable-run measurement (in-memory store; serialised JSON sizes of this implementation; a measurement, not a budget):");
+    foreach (var line in durableStats)
+    {
+        Say("  " + line);
+    }
+
+    Say($"  steps {s.Steps.Count} (units {s.Steps.Sum(x => (long)x.Units)}), outputs {s.Outputs.Count}, controls {s.Controls.Count}, checkpoints {s.Checkpoints.Count}, projections {s.Projections.Count}, commits {lastStore.CommitCount}");
+    Say($"  bytes: steps {steps}, outputs {outputs}, projections {projections}, checkpoint digests {s.Checkpoints.Sum(x => (long)x.StateDigest.Length)}, final record {J(s.Final!).Length}, header {J(s.Header!).Length}; total {steps + outputs + projections + s.Checkpoints.Sum(x => (long)x.StateDigest.Length) + J(s.Final!).Length + J(s.Header!).Length}");
+    Say($"  steps by kind: {string.Join(", ", s.Steps.GroupBy(x => x.Kind).Select(g => g.Key + "=" + g.Count()))}; ledger completed: {s.Completed}");
+}
+
 var exit = 0;
 var rec0 = new RecorderOptions { CheckpointEvery = 5_000 };
 Say();
-if (mode == "hist" || mode == "live")
+if (mode == "durable")
+{
+    var diff = RunDiff.Compare(Historical, DurableScenario, new DiffOptions { CheckpointEvery = 5_000 });
+    Say(RunDiff.Render(diff));
+    Say();
+    PrintRun("historical (A)", diff.A);
+    PrintRun("durable (B)", diff.B);
+    Say();
+    PrintDurableMeasurement();
+    exit = diff.Equivalent ? 0 : 1;
+}
+else if (mode == "hist" || mode == "live")
 {
     var r = mode == "hist" ? Historical(rec0) : Live(rec0);
     PrintRun(mode, r);
