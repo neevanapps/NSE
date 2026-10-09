@@ -57,7 +57,7 @@ public abstract record EngineEvent
 /// <summary>A top-of-book quote update. Missing sides are null; the engine never fills them from LTP.</summary>
 public sealed record QuoteEvent : EngineEvent
 {
-    public QuoteEvent(DateTimeOffset availableAt, EventKind kind, long sourceTickId, string token, decimal? bid, decimal? ask, decimal? last = null)
+    public QuoteEvent(DateTimeOffset availableAt, EventKind kind, long sourceTickId, string token, decimal? bid, decimal? ask, decimal? last = null, long? bidQty = null, long? askQty = null)
         : base(availableAt, kind, sourceTickId, token)
     {
         if (kind is EventKind.BarCompleted)
@@ -68,6 +68,8 @@ public sealed record QuoteEvent : EngineEvent
         Bid = bid;
         Ask = ask;
         Last = last;
+        BidQty = bidQty;
+        AskQty = askQty;
     }
 
     public decimal? Bid { get; }
@@ -75,6 +77,12 @@ public sealed record QuoteEvent : EngineEvent
     public decimal? Ask { get; }
 
     public decimal? Last { get; }
+
+    /// <summary>Displayed level-1 bid quantity in units, when the source provides it (null = unknown; never inferred).</summary>
+    public long? BidQty { get; }
+
+    /// <summary>Displayed level-1 ask quantity in units, when the source provides it (null = unknown; never inferred).</summary>
+    public long? AskQty { get; }
 }
 
 /// <summary>

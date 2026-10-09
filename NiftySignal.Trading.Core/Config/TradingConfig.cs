@@ -1,4 +1,6 @@
 using NiftySignal.Trading.Core.Candles;
+using NiftySignal.Trading.Core.Costs;
+using NiftySignal.Trading.Core.Execution;
 using NiftySignal.Trading.Core.Selection;
 using NiftySignal.Trading.Core.Session;
 using NiftySignal.Trading.Core.Variants;
@@ -13,7 +15,7 @@ namespace NiftySignal.Trading.Core.Config;
 /// </summary>
 public sealed record TradingConfig
 {
-    public const int CurrentSchemaVersion = 2;
+    public const int CurrentSchemaVersion = 3;
 
     public int SchemaVersion { get; init; } = CurrentSchemaVersion;
 
@@ -26,6 +28,12 @@ public sealed record TradingConfig
     public ContractSelectionConfig Selection { get; init; } = new();
 
     public CandleConfig Candles { get; init; } = new();
+
+    /// <summary>Simulated execution assumptions (placeholders pending calibration). Real-order mode is unavailable.</summary>
+    public ExecutionConfig Execution { get; init; } = new();
+
+    /// <summary>Effective-dated cost schedules. Empty = not configured (the trading engine then refuses to run).</summary>
+    public CostsConfig Costs { get; init; } = new();
 
     public IReadOnlyDictionary<string, VariantSpec> Variants { get; init; } = new Dictionary<string, VariantSpec>();
 
@@ -45,6 +53,8 @@ public sealed record TradingConfig
         errors.AddRange(Session.Validate());
         errors.AddRange(Selection.Validate());
         errors.AddRange(Candles.Validate());
+        errors.AddRange(Execution.Validate());
+        errors.AddRange(Costs.Validate());
         foreach (var (key, spec) in Variants)
         {
             if (!string.Equals(key, spec.VariantId, StringComparison.Ordinal))
@@ -73,6 +83,6 @@ public sealed record TradingConfig
             throw new KeyNotFoundException($"Unknown variant '{variantId}'.");
         }
 
-        return CanonicalJson.Hash(new { SchemaVersion, Variant = spec, Selection, Candles, Session });
+        return CanonicalJson.Hash(new { SchemaVersion, Variant = spec, Selection, Candles, Session, Execution, Costs });
     }
 }

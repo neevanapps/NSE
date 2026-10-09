@@ -62,6 +62,8 @@ public sealed record EntryIntent(
     int SlotNo,
     OptionContract Contract,
     int RequestedQuantity,
+    int Lots,
+    int LotSize,
     decimal LimitPrice,
     decimal QualifyingAsk,
     decimal MinimumEntryPremium,

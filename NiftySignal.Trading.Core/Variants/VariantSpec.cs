@@ -1,6 +1,8 @@
 using NiftySignal.Trading.Core.Entry;
+using NiftySignal.Trading.Core.Exits;
 using NiftySignal.Trading.Core.Events;
 using NiftySignal.Trading.Core.Instruments;
+using NiftySignal.Trading.Core.Sizing;
 
 namespace NiftySignal.Trading.Core.Variants;
 
@@ -32,8 +34,14 @@ public sealed record VariantSpec
 
     public required EntryConditionSpec EntryCondition { get; init; }
 
-    /// <summary>Requested simulation quantity in units, carried on the entry intent. Default 650 (confirmed); lot validation and sizing execution are CP3.</summary>
-    public int RequestedQuantity { get; init; } = 650;
+    /// <summary>Entry quantity rule. Default: fixed 650 units (confirmed requested simulation quantity), validated per contract against the lot size of the trade date; never silently rounded.</summary>
+    public SizingSpec Sizing { get; init; } = new FixedQuantitySpec();
+
+    /// <summary>Per-trade SL, TP1, final target (each optional / disabled by default).</summary>
+    public ExitSpec Exit { get; init; } = new();
+
+    /// <summary>Daily SL in rupees (positive = loss limit). ResearchV1 RECORDS a breach only: no entry lockout, no forced exit, no trade cap. Null = not tracked.</summary>
+    public decimal? DailySl { get; init; }
 
     /// <summary>Null = condition-dependent default: Reject for Immediate, Wait for waiting conditions.</summary>
     public CapacityBlockedPolicy? OnCapacityBlocked { get; init; }
@@ -64,9 +72,29 @@ public sealed record VariantSpec
             errors.Add($"Variant '{VariantId}': StrategyId is required.");
         }
 
-        if (RequestedQuantity <= 0)
+        switch (Sizing)
         {
-            errors.Add($"Variant '{VariantId}': RequestedQuantity must be positive.");
+            case FixedQuantitySpec { Units: <= 0 }:
+                errors.Add($"Variant '{VariantId}': fixed quantity must be positive.");
+                break;
+            case PremiumBudgetSpec { Rupees: <= 0m }:
+                errors.Add($"Variant '{VariantId}': premium budget must be positive.");
+                break;
+            case PremiumBudgetSpec { MaxLots: < 1 }:
+                errors.Add($"Variant '{VariantId}': MaxLots must be at least 1 when set.");
+                break;
+            case FixedQuantitySpec:
+            case PremiumBudgetSpec:
+                break;
+            default:
+                errors.Add($"Variant '{VariantId}': unknown sizing spec.");
+                break;
+        }
+
+        errors.AddRange(Exit.Validate(VariantId));
+        if (DailySl is <= 0m)
+        {
+            errors.Add($"Variant '{VariantId}': DailySl must be positive when set.");
         }
 
         if (MaxAttemptsPerOpportunity is <= 0)

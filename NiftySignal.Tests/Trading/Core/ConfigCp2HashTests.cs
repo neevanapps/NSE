@@ -2,6 +2,7 @@ using NiftySignal.Trading.Core.Candles;
 using NiftySignal.Trading.Core.Config;
 using NiftySignal.Trading.Core.Entry;
 using NiftySignal.Trading.Core.Selection;
+using NiftySignal.Trading.Core.Sizing;
 using NiftySignal.Trading.Core.Variants;
 
 namespace NiftySignal.Tests.Trading.Core;
@@ -9,10 +10,10 @@ namespace NiftySignal.Tests.Trading.Core;
 public class ConfigCp2HashTests
 {
     // Independently computed (Python hashlib over the hand-written canonical text), then pinned. See contract section A.12.
-    private const string GoldenVariantsJson = """{"Candles":{"Clock":"AdaptiveFuturesBars","HistoryDepth":64,"MaxCloseAge":null,"MinObservationsPerCandle":1},"ConfigVersion":"cp2-test","SchemaVersion":2,"Selection":{"ExpiryPolicy":"NearestExpiryOnOrAfterTradeDate","MaxQuoteAge":"00:00:02","MaximumEntryPremium":150,"MinCalendarDaysToExpiry":0,"MinimumEntryPremium":100,"Ranking":["AskNearestBandMidpoint","SmallestSpread"]},"Session":{"EntryClose":"15:00:00.0000000","EntryOpen":"09:30:00.0000000","FinalClose":"15:10:00.0000000","LiquidationStart":null,"SessionEnd":"15:35:00.0000000","TimeZoneId":"Asia/Kolkata"},"Variants":{"A":{"AccountId":null,"EntryCondition":{"Kind":"Immediate"},"MaxAttemptsPerOpportunity":null,"OnCapacityBlocked":null,"Reentry":"NewEpisodeRequired","RequestedQuantity":650,"StrategyId":"S","VariantId":"A"},"A2":{"AccountId":null,"EntryCondition":{"Kind":"AskBelowCandleMA","N":10,"PriceSource":"AskClose"},"MaxAttemptsPerOpportunity":null,"OnCapacityBlocked":null,"Reentry":"NewEpisodeRequired","RequestedQuantity":650,"StrategyId":"S","VariantId":"A2"}}}""";
+    private const string GoldenVariantsJson = """{"Candles":{"Clock":"AdaptiveFuturesBars","HistoryDepth":64,"MaxCloseAge":null,"MinObservationsPerCandle":1},"ConfigVersion":"cp2-test","Costs":{"Schedules":[]},"Execution":{"Adapter":"Simulated","BelowBand":"ResearchEnforceBand","Books":"IndependentVirtualBooks","CancelLatency":"00:00:01","EntryOrderLifetime":"00:00:05","ExitRetryInterval":"00:00:01","FillFractionOfDisplayed":1,"Latency":"00:00:01","MaxQuoteAge":"00:00:02","MaxSpreadAbsolute":2,"MaxSpreadFraction":0.03,"PartialEntry":"KeepFilledCancelRemainder","RequireDisplayedQuantity":true},"SchemaVersion":3,"Selection":{"ExpiryPolicy":"NearestExpiryOnOrAfterTradeDate","MaxQuoteAge":"00:00:02","MaximumEntryPremium":150,"MinCalendarDaysToExpiry":0,"MinimumEntryPremium":100,"Ranking":["AskNearestBandMidpoint","SmallestSpread"]},"Session":{"EntryClose":"15:00:00.0000000","EntryOpen":"09:30:00.0000000","FinalClose":"15:10:00.0000000","LiquidationStart":null,"SessionEnd":"15:35:00.0000000","TimeZoneId":"Asia/Kolkata"},"Variants":{"A":{"AccountId":null,"DailySl":null,"EntryCondition":{"Kind":"Immediate"},"Exit":{"FinalTpPct":null,"RemainderSl":"Unchanged","Tp1Pct":null,"Tp1Proportion":null,"TradeSlPct":null},"MaxAttemptsPerOpportunity":null,"OnCapacityBlocked":null,"Reentry":"NewEpisodeRequired","Sizing":{"Kind":"FixedQuantity","Units":650},"StrategyId":"S","VariantId":"A"},"A2":{"AccountId":null,"DailySl":null,"EntryCondition":{"Kind":"AskBelowCandleMA","N":10,"PriceSource":"AskClose"},"Exit":{"FinalTpPct":null,"RemainderSl":"Unchanged","Tp1Pct":null,"Tp1Proportion":null,"TradeSlPct":null},"MaxAttemptsPerOpportunity":null,"OnCapacityBlocked":null,"Reentry":"NewEpisodeRequired","Sizing":{"Kind":"FixedQuantity","Units":650},"StrategyId":"S","VariantId":"A2"}}}""";
 
-    private const string GoldenVariantsHash = "63cad4b98652cbe9e7501047933c210dcd7bfb51c60c9b57c1317209cf7ab118";
-    private const string GoldenA2VariantHash = "a2016e0b27564c74f7e4dbe425fdfe6009674c2463f4cf2f6b40ac28d8b3f484";
+    private const string GoldenVariantsHash = "71679ccbb211d4dd42bfeaa6cc59db1ed1211e2005882364e3212a25e0118a08";
+    private const string GoldenA2VariantHash = "955b7ca5639ca677d9b86a966f18e39f3c9b1f97d6118102e67d21fee022b149";
 
     private static VariantSpec A() => new() { VariantId = "A", StrategyId = "S", EntryCondition = new ImmediateEntrySpec() };
 
@@ -63,7 +64,7 @@ public class ConfigCp2HashTests
         Assert.NotEqual(baseline.ComputeHash(), (baseline with { Candles = new CandleConfig { MinObservationsPerCandle = 2 } }).ComputeHash());
         Assert.NotEqual(
             baseline.ComputeHash(),
-            WithVariants(A2() with { RequestedQuantity = 130 }).ComputeHash());
+            WithVariants(A2() with { Sizing = new FixedQuantitySpec { Units = 130 } }).ComputeHash());
         Assert.NotEqual(
             WithVariants(A()).ComputeVariantHash("A"),
             WithVariants(A() with { EntryCondition = new AskBelowCandleMaSpec { N = 1, PriceSource = CandlePriceSource.AskClose } }).ComputeVariantHash("A"));
@@ -82,7 +83,7 @@ public class ConfigCp2HashTests
         Assert.NotEmpty(WithVariants(A2(n: 0)).Validate());
         Assert.NotEmpty(WithVariants(A2(n: 65)).Validate());                          // beyond HistoryDepth 64
         Assert.NotEmpty((WithVariants(A()) with { Variants = new Dictionary<string, VariantSpec> { ["X"] = A() } }).Validate());   // key != VariantId
-        Assert.NotEmpty(WithVariants(A() with { RequestedQuantity = 0 }).Validate());
+        Assert.NotEmpty(WithVariants(A() with { Sizing = new FixedQuantitySpec { Units = 0 } }).Validate());
         Assert.NotEmpty(WithVariants(A() with { MaxAttemptsPerOpportunity = 0 }).Validate());
         Assert.NotEmpty(WithVariants(A() with { StrategyId = " " }).Validate());
         Assert.NotEmpty((WithVariants(A()) with { Selection = new ContractSelectionConfig { MaximumEntryPremium = 50m } }).Validate());
@@ -93,7 +94,7 @@ public class ConfigCp2HashTests
     {
         var spec = A();
 
-        Assert.Equal(650, spec.RequestedQuantity);
+        Assert.Equal(650, Assert.IsType<FixedQuantitySpec>(spec.Sizing).Units);
         Assert.Equal(CapacityBlockedPolicy.Reject, spec.ResolveCapacityPolicy());                   // Immediate
         Assert.Equal(CapacityBlockedPolicy.Wait, A2().ResolveCapacityPolicy());                       // waiting condition
         Assert.Equal(ReentryPolicy.NewEpisodeRequired, spec.Reentry);

@@ -1,5 +1,6 @@
 using NiftySignal.Trading.Core.Candles;
 using NiftySignal.Trading.Core.Config;
+using NiftySignal.Trading.Core.Costs;
 using NiftySignal.Trading.Core.Entry;
 using NiftySignal.Trading.Core.Events;
 using NiftySignal.Trading.Core.Ids;
@@ -7,6 +8,7 @@ using NiftySignal.Trading.Core.Instruments;
 using NiftySignal.Trading.Core.Quotes;
 using NiftySignal.Trading.Core.Scheduling;
 using NiftySignal.Trading.Core.Selection;
+using NiftySignal.Trading.Core.Sizing;
 using NiftySignal.Trading.Core.Session;
 
 namespace NiftySignal.Trading.Core.Variants;
@@ -46,14 +48,16 @@ public sealed class VariantEngine : IEngineHandler
     private readonly CandleStore _candles;
     private readonly List<VariantState> _variants = new();
     private readonly List<Opportunity> _allOpportunities = new();
-    private readonly List<EngineOutput> _outputs = new();
+    private readonly List<EngineOutput> _outputs;
+    private readonly CostModel? _costModel;
     private bool _entryClosed;
 
     public VariantEngine(
         TradingConfig config,
         DateOnly tradeDate,
         IReadOnlyList<OptionContract> universe,
-        IReadOnlyDictionary<string, IBaseStrategy> strategies)
+        IReadOnlyDictionary<string, IBaseStrategy> strategies,
+        List<EngineOutput>? outputSink = null)
     {
         ArgumentNullException.ThrowIfNull(config);
         ArgumentNullException.ThrowIfNull(universe);
@@ -65,11 +69,22 @@ public sealed class VariantEngine : IEngineHandler
         }
 
         _config = config;
+        _outputs = outputSink ?? new List<EngineOutput>();
         _configHash = config.ComputeHash();
         _tradeDate = tradeDate;
         Schedule = SessionSchedule.Create(config.Session, tradeDate);
         _universe = universe.OrderBy(c => c.Token, StringComparer.Ordinal).ToList();
         _candles = new CandleStore(config.Candles);
+        _costModel = CostModel.IsConfigured(config.Costs, tradeDate) ? new CostModel(config.Costs, tradeDate) : null;
+
+        var sizingErrors = config.Variants.Values
+            .OrderBy(x => x.VariantId, StringComparer.Ordinal)
+            .SelectMany(x => Sizer.ValidateFixedQuantities(x.VariantId, x.Sizing, universe))
+            .ToList();
+        if (sizingErrors.Count > 0)
+        {
+            throw new ArgumentException("Invalid sizing for the contract universe: " + string.Join(" ", sizingErrors), nameof(config));
+        }
 
         var ordinal = 0;
         foreach (var id in config.Variants.Keys.Order(StringComparer.Ordinal))
@@ -345,6 +360,20 @@ public sealed class VariantEngine : IEngineHandler
             return;
         }
 
+        var sizing = Sizer.Size(v.Spec.Sizing, opportunity.Contract.LotSize, ask, _costModel);
+        if (sizing.Status == SizingStatus.InvalidQuantity)
+        {
+            Audit(now, v, opportunity.Id, "Sizing", "InvalidQuantity", sizing.Detail);
+            Terminal(v, opportunity, OpportunityState.Rejected, now, "InvalidQuantity");
+            return;
+        }
+
+        if (sizing.Status == SizingStatus.Unaffordable)
+        {
+            Note(v, opportunity, now, "Blocked:InsufficientBudget", sizing.Detail);
+            return;
+        }
+
         var slot = v.Slots.FirstOrDefault(s => s.State == SlotState.Free);
         if (slot is null)
         {
@@ -360,7 +389,7 @@ public sealed class VariantEngine : IEngineHandler
             return;
         }
 
-        IssueIntent(v, opportunity, slot, quote, condition, now, triggerKind, triggerSeq);
+        IssueIntent(v, opportunity, slot, quote, condition, sizing, now, triggerKind, triggerSeq);
     }
 
     private void IssueIntent(
@@ -369,6 +398,7 @@ public sealed class VariantEngine : IEngineHandler
         CapacitySlot slot,
         QuoteSnapshot quote,
         ConditionResult condition,
+        SizingResult sizing,
         DateTimeOffset now,
         string triggerKind,
         long triggerSeq)
@@ -391,7 +421,9 @@ public sealed class VariantEngine : IEngineHandler
             opportunity.Attempts,
             slot.SlotNo,
             contract,
-            v.Spec.RequestedQuantity,
+            sizing.Quantity,
+            sizing.Lots,
+            contract.LotSize,
             LimitPrice: quote.Ask!.Value,
             QualifyingAsk: quote.Ask.Value,
             _config.Selection.MinimumEntryPremium,
@@ -486,6 +518,21 @@ public sealed class VariantEngine : IEngineHandler
         slot.OwnerOpportunityId = null;
         Audit(scheduler.Now, v, opportunityId, "Position", "Closed", FormattableString.Invariant($"slot={slot.SlotNo} freed"));
     }
+
+    /// <summary>True while the base strategy is valid for the episode that owns this opportunity (used by execution to revalidate a pending entry at maturity).</summary>
+    public bool IsStrategyValidFor(string variantId, string opportunityId)
+    {
+        var v = FindVariant(variantId);
+        return v.Valid && v.Active is { } active && active.Id == opportunityId && active.EpisodeId == v.EpisodeId;
+    }
+
+    /// <summary>The contract token fixed for an opportunity, or null when it has none yet.</summary>
+    public string? FixedContractToken(string opportunityId)
+        => _allOpportunities.FirstOrDefault(o => o.Id == opportunityId)?.Contract?.Token;
+
+    public VariantState GetVariant(string variantId) => FindVariant(variantId);
+
+    public string VariantHashOf(string variantId) => FindVariant(variantId).VariantHash;
 
     /// <summary>Exits must use the contract fixed by the opportunity; throws <see cref="ContractChangedException"/> otherwise. Premium band limits do not apply to exits.</summary>
     public void RequireFixedContract(string opportunityId, string token)
