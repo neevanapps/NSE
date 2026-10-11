@@ -68,6 +68,15 @@ public sealed class InMemoryRunStore : IRunStore
 
     public int ControlAppendCount { get; private set; }
 
+    /// <summary>How many calls of the operation have passed the fence check so far (the numbering <see cref="StoreFault.Nth"/> refers to is absolute, from the creation of the store).</summary>
+    public int CallsOf(StoreOperation operation)
+    {
+        lock (_gate)
+        {
+            return _calls.GetValueOrDefault(operation);
+        }
+    }
+
     /// <summary>Scripts a fault for a later call.</summary>
     public void Inject(StoreFault fault)
     {

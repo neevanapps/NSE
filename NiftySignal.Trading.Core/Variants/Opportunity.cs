@@ -33,6 +33,9 @@ public sealed class Opportunity
     /// <summary>The family decision (with its source bar identity) that opened the validity episode this opportunity belongs to.</summary>
     public AttributedDecision? EntryDecision { get; }
 
+    /// <summary>The family decision (and finalized source bar) on which the entry intent of this opportunity was issued; null until an intent exists.</summary>
+    public AttributedDecision? IntentDecision { get; internal set; }
+
     public string EpisodeId { get; }
 
     public long EpisodeStartBarSeq { get; }

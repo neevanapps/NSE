@@ -161,6 +161,7 @@ public sealed class VariantEngine : IEngineHandler
     {
         using var scope = w.Scope("variants");
         w.Line("entryClosed", _entryClosed);
+        w.Line("lastBarSeq", LastBarSeq);
         foreach (var v in _variants)
         {
             using var vs = w.Scope(v.Key.ToString());
@@ -197,6 +198,7 @@ public sealed class VariantEngine : IEngineHandler
             using var os = w.Scope("opportunity/" + o.Id);
             w.Line("variant", o.Variant.ToString());
             w.Line("entryDecision", o.EntryDecision?.CanonicalText());
+            w.Line("intentDecision", o.IntentDecision?.CanonicalText());
             w.Line("episode", o.EpisodeId);
             w.Line("episodeStart", o.EpisodeStartBarSeq);
             w.Line("side", o.Side);
@@ -277,8 +279,15 @@ public sealed class VariantEngine : IEngineHandler
     /// </summary>
     public Action<VariantKey, IEngineScheduler>? StrategyExitRequested { get; set; }
 
+    /// <summary>Sequence of the latest finalized bar this engine has seen (0 before the first); positions record it as the bar known at their exit.</summary>
+    public long LastBarSeq { get; private set; }
+
+    /// <summary>The label of the finalized input session (the Adaptive session id under the Host; a date label elsewhere).</summary>
+    public string SourceSessionId => _sourceSessionId;
+
     private void OnBar(BarCompletedEvent bar, IEngineScheduler scheduler)
     {
+        LastBarSeq = bar.BarSeq;
         // Publish first: candles up to this bar are visible to everything that runs after this event, and to nothing that ran before it
         // (quotes of the same availability group precede the bar event in the total order).
         _candles.PublishBar(bar.BarSeq, bar.AvailableAt);
@@ -589,6 +598,7 @@ public sealed class VariantEngine : IEngineHandler
         opportunity.ActiveIntentId = intentId;
         opportunity.LastEvaluationKey = "Issued";
         opportunity.LastRejectionKey = null;
+        opportunity.IntentDecision = v.LastDecision;
         var limit = quote.Ask!.Value + _config.Execution.EntrySlippage;
         opportunity.IntentPremium = limit * sizing.Quantity;
         _outputs.Add(new EntryIntent(

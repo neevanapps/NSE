@@ -73,7 +73,8 @@ public sealed record SessionFreeze(
                 o.LotSize,
                 TickSizes.TryGetValue(o.Token, out var tick) && tick > 0m
                     ? tick
-                    : throw new InvalidOperationException($"No effective-date tick size for option '{o.Token}'.")))
+                    : throw new InvalidOperationException($"No effective-date tick size for option '{o.Token}'."),
+                o.TradingSymbol))
             .ToList();
 }
 

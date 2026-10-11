@@ -267,7 +267,34 @@ public sealed record FillRecord(
     long? QuoteSourceId,
     string Book) : EngineOutput(At, Variant);
 
-public sealed record PositionOpened(DateTimeOffset At, VariantKey Variant, string PositionId, string OpportunityId, string Token, long Quantity, decimal AvgEntryPrice) : EngineOutput(At, Variant);
+/// <summary>
+/// A position exists: its first entry fill happened. Carries everything the stored trade needs about its ENTRY, so a stored row can be derived from this
+/// output alone: the contract (token, symbol, strike, expiry, call/put) that stays fixed to final exit, the direction and the finalized source bar of the
+/// decision, the decision time, the executable quote of the fill, the fill price, and the exit levels fixed by the variant (stop, TP1, max-hold deadline).
+/// </summary>
+public sealed record PositionOpened(
+    DateTimeOffset At,
+    VariantKey Variant,
+    string PositionId,
+    string OpportunityId,
+    string Token,
+    long Quantity,
+    decimal AvgEntryPrice,
+    OptionSide Side,
+    StrategyDirection Direction,
+    string Symbol,
+    decimal Strike,
+    DateOnly Expiry,
+    int LotSize,
+    string SourceSessionId,
+    long EntryBarSeq,
+    DateTimeOffset EntryDecisionAt,
+    decimal? EntryQuoteBid,
+    decimal? EntryQuoteAsk,
+    DateTimeOffset EntryQuoteAt,
+    decimal? StopLevel,
+    decimal? Tp1Level,
+    DateTimeOffset? MaxHoldDeadline) : EngineOutput(At, Variant);
 
 /// <summary>
 /// Lifetime excursion of ONE position (not of its variant or family), marked on the executable side: the bid, the price a long option can actually be sold at.
@@ -333,7 +360,15 @@ public sealed record PositionClosed(
     decimal GrossPnl,
     decimal TotalCosts,
     decimal NetPnl,
-    PositionExcursion Excursion) : EngineOutput(At, Variant);
+    PositionExcursion Excursion,
+    DateTimeOffset OpenedAt,
+    ExitReason FinalExitReason,
+    decimal AvgExitPrice,
+    decimal? ExitQuoteBid,
+    Tp1State Tp1,
+    long Tp1FilledQuantity,
+    string ExitSourceSessionId,
+    long ExitBarSeq) : EngineOutput(At, Variant);
 
 public sealed record ExitOrderCreated(
     DateTimeOffset At,

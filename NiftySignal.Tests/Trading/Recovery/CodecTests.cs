@@ -161,13 +161,13 @@ public class OutputCodecTests
     public void TheVariantIdentity_StrategyAndVariant_SurvivesTheCodec_AndSameVariantIdUnderTwoStrategiesStaysDistinct()
     {
         var at = new DateTimeOffset(2026, 9, 22, 4, 30, 0, TimeSpan.Zero);
-        var xa = new PositionOpened(at, new VariantKey("X", "A"), "pos_1", "opp_1", "CE23900", 650, 125m);
-        var ya = new PositionOpened(at, new VariantKey("Y", "A"), "pos_1", "opp_1", "CE23900", 650, 125m);
+        var xa = NiftySignal.Tests.Trading.Core.OutputFactory.Opened(at, new VariantKey("X", "A"));
+        var ya = NiftySignal.Tests.Trading.Core.OutputFactory.Opened(at, new VariantKey("Y", "A"));
 
         var encodedX = OutputCodec.Encode(xa);
         var encodedY = OutputCodec.Encode(ya);
 
-        Assert.Equal("trading-codec/3", OutputCodec.Version);
+        Assert.Equal("trading-codec/4", OutputCodec.Version);
         Assert.Contains("\"Variant\":\"X/A\"", encodedX, StringComparison.Ordinal);
         Assert.NotEqual(encodedX, encodedY);
         Assert.NotEqual(OutputCodec.ContentHash(encodedX), OutputCodec.ContentHash(encodedY));
@@ -195,7 +195,7 @@ public class OutputCodecTests
 
         foreach (var excursion in new[] { full, none })
         {
-            var closed = new PositionClosed(at, key, "pos_1", "CE23900", 650, 125m, 4_875.00m, 310.25m, 4_564.75m, excursion);
+            var closed = NiftySignal.Tests.Trading.Core.OutputFactory.Closed(at, key, excursion);
             var back = Assert.IsType<PositionClosed>(OutputCodec.Decode(OutputCodec.Encode(closed)));
             Assert.Equal(closed, back);
             Assert.Equal(excursion.Mae, back.Excursion.Mae);

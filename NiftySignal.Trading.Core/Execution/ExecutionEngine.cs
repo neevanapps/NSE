@@ -5,6 +5,7 @@ using NiftySignal.Trading.Core.Events;
 using NiftySignal.Trading.Core.Ids;
 using NiftySignal.Trading.Core.Integrity;
 using NiftySignal.Trading.Core.Quotes;
+using NiftySignal.Trading.Core.Instruments;
 using NiftySignal.Trading.Core.Risk;
 using NiftySignal.Trading.Core.Scheduling;
 using NiftySignal.Trading.Core.Session;
@@ -495,14 +496,39 @@ public sealed class ExecutionEngine
             null,
             quote.SourceId,
             BookLabel(intent.Variant)));
-        _out.Add(new PositionOpened(execTime, intent.Variant, positionId, intent.OpportunityId, intent.Contract.Token, quantity, position.AvgEntryPrice));
-
         // Max hold: the clock starts at the entry fill and is never reset or extended by a partial exit.
         if (variant.Spec.Exit.MaxHold is { } maxHold)
         {
             position.MaxHoldDeadline = execTime + maxHold;
             position.MaxHoldHandle = s.Schedule(position.MaxHoldDeadline.Value, DeadlineClass.RiskRetry, book.Ordinal, HoldPrefix + positionId);
         }
+
+        var exit = variant.Spec.Exit;
+        var avg = position.AvgEntryPrice;
+        var decision = _variants.AllOpportunities.FirstOrDefault(o => o.Id == intent.OpportunityId)?.IntentDecision;
+        _out.Add(new PositionOpened(
+            execTime,
+            intent.Variant,
+            positionId,
+            intent.OpportunityId,
+            intent.Contract.Token,
+            quantity,
+            avg,
+            intent.Contract.Side,
+            intent.Contract.Side == OptionSide.Call ? StrategyDirection.Long : StrategyDirection.Short,
+            intent.Contract.Symbol,
+            intent.Contract.Strike,
+            intent.Contract.Expiry,
+            intent.Contract.LotSize,
+            decision?.SourceSessionId ?? _variants.SourceSessionId,
+            decision?.BarSeq ?? _variants.LastBarSeq,
+            intent.At,
+            quote.Bid,
+            quote.Ask,
+            quote.AvailableAt,
+            exit.TradeSlPct is { } sl ? avg * (1m - sl) : null,
+            exit.Tp1Pct is { } tp ? avg * (1m + tp) : null,
+            position.MaxHoldDeadline));
     }
 
     private void OnMaxHold(string positionId, IEngineScheduler s)
@@ -892,7 +918,9 @@ public sealed class ExecutionEngine
             position.State = PositionState.Closed;
             position.ClosedAt = execTime;
             var gross = position.GrossRealised;
-            _out.Add(new PositionClosed(execTime, position.Variant, position.Id, position.Contract.Token, position.EntryQuantity, position.AvgEntryPrice, gross, position.TotalCosts, position.NetRealised, PositionExcursion.From(position)));
+            _out.Add(new PositionClosed(execTime, position.Variant, position.Id, position.Contract.Token, position.EntryQuantity, position.AvgEntryPrice, gross, position.TotalCosts, position.NetRealised, PositionExcursion.From(position),
+                position.OpenedAt, order.Reason, position.ExitedQuantity == 0 ? 0m : position.ExitProceeds / position.ExitedQuantity, quote.Bid, position.Tp1, position.Tp1FilledQuantity,
+                _variants.SourceSessionId, _variants.LastBarSeq));
             if (position.NetRealised < 0m)
             {
                 book.LossStreak++;

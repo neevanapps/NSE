@@ -171,6 +171,12 @@ public sealed record BinaryProvenance(string? GitCommit, bool? TreeClean, string
     public static BinaryProvenance None { get; } = new(null, null, "unknown", new Dictionary<string, string>());
 }
 
+/// <summary>
+/// One variant of a run with the virtual account (book) it trades in. Recorded in the header so that a store can create the ownership rows
+/// (run, account, variant) without parsing the configuration. <see cref="VariantHash"/> is the hash that determines the variant's behaviour.
+/// </summary>
+public sealed record VariantIdentity(string VariantId, string VariantHash, string StrategyId, string StrategyVersion, string AccountId);
+
 /// <summary>The immutable header of a run: identity plus the snapshots it was started from.</summary>
 public sealed record RunHeader(
     string RunId,
@@ -181,12 +187,13 @@ public sealed record RunHeader(
     string FreezeSnapshot,
     string SourceManifest,
     DateTimeOffset Horizon,
+    IReadOnlyList<VariantIdentity> Variants,
     string ContentHash)
 {
     public bool HashIsValid => ContentHash == ComputeHash(this);
 
     public static string ComputeHash(RunHeader h)
-        => OutputCodec.ContentHash(string.Create(CultureInfo.InvariantCulture, $"{h.RunId}|{h.TradeDate:yyyy-MM-dd}|{h.Compatibility.CanonicalText()}|{h.ConfigJson}|{h.FreezeSnapshot}|{h.SourceManifest}|{h.Horizon.UtcTicks}"));
+        => OutputCodec.ContentHash(string.Create(CultureInfo.InvariantCulture, $"{h.RunId}|{h.TradeDate:yyyy-MM-dd}|{h.Compatibility.CanonicalText()}|{h.ConfigJson}|{h.FreezeSnapshot}|{h.SourceManifest}|{h.Horizon.UtcTicks}|{string.Join(";", h.Variants.Select(v => $"{v.VariantId},{v.VariantHash},{v.StrategyId},{v.StrategyVersion},{v.AccountId}"))}"));
 
     public static RunHeader Create(RunHeader withoutHash) => withoutHash with { ContentHash = ComputeHash(withoutHash) };
 }

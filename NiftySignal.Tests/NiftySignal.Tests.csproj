@@ -30,6 +30,7 @@
     <ProjectReference Include="..\NiftySignal.Trading.Signals\NiftySignal.Trading.Signals.csproj" />
     <ProjectReference Include="..\NiftySignal.Trading.Adapters\NiftySignal.Trading.Adapters.csproj" />
     <ProjectReference Include="..\NiftySignal.Trading.Recovery\NiftySignal.Trading.Recovery.csproj" />
+    <ProjectReference Include="..\NiftySignal.Trading.Data\NiftySignal.Trading.Data.csproj" />
     <ProjectReference Include="..\NiftySignal.Backtest\NiftySignal.Backtest.csproj" />
     <ProjectReference Include="..\NiftySignal.BacktestData\NiftySignal.BacktestData.csproj" />
     <ProjectReference Include="..\NiftySignal.MetricTrials\NiftySignal.MetricTrials.csproj" />

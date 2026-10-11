@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- CP6.2: the PostgreSQL persistence MODEL for the trading engine (docs/TRADING_ENGINE_PHASE1_CONTRACT.md section A.19): entities, EF configuration,
+       migration source, lossless mappers between the recovery records and the entities, schema compatibility checks and the blocking bridge for the
+       synchronous durable run. It targets its own database (niftysignal_trading), never the tick or observer databases. It contains NO store
+       implementation yet (CP6.3), never creates a database, never applies a migration, never calls Migrate / EnsureCreated, and the design-time factory
+       uses an unreachable placeholder host, so generating migrations or SQL never contacts a database. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" />
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NiftySignal.Trading.Recovery\NiftySignal.Trading.Recovery.csproj" />
+  </ItemGroup>
+
+</Project>

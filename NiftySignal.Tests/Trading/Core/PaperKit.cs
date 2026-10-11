@@ -26,6 +26,11 @@ internal sealed class PaperKit
         Kit = new TradeKit(config, families.ToDictionary(f => f.StrategyId, f => f));
     }
 
+    public PaperKit(TradingConfig config, IReadOnlyList<NiftySignal.Trading.Core.Instruments.OptionContract> universe, params IStrategyFamily[] families)
+    {
+        Kit = new TradeKit(config, families.ToDictionary(f => f.StrategyId, f => f), universe);
+    }
+
     public TradeKit Kit { get; }
 
     public TradingEngineView Engine => new(Kit);
