@@ -43,7 +43,7 @@ public sealed record ControlRecord(ControlKind Kind, long Key, DateTimeOffset Av
 }
 
 /// <summary>One engine output in the durable ledger: global sequence, the step that committed it, the canonical payload and its hash.</summary>
-public sealed record OutputRecord(long Seq, long StepSeq, string Type, string VariantId, DateTimeOffset At, string Payload, string ContentHash)
+public sealed record OutputRecord(long Seq, long StepSeq, string Type, string StrategyId, string VariantId, DateTimeOffset At, string Payload, string ContentHash)
 {
     public bool HashIsValid => ContentHash == OutputCodec.ContentHash(Payload);
 }

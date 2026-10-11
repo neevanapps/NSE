@@ -186,7 +186,7 @@ public class IntegrityAndCompatibilityTests
         var run = store.Unsafe("run-1");
         var o = run.Outputs[10];
         var tampered = Retied(o, o.Payload.Replace("\"", "\"") + string.Empty);
-        var altered = o.Payload.Contains("\"VariantId\":\"A\"", StringComparison.Ordinal) ? o.Payload.Replace("\"VariantId\":\"A\"", "\"VariantId\":\"B\"") : o.Payload.Replace("\"VariantId\":\"B\"", "\"VariantId\":\"A\"");
+        var altered = o.Payload.Contains("\"Variant\":\"P6/A\"", StringComparison.Ordinal) ? o.Payload.Replace("\"Variant\":\"P6/A\"", "\"Variant\":\"P4/B\"") : o.Payload.Replace("\"Variant\":\"P4/B\"", "\"Variant\":\"P6/A\"");
         Assert.NotEqual(o.Payload, altered);
         run.Outputs[10] = Retied(o, altered);
         run.Projections.Clear();

@@ -4,6 +4,7 @@ using NiftySignal.Trading.Core.Execution;
 using NiftySignal.Trading.Core.Reporting;
 using NiftySignal.Trading.Core.Scheduling;
 using NiftySignal.Trading.Core.State;
+using NiftySignal.Trading.Core.Strategies;
 using NiftySignal.Trading.Core.Trading;
 using NiftySignal.Trading.Core.Variants;
 
@@ -52,6 +53,7 @@ public sealed record UnitInfo(UnitKind Kind, DateTimeOffset EngineNow, long? Gro
 
 /// <summary>Per-variant activity of a run (engineering coverage evidence, not performance).</summary>
 public sealed record VariantReport(
+    string StrategyId,
     string VariantId,
     int OpportunitiesCreated,
     int EntryIntents,
@@ -114,11 +116,24 @@ public sealed class TradingRun
     private DateTimeOffset? _firstReadyEnd;
     private long? _firstReadySeq;
 
+    /// <summary>Compatibility constructor for single-case strategies (one canonical family path underneath).</summary>
     public TradingRun(
         SessionFreeze freeze,
         TranslatorOptions translatorOptions,
         TradingConfig config,
         IReadOnlyDictionary<string, IBaseStrategy> strategies,
+        RunSettings settings,
+        RecorderOptions? recorderOptions = null,
+        IEnumerable<EngineEvent>? controls = null)
+        : this(freeze, translatorOptions, config, LegacyStrategies.AsFamilies(config, strategies), settings, recorderOptions, controls)
+    {
+    }
+
+    public TradingRun(
+        SessionFreeze freeze,
+        TranslatorOptions translatorOptions,
+        TradingConfig config,
+        IReadOnlyDictionary<string, IStrategyFamily> strategies,
         RunSettings settings,
         RecorderOptions? recorderOptions = null,
         IEnumerable<EngineEvent>? controls = null)
@@ -401,7 +416,7 @@ public sealed class TradingRun
         for (; _outputsRecorded < outputs.Count; _outputsRecorded++)
         {
             var o = outputs[_outputsRecorded];
-            channel.Add($"O{_outputsRecorded}:{o.GetType().Name}:{o.VariantId}", $"{Canonical.Time(o.At)}|{Canonical.Typed(o)}");
+            channel.Add($"O{_outputsRecorded}:{o.GetType().Name}:{o.Variant}", $"{Canonical.Time(o.At)}|{Canonical.Typed(o)}");
         }
 
         if (!changed)
@@ -412,11 +427,11 @@ public sealed class TradingRun
         var opportunities = Recorders[RunRecorders.Names.Opportunities];
         foreach (var o in Engine.Variants.AllOpportunities)
         {
-            var line = $"{o.VariantId}|{o.Id}|{o.State}|{o.Contract?.Token}|attempts={o.Attempts}|selection={o.SelectionAttempts}|cancel={o.CancelReason}|terminal={o.TerminalReason}";
+            var line = $"{o.Variant}|{o.Id}|{o.State}|{o.Contract?.Token}|attempts={o.Attempts}|selection={o.SelectionAttempts}|cancel={o.CancelReason}|terminal={o.TerminalReason}";
             if (!_opportunityLines.TryGetValue(o.Id, out var previous) || previous != line)
             {
                 _opportunityLines[o.Id] = line;
-                opportunities.Add($"{o.VariantId}:{o.Id}", $"{Canonical.Time(Loop.Now)}|{line}");
+                opportunities.Add($"{o.Variant}:{o.Id}", $"{Canonical.Time(Loop.Now)}|{line}");
             }
         }
     }
@@ -427,7 +442,7 @@ public sealed class TradingRun
         var audit = Engine.AuditTrailEntries()
             .Select(a =>
                 // RunId and RunMode are labels of the run, not behaviour: they are the one documented exclusion in the audit comparison.
-                $"{Canonical.Time(a.At)}|{a.AccountId}|{a.VariantId}|{a.OpportunityId}|{a.OrderId}|{a.PositionId}|{a.ConfigHash}|{a.VariantHash}|{a.Category}|{a.Reason}|{a.Event}|{a.Detail}")
+                $"{Canonical.Time(a.At)}|{a.AccountId}|{a.StrategyId}|{a.VariantId}|{a.OpportunityId}|{a.OrderId}|{a.PositionId}|{a.ConfigHash}|{a.VariantHash}|{a.Category}|{a.Reason}|{a.Event}|{a.Detail}")
             .ToList();
         var summaries = Engine.DailySummaries(_horizon).Select(s => Canonical.Json(s with { RunId = string.Empty })).ToList();
         return (audit, summaries);
@@ -441,13 +456,13 @@ public sealed class TradingRun
             // RunId and RunMode are labels of the run, not behaviour: they are the one documented exclusion in the audit comparison.
             audit.Add(
                 $"A{a.Seq}",
-                $"{Canonical.Time(a.At)}|{a.AccountId}|{a.VariantId}|{a.OpportunityId}|{a.OrderId}|{a.PositionId}|{a.ConfigHash}|{a.VariantHash}|{a.Category}|{a.Reason}|{a.Event}|{a.Detail}");
+                $"{Canonical.Time(a.At)}|{a.AccountId}|{a.StrategyId}|{a.VariantId}|{a.OpportunityId}|{a.OrderId}|{a.PositionId}|{a.ConfigHash}|{a.VariantHash}|{a.Category}|{a.Reason}|{a.Event}|{a.Detail}");
         }
 
         var summaries = Recorders[RunRecorders.Names.Summaries];
         foreach (var s in Engine.DailySummaries(_horizon))
         {
-            summaries.Add(s.VariantId, Canonical.Json(s with { RunId = string.Empty }));
+            summaries.Add($"{s.StrategyId}/{s.VariantId}", Canonical.Json(s with { RunId = string.Empty }));
         }
     }
 
@@ -475,18 +490,19 @@ public sealed class TradingRun
     private List<VariantReport> VariantReports()
     {
         var list = new List<VariantReport>();
-        foreach (var v in Engine.Variants.Variants.OrderBy(x => x.VariantId, StringComparer.Ordinal))
+        foreach (var v in Engine.Variants.Variants.OrderBy(x => x.Key))
         {
-            var positions = Engine.Execution.PositionsOf(v.VariantId);
-            var fills = Engine.Outputs.OfType<FillRecord>().Where(f => f.VariantId == v.VariantId).ToList();
+            var positions = Engine.Execution.PositionsOf(v.Key);
+            var fills = Engine.Outputs.OfType<FillRecord>().Where(f => f.Variant == v.Key).ToList();
             var exits = fills.Where(f => f.Side == NiftySignal.Trading.Core.Costs.TradeSide.Sell)
                 .GroupBy(f => f.Reason?.ToString() ?? "Unspecified")
                 .OrderBy(g => g.Key, StringComparer.Ordinal)
                 .ToDictionary(g => g.Key, g => g.Count(), StringComparer.Ordinal);
             list.Add(new VariantReport(
+                v.StrategyId,
                 v.VariantId,
-                Engine.Variants.AllOpportunities.Count(o => o.VariantId == v.VariantId),
-                Engine.Outputs.OfType<EntryIntent>().Count(i => i.VariantId == v.VariantId),
+                Engine.Variants.AllOpportunities.Count(o => o.Variant == v.Key),
+                Engine.Outputs.OfType<EntryIntent>().Count(i => i.Variant == v.Key),
                 positions.Count,
                 exits,
                 positions.Count(p => p.State == PositionState.Closed),

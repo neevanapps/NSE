@@ -220,7 +220,7 @@ public class VariantConcurrencyTests
 
         Assert.Equal(forward.Config.ComputeHash(), backward.Config.ComputeHash());
         Assert.Equal(Kit.Signature(forward.Engine.Outputs), Kit.Signature(backward.Engine.Outputs));
-        Assert.Equal(AllVariants.OrderBy(v => v, StringComparer.Ordinal), forward.Engine.Variants.Select(v => v.VariantId));
+        Assert.Equal(Specs().OrderBy(s => s.GetKey()).Select(s => s.VariantId), forward.Engine.Variants.Select(v => v.VariantId));   // ascending (StrategyId, VariantId)
         Assert.Equal(Enumerable.Range(0, 5), forward.Engine.Variants.Select(v => v.Ordinal));
     }
 

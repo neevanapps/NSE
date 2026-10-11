@@ -1,6 +1,7 @@
 using NiftySignal.Trading.Core.Costs;
 using NiftySignal.Trading.Core.Instruments;
 using NiftySignal.Trading.Core.Variants;
+using NiftySignal.Trading.Core.Strategies;
 
 namespace NiftySignal.Trading.Core.Execution;
 
@@ -118,10 +119,10 @@ public sealed class ExitOrder
 /// <summary>A long option position built only from actual simulated fills.</summary>
 public sealed class Position
 {
-    internal Position(string id, string variantId, string opportunityId, string entryDecisionId, OptionContract contract, int slotNo, DateTimeOffset openedAt)
+    internal Position(string id, VariantKey variant, string opportunityId, string entryDecisionId, OptionContract contract, int slotNo, DateTimeOffset openedAt)
     {
         Id = id;
-        VariantId = variantId;
+        Variant = variant;
         OpportunityId = opportunityId;
         EntryDecisionId = entryDecisionId;
         Contract = contract;
@@ -131,7 +132,12 @@ public sealed class Position
 
     public string Id { get; }
 
-    public string VariantId { get; }
+    /// <summary>Owner of the position: (StrategyId, VariantId).</summary>
+    public VariantKey Variant { get; }
+
+    public string StrategyId => Variant.StrategyId;
+
+    public string VariantId => Variant.VariantId;
 
     public string OpportunityId { get; }
 
@@ -232,7 +238,7 @@ public sealed record PositionValuation(
 
 public sealed record FillRecord(
     DateTimeOffset At,
-    string VariantId,
+    VariantKey Variant,
     string FillId,
     string OrderId,
     string PositionId,
@@ -247,61 +253,61 @@ public sealed record FillRecord(
     ExitReason? Reason,
     decimal? TriggerThreshold,
     long? QuoteSourceId,
-    string Book) : EngineOutput(At, VariantId);
+    string Book) : EngineOutput(At, Variant);
 
-public sealed record PositionOpened(DateTimeOffset At, string VariantId, string PositionId, string OpportunityId, string Token, long Quantity, decimal AvgEntryPrice) : EngineOutput(At, VariantId);
+public sealed record PositionOpened(DateTimeOffset At, VariantKey Variant, string PositionId, string OpportunityId, string Token, long Quantity, decimal AvgEntryPrice) : EngineOutput(At, Variant);
 
 public sealed record PositionClosed(
     DateTimeOffset At,
-    string VariantId,
+    VariantKey Variant,
     string PositionId,
     string Token,
     long EntryQuantity,
     decimal AvgEntryPrice,
     decimal GrossPnl,
     decimal TotalCosts,
-    decimal NetPnl) : EngineOutput(At, VariantId);
+    decimal NetPnl) : EngineOutput(At, Variant);
 
 public sealed record ExitOrderCreated(
     DateTimeOffset At,
-    string VariantId,
+    VariantKey Variant,
     string OrderId,
     string PositionId,
     ExitReason Reason,
     long Quantity,
     DateTimeOffset FirstAttemptAt,
-    decimal? TriggerThreshold) : EngineOutput(At, VariantId);
+    decimal? TriggerThreshold) : EngineOutput(At, Variant);
 
-public sealed record Tp1Resolved(DateTimeOffset At, string VariantId, string PositionId, Tp1State State, long TargetQuantity, long OpenLots) : EngineOutput(At, VariantId);
+public sealed record Tp1Resolved(DateTimeOffset At, VariantKey Variant, string PositionId, Tp1State State, long TargetQuantity, long OpenLots) : EngineOutput(At, Variant);
 
 /// <summary>Reported at the final-close time (default 15:10:00) for every position still open. Orders keep trying until session end; later fills are flagged.</summary>
 public sealed record UnresolvedAtClose(
     DateTimeOffset At,
-    string VariantId,
+    VariantKey Variant,
     string PositionId,
     string Token,
     long OpenQuantity,
     long ReservedExitQuantity,
     int LiveExitOrders,
     decimal? LastEligibleBid,
-    TimeSpan? LastBidAge) : EngineOutput(At, VariantId);
+    TimeSpan? LastBidAge) : EngineOutput(At, Variant);
 
 /// <summary>Reported at session end for every position still open. The position stays open in the books (state Unresolved); no fill is manufactured.</summary>
 public sealed record UnresolvedAtSessionEnd(
     DateTimeOffset At,
-    string VariantId,
+    VariantKey Variant,
     string PositionId,
     string Token,
     long OpenQuantity,
     decimal? LastEligibleBid,
-    TimeSpan? LastBidAge) : EngineOutput(At, VariantId);
+    TimeSpan? LastBidAge) : EngineOutput(At, Variant);
 
 /// <summary>Record-only in ResearchV1: nothing is blocked, liquidated or capped when this is emitted.</summary>
-public sealed record DailySlBreached(DateTimeOffset At, string VariantId, decimal DailyPnl, decimal DailySl, bool ConservativeMark) : EngineOutput(At, VariantId);
+public sealed record DailySlBreached(DateTimeOffset At, VariantKey Variant, decimal DailyPnl, decimal DailySl, bool ConservativeMark) : EngineOutput(At, Variant);
 
 public sealed record SessionEndReport(
     DateTimeOffset At,
-    string VariantId,
+    VariantKey Variant,
     decimal NetRealisedAllPositions,
     long Fills,
     long BelowBandFills,
@@ -309,4 +315,4 @@ public sealed record SessionEndReport(
     int UnresolvedPositions,
     decimal? WorstDailyPnl,
     bool DailySlBreachedRecorded,
-    string Book) : EngineOutput(At, VariantId);
+    string Book) : EngineOutput(At, Variant);

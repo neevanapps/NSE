@@ -364,8 +364,8 @@ public class VariantEngineTests
 
         kit.At(Kit.Bar(1).AddSeconds(5), s =>
         {
-            Assert.Throws<InvalidOperationException>(() => kit.Engine.ReportEntryOutcome(new EntryOutcome("A", opportunity.Id, "ord_other", EntryOutcomeKind.Expired), s));
-            Assert.Throws<KeyNotFoundException>(() => kit.Engine.ReportEntryOutcome(new EntryOutcome("ZZ", opportunity.Id, intent.IntentId, EntryOutcomeKind.Expired), s));
+            Assert.Throws<InvalidOperationException>(() => kit.Engine.ReportEntryOutcome(new EntryOutcome(Vk.S("A"), opportunity.Id, "ord_other", EntryOutcomeKind.Expired), s));
+            Assert.Throws<KeyNotFoundException>(() => kit.Engine.ReportEntryOutcome(new EntryOutcome(Vk.S("ZZ"), opportunity.Id, intent.IntentId, EntryOutcomeKind.Expired), s));
             kit.Outcome(intent, EntryOutcomeKind.Expired, s);
         });
         kit.Loop.AdvanceTo(Kit.Bar(1).AddSeconds(6));
@@ -406,7 +406,7 @@ public class VariantEngineTests
         Assert.Equal(OpportunityState.Consumed, firstOpportunity.State);
         Assert.Equal(SlotState.Occupied, kit.Variant("A").Slots[0].State);
 
-        kit.At(Kit.Bar(1).AddSeconds(30), s => kit.Engine.ReportPositionClosed("A", firstOpportunity.Id, s));
+        kit.At(Kit.Bar(1).AddSeconds(30), s => kit.Engine.ReportPositionClosed(Vk.S("A"), firstOpportunity.Id, s));
         kit.BarGroup(2, kit.Q(Kit.Bar(2), Ce, 120m));                  // position closed during/before this bar; strategy still valid
         kit.BarGroup(3, kit.Q(Kit.Bar(3), Ce, 120m));
         Assert.Equal(SlotState.Free, kit.Variant("A").Slots[0].State);
@@ -455,7 +455,7 @@ public class VariantEngineTests
         Assert.Single(kit.Out<EntryIntent>("W"));
         Assert.Contains(kit.Out<AuditRecord>("W"), r => r.Outcome == "Blocked:CapacityBusy");
 
-        kit.At(Kit.Bar(3).AddSeconds(5), s => kit.Engine.ReportPositionClosed("W", w.Id, s));
+        kit.At(Kit.Bar(3).AddSeconds(5), s => kit.Engine.ReportPositionClosed(Vk.S("W"), w.Id, s));
         kit.Loop.AdvanceTo(Kit.Bar(3).AddSeconds(6));
         kit.Feed(kit.Q(Kit.Bar(3).AddSeconds(7), Ce, 119m));
         Assert.Equal(2, kit.Out<EntryIntent>("W").Count());
@@ -470,7 +470,7 @@ public class VariantEngineTests
         Assert.Single(kit.Out<EntryIntent>("A"));
         Assert.Single(kit.Out<EntryIntent>("B"));                       // A's reservation does not block B
         Assert.NotSame(kit.Variant("A").Slots[0], kit.Variant("B").Slots[0]);
-        Assert.Equal("A", kit.Variant("A").Spec.ResolveAccountId());
+        Assert.Equal("S/A", kit.Variant("A").Spec.ResolveAccountId());
         Assert.Equal("shared", (Kit.Immediate("C") with { AccountId = "shared" }).ResolveAccountId());
         Assert.NotEqual(kit.Out<EntryIntent>("A").Single().IntentId, kit.Out<EntryIntent>("B").Single().IntentId);
         Assert.NotEqual(kit.Variant("A").VariantHash, kit.Variant("B").VariantHash);

@@ -1,5 +1,6 @@
 using NiftySignal.Trading.Core.Instruments;
 using NiftySignal.Trading.Core.Selection;
+using NiftySignal.Trading.Core.Strategies;
 
 namespace NiftySignal.Trading.Core.Variants;
 
@@ -9,10 +10,11 @@ namespace NiftySignal.Trading.Core.Variants;
 /// </summary>
 public sealed class Opportunity
 {
-    internal Opportunity(string id, string variantId, string episodeId, long episodeStartBarSeq, OptionSide side, DateTimeOffset createdAt)
+    internal Opportunity(string id, VariantKey variant, string episodeId, long episodeStartBarSeq, OptionSide side, DateTimeOffset createdAt, AttributedDecision? entryDecision = null)
     {
         Id = id;
-        VariantId = variantId;
+        Variant = variant;
+        EntryDecision = entryDecision;
         EpisodeId = episodeId;
         EpisodeStartBarSeq = episodeStartBarSeq;
         Side = side;
@@ -21,7 +23,15 @@ public sealed class Opportunity
 
     public string Id { get; }
 
-    public string VariantId { get; }
+    /// <summary>The owning variant: (StrategyId, VariantId).</summary>
+    public VariantKey Variant { get; }
+
+    public string StrategyId => Variant.StrategyId;
+
+    public string VariantId => Variant.VariantId;
+
+    /// <summary>The family decision (with its source bar identity) that opened the validity episode this opportunity belongs to.</summary>
+    public AttributedDecision? EntryDecision { get; }
 
     public string EpisodeId { get; }
 
@@ -82,11 +92,12 @@ public sealed class CapacitySlot
 /// <summary>Runtime state of one variant. Fully isolated: no field is shared with another variant.</summary>
 public sealed class VariantState
 {
-    internal VariantState(VariantSpec spec, int ordinal, IBaseStrategy strategy, string variantHash, int capacity)
+    internal VariantState(VariantSpec spec, int ordinal, IStrategyFamily family, string variantHash, int capacity)
     {
         Spec = spec;
+        Key = spec.GetKey();
         Ordinal = ordinal;
-        Strategy = strategy;
+        Family = family;
         VariantHash = variantHash;
         var slots = new List<CapacitySlot>();
         for (var i = 0; i < capacity; i++)
@@ -99,12 +110,23 @@ public sealed class VariantState
 
     public VariantSpec Spec { get; }
 
-    public string VariantId => Spec.VariantId;
+    /// <summary>The canonical identity (StrategyId, VariantId): the key of this variant's capacity slot, opportunities, orders, positions and accounting.</summary>
+    public VariantKey Key { get; }
 
-    /// <summary>Position in the sorted VariantId list; used for deterministic processing and deadline ordering.</summary>
+    public string StrategyId => Key.StrategyId;
+
+    public string VariantId => Key.VariantId;
+
+    /// <summary>Position in the list sorted by (StrategyId, VariantId); used for deterministic processing and deadline ordering.</summary>
     public int Ordinal { get; }
 
-    internal IBaseStrategy Strategy { get; }
+    internal IStrategyFamily Family { get; }
+
+    /// <summary>The latest decision the family made for this variant (attributed to its source bar). Part of the state digest.</summary>
+    public AttributedDecision? LastDecision { get; internal set; }
+
+    /// <summary>The decision that started the current validity episode.</summary>
+    public AttributedDecision? EpisodeDecision { get; internal set; }
 
     public string VariantHash { get; }
 

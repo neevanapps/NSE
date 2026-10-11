@@ -1509,3 +1509,24 @@ Out of Phase 2: broker adapter, Host registration/deploy, Dashboard changes, cal
 | Recorded-session measurement / recovery comparison | **not run**: the source connection variable is not available to the author's shells; `NSE_RUN_MODE=durable` in `tools/TradingRunDiff` is provided for the user to run (compiled, not executed) |
 | Database creation / EF / Npgsql / migrations / Host / broker / deployment / merge / CP6.2 | none |
 | Credentials | none used, none searched for, none printed or committed |
+---
+
+## Amendment 2 — adaptive paper-trading engine V1, branch `feature/adaptive-paper-trading-engine-v1`
+
+The engine is carried forward onto current master in checkpoints (CP0 – CP8 of the V1 plan; these are NOT the original CP0 – CP7 numbering above). This amendment records the decisions of the V1 plan; it overrides earlier text where they differ.
+
+### B.1 CP1 — strategy family and (StrategyId, VariantId) identity (implemented)
+
+**Identity.** `StrategyId` is a logical strategy family. `VariantId` is a case inside that family and is unique only inside it: `X/A` and `Y/A` are different variants. The canonical key is `VariantKey(StrategyId, VariantId)` (text form `StrategyId/VariantId`; both parts are restricted to letters, digits, `_`, `.`, `-`, starting with a letter or digit, so the text form is unambiguous). It is the key of the configuration's variant dictionary (`TradingConfig` schema 6), of the capacity slot, opportunities, orders, positions, books (default account = the key text), the state digest scopes, the kill switch scope (`*` or `StrategyId/VariantId`; a bare VariantId is refused) and of the audit and summary records. Processing order is ascending `(StrategyId, VariantId)` ordinal.
+
+**Capacity.** One slot per `(StrategyId, VariantId)`, never per family. An open X2 position does not block X1 or X3; a second X2 entry meets X2's own `OnCapacityBlocked` policy (default: Reject for an immediate entry, Wait for a waiting condition). A family-level position limit does not exist; if one is ever wanted it is a separate risk rule (CP2).
+
+**Strategy contract.** `IStrategyFamily` (`StrategyId`, `Version`, declared `VariantIds`, `OnBar(BarCompletedEvent) -> FamilyDecisions`) is evaluated exactly once per finalized bar and answers for each of its variants with a `VariantDecision(VariantId, Action, Direction, ReasonCode, Detail)`. `Action` is Enter, Hold, Exit or Wait; `Direction` is Long, Short or Neutral. Valid combinations: Enter with Long or Short; Hold, Exit and Wait with Neutral; a reason code is always required. The family knows nothing about contracts, strikes, quantities, quotes, fills or capital. The engine stamps every decision with its source (`AttributedDecision`: variant key, action, direction, reason, source session id, BarSeq, bar availability time); the decision that opened an episode is kept on the `Opportunity` and both are part of the state digest. The source session id is a constructor argument of the engine (default `session:<trade date>`; the Host supplies the Adaptive session id in CP6).
+
+**Engine semantics of the actions.** Enter = the variant's setup is valid on that side (Long -> call, Short -> put: the mapping lives in the engine, below the strategy layer). Wait, Hold and an omitted variant (treated as Wait/`NoDecision`, never Hold) = no entry intent, which ends a still-waiting opportunity as before. Exit = the variant's own open position is closed through the normal exit path with `ExitReason.StrategyExit` (whole unreserved lots; siblings are never touched). A decision for an undeclared variant, two decisions for one variant, or an invalid decision is a defect of the family and throws.
+
+**Compatibility.** The old single-case `IBaseStrategy` is kept only as input to `LegacyBaseStrategyFamily` (Call = Long, Put = Short; every variant of that StrategyId receives the same decision). Engine, translator run and durable run take families; thin overloads convert legacy strategy dictionaries so there is one execution path. `PlumbingFamily` (Trading.Signals) is the TEST/PLUMBING family: scripted windows and exits, no edge, never to be enabled for normal paper trading.
+
+**Outputs and codec.** `EngineOutput` carries `Variant` (both parts); `StrategyId` / `VariantId` are derived properties. Audit entries, daily summaries, variant reports and the durable `OutputRecord` carry both. The output codec is `trading-codec/2` (member `Variant` = key text; version 1 carried a bare `VariantId`). Deterministic ids use scheme `tid2`: decision, opportunity and position ids include both parts (nothing was persisted under `tid1`). Golden values were regenerated deliberately: ids (scheme tid2) and the canonical configuration (schema 6, variant keys).
+
+**Not in CP1.** Risk changes, PaperLiveV1, MAE/MFE persistence, PostgreSQL, Host, Dashboard and any real strategy.

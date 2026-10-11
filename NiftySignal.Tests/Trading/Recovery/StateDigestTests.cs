@@ -87,7 +87,7 @@ public class StateDigestTests(ITestOutputHelper output)
 
         foreach (var marker in new[]
         {
-            "loop/deadline[", "loop/nextCreationSeq", "engine/execution/book/A/cash", "engine/execution/quoteHistory/", "engine/variants/quoteBook/", "engine/variants/candles/history[", "engine/variants/A/slot[", "engine/integrity/killAll", "engine/admission/", "translator/lastRow[", "translator/bar[", "translator/partialBar",
+            "loop/deadline[", "loop/nextCreationSeq", "engine/execution/book/P6/A/cash", "engine/execution/quoteHistory/", "engine/variants/quoteBook/", "engine/variants/candles/history[", "engine/variants/P6/A/slot[", "engine/integrity/killAll", "engine/admission/", "translator/lastRow[", "translator/bar[", "translator/partialBar",
         })
         {
             Assert.Contains(marker, text, StringComparison.Ordinal);

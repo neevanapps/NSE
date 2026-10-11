@@ -1,5 +1,6 @@
 using NiftySignal.Trading.Core.Candles;
 using NiftySignal.Trading.Core.Instruments;
+using NiftySignal.Trading.Core.Strategies;
 
 namespace NiftySignal.Trading.Core.Variants;
 
@@ -36,7 +37,7 @@ public enum EntryOutcomeKind
 }
 
 /// <summary>Terminal result of an entry intent, reported by the execution model (CP3) or a test harness, from inside the engine loop.</summary>
-public sealed record EntryOutcome(string VariantId, string OpportunityId, string IntentId, EntryOutcomeKind Kind);
+public sealed record EntryOutcome(VariantKey Variant, string OpportunityId, string IntentId, EntryOutcomeKind Kind);
 
 public enum CancelReason
 {
@@ -51,7 +52,14 @@ public enum CancelReason
 }
 
 /// <summary>Base of everything the variant engine emits. Outputs are plain data; the engine performs no I/O.</summary>
-public abstract record EngineOutput(DateTimeOffset At, string VariantId);
+public abstract record EngineOutput(DateTimeOffset At, VariantKey Variant)
+{
+    /// <summary>The variant id inside its strategy family (convenience for <see cref="Variant"/>).</summary>
+    public string VariantId => Variant.VariantId;
+
+    /// <summary>The logical strategy family that owns this output (every output carries both parts of the identity).</summary>
+    public string StrategyId => Variant.StrategyId;
+}
 
 /// <summary>
 /// Marketable-limit entry intent at the observed qualifying ask (initial policy). Carries the premium limits so that CP3 can enforce
@@ -60,7 +68,7 @@ public abstract record EngineOutput(DateTimeOffset At, string VariantId);
 /// </summary>
 public sealed record EntryIntent(
     DateTimeOffset At,
-    string VariantId,
+    VariantKey Variant,
     string IntentId,
     string DecisionId,
     string OpportunityId,
@@ -79,18 +87,18 @@ public sealed record EntryIntent(
     string ConditionKind,
     decimal? ConditionAverage,
     int? ConditionN,
-    CandlePriceSource? ConditionPriceSource) : EngineOutput(At, VariantId);
+    CandlePriceSource? ConditionPriceSource) : EngineOutput(At, Variant);
 
 /// <summary>Request to cancel the unfilled quantity of an outstanding entry intent. The reservation is retained until the outcome is reported.</summary>
-public sealed record CancelRequest(DateTimeOffset At, string VariantId, string IntentId, string OpportunityId, CancelReason Reason) : EngineOutput(At, VariantId);
+public sealed record CancelRequest(DateTimeOffset At, VariantKey Variant, string IntentId, string OpportunityId, CancelReason Reason) : EngineOutput(At, Variant);
 
 public sealed record OpportunityTransition(
     DateTimeOffset At,
-    string VariantId,
+    VariantKey Variant,
     string OpportunityId,
     OpportunityState From,
     OpportunityState To,
-    string Reason) : EngineOutput(At, VariantId);
+    string Reason) : EngineOutput(At, Variant);
 
 /// <summary>Why-record for accepted and rejected steps. Detail strings are built with invariant formatting only.</summary>
-public sealed record AuditRecord(DateTimeOffset At, string VariantId, string? OpportunityId, string Stage, string Outcome, string Detail) : EngineOutput(At, VariantId);
+public sealed record AuditRecord(DateTimeOffset At, VariantKey Variant, string? OpportunityId, string Stage, string Outcome, string Detail) : EngineOutput(At, Variant);

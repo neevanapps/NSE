@@ -1,5 +1,6 @@
 using NiftySignal.Trading.Core.Config;
 using NiftySignal.Trading.Core.Ids;
+using NiftySignal.Trading.Core.Strategies;
 
 namespace NiftySignal.Tests.Trading.Core;
 
@@ -8,36 +9,36 @@ public class DeterministicIdTests
     private static readonly ConfigHash Config = new("abc123");
     private static readonly DateOnly Date = new(2026, 9, 22);
 
-    // Golden ids: changing the scheme re-identifies every persisted entity. Update only with a new Scheme tag.
-    private const string GoldenDecision = "dec_e74ccb421c9350f836e3385d3f597d6a";
-    private const string GoldenOrder = "ord_8597464e5cf6baf263d6e9399bda8cd6";
-    private const string GoldenOpportunity = "opp_e978c8e0b05ab966dbd81d6ae384ab45";
-    private const string GoldenPosition = "pos_8ba3a94873adbbc0a32842261a2c1918";
+    // Golden ids: changing the scheme re-identifies every persisted entity. Update only with a new Scheme tag (tid2: the identity is (StrategyId, VariantId); nothing was persisted under tid1).
+    private const string GoldenDecision = "dec_fa802b9d65701442244b73c747bfd18f";
+    private const string GoldenOrder = "ord_0a689a24511f0241408d59383fd80d0f";
+    private const string GoldenOpportunity = "opp_d31c7da6aec3d121b6633952e3ef340a";
+    private const string GoldenPosition = "pos_e75d48c35d61d7fc4742e3f3238650b2";
 
     [Fact]
     public void Ids_AreStableGoldenValues()
     {
-        var decision = EngineIds.Decision(Config, "A2-ma10", "S1", Date, "Bar", 17, 0);
+        var decision = EngineIds.Decision(Config, new VariantKey("S1", "A2-ma10"), Date, "Bar", 17, 0);
 
         Assert.Equal(GoldenDecision, decision);
         Assert.Equal(GoldenOrder, EngineIds.Order(decision, "entry", 1));
-        Assert.Equal(GoldenOpportunity, EngineIds.Opportunity("A2-ma10", new ConfigHash("v1"), Date, "episode-17"));
-        Assert.Equal(GoldenPosition, EngineIds.Position(Config, "A2-ma10", Date, decision));
+        Assert.Equal(GoldenOpportunity, EngineIds.Opportunity(new VariantKey("S1", "A2-ma10"), new ConfigHash("v1"), Date, "episode-17"));
+        Assert.Equal(GoldenPosition, EngineIds.Position(Config, new VariantKey("S1", "A2-ma10"), Date, decision));
     }
 
     [Fact]
     public void SameInputs_SameId_AcrossCulturesAndRepeats()
     {
-        var baseline = EngineIds.Decision(Config, "A", "S", Date, "Bar", 5, 0);
+        var baseline = EngineIds.Decision(Config, new VariantKey("S", "A"), Date, "Bar", 5, 0);
 
         for (var i = 0; i < 100; i++)
         {
-            Assert.Equal(baseline, EngineIds.Decision(Config, "A", "S", Date, "Bar", 5, 0));
+            Assert.Equal(baseline, EngineIds.Decision(Config, new VariantKey("S", "A"), Date, "Bar", 5, 0));
         }
 
         foreach (var culture in new[] { "tr-TR", "ar-SA", "th-TH", "de-DE" })
         {
-            Assert.Equal(baseline, Culture.Under(culture, () => EngineIds.Decision(Config, "A", "S", Date, "Bar", 5, 0)));
+            Assert.Equal(baseline, Culture.Under(culture, () => EngineIds.Decision(Config, new VariantKey("S", "A"), Date, "Bar", 5, 0)));
         }
     }
 
@@ -46,14 +47,14 @@ public class DeterministicIdTests
     {
         var ids = new[]
         {
-            EngineIds.Decision(Config, "A", "S", Date, "Bar", 5, 0),
-            EngineIds.Decision(new ConfigHash("other"), "A", "S", Date, "Bar", 5, 0),
-            EngineIds.Decision(Config, "B", "S", Date, "Bar", 5, 0),
-            EngineIds.Decision(Config, "A", "T", Date, "Bar", 5, 0),
-            EngineIds.Decision(Config, "A", "S", Date.AddDays(1), "Bar", 5, 0),
-            EngineIds.Decision(Config, "A", "S", Date, "Timer", 5, 0),
-            EngineIds.Decision(Config, "A", "S", Date, "Bar", 6, 0),
-            EngineIds.Decision(Config, "A", "S", Date, "Bar", 5, 1),
+            EngineIds.Decision(Config, new VariantKey("S", "A"), Date, "Bar", 5, 0),
+            EngineIds.Decision(new ConfigHash("other"), new VariantKey("S", "A"), Date, "Bar", 5, 0),
+            EngineIds.Decision(Config, new VariantKey("S", "B"), Date, "Bar", 5, 0),
+            EngineIds.Decision(Config, new VariantKey("T", "A"), Date, "Bar", 5, 0),
+            EngineIds.Decision(Config, new VariantKey("S", "A"), Date.AddDays(1), "Bar", 5, 0),
+            EngineIds.Decision(Config, new VariantKey("S", "A"), Date, "Timer", 5, 0),
+            EngineIds.Decision(Config, new VariantKey("S", "A"), Date, "Bar", 6, 0),
+            EngineIds.Decision(Config, new VariantKey("S", "A"), Date, "Bar", 5, 1),
         };
 
         Assert.Equal(ids.Length, ids.Distinct().Count());
@@ -63,11 +64,27 @@ public class DeterministicIdTests
     public void VariantsNeverShareAnIdNamespace()
     {
         Assert.NotEqual(
-            EngineIds.Opportunity("A", new ConfigHash("v"), Date, "e1"),
-            EngineIds.Opportunity("A2", new ConfigHash("v"), Date, "e1"));
+            EngineIds.Opportunity(new VariantKey("S", "A"), new ConfigHash("v"), Date, "e1"),
+            EngineIds.Opportunity(new VariantKey("S", "A2"), new ConfigHash("v"), Date, "e1"));
         Assert.NotEqual(
-            EngineIds.Position(Config, "A", Date, "dec_x"),
-            EngineIds.Position(Config, "A2", Date, "dec_x"));
+            EngineIds.Position(Config, new VariantKey("S", "A"), Date, "dec_x"),
+            EngineIds.Position(Config, new VariantKey("S", "A2"), Date, "dec_x"));
+    }
+
+    [Fact]
+    public void TheSameVariantIdUnderTwoStrategies_NeverSharesAnIdNamespace()
+    {
+        var xa = new VariantKey("X", "A");
+        var ya = new VariantKey("Y", "A");
+        var hash = new ConfigHash("v");
+
+        Assert.NotEqual(EngineIds.Decision(Config, xa, Date, "Bar", 5, 0), EngineIds.Decision(Config, ya, Date, "Bar", 5, 0));
+        Assert.NotEqual(EngineIds.Opportunity(xa, hash, Date, "e1"), EngineIds.Opportunity(ya, hash, Date, "e1"));
+        Assert.NotEqual(EngineIds.Position(Config, xa, Date, "dec_x"), EngineIds.Position(Config, ya, Date, "dec_x"));
+        // the split point between the two parts must not collide either: "X"+"A.B" versus "X.A"+"B"
+        Assert.NotEqual(
+            EngineIds.Opportunity(new VariantKey("X", "A.B"), hash, Date, "e1"),
+            EngineIds.Opportunity(new VariantKey("X.A", "B"), hash, Date, "e1"));
     }
 
     [Fact]

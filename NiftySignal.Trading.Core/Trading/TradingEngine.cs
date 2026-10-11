@@ -9,6 +9,7 @@ using NiftySignal.Trading.Core.Risk;
 using NiftySignal.Trading.Core.Scheduling;
 using NiftySignal.Trading.Core.Session;
 using NiftySignal.Trading.Core.State;
+using NiftySignal.Trading.Core.Strategies;
 using NiftySignal.Trading.Core.Variants;
 
 namespace NiftySignal.Trading.Core.Trading;
@@ -46,22 +47,22 @@ public sealed class TradingEngine : IEngineHandler
 {
     private sealed class CompositeGate(TradingEngine owner) : IEntryGate
     {
-        public string? BlockReason(string variantId, DateTimeOffset now)
+        public string? BlockReason(VariantKey variant, DateTimeOffset now)
         {
-            var integrity = owner.Integrity.BlockReason(variantId, now);
+            var integrity = owner.Integrity.BlockReason(variant, now);
             if (integrity is not null)
             {
                 return integrity;
             }
 
             var execution = owner.Execution;
-            var (breached, worst) = execution.DailySlOf(variantId);
+            var (breached, worst) = execution.DailySlOf(variant);
             var state = new RiskState(
-                execution.TradesOf(variantId),
+                execution.TradesOf(variant),
                 worst ?? 0m,
-                owner.Variants.GetVariant(variantId).Spec.DailySl is not null,
+                owner.Variants.GetVariant(variant).Spec.DailySl is not null,
                 breached,
-                execution.CommittedPremiumOf(variantId),
+                execution.CommittedPremiumOf(variant),
                 0m);
             var decision = RiskPolicy.CheckEntry(owner.Config.Risk, state);
             return decision.Allowed ? null : decision.ReasonCode;
@@ -75,10 +76,11 @@ public sealed class TradingEngine : IEngineHandler
         TradingConfig config,
         DateOnly tradeDate,
         IReadOnlyList<OptionContract> universe,
-        IReadOnlyDictionary<string, IBaseStrategy> strategies,
+        IReadOnlyDictionary<string, IStrategyFamily> families,
         string runId = "run-unspecified",
         string runMode = "Historical",
-        RetentionPolicy? retention = null)
+        RetentionPolicy? retention = null,
+        string? sourceSessionId = null)
     {
         ArgumentNullException.ThrowIfNull(config);
         var errors = new List<string>(config.Validate());
@@ -110,14 +112,29 @@ public sealed class TradingEngine : IEngineHandler
         TradeDate = tradeDate;
         RunId = runId;
         RunMode = runMode;
-        Variants = new VariantEngine(config, tradeDate, universe, strategies, _outputs);
+        Variants = new VariantEngine(config, tradeDate, universe, families, _outputs, sourceSessionId);
         Retention = retention ?? RetentionPolicy.Default;
         Execution = new ExecutionEngine(config, tradeDate, Variants.Schedule, Variants, new CostModel(config.Costs, tradeDate), _outputs, Retention.QuoteHistoryRetention);
         Integrity = new IntegrityManager(config.Integrity);
         var gate = new CompositeGate(this);
         Variants.EntryGate = gate;
         Execution.EntryGate = gate;
+        Variants.StrategyExitRequested = (variantKey, scheduler) => Execution.RequestStrategyExitForVariant(variantKey, scheduler);
         Admission = new EventAdmission(q => _outputs.Add(q));
+    }
+
+    /// <summary>Compatibility constructor for single-case strategies: wraps each in <see cref="LegacyBaseStrategyFamily"/> and uses the one canonical family path.</summary>
+    public TradingEngine(
+        TradingConfig config,
+        DateOnly tradeDate,
+        IReadOnlyList<OptionContract> universe,
+        IReadOnlyDictionary<string, IBaseStrategy> strategies,
+        string runId = "run-unspecified",
+        string runMode = "Historical",
+        RetentionPolicy? retention = null,
+        string? sourceSessionId = null)
+        : this(config, tradeDate, universe, LegacyStrategies.AsFamilies(config, strategies), runId, runMode, retention, sourceSessionId)
+    {
     }
 
     public TradingConfig Config { get; }
@@ -248,7 +265,7 @@ public sealed class TradingEngine : IEngineHandler
     private void HandleOperator(OperatorCommandEvent command, IEngineScheduler scheduler)
     {
         var at = command.AvailableAt;
-        var known = command.Scope == "*" || Variants.Variants.Any(v => v.VariantId == command.Scope);
+        var known = command.Scope == "*" || (VariantKey.TryParse(command.Scope, out var scopeKey) && Variants.Variants.Any(v => v.Key == scopeKey));
         if (!known)
         {
             _outputs.Add(new KillSwitchChanged(at, command.Scope, command.Command, command.Mode, command.Actor, command.Reason, "Rejected:UnknownVariant", 0, 0, 0));

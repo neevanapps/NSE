@@ -242,16 +242,16 @@ public class AdapterEquivalenceTests
     public void IndependentVariants_AreUnaffectedByTheirNeighbours_AndKeepOneContractFromEntryToExit()
     {
         var both = Runs.Hist(Rows, Freeze)(new RecorderOptions { CaptureAll = true });
-        var onlyA = Runs.Hist(Rows, Freeze, tweak: c => c with { Variants = c.Variants.Where(v => v.Key == "A").ToDictionary(v => v.Key, v => v.Value) })(new RecorderOptions { CaptureAll = true });
+        var onlyA = Runs.Hist(Rows, Freeze, tweak: c => c with { Variants = c.Variants.Where(v => v.Key == "P6/A").ToDictionary(v => v.Key, v => v.Value) })(new RecorderOptions { CaptureAll = true });
 
         List<string> Lines(RunResult r, string variant) => r.Captured[RunRecorders.Names.Outputs]
             .Where(l => l.Key.EndsWith(":" + variant, StringComparison.Ordinal))
             .Select(l => l.Line)
             .ToList();
 
-        Assert.True(Lines(both, "A").Count > 30);
-        Assert.True(Lines(both, "B").Count > 30);
-        Assert.Equal(Lines(onlyA, "A"), Lines(both, "A"));                                                     // variant A behaves identically with or without B beside it
+        Assert.True(Lines(both, "P6/A").Count > 30);
+        Assert.True(Lines(both, "P4/B").Count > 30);
+        Assert.Equal(Lines(onlyA, "P6/A"), Lines(both, "P6/A"));                                                     // variant A behaves identically with or without B beside it
 
         var tokensByOpportunity = both.Captured[RunRecorders.Names.Outputs]
             .Where(l => l.Line.Contains("EntryIntent:", StringComparison.Ordinal))
@@ -260,8 +260,8 @@ public class AdapterEquivalenceTests
             .ToList();
         Assert.NotEmpty(tokensByOpportunity);
         Assert.All(tokensByOpportunity, g => Assert.Single(g.Distinct()));                                      // every attempt of an opportunity names the same contract
-        Assert.Contains(both.Captured[RunRecorders.Names.Outputs], l => l.Line.Contains("independent-virtual-book:A", StringComparison.Ordinal));
-        Assert.Contains(both.Captured[RunRecorders.Names.Outputs], l => l.Line.Contains("independent-virtual-book:B", StringComparison.Ordinal));
+        Assert.Contains(both.Captured[RunRecorders.Names.Outputs], l => l.Line.Contains("independent-virtual-book:P6/A", StringComparison.Ordinal));
+        Assert.Contains(both.Captured[RunRecorders.Names.Outputs], l => l.Line.Contains("independent-virtual-book:P4/B", StringComparison.Ordinal));
     }
 
     // ------------------------------------------------------------------ quiet market close
@@ -273,7 +273,7 @@ public class AdapterEquivalenceTests
         var freeze = SyntheticSession.Freeze(rows, anchor: false);
         TradingConfig OneVariant(TradingConfig c) => c with
         {
-            Variants = new Dictionary<string, VariantSpec> { ["Q"] = new() { VariantId = "Q", StrategyId = "ALWAYS", EntryCondition = new ImmediateEntrySpec() } },
+            Variants = new Dictionary<string, VariantSpec> { ["ALWAYS/Q"] = new() { VariantId = "Q", StrategyId = "ALWAYS", EntryCondition = new ImmediateEntrySpec() } },
         };
 
         var report = RunDiff.Compare(

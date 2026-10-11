@@ -58,7 +58,7 @@ public sealed record DurableRunSpec(
     SessionFreeze Freeze,
     TranslatorOptions Translator,
     TradingConfig Config,
-    IReadOnlyDictionary<string, IBaseStrategy> Strategies,
+    IReadOnlyDictionary<string, NiftySignal.Trading.Core.Strategies.IStrategyFamily> Strategies,
     RunSettings Settings,
     string SourceManifest,
     RecorderOptions? Recorder = null,
@@ -529,7 +529,7 @@ public sealed class DurableRun : IDisposable
         {
             var o = _run.Engine.Outputs[i];
             var payload = OutputCodec.Encode(o);
-            outputs.Add(new OutputRecord(i, stepSeq, o.GetType().Name, o.VariantId, o.At, payload, OutputCodec.ContentHash(payload)));
+            outputs.Add(new OutputRecord(i, stepSeq, o.GetType().Name, o.StrategyId, o.VariantId, o.At, payload, OutputCodec.ContentHash(payload)));
         }
 
         var digests = _run.Recorders.Digests().OrderBy(d => d.Key, StringComparer.Ordinal).Select(d => new ChannelDigestRecord(d.Key, d.Value.Count, d.Value.Hash)).ToList();

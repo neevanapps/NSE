@@ -10,10 +10,10 @@ namespace NiftySignal.Tests.Trading.Core;
 public class ConfigCp2HashTests
 {
     // Independently computed (Python hashlib over the hand-written canonical text), then pinned. See contract section A.12.
-    private const string GoldenVariantsJson = """{"Candles":{"Clock":"AdaptiveFuturesBars","HistoryDepth":64,"MaxCloseAge":null,"MinObservationsPerCandle":1},"ConfigVersion":"cp2-test","Costs":{"Schedules":[]},"Execution":{"Adapter":"Simulated","BelowBand":"ResearchEnforceBand","Books":"IndependentVirtualBooks","CancelLatency":"00:00:01","EntryOrderLifetime":"00:00:05","ExitRetryInterval":"00:00:01","FillFractionOfDisplayed":1,"Latency":"00:00:01","MaxQuoteAge":"00:00:02","MaxSpreadAbsolute":2,"MaxSpreadFraction":0.03,"PartialEntry":"KeepFilledCancelRemainder","RequireDisplayedQuantity":true,"SignalQuoteReuse":"AllowFreshSignalQuote"},"Integrity":{"ReadyBarMustStartAfterRecovery":true,"RequireFutureQuoteAfterRecovery":true,"RequireReadyBarAfterRecovery":true},"Risk":{"DailySlEnforcement":"None","MaxPeakPremiumExposure":null,"MaxTradesPerDay":null,"Name":"ResearchV1","Version":"1"},"SchemaVersion":5,"Selection":{"ExpiryPolicy":"NearestExpiryOnOrAfterTradeDate","MaxQuoteAge":"00:00:02","MaximumEntryPremium":150,"MinCalendarDaysToExpiry":0,"MinimumEntryPremium":100,"Ranking":["AskNearestBandMidpoint","SmallestSpread"]},"Session":{"EntryClose":"15:00:00.0000000","EntryOpen":"09:30:00.0000000","FinalClose":"15:10:00.0000000","LiquidationStart":null,"SessionEnd":"15:35:00.0000000","TimeZoneId":"Asia/Kolkata"},"Variants":{"A":{"AccountId":null,"DailySl":null,"EntryCondition":{"Kind":"Immediate"},"Exit":{"FinalTpPct":null,"RemainderSl":"Unchanged","Tp1Pct":null,"Tp1Proportion":null,"TradeSlPct":null},"MaxAttemptsPerOpportunity":null,"OnCapacityBlocked":null,"Reentry":"NewEpisodeRequired","Sizing":{"Kind":"FixedQuantity","Units":650},"StrategyId":"S","VariantId":"A"},"A2":{"AccountId":null,"DailySl":null,"EntryCondition":{"Kind":"AskBelowCandleMA","N":10,"PriceSource":"AskClose"},"Exit":{"FinalTpPct":null,"RemainderSl":"Unchanged","Tp1Pct":null,"Tp1Proportion":null,"TradeSlPct":null},"MaxAttemptsPerOpportunity":null,"OnCapacityBlocked":null,"Reentry":"NewEpisodeRequired","Sizing":{"Kind":"FixedQuantity","Units":650},"StrategyId":"S","VariantId":"A2"}}}""";
+    private const string GoldenVariantsJson = """{"Candles":{"Clock":"AdaptiveFuturesBars","HistoryDepth":64,"MaxCloseAge":null,"MinObservationsPerCandle":1},"ConfigVersion":"cp2-test","Costs":{"Schedules":[]},"Execution":{"Adapter":"Simulated","BelowBand":"ResearchEnforceBand","Books":"IndependentVirtualBooks","CancelLatency":"00:00:01","EntryOrderLifetime":"00:00:05","ExitRetryInterval":"00:00:01","FillFractionOfDisplayed":1,"Latency":"00:00:01","MaxQuoteAge":"00:00:02","MaxSpreadAbsolute":2,"MaxSpreadFraction":0.03,"PartialEntry":"KeepFilledCancelRemainder","RequireDisplayedQuantity":true,"SignalQuoteReuse":"AllowFreshSignalQuote"},"Integrity":{"ReadyBarMustStartAfterRecovery":true,"RequireFutureQuoteAfterRecovery":true,"RequireReadyBarAfterRecovery":true},"Risk":{"DailySlEnforcement":"None","MaxPeakPremiumExposure":null,"MaxTradesPerDay":null,"Name":"ResearchV1","Version":"1"},"SchemaVersion":6,"Selection":{"ExpiryPolicy":"NearestExpiryOnOrAfterTradeDate","MaxQuoteAge":"00:00:02","MaximumEntryPremium":150,"MinCalendarDaysToExpiry":0,"MinimumEntryPremium":100,"Ranking":["AskNearestBandMidpoint","SmallestSpread"]},"Session":{"EntryClose":"15:00:00.0000000","EntryOpen":"09:30:00.0000000","FinalClose":"15:10:00.0000000","LiquidationStart":null,"SessionEnd":"15:35:00.0000000","TimeZoneId":"Asia/Kolkata"},"Variants":{"S/A":{"AccountId":null,"DailySl":null,"EntryCondition":{"Kind":"Immediate"},"Exit":{"FinalTpPct":null,"RemainderSl":"Unchanged","Tp1Pct":null,"Tp1Proportion":null,"TradeSlPct":null},"MaxAttemptsPerOpportunity":null,"OnCapacityBlocked":null,"Reentry":"NewEpisodeRequired","Sizing":{"Kind":"FixedQuantity","Units":650},"StrategyId":"S","VariantId":"A"},"S/A2":{"AccountId":null,"DailySl":null,"EntryCondition":{"Kind":"AskBelowCandleMA","N":10,"PriceSource":"AskClose"},"Exit":{"FinalTpPct":null,"RemainderSl":"Unchanged","Tp1Pct":null,"Tp1Proportion":null,"TradeSlPct":null},"MaxAttemptsPerOpportunity":null,"OnCapacityBlocked":null,"Reentry":"NewEpisodeRequired","Sizing":{"Kind":"FixedQuantity","Units":650},"StrategyId":"S","VariantId":"A2"}}}""";
 
-    private const string GoldenVariantsHash = "c9bf8374e80785a733b1daf5f1b370b3eaea43d230d043f92e8692db9d2b3cb1";
-    private const string GoldenA2VariantHash = "8a55ac2e4d1f831749e81d29ed10035cc07073ce7b0c0a1d05195030b8e23d58";
+    private const string GoldenVariantsHash = "0030e1d4c6bddc7a6a9e25e25ea301fc331e4cc470cd144bbdd630feaca4de4b";
+    private const string GoldenA2VariantHash = "51ff8d871d84e905ccadd4ce83e613c8cba3d49c5fb044be1fc1c8733c50fbc2";
 
     private static VariantSpec A() => new() { VariantId = "A", StrategyId = "S", EntryCondition = new ImmediateEntrySpec() };
 
@@ -21,7 +21,7 @@ public class ConfigCp2HashTests
         => new() { VariantId = "A2", StrategyId = "S", EntryCondition = new AskBelowCandleMaSpec { N = n, PriceSource = source } };
 
     private static TradingConfig WithVariants(params VariantSpec[] variants)
-        => new() { ConfigVersion = "cp2-test", Variants = variants.ToDictionary(v => v.VariantId) };
+        => new() { ConfigVersion = "cp2-test", Variants = variants.ToDictionary(v => v.StrategyId + "/" + v.VariantId) };
 
     [Fact]
     public void ConfigWithVariants_HasAPinnedCanonicalFormAndHash()
@@ -30,7 +30,7 @@ public class ConfigCp2HashTests
 
         Assert.Equal(GoldenVariantsJson, config.ToCanonicalJson());
         Assert.Equal(GoldenVariantsHash, config.ComputeHash().Value);
-        Assert.Equal(GoldenA2VariantHash, config.ComputeVariantHash("A2").Value);
+        Assert.Equal(GoldenA2VariantHash, config.ComputeVariantHash(Vk.S("A2")).Value);
     }
 
     [Fact]
@@ -60,20 +60,20 @@ public class ConfigCp2HashTests
 
         Assert.NotEqual(baseline.ComputeHash(), WithVariants(A2(n: 11)).ComputeHash());
         Assert.NotEqual(baseline.ComputeHash(), WithVariants(A2(source: CandlePriceSource.MidClose)).ComputeHash());
-        Assert.NotEqual(baseline.ComputeVariantHash("A2"), WithVariants(A2(n: 11)).ComputeVariantHash("A2"));
+        Assert.NotEqual(baseline.ComputeVariantHash(Vk.S("A2")), WithVariants(A2(n: 11)).ComputeVariantHash(Vk.S("A2")));
         Assert.NotEqual(baseline.ComputeHash(), (baseline with { Candles = new CandleConfig { MinObservationsPerCandle = 2 } }).ComputeHash());
         Assert.NotEqual(
             baseline.ComputeHash(),
             WithVariants(A2() with { Sizing = new FixedQuantitySpec { Units = 130 } }).ComputeHash());
         Assert.NotEqual(
-            WithVariants(A()).ComputeVariantHash("A"),
-            WithVariants(A() with { EntryCondition = new AskBelowCandleMaSpec { N = 1, PriceSource = CandlePriceSource.AskClose } }).ComputeVariantHash("A"));
+            WithVariants(A()).ComputeVariantHash(Vk.S("A")),
+            WithVariants(A() with { EntryCondition = new AskBelowCandleMaSpec { N = 1, PriceSource = CandlePriceSource.AskClose } }).ComputeVariantHash(Vk.S("A")));
     }
 
     [Fact]
     public void AnotherVariantsPresence_DoesNotChangeAVariantHash()
     {
-        Assert.Equal(WithVariants(A2()).ComputeVariantHash("A2"), WithVariants(A(), A2()).ComputeVariantHash("A2"));
+        Assert.Equal(WithVariants(A2()).ComputeVariantHash(Vk.S("A2")), WithVariants(A(), A2()).ComputeVariantHash(Vk.S("A2")));
     }
 
     [Fact]
@@ -99,7 +99,7 @@ public class ConfigCp2HashTests
         Assert.Equal(CapacityBlockedPolicy.Wait, A2().ResolveCapacityPolicy());                       // waiting condition
         Assert.Equal(ReentryPolicy.NewEpisodeRequired, spec.Reentry);
         Assert.Null(spec.MaxAttemptsPerOpportunity);                                                  // attempts are not trades: unlimited
-        Assert.Equal("A", spec.ResolveAccountId());
+        Assert.Equal("S/A", spec.ResolveAccountId());                                                   // default account = the canonical identity (StrategyId/VariantId)
     }
 
     [Fact]

@@ -71,6 +71,9 @@ public sealed record OpenPositionValuation(string PositionId, ValuationStatus St
 /// </summary>
 public sealed record VariantDailySummary
 {
+    /// <summary>The logical strategy family that owns the variant (family roll-ups group by this).</summary>
+    public required string StrategyId { get; init; }
+
     public required string VariantId { get; init; }
 
     public required string AccountId { get; init; }
@@ -179,8 +182,8 @@ public static class DailySummaryBuilder
         var execution = engine.Execution;
         foreach (var variant in engine.Variants.Variants)
         {
-            var id = variant.VariantId;
-            var outputs = engine.Outputs.Where(o => o.VariantId == id).ToList();
+            var id = variant.Key;
+            var outputs = engine.Outputs.Where(o => o.Variant == id).ToList();
             var transitions = outputs.OfType<OpportunityTransition>().ToList();
             var created = transitions.Count(t => t.From == OpportunityState.Created);
             var ends = transitions
@@ -233,7 +236,8 @@ public static class DailySummaryBuilder
 
             summaries.Add(new VariantDailySummary
             {
-                VariantId = id,
+                StrategyId = id.StrategyId,
+                VariantId = id.VariantId,
                 AccountId = variant.Spec.ResolveAccountId(),
                 Book = execution.BookLabel(id),
                 RunId = engine.RunId,

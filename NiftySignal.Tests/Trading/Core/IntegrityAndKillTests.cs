@@ -47,12 +47,12 @@ public class IntegrityTests
         kit.Feed(Ctl.Degraded(kit.At(20), 2));                                          // already degraded: no new transition
         kit.Feed(Ctl.Healthy(kit.At(30), 3));
         Assert.Equal(IntegrityState.Recovering, kit.Engine.Integrity.State);
-        Assert.Equal("IntegrityRecovering", kit.Engine.Integrity.BlockReason("A", kit.At(30)));    // still blocked until the evidence arrives
+        Assert.Equal("IntegrityRecovering", kit.Engine.Integrity.BlockReason(Vk.S("A"), kit.At(30)));    // still blocked until the evidence arrives
         kit.Feed(Rec.Fut(kit.At(40), 1));
         kit.Feed(Rec.ReadyBar(kit.At(35), kit.At(41), 5));                              // ready bar that started after the recovery instant
 
         Assert.Equal(IntegrityState.Healthy, kit.Engine.Integrity.State);
-        Assert.Null(kit.Engine.Integrity.BlockReason("A", kit.At(41)));
+        Assert.Null(kit.Engine.Integrity.BlockReason(Vk.S("A"), kit.At(41)));
         var t = Transitions(kit);
         Assert.Equal(
             new[] { (IntegrityState.Healthy, IntegrityState.Degraded), (IntegrityState.Degraded, IntegrityState.Recovering), (IntegrityState.Recovering, IntegrityState.Healthy) },
@@ -94,7 +94,7 @@ public class IntegrityTests
         kit.Feed(kit.Q(kit.At(33), 124m, 125m));
 
         Assert.Equal(IntegrityState.Recovering, kit.Engine.Integrity.State);
-        Assert.Equal("IntegrityRecovering", kit.Engine.Integrity.BlockReason("A", kit.At(33)));
+        Assert.Equal("IntegrityRecovering", kit.Engine.Integrity.BlockReason(Vk.S("A"), kit.At(33)));
         Assert.Equal(2, Transitions(kit).Count);
     }
 
@@ -157,20 +157,20 @@ public class IntegrityTests
     {
         var kit = NewKit();
         kit.Bar(TradeKit.T0, 1, kit.Q(TradeKit.T0, 124m, 125m));                       // an entry attempt is pending (matures at 1 s)
-        var slot = kit.Engine.Variants.GetVariant("A").Slots[0];
+        var slot = kit.Engine.Variants.GetVariant(Vk.S("A")).Slots[0];
         Assert.Equal(SlotState.Reserved, slot.State);
 
         kit.Feed(Ctl.Degraded(kit.At(0.5), 1));
         var cancel = Assert.Single(kit.Out<CancelRequest>("A"));
         Assert.Equal(CancelReason.IntegrityDegraded, cancel.Reason);
         Assert.Equal(SlotState.Reserved, slot.State);                                  // reservation kept until the cancellation is resolved
-        Assert.Equal(OpportunityState.OrderPending, kit.Engine.Variants.GetVariant("A").Active!.State);
+        Assert.Equal(OpportunityState.OrderPending, kit.Engine.Variants.GetVariant(Vk.S("A")).Active!.State);
 
         kit.Loop.AdvanceTo(kit.At(1.2));                                               // the order matures: the integrity gate cancels it instead of filling it
         Assert.Empty(kit.Fills());
         Assert.Equal(OrderStatus.Cancelled, kit.Engine.Execution.EntryOrders.Single().Status);
         Assert.Equal(SlotState.Free, slot.State);
-        Assert.Equal(OpportunityState.Waiting, kit.Engine.Variants.GetVariant("A").Active!.State);       // the idea survives; entries stay blocked
+        Assert.Equal(OpportunityState.Waiting, kit.Engine.Variants.GetVariant(Vk.S("A")).Active!.State);       // the idea survives; entries stay blocked
 
         kit.Feed(kit.Q(kit.At(2), 124m, 125m));                                        // a perfectly good quote while Degraded
         Assert.Single(kit.Out<EntryIntent>("A"));
@@ -359,19 +359,19 @@ public class KillSwitchTests
         var script = new ScriptedStrategy("S", seq => new StrategyValidity(seq is 1 or 3, OptionSide.Call, "x"));
         var kit = new TradeKit(TradeKit.MakeConfig(variants: new[] { new VariantSpec { VariantId = "A", StrategyId = "S", EntryCondition = new NiftySignal.Trading.Core.Entry.AskBelowCandleMaSpec { N = 1, PriceSource = NiftySignal.Trading.Core.Candles.CandlePriceSource.AskClose } } }), null, script);
         kit.Bar(TradeKit.T0, 1, kit.Q(TradeKit.T0, 124m, 125m));                       // waiting
-        var first = kit.Engine.Variants.GetVariant("A").Active!;
+        var first = kit.Engine.Variants.GetVariant(Vk.S("A")).Active!;
 
         kit.Feed(Ctl.Kill(kit.At(2), 1));
         Assert.Equal("Killed", Last(kit).Effect);
         Assert.Equal(1, Last(kit).CancelledWaiting);
         Assert.Equal(OpportunityState.Cancelled, first.State);
         Assert.Equal("KillSwitch", first.TerminalReason);
-        Assert.Equal("KillSwitch", kit.Engine.Integrity.BlockReason("A", kit.At(2)));
+        Assert.Equal("KillSwitch", kit.Engine.Integrity.BlockReason(Vk.S("A"), kit.At(2)));
 
         kit.Feed(Ev.Bar(kit.At(3), 2));                                                // strategy invalid
         kit.Feed(Ctl.Reset(kit.At(4), 2));
         Assert.Equal("Reset", Last(kit).Effect);
-        Assert.Null(kit.Engine.Integrity.BlockReason("A", kit.At(4)));
+        Assert.Null(kit.Engine.Integrity.BlockReason(Vk.S("A"), kit.At(4)));
         Assert.Equal(OpportunityState.Cancelled, first.State);                         // not resurrected
 
         kit.Bar(kit.At(6), 3, kit.Q(kit.At(6), 129m, 130m));                           // a NEW episode after the reset
@@ -386,7 +386,7 @@ public class KillSwitchTests
     {
         var kit = NewKit();
         kit.Bar(TradeKit.T0, 1, kit.Q(TradeKit.T0, 124m, 125m));
-        var slot = kit.Engine.Variants.GetVariant("A").Slots[0];
+        var slot = kit.Engine.Variants.GetVariant(Vk.S("A")).Slots[0];
 
         kit.Feed(Ctl.Kill(kit.At(0.5), 1));
         Assert.Equal(1, Last(kit).CancelledPending);
@@ -408,26 +408,26 @@ public class KillSwitchTests
         var kit = NewKit(TradeKit.Immediate("A"), TradeKit.Immediate("B"));
         kit.Bar(TradeKit.T0, 1, kit.Q(TradeKit.T0, 124m, 125m));
 
-        kit.Feed(Ctl.Kill(kit.At(0.5), 1, "A"));
+        kit.Feed(Ctl.Kill(kit.At(0.5), 1, "S/A"));
         kit.Loop.AdvanceTo(kit.At(1.5));
         Assert.Empty(kit.Fills("A"));
         Assert.Single(kit.Fills("B"));                                                 // B was not in scope
 
-        kit.Feed(Ctl.Kill(kit.At(2), 2, "A"));
+        kit.Feed(Ctl.Kill(kit.At(2), 2, "S/A"));
         Assert.Equal("AlreadyKilled", Last(kit).Effect);
-        kit.Feed(Ctl.Kill(kit.At(3), 3, "Z"));
+        kit.Feed(Ctl.Kill(kit.At(3), 3, "S/Z"));
         Assert.Equal("Rejected:UnknownVariant", Last(kit).Effect);
 
         kit.Feed(Ctl.Kill(kit.At(4), 4));
         Assert.True(kit.Engine.Integrity.KillAll);
-        kit.Feed(Ctl.Reset(kit.At(5), 5, "A"));
+        kit.Feed(Ctl.Reset(kit.At(5), 5, "S/A"));
         Assert.Equal("ResetIgnored:GlobalKillActive", Last(kit).Effect);
-        Assert.Equal("KillSwitch", kit.Engine.Integrity.BlockReason("A", kit.At(5)));
+        Assert.Equal("KillSwitch", kit.Engine.Integrity.BlockReason(Vk.S("A"), kit.At(5)));
         kit.Feed(Ctl.Reset(kit.At(6), 6));
         Assert.Equal("Reset", Last(kit).Effect);
         kit.Feed(Ctl.Reset(kit.At(7), 7));
         Assert.Equal("NothingToReset", Last(kit).Effect);
-        Assert.Null(kit.Engine.Integrity.BlockReason("A", kit.At(7)));
+        Assert.Null(kit.Engine.Integrity.BlockReason(Vk.S("A"), kit.At(7)));
     }
 
     [Fact]

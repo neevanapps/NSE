@@ -9,6 +9,7 @@ using NiftySignal.Trading.Core.Scheduling;
 using NiftySignal.Trading.Core.Session;
 using NiftySignal.Trading.Core.State;
 using NiftySignal.Trading.Core.Variants;
+using NiftySignal.Trading.Core.Strategies;
 
 namespace NiftySignal.Trading.Core.Execution;
 
@@ -45,14 +46,14 @@ public sealed class ExecutionEngine
 
     private sealed class Book
     {
-        public Book(string variantId, int ordinal, decimal? dailySl)
+        public Book(VariantKey variant, int ordinal, decimal? dailySl)
         {
-            VariantId = variantId;
+            Variant = variant;
             Ordinal = ordinal;
             DailySl = dailySl;
         }
 
-        public string VariantId { get; }
+        public VariantKey Variant { get; }
 
         public int Ordinal { get; }
 
@@ -106,7 +107,7 @@ public sealed class ExecutionEngine
         _history = new QuoteHistory(quoteHistoryRetention ?? _x.MaxQuoteAge + TimeSpan.FromMinutes(1));
         foreach (var v in variants.Variants)
         {
-            _books.Add(new Book(v.VariantId, v.Ordinal, v.Spec.DailySl));
+            _books.Add(new Book(v.Key, v.Ordinal, v.Spec.DailySl));
         }
     }
 
@@ -119,28 +120,28 @@ public sealed class ExecutionEngine
     public IEntryGate? EntryGate { get; set; }
 
     /// <summary>Trades opened so far by the variant (positions; a partial exit is not a trade).</summary>
-    public int TradesOf(string variantId) => BookOf(variantId).Positions.Count;
+    public int TradesOf(VariantKey variant) => BookOf(variant).Positions.Count;
 
-    public decimal PeakPremiumOf(string variantId) => BookOf(variantId).PeakExposure;
+    public decimal PeakPremiumOf(VariantKey variant) => BookOf(variant).PeakExposure;
 
-    public decimal CommittedPremiumOf(string variantId) => Committed(BookOf(variantId));
+    public decimal CommittedPremiumOf(VariantKey variant) => Committed(BookOf(variant));
 
-    public (bool Breached, decimal? Worst) DailySlOf(string variantId)
+    public (bool Breached, decimal? Worst) DailySlOf(VariantKey variant)
     {
-        var book = BookOf(variantId);
+        var book = BookOf(variant);
         return (book.Breached, book.WorstDailyPnl);
     }
 
     public IReadOnlyList<EntryOrder> EntryOrders => _entryOrders;
 
-    public IReadOnlyList<Position> PositionsOf(string variantId) => BookOf(variantId).Positions;
+    public IReadOnlyList<Position> PositionsOf(VariantKey variant) => BookOf(variant).Positions;
 
     public IEnumerable<Position> AllPositions => _books.SelectMany(b => b.Positions);
 
     /// <summary>Cash of the variant's virtual book: -(entry notional + costs) + (exit notional - costs). With the book flat it equals the sum of closed positions' net P&amp;L.</summary>
-    public decimal CashOf(string variantId) => BookOf(variantId).Cash;
+    public decimal CashOf(VariantKey variant) => BookOf(variant).Cash;
 
-    public string BookLabel(string variantId) => "independent-virtual-book:" + variantId;
+    public string BookLabel(VariantKey variant) => "independent-virtual-book:" + variant;
 
     public void AppendQuote(QuoteEvent quote) => _history.Append(quote);
 
@@ -155,7 +156,7 @@ public sealed class ExecutionEngine
         w.Line("ended", _ended);
         foreach (var book in _books)
         {
-            using var bs = w.Scope("book/" + book.VariantId);
+            using var bs = w.Scope("book/" + book.Variant);
             w.Line("cash", book.Cash);
             w.Line("breached", book.Breached);
             w.Line("worstDailyPnl", book.WorstDailyPnl);
@@ -247,10 +248,10 @@ public sealed class ExecutionEngine
         var order = new EntryOrder(intent, intent.At + _x.Latency, intent.At + _x.EntryOrderLifetime);
         _entryOrders.Add(order);
         _entryById.Add(order.Id, order);
-        var ordinal = BookOf(intent.VariantId).Ordinal;
+        var ordinal = BookOf(intent.Variant).Ordinal;
         order.Handles.Add(s.Schedule(order.MaturityAt, DeadlineClass.ExecutionMaturity, ordinal, MaturePrefix + order.Id));
         order.Handles.Add(s.Schedule(order.ExpiresAt, DeadlineClass.ExecutionMaturity, ordinal, ExpirePrefix + order.Id));
-        Touch(BookOf(intent.VariantId));
+        Touch(BookOf(intent.Variant));
     }
 
     public void RequestCancel(CancelRequest request, IEngineScheduler s)
@@ -267,7 +268,7 @@ public sealed class ExecutionEngine
             return;
         }
 
-        order.Handles.Add(s.Schedule(s.Now + _x.CancelLatency, DeadlineClass.ExecutionMaturity, BookOf(order.Intent.VariantId).Ordinal, CancelPrefix + order.Id));
+        order.Handles.Add(s.Schedule(s.Now + _x.CancelLatency, DeadlineClass.ExecutionMaturity, BookOf(order.Intent.Variant).Ordinal, CancelPrefix + order.Id));
     }
 
     /// <summary>A resting entry order that has matured sees every new quote of its contract (execution time = the quote's AvailableAt).</summary>
@@ -313,13 +314,13 @@ public sealed class ExecutionEngine
             return;
         }
 
-        if (!_variants.IsStrategyValidFor(intent.VariantId, intent.OpportunityId))
+        if (!_variants.IsStrategyValidFor(intent.Variant, intent.OpportunityId))
         {
             Resolve(order, EntryOutcomeKind.Cancelled, "StrategyInvalidated", s);
             return;
         }
 
-        var gateBlock = EntryGate?.BlockReason(intent.VariantId, execTime);
+        var gateBlock = EntryGate?.BlockReason(intent.Variant, execTime);
         if (gateBlock is not null)
         {
             Resolve(order, EntryOutcomeKind.Cancelled, "Gate:" + gateBlock, s);
@@ -361,7 +362,7 @@ public sealed class ExecutionEngine
             return;
         }
 
-        var book = BookOf(intent.VariantId);
+        var book = BookOf(intent.Variant);
         var usable = UsableQuantity(book, quote.Token, TradeSide.Buy, ask, quote.AskQty);
         var lots = (int)Math.Min(intent.Lots, usable / intent.LotSize);
         if (lots <= 0)
@@ -418,9 +419,9 @@ public sealed class ExecutionEngine
     private void OpenPosition(Book book, EntryOrder order, long quantity, decimal price, bool belowBand, QuoteSnapshot quote, DateTimeOffset execTime)
     {
         var intent = order.Intent;
-        var variant = _variants.GetVariant(intent.VariantId);
-        var positionId = EngineIds.Position(new ConfigHash(variant.VariantHash), intent.VariantId, _tradeDate, intent.DecisionId);
-        var position = new Position(positionId, intent.VariantId, intent.OpportunityId, intent.DecisionId, intent.Contract, intent.SlotNo, execTime)
+        var variant = _variants.GetVariant(intent.Variant);
+        var positionId = EngineIds.Position(new ConfigHash(variant.VariantHash), intent.Variant, _tradeDate, intent.DecisionId);
+        var position = new Position(positionId, intent.Variant, intent.OpportunityId, intent.DecisionId, intent.Contract, intent.SlotNo, execTime)
         {
             EntryQuantity = quantity,
             OpenQuantity = quantity,
@@ -440,7 +441,7 @@ public sealed class ExecutionEngine
 
         _out.Add(new FillRecord(
             execTime,
-            intent.VariantId,
+            intent.Variant,
             FillId(book, order.Id),
             order.Id,
             positionId,
@@ -455,8 +456,8 @@ public sealed class ExecutionEngine
             null,
             null,
             quote.SourceId,
-            BookLabel(intent.VariantId)));
-        _out.Add(new PositionOpened(execTime, intent.VariantId, positionId, intent.OpportunityId, intent.Contract.Token, quantity, position.AvgEntryPrice));
+            BookLabel(intent.Variant)));
+        _out.Add(new PositionOpened(execTime, intent.Variant, positionId, intent.OpportunityId, intent.Contract.Token, quantity, position.AvgEntryPrice));
     }
 
     private void Resolve(EntryOrder order, EntryOutcomeKind kind, string reason, IEngineScheduler s)
@@ -478,9 +479,9 @@ public sealed class ExecutionEngine
         }
 
         order.Handles.Clear();
-        FlushNotes(order.NoteCounts, order.Intent.VariantId, order.Intent.OpportunityId, "EntryOrder", order.Id, s.Now);
-        _out.Add(new AuditRecord(s.Now, order.Intent.VariantId, order.Intent.OpportunityId, "EntryOrder", kind.ToString(), reason));
-        _variants.ReportEntryOutcome(new EntryOutcome(order.Intent.VariantId, order.Intent.OpportunityId, order.Id, kind), s);
+        FlushNotes(order.NoteCounts, order.Intent.Variant, order.Intent.OpportunityId, "EntryOrder", order.Id, s.Now);
+        _out.Add(new AuditRecord(s.Now, order.Intent.Variant, order.Intent.OpportunityId, "EntryOrder", kind.ToString(), reason));
+        _variants.ReportEntryOutcome(new EntryOutcome(order.Intent.Variant, order.Intent.OpportunityId, order.Id, kind), s);
     }
 
     private void NoteEntry(EntryOrder order, string note, DateTimeOffset at)
@@ -492,7 +493,7 @@ public sealed class ExecutionEngine
         }
 
         order.LastNote = note;
-        _out.Add(new AuditRecord(at, order.Intent.VariantId, order.Intent.OpportunityId, "EntryOrder", "Working:" + note, "no fill at this execution time; the order keeps working until it expires"));
+        _out.Add(new AuditRecord(at, order.Intent.Variant, order.Intent.OpportunityId, "EntryOrder", "Working:" + note, "no fill at this execution time; the order keeps working until it expires"));
     }
 
     // ------------------------------------------------------------------ deadlines
@@ -577,7 +578,7 @@ public sealed class ExecutionEngine
             return;
         }
 
-        var spec = _variants.GetVariant(position.VariantId).Spec.Exit;
+        var spec = _variants.GetVariant(position.Variant).Spec.Exit;
         var bid = quote.Bid!.Value;
         var avg = position.AvgEntryPrice;
 
@@ -609,7 +610,7 @@ public sealed class ExecutionEngine
             if (targetLots <= 0)
             {
                 position.Tp1 = Tp1State.Skipped;
-                _out.Add(new Tp1Resolved(s.Now, position.VariantId, position.Id, Tp1State.Skipped, 0, openLots));
+                _out.Add(new Tp1Resolved(s.Now, position.Variant, position.Id, Tp1State.Skipped, 0, openLots));
                 return;
             }
 
@@ -621,15 +622,15 @@ public sealed class ExecutionEngine
 
             position.Tp1 = Tp1State.Triggered;
             position.Tp1TargetQuantity = quantity;
-            _out.Add(new Tp1Resolved(s.Now, position.VariantId, position.Id, Tp1State.Triggered, quantity, openLots));
+            _out.Add(new Tp1Resolved(s.Now, position.Variant, position.Id, Tp1State.Triggered, quantity, openLots));
             CreateExit(book, position, ExitReason.Tp1, quantity, avg * (1m + tp1Pct), quote.SourceId, s);
         }
     }
 
     /// <summary>Later signals close positions through the same execution path: whole lots only, never more than the unreserved quantity.</summary>
-    public void RequestStrategyExit(string variantId, string positionId, long? quantity, IEngineScheduler s)
+    public void RequestStrategyExit(VariantKey variant, string positionId, long? quantity, IEngineScheduler s)
     {
-        var book = BookOf(variantId);
+        var book = BookOf(variant);
         var position = book.Positions.FirstOrDefault(p => p.Id == positionId) ?? throw new KeyNotFoundException($"Unknown position {positionId}.");
         if (position.State != PositionState.Open)
         {
@@ -646,11 +647,31 @@ public sealed class ExecutionEngine
         CreateExit(book, position, ExitReason.StrategyExit, wanted, null, 0, s);
     }
 
+    /// <summary>
+    /// Family Exit decision: closes the variant's own open position(s) through the normal exit path (ExitReason.StrategyExit), whole unreserved lots only.
+    /// Positions whose quantity is already fully reserved by live exit orders are left alone (the exit is already under way). Never touches a sibling variant.
+    /// </summary>
+    public int RequestStrategyExitForVariant(VariantKey variant, IEngineScheduler s)
+    {
+        var book = BookOf(variant);
+        var requested = 0;
+        foreach (var position in book.Positions.Where(p => p.State == PositionState.Open).ToList())
+        {
+            if (position.OpenQuantity - position.ReservedExitQuantity > 0)
+            {
+                RequestStrategyExit(variant, position.Id, null, s);
+                requested++;
+            }
+        }
+
+        return requested;
+    }
+
     private void CreateExit(Book book, Position position, ExitReason reason, long quantity, decimal? threshold, long triggerSeq, IEngineScheduler s)
     {
         position.ExitSeq++;
-        var variant = _variants.GetVariant(position.VariantId);
-        var decisionId = EngineIds.Decision(new ConfigHash(variant.VariantHash), position.VariantId, variant.Spec.StrategyId, _tradeDate, "Exit" + reason + "@" + position.Id, triggerSeq, position.ExitSeq);   // the position id keeps exit ids unique across the several positions a variant opens in a day
+        var variant = _variants.GetVariant(position.Variant);
+        var decisionId = EngineIds.Decision(new ConfigHash(variant.VariantHash), position.Variant, _tradeDate, "Exit" + reason + "@" + position.Id, triggerSeq, position.ExitSeq);   // the position id keeps exit ids unique across the several positions a variant opens in a day
         var orderId = EngineIds.Order(decisionId, "exit", 1);
         var order = new ExitOrder(orderId, position, reason, quantity, threshold, s.Now);
         position.ExitOrders.Add(order);
@@ -658,7 +679,7 @@ public sealed class ExecutionEngine
         _exitById.Add(orderId, order);
         var first = s.Now + _x.Latency;
         order.AttemptHandle = s.Schedule(first, DeadlineClass.ExecutionMaturity, book.Ordinal, ExitPrefix + orderId);
-        _out.Add(new ExitOrderCreated(s.Now, position.VariantId, orderId, position.Id, reason, quantity, first, threshold));
+        _out.Add(new ExitOrderCreated(s.Now, position.Variant, orderId, position.Id, reason, quantity, first, threshold));
     }
 
     private void AttemptExit(ExitOrder order, IEngineScheduler s)
@@ -669,7 +690,7 @@ public sealed class ExecutionEngine
         }
 
         var position = order.Position;
-        var book = BookOf(position.VariantId);
+        var book = BookOf(position.Variant);
         var execTime = s.Now;
         order.Attempts++;
         string? failure = null;
@@ -707,7 +728,7 @@ public sealed class ExecutionEngine
             if (failure is not null && order.LastNote != failure)
             {
                 order.LastNote = failure;
-                _out.Add(new AuditRecord(execTime, position.VariantId, position.OpportunityId, "ExitOrder", "Retry:" + failure, "order " + order.Id));
+                _out.Add(new AuditRecord(execTime, position.Variant, position.OpportunityId, "ExitOrder", "Retry:" + failure, "order " + order.Id));
             }
 
             order.AttemptHandle = s.Schedule(execTime + _x.ExitRetryInterval, DeadlineClass.RiskRetry, book.Ordinal, ExitPrefix + order.Id);
@@ -765,7 +786,7 @@ public sealed class ExecutionEngine
 
         _out.Add(new FillRecord(
             execTime,
-            position.VariantId,
+            position.Variant,
             FillId(book, order.Id),
             order.Id,
             position.Id,
@@ -780,7 +801,7 @@ public sealed class ExecutionEngine
             order.Reason,
             order.TriggerThreshold,
             quote.SourceId,
-            BookLabel(position.VariantId)));
+            BookLabel(position.Variant)));
         if (order.Reason == ExitReason.Tp1)
         {
             position.Tp1FilledQuantity += quantity;
@@ -793,7 +814,7 @@ public sealed class ExecutionEngine
         if (order.RemainingQuantity == 0)
         {
             order.Status = OrderStatus.Filled;
-            FlushNotes(order.NoteCounts, position.VariantId, position.OpportunityId, "ExitOrder", order.Id, execTime);
+            FlushNotes(order.NoteCounts, position.Variant, position.OpportunityId, "ExitOrder", order.Id, execTime);
         }
 
         if (position.OpenQuantity == 0)
@@ -801,8 +822,8 @@ public sealed class ExecutionEngine
             position.State = PositionState.Closed;
             position.ClosedAt = execTime;
             var gross = position.GrossRealised;
-            _out.Add(new PositionClosed(execTime, position.VariantId, position.Id, position.Contract.Token, position.EntryQuantity, position.AvgEntryPrice, gross, position.TotalCosts, position.NetRealised));
-            _variants.ReportPositionClosed(position.VariantId, position.OpportunityId, s);
+            _out.Add(new PositionClosed(execTime, position.Variant, position.Id, position.Contract.Token, position.EntryQuantity, position.AvgEntryPrice, gross, position.TotalCosts, position.NetRealised));
+            _variants.ReportPositionClosed(position.Variant, position.OpportunityId, s);
         }
 
         Touch(book);
@@ -840,7 +861,7 @@ public sealed class ExecutionEngine
                         var (bid, age) = LastEligibleBid(position.Contract.Token, s.Now);
                         _out.Add(new UnresolvedAtClose(
                             s.Now,
-                            position.VariantId,
+                            position.Variant,
                             position.Id,
                             position.Contract.Token,
                             position.OpenQuantity,
@@ -862,7 +883,7 @@ public sealed class ExecutionEngine
     public int LiquidateScope(string scope, ExitReason reason, long triggerSeq, IEngineScheduler s)
     {
         var count = 0;
-        foreach (var book in _books.Where(b => scope == "*" || string.Equals(b.VariantId, scope, StringComparison.Ordinal)))
+        foreach (var book in _books.Where(b => scope == "*" || (VariantKey.TryParse(scope, out var scoped) && b.Variant == scoped)))
         {
             foreach (var position in book.Positions.Where(p => p.State == PositionState.Open).ToList())
             {
@@ -883,7 +904,7 @@ public sealed class ExecutionEngine
            + working.Sum(o => o.Intent.LimitPrice * o.Intent.RequestedQuantity);
 
     private decimal Committed(Book book)
-        => Committed(book, _entryOrders.Where(o => o.Status == OrderStatus.Working && o.Intent.VariantId == book.VariantId));
+        => Committed(book, _entryOrders.Where(o => o.Status == OrderStatus.Working && o.Intent.Variant == book.Variant));
 
     private void Touch(Book book) => book.PeakExposure = Math.Max(book.PeakExposure, Committed(book));
 
@@ -907,11 +928,11 @@ public sealed class ExecutionEngine
         position.LastBidObservationAt = now;
     }
 
-    private void FlushNotes(Dictionary<string, (int Count, DateTimeOffset First, DateTimeOffset Last)> counts, string variantId, string? opportunityId, string scope, string subject, DateTimeOffset at)
+    private void FlushNotes(Dictionary<string, (int Count, DateTimeOffset First, DateTimeOffset Last)> counts, VariantKey variant, string? opportunityId, string scope, string subject, DateTimeOffset at)
     {
         foreach (var (reason, info) in counts.OrderBy(x => x.Key, StringComparer.Ordinal).ToList())
         {
-            _out.Add(new EvaluationSummary(at, variantId, opportunityId, scope, subject, reason, info.Count, info.First, info.Last));
+            _out.Add(new EvaluationSummary(at, variant, opportunityId, scope, subject, reason, info.Count, info.First, info.Last));
         }
 
         counts.Clear();
@@ -934,7 +955,7 @@ public sealed class ExecutionEngine
                 foreach (var order in position.ExitOrders.Where(o => o.Status == OrderStatus.Working))
                 {
                     order.Status = OrderStatus.Cancelled;
-                    FlushNotes(order.NoteCounts, position.VariantId, position.OpportunityId, "ExitOrder", order.Id, s.Now);
+                    FlushNotes(order.NoteCounts, position.Variant, position.OpportunityId, "ExitOrder", order.Id, s.Now);
                     if (order.AttemptHandle is { } handle)
                     {
                         s.Cancel(handle);
@@ -942,7 +963,7 @@ public sealed class ExecutionEngine
                 }
 
                 var (bid, age) = LastEligibleBid(position.Contract.Token, s.Now);
-                _out.Add(new UnresolvedAtSessionEnd(s.Now, position.VariantId, position.Id, position.Contract.Token, position.OpenQuantity, bid, age));
+                _out.Add(new UnresolvedAtSessionEnd(s.Now, position.Variant, position.Id, position.Contract.Token, position.OpenQuantity, bid, age));
             }
 
             if (book.DailySl is not null)
@@ -952,7 +973,7 @@ public sealed class ExecutionEngine
 
             _out.Add(new SessionEndReport(
                 s.Now,
-                book.VariantId,
+                book.Variant,
                 book.Positions.Sum(p => p.NetRealised),
                 book.Fills,
                 book.BelowBandFills,
@@ -960,7 +981,7 @@ public sealed class ExecutionEngine
                 unresolved,
                 book.WorstDailyPnl,
                 book.Breached,
-                BookLabel(book.VariantId)));
+                BookLabel(book.Variant)));
         }
 
         _ended = true;
@@ -999,9 +1020,9 @@ public sealed class ExecutionEngine
     }
 
     /// <summary>Realised net of all positions plus the liquidation value of open ones; an unmarkable open position is conservatively valued at zero (flagged).</summary>
-    public (decimal Pnl, bool Conservative) DailyPnl(string variantId, DateTimeOffset now)
+    public (decimal Pnl, bool Conservative) DailyPnl(VariantKey variant, DateTimeOffset now)
     {
-        var book = BookOf(variantId);
+        var book = BookOf(variant);
         var pnl = 0m;
         var conservative = false;
         foreach (var position in book.Positions)
@@ -1027,12 +1048,12 @@ public sealed class ExecutionEngine
 
     private void UpdateDailySl(Book book, DateTimeOffset now)
     {
-        var (pnl, conservative) = DailyPnl(book.VariantId, now);
+        var (pnl, conservative) = DailyPnl(book.Variant, now);
         book.WorstDailyPnl = book.WorstDailyPnl is { } worst ? Math.Min(worst, pnl) : pnl;
         if (!book.Breached && book.DailySl is { } limit && pnl <= -limit)
         {
             book.Breached = true;
-            _out.Add(new DailySlBreached(now, book.VariantId, pnl, limit, conservative));
+            _out.Add(new DailySlBreached(now, book.Variant, pnl, limit, conservative));
         }
     }
 
@@ -1075,7 +1096,7 @@ public sealed class ExecutionEngine
     private string FillId(Book book, string orderId)
         => DeterministicId.Create("fil", "fill", orderId, ++book.FillSeq);
 
-    private Book BookOf(string variantId)
-        => _books.FirstOrDefault(b => string.Equals(b.VariantId, variantId, StringComparison.Ordinal))
-           ?? throw new KeyNotFoundException($"Unknown variant '{variantId}'.");
+    private Book BookOf(VariantKey variant)
+        => _books.FirstOrDefault(b => b.Variant == variant)
+           ?? throw new KeyNotFoundException($"Unknown variant '{variant}'.");
 }

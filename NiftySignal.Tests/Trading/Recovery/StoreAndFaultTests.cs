@@ -62,7 +62,7 @@ public class StoreAndFaultTests
             Assert.Throws<ConflictFaultException>(() => store.Commit(token, corruptOutput));
         }
 
-        var wrongCount = batch with { Outputs = new List<OutputRecord> { new(0, 0, "AuditRecord", "A", DateTimeOffset.UnixEpoch, "{}", "00") } };
+        var wrongCount = batch with { Outputs = new List<OutputRecord> { new(0, 0, "AuditRecord", "S", "A", DateTimeOffset.UnixEpoch, "{}", "00") } };
         Assert.ThrowsAny<Exception>(() => store.Commit(token, wrongCount));
         var snapshot = store.Load("run-1");
         Assert.Empty(snapshot.Steps);

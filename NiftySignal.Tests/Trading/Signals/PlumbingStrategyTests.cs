@@ -52,7 +52,7 @@ public class PlumbingStrategyTests
                 var intent = kit.Out<EntryIntent>().Last();
                 var t = Kit.Bar(k);
                 kit.At(t.AddSeconds(5), s => kit.Outcome(intent, EntryOutcomeKind.Filled, s));
-                kit.At(t.AddSeconds(10), s => kit.Engine.ReportPositionClosed(intent.VariantId, intent.OpportunityId, s));
+                kit.At(t.AddSeconds(10), s => kit.Engine.ReportPositionClosed(intent.Variant, intent.OpportunityId, s));
                 kit.Loop.AdvanceTo(t.AddSeconds(11));
             }
         }

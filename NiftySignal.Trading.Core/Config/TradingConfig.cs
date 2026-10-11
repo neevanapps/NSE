@@ -5,6 +5,7 @@ using NiftySignal.Trading.Core.Integrity;
 using NiftySignal.Trading.Core.Risk;
 using NiftySignal.Trading.Core.Selection;
 using NiftySignal.Trading.Core.Session;
+using NiftySignal.Trading.Core.Strategies;
 using NiftySignal.Trading.Core.Variants;
 
 namespace NiftySignal.Trading.Core.Config;
@@ -13,11 +14,12 @@ namespace NiftySignal.Trading.Core.Config;
 /// Versioned, immutable engine configuration (contract section 7). Schema 2 (CP2) adds contract selection / entry premium band, candle
 /// construction and the variant set to the CP1 session policy. The hash is over the canonical serialisation, so it is independent of
 /// property or dictionary order, machine culture, time zone and anything generated at run time. Variants are a dictionary keyed by
-/// VariantId, so the order in which they are declared never affects the hash.
+/// the canonical variant identity text <c>StrategyId/VariantId</c> (schema 6), so the order in which they are declared never affects the hash and the
+/// same VariantId may exist under different StrategyIds.
 /// </summary>
 public sealed record TradingConfig
 {
-    public const int CurrentSchemaVersion = 5;
+    public const int CurrentSchemaVersion = 6;
 
     public int SchemaVersion { get; init; } = CurrentSchemaVersion;
 
@@ -67,9 +69,13 @@ public sealed record TradingConfig
         errors.AddRange(Integrity.Validate());
         foreach (var (key, spec) in Variants)
         {
-            if (!string.Equals(key, spec.VariantId, StringComparison.Ordinal))
+            if (!VariantKey.IsValidPart(spec.StrategyId) || !VariantKey.IsValidPart(spec.VariantId))
             {
-                errors.Add($"Variant key '{key}' does not match its VariantId '{spec.VariantId}'.");
+                errors.Add($"Variant key '{key}': StrategyId '{spec.StrategyId}' and VariantId '{spec.VariantId}' must each be valid identifier parts.");
+            }
+            else if (!string.Equals(key, spec.GetKey().ToString(), StringComparison.Ordinal))
+            {
+                errors.Add($"Variant key '{key}' does not match its identity '{spec.GetKey()}' (StrategyId/VariantId).");
             }
 
             errors.AddRange(spec.Validate(Candles.HistoryDepth));
@@ -86,11 +92,11 @@ public sealed record TradingConfig
     /// Hash of everything that determines one variant's behaviour: its spec plus the shared selection, candle and session policy. Two
     /// variants with different specs therefore never share an opportunity or order id namespace.
     /// </summary>
-    public ConfigHash ComputeVariantHash(string variantId)
+    public ConfigHash ComputeVariantHash(VariantKey key)
     {
-        if (!Variants.TryGetValue(variantId, out var spec))
+        if (!Variants.TryGetValue(key.ToString(), out var spec))
         {
-            throw new KeyNotFoundException($"Unknown variant '{variantId}'.");
+            throw new KeyNotFoundException($"Unknown variant '{key}'.");
         }
 
         return CanonicalJson.Hash(new { SchemaVersion, Variant = spec, Selection, Candles, Session, Execution, Costs, Risk, Integrity });

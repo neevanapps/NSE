@@ -41,7 +41,7 @@ public static class HarnessSettings
             ConfigVersion = $"{Label}:{name}",
             Costs = new CostsConfig { Schedules = new[] { NseIndexOptionsCostSchedules.From20260401(new FlatBrokerage { Amount = BrokeragePerOrder, Unit = BrokerageUnit.PerOrder }) } },
             Session = new SessionConfig { LiquidationStart = LiquidationStart },
-            Variants = variants.ToDictionary(v => v.VariantId),
+            Variants = variants.ToDictionary(v => v.GetKey().ToString()),
         };
     }
 }

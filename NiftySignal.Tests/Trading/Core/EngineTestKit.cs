@@ -94,7 +94,7 @@ internal sealed class Kit
             ConfigVersion = "kit",
             Selection = selection ?? new ContractSelectionConfig(),
             Candles = candles ?? new CandleConfig(),
-            Variants = variants.ToDictionary(v => v.VariantId, v => v),
+            Variants = variants.ToDictionary(v => v.StrategyId + "/" + v.VariantId, v => v),
         };
 
     public static VariantSpec Immediate(string id, string strategy = "S", CapacityBlockedPolicy? capacity = null, int? maxAttempts = null)
@@ -136,7 +136,7 @@ internal sealed class Kit
     public VariantState Variant(string id) => Engine.Variants.First(v => v.VariantId == id);
 
     public void Outcome(EntryIntent intent, EntryOutcomeKind kind, IEngineScheduler s)
-        => Engine.ReportEntryOutcome(new EntryOutcome(intent.VariantId, intent.OpportunityId, intent.IntentId, kind), s);
+        => Engine.ReportEntryOutcome(new EntryOutcome(intent.Variant, intent.OpportunityId, intent.IntentId, kind), s);
 
     /// <summary>Canonical text of a sequence of outputs. Record ToString() is culture-sensitive, so it is rendered under the invariant culture (a test-side concern only: the engine's own strings are invariant).</summary>
     public static string Signature(IEnumerable<EngineOutput> outputs)

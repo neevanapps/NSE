@@ -115,8 +115,8 @@ public class SizingTests
 
         Assert.Empty(kit.Out<EntryIntent>("A"));
         Assert.Contains(kit.Out<AuditRecord>("A"), r => r.Outcome == "Blocked:InsufficientBudget");
-        Assert.Equal(SlotState.Free, kit.Engine.Variants.GetVariant("A").Slots[0].State);
-        Assert.Equal(OpportunityState.Waiting, kit.Engine.Variants.GetVariant("A").Active!.State);
+        Assert.Equal(SlotState.Free, kit.Engine.Variants.GetVariant(Vk.S("A")).Slots[0].State);
+        Assert.Equal(OpportunityState.Waiting, kit.Engine.Variants.GetVariant(Vk.S("A")).Active!.State);
 
         kit.Feed(kit.Q(kit.At(2), 119m, 120m));                                        // 7,800 + 27.11 <= 8,000
 
@@ -162,7 +162,7 @@ public class ExitTests
         Assert.Equal(81250m, position.EntryCostBasis);
         Assert.Equal(60.20m, position.EntryCosts);
         Assert.Equal(-60.20m, position.NetRealised);                                   // all entry costs count at once
-        Assert.Equal(-(81250m + 60.20m), kit.Engine.Execution.CashOf("A"));
+        Assert.Equal(-(81250m + 60.20m), kit.Engine.Execution.CashOf(Vk.S("A")));
         Assert.Equal("CE23900", position.Contract.Token);
     }
 
@@ -327,10 +327,10 @@ public class ExitTests
         var kit = Open(new ExitSpec());
         var id = kit.Position().Id;
 
-        Assert.Throws<ArgumentException>(() => kit.Engine.Execution.RequestStrategyExit("A", id, 100, kit.Loop));      // not whole lots
-        Assert.Throws<ArgumentException>(() => kit.Engine.Execution.RequestStrategyExit("A", id, 715, kit.Loop));      // more than open
-        kit.Engine.Execution.RequestStrategyExit("A", id, 130, kit.Loop);
-        Assert.Throws<ArgumentException>(() => kit.Engine.Execution.RequestStrategyExit("A", id, 650, kit.Loop));      // only 520 unreserved
+        Assert.Throws<ArgumentException>(() => kit.Engine.Execution.RequestStrategyExit(Vk.S("A"), id, 100, kit.Loop));      // not whole lots
+        Assert.Throws<ArgumentException>(() => kit.Engine.Execution.RequestStrategyExit(Vk.S("A"), id, 715, kit.Loop));      // more than open
+        kit.Engine.Execution.RequestStrategyExit(Vk.S("A"), id, 130, kit.Loop);
+        Assert.Throws<ArgumentException>(() => kit.Engine.Execution.RequestStrategyExit(Vk.S("A"), id, 650, kit.Loop));      // only 520 unreserved
         kit.Feed(kit.Q(kit.At(2), 120m, 121m));
         Settle(kit, 4);
 

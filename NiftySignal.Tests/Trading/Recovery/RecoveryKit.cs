@@ -56,7 +56,7 @@ internal static class RecoveryKit
         IReadOnlyDictionary<string, IBaseStrategy>? strategies = null,
         TranslatorOptions? translator = null,
         RecorderOptions? recorder = null)
-        => new(
+        => Build(
             freeze,
             translator ?? SyntheticSession.Translator(freeze),
             SyntheticSession.Config(tweak),
@@ -66,6 +66,18 @@ internal static class RecoveryKit
             recorder ?? new RecorderOptions { CaptureAll = true },
             null,
             durable ?? new DurableOptions { CheckpointEverySteps = 5 });
+
+    private static DurableRunSpec Build(
+        SessionFreeze freeze,
+        TranslatorOptions translator,
+        TradingConfig config,
+        IReadOnlyDictionary<string, IBaseStrategy> strategies,
+        RunSettings settings,
+        string manifest,
+        RecorderOptions recorder,
+        BinaryProvenance? provenance,
+        DurableOptions durable)
+        => new(freeze, translator, config, NiftySignal.Trading.Core.Strategies.LegacyStrategies.AsFamilies(config, strategies), settings, manifest, recorder, provenance, durable);
 
     /// <summary>The CP5 reference: the same spec run through the unchanged historical adapter, with no durability at all.</summary>
     public static RunResult Plain(DurableRunSpec spec, IReadOnlyList<SourceTick> rows)

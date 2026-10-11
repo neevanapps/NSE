@@ -82,7 +82,7 @@ public class RiskProfileTests
 
         Assert.Contains("\"Risk\":{\"DailySlEnforcement\":\"None\",\"MaxPeakPremiumExposure\":null,\"MaxTradesPerDay\":null,\"Name\":\"ResearchV1\",\"Version\":\"1\"}", baseline.ToCanonicalJson());
         Assert.NotEqual(baseline.ComputeHash(), (baseline with { Risk = RiskProfile.ResearchV1() with { Version = "2" } }).ComputeHash());
-        Assert.NotEqual(baseline.ComputeVariantHash("A"), (baseline with { Risk = RiskProfile.ResearchV1() with { Version = "2" } }).ComputeVariantHash("A"));
+        Assert.NotEqual(baseline.ComputeVariantHash(Vk.S("A")), (baseline with { Risk = RiskProfile.ResearchV1() with { Version = "2" } }).ComputeVariantHash(Vk.S("A")));
     }
 
     [Fact]
@@ -135,9 +135,10 @@ public class AuditTests
         {
             Assert.Equal("run-unspecified", e.RunId);
             Assert.Equal(kit.Engine.Variants.ConfigHash.Value, e.ConfigHash);
-            Assert.Equal("A", e.AccountId);
+            Assert.Equal("S/A", e.AccountId);
+            Assert.Equal("S", e.StrategyId);
             Assert.Equal("A", e.VariantId);
-            Assert.Equal(kit.Engine.Variants.GetVariant("A").VariantHash, e.VariantHash);
+            Assert.Equal(kit.Engine.Variants.GetVariant(Vk.S("A")).VariantHash, e.VariantHash);
         });
         Assert.DoesNotContain(trail, e => e.Reason == ReasonCode.Other);
         Assert.All(trail.Where(e => e.Category == AuditCategory.Fill), e =>
@@ -257,7 +258,7 @@ public class DailySummaryTests
         Assert.Contains("PROVISIONAL", s.CostSourceStatus);
         Assert.Equal(287.79m, s.AllFillCosts.Total);
         Assert.Equal("ResearchV1/1", s.RiskProfile);
-        Assert.Equal("independent-virtual-book:A", s.Book);
+        Assert.Equal("independent-virtual-book:S/A", s.Book);
         Assert.Empty(s.OpenValuations);
         Assert.Equal(12387.21m, s.DailyPnlAsOf);
         Assert.Equal(81250m, s.PeakPremiumExposure);                                           // committed premium: 650 x 125, recorded, not limited

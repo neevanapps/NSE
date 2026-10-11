@@ -177,7 +177,7 @@ public class ExecutionTimingTests
         var opportunity = kit.Engine.Variants.AllOpportunities.Single();
         Assert.Equal(OpportunityState.Cancelled, opportunity.State);
         Assert.Equal("StrategyInvalidated", opportunity.TerminalReason);
-        Assert.Equal(SlotState.Free, kit.Engine.Variants.GetVariant("A").Slots[0].State);
+        Assert.Equal(SlotState.Free, kit.Engine.Variants.GetVariant(Vk.S("A")).Slots[0].State);
         Assert.DoesNotContain(kit.Loop.PendingDeadlines, d => d.Key.StartsWith("exec-", StringComparison.Ordinal));   // its cancel/expiry deadlines were removed
     }
 
@@ -216,7 +216,7 @@ public class ExecutionTimingTests
         var opportunity = kit.Engine.Variants.AllOpportunities.Single();
         Assert.Equal(OpportunityState.Expired, opportunity.State);
         Assert.Equal("EntryClose", opportunity.TerminalReason);
-        Assert.Equal(SlotState.Free, kit.Engine.Variants.GetVariant("A").Slots[0].State);
+        Assert.Equal(SlotState.Free, kit.Engine.Variants.GetVariant(Vk.S("A")).Slots[0].State);
     }
 
     [Fact]
@@ -241,7 +241,7 @@ public class ExecutionTimingTests
     {
         var kit = NewKit();
         kit.Bar(TradeKit.T0, 1, kit.Q(TradeKit.T0, 124m, 125m));
-        var slot = kit.Engine.Variants.GetVariant("A").Slots[0];
+        var slot = kit.Engine.Variants.GetVariant(Vk.S("A")).Slots[0];
         for (var i = 1; i <= 8; i++)
         {
             kit.Feed(kit.Q(kit.At(i * 0.5), 129m, 130m));                         // unfillable at limit 125, qualifying for a new intent were the old one terminal

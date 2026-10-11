@@ -341,7 +341,7 @@ RunResult DurableScenario(RecorderOptions rec)
         freeze,
         translatorOptions,
         config,
-        Strategies(),
+        NiftySignal.Trading.Core.Strategies.LegacyStrategies.AsFamilies(config, Strategies()),
         new RunSettings { RunMode = "Historical", RunId = "cp61-" + day.ToString("yyyyMMdd", CultureInfo.InvariantCulture), Horizon = horizon },
         manifest,
         rec,

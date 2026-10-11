@@ -196,7 +196,7 @@ public class SignalQuoteReuseTests
         kit.Loop.AdvanceTo(kit.At(1.5));
         Assert.Equal(260, Assert.Single(kit.Fills()).Quantity);                     // reuse: the first order takes 4 lots from the signal quote
 
-        kit.Engine.Execution.RequestStrategyExit("A", kit.Position().Id, null, kit.Loop);
+        kit.Engine.Execution.RequestStrategyExit(Vk.S("A"), kit.Position().Id, null, kit.Loop);
         kit.Feed(kit.Q(kit.At(2), 124m, 125m, askQty: 300));
         kit.Loop.AdvanceTo(kit.At(4));
         kit.Feed(Ev.Bar(kit.At(4.5), 2));

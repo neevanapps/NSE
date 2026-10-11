@@ -157,7 +157,7 @@ public class ExecutionPolicyTests
         var opportunity = kit.Engine.Variants.AllOpportunities.Single();
         Assert.Equal(OpportunityState.Consumed, opportunity.State);
         Assert.Equal("PartiallyFilled", opportunity.TerminalReason);
-        Assert.Equal(SlotState.Occupied, kit.Engine.Variants.GetVariant("A").Slots[0].State);
+        Assert.Equal(SlotState.Occupied, kit.Engine.Variants.GetVariant(Vk.S("A")).Slots[0].State);
 
         kit.Feed(kit.Q(kit.At(2), 124m, 125m, askQty: 5000));                      // more liquidity later: no top-up
         Assert.Single(kit.Fills());
@@ -182,7 +182,7 @@ public class ExecutionPolicyTests
         Assert.Equal(260, Assert.Single(kit.Fills()).Quantity);
 
         kit.Feed(kit.Q(kit.At(1.5), 124m, 125m, bidQty: 100000, askQty: 300));    // same displayed ask state
-        kit.Engine.Execution.RequestStrategyExit("A", kit.Position().Id, null, kit.Loop);
+        kit.Engine.Execution.RequestStrategyExit(Vk.S("A"), kit.Position().Id, null, kit.Loop);
         kit.Loop.AdvanceTo(kit.At(3));
         Assert.Equal(PositionState.Closed, kit.Position().State);
 
@@ -209,8 +209,8 @@ public class ExecutionPolicyTests
         var b = Assert.Single(kit.Fills("B"));
         Assert.Equal(650, a.Quantity);
         Assert.Equal(650, b.Quantity);                                             // both took the SAME 650 displayed: a shared account could have had 650 in total
-        Assert.Equal("independent-virtual-book:A", a.Book);
-        Assert.Equal("independent-virtual-book:B", b.Book);
+        Assert.Equal("independent-virtual-book:S/A", a.Book);
+        Assert.Equal("independent-virtual-book:S/B", b.Book);
         Assert.Equal(BookMode.IndependentVirtualBooks, kit.Config.Execution.Books);
     }
 

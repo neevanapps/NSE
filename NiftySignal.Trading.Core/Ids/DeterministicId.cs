@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using NiftySignal.Trading.Core.Config;
+using NiftySignal.Trading.Core.Strategies;
 
 namespace NiftySignal.Trading.Core.Ids;
 
@@ -12,7 +13,7 @@ namespace NiftySignal.Trading.Core.Ids;
 /// </summary>
 public static class DeterministicId
 {
-    public const string Scheme = "tid1";
+    public const string Scheme = "tid2";
 
     public static string Create(string prefix, string kind, params object?[] parts)
     {
@@ -34,15 +35,15 @@ public static class DeterministicId
 /// </summary>
 public static class EngineIds
 {
-    public static string Decision(ConfigHash configHash, string variantId, string strategyId, DateOnly tradeDate, string triggerKind, long triggerSeq, int ordinal)
-        => DeterministicId.Create("dec", "decision", configHash.Value, variantId, strategyId, tradeDate, triggerKind, triggerSeq, ordinal);
+    public static string Decision(ConfigHash configHash, VariantKey variant, DateOnly tradeDate, string triggerKind, long triggerSeq, int ordinal)
+        => DeterministicId.Create("dec", "decision", configHash.Value, variant.StrategyId, variant.VariantId, tradeDate, triggerKind, triggerSeq, ordinal);
 
     public static string Order(string decisionId, string leg, int attempt)
         => DeterministicId.Create("ord", "order", decisionId, leg, attempt);
 
-    public static string Opportunity(string variantId, ConfigHash variantConfigHash, DateOnly tradeDate, string episodeId)
-        => DeterministicId.Create("opp", "opportunity", variantId, variantConfigHash.Value, tradeDate, episodeId);
+    public static string Opportunity(VariantKey variant, ConfigHash variantConfigHash, DateOnly tradeDate, string episodeId)
+        => DeterministicId.Create("opp", "opportunity", variant.StrategyId, variant.VariantId, variantConfigHash.Value, tradeDate, episodeId);
 
-    public static string Position(ConfigHash configHash, string variantId, DateOnly tradeDate, string entryDecisionId)
-        => DeterministicId.Create("pos", "position", configHash.Value, variantId, tradeDate, entryDecisionId);
+    public static string Position(ConfigHash configHash, VariantKey variant, DateOnly tradeDate, string entryDecisionId)
+        => DeterministicId.Create("pos", "position", configHash.Value, variant.StrategyId, variant.VariantId, tradeDate, entryDecisionId);
 }

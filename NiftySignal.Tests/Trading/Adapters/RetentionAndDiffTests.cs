@@ -188,7 +188,7 @@ public class WatchdogAndHarnessTests
         Assert.Equal("ResearchV1", config.Risk.Name);
         Assert.Null(config.Risk.MaxTradesPerDay);
         Assert.Equal(NiftySignal.Trading.Core.Risk.DailySlEnforcement.None, config.Risk.DailySlEnforcement);
-        Assert.Equal(650, Assert.IsType<NiftySignal.Trading.Core.Sizing.FixedQuantitySpec>(config.Variants["A"].Sizing).Units);
+        Assert.Equal(650, Assert.IsType<NiftySignal.Trading.Core.Sizing.FixedQuantitySpec>(config.Variants["P6/A"].Sizing).Units);
         var brokerage = Assert.IsType<FlatBrokerage>(config.Costs.Schedules.Single().Brokerage);
         Assert.Equal((20m, BrokerageUnit.PerOrder), (brokerage.Amount, brokerage.Unit));
         Assert.Empty(config.Validate());

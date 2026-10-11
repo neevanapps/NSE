@@ -1,6 +1,8 @@
 using System.Globalization;
 using System.Reflection;
 using NiftySignal.Trading.Core.Events;
+using NiftySignal.Trading.Core.Execution;
+using NiftySignal.Trading.Core.Strategies;
 using NiftySignal.Trading.Core.Variants;
 using NiftySignal.Trading.Recovery;
 using NiftySignal.Trading.Recovery.Codec;
@@ -156,6 +158,34 @@ public class OutputCodecTests
     }
 
     [Fact]
+    public void TheVariantIdentity_StrategyAndVariant_SurvivesTheCodec_AndSameVariantIdUnderTwoStrategiesStaysDistinct()
+    {
+        var at = new DateTimeOffset(2026, 9, 22, 4, 30, 0, TimeSpan.Zero);
+        var xa = new PositionOpened(at, new VariantKey("X", "A"), "pos_1", "opp_1", "CE23900", 650, 125m);
+        var ya = new PositionOpened(at, new VariantKey("Y", "A"), "pos_1", "opp_1", "CE23900", 650, 125m);
+
+        var encodedX = OutputCodec.Encode(xa);
+        var encodedY = OutputCodec.Encode(ya);
+
+        Assert.Equal("trading-codec/2", OutputCodec.Version);
+        Assert.Contains("\"Variant\":\"X/A\"", encodedX, StringComparison.Ordinal);
+        Assert.NotEqual(encodedX, encodedY);
+        Assert.NotEqual(OutputCodec.ContentHash(encodedX), OutputCodec.ContentHash(encodedY));
+        var back = Assert.IsType<PositionOpened>(OutputCodec.Decode(encodedX));
+        Assert.Equal(xa, back);
+        Assert.Equal(("X", "A"), (back.StrategyId, back.VariantId));
+        Assert.Equal(new VariantKey("Y", "A"), Assert.IsType<PositionOpened>(OutputCodec.Decode(encodedY)).Variant);
+
+        // a global output (feed integrity) carries the global identity and also round-trips
+        var transition = new NiftySignal.Trading.Core.Integrity.IntegrityTransition(at, NiftySignal.Trading.Core.Integrity.IntegrityState.Healthy, NiftySignal.Trading.Core.Integrity.IntegrityState.Degraded, FeedFaultReason.SocketDisconnected, "d", 3);
+        Assert.True(OutputCodec.Decode(OutputCodec.Encode(transition)).Variant.IsGlobal);
+
+        // a payload whose identity is not StrategyId/VariantId is refused, never repaired
+        Assert.Throws<FormatException>(() => OutputCodec.Decode(encodedX.Replace("X/A", "A")));
+    }
+
+
+    [Fact]
     public void DecimalScale_SurvivesTheCodec_NotJustTheValue()
     {
         var type = OutputTypes().Single(t => t.Name == "PositionOpened");
@@ -266,6 +296,11 @@ internal static class Sample
             return null;
         }
 
+        if (t == typeof(VariantKey))
+        {
+            return new VariantKey($"S{counter}", $"V-{counter}");        // identity parts use a restricted character set; both must survive the codec
+        }
+
         if (t == typeof(string))
         {
             return $"{name}-é\"{counter}";
@@ -314,4 +349,5 @@ internal static class Sample
 
         return Build(t, variant);
     }
+
 }

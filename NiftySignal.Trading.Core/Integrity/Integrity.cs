@@ -2,6 +2,7 @@ using NiftySignal.Trading.Core.Events;
 using NiftySignal.Trading.Core.Scheduling;
 using NiftySignal.Trading.Core.State;
 using NiftySignal.Trading.Core.Variants;
+using NiftySignal.Trading.Core.Strategies;
 
 namespace NiftySignal.Trading.Core.Integrity;
 
@@ -53,21 +54,21 @@ public sealed record IntegrityPolicy
 /// <summary>Anything that can veto NEW entries (feed integrity, manual kill switch, risk profile). Returns a reason code or null when entries are allowed.</summary>
 public interface IEntryGate
 {
-    string? BlockReason(string variantId, DateTimeOffset now);
+    string? BlockReason(VariantKey variant, DateTimeOffset now);
 }
 
 public sealed record IntegrityTransition(DateTimeOffset At, IntegrityState From, IntegrityState To, FeedFaultReason Reason, string Detail, long Sequence)
-    : EngineOutput(At, "*");
+    : EngineOutput(At, VariantKey.Global);
 
 public sealed record KillSwitchChanged(DateTimeOffset At, string Scope, OperatorCommand Command, KillMode Mode, string Actor, string Reason, string Effect, int CancelledPending, int CancelledWaiting, int LiquidationOrders)
-    : EngineOutput(At, Scope);
+    : EngineOutput(At, VariantKey.TryParse(Scope, out var scopeKey) ? scopeKey : VariantKey.Global);
 
 /// <summary>An input event that was rejected before reaching the engine (late, conflicting duplicate or inconsistent), with the reason. The event has NO effect on state.</summary>
 public sealed record EventQuarantined(DateTimeOffset At, EventKind Kind, long SourceId, string Token, string Reason, string Detail)
-    : EngineOutput(At, "*");
+    : EngineOutput(At, VariantKey.Global);
 
-public sealed record EvaluationSummary(DateTimeOffset At, string VariantId, string? OpportunityId, string Scope, string Subject, string Reason, int Count, DateTimeOffset FirstAt, DateTimeOffset LastAt)
-    : EngineOutput(At, VariantId);
+public sealed record EvaluationSummary(DateTimeOffset At, VariantKey Variant, string? OpportunityId, string Scope, string Subject, string Reason, int Count, DateTimeOffset FirstAt, DateTimeOffset LastAt)
+    : EngineOutput(At, Variant);
 
 /// <summary>
 /// Global feed integrity plus the manual kill switch (contract section A.14). Pure state: the owner (<c>TradingEngine</c>) performs the effects
@@ -105,7 +106,8 @@ public sealed class IntegrityManager : IEntryGate
 
     public IReadOnlyCollection<string> KilledVariants => _killedVariants;
 
-    public bool IsKilled(string variantId) => KillAll || _killedVariants.Contains(variantId);
+    /// <summary>Kill scopes are stored as the canonical text of the scope: a variant kill is <c>StrategyId/VariantId</c>.</summary>
+    public bool IsKilled(VariantKey variant) => KillAll || _killedVariants.Contains(variant.ToString());
 
     /// <summary>Integrity state, kill switch and the recovery-evidence progress.</summary>
     public void WriteState(StateWriter w)
@@ -121,9 +123,9 @@ public sealed class IntegrityManager : IEntryGate
         w.Line("evidenceBarSeq", _evidenceBarSeq);
     }
 
-    public string? BlockReason(string variantId, DateTimeOffset now)
+    public string? BlockReason(VariantKey variant, DateTimeOffset now)
     {
-        if (IsKilled(variantId))
+        if (IsKilled(variant))
         {
             return "KillSwitch";
         }

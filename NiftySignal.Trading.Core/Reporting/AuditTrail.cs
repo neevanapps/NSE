@@ -92,6 +92,7 @@ public sealed record AuditEntry(
     string RunId,
     string RunMode,
     string AccountId,
+    string StrategyId,
     string VariantId,
     string? OpportunityId,
     string? OrderId,
@@ -120,11 +121,11 @@ public static class AuditTrail
         for (var i = 0; i < engine.Outputs.Count; i++)
         {
             var o = engine.Outputs[i];
-            var variant = o.VariantId;
-            var hash = variant == "*" || !engine.Variants.Variants.Any(v => v.VariantId == variant) ? string.Empty : engine.Variants.GetVariant(variant).VariantHash;
+            var variant = o.Variant;
+            var hash = variant.IsGlobal || !engine.Variants.Variants.Any(v => v.Key == variant) ? string.Empty : engine.Variants.GetVariant(variant).VariantHash;
             var account = hash.Length == 0 ? "*" : engine.Variants.GetVariant(variant).Spec.ResolveAccountId();
             AuditEntry E(AuditCategory category, ReasonCode reason, string ev, string detail, string? opportunity = null, string? order = null, string? position = null)
-                => new(i, o.At, engine.RunId, engine.RunMode, account, variant, opportunity, order, position, configHash, hash, category, reason, ev, detail);
+                => new(i, o.At, engine.RunId, engine.RunMode, account, variant.StrategyId, variant.VariantId, opportunity, order, position, configHash, hash, category, reason, ev, detail);
 
             switch (o)
             {

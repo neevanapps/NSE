@@ -5,6 +5,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
+using NiftySignal.Trading.Core.Strategies;
 using NiftySignal.Trading.Core.Variants;
 
 namespace NiftySignal.Trading.Recovery.Codec;
@@ -23,7 +24,8 @@ namespace NiftySignal.Trading.Recovery.Codec;
 /// </summary>
 public static class OutputCodec
 {
-    public const string Version = "trading-codec/1";
+    /// <summary>2: the variant identity of an output is the canonical text of (StrategyId, VariantId) in the member <c>Variant</c> (version 1 carried a bare <c>VariantId</c>); both parts are therefore on every record.</summary>
+    public const string Version = "trading-codec/2";
 
     private const string TimeFormat = "yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'";
     private const string DateFormat = "yyyy-MM-dd";
@@ -120,7 +122,7 @@ public static class OutputCodec
     {
         var t = Nullable.GetUnderlyingType(type) ?? type;
         if (t == typeof(string) || t == typeof(bool) || t == typeof(int) || t == typeof(long) || t == typeof(decimal) || t == typeof(DateTimeOffset)
-            || t == typeof(DateOnly) || t == typeof(TimeSpan) || t.IsEnum)
+            || t == typeof(DateOnly) || t == typeof(TimeSpan) || t == typeof(VariantKey) || t.IsEnum)
         {
             return;
         }
@@ -195,6 +197,9 @@ public static class OutputCodec
                 break;
             case DateOnly date:
                 sb.Append(Quote(date.ToString(DateFormat, CultureInfo.InvariantCulture)));
+                break;
+            case VariantKey key:
+                sb.Append(Quote(key.ToString()));
                 break;
             case TimeSpan span:
                 sb.Append(Quote(span.ToString("c", CultureInfo.InvariantCulture)));
@@ -293,6 +298,11 @@ public static class OutputCodec
         if (t == typeof(DateOnly))
         {
             return DateOnly.ParseExact(element.GetString()!, DateFormat, CultureInfo.InvariantCulture);
+        }
+
+        if (t == typeof(VariantKey))
+        {
+            return VariantKey.TryParse(element.GetString(), out var key) ? key : throw new FormatException($"'{element.GetString()}' is not a valid variant identity (StrategyId/VariantId).");
         }
 
         if (t == typeof(TimeSpan))

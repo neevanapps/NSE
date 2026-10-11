@@ -17,7 +17,7 @@ public class SessionLiquidationTests
     public void QuietMarketToTheEnd_ReportsUnresolvedPositions_AndNeverManufacturesAFill()
     {
         var kit = TradeKit.Opened(TradeKit.Immediate());
-        var cashAfterEntry = kit.Engine.Execution.CashOf("A");
+        var cashAfterEntry = kit.Engine.Execution.CashOf(Vk.S("A"));
 
         kit.Loop.AdvanceTo(At(15, 5, 30));
         var created = Assert.Single(kit.Out<ExitOrderCreated>("A"));
@@ -42,7 +42,7 @@ public class SessionLiquidationTests
         Assert.Equal(PositionState.Unresolved, kit.Position().State);
         Assert.Equal(650, kit.Position().OpenQuantity);
         Assert.Single(kit.Fills());                                                           // still only the entry
-        Assert.Equal(cashAfterEntry, kit.Engine.Execution.CashOf("A"));
+        Assert.Equal(cashAfterEntry, kit.Engine.Execution.CashOf(Vk.S("A")));
         Assert.Empty(kit.Out<PositionClosed>("A"));
         var report = Assert.Single(kit.Out<SessionEndReport>("A"));
         Assert.Equal(1, report.UnresolvedPositions);
@@ -67,7 +67,7 @@ public class SessionLiquidationTests
         Assert.False(sell.AfterFinalClose);
         Assert.Equal(PositionState.Closed, kit.Position().State);
         Assert.Empty(kit.Out<UnresolvedAtClose>("A"));
-        Assert.Equal(SlotState.Free, kit.Engine.Variants.GetVariant("A").Slots[0].State);
+        Assert.Equal(SlotState.Free, kit.Engine.Variants.GetVariant(Vk.S("A")).Slots[0].State);
     }
 
     [Fact]
@@ -203,7 +203,7 @@ public class CostAndLedgerTests
         Assert.Equal(12675.00m, closed.GrossPnl);                                                // (138-125) x 325 + (151-125) x 325
         Assert.Equal(287.79m, closed.TotalCosts);                                                // 60.20 + 109.74 + 117.85
         Assert.Equal(12387.21m, closed.NetPnl);
-        Assert.Equal(12387.21m, kit.Engine.Execution.CashOf("A"));
+        Assert.Equal(12387.21m, kit.Engine.Execution.CashOf(Vk.S("A")));
     }
 
     [Fact]
@@ -219,8 +219,8 @@ public class CostAndLedgerTests
         Assert.Equal(0, position.ReservedExitQuantity);
 
         var cashFlows = kit.Fills("A").Sum(f => f.Side == TradeSide.Buy ? -(f.Notional + f.Costs.Total) : f.Notional - f.Costs.Total);
-        Assert.Equal(cashFlows, kit.Engine.Execution.CashOf("A"));
-        Assert.Equal(kit.Engine.Execution.CashOf("A"), kit.Engine.Execution.PositionsOf("A").Sum(p => p.NetRealised));
+        Assert.Equal(cashFlows, kit.Engine.Execution.CashOf(Vk.S("A")));
+        Assert.Equal(kit.Engine.Execution.CashOf(Vk.S("A")), kit.Engine.Execution.PositionsOf(Vk.S("A")).Sum(p => p.NetRealised));
     }
 
     [Fact]
@@ -352,7 +352,7 @@ public class CostAndLedgerTests
             kit.Bar(t, (2 * cycle) + 1, kit.Q(t, 124m, 125m));                                   // entry 650 @ 125
             kit.Loop.AdvanceTo(t.AddSeconds(1.5));
             kit.Feed(kit.Q(t.AddSeconds(2), 119m, 120m));
-            kit.Engine.Execution.RequestStrategyExit("A", kit.Position("A", cycle).Id, null, kit.Loop);   // a loss-making discretionary exit
+            kit.Engine.Execution.RequestStrategyExit(Vk.S("A"), kit.Position("A", cycle).Id, null, kit.Loop);   // a loss-making discretionary exit
             kit.Loop.AdvanceTo(t.AddSeconds(5));
             kit.Feed(Ev.Bar(t.AddSeconds(10), (2 * cycle) + 2));                                 // the episode ends
         }

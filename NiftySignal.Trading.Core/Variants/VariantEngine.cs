@@ -12,6 +12,7 @@ using NiftySignal.Trading.Core.Selection;
 using NiftySignal.Trading.Core.Sizing;
 using NiftySignal.Trading.Core.Session;
 using NiftySignal.Trading.Core.State;
+using NiftySignal.Trading.Core.Strategies;
 
 namespace NiftySignal.Trading.Core.Variants;
 
@@ -36,7 +37,7 @@ public static class ContractFixation
 /// execution: an intent only becomes a fill/cancel through <see cref="ReportEntryOutcome"/>, which the CP3 execution model (or a test
 /// harness) must call from inside the loop.
 /// <para>
-/// Determinism: variants are processed in ascending VariantId (ordinal) order for every event; ids are hashes; time comes only from
+/// Determinism: variants are processed in ascending (StrategyId, VariantId) ordinal order for every event; each strategy family is evaluated exactly once per bar; ids are hashes; time comes only from
 /// the events and the scheduler passed to the callbacks.
 /// </para>
 /// </summary>
@@ -49,6 +50,8 @@ public sealed class VariantEngine : IEngineHandler
     private readonly QuoteBook _quotes = new();
     private readonly CandleStore _candles;
     private readonly List<VariantState> _variants = new();
+    private readonly IReadOnlyList<IStrategyFamily> _families;
+    private readonly string _sourceSessionId;
     private readonly List<Opportunity> _allOpportunities = new();
     private readonly List<EngineOutput> _outputs;
     private readonly CostModel? _costModel;
@@ -58,12 +61,13 @@ public sealed class VariantEngine : IEngineHandler
         TradingConfig config,
         DateOnly tradeDate,
         IReadOnlyList<OptionContract> universe,
-        IReadOnlyDictionary<string, IBaseStrategy> strategies,
-        List<EngineOutput>? outputSink = null)
+        IReadOnlyDictionary<string, IStrategyFamily> families,
+        List<EngineOutput>? outputSink = null,
+        string? sourceSessionId = null)
     {
         ArgumentNullException.ThrowIfNull(config);
         ArgumentNullException.ThrowIfNull(universe);
-        ArgumentNullException.ThrowIfNull(strategies);
+        ArgumentNullException.ThrowIfNull(families);
         var errors = config.Validate();
         if (errors.Count > 0)
         {
@@ -74,14 +78,15 @@ public sealed class VariantEngine : IEngineHandler
         _outputs = outputSink ?? new List<EngineOutput>();
         _configHash = config.ComputeHash();
         _tradeDate = tradeDate;
+        _sourceSessionId = string.IsNullOrWhiteSpace(sourceSessionId) ? FormattableString.Invariant($"session:{tradeDate:yyyy-MM-dd}") : sourceSessionId;
         Schedule = SessionSchedule.Create(config.Session, tradeDate);
         _universe = universe.OrderBy(c => c.Token, StringComparer.Ordinal).ToList();
         _candles = new CandleStore(config.Candles);
         _costModel = CostModel.IsConfigured(config.Costs, tradeDate) ? new CostModel(config.Costs, tradeDate) : null;
 
         var sizingErrors = config.Variants.Values
-            .OrderBy(x => x.VariantId, StringComparer.Ordinal)
-            .SelectMany(x => Sizer.ValidateFixedQuantities(x.VariantId, x.Sizing, universe))
+            .OrderBy(x => x.GetKey())
+            .SelectMany(x => Sizer.ValidateFixedQuantities(x.GetKey().ToString(), x.Sizing, universe))
             .ToList();
         if (sizingErrors.Count > 0)
         {
@@ -89,16 +94,41 @@ public sealed class VariantEngine : IEngineHandler
         }
 
         var ordinal = 0;
-        foreach (var id in config.Variants.Keys.Order(StringComparer.Ordinal))
+        foreach (var spec in config.Variants.Values.OrderBy(x => x.GetKey()))
         {
-            var spec = config.Variants[id];
-            if (!strategies.TryGetValue(spec.StrategyId, out var strategy))
+            var key = spec.GetKey();
+            if (!families.TryGetValue(spec.StrategyId, out var family))
             {
-                throw new ArgumentException($"Variant '{id}' references unknown strategy '{spec.StrategyId}'.", nameof(strategies));
+                throw new ArgumentException($"Variant '{key}' references unknown strategy '{spec.StrategyId}'.", nameof(families));
             }
 
-            _variants.Add(new VariantState(spec, ordinal++, strategy, config.ComputeVariantHash(id).Value, capacity: 1));
+            if (!string.Equals(family.StrategyId, spec.StrategyId, StringComparison.Ordinal))
+            {
+                throw new ArgumentException($"Strategy family registered as '{spec.StrategyId}' reports StrategyId '{family.StrategyId}'.", nameof(families));
+            }
+
+            if (!family.VariantIds.Contains(spec.VariantId, StringComparer.Ordinal))
+            {
+                throw new ArgumentException($"Strategy family '{spec.StrategyId}' does not declare variant '{spec.VariantId}'.", nameof(families));
+            }
+
+            _variants.Add(new VariantState(spec, ordinal++, family, config.ComputeVariantHash(key).Value, capacity: 1));
         }
+
+        // Families in ascending StrategyId order; each is evaluated once per bar even when it serves several variants.
+        _families = _variants.Select(v => v.Family).Distinct().OrderBy(f => f.StrategyId, StringComparer.Ordinal).ToList();
+    }
+
+    /// <summary>Compatibility constructor for single-case strategies (see <see cref="LegacyBaseStrategyFamily"/>).</summary>
+    public VariantEngine(
+        TradingConfig config,
+        DateOnly tradeDate,
+        IReadOnlyList<OptionContract> universe,
+        IReadOnlyDictionary<string, IBaseStrategy> strategies,
+        List<EngineOutput>? outputSink = null,
+        string? sourceSessionId = null)
+        : this(config, tradeDate, universe, LegacyStrategies.AsFamilies(config, strategies), outputSink, sourceSessionId)
+    {
     }
 
     public SessionSchedule Schedule { get; }
@@ -132,7 +162,7 @@ public sealed class VariantEngine : IEngineHandler
         w.Line("entryClosed", _entryClosed);
         foreach (var v in _variants)
         {
-            using var vs = w.Scope(v.VariantId);
+            using var vs = w.Scope(v.Key.ToString());
             w.Line("ordinal", v.Ordinal);
             w.Line("valid", v.Valid);
             w.Line("episodeSide", v.EpisodeSide);
@@ -146,9 +176,15 @@ public sealed class VariantEngine : IEngineHandler
                 w.Line($"slot[{slot.SlotNo}]", $"{slot.State}|{slot.OwnerOpportunityId ?? "~"}");
             }
 
-            if (v.Strategy is IStateContributor contributor)
+            w.Line("lastDecision", v.LastDecision?.CanonicalText());
+            w.Line("episodeDecision", v.EpisodeDecision?.CanonicalText());
+        }
+
+        foreach (var family in _families)
+        {
+            if (family is IStateContributor contributor)
             {
-                using var ss = w.Scope("strategy");
+                using var ss = w.Scope("strategy/" + family.StrategyId);
                 contributor.WriteState(w);
             }
         }
@@ -156,7 +192,8 @@ public sealed class VariantEngine : IEngineHandler
         foreach (var o in _allOpportunities)
         {
             using var os = w.Scope("opportunity/" + o.Id);
-            w.Line("variant", o.VariantId);
+            w.Line("variant", o.Variant.ToString());
+            w.Line("entryDecision", o.EntryDecision?.CanonicalText());
             w.Line("episode", o.EpisodeId);
             w.Line("episodeStart", o.EpisodeStartBarSeq);
             w.Line("side", o.Side);
@@ -189,7 +226,7 @@ public sealed class VariantEngine : IEngineHandler
                 OnQuote(quote);
                 break;
             case BarCompletedEvent bar:
-                OnBar(bar);
+                OnBar(bar, scheduler);
                 break;
         }
     }
@@ -229,26 +266,70 @@ public sealed class VariantEngine : IEngineHandler
         }
     }
 
-    private void OnBar(BarCompletedEvent bar)
+    /// <summary>
+    /// Raised for a family Exit decision of a variant: the execution model closes that variant's own open position (if any) through the normal exit path.
+    /// Set by the trading engine; null in entry-only harnesses (the decision is then only recorded).
+    /// </summary>
+    public Action<VariantKey, IEngineScheduler>? StrategyExitRequested { get; set; }
+
+    private void OnBar(BarCompletedEvent bar, IEngineScheduler scheduler)
     {
         // Publish first: candles up to this bar are visible to everything that runs after this event, and to nothing that ran before it
         // (quotes of the same availability group precede the bar event in the total order).
         _candles.PublishBar(bar.BarSeq, bar.AvailableAt);
+
+        // Every family sees every bar exactly once and answers for all of its variants. A decision for an id the family does not declare, or two
+        // decisions for one variant, is a defect of the family and fails loudly rather than being guessed around.
+        var decisions = new Dictionary<VariantKey, VariantDecision>();
+        foreach (var family in _families)
+        {
+            var answer = family.OnBar(bar) ?? FamilyDecisions.None;
+            foreach (var d in answer.Decisions)
+            {
+                var errors = d.Validate();
+                if (errors.Count > 0)
+                {
+                    throw new InvalidOperationException($"Strategy '{family.StrategyId}' returned an invalid decision: {string.Join(" ", errors)}");
+                }
+
+                if (!family.VariantIds.Contains(d.VariantId, StringComparer.Ordinal))
+                {
+                    throw new InvalidOperationException($"Strategy '{family.StrategyId}' returned a decision for undeclared variant '{d.VariantId}'.");
+                }
+
+                if (!decisions.TryAdd(new VariantKey(family.StrategyId, d.VariantId), d))
+                {
+                    throw new InvalidOperationException($"Strategy '{family.StrategyId}' returned two decisions for variant '{d.VariantId}' on bar {bar.BarSeq}.");
+                }
+            }
+        }
+
         foreach (var v in _variants)
         {
-            OnBarForVariant(v, bar);
+            var decision = decisions.TryGetValue(v.Key, out var d) ? d : VariantDecision.Wait(v.VariantId, "NoDecision");
+            OnBarForVariant(v, bar, decision, scheduler);
         }
     }
 
-    private void OnBarForVariant(VariantState v, BarCompletedEvent bar)
+    private void OnBarForVariant(VariantState v, BarCompletedEvent bar, VariantDecision decision, IEngineScheduler scheduler)
     {
         var now = bar.AvailableAt;
-        var validity = v.Strategy.OnBar(bar);
+        var attributed = new AttributedDecision(v.Key, decision.Action, decision.Direction, decision.ReasonCode, decision.Detail, _sourceSessionId, bar.BarSeq, bar.AvailableAt);
+        v.LastDecision = attributed;
+
+        // Long -> Call and Short -> Put is the engine's mapping, below the strategy layer.
+        var wantsEntry = decision.Action == StrategyAction.Enter;
+        var validity = new StrategyValidity(wantsEntry, decision.Direction == StrategyDirection.Short ? OptionSide.Put : OptionSide.Call, decision.ReasonCode);
         if (validity.IsValid && bar.Info is { Ready: false })
         {
             // Trading eligibility = the strategy's validity AND the adaptive readiness evidence carried by the bar (frozen session, enough
             // consecutive valid bars, signal start reached). The strategy still sees every bar (its own warm-up state is unaffected).
             validity = new StrategyValidity(false, validity.Side, "ReadinessNotMet");
+        }
+
+        if (decision.Action == StrategyAction.Exit)
+        {
+            StrategyExitRequested?.Invoke(v.Key, scheduler);
         }
 
         if (!validity.IsValid)
@@ -279,6 +360,7 @@ public sealed class VariantEngine : IEngineHandler
             v.EpisodeStartBarSeq = bar.BarSeq;
             v.EpisodeSpent = false;
             v.EpisodeBlockNoted = false;
+            v.EpisodeDecision = attributed;
         }
 
         if (v.EpisodeSpent)
@@ -299,8 +381,8 @@ public sealed class VariantEngine : IEngineHandler
 
         if (v.Active is null)
         {
-            var id = EngineIds.Opportunity(v.VariantId, new ConfigHash(v.VariantHash), _tradeDate, v.EpisodeId!);
-            var opportunity = new Opportunity(id, v.VariantId, v.EpisodeId!, v.EpisodeStartBarSeq, v.EpisodeSide, now);
+            var id = EngineIds.Opportunity(v.Key, new ConfigHash(v.VariantHash), _tradeDate, v.EpisodeId!);
+            var opportunity = new Opportunity(id, v.Key, v.EpisodeId!, v.EpisodeStartBarSeq, v.EpisodeSide, now, v.EpisodeDecision);
             v.Active = opportunity;
             _allOpportunities.Add(opportunity);
             Transition(v, opportunity, OpportunityState.AwaitingContract, now, "EpisodeValid");
@@ -382,7 +464,7 @@ public sealed class VariantEngine : IEngineHandler
             return;
         }
 
-        var gateBlock = EntryGate?.BlockReason(v.VariantId, now);
+        var gateBlock = EntryGate?.BlockReason(v.Key, now);
         if (gateBlock is not null)
         {
             Note(v, opportunity, now, "Blocked:" + gateBlock, "new entries are blocked for this scope");
@@ -486,14 +568,14 @@ public sealed class VariantEngine : IEngineHandler
         slot.OwnerOpportunityId = opportunity.Id;
         opportunity.Attempts++;
         // The variant hash (spec + shared policy), not the whole-config hash: adding or removing another variant must not re-identify this one's decisions.
-        var decisionId = EngineIds.Decision(new ConfigHash(v.VariantHash), v.VariantId, v.Spec.StrategyId, _tradeDate, triggerKind, triggerSeq, opportunity.Attempts);
+        var decisionId = EngineIds.Decision(new ConfigHash(v.VariantHash), v.Key, _tradeDate, triggerKind, triggerSeq, opportunity.Attempts);
         var intentId = EngineIds.Order(decisionId, "entry", opportunity.Attempts);
         var contract = opportunity.Contract!;
         opportunity.ActiveIntentId = intentId;
         opportunity.LastEvaluationKey = "Issued";
         _outputs.Add(new EntryIntent(
             now,
-            v.VariantId,
+            v.Key,
             intentId,
             decisionId,
             opportunity.Id,
@@ -530,13 +612,13 @@ public sealed class VariantEngine : IEngineHandler
         ArgumentNullException.ThrowIfNull(outcome);
         ArgumentNullException.ThrowIfNull(scheduler);
         var now = scheduler.Now;
-        var v = FindVariant(outcome.VariantId);
+        var v = FindVariant(outcome.Variant);
         if (v.Active is not { } opportunity
             || opportunity.Id != outcome.OpportunityId
             || opportunity.State != OpportunityState.OrderPending
             || opportunity.ActiveIntentId != outcome.IntentId)
         {
-            throw new InvalidOperationException($"No outstanding entry intent {outcome.IntentId} for opportunity {outcome.OpportunityId} of variant {outcome.VariantId}.");
+            throw new InvalidOperationException($"No outstanding entry intent {outcome.IntentId} for opportunity {outcome.OpportunityId} of variant {outcome.Variant}.");
         }
 
         var slot = v.Slots.First(s => s.OwnerOpportunityId == opportunity.Id);
@@ -594,21 +676,21 @@ public sealed class VariantEngine : IEngineHandler
     }
 
     /// <summary>Frees the slot of a position that has been fully closed (CP3 reports this). The episode stays spent: a new validity episode is required for another opportunity.</summary>
-    public void ReportPositionClosed(string variantId, string opportunityId, IEngineScheduler scheduler)
+    public void ReportPositionClosed(VariantKey variant, string opportunityId, IEngineScheduler scheduler)
     {
         ArgumentNullException.ThrowIfNull(scheduler);
-        var v = FindVariant(variantId);
+        var v = FindVariant(variant);
         var slot = v.Slots.FirstOrDefault(s => s.State == SlotState.Occupied && s.OwnerOpportunityId == opportunityId)
-            ?? throw new InvalidOperationException($"Variant {variantId} has no occupied slot owned by {opportunityId}.");
+            ?? throw new InvalidOperationException($"Variant {variant} has no occupied slot owned by {opportunityId}.");
         slot.State = SlotState.Free;
         slot.OwnerOpportunityId = null;
         Audit(scheduler.Now, v, opportunityId, "Position", "Closed", FormattableString.Invariant($"slot={slot.SlotNo} freed"));
     }
 
     /// <summary>True while the base strategy is valid for the episode that owns this opportunity (used by execution to revalidate a pending entry at maturity).</summary>
-    public bool IsStrategyValidFor(string variantId, string opportunityId)
+    public bool IsStrategyValidFor(VariantKey variant, string opportunityId)
     {
-        var v = FindVariant(variantId);
+        var v = FindVariant(variant);
         return v.Valid && v.Active is { } active && active.Id == opportunityId && active.EpisodeId == v.EpisodeId;
     }
 
@@ -616,9 +698,9 @@ public sealed class VariantEngine : IEngineHandler
     public string? FixedContractToken(string opportunityId)
         => _allOpportunities.FirstOrDefault(o => o.Id == opportunityId)?.Contract?.Token;
 
-    public VariantState GetVariant(string variantId) => FindVariant(variantId);
+    public VariantState GetVariant(VariantKey variant) => FindVariant(variant);
 
-    public string VariantHashOf(string variantId) => FindVariant(variantId).VariantHash;
+    public string VariantHashOf(VariantKey variant) => FindVariant(variant).VariantHash;
 
     /// <summary>Exits must use the contract fixed by the opportunity; throws <see cref="ContractChangedException"/> otherwise. Premium band limits do not apply to exits.</summary>
     public void RequireFixedContract(string opportunityId, string token)
@@ -643,7 +725,7 @@ public sealed class VariantEngine : IEngineHandler
                 {
                     opportunity.CancelRequested = true;
                     opportunity.CancelReason = CancelReason.StrategyInvalidated;
-                    _outputs.Add(new CancelRequest(now, v.VariantId, opportunity.ActiveIntentId!, opportunity.Id, CancelReason.StrategyInvalidated));
+                    _outputs.Add(new CancelRequest(now, v.Key, opportunity.ActiveIntentId!, opportunity.Id, CancelReason.StrategyInvalidated));
                     Audit(now, v, opportunity.Id, "EntryIntent", "CancelRequested", "StrategyInvalidated:" + reason + "; reservation retained until the outcome is reported");
                 }
 
@@ -672,7 +754,7 @@ public sealed class VariantEngine : IEngineHandler
                     {
                         opportunity.CancelRequested = true;
                         opportunity.CancelReason = CancelReason.EntryClose;
-                        _outputs.Add(new CancelRequest(at, v.VariantId, opportunity.ActiveIntentId!, opportunity.Id, CancelReason.EntryClose));
+                        _outputs.Add(new CancelRequest(at, v.Key, opportunity.ActiveIntentId!, opportunity.Id, CancelReason.EntryClose));
                         Audit(at, v, opportunity.Id, "EntryIntent", "CancelRequested", "EntryClose; reservation retained until the outcome is reported");
                     }
 
@@ -684,7 +766,7 @@ public sealed class VariantEngine : IEngineHandler
     // ------------------------------------------------------------------ safety actions (integrity / kill switch)
 
     private IEnumerable<VariantState> InScope(string scope)
-        => scope == "*" ? _variants : _variants.Where(x => string.Equals(x.VariantId, scope, StringComparison.Ordinal));
+        => scope == "*" ? _variants : VariantKey.TryParse(scope, out var scoped) ? _variants.Where(x => x.Key == scoped) : Enumerable.Empty<VariantState>();
 
     /// <summary>Requests cancellation of the pending entry attempts (OrderPending) of the scope. Reservations stay until the outcome is reported. Returns how many requests were issued.</summary>
     public int RequestCancelPending(string scope, CancelReason reason, DateTimeOffset at)
@@ -696,7 +778,7 @@ public sealed class VariantEngine : IEngineHandler
             {
                 opportunity.CancelRequested = true;
                 opportunity.CancelReason = reason;
-                _outputs.Add(new CancelRequest(at, v.VariantId, opportunity.ActiveIntentId!, opportunity.Id, reason));
+                _outputs.Add(new CancelRequest(at, v.Key, opportunity.ActiveIntentId!, opportunity.Id, reason));
                 Audit(at, v, opportunity.Id, "EntryIntent", "CancelRequested", reason + "; reservation retained until the outcome is reported");
                 count++;
             }
@@ -737,7 +819,7 @@ public sealed class VariantEngine : IEngineHandler
     {
         foreach (var (reason, info) in opportunity.NoteCounts.OrderBy(x => x.Key, StringComparer.Ordinal).ToList())
         {
-            _outputs.Add(new EvaluationSummary(at, v.VariantId, opportunity.Id, "Opportunity", opportunity.Id, reason, info.Count, info.First, info.Last));
+            _outputs.Add(new EvaluationSummary(at, v.Key, opportunity.Id, "Opportunity", opportunity.Id, reason, info.Count, info.First, info.Last));
         }
 
         opportunity.NoteCounts.Clear();
@@ -745,15 +827,15 @@ public sealed class VariantEngine : IEngineHandler
 
     // ------------------------------------------------------------------ helpers
 
-    private VariantState FindVariant(string variantId)
-        => _variants.FirstOrDefault(x => string.Equals(x.VariantId, variantId, StringComparison.Ordinal))
-           ?? throw new KeyNotFoundException($"Unknown variant '{variantId}'.");
+    private VariantState FindVariant(VariantKey variant)
+        => _variants.FirstOrDefault(x => x.Key == variant)
+           ?? throw new KeyNotFoundException($"Unknown variant '{variant}'.");
 
     private void Transition(VariantState v, Opportunity opportunity, OpportunityState to, DateTimeOffset at, string reason)
     {
         var from = opportunity.State;
         opportunity.State = to;
-        _outputs.Add(new OpportunityTransition(at, v.VariantId, opportunity.Id, from, to, reason));
+        _outputs.Add(new OpportunityTransition(at, v.Key, opportunity.Id, from, to, reason));
     }
 
     private void Terminal(VariantState v, Opportunity opportunity, OpportunityState to, DateTimeOffset at, string reason)
@@ -783,5 +865,5 @@ public sealed class VariantEngine : IEngineHandler
     }
 
     private void Audit(DateTimeOffset at, VariantState v, string? opportunityId, string stage, string outcome, string detail)
-        => _outputs.Add(new AuditRecord(at, v.VariantId, opportunityId, stage, outcome, detail));
+        => _outputs.Add(new AuditRecord(at, v.Key, opportunityId, stage, outcome, detail));
 }

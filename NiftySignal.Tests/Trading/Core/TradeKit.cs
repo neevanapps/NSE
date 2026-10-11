@@ -32,6 +32,15 @@ internal sealed class TradeKit
         Engine.Start(Loop);
     }
 
+    /// <summary>Canonical family path: the engine is driven by strategy families (several variants per family).</summary>
+    public TradeKit(TradingConfig config, IReadOnlyDictionary<string, NiftySignal.Trading.Core.Strategies.IStrategyFamily> families, IEnumerable<OptionContract>? universe = null)
+    {
+        Config = config;
+        Engine = new TradingEngine(config, Clock.Day, (universe ?? Kit.StandardUniverse()).ToList(), families);
+        Loop = new EngineLoop(Engine, Engine.Variants.Schedule.DayStartUtc);
+        Engine.Start(Loop);
+    }
+
     public TradingConfig Config { get; }
 
     public TradingEngine Engine { get; }
@@ -50,7 +59,7 @@ internal sealed class TradeKit
             Costs = costs ?? TestCosts(),
             Session = session ?? new SessionConfig { LiquidationStart = new TimeOnly(15, 5, 0) },
             Selection = selection ?? new ContractSelectionConfig(),
-            Variants = variants.ToDictionary(v => v.VariantId),
+            Variants = variants.ToDictionary(v => v.StrategyId + "/" + v.VariantId),
         };
 
     public static VariantSpec Immediate(string id = "A", SizingSpec? sizing = null, ExitSpec? exit = null, decimal? dailySl = null, int? maxAttempts = null)
@@ -79,7 +88,13 @@ internal sealed class TradeKit
 
     public IEnumerable<FillRecord> Fills(string? variantId = null) => Out<FillRecord>(variantId);
 
-    public Position Position(string variantId = "A", int index = 0) => Engine.Execution.PositionsOf(variantId)[index];
+    /// <summary>Outputs of one exact variant identity (StrategyId + VariantId).</summary>
+    public IEnumerable<T> Out<T>(NiftySignal.Trading.Core.Strategies.VariantKey key) where T : EngineOutput
+        => Engine.Outputs.OfType<T>().Where(o => o.Variant == key);
+
+    public Position Position(NiftySignal.Trading.Core.Strategies.VariantKey key, int index = 0) => Engine.Execution.PositionsOf(key)[index];
+
+    public Position Position(string variantId = "A", int index = 0) => Engine.Execution.PositionsOf(Vk.S(variantId))[index];
 
     /// <summary>Bar 1 at T0 with an entry quote (bid = ask - 1), heartbeat past the 1 s latency: the entry order fills at T0 + 1 s.</summary>
     public static TradeKit Opened(VariantSpec spec, decimal entryAsk = 125m, ExecutionConfig? execution = null, long? askQty = 100000)

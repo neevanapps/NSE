@@ -3,6 +3,7 @@ using NiftySignal.Trading.Core.Exits;
 using NiftySignal.Trading.Core.Events;
 using NiftySignal.Trading.Core.Instruments;
 using NiftySignal.Trading.Core.Sizing;
+using NiftySignal.Trading.Core.Strategies;
 
 namespace NiftySignal.Trading.Core.Variants;
 
@@ -27,9 +28,10 @@ public enum ReentryPolicy
 /// </summary>
 public sealed record VariantSpec
 {
+    /// <summary>Case name INSIDE its strategy family; unique only within <see cref="StrategyId"/> (X/A and Y/A are different variants).</summary>
     public required string VariantId { get; init; }
 
-    /// <summary>Key of the (pure) base strategy supplied to the engine.</summary>
+    /// <summary>The logical strategy family this variant belongs to: the key of the strategy family supplied to the engine.</summary>
     public required string StrategyId { get; init; }
 
     public required EntryConditionSpec EntryCondition { get; init; }
@@ -57,19 +59,22 @@ public sealed record VariantSpec
     public CapacityBlockedPolicy ResolveCapacityPolicy()
         => OnCapacityBlocked ?? (EntryCondition is ImmediateEntrySpec ? CapacityBlockedPolicy.Reject : CapacityBlockedPolicy.Wait);
 
-    public string ResolveAccountId() => AccountId ?? VariantId;
+    /// <summary>The canonical identity (StrategyId, VariantId). A method, not a property, so that it is not part of the canonical configuration serialisation. Throws when either part is invalid (see Validate).</summary>
+    public VariantKey GetKey() => new(StrategyId, VariantId);
+
+    public string ResolveAccountId() => AccountId ?? GetKey().ToString();
 
     public IReadOnlyList<string> Validate(int candleHistoryDepth)
     {
         var errors = new List<string>();
-        if (string.IsNullOrWhiteSpace(VariantId))
+        if (!VariantKey.IsValidPart(VariantId))
         {
-            errors.Add("VariantId is required.");
+            errors.Add($"VariantId '{VariantId}' is not valid: use letters, digits, underscore, dot or hyphen, starting with a letter or digit.");
         }
 
-        if (string.IsNullOrWhiteSpace(StrategyId))
+        if (!VariantKey.IsValidPart(StrategyId))
         {
-            errors.Add($"Variant '{VariantId}': StrategyId is required.");
+            errors.Add($"Variant '{VariantId}': StrategyId '{StrategyId}' is not valid: use letters, digits, underscore, dot or hyphen, starting with a letter or digit.");
         }
 
         switch (Sizing)
@@ -128,9 +133,10 @@ public sealed record VariantSpec
 public readonly record struct StrategyValidity(bool IsValid, OptionSide Side, string Reason);
 
 /// <summary>
-/// The base strategy: pure, stateless function of the bars it is shown. It decides only whether its setup is valid and on which side;
-/// episodes, opportunities, contract selection, entry conditions and capacity belong to the engine. The same instance may serve
-/// several variants, so it must hold no mutable state.
+/// LEGACY single-case strategy: a pure, stateless function of the bars it is shown that decides only whether its setup is valid and on which
+/// side. The engine knows only <see cref="Strategies.IStrategyFamily"/>; a single-case strategy enters it through
+/// <see cref="Strategies.LegacyBaseStrategyFamily"/>, which gives every variant of that StrategyId the same decision. New strategies implement
+/// the family contract directly.
 /// </summary>
 public interface IBaseStrategy
 {
