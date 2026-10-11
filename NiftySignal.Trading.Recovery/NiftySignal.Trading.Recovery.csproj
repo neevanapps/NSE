@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- CP6.1: database-free persistence contracts and verified recovery (docs/TRADING_ENGINE_PHASE1_CONTRACT.md section A.18). Lossless versioned
+       codecs, run / step / checkpoint / control records, the run-store interface with an in-memory implementation (atomic commit, ownership fencing,
+       scripted faults), the durable-run orchestration over the existing translator and engine, and the state-digest based recovery verification.
+       Pure: no I/O, no wall clock, no randomness, no EF, no Npgsql. NiftySignal.Tests contains the banned-API guard over this assembly. -->
+  <ItemGroup>
+    <ProjectReference Include="..\NiftySignal.Trading.Core\NiftySignal.Trading.Core.csproj" />
+    <ProjectReference Include="..\NiftySignal.Trading.Adapters\NiftySignal.Trading.Adapters.csproj" />
+  </ItemGroup>
+
+</Project>

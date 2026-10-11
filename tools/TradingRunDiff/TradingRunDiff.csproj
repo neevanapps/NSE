@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- CP5 engineering-validation harness: runs ONE recorded session through the historical adapter and the non-hosted live-paper adapter and
+       compares them (docs/TRADING_ENGINE_PHASE1_CONTRACT.md section A.16.9); mode "durable" (CP6.1, section A.18) compares the historical adapter with the durable run over an in-memory store. Read-only against the recorded tick database; no writes, no
+       migrations, no Host, no broker. Not a profitability experiment. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../NiftySignal.Persistence/NiftySignal.Persistence.csproj" />
+    <ProjectReference Include="../../NiftySignal.AdaptiveObserver/NiftySignal.AdaptiveObserver.csproj" />
+    <ProjectReference Include="../../NiftySignal.Trading.Adapters/NiftySignal.Trading.Adapters.csproj" />
+    <ProjectReference Include="../../NiftySignal.Trading.Recovery/NiftySignal.Trading.Recovery.csproj" />
+    <ProjectReference Include="../../NiftySignal.Trading.Signals/NiftySignal.Trading.Signals.csproj" />
+  </ItemGroup>
+
+</Project>

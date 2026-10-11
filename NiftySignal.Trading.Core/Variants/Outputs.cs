@@ -1,0 +1,96 @@
+using NiftySignal.Trading.Core.Candles;
+using NiftySignal.Trading.Core.Instruments;
+
+namespace NiftySignal.Trading.Core.Variants;
+
+public enum OpportunityState
+{
+    Created = 0,
+
+    /// <summary>Base strategy valid, contract selection not yet successful (NoEligibleContract); retried on later completed bars only.</summary>
+    AwaitingContract = 1,
+
+    /// <summary>Contract fixed; waiting for the entry condition and rechecks to pass on an eligible quote update.</summary>
+    Waiting = 2,
+
+    /// <summary>An entry intent is outstanding (reservation held). No second intent may exist until it is terminal.</summary>
+    OrderPending = 3,
+
+    /// <summary>A fill (full or partial) resolved the intent; the opportunity is spent. The slot stays occupied until the position is closed.</summary>
+    Consumed = 4,
+
+    Cancelled = 5,
+    Expired = 6,
+    Rejected = 7,
+}
+
+public enum EntryOutcomeKind
+{
+    Filled = 0,
+
+    /// <summary>Any fill quantity below the requested one; per contract it consumes the opportunity.</summary>
+    PartiallyFilled = 1,
+    Cancelled = 2,
+    Expired = 3,
+    Rejected = 4,
+}
+
+/// <summary>Terminal result of an entry intent, reported by the execution model (CP3) or a test harness, from inside the engine loop.</summary>
+public sealed record EntryOutcome(string VariantId, string OpportunityId, string IntentId, EntryOutcomeKind Kind);
+
+public enum CancelReason
+{
+    StrategyInvalidated = 0,
+    EntryClose = 1,
+
+    /// <summary>A global feed fault: the attempt is cancelled and the opportunity is re-armed once the engine is Healthy again (if still valid).</summary>
+    IntegrityDegraded = 2,
+
+    /// <summary>Manual kill: the attempt is cancelled and the opportunity ends (it is not resurrected by a reset).</summary>
+    KillSwitch = 3,
+}
+
+/// <summary>Base of everything the variant engine emits. Outputs are plain data; the engine performs no I/O.</summary>
+public abstract record EngineOutput(DateTimeOffset At, string VariantId);
+
+/// <summary>
+/// Marketable-limit entry intent at the observed qualifying ask (initial policy). Carries the premium limits so that CP3 can enforce
+/// them: a buy limit caps the price but cannot guarantee a minimum fill price, so how fills below
+/// <see cref="MinimumEntryPremium"/> are handled is a CP3 decision, and a fill inside the band must never be fabricated.
+/// </summary>
+public sealed record EntryIntent(
+    DateTimeOffset At,
+    string VariantId,
+    string IntentId,
+    string DecisionId,
+    string OpportunityId,
+    int Attempt,
+    int SlotNo,
+    OptionContract Contract,
+    int RequestedQuantity,
+    int Lots,
+    int LotSize,
+    decimal LimitPrice,
+    decimal QualifyingAsk,
+    decimal MinimumEntryPremium,
+    decimal MaximumEntryPremium,
+    DateTimeOffset QuoteAvailableAt,
+    long QuoteSourceId,
+    string ConditionKind,
+    decimal? ConditionAverage,
+    int? ConditionN,
+    CandlePriceSource? ConditionPriceSource) : EngineOutput(At, VariantId);
+
+/// <summary>Request to cancel the unfilled quantity of an outstanding entry intent. The reservation is retained until the outcome is reported.</summary>
+public sealed record CancelRequest(DateTimeOffset At, string VariantId, string IntentId, string OpportunityId, CancelReason Reason) : EngineOutput(At, VariantId);
+
+public sealed record OpportunityTransition(
+    DateTimeOffset At,
+    string VariantId,
+    string OpportunityId,
+    OpportunityState From,
+    OpportunityState To,
+    string Reason) : EngineOutput(At, VariantId);
+
+/// <summary>Why-record for accepted and rejected steps. Detail strings are built with invariant formatting only.</summary>
+public sealed record AuditRecord(DateTimeOffset At, string VariantId, string? OpportunityId, string Stage, string Outcome, string Detail) : EngineOutput(At, VariantId);

@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Pure, deterministic trading core (docs/TRADING_ENGINE_PHASE1_CONTRACT.md). No I/O, no wall clock,
+       no randomness, no EF. The only project reference is Domain (for IstTime). NiftySignal.Tests contains a
+       banned-API guard that inspects this assembly's metadata. -->
+  <ItemGroup>
+    <ProjectReference Include="..\NiftySignal.Domain\NiftySignal.Domain.csproj" />
+  </ItemGroup>
+
+</Project>
