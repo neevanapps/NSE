@@ -1,6 +1,7 @@
 using NiftySignal.Trading.Core.Costs;
 using NiftySignal.Trading.Core.Instruments;
 using NiftySignal.Trading.Core.Variants;
+using NiftySignal.Trading.Core.Reporting;
 using NiftySignal.Trading.Core.Strategies;
 
 namespace NiftySignal.Trading.Core.Execution;
@@ -268,6 +269,60 @@ public sealed record FillRecord(
 
 public sealed record PositionOpened(DateTimeOffset At, VariantKey Variant, string PositionId, string OpportunityId, string Token, long Quantity, decimal AvgEntryPrice) : EngineOutput(At, Variant);
 
+/// <summary>
+/// Lifetime excursion of ONE position (not of its variant or family), marked on the executable side: the bid, the price a long option can actually be sold at.
+/// Units are premium rupees per unit of the contract (NOT multiplied by quantity), relative to the average entry FILL price (slippage included):
+/// <c>MFE = max(0, highest eligible bid - avg entry)</c>, <c>MAE = min(0, lowest eligible bid - avg entry)</c> (so MAE is zero or negative); the percentages are
+/// 100 x that / avg entry. The observed series starts with the quote of the entry fill and runs to the final exit; TP1 and other partial exits do not
+/// reset or split it. The values at the first exit fill are reported separately. <c>Coverage</c> says whether a gap longer than the quote-age limit
+/// interrupted the bid path (the true extremes may then lie in an unobserved stretch); <c>None</c> means no eligible bid was ever observed and the
+/// values are null (never zero).
+/// </summary>
+public sealed record PositionExcursion(
+    decimal? Mfe,
+    decimal? Mae,
+    decimal? MfePct,
+    decimal? MaePct,
+    decimal? MaxBid,
+    decimal? MinBid,
+    int Observations,
+    int Gaps,
+    ExcursionCoverage Coverage,
+    DateTimeOffset? FirstObservedAt,
+    DateTimeOffset? LastObservedAt,
+    decimal? MfeAtFirstExit,
+    decimal? MaeAtFirstExit)
+{
+    /// <summary>The single definition of the excursion of a position at this moment (a running position gives its values so far).</summary>
+    public static PositionExcursion From(Position p)
+    {
+        ArgumentNullException.ThrowIfNull(p);
+        if (p.BidObservations == 0 || p.MaxBid is not { } max || p.MinBid is not { } min)
+        {
+            return new PositionExcursion(null, null, null, null, null, null, 0, p.BidObservationGaps, ExcursionCoverage.None, null, null, null, null);
+        }
+
+        var avg = p.AvgEntryPrice;
+        var mfe = Math.Max(0m, max - avg);
+        var mae = Math.Min(0m, min - avg);
+        return new PositionExcursion(
+            mfe,
+            mae,
+            avg == 0m ? null : 100m * mfe / avg,
+            avg == 0m ? null : 100m * mae / avg,
+            max,
+            min,
+            p.BidObservations,
+            p.BidObservationGaps,
+            p.BidObservationGaps == 0 ? ExcursionCoverage.Complete : ExcursionCoverage.HasGaps,
+            p.FirstBidObservationAt,
+            p.LastBidObservationAt,
+            p.MaxBidAtFirstExit is { } fm ? Math.Max(0m, fm - avg) : null,
+            p.MinBidAtFirstExit is { } fn ? Math.Min(0m, fn - avg) : null);
+    }
+}
+
+/// <summary>A position closed completely. <see cref="Excursion"/> is its LIFETIME MAE / MFE (entry fill to final exit), so the stored trade keeps it.</summary>
 public sealed record PositionClosed(
     DateTimeOffset At,
     VariantKey Variant,
@@ -277,7 +332,8 @@ public sealed record PositionClosed(
     decimal AvgEntryPrice,
     decimal GrossPnl,
     decimal TotalCosts,
-    decimal NetPnl) : EngineOutput(At, Variant);
+    decimal NetPnl,
+    PositionExcursion Excursion) : EngineOutput(At, Variant);
 
 public sealed record ExitOrderCreated(
     DateTimeOffset At,
@@ -326,7 +382,8 @@ public sealed record UnresolvedAtSessionEnd(
     string Token,
     long OpenQuantity,
     decimal? LastEligibleBid,
-    TimeSpan? LastBidAge) : EngineOutput(At, Variant);
+    TimeSpan? LastBidAge,
+    PositionExcursion Excursion) : EngineOutput(At, Variant);
 
 /// <summary>Record-only in ResearchV1: nothing is blocked, liquidated or capped when this is emitted.</summary>
 public sealed record DailySlBreached(DateTimeOffset At, VariantKey Variant, decimal DailyPnl, decimal DailySl, bool ConservativeMark) : EngineOutput(At, Variant);

@@ -892,7 +892,7 @@ public sealed class ExecutionEngine
             position.State = PositionState.Closed;
             position.ClosedAt = execTime;
             var gross = position.GrossRealised;
-            _out.Add(new PositionClosed(execTime, position.Variant, position.Id, position.Contract.Token, position.EntryQuantity, position.AvgEntryPrice, gross, position.TotalCosts, position.NetRealised));
+            _out.Add(new PositionClosed(execTime, position.Variant, position.Id, position.Contract.Token, position.EntryQuantity, position.AvgEntryPrice, gross, position.TotalCosts, position.NetRealised, PositionExcursion.From(position)));
             if (position.NetRealised < 0m)
             {
                 book.LossStreak++;
@@ -1044,7 +1044,7 @@ public sealed class ExecutionEngine
                 }
 
                 var (bid, age) = LastEligibleBid(position.Contract.Token, s.Now);
-                _out.Add(new UnresolvedAtSessionEnd(s.Now, position.Variant, position.Id, position.Contract.Token, position.OpenQuantity, bid, age));
+                _out.Add(new UnresolvedAtSessionEnd(s.Now, position.Variant, position.Id, position.Contract.Token, position.OpenQuantity, bid, age, PositionExcursion.From(position)));
             }
 
             if (book.DailySl is not null)

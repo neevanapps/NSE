@@ -289,28 +289,7 @@ public static class DailySummaryBuilder
     private static TradeExcursion Excursion(Position p)
     {
         const string unit = "premium rupees per unit (bid - average entry fill price), not multiplied by quantity";
-        if (p.BidObservations == 0 || p.MaxBid is not { } max || p.MinBid is not { } min)
-        {
-            return new TradeExcursion(p.Id, p.Contract.Token, unit, p.State, p.AvgEntryPrice, null, null, null, null, 0, p.BidObservationGaps, ExcursionCoverage.None, null, null);
-        }
-
-        var avg = p.AvgEntryPrice;
-        var mfe = Math.Max(0m, max - avg);
-        var mae = Math.Min(0m, min - avg);
-        return new TradeExcursion(
-            p.Id,
-            p.Contract.Token,
-            unit,
-            p.State,
-            avg,
-            mfe,
-            mae,
-            avg == 0m ? null : 100m * mfe / avg,
-            avg == 0m ? null : 100m * mae / avg,
-            p.BidObservations,
-            p.BidObservationGaps,
-            p.BidObservationGaps == 0 ? ExcursionCoverage.Complete : ExcursionCoverage.HasGaps,
-            p.MaxBidAtFirstExit is { } fm ? Math.Max(0m, fm - avg) : null,
-            p.MinBidAtFirstExit is { } fn ? Math.Min(0m, fn - avg) : null);
+        var e = PositionExcursion.From(p);
+        return new TradeExcursion(p.Id, p.Contract.Token, unit, p.State, p.AvgEntryPrice, e.Mfe, e.Mae, e.MfePct, e.MaePct, e.Observations, e.Gaps, e.Coverage, e.MfeAtFirstExit, e.MaeAtFirstExit);
     }
 }

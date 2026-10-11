@@ -24,8 +24,8 @@ namespace NiftySignal.Trading.Recovery.Codec;
 /// </summary>
 public static class OutputCodec
 {
-    /// <summary>2: the variant identity of an output is the canonical text of (StrategyId, VariantId) in the member <c>Variant</c> (version 1 carried a bare <c>VariantId</c>); both parts are therefore on every record.</summary>
-    public const string Version = "trading-codec/2";
+    /// <summary>3: PositionClosed and UnresolvedAtSessionEnd carry the lifetime excursion (MAE / MFE) of the position. 2: the variant identity of an output is the canonical text of (StrategyId, VariantId) in the member <c>Variant</c> (version 1 carried a bare <c>VariantId</c>); both parts are therefore on every record.</summary>
+    public const string Version = "trading-codec/3";
 
     private const string TimeFormat = "yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'";
     private const string DateFormat = "yyyy-MM-dd";

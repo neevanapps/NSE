@@ -66,7 +66,7 @@ internal sealed class PaperKit
     }
 
     /// <summary>A market move: new quotes for the contracts at the given time, then 1.5 s pass (stops, targets and exits fire from quotes).</summary>
-    public DateTimeOffset Move(DateTimeOffset at, decimal? ceBid = null, decimal? peBid = null, decimal spread = 1m)
+    public DateTimeOffset Move(DateTimeOffset at, decimal? ceBid = null, decimal? peBid = null, decimal spread = 1m, double advance = 1.5)
     {
         var events = new List<EngineEvent>();
         if (ceBid is { } c)
@@ -80,7 +80,7 @@ internal sealed class PaperKit
         }
 
         Kit.Feed(events.ToArray());
-        Kit.Loop.AdvanceTo(at.AddSeconds(1.5));
+        Kit.Loop.AdvanceTo(at.AddSeconds(advance));
         return at;
     }
 
