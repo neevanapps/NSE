@@ -60,6 +60,12 @@ public sealed class Opportunity
 
     public int SelectionAttempts { get; internal set; }
 
+    /// <summary>Premium (limit x quantity) of the entry intent currently outstanding for this opportunity; 0 when none. Counts against the shared capital.</summary>
+    public decimal IntentPremium { get; internal set; }
+
+    /// <summary>Canonical reason set of the last EntryRejected emitted for this opportunity (a record is emitted only when the set changes).</summary>
+    internal string? LastRejectionKey { get; set; }
+
     public int Evaluations { get; internal set; }
 
     internal string? LastEvaluationKey { get; set; }
@@ -143,6 +149,11 @@ public sealed class VariantState
     public bool EpisodeSpent { get; internal set; }
 
     public bool EpisodeBlockNoted { get; internal set; }
+
+    /// <summary>Reason set of the last rejection recorded for this episode while no opportunity existed.</summary>
+    internal string? EpisodeRejectionKey { get; set; }
+
+    internal int RejectionOrdinal { get; set; }
 
     public Opportunity? Active { get; internal set; }
 

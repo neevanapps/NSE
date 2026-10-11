@@ -73,6 +73,9 @@ public enum ReasonCode
     PositionClosed,
     UnresolvedAtClose,
     UnresolvedAtSessionEnd,
+    MandatoryExitPending,
+    EntryRejected,
+    MaxHold,
     DailySlBreached,
     IntegrityTransition,
     KillSwitchCommand,
@@ -169,6 +172,15 @@ public static class AuditTrail
                     positionOpportunity.TryGetValue(p.PositionId, out var closedOpp);
                     list.Add(E(AuditCategory.Position, ReasonCode.PositionClosed, "PositionClosed", FormattableString.Invariant($"gross={p.GrossPnl} costs={p.TotalCosts} net={p.NetPnl}"), closedOpp, null, p.PositionId));
                     break;
+                case EntryRejected r:
+                    list.Add(E(AuditCategory.Evaluation, ReasonCode.EntryRejected, "EntryRejected",
+                        FormattableString.Invariant($"stage={r.Stage} reasons={r.Reasons} decision={r.DecisionId} session={r.SourceSessionId} bar={r.BarSeq}"), r.OpportunityId));
+                    break;
+                case MandatoryExitPending m:
+                    positionOpportunity.TryGetValue(m.PositionId, out var pendingOpp);
+                    list.Add(E(AuditCategory.Exit, ReasonCode.MandatoryExitPending, "MandatoryExitPending",
+                        FormattableString.Invariant($"reason={m.Reason} remainingQty={m.RemainingQuantity} attempts={m.Attempts} failure={m.Failure}"), pendingOpp, m.OrderId, m.PositionId));
+                    break;
                 case UnresolvedAtClose u:
                     list.Add(E(AuditCategory.Position, ReasonCode.UnresolvedAtClose, "UnresolvedAtClose", FormattableString.Invariant($"openQty={u.OpenQuantity} reserved={u.ReservedExitQuantity} liveOrders={u.LiveExitOrders} lastBid={u.LastEligibleBid} bidAge={u.LastBidAge}"), null, null, u.PositionId));
                     break;
@@ -221,6 +233,7 @@ public static class AuditTrail
         ExitReason.FinalTarget => ReasonCode.FinalTarget,
         ExitReason.StrategyExit => ReasonCode.StrategyExit,
         ExitReason.ManualKill => ReasonCode.ManualKill,
+        ExitReason.MaxHold => ReasonCode.MaxHold,
         _ => ReasonCode.SessionLiquidation,
     };
 
@@ -278,6 +291,8 @@ public static class AuditTrail
             "IntegrityDegraded" => ReasonCode.IntegrityDegraded,
             "IntegrityRecovering" => ReasonCode.IntegrityRecovering,
             "KillSwitch" => ReasonCode.KillSwitch,
+            "GlobalCapital" or "GlobalTradeLimit" or "FamilyTradeLimit" or "VariantTradeLimit" or "GlobalDailyLoss" or "FamilyDailyLoss" or "VariantDailyLoss"
+                or "FamilyConsecutiveLoss" or "VariantConsecutiveLoss" => ReasonCode.RiskBlocked,
             "Filled" or "FilledBelowBand" => ReasonCode.Filled,
             "PartiallyFilled" => ReasonCode.PartiallyFilled,
             "Expired" => ReasonCode.Expired,

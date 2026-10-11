@@ -5,6 +5,7 @@ using NiftySignal.Trading.Core.Events;
 using NiftySignal.Trading.Core.Ids;
 using NiftySignal.Trading.Core.Integrity;
 using NiftySignal.Trading.Core.Quotes;
+using NiftySignal.Trading.Core.Risk;
 using NiftySignal.Trading.Core.Scheduling;
 using NiftySignal.Trading.Core.Session;
 using NiftySignal.Trading.Core.State;
@@ -36,6 +37,7 @@ public sealed class ExecutionEngine
     public const string ExpirePrefix = "exec-expire:";
     public const string CancelPrefix = "exec-cancel:";
     public const string ExitPrefix = "exec-xattempt:";
+    public const string HoldPrefix = "exec-hold:";
 
     private sealed class Liquidity
     {
@@ -78,6 +80,9 @@ public sealed class ExecutionEngine
         public long LateFills { get; set; }
 
         public int FillSeq { get; set; }
+
+        /// <summary>Consecutive closed trades with total net P&L below zero (reset by a trade closing at or above zero).</summary>
+        public int LossStreak { get; set; }
     }
 
     private readonly TradingConfig _config;
@@ -92,6 +97,7 @@ public sealed class ExecutionEngine
     private readonly List<EntryOrder> _entryOrders = new();
     private readonly Dictionary<string, EntryOrder> _entryById = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ExitOrder> _exitById = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, int> _familyLossStreak = new(StringComparer.Ordinal);
     private bool _ended;
 
     public ExecutionEngine(TradingConfig config, DateOnly tradeDate, SessionSchedule schedule, VariantEngine variants, CostModel costs, List<EngineOutput> sink, TimeSpan? quoteHistoryRetention = null)
@@ -121,6 +127,29 @@ public sealed class ExecutionEngine
 
     /// <summary>Trades opened so far by the variant (positions; a partial exit is not a trade).</summary>
     public int TradesOf(VariantKey variant) => BookOf(variant).Positions.Count;
+
+    /// <summary>Trades opened so far by a whole strategy family (all of its variants).</summary>
+    public int FamilyTradesOf(string strategyId) => _books.Where(b => b.Variant.StrategyId == strategyId).Sum(b => b.Positions.Count);
+
+    public int GlobalTrades() => _books.Sum(b => b.Positions.Count);
+
+    /// <summary>
+    /// Realized NET P&amp;L of a variant today: exit proceeds already received (a TP1 leg counts at once) minus the average-entry cost of the quantity sold, minus ALL
+    /// entry and exit costs incurred so far. The unrealized part of any open quantity is never included.
+    /// </summary>
+    public decimal RealizedNetOf(VariantKey variant) => BookOf(variant).Positions.Sum(p => p.NetRealised);
+
+    public decimal FamilyRealizedNet(string strategyId) => _books.Where(b => b.Variant.StrategyId == strategyId).Sum(b => b.Positions.Sum(p => p.NetRealised));
+
+    public decimal GlobalRealizedNet() => _books.Sum(b => b.Positions.Sum(p => p.NetRealised));
+
+    public int ConsecutiveLossesOf(VariantKey variant) => BookOf(variant).LossStreak;
+
+    /// <summary>The family streak is chronological across all of its variants: updated at each final close, in the engine's deterministic close order.</summary>
+    public int FamilyConsecutiveLosses(string strategyId) => _familyLossStreak.TryGetValue(strategyId, out var n) ? n : 0;
+
+    /// <summary>Committed premium of OPEN positions only (average entry price x open quantity), over every variant: the shared capital in use.</summary>
+    public decimal OpenExposure() => _books.Sum(b => b.Positions.Where(p => p.State == PositionState.Open).Sum(p => p.AvgEntryPrice * p.OpenQuantity));
 
     public decimal PeakPremiumOf(VariantKey variant) => BookOf(variant).PeakExposure;
 
@@ -154,6 +183,11 @@ public sealed class ExecutionEngine
     {
         using var scope = w.Scope("execution");
         w.Line("ended", _ended);
+        foreach (var (family, streak) in _familyLossStreak.OrderBy(x => x.Key, StringComparer.Ordinal))
+        {
+            w.Line("familyLossStreak/" + family, streak);
+        }
+
         foreach (var book in _books)
         {
             using var bs = w.Scope("book/" + book.Variant);
@@ -165,6 +199,7 @@ public sealed class ExecutionEngine
             w.Line("belowBandFills", book.BelowBandFills);
             w.Line("lateFills", book.LateFills);
             w.Line("fillSeq", book.FillSeq);
+            w.Line("lossStreak", book.LossStreak);
             foreach (var ((token, side), l) in book.Liquidity.OrderBy(x => x.Key.Token, StringComparer.Ordinal).ThenBy(x => (int)x.Key.Side))
             {
                 w.Line($"liquidity[{token}][{side}]", $"{StateWriter.Dec(l.Price)}|{l.Displayed}|{l.Consumed}");
@@ -192,6 +227,7 @@ public sealed class ExecutionEngine
                 w.Line("tp1Target", p.Tp1TargetQuantity);
                 w.Line("tp1Filled", p.Tp1FilledQuantity);
                 w.Line("exitSeq", p.ExitSeq);
+                w.Line("maxHoldDeadline", p.MaxHoldDeadline);
                 w.Line("bidObservations", p.BidObservations);
                 w.Line("maxBid", p.MaxBid);
                 w.Line("minBid", p.MinBid);
@@ -320,10 +356,11 @@ public sealed class ExecutionEngine
             return;
         }
 
-        var gateBlock = EntryGate?.BlockReason(intent.Variant, execTime);
-        if (gateBlock is not null)
+        var gateReasons = EntryGate?.Evaluate(intent.Variant, execTime, intent.LimitPrice * intent.RequestedQuantity, intent.OpportunityId) ?? Array.Empty<RejectionReason>();
+        if (gateReasons.Count > 0)
         {
-            Resolve(order, EntryOutcomeKind.Cancelled, "Gate:" + gateBlock, s);
+            _variants.ReportFillTimeRejection(intent.Variant, intent.OpportunityId, gateReasons, execTime, intent.Attempt);
+            Resolve(order, EntryOutcomeKind.Cancelled, "Gate:" + RejectionReasons.NoteName(gateReasons[0]), s);
             return;
         }
 
@@ -342,20 +379,21 @@ public sealed class ExecutionEngine
         }
 
         var ask = quote!.Ask!.Value;
+        var price = ask + _x.EntrySlippage;                      // the executable premium actually paid: ask plus the configured slippage
         var selection = _config.Selection;
-        if (ask > intent.LimitPrice)
+        if (price > intent.LimitPrice)
         {
             NoteEntry(order, "AskAboveLimit", execTime);
             return;
         }
 
-        if (ask > selection.MaximumEntryPremium)
+        if (price > selection.MaximumEntryPremium)
         {
             NoteEntry(order, "AskAboveBand", execTime);
             return;
         }
 
-        var belowBand = ask < selection.MinimumEntryPremium;
+        var belowBand = price < selection.MinimumEntryPremium;
         if (belowBand && _x.BelowBand == BelowBandMode.ResearchEnforceBand)
         {
             NoteEntry(order, "AskBelowBand", execTime);
@@ -373,7 +411,7 @@ public sealed class ExecutionEngine
 
         var quantity = (long)lots * intent.LotSize;
         Consume(book, quote.Token, TradeSide.Buy, ask, quote.AskQty, quantity);
-        OpenPosition(book, order, quantity, ask, belowBand, quote, execTime);
+        OpenPosition(book, order, quantity, price, belowBand, quote, execTime, s);
         Resolve(order, lots == intent.Lots ? EntryOutcomeKind.Filled : EntryOutcomeKind.PartiallyFilled, belowBand ? "FilledBelowBand" : "Filled", s);
         Touch(book);
     }
@@ -416,7 +454,7 @@ public sealed class ExecutionEngine
         return null;
     }
 
-    private void OpenPosition(Book book, EntryOrder order, long quantity, decimal price, bool belowBand, QuoteSnapshot quote, DateTimeOffset execTime)
+    private void OpenPosition(Book book, EntryOrder order, long quantity, decimal price, bool belowBand, QuoteSnapshot quote, DateTimeOffset execTime, IEngineScheduler s)
     {
         var intent = order.Intent;
         var variant = _variants.GetVariant(intent.Variant);
@@ -458,6 +496,28 @@ public sealed class ExecutionEngine
             quote.SourceId,
             BookLabel(intent.Variant)));
         _out.Add(new PositionOpened(execTime, intent.Variant, positionId, intent.OpportunityId, intent.Contract.Token, quantity, position.AvgEntryPrice));
+
+        // Max hold: the clock starts at the entry fill and is never reset or extended by a partial exit.
+        if (variant.Spec.Exit.MaxHold is { } maxHold)
+        {
+            position.MaxHoldDeadline = execTime + maxHold;
+            position.MaxHoldHandle = s.Schedule(position.MaxHoldDeadline.Value, DeadlineClass.RiskRetry, book.Ordinal, HoldPrefix + positionId);
+        }
+    }
+
+    private void OnMaxHold(string positionId, IEngineScheduler s)
+    {
+        var position = _books.SelectMany(b => b.Positions).FirstOrDefault(p => p.Id == positionId);
+        if (position is null || position.State != PositionState.Open)
+        {
+            return;
+        }
+
+        var available = position.OpenQuantity - position.ReservedExitQuantity;
+        if (available > 0)
+        {
+            CreateExit(BookOf(position.Variant), position, ExitReason.MaxHold, available, null, 0, s);
+        }
     }
 
     private void Resolve(EntryOrder order, EntryOutcomeKind kind, string reason, IEngineScheduler s)
@@ -523,6 +583,10 @@ public sealed class ExecutionEngine
             {
                 Resolve(order, EntryOutcomeKind.Cancelled, "CancelRequested", s);
             }
+        }
+        else if (key.StartsWith(HoldPrefix, StringComparison.Ordinal))
+        {
+            OnMaxHold(key[HoldPrefix.Length..], s);
         }
         else if (key.StartsWith(ExitPrefix, StringComparison.Ordinal))
         {
@@ -729,6 +793,11 @@ public sealed class ExecutionEngine
             {
                 order.LastNote = failure;
                 _out.Add(new AuditRecord(execTime, position.Variant, position.OpportunityId, "ExitOrder", "Retry:" + failure, "order " + order.Id));
+                if (order.Reason is ExitReason.SessionLiquidation or ExitReason.ManualKill)
+                {
+                    // A mandatory exit cannot fill yet: nothing is fabricated, the order keeps retrying, and the unresolved condition is made visible.
+                    _out.Add(new MandatoryExitPending(execTime, position.Variant, position.Id, order.Id, order.Reason, order.RemainingQuantity, order.Attempts, failure));
+                }
             }
 
             order.AttemptHandle = s.Schedule(execTime + _x.ExitRetryInterval, DeadlineClass.RiskRetry, book.Ordinal, ExitPrefix + order.Id);
@@ -759,7 +828,8 @@ public sealed class ExecutionEngine
     private void FillExit(Book book, ExitOrder order, long quantity, decimal bid, QuoteSnapshot quote, DateTimeOffset execTime, IEngineScheduler s)
     {
         var position = order.Position;
-        var notional = bid * quantity;
+        var fillPrice = Math.Max(bid - _x.ExitSlippage, position.Contract.TickSize);      // a sell receives the executable bid minus the configured slippage (never below one tick)
+        var notional = fillPrice * quantity;
         var costs = _costs.Compute(TradeSide.Sell, notional, order.Charged);
         order.Charged = new OrderChargeState(order.Charged.Fills + 1, order.Charged.Turnover + notional, order.Charged.BrokerageCharged + costs.Brokerage);
         Consume(book, quote.Token, TradeSide.Sell, bid, quote.BidQty, quantity);
@@ -793,7 +863,7 @@ public sealed class ExecutionEngine
             TradeSide.Sell,
             position.Contract.Token,
             quantity,
-            bid,
+            fillPrice,
             notional,
             costs,
             false,
@@ -823,6 +893,17 @@ public sealed class ExecutionEngine
             position.ClosedAt = execTime;
             var gross = position.GrossRealised;
             _out.Add(new PositionClosed(execTime, position.Variant, position.Id, position.Contract.Token, position.EntryQuantity, position.AvgEntryPrice, gross, position.TotalCosts, position.NetRealised));
+            if (position.NetRealised < 0m)
+            {
+                book.LossStreak++;
+                _familyLossStreak[position.Variant.StrategyId] = FamilyConsecutiveLosses(position.Variant.StrategyId) + 1;
+            }
+            else
+            {
+                book.LossStreak = 0;
+                _familyLossStreak[position.Variant.StrategyId] = 0;
+            }
+
             _variants.ReportPositionClosed(position.Variant, position.OpportunityId, s);
         }
 
@@ -883,7 +964,7 @@ public sealed class ExecutionEngine
     public int LiquidateScope(string scope, ExitReason reason, long triggerSeq, IEngineScheduler s)
     {
         var count = 0;
-        foreach (var book in _books.Where(b => scope == "*" || (VariantKey.TryParse(scope, out var scoped) && b.Variant == scoped)))
+        foreach (var book in _books.Where(b => Integrity.KillScopes.Covers(scope, b.Variant)))
         {
             foreach (var position in book.Positions.Where(p => p.State == PositionState.Open).ToList())
             {

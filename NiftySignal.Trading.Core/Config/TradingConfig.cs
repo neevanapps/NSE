@@ -19,7 +19,7 @@ namespace NiftySignal.Trading.Core.Config;
 /// </summary>
 public sealed record TradingConfig
 {
-    public const int CurrentSchemaVersion = 6;
+    public const int CurrentSchemaVersion = 7;
 
     public int SchemaVersion { get; init; } = CurrentSchemaVersion;
 
@@ -67,8 +67,29 @@ public sealed record TradingConfig
         errors.AddRange(Costs.Validate());
         errors.AddRange(Risk.Validate());
         errors.AddRange(Integrity.Validate());
+        if (Risk.Name == RiskProfile.PaperLiveV1Name)
+        {
+            if (Session.EntryOpen != new TimeOnly(9, 30, 0) || Session.EntryClose != new TimeOnly(15, 0, 0) || Session.LiquidationStart != new TimeOnly(15, 10, 0))
+            {
+                errors.Add("PaperLiveV1 fixes the session rules: entries from 09:30:00 until (not including) 15:00:00 and mandatory liquidation from 15:10:00 (use SessionConfig.PaperLiveV1()).");
+            }
+
+            foreach (var family in Risk.Families.Keys)
+            {
+                if (!Variants.Values.Any(v => string.Equals(v.StrategyId, family, StringComparison.Ordinal)))
+                {
+                    errors.Add($"Family limits are configured for '{family}', which has no variant.");
+                }
+            }
+        }
+
         foreach (var (key, spec) in Variants)
         {
+            if (spec.Limits is not null && Risk.Name != RiskProfile.PaperLiveV1Name)
+            {
+                errors.Add($"Variant '{key}': Limits are enforced only under the PaperLiveV1 profile.");
+            }
+
             if (!VariantKey.IsValidPart(spec.StrategyId) || !VariantKey.IsValidPart(spec.VariantId))
             {
                 errors.Add($"Variant key '{key}': StrategyId '{spec.StrategyId}' and VariantId '{spec.VariantId}' must each be valid identifier parts.");

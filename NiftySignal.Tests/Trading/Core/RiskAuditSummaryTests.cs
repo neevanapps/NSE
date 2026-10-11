@@ -80,7 +80,7 @@ public class RiskProfileTests
     {
         var baseline = TradeKit.MakeConfig(variants: TradeKit.Immediate());
 
-        Assert.Contains("\"Risk\":{\"DailySlEnforcement\":\"None\",\"MaxPeakPremiumExposure\":null,\"MaxTradesPerDay\":null,\"Name\":\"ResearchV1\",\"Version\":\"1\"}", baseline.ToCanonicalJson());
+        Assert.Contains("\"Risk\":{\"DailySlEnforcement\":\"None\",\"Families\":{},\"Global\":null,\"GlobalCapital\":null,\"MaxPeakPremiumExposure\":null,\"MaxTradesPerDay\":null,\"Name\":\"ResearchV1\",\"Version\":\"1\"}", baseline.ToCanonicalJson());
         Assert.NotEqual(baseline.ComputeHash(), (baseline with { Risk = RiskProfile.ResearchV1() with { Version = "2" } }).ComputeHash());
         Assert.NotEqual(baseline.ComputeVariantHash(Vk.S("A")), (baseline with { Risk = RiskProfile.ResearchV1() with { Version = "2" } }).ComputeVariantHash(Vk.S("A")));
     }

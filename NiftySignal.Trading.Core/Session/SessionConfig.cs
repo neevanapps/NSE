@@ -32,6 +32,12 @@ public sealed record SessionConfig
     /// <summary>End of the session in engine terms (adaptive hard close today, 15:35:00). Last session-boundary deadline; reporting of unresolved positions happens here.</summary>
     public TimeOnly SessionEnd { get; init; } = new(15, 35, 0);
 
+    /// <summary>
+    /// The PaperLiveV1 session: entries from 09:30:00 (inclusive) to 15:00:00 (exclusive); mandatory liquidation of every remaining position starts at 15:10:00;
+    /// FinalClose coincides with the hard session end 15:35:00, the explicit boundary at which a position that still has no executable bid is reported unresolved.
+    /// </summary>
+    public static SessionConfig PaperLiveV1() => new() { LiquidationStart = new TimeOnly(15, 10, 0), FinalClose = new TimeOnly(15, 35, 0), SessionEnd = new TimeOnly(15, 35, 0) };
+
     /// <summary>Returns human-readable validation errors (empty when valid).</summary>
     public IReadOnlyList<string> Validate()
     {

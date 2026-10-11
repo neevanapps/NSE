@@ -1,4 +1,5 @@
 using NiftySignal.Trading.Core.Events;
+using NiftySignal.Trading.Core.Risk;
 using NiftySignal.Trading.Core.Scheduling;
 using NiftySignal.Trading.Core.State;
 using NiftySignal.Trading.Core.Variants;
@@ -51,10 +52,37 @@ public sealed record IntegrityPolicy
     }
 }
 
-/// <summary>Anything that can veto NEW entries (feed integrity, manual kill switch, risk profile). Returns a reason code or null when entries are allowed.</summary>
+/// <summary>
+/// Anything that can veto NEW entries (feed integrity, kill switches at global / family / variant scope, the risk profile's scoped limits, the shared capital).
+/// Returns EVERY reason that holds in stable order (empty = entries allowed). <paramref name="newPremium"/> is the premium (price x quantity) the entry would add to
+/// the committed capital; <paramref name="excludeOpportunityId"/> is the opportunity whose own outstanding intent must not be counted twice. Exits are never gated.
+/// </summary>
 public interface IEntryGate
 {
-    string? BlockReason(VariantKey variant, DateTimeOffset now);
+    IReadOnlyList<RejectionReason> Evaluate(VariantKey variant, DateTimeOffset now, decimal newPremium, string? excludeOpportunityId);
+}
+
+/// <summary>
+/// Kill / reset scope text. <c>*</c> is the whole engine (GLOBAL), a bare StrategyId such as <c>X</c> is a STRATEGY FAMILY and <c>StrategyId/VariantId</c> such as
+/// <c>X/X1</c> is one VARIANT. A family scope covers every variant of that family and nothing else.
+/// </summary>
+public static class KillScopes
+{
+    public static bool IsGlobal(string scope) => scope == "*";
+
+    public static bool IsFamily(string scope) => scope != "*" && VariantKey.IsValidPart(scope);
+
+    public static bool IsVariant(string scope, out VariantKey key) => VariantKey.TryParse(scope, out key) && !key.IsGlobal;
+
+    /// <summary>True when the scope text covers the variant.</summary>
+    public static bool Covers(string scope, VariantKey variant)
+        => IsGlobal(scope)
+           || (IsFamily(scope) && string.Equals(scope, variant.StrategyId, StringComparison.Ordinal))
+           || (IsVariant(scope, out var key) && key == variant);
+
+    /// <summary>True when the scope is well formed and names something that exists among the variants.</summary>
+    public static bool IsKnown(string scope, IEnumerable<VariantKey> variants)
+        => IsGlobal(scope) || variants.Any(v => Covers(scope, v));
 }
 
 public sealed record IntegrityTransition(DateTimeOffset At, IntegrityState From, IntegrityState To, FeedFaultReason Reason, string Detail, long Sequence)
@@ -79,7 +107,7 @@ public sealed record EvaluationSummary(DateTimeOffset At, VariantKey Variant, st
 /// <c>QuoteStale</c> etc.) and never cancels other contracts' orders.
 /// </para>
 /// </summary>
-public sealed class IntegrityManager : IEntryGate
+public sealed class IntegrityManager
 {
     private readonly HashSet<string> _killedVariants = new(StringComparer.Ordinal);
     private readonly IntegrityPolicy _policy;
@@ -106,8 +134,42 @@ public sealed class IntegrityManager : IEntryGate
 
     public IReadOnlyCollection<string> KilledVariants => _killedVariants;
 
-    /// <summary>Kill scopes are stored as the canonical text of the scope: a variant kill is <c>StrategyId/VariantId</c>.</summary>
-    public bool IsKilled(VariantKey variant) => KillAll || _killedVariants.Contains(variant.ToString());
+    /// <summary>Killed family scopes (bare StrategyIds).</summary>
+    public IReadOnlyCollection<string> KilledFamilies => _killedVariants.Where(KillScopes.IsFamily).Order(StringComparer.Ordinal).ToList();
+
+    /// <summary>Kill scopes are stored as the canonical text of the scope: a family kill is <c>StrategyId</c>, a variant kill is <c>StrategyId/VariantId</c>.</summary>
+    public bool IsKilled(VariantKey variant) => KillAll || _killedVariants.Contains(variant.StrategyId) || _killedVariants.Contains(variant.ToString());
+
+    /// <summary>Every kill scope that blocks entries of the variant, in stable order (global, family, variant).</summary>
+    public IReadOnlyList<RejectionReason> KillReasons(VariantKey variant)
+    {
+        var reasons = new List<RejectionReason>();
+        if (KillAll)
+        {
+            reasons.Add(RejectionReason.KillSwitchGlobal);
+        }
+
+        if (_killedVariants.Contains(variant.StrategyId))
+        {
+            reasons.Add(RejectionReason.KillSwitchFamily);
+        }
+
+        if (_killedVariants.Contains(variant.ToString()))
+        {
+            reasons.Add(RejectionReason.KillSwitchVariant);
+        }
+
+        return reasons;
+    }
+
+    /// <summary>The feed-integrity block (a global state), as a typed reason; empty when healthy.</summary>
+    public IReadOnlyList<RejectionReason> IntegrityReasons()
+        => State switch
+        {
+            IntegrityState.Degraded => new[] { RejectionReason.IntegrityDegraded },
+            IntegrityState.Recovering => new[] { RejectionReason.IntegrityRecovering },
+            _ => Array.Empty<RejectionReason>(),
+        };
 
     /// <summary>Integrity state, kill switch and the recovery-evidence progress.</summary>
     public void WriteState(StateWriter w)
@@ -236,7 +298,10 @@ public sealed class IntegrityManager : IEntryGate
         return _killedVariants.Add(scope);
     }
 
-    /// <summary>Clears a kill. Reset("*") clears everything; Reset(variant) is ignored while a global kill is active (returns "ResetIgnored:GlobalKillActive").</summary>
+    /// <summary>
+    /// Clears a kill. Reset("*") clears everything. Reset(family) is ignored while a global kill is active; Reset(variant) is ignored while a global or its family kill
+    /// is active ("ResetIgnored:GlobalKillActive" / "ResetIgnored:FamilyKillActive"). A reset clears exactly the named scope.
+    /// </summary>
     public string Reset(string scope)
     {
         if (scope == "*")
@@ -250,6 +315,11 @@ public sealed class IntegrityManager : IEntryGate
         if (KillAll)
         {
             return "ResetIgnored:GlobalKillActive";
+        }
+
+        if (KillScopes.IsVariant(scope, out var variant) && _killedVariants.Contains(variant.StrategyId))
+        {
+            return "ResetIgnored:FamilyKillActive";
         }
 
         return _killedVariants.Remove(scope) ? "Reset" : "NothingToReset";

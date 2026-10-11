@@ -100,5 +100,20 @@ public sealed record OpportunityTransition(
     OpportunityState To,
     string Reason) : EngineOutput(At, Variant);
 
+/// <summary>
+/// An Enter decision that reached the engine did not (yet) become an entry. Reasons are typed (<see cref="Risk.RejectionReason"/>) and listed in stable
+/// order. One record per distinct reason set per opportunity (or per episode when no opportunity could be created); the stage says where it was blocked.
+/// SourceSessionId and BarSeq identify the finalized input bar of the decision the block belongs to.
+/// </summary>
+public sealed record EntryRejected(
+    DateTimeOffset At,
+    VariantKey Variant,
+    string? OpportunityId,
+    string DecisionId,
+    string SourceSessionId,
+    long BarSeq,
+    string Stage,
+    string Reasons) : EngineOutput(At, Variant);
+
 /// <summary>Why-record for accepted and rejected steps. Detail strings are built with invariant formatting only.</summary>
 public sealed record AuditRecord(DateTimeOffset At, VariantKey Variant, string? OpportunityId, string Stage, string Outcome, string Detail) : EngineOutput(At, Variant);

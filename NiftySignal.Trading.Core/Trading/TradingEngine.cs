@@ -47,25 +47,29 @@ public sealed class TradingEngine : IEngineHandler
 {
     private sealed class CompositeGate(TradingEngine owner) : IEntryGate
     {
-        public string? BlockReason(VariantKey variant, DateTimeOffset now)
+        public IReadOnlyList<RejectionReason> Evaluate(VariantKey variant, DateTimeOffset now, decimal newPremium, string? excludeOpportunityId)
         {
-            var integrity = owner.Integrity.BlockReason(variant, now);
-            if (integrity is not null)
+            var reasons = new List<RejectionReason>();
+            reasons.AddRange(owner.Integrity.KillReasons(variant));
+            reasons.AddRange(owner.Integrity.IntegrityReasons());
+
+            var profile = owner.Config.Risk;
+            if (profile.Name == RiskProfile.PaperLiveV1Name)
             {
-                return integrity;
+                // Every counter is derived from the fills and closed trades of this run; the capital is the ONE shared pool: open positions at average entry price
+                // x open quantity plus the outstanding entry intents of every variant (the intent being decided is excluded: it is the new premium).
+                var execution = owner.Execution;
+                var strategyId = variant.StrategyId;
+                var state = new ScopedRiskState(
+                    new ScopeCounters(execution.TradesOf(variant), execution.RealizedNetOf(variant), execution.ConsecutiveLossesOf(variant)),
+                    new ScopeCounters(execution.FamilyTradesOf(strategyId), execution.FamilyRealizedNet(strategyId), execution.FamilyConsecutiveLosses(strategyId)),
+                    new ScopeCounters(execution.GlobalTrades(), execution.GlobalRealizedNet(), 0),
+                    execution.OpenExposure() + owner.Variants.OutstandingIntentPremium(excludeOpportunityId),
+                    newPremium);
+                reasons.AddRange(ScopedRisk.Evaluate(profile, strategyId, owner.Variants.GetVariant(variant).Spec.Limits, state));
             }
 
-            var execution = owner.Execution;
-            var (breached, worst) = execution.DailySlOf(variant);
-            var state = new RiskState(
-                execution.TradesOf(variant),
-                worst ?? 0m,
-                owner.Variants.GetVariant(variant).Spec.DailySl is not null,
-                breached,
-                execution.CommittedPremiumOf(variant),
-                0m);
-            var decision = RiskPolicy.CheckEntry(owner.Config.Risk, state);
-            return decision.Allowed ? null : decision.ReasonCode;
+            return reasons.Distinct().OrderBy(r => (int)r).ToList();
         }
     }
 
@@ -265,7 +269,7 @@ public sealed class TradingEngine : IEngineHandler
     private void HandleOperator(OperatorCommandEvent command, IEngineScheduler scheduler)
     {
         var at = command.AvailableAt;
-        var known = command.Scope == "*" || (VariantKey.TryParse(command.Scope, out var scopeKey) && Variants.Variants.Any(v => v.Key == scopeKey));
+        var known = KillScopes.IsKnown(command.Scope, Variants.Variants.Select(v => v.Key));
         if (!known)
         {
             _outputs.Add(new KillSwitchChanged(at, command.Scope, command.Command, command.Mode, command.Actor, command.Reason, "Rejected:UnknownVariant", 0, 0, 0));

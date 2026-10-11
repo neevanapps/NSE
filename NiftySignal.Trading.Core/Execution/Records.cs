@@ -19,6 +19,9 @@ public enum ExitReason
     StrategyExit = 3,
     FinalTarget = 4,
     Tp1 = 5,
+
+    /// <summary>The position reached its maximum holding time (measured from the entry fill).</summary>
+    MaxHold = 6,
 }
 
 public enum OrderStatus
@@ -182,6 +185,14 @@ public sealed class Position
 
     public int ExitSeq { get; internal set; }
 
+    /// <summary>Instant at which the max-hold exit fires (entry fill time + MaxHold); null when the variant has no max hold.</summary>
+    public DateTimeOffset? MaxHoldDeadline { get; internal set; }
+
+    internal Scheduling.DeadlineHandle? MaxHoldHandle { get; set; }
+
+    /// <summary>True while at least one live exit order exists for an open position (e.g. a mandatory liquidation waiting for an executable bid).</summary>
+    public bool ExitPending => State == PositionState.Open && ExitOrders.Any(o => o.Status == OrderStatus.Working);
+
     // ---- bid-based excursion tracking (contract section A.14.5). Units: premium rupees per unit; the series is the contract's executable bid
     // observed on quote events of the held contract (plus the entry-fill quote), from the entry fill until the position closes or the session ends.
     // It is a property of the contract price path, so it keeps running after TP1 and is not split by partial exits.
@@ -277,6 +288,21 @@ public sealed record ExitOrderCreated(
     long Quantity,
     DateTimeOffset FirstAttemptAt,
     decimal? TriggerThreshold) : EngineOutput(At, Variant);
+
+/// <summary>
+/// A mandatory exit (session liquidation or manual kill with liquidation) could not fill yet: no valid executable bid, no liquidity or a stale quote. The
+/// position stays open, the exit order keeps retrying with executable quotes only (nothing is ever fabricated) and this record makes the unresolved condition
+/// visible. Emitted when an order's failure reason first appears or changes.
+/// </summary>
+public sealed record MandatoryExitPending(
+    DateTimeOffset At,
+    VariantKey Variant,
+    string PositionId,
+    string OrderId,
+    ExitReason Reason,
+    long RemainingQuantity,
+    int Attempts,
+    string Failure) : EngineOutput(At, Variant);
 
 public sealed record Tp1Resolved(DateTimeOffset At, VariantKey Variant, string PositionId, Tp1State State, long TargetQuantity, long OpenLots) : EngineOutput(At, Variant);
 

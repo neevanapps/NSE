@@ -7,6 +7,7 @@ using NiftySignal.Trading.Core.Ids;
 using NiftySignal.Trading.Core.Integrity;
 using NiftySignal.Trading.Core.Instruments;
 using NiftySignal.Trading.Core.Quotes;
+using NiftySignal.Trading.Core.Risk;
 using NiftySignal.Trading.Core.Scheduling;
 using NiftySignal.Trading.Core.Selection;
 using NiftySignal.Trading.Core.Sizing;
@@ -170,6 +171,8 @@ public sealed class VariantEngine : IEngineHandler
             w.Line("episodeStartBarSeq", v.EpisodeStartBarSeq);
             w.Line("episodeSpent", v.EpisodeSpent);
             w.Line("episodeBlockNoted", v.EpisodeBlockNoted);
+            w.Line("episodeRejection", v.EpisodeRejectionKey);
+            w.Line("rejectionOrdinal", v.RejectionOrdinal);
             w.Line("active", v.Active?.Id);
             foreach (var slot in v.Slots)
             {
@@ -201,6 +204,8 @@ public sealed class VariantEngine : IEngineHandler
             w.Line("state", o.State);
             w.Line("contract", o.Contract is null ? null : $"{o.Contract.Token}|{o.Contract.Side}|{StateWriter.Dec(o.Contract.Strike)}|{o.Contract.Expiry:yyyy-MM-dd}|{o.Contract.LotSize}|{StateWriter.Dec(o.Contract.TickSize)}");
             w.Line("attempts", o.Attempts);
+            w.Line("intentPremium", o.IntentPremium);
+            w.Line("lastRejection", o.LastRejectionKey);
             w.Line("activeIntent", o.ActiveIntentId);
             w.Line("cancelRequested", o.CancelRequested);
             w.Line("cancelReason", o.CancelReason);
@@ -360,6 +365,7 @@ public sealed class VariantEngine : IEngineHandler
             v.EpisodeStartBarSeq = bar.BarSeq;
             v.EpisodeSpent = false;
             v.EpisodeBlockNoted = false;
+            v.EpisodeRejectionKey = null;
             v.EpisodeDecision = attributed;
         }
 
@@ -374,6 +380,7 @@ public sealed class VariantEngine : IEngineHandler
             {
                 v.EpisodeBlockNoted = true;
                 Audit(now, v, null, "OpportunityCreate", "SessionNotEligible", "No opportunity: outside the entry window.");
+                Reject(v, null, now, new[] { WindowReason(now) }, "Window", "Bar", bar.BarSeq);
             }
 
             return;
@@ -408,6 +415,7 @@ public sealed class VariantEngine : IEngineHandler
                 ",",
                 result.Evaluations.GroupBy(e => e.Reason).OrderBy(g => (int)g.Key).Select(g => FormattableString.Invariant($"{g.Key}={g.Count()}")));
             Audit(now, v, opportunity.Id, "ContractSelection", "NoEligibleContract", FormattableString.Invariant($"attempt={opportunity.SelectionAttempts} {reasons}"));
+            Reject(v, opportunity, now, new[] { RejectionReason.NoEligibleContract }, "Contract", "Bar", barSeq);
             return;
         }
 
@@ -455,6 +463,7 @@ public sealed class VariantEngine : IEngineHandler
         if (!Schedule.IsEntryEligible(now))
         {
             Note(v, opportunity, now, "Blocked:SessionNotEligible", "outside the entry window");
+            Reject(v, opportunity, now, new[] { WindowReason(now) }, "Window", triggerKind, triggerSeq);
             return;
         }
 
@@ -464,10 +473,11 @@ public sealed class VariantEngine : IEngineHandler
             return;
         }
 
-        var gateBlock = EntryGate?.BlockReason(v.Key, now);
-        if (gateBlock is not null)
+        var gateReasons = EntryGate?.Evaluate(v.Key, now, EstimatePremium(v, opportunity, quote), opportunity.Id) ?? Array.Empty<RejectionReason>();
+        if (gateReasons.Count > 0)
         {
-            Note(v, opportunity, now, "Blocked:" + gateBlock, "new entries are blocked for this scope");
+            Note(v, opportunity, now, "Blocked:" + RejectionReasons.NoteName(gateReasons[0]), "new entries are blocked for this scope");
+            Reject(v, opportunity, now, gateReasons, "Gate", triggerKind, triggerSeq);
             return;
         }
 
@@ -475,18 +485,21 @@ public sealed class VariantEngine : IEngineHandler
         if (age < TimeSpan.Zero)
         {
             Note(v, opportunity, now, "Blocked:QuoteNotCausal", "quote is after the decision time");
+            Reject(v, opportunity, now, new[] { RejectionReason.NoExecutableAsk }, "Quote", triggerKind, triggerSeq);
             return;
         }
 
         if (age > selection.MaxQuoteAge)
         {
             Note(v, opportunity, now, "Blocked:QuoteStale", FormattableString.Invariant($"age={age.TotalMilliseconds}ms"));
+            Reject(v, opportunity, now, new[] { RejectionReason.NoExecutableAsk }, "Quote", triggerKind, triggerSeq);
             return;
         }
 
         if (!quote.IsExecutable)
         {
             Note(v, opportunity, now, "Blocked:QuoteNotExecutable", "quote is not two-sided");
+            Reject(v, opportunity, now, new[] { RejectionReason.NoExecutableAsk }, "Quote", triggerKind, triggerSeq);
             return;
         }
 
@@ -499,6 +512,7 @@ public sealed class VariantEngine : IEngineHandler
                 now,
                 ask < selection.MinimumEntryPremium ? "Blocked:AskBelowBand" : "Blocked:AskAboveBand",
                 FormattableString.Invariant($"ask={ask} band=[{selection.MinimumEntryPremium},{selection.MaximumEntryPremium}] (contract kept)"));
+            Reject(v, opportunity, now, new[] { RejectionReason.PremiumOutsideBand }, "Band", triggerKind, triggerSeq);
             return;
         }
 
@@ -538,6 +552,7 @@ public sealed class VariantEngine : IEngineHandler
         var slot = v.Slots.FirstOrDefault(s => s.State == SlotState.Free);
         if (slot is null)
         {
+            Reject(v, opportunity, now, new[] { RejectionReason.VariantCapacity }, "Capacity", triggerKind, triggerSeq);
             if (v.Spec.ResolveCapacityPolicy() == CapacityBlockedPolicy.Reject)
             {
                 Terminal(v, opportunity, OpportunityState.Rejected, now, "CapacityBusy");
@@ -573,6 +588,9 @@ public sealed class VariantEngine : IEngineHandler
         var contract = opportunity.Contract!;
         opportunity.ActiveIntentId = intentId;
         opportunity.LastEvaluationKey = "Issued";
+        opportunity.LastRejectionKey = null;
+        var limit = quote.Ask!.Value + _config.Execution.EntrySlippage;
+        opportunity.IntentPremium = limit * sizing.Quantity;
         _outputs.Add(new EntryIntent(
             now,
             v.Key,
@@ -585,7 +603,7 @@ public sealed class VariantEngine : IEngineHandler
             sizing.Quantity,
             sizing.Lots,
             contract.LotSize,
-            LimitPrice: quote.Ask!.Value,
+            LimitPrice: limit,
             QualifyingAsk: quote.Ask.Value,
             _config.Selection.MinimumEntryPremium,
             _config.Selection.MaximumEntryPremium,
@@ -623,6 +641,7 @@ public sealed class VariantEngine : IEngineHandler
 
         var slot = v.Slots.First(s => s.OwnerOpportunityId == opportunity.Id);
         opportunity.ActiveIntentId = null;
+        opportunity.IntentPremium = 0m;
         if (outcome.Kind is EntryOutcomeKind.Filled or EntryOutcomeKind.PartiallyFilled)
         {
             slot.State = SlotState.Occupied;
@@ -765,8 +784,7 @@ public sealed class VariantEngine : IEngineHandler
 
     // ------------------------------------------------------------------ safety actions (integrity / kill switch)
 
-    private IEnumerable<VariantState> InScope(string scope)
-        => scope == "*" ? _variants : VariantKey.TryParse(scope, out var scoped) ? _variants.Where(x => x.Key == scoped) : Enumerable.Empty<VariantState>();
+    private IEnumerable<VariantState> InScope(string scope) => _variants.Where(x => Integrity.KillScopes.Covers(scope, x.Key));
 
     /// <summary>Requests cancellation of the pending entry attempts (OrderPending) of the scope. Reservations stay until the outcome is reported. Returns how many requests were issued.</summary>
     public int RequestCancelPending(string scope, CancelReason reason, DateTimeOffset at)
@@ -826,6 +844,70 @@ public sealed class VariantEngine : IEngineHandler
     }
 
     // ------------------------------------------------------------------ helpers
+
+    /// <summary>Premium (limit x quantity) of every entry intent currently outstanding (opportunities in OrderPending), optionally excluding one opportunity. Counts against the shared capital.</summary>
+    public decimal OutstandingIntentPremium(string? excludeOpportunityId = null)
+        => _allOpportunities.Where(o => o.State == OpportunityState.OrderPending && o.Id != excludeOpportunityId).Sum(o => o.IntentPremium);
+
+    private decimal EstimatePremium(VariantState v, Opportunity opportunity, QuoteSnapshot quote)
+    {
+        if (!quote.IsExecutable || opportunity.Contract is null)
+        {
+            return 0m;
+        }
+
+        var ask = quote.Ask!.Value;
+        var sizing = Sizer.Size(v.Spec.Sizing, opportunity.Contract.LotSize, ask, _costModel);
+        return sizing.Status == SizingStatus.InvalidQuantity ? 0m : sizing.Quantity * (ask + _config.Execution.EntrySlippage);
+    }
+
+    private RejectionReason WindowReason(DateTimeOffset now) => now < Schedule.EntryOpenUtc ? RejectionReason.BeforeEntryWindow : RejectionReason.EntryWindowClosed;
+
+    /// <summary>
+    /// Records, once per distinct reason set, that an Enter decision was blocked: typed reasons in stable order, with the decision id and the finalized source bar
+    /// (session id and BarSeq) the block belongs to. <paramref name="opportunity"/> is null when no opportunity could be created.
+    /// </summary>
+    private void Reject(VariantState v, Opportunity? opportunity, DateTimeOffset now, IEnumerable<RejectionReason> reasons, string stage, string triggerKind, long triggerSeq)
+    {
+        var text = RejectionReasons.Canonical(reasons);
+        var key = stage + ":" + text;
+        if (opportunity is null)
+        {
+            if (v.EpisodeRejectionKey == key)
+            {
+                return;
+            }
+
+            v.EpisodeRejectionKey = key;
+        }
+        else
+        {
+            if (opportunity.LastRejectionKey == key)
+            {
+                return;
+            }
+
+            opportunity.LastRejectionKey = key;
+        }
+
+        EmitRejection(v, opportunity?.Id, now, stage, text, triggerKind, triggerSeq);
+    }
+
+    private void EmitRejection(VariantState v, string? opportunityId, DateTimeOffset now, string stage, string reasons, string triggerKind, long triggerSeq)
+    {
+        v.RejectionOrdinal++;
+        var decisionId = EngineIds.Decision(new ConfigHash(v.VariantHash), v.Key, _tradeDate, "Reject:" + triggerKind, triggerSeq, v.RejectionOrdinal);
+        var decision = v.LastDecision;
+        _outputs.Add(new EntryRejected(now, v.Key, opportunityId, decisionId, decision?.SourceSessionId ?? _sourceSessionId, decision?.BarSeq ?? triggerSeq, stage, reasons));
+    }
+
+    /// <summary>The execution model reports an entry that was cancelled at fill time by the gate (trade limit, daily loss, capital, kill, integrity ...).</summary>
+    public void ReportFillTimeRejection(VariantKey variant, string opportunityId, IReadOnlyList<RejectionReason> reasons, DateTimeOffset at, long triggerSeq)
+    {
+        var v = FindVariant(variant);
+        var opportunity = _allOpportunities.FirstOrDefault(o => o.Id == opportunityId);
+        Reject(v, opportunity, at, reasons, "Fill", "Fill", triggerSeq);
+    }
 
     private VariantState FindVariant(VariantKey variant)
         => _variants.FirstOrDefault(x => x.Key == variant)

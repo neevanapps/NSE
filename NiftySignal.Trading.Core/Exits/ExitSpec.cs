@@ -30,6 +30,12 @@ public sealed record ExitSpec
 
     public RemainderSlMode RemainderSl { get; init; } = RemainderSlMode.Unchanged;
 
+    /// <summary>
+    /// Maximum holding time of a position, measured from the instant of the ENTRY FILL (the clock is never reset by TP1 or any partial exit). When it elapses the
+    /// whole unreserved remainder is sold through the normal exit path (ExitReason.MaxHold). Null = no limit.
+    /// </summary>
+    public TimeSpan? MaxHold { get; init; }
+
     public IReadOnlyList<string> Validate(string variantId)
     {
         var errors = new List<string>();
@@ -56,6 +62,11 @@ public sealed record ExitSpec
         if (Tp1Proportion is <= 0m or >= 1m)
         {
             errors.Add($"Variant '{variantId}': Tp1Proportion must be in (0, 1).");
+        }
+
+        if (MaxHold is { } hold && hold <= TimeSpan.Zero)
+        {
+            errors.Add($"Variant '{variantId}': MaxHold must be positive when set.");
         }
 
         if (!Enum.IsDefined(RemainderSl))

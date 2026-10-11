@@ -2,6 +2,7 @@ using NiftySignal.Trading.Core.Entry;
 using NiftySignal.Trading.Core.Exits;
 using NiftySignal.Trading.Core.Events;
 using NiftySignal.Trading.Core.Instruments;
+using NiftySignal.Trading.Core.Risk;
 using NiftySignal.Trading.Core.Sizing;
 using NiftySignal.Trading.Core.Strategies;
 
@@ -44,6 +45,12 @@ public sealed record VariantSpec
 
     /// <summary>Daily SL in rupees (positive = loss limit). ResearchV1 RECORDS a breach only: no entry lockout, no forced exit, no trade cap. Null = not tracked.</summary>
     public decimal? DailySl { get; init; }
+
+    /// <summary>
+    /// Variant-scope entry limits (PaperLiveV1 only): max trades per day, realized daily loss and consecutive-loss streak of THIS variant. They gate new entries of
+    /// this variant and nothing else. Must be null under ResearchV1.
+    /// </summary>
+    public ScopeLimits? Limits { get; init; }
 
     /// <summary>Null = condition-dependent default: Reject for Immediate, Wait for waiting conditions.</summary>
     public CapacityBlockedPolicy? OnCapacityBlocked { get; init; }
@@ -97,6 +104,11 @@ public sealed record VariantSpec
         }
 
         errors.AddRange(Exit.Validate(VariantId));
+        if (Limits is not null)
+        {
+            errors.AddRange(Limits.Validate($"Variant '{VariantId}' limits"));
+        }
+
         if (DailySl is <= 0m)
         {
             errors.Add($"Variant '{VariantId}': DailySl must be positive when set.");

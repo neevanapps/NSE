@@ -85,6 +85,12 @@ public sealed record ExecutionConfig
 
     public SignalQuoteReusePolicy SignalQuoteReuse { get; init; } = SignalQuoteReusePolicy.AllowFreshSignalQuote;
 
+    /// <summary>Rupees added to the executable ASK to obtain the simulated entry fill price (a buy pays the ask plus this). 0 = fill at the ask. PLACEHOLDER pending calibration; never negative.</summary>
+    public decimal EntrySlippage { get; init; }
+
+    /// <summary>Rupees subtracted from the executable BID to obtain the simulated exit fill price (a sell receives the bid minus this, floored at one tick). 0 = fill at the bid. PLACEHOLDER; never negative.</summary>
+    public decimal ExitSlippage { get; init; }
+
     public PartialEntryPolicy PartialEntry { get; init; } = PartialEntryPolicy.KeepFilledCancelRemainder;
 
     public BookMode Books { get; init; } = BookMode.IndependentVirtualBooks;
@@ -130,6 +136,11 @@ public sealed record ExecutionConfig
         if (FillFractionOfDisplayed is <= 0m or > 1m)
         {
             errors.Add("Execution.FillFractionOfDisplayed must be in (0, 1].");
+        }
+
+        if (EntrySlippage < 0m || ExitSlippage < 0m)
+        {
+            errors.Add("Execution.EntrySlippage and ExitSlippage must not be negative.");
         }
 
         if (ExitRetryInterval <= TimeSpan.Zero)
