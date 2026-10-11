@@ -61,7 +61,7 @@ public sealed record PaperLiveView(
 /// rejections and a few decoded outputs — through a context whose connection is opened read-only. It cannot place, change or cancel anything: there is no write method, no broker, no
 /// command of any kind. The figures shown come from the durable ledger (outputs and the rows derived from them), never from the Host's memory.
 /// </summary>
-public sealed partial class PaperLiveDataService(IDbContextFactory<TradingDbContext>? factory)
+public sealed partial class PaperLiveDataService(IDbContextFactory<TradingDbContext>? factory, Func<DateOnly>? today = null)
 {
     public bool Configured => factory is not null;
 
@@ -98,6 +98,12 @@ public sealed partial class PaperLiveDataService(IDbContextFactory<TradingDbCont
         var lastGroup = await db.Inputs.Where(i => i.RunId == id && i.Kind != "Advance" && i.Kind != "Finish").MaxAsync(i => (long?)i.AtUtcTicks, ct);
         var recovery = await db.RecoveryLog.Where(l => l.RunId == id).OrderByDescending(l => l.LogSeq).FirstOrDefaultAsync(ct);
         var capital = GlobalCapitalOf(run.ConfigJson);
+        var istToday = today?.Invoke() ?? DateOnly.FromDateTime(DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromHours(5.5)).Date);
+        if (!run.Completed && run.TradeDate < istToday)
+        {
+            problems.Add("This run never reached its final close (the Host was not running at the session end): positions that were still open were NOT liquidated in the paper ledger and stay unresolved.");
+        }
+
         if (recovery is not null && recovery.Outcome.StartsWith("Halted", StringComparison.Ordinal))
         {
             problems.Add($"HALTED: {recovery.Outcome} - {recovery.Detail}");

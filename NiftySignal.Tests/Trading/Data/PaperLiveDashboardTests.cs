@@ -41,7 +41,7 @@ public class PaperLiveDashboardTests
         using var fixture = new PostgresContractFixture();
         var s = LiveEngineRunContractTests.XScenario();
         using var run = RunTo(fixture, s.AfterTp1);
-        var service = new PaperLiveDataService(new Factory(PostgresTestDatabase.ConnectionString!));
+        var service = new PaperLiveDataService(new Factory(PostgresTestDatabase.ConnectionString!), () => Clock.Day);
 
         var view = await service.LoadLatestAsync();
 
@@ -65,12 +65,25 @@ public class PaperLiveDashboardTests
     }
 
     [PostgresFact]
+    public async Task ARunThatNeverReachedItsFinalClose_IsFlaggedOnceItsTradeDateIsPast()
+    {
+        using var fixture = new PostgresContractFixture();
+        using var run = RunTo(fixture, 2);
+
+        var sameDay = await new PaperLiveDataService(new Factory(PostgresTestDatabase.ConnectionString!), () => Clock.Day).LoadLatestAsync();
+        var nextDay = await new PaperLiveDataService(new Factory(PostgresTestDatabase.ConnectionString!), () => Clock.Day.AddDays(1)).LoadLatestAsync();
+
+        Assert.Empty(sameDay!.Status.Problems);
+        Assert.Contains(nextDay!.Status.Problems, p => p.Contains("never reached its final close", StringComparison.Ordinal));
+    }
+
+    [PostgresFact]
     public async Task TheView_ShowsClosedTradesWithMaeMfe_FamilyFigures_Rejections_AndKillSwitches()
     {
         using var fixture = new PostgresContractFixture();
         var s = LiveEngineRunContractTests.XScenario();
         using var run = RunTo(fixture, s.AfterStops, kill: true);
-        var service = new PaperLiveDataService(new Factory(PostgresTestDatabase.ConnectionString!));
+        var service = new PaperLiveDataService(new Factory(PostgresTestDatabase.ConnectionString!), () => Clock.Day);
 
         var view = await service.LoadLatestAsync();
 
