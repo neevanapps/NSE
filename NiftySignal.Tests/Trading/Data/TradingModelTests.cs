@@ -38,7 +38,7 @@ public class TradingModelTests
         });
         Assert.Equal(new[]
         {
-            "accounts", "audit_entries", "checkpoints", "control_applications", "control_journal", "engine_outputs", "fills", "final_lines", "final_records", "ledger_entries", "orders",
+            "accounts", "audit_entries", "checkpoints", "control_applications", "control_journal", "engine_inputs", "engine_outputs", "fills", "final_lines", "final_records", "ledger_entries", "orders",
             "position_snapshots", "positions", "recovery_log", "rejections", "risk_checkpoints", "run_owner", "runs", "schema_versions", "step_digests", "steps", "variants",
         }, entities.Select(e => e.GetTableName()!).Order(StringComparer.Ordinal).ToArray());
     }

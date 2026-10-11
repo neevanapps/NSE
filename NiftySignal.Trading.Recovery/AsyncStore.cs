@@ -129,6 +129,12 @@ public static class RunSnapshotDigest
         }
 
         sb.Append('|');
+        foreach (var i in snapshot.Inputs)
+        {
+            sb.Append(i.ContentHash).Append(';');
+        }
+
+        sb.Append('|');
         foreach (var p in snapshot.Projections)
         {
             sb.Append(p.Table).Append(':').Append(p.Key).Append(':').Append(p.ContentHash).Append(';');

@@ -48,6 +48,26 @@ public sealed record OutputRecord(long Seq, long StepSeq, string Type, string St
     public bool HashIsValid => ContentHash == OutputCodec.ContentHash(Payload);
 }
 
+/// <summary>
+/// One canonical input of a live run, journaled in the same commit as the step that processed it (contract section B.5). Inputs are what the live engine was
+/// GIVEN (a quote, a completed Adaptive bar, a feed-health or operator event, a clock advance, the finish), never what it decided: replaying them in order through the
+/// deterministic core reproduces every output. <see cref="GroupOrdinal"/> numbers the units (one availability group, one advance or the finish); records with the same
+/// ordinal were delivered together. <see cref="Kind"/> is an <c>EventKind</c> name, <c>Advance</c> or <c>Finish</c>.
+/// </summary>
+public sealed record InputRecord(long Seq, long StepSeq, long GroupOrdinal, string Kind, long SourceId, string Token, DateTimeOffset At, string Payload, string ContentHash)
+{
+    public const string AdvanceKind = "Advance";
+    public const string FinishKind = "Finish";
+
+    public bool HashIsValid => ContentHash == HashOf(GroupOrdinal, Kind, SourceId, Token, At, Payload);
+
+    public static InputRecord Create(long seq, long stepSeq, long groupOrdinal, string kind, long sourceId, string token, DateTimeOffset at, string payload)
+        => new(seq, stepSeq, groupOrdinal, kind, sourceId, token, at, payload, HashOf(groupOrdinal, kind, sourceId, token, at, payload));
+
+    public static string HashOf(long groupOrdinal, string kind, long sourceId, string token, DateTimeOffset at, string payload)
+        => OutputCodec.ContentHash(string.Create(CultureInfo.InvariantCulture, $"{groupOrdinal}|{kind}|{sourceId}|{token}|{at.UtcTicks}|{payload}"));
+}
+
 /// <summary>A cumulative recorder digest at a step boundary (one of the nine CP5 channels).</summary>
 public sealed record ChannelDigestRecord(string Channel, long Count, string Hash);
 
@@ -133,7 +153,7 @@ public sealed record CompatibilityIdentity(
     string SourceManifestHash)
 {
     /// <summary>The engine behaviour label of this checkpoint of the code base. Bump it with any behaviour or state-layout change.</summary>
-    public const string CurrentEngine = "trading-engine/cp6.1";
+    public const string CurrentEngine = "trading-engine/paperlive-v1";
 
     public string CanonicalText()
         => string.Create(CultureInfo.InvariantCulture, $"{CodecVersion}|{StateDigestVersion}|{EngineCompatibilityId}|{ConfigSchemaVersion}|{ConfigHash}|{FreezeHash}|{TranslatorOptionsHash}|{ReadinessSpec}|{RetentionHash}|{StrategiesIdentity}|{DurableOptionsHash}|{SourceManifestHash}");
@@ -211,4 +231,8 @@ public sealed record RunSnapshot(
     IReadOnlyList<ProjectionRow> Projections,
     FinalRecord? Final,
     bool Completed,
-    IReadOnlyList<RecoveryLogEntry> RecoveryLog);
+    IReadOnlyList<RecoveryLogEntry> RecoveryLog)
+{
+    /// <summary>The journaled canonical inputs of a live run, in sequence order (empty for a source-driven run).</summary>
+    public IReadOnlyList<InputRecord> Inputs { get; init; } = Array.Empty<InputRecord>();
+}

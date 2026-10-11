@@ -32,4 +32,5 @@
   <Project Path="tools/AdaptiveDashboardValidation/AdaptiveDashboardValidation.csproj" />
   <Project Path="tools/AdaptiveLivePerformance/AdaptiveLivePerformance.csproj" />
   <Project Path="tools/TradingRunDiff/TradingRunDiff.csproj" />
+  <Project Path="tools/TradingCrashHarness/TradingCrashHarness.csproj" />
 </Solution>

@@ -241,33 +241,7 @@ public sealed class DurableRun : IDisposable
         }
     }
 
-    private static void CheckCompatibility(RunHeader durable, RunHeader running)
-    {
-        if (!durable.HashIsValid)
-        {
-            throw new RecoveryHaltException(HaltKind.CorruptLedger, "The durable run header is corrupt (hash mismatch).", new[] { "header hash" });
-        }
-
-        var diffs = durable.Compatibility.DifferencesFrom(running.Compatibility).ToList();
-        void Check(string name, string a, string b)
-        {
-            if (!string.Equals(a, b, StringComparison.Ordinal))
-            {
-                diffs.Add($"{name} differs from the durable header");
-            }
-        }
-
-        Check(nameof(RunHeader.RunId), durable.RunId, running.RunId);
-        Check(nameof(RunHeader.TradeDate), durable.TradeDate.ToString("O", CultureInfo.InvariantCulture), running.TradeDate.ToString("O", CultureInfo.InvariantCulture));
-        Check(nameof(RunHeader.Horizon), durable.Horizon.UtcTicks.ToString(CultureInfo.InvariantCulture), running.Horizon.UtcTicks.ToString(CultureInfo.InvariantCulture));
-        Check(nameof(RunHeader.ConfigJson), durable.ConfigJson, running.ConfigJson);
-        Check(nameof(RunHeader.FreezeSnapshot), durable.FreezeSnapshot, running.FreezeSnapshot);
-        Check(nameof(RunHeader.SourceManifest), durable.SourceManifest, running.SourceManifest);
-        if (diffs.Count > 0)
-        {
-            throw new RecoveryHaltException(HaltKind.Compatibility, "The durable run is not compatible with this build / configuration; resume refused.", diffs);
-        }
-    }
+    private static void CheckCompatibility(RunHeader durable, RunHeader running) => RunIdentity.CheckCompatibility(durable, running);
 
     // ------------------------------------------------------------------ input
 

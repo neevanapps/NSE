@@ -44,6 +44,8 @@ public sealed class InMemoryRunStore : IRunStore
 
         public List<OutputRecord> Outputs { get; } = new();
 
+        public List<InputRecord> Inputs { get; } = new();
+
         public List<CheckpointRecord> Checkpoints { get; } = new();
 
         public List<ProjectionRow> Projections { get; } = new();
@@ -160,7 +162,10 @@ public sealed class InMemoryRunStore : IRunStore
                 run.Projections.ToArray(),
                 run.Final,
                 run.Completed,
-                run.RecoveryLog.ToArray());
+                run.RecoveryLog.ToArray())
+            {
+                Inputs = run.Inputs.ToArray(),
+            };
         }
     }
 
@@ -248,6 +253,7 @@ public sealed class InMemoryRunStore : IRunStore
             ThrowIfFailsDuring(fault);
 
             run.Outputs.AddRange(stagedOutputs);
+            run.Inputs.AddRange(batch.Inputs);
             run.Projections.AddRange(stagedProjections);
             run.Steps.Add(batch.Step);
             if (batch.Checkpoint is not null)
@@ -314,6 +320,20 @@ public sealed class InMemoryRunStore : IRunStore
             }
         }
 
+        for (var i = 0; i < batch.Inputs.Count; i++)
+        {
+            var input = batch.Inputs[i];
+            if (!input.HashIsValid)
+            {
+                throw new ConflictFaultException($"Input {input.Seq}: content hash does not match its content.");
+            }
+
+            if (input.StepSeq != step.StepSeq || (i > 0 && input.Seq != batch.Inputs[i - 1].Seq + 1))
+            {
+                throw new SequenceGapException($"Input {input.Seq} is out of sequence in step {step.StepSeq}.");
+            }
+        }
+
         if (batch.Projections.Any(p => !p.HashIsValid))
         {
             throw new ConflictFaultException($"Step {step.StepSeq}: a projection row's hash does not match its payload.");
@@ -344,6 +364,11 @@ public sealed class InMemoryRunStore : IRunStore
                 }
             }
 
+            if (batch.Inputs.Count > 0 && batch.Inputs[0].Seq != run.Inputs.Count)
+            {
+                throw new SequenceGapException($"Step {step.StepSeq} starts at input {batch.Inputs[0].Seq} but {run.Inputs.Count} inputs are durable.");
+            }
+
             var existing = run.Projections.Select(p => (p.Table, p.Key)).ToHashSet();
             var duplicate = batch.Projections.FirstOrDefault(p => existing.Contains((p.Table, p.Key)));
             if (duplicate is not null)
@@ -366,6 +391,14 @@ public sealed class InMemoryRunStore : IRunStore
             if (o.Seq >= run.Outputs.Count || run.Outputs[(int)o.Seq].ContentHash != o.ContentHash)
             {
                 throw new ConflictFaultException($"Output {o.Seq} of step {batch.Step.StepSeq} already exists with different content.");
+            }
+        }
+
+        foreach (var input in batch.Inputs)
+        {
+            if (input.Seq >= run.Inputs.Count || run.Inputs[(int)input.Seq].ContentHash != input.ContentHash)
+            {
+                throw new ConflictFaultException($"Input {input.Seq} of step {batch.Step.StepSeq} already exists with different content.");
             }
         }
 

@@ -61,13 +61,48 @@ public enum AppendResult
     Duplicate = 1,
 }
 
+/// <summary>
+/// A CACHE of the live state of one position for observers (the Dashboard), written with the step it was derived at: remaining quantity, TP1 progress, last executable bid
+/// and the running MAE / MFE. Derived from the engine state, never an input of it, never part of any digest; replaying the inputs recomputes it and the next commit overwrites it.
+/// </summary>
+public sealed record PositionSnapshotRow(
+    string PositionId,
+    string StrategyId,
+    string VariantId,
+    long AsOfUtcTicks,
+    string Status,
+    long RemainingQuantity,
+    long ReservedExitQuantity,
+    bool ExitPending,
+    string Tp1State,
+    long Tp1FilledQuantity,
+    string? LastBidText,
+    long? LastBidUtcTicks,
+    string? UnrealizedPnlText,
+    string? MfeText,
+    string? MaeText,
+    string? MfePctText,
+    string? MaePctText,
+    string? HighestBidText,
+    string? LowestBidText,
+    int ExcursionObservations,
+    int ExcursionGaps,
+    string ExcursionCoverage);
+
 /// <summary>Everything one commit makes durable, atomically.</summary>
 public sealed record CommitBatch(
     StepRecord Step,
     IReadOnlyList<OutputRecord> Outputs,
     IReadOnlyList<ProjectionRow> Projections,
     CheckpointRecord? Checkpoint,
-    FinalRecord? Final);
+    FinalRecord? Final)
+{
+    /// <summary>The canonical inputs processed by this step (live runs only; a source-driven run derives its inputs from the source and leaves this empty).</summary>
+    public IReadOnlyList<InputRecord> Inputs { get; init; } = Array.Empty<InputRecord>();
+
+    /// <summary>The observer cache of the positions touched or still open at this step (live runs only; never part of the step identity).</summary>
+    public IReadOnlyList<PositionSnapshotRow> PositionSnapshots { get; init; } = Array.Empty<PositionSnapshotRow>();
+}
 
 /// <summary>
 /// The durable run store (contract section A.18.5). The interface is synchronous in CP6.1; the PostgreSQL implementation will wrap it. Every write

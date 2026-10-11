@@ -94,7 +94,7 @@ public class PostgresSchemaTests
         var tables = await TablesAsync();
         Assert.Contains("positions", tables);
         Assert.Contains("rejections", tables);
-        Assert.Equal(22 + 1, tables.Count);                              // the 22 model tables plus the migration history
+        Assert.Equal(23 + 1, tables.Count);                              // the 23 model tables plus the migration history
     }
 
     [PostgresFact]

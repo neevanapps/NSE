@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Test-only child process for the real process-kill tests (docs/TRADING_ENGINE_PHASE1_CONTRACT.md section B.5): it runs a deterministic three-variant live scenario
+       against the LOCAL PostgreSQL test database and is killed abruptly (Process.Kill, no finally block, no flush) at a chosen point. It refuses any database that is not
+       the local niftysignal_trading_test one. The scenario also lives here so that the tests and the child run exactly the same inputs. Never deployed, never referenced by the Host. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\NiftySignal.Trading.Core\NiftySignal.Trading.Core.csproj" />
+    <ProjectReference Include="..\..\NiftySignal.Trading.Adapters\NiftySignal.Trading.Adapters.csproj" />
+    <ProjectReference Include="..\..\NiftySignal.Trading.Recovery\NiftySignal.Trading.Recovery.csproj" />
+    <ProjectReference Include="..\..\NiftySignal.Trading.Data\NiftySignal.Trading.Data.csproj" />
+    <ProjectReference Include="..\..\NiftySignal.Trading.Signals\NiftySignal.Trading.Signals.csproj" />
+    <ProjectReference Include="..\..\NiftySignal.Domain\NiftySignal.Domain.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -247,6 +247,39 @@ public sealed class OutputEntity
 }
 
 /// <summary>
+/// A canonical input of a LIVE run (a quote, a completed finalized bar, a feed-health or operator event, a clock advance, the finish), written in the same transaction
+/// as the step that processed it. Replaying these rows in order through the deterministic core rebuilds the engine; they are the durable cursor of a live run
+/// (the highest <c>BarCompleted</c> row's <see cref="SourceId"/> is the last finalized bar processed). Payload text is authoritative; the hash covers ordinal, kind, id, token, instant and payload.
+/// </summary>
+public sealed class InputEntity
+{
+    public string RunId { get; set; } = string.Empty;
+
+    public long Seq { get; set; }
+
+    public long StepSeq { get; set; }
+
+    /// <summary>The unit (availability group, advance or finish) the input belongs to; inputs with the same ordinal were delivered together.</summary>
+    public long GroupOrdinal { get; set; }
+
+    /// <summary>An <c>EventKind</c> name, <c>Advance</c> or <c>Finish</c>.</summary>
+    public string Kind { get; set; } = string.Empty;
+
+    /// <summary>Source tick id for a quote, <c>BarSeq</c> for a completed bar, the command / health sequence for a control event.</summary>
+    public long SourceId { get; set; }
+
+    public string Token { get; set; } = string.Empty;
+
+    public long AtUtcTicks { get; set; }
+
+    public string Payload { get; set; } = string.Empty;
+
+    public string ContentHash { get; set; } = string.Empty;
+
+    public string CodecVersion { get; set; } = string.Empty;
+}
+
+/// <summary>
 /// One stored trade, derived from the engine outputs (PositionOpened at the entry fill, PositionClosed at the final exit). Every column is write-once: the entry
 /// columns are written when the position opens, the close columns (all nullable) are filled once when it closes, never changed afterwards. While open, the live
 /// remaining quantity, TP1 progress and running MAE / MFE are in <see cref="PositionSnapshotEntity"/>, a cache. Decimals are canonical text, instants are UTC ticks.

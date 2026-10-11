@@ -145,7 +145,7 @@ public abstract class RunStoreContractTests
 
     // ------------------------------------------------------------------ header and round trips
 
-    [Fact]
+    [ContractFact]
     public async Task AnUnknownRun_LoadsAsEmpty()
     {
         using var f = CreateFixture();
@@ -158,7 +158,7 @@ public abstract class RunStoreContractTests
         Assert.False(s.Completed);
     }
 
-    [Fact]
+    [ContractFact]
     public async Task TheHeader_RoundTripsExactly_IncludingVariantsAndProvenance_AndIsIdempotentOrConflicting()
     {
         using var f = CreateFixture();
@@ -183,7 +183,7 @@ public abstract class RunStoreContractTests
         Assert.Equal((header.ConfigJson, header.FreezeSnapshot, header.SourceManifest, header.Horizon, header.TradeDate), (loaded.ConfigJson, loaded.FreezeSnapshot, loaded.SourceManifest, loaded.Horizon, loaded.TradeDate));
     }
 
-    [Fact]
+    [ContractFact]
     public async Task AWholeRunCommittedStepByStep_LoadsBackIdentically_AllHashesValid_ProjectionsDerivable()
     {
         using var f = CreateFixture();
@@ -210,7 +210,7 @@ public abstract class RunStoreContractTests
 
     // ------------------------------------------------------------------ atomicity and equality checks
 
-    [Fact]
+    [ContractFact]
     public async Task Commit_IsIdempotentForTheIdenticalStep_AndEqualityCheckedForADifferentOne()
     {
         using var f = CreateFixture();
@@ -227,7 +227,7 @@ public abstract class RunStoreContractTests
         Assert.Equal(batch.Outputs.Count, s.Outputs.Count);
     }
 
-    [Fact]
+    [ContractFact]
     public async Task ARejectedCommit_ChangesNothing()
     {
         using var f = CreateFixture();
@@ -250,12 +250,19 @@ public abstract class RunStoreContractTests
         Assert.Equal(before, RunSnapshotDigest.Economic(await LoadAsync(f)));
     }
 
-    [Theory]
-    [InlineData(StoreFaultMode.FailBeforeApply, false)]
-    [InlineData(StoreFaultMode.FailDuringApply, false)]
-    [InlineData(StoreFaultMode.UnknownApplied, true)]
-    [InlineData(StoreFaultMode.UnknownNotApplied, false)]
-    public async Task ACommitIsAllOrNothing_WhateverTheFault_AndRetryingTheSameBatchConverges(StoreFaultMode mode, bool applied)
+    [ContractFact]
+    public Task ACommitIsAllOrNothing_FailBeforeApply() => CommitIsAllOrNothing(StoreFaultMode.FailBeforeApply, false);
+
+    [ContractFact]
+    public Task ACommitIsAllOrNothing_FailDuringApply() => CommitIsAllOrNothing(StoreFaultMode.FailDuringApply, false);
+
+    [ContractFact]
+    public Task ACommitIsAllOrNothing_UnknownApplied() => CommitIsAllOrNothing(StoreFaultMode.UnknownApplied, true);
+
+    [ContractFact]
+    public Task ACommitIsAllOrNothing_UnknownNotApplied() => CommitIsAllOrNothing(StoreFaultMode.UnknownNotApplied, false);
+
+    private async Task CommitIsAllOrNothing(StoreFaultMode mode, bool applied)
     {
         using var f = CreateFixture();
         var token = await ContractData.StartAsync(f.Store, steps: 3);
@@ -277,7 +284,7 @@ public abstract class RunStoreContractTests
 
     // ------------------------------------------------------------------ cancellation
 
-    [Fact]
+    [ContractFact]
     public async Task CancellationBeforeSubmission_AppliesNothing_ForEveryWrite()
     {
         using var f = CreateFixture();
@@ -295,7 +302,7 @@ public abstract class RunStoreContractTests
         Assert.Empty((await LoadAsync(f)).Steps);
     }
 
-    [Fact]
+    [ContractFact]
     public async Task CancellationAfterACommitWasSubmitted_IsAnUnknownOutcome_NeverARollback()
     {
         using var f = CreateFixture();
@@ -318,7 +325,7 @@ public abstract class RunStoreContractTests
 
     // ------------------------------------------------------------------ control journal: durable versus applied
 
-    [Fact]
+    [ContractFact]
     public async Task AControl_IsDurableWhenJournaled_AndAppliedOnlyWhenAStepThatListsItCommits()
     {
         using var f = CreateFixture();
@@ -337,7 +344,7 @@ public abstract class RunStoreContractTests
         Assert.Equal(applyingStep.AppliedControls, applied.Steps[(int)applyingStep.StepSeq].AppliedControls.ToList());
     }
 
-    [Fact]
+    [ContractFact]
     public async Task TheJournal_IsIdempotentByIdentity_ConflictsOnDifferentContent_AndKeepsAppendOrder()
     {
         using var f = CreateFixture();
@@ -355,7 +362,7 @@ public abstract class RunStoreContractTests
         Assert.Equal(new[] { b.Id, a.Id }, (await LoadAsync(f)).Controls.Select(c => c.Id));
     }
 
-    [Fact]
+    [ContractFact]
     public async Task AControlWriteFault_NeverLeavesAHalfWrittenRecord()
     {
         using var f = CreateFixture();
@@ -375,7 +382,7 @@ public abstract class RunStoreContractTests
 
     // ------------------------------------------------------------------ ownership and fencing
 
-    [Fact]
+    [ContractFact]
     public async Task Ownership_IsExclusive_EpochsOnlyIncrease_AndADeadOwnersTokenStaysStale()
     {
         using var f = CreateFixture();
@@ -392,7 +399,7 @@ public abstract class RunStoreContractTests
         Assert.True(third.Epoch > second.Epoch);
     }
 
-    [Fact]
+    [ContractFact]
     public async Task EveryWrite_IsFencedAfterATakeover_AndTheOldOwnerChangesNothing()
     {
         using var f = CreateFixture();
@@ -412,7 +419,7 @@ public abstract class RunStoreContractTests
 
     // ------------------------------------------------------------------ diagnostics isolation
 
-    [Fact]
+    [ContractFact]
     public async Task RecoveryDiagnostics_AreStored_ButNeverChangeAnEconomicDigest()
     {
         using var f = CreateFixture();
@@ -430,7 +437,7 @@ public abstract class RunStoreContractTests
 
     // ------------------------------------------------------------------ precision
 
-    [Fact]
+    [ContractFact]
     public async Task TimestampsAndDecimals_RoundTripExactly_IncludingOneTickApartInstantsAndNonAsciiText()
     {
         using var f = CreateFixture();

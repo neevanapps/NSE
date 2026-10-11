@@ -53,7 +53,41 @@ public static class PostgresTestDatabase
 
         await using var db = NewContext();
         await db.Database.MigrateAsync();
+        PostgresTestDatabaseClean.MarkMigrated();
     }
+}
+
+/// <summary>Removes every row of every trading table (the schema and the schema_versions row stay): a fast reset between tests that share the migrated schema.</summary>
+public static class PostgresTestDatabaseClean
+{
+    private static readonly SemaphoreSlim Gate = new(1, 1);
+    private static bool _migrated;
+
+    public static async Task CleanAsync()
+    {
+        await Gate.WaitAsync();
+        try
+        {
+            if (!_migrated)
+            {
+                await PostgresTestDatabase.ResetAsync();
+            }
+
+            await using var connection = new NpgsqlConnection(PostgresTestDatabase.ConnectionString);
+            await connection.OpenAsync();
+            await using var command = new NpgsqlCommand(
+                "DO $$ DECLARE t text; BEGIN FOR t IN SELECT tablename FROM pg_tables WHERE schemaname = 'trading' AND tablename NOT IN ('schema_versions', '__ef_migrations_history') LOOP EXECUTE format('TRUNCATE TABLE trading.%I CASCADE', t); END LOOP; END $$;",
+                connection);
+            await command.ExecuteNonQueryAsync();
+        }
+        finally
+        {
+            Gate.Release();
+        }
+    }
+
+    /// <summary>The schema was just dropped and migrated afresh: no need to do it again before the next clean.</summary>
+    public static void MarkMigrated() => _migrated = true;
 }
 
 /// <summary>A fact that is skipped (visibly) when the local test database is not configured.</summary>

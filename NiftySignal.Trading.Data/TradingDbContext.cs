@@ -34,6 +34,8 @@ public sealed class TradingDbContext(DbContextOptions<TradingDbContext> options)
 
     public DbSet<OutputEntity> Outputs => Set<OutputEntity>();
 
+    public DbSet<InputEntity> Inputs => Set<InputEntity>();
+
     public DbSet<PositionEntity> Positions => Set<PositionEntity>();
 
     public DbSet<OrderEntity> Orders => Set<OrderEntity>();
@@ -236,6 +238,25 @@ public sealed class TradingDbContext(DbContextOptions<TradingDbContext> options)
             Text(b.Property(e => e.CodecVersion), 64);
             b.HasIndex(e => new { e.RunId, e.StepSeq });
             b.HasIndex(e => new { e.RunId, e.StrategyId, e.VariantId, e.AtUtcTicks });
+            b.HasOne<StepEntity>().WithMany().HasForeignKey(e => new { e.RunId, e.StepSeq }).OnDelete(DeleteBehavior.Restrict);
+        });
+
+        modelBuilder.Entity<InputEntity>(b =>
+        {
+            b.ToTable("engine_inputs", t =>
+            {
+                t.HasCheckConstraint("ck_engine_inputs_hash", $"content_hash ~ {HashPattern}");
+                t.HasCheckConstraint("ck_engine_inputs_seq", "seq >= 0 AND group_ordinal >= 0");
+            });
+            b.HasKey(e => new { e.RunId, e.Seq });
+            Id(b.Property(e => e.RunId));
+            Text(b.Property(e => e.Kind), 32);
+            Id(b.Property(e => e.Token));
+            b.Property(e => e.Payload).HasColumnType("text");
+            Hash(b.Property(e => e.ContentHash));
+            Text(b.Property(e => e.CodecVersion), 64);
+            b.HasIndex(e => new { e.RunId, e.StepSeq });
+            b.HasIndex(e => new { e.RunId, e.Kind, e.SourceId });
             b.HasOne<StepEntity>().WithMany().HasForeignKey(e => new { e.RunId, e.StepSeq }).OnDelete(DeleteBehavior.Restrict);
         });
 

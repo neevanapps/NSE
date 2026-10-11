@@ -12,7 +12,7 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace NiftySignal.Trading.Data.Migrations
 {
     [DbContext(typeof(TradingDbContext))]
-    [Migration("20261011105435_InitialTradingSchema")]
+    [Migration("20261011112552_InitialTradingSchema")]
     partial class InitialTradingSchema
     {
         /// <inheritdoc />
@@ -431,6 +431,86 @@ namespace NiftySignal.Trading.Data.Migrations
                     b.ToTable("final_records", "trading", t =>
                         {
                             t.HasCheckConstraint("ck_final_records_hash", "content_hash ~ '^[0-9A-F]{64}$'");
+                        });
+                });
+
+            modelBuilder.Entity("NiftySignal.Trading.Data.InputEntity", b =>
+                {
+                    b.Property<string>("RunId")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)")
+                        .HasColumnName("run_id")
+                        .UseCollation("C");
+
+                    b.Property<long>("Seq")
+                        .HasColumnType("bigint")
+                        .HasColumnName("seq");
+
+                    b.Property<long>("AtUtcTicks")
+                        .HasColumnType("bigint")
+                        .HasColumnName("at_utc_ticks");
+
+                    b.Property<string>("CodecVersion")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("codec_version")
+                        .UseCollation("C");
+
+                    b.Property<string>("ContentHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character(64)")
+                        .HasColumnName("content_hash")
+                        .IsFixedLength()
+                        .UseCollation("C");
+
+                    b.Property<long>("GroupOrdinal")
+                        .HasColumnType("bigint")
+                        .HasColumnName("group_ordinal");
+
+                    b.Property<string>("Kind")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)")
+                        .HasColumnName("kind")
+                        .UseCollation("C");
+
+                    b.Property<string>("Payload")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("payload")
+                        .UseCollation("C");
+
+                    b.Property<long>("SourceId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("source_id");
+
+                    b.Property<long>("StepSeq")
+                        .HasColumnType("bigint")
+                        .HasColumnName("step_seq");
+
+                    b.Property<string>("Token")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)")
+                        .HasColumnName("token")
+                        .UseCollation("C");
+
+                    b.HasKey("RunId", "Seq")
+                        .HasName("pk_engine_inputs");
+
+                    b.HasIndex("RunId", "StepSeq")
+                        .HasDatabaseName("ix_engine_inputs_run_id_step_seq");
+
+                    b.HasIndex("RunId", "Kind", "SourceId")
+                        .HasDatabaseName("ix_engine_inputs_run_id_kind_source_id");
+
+                    b.ToTable("engine_inputs", "trading", t =>
+                        {
+                            t.HasCheckConstraint("ck_engine_inputs_hash", "content_hash ~ '^[0-9A-F]{64}$'");
+
+                            t.HasCheckConstraint("ck_engine_inputs_seq", "seq >= 0 AND group_ordinal >= 0");
                         });
                 });
 
@@ -1524,7 +1604,7 @@ namespace NiftySignal.Trading.Data.Migrations
                         {
                             Component = "trading-engine",
                             CodecVersion = "trading-codec/4",
-                            MinimumCompatibleCode = "trading-engine/cp6.1",
+                            MinimumCompatibleCode = "trading-engine/paperlive-v1",
                             SchemaVersion = 1,
                             StateDigestVersion = "trading-state/1"
                         });
@@ -1823,6 +1903,16 @@ namespace NiftySignal.Trading.Data.Migrations
                         .OnDelete(DeleteBehavior.Restrict)
                         .IsRequired()
                         .HasConstraintName("fk_final_records_runs_run_id");
+                });
+
+            modelBuilder.Entity("NiftySignal.Trading.Data.InputEntity", b =>
+                {
+                    b.HasOne("NiftySignal.Trading.Data.StepEntity", null)
+                        .WithMany()
+                        .HasForeignKey("RunId", "StepSeq")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired()
+                        .HasConstraintName("fk_engine_inputs_steps_run_id_step_seq");
                 });
 
             modelBuilder.Entity("NiftySignal.Trading.Data.LedgerEntryEntity", b =>

@@ -335,6 +335,37 @@ namespace NiftySignal.Trading.Data.Migrations
                 });
 
             migrationBuilder.CreateTable(
+                name: "engine_inputs",
+                schema: "trading",
+                columns: table => new
+                {
+                    run_id = table.Column<string>(type: "character varying(256)", maxLength: 256, nullable: false, collation: "C"),
+                    seq = table.Column<long>(type: "bigint", nullable: false),
+                    step_seq = table.Column<long>(type: "bigint", nullable: false),
+                    group_ordinal = table.Column<long>(type: "bigint", nullable: false),
+                    kind = table.Column<string>(type: "character varying(32)", maxLength: 32, nullable: false, collation: "C"),
+                    source_id = table.Column<long>(type: "bigint", nullable: false),
+                    token = table.Column<string>(type: "character varying(256)", maxLength: 256, nullable: false, collation: "C"),
+                    at_utc_ticks = table.Column<long>(type: "bigint", nullable: false),
+                    payload = table.Column<string>(type: "text", nullable: false, collation: "C"),
+                    content_hash = table.Column<string>(type: "character(64)", fixedLength: true, maxLength: 64, nullable: false, collation: "C"),
+                    codec_version = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: false, collation: "C")
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("pk_engine_inputs", x => new { x.run_id, x.seq });
+                    table.CheckConstraint("ck_engine_inputs_hash", "content_hash ~ '^[0-9A-F]{64}$'");
+                    table.CheckConstraint("ck_engine_inputs_seq", "seq >= 0 AND group_ordinal >= 0");
+                    table.ForeignKey(
+                        name: "fk_engine_inputs_steps_run_id_step_seq",
+                        columns: x => new { x.run_id, x.step_seq },
+                        principalSchema: "trading",
+                        principalTable: "steps",
+                        principalColumns: new[] { "run_id", "step_seq" },
+                        onDelete: ReferentialAction.Restrict);
+                });
+
+            migrationBuilder.CreateTable(
                 name: "engine_outputs",
                 schema: "trading",
                 columns: table => new
@@ -749,7 +780,7 @@ namespace NiftySignal.Trading.Data.Migrations
                 schema: "trading",
                 table: "schema_versions",
                 columns: new[] { "component", "codec_version", "minimum_compatible_code", "schema_version", "state_digest_version" },
-                values: new object[] { "trading-engine", "trading-codec/4", "trading-engine/cp6.1", 1, "trading-state/1" });
+                values: new object[] { "trading-engine", "trading-codec/4", "trading-engine/paperlive-v1", 1, "trading-state/1" });
 
             migrationBuilder.CreateIndex(
                 name: "ux_control_applications_run_id_step_seq_ordinal",
@@ -764,6 +795,18 @@ namespace NiftySignal.Trading.Data.Migrations
                 table: "control_journal",
                 columns: new[] { "run_id", "journal_seq" },
                 unique: true);
+
+            migrationBuilder.CreateIndex(
+                name: "ix_engine_inputs_run_id_kind_source_id",
+                schema: "trading",
+                table: "engine_inputs",
+                columns: new[] { "run_id", "kind", "source_id" });
+
+            migrationBuilder.CreateIndex(
+                name: "ix_engine_inputs_run_id_step_seq",
+                schema: "trading",
+                table: "engine_inputs",
+                columns: new[] { "run_id", "step_seq" });
 
             migrationBuilder.CreateIndex(
                 name: "ix_engine_outputs_run_id_step_seq",
@@ -907,6 +950,10 @@ namespace NiftySignal.Trading.Data.Migrations
 
             migrationBuilder.DropTable(
                 name: "control_applications",
+                schema: "trading");
+
+            migrationBuilder.DropTable(
+                name: "engine_inputs",
                 schema: "trading");
 
             migrationBuilder.DropTable(

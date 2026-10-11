@@ -14,7 +14,7 @@ START TRANSACTION;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
         IF NOT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = 'trading') THEN
             CREATE SCHEMA trading;
         END IF;
@@ -23,7 +23,7 @@ END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE TABLE trading.run_owner (
         run_id character varying(256) COLLATE "C" NOT NULL,
         epoch bigint NOT NULL,
@@ -38,7 +38,7 @@ END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE TABLE trading.runs (
         run_id character varying(256) COLLATE "C" NOT NULL,
         trade_date date NOT NULL,
@@ -73,7 +73,7 @@ END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE TABLE trading.schema_versions (
         component character varying(64) COLLATE "C" NOT NULL,
         schema_version integer NOT NULL,
@@ -87,7 +87,7 @@ END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE TABLE trading.accounts (
         run_id character varying(256) COLLATE "C" NOT NULL,
         account_id character varying(256) COLLATE "C" NOT NULL,
@@ -99,7 +99,7 @@ END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE TABLE trading.control_journal (
         run_id character varying(256) COLLATE "C" NOT NULL,
         control_id character varying(256) COLLATE "C" NOT NULL,
@@ -123,7 +123,7 @@ END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE TABLE trading.final_records (
         run_id character varying(256) COLLATE "C" NOT NULL,
         content_hash character(64) COLLATE "C" NOT NULL,
@@ -137,7 +137,7 @@ END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE TABLE trading.recovery_log (
         run_id character varying(256) COLLATE "C" NOT NULL,
         log_seq bigint NOT NULL,
@@ -158,7 +158,7 @@ END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE TABLE trading.steps (
         run_id character varying(256) COLLATE "C" NOT NULL,
         step_seq bigint NOT NULL,
@@ -187,7 +187,7 @@ END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE TABLE trading.variants (
         run_id character varying(256) COLLATE "C" NOT NULL,
         variant_id character varying(256) COLLATE "C" NOT NULL,
@@ -204,7 +204,7 @@ END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE TABLE trading.final_lines (
         run_id character varying(256) COLLATE "C" NOT NULL,
         channel character varying(16) COLLATE "C" NOT NULL,
@@ -220,7 +220,7 @@ END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE TABLE trading.checkpoints (
         run_id character varying(256) COLLATE "C" NOT NULL,
         step_seq bigint NOT NULL,
@@ -237,7 +237,7 @@ END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE TABLE trading.control_applications (
         run_id character varying(256) COLLATE "C" NOT NULL,
         control_id character varying(256) COLLATE "C" NOT NULL,
@@ -253,7 +253,30 @@ END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
+    CREATE TABLE trading.engine_inputs (
+        run_id character varying(256) COLLATE "C" NOT NULL,
+        seq bigint NOT NULL,
+        step_seq bigint NOT NULL,
+        group_ordinal bigint NOT NULL,
+        kind character varying(32) COLLATE "C" NOT NULL,
+        source_id bigint NOT NULL,
+        token character varying(256) COLLATE "C" NOT NULL,
+        at_utc_ticks bigint NOT NULL,
+        payload text COLLATE "C" NOT NULL,
+        content_hash character(64) COLLATE "C" NOT NULL,
+        codec_version character varying(64) COLLATE "C" NOT NULL,
+        CONSTRAINT pk_engine_inputs PRIMARY KEY (run_id, seq),
+        CONSTRAINT ck_engine_inputs_hash CHECK (content_hash ~ '^[0-9A-F]{64}$'),
+        CONSTRAINT ck_engine_inputs_seq CHECK (seq >= 0 AND group_ordinal >= 0),
+        CONSTRAINT fk_engine_inputs_steps_run_id_step_seq FOREIGN KEY (run_id, step_seq) REFERENCES trading.steps (run_id, step_seq) ON DELETE RESTRICT
+    );
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE TABLE trading.engine_outputs (
         run_id character varying(256) COLLATE "C" NOT NULL,
         seq bigint NOT NULL,
@@ -276,7 +299,7 @@ END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE TABLE trading.risk_checkpoints (
         run_id character varying(256) COLLATE "C" NOT NULL,
         step_seq bigint NOT NULL,
@@ -292,7 +315,7 @@ END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE TABLE trading.step_digests (
         run_id character varying(256) COLLATE "C" NOT NULL,
         step_seq bigint NOT NULL,
@@ -310,7 +333,7 @@ END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE TABLE trading.audit_entries (
         run_id character varying(256) COLLATE "C" NOT NULL,
         output_seq bigint NOT NULL,
@@ -328,7 +351,7 @@ END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE TABLE trading.positions (
         run_id character varying(256) COLLATE "C" NOT NULL,
         position_id character varying(256) COLLATE "C" NOT NULL,
@@ -397,7 +420,7 @@ END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE TABLE trading.rejections (
         run_id character varying(256) COLLATE "C" NOT NULL,
         output_seq bigint NOT NULL,
@@ -419,7 +442,7 @@ END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE TABLE trading.orders (
         run_id character varying(256) COLLATE "C" NOT NULL,
         order_id character varying(256) COLLATE "C" NOT NULL,
@@ -443,7 +466,7 @@ END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE TABLE trading.position_snapshots (
         run_id character varying(256) COLLATE "C" NOT NULL,
         position_id character varying(256) COLLATE "C" NOT NULL,
@@ -481,7 +504,7 @@ END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE TABLE trading.fills (
         run_id character varying(256) COLLATE "C" NOT NULL,
         fill_id character varying(256) COLLATE "C" NOT NULL,
@@ -509,7 +532,7 @@ END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE TABLE trading.ledger_entries (
         run_id character varying(256) COLLATE "C" NOT NULL,
         fill_id character varying(256) COLLATE "C" NOT NULL,
@@ -524,178 +547,192 @@ END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     INSERT INTO trading.schema_versions (component, codec_version, minimum_compatible_code, schema_version, state_digest_version)
-    VALUES ('trading-engine', 'trading-codec/4', 'trading-engine/cp6.1', 1, 'trading-state/1');
+    VALUES ('trading-engine', 'trading-codec/4', 'trading-engine/paperlive-v1', 1, 'trading-state/1');
     END IF;
 END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE UNIQUE INDEX ux_control_applications_run_id_step_seq_ordinal ON trading.control_applications (run_id, step_seq, ordinal);
     END IF;
 END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE UNIQUE INDEX ux_control_journal_run_id_journal_seq ON trading.control_journal (run_id, journal_seq);
     END IF;
 END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
+    CREATE INDEX ix_engine_inputs_run_id_kind_source_id ON trading.engine_inputs (run_id, kind, source_id);
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
+    CREATE INDEX ix_engine_inputs_run_id_step_seq ON trading.engine_inputs (run_id, step_seq);
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE INDEX ix_engine_outputs_run_id_step_seq ON trading.engine_outputs (run_id, step_seq);
     END IF;
 END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE INDEX ix_engine_outputs_run_id_strategy_id_variant_id_at_utc_ticks ON trading.engine_outputs (run_id, strategy_id, variant_id, at_utc_ticks);
     END IF;
 END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE INDEX ix_fills_run_id_account_id ON trading.fills (run_id, account_id);
     END IF;
 END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE INDEX ix_fills_run_id_order_id ON trading.fills (run_id, order_id);
     END IF;
 END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE INDEX ix_fills_run_id_output_seq ON trading.fills (run_id, output_seq);
     END IF;
 END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE INDEX ix_fills_run_id_position_id ON trading.fills (run_id, position_id);
     END IF;
 END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE INDEX ix_fills_run_id_strategy_id_variant_id ON trading.fills (run_id, strategy_id, variant_id);
     END IF;
 END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE INDEX ix_orders_run_id_created_output_seq ON trading.orders (run_id, created_output_seq);
     END IF;
 END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE INDEX ix_orders_run_id_position_id ON trading.orders (run_id, position_id);
     END IF;
 END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE INDEX ix_orders_run_id_strategy_id_variant_id ON trading.orders (run_id, strategy_id, variant_id);
     END IF;
 END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE INDEX ix_position_snapshots_run_id_source_step_seq ON trading.position_snapshots (run_id, source_step_seq);
     END IF;
 END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE INDEX ix_position_snapshots_run_id_status ON trading.position_snapshots (run_id, status);
     END IF;
 END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE INDEX ix_positions_run_id_account_id ON trading.positions (run_id, account_id);
     END IF;
 END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE INDEX ix_positions_run_id_closed_output_seq ON trading.positions (run_id, closed_output_seq);
     END IF;
 END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE INDEX ix_positions_run_id_opened_output_seq ON trading.positions (run_id, opened_output_seq);
     END IF;
 END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE INDEX ix_positions_run_id_strategy_id ON trading.positions (run_id, strategy_id);
     END IF;
 END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE UNIQUE INDEX ux_positions_open_slot ON trading.positions (run_id, strategy_id, variant_id, slot_no) WHERE closed_output_seq IS NULL;
     END IF;
 END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE INDEX ix_rejections_run_id_source_session_id_bar_seq ON trading.rejections (run_id, source_session_id, bar_seq);
     END IF;
 END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE INDEX ix_rejections_run_id_strategy_id_variant_id ON trading.rejections (run_id, strategy_id, variant_id);
     END IF;
 END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE INDEX ix_runs_trade_date ON trading.runs (trade_date);
     END IF;
 END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     CREATE INDEX ix_variants_run_id_account_id ON trading.variants (run_id, account_id);
     END IF;
 END $EF$;
 
 DO $EF$
 BEGIN
-    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011105435_InitialTradingSchema') THEN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261011112552_InitialTradingSchema') THEN
     INSERT INTO trading.__ef_migrations_history ("MigrationId", "ProductVersion")
-    VALUES ('20261011105435_InitialTradingSchema', '10.0.11');
+    VALUES ('20261011112552_InitialTradingSchema', '10.0.11');
     END IF;
 END $EF$;
 COMMIT;

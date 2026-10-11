@@ -81,6 +81,16 @@ public static class LedgerCheck
             }
         }
 
+        for (var i = 0; i < snapshot.Inputs.Count; i++)
+        {
+            var input = snapshot.Inputs[i];
+            if (input.Seq != i || !input.HashIsValid || input.StepSeq < 0 || input.StepSeq >= snapshot.Steps.Count || (i > 0 && input.StepSeq < snapshot.Inputs[i - 1].StepSeq))
+            {
+                problems.Add($"input {i}: sequence, step assignment or hash mismatch");
+                break;
+            }
+        }
+
         foreach (var c in snapshot.Checkpoints.Where(c => c.StepSeq < 0 || c.StepSeq >= snapshot.Steps.Count))
         {
             problems.Add($"checkpoint at step {c.StepSeq} refers to a step that does not exist");

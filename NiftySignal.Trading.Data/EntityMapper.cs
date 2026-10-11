@@ -163,6 +163,56 @@ public static class EntityMapper
     public static OutputRecord ToRecord(OutputEntity e)
         => new(e.Seq, e.StepSeq, e.Type, e.StrategyId, e.VariantId, TickTime.FromTicks(e.AtUtcTicks), e.Payload, e.ContentHash);
 
+    public static PositionSnapshotEntity ToEntity(string runId, PositionSnapshotRow r, long stepSeq, long outputSeq)
+    {
+        var e = new PositionSnapshotEntity { RunId = runId, PositionId = r.PositionId, StrategyId = r.StrategyId, VariantId = r.VariantId };
+        Apply(e, r, stepSeq, outputSeq);
+        return e;
+    }
+
+    public static void Apply(PositionSnapshotEntity e, PositionSnapshotRow r, long stepSeq, long outputSeq)
+    {
+        e.AsOfUtcTicks = r.AsOfUtcTicks;
+        e.SourceOutputSeq = outputSeq;
+        e.SourceStepSeq = stepSeq;
+        e.Status = r.Status;
+        e.RemainingQuantity = r.RemainingQuantity;
+        e.ReservedExitQuantity = r.ReservedExitQuantity;
+        e.ExitPending = r.ExitPending;
+        e.Tp1State = r.Tp1State;
+        e.Tp1FilledQuantity = r.Tp1FilledQuantity;
+        e.LastBidText = r.LastBidText;
+        e.LastBidUtcTicks = r.LastBidUtcTicks;
+        e.UnrealizedPnlText = r.UnrealizedPnlText;
+        e.MfeText = r.MfeText;
+        e.MaeText = r.MaeText;
+        e.MfePctText = r.MfePctText;
+        e.MaePctText = r.MaePctText;
+        e.HighestBidText = r.HighestBidText;
+        e.LowestBidText = r.LowestBidText;
+        e.ExcursionObservations = r.ExcursionObservations;
+        e.ExcursionGaps = r.ExcursionGaps;
+        e.ExcursionCoverage = r.ExcursionCoverage;
+    }
+
+    public static InputEntity ToEntity(string runId, InputRecord i)
+        => new()
+        {
+            RunId = runId,
+            Seq = i.Seq,
+            StepSeq = i.StepSeq,
+            GroupOrdinal = i.GroupOrdinal,
+            Kind = i.Kind,
+            SourceId = i.SourceId,
+            Token = i.Token,
+            AtUtcTicks = TickTime.ToTicks(i.At),
+            Payload = i.Payload,
+            ContentHash = i.ContentHash,
+            CodecVersion = OutputCodec.Version,
+        };
+
+    public static InputRecord ToRecord(InputEntity e) => new(e.Seq, e.StepSeq, e.GroupOrdinal, e.Kind, e.SourceId, e.Token, TickTime.FromTicks(e.AtUtcTicks), e.Payload, e.ContentHash);
+
     public static CheckpointEntity ToEntity(string runId, CheckpointRecord c)
         => new() { RunId = runId, StepSeq = c.StepSeq, EngineTimeUtcTicks = TickTime.ToTicks(c.EngineTime), StateDigest = c.StateDigest, StateDigestVersion = Core.State.StateWriter.Version, StateText = c.StateText };
 
