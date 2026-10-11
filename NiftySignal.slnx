@@ -22,6 +22,7 @@
   <Project Path="NiftySignal.Trading.Core/NiftySignal.Trading.Core.csproj" />
   <Project Path="NiftySignal.Trading.Recovery/NiftySignal.Trading.Recovery.csproj" />
   <Project Path="NiftySignal.Trading.Data/NiftySignal.Trading.Data.csproj" />
+  <Project Path="NiftySignal.Trading.Live/NiftySignal.Trading.Live.csproj" />
   <Project Path="NiftySignal.Trading.Signals/NiftySignal.Trading.Signals.csproj" />
   <Project Path="NiftySignal.Tests/NiftySignal.Tests.csproj" />
   <!-- Audit finding F69: include every root project in the full solution release build. -->

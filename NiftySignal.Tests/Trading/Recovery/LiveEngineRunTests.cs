@@ -136,7 +136,7 @@ public abstract class LiveEngineRunContractTests
         Assert.Equal(3, d.Inputs.Count(i => i.Kind == "BarCompleted"));
         Assert.Equal(1, d.Inputs.Count(i => i.Kind == "Finish"));
         Assert.Equal(3L, run.DurableBarCursor);
-        Assert.Equal(d.Inputs.Where(i => i.Kind == "OptionQuote").Max(i => i.SourceId), run.DurableQuoteCursor);
+        Assert.Equal(new DateTimeOffset(d.Inputs.Where(i => InputCodec.IsEvent(i)).Max(i => i.At.UtcTicks), TimeSpan.Zero), run.DurableGroupCursor);
         Assert.True(d.Completed);
         LedgerCheck.Verify(d);
         Assert.All(d.Inputs.Where(InputCodec.IsEvent), i => Assert.Equal(i.ContentHash, InputCodec.ToRecord(i.Seq, i.StepSeq, i.GroupOrdinal, InputCodec.ToEvent(i)).ContentHash));

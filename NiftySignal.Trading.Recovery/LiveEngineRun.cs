@@ -88,7 +88,7 @@ public sealed class LiveEngineRun : IDisposable
     private bool _finished;
     private long? _durableBarSeq;
     private long? _processedBarSeq;
-    private long? _durableQuoteId;
+    private DateTimeOffset? _durableGroupAt;
 
     public long CommitsMade { get; private set; }
 
@@ -136,8 +136,11 @@ public sealed class LiveEngineRun : IDisposable
     /// <summary>The highest finalized bar whose input is DURABLE (committed), or null before the first bar. Bars at or below it must not be delivered again.</summary>
     public long? DurableBarCursor => _durableBarSeq;
 
-    /// <summary>The highest quote source id (tick id) whose input is DURABLE, or null before the first quote: a source resumes strictly after it. Quotes processed but not yet committed are lost by a crash and are delivered again from the source.</summary>
-    public long? DurableQuoteCursor => _durableQuoteId;
+    /// <summary>
+    /// The availability time of the last input group that is DURABLE (committed), or null before the first: a source resumes strictly after it, because the engine only accepts groups in
+    /// availability order. (Tick ids are NOT ordered by availability, so an id cannot serve as a cursor.) Input that was processed but not yet committed is lost by a crash and is delivered again.
+    /// </summary>
+    public DateTimeOffset? DurableGroupCursor => _durableGroupAt;
 
     /// <summary>The availability time of the last group the engine processed (a source must not deliver a new event at or before it).</summary>
     public DateTimeOffset? LastGroupTime => _loop.LastGroupTime;
@@ -480,7 +483,7 @@ public sealed class LiveEngineRun : IDisposable
             digests,
             string.Empty));
         var barSeq = _batchBarSeq;
-        var quoteId = _batchMaxSourceId;
+        var groupAt = _batchLastGroupAt;
         var checkpointDue = kind == UnitKind.Finish || (stepSeq + 1) % Math.Max(1, _options.CheckpointEverySteps) == 0;
         FinalRecord? final = null;
         if (kind == UnitKind.Finish)
@@ -511,9 +514,9 @@ public sealed class LiveEngineRun : IDisposable
             _durableBarSeq = _durableBarSeq is { } d ? Math.Max(d, b) : b;
         }
 
-        if (quoteId is { } q)
+        if (groupAt is { } g)
         {
-            _durableQuoteId = _durableQuoteId is { } dq ? Math.Max(dq, q) : q;
+            _durableGroupAt = _durableGroupAt is { } dg && dg > g ? dg : g;
         }
 
         _committedOutputs = outputCount;

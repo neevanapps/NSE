@@ -183,6 +183,8 @@ try
     // Adaptive Market Observer V1: watch-only, independent of the legacy score/trading workers.
     // It reads authoritative persisted raw ticks, writes its own isolated database and never
     // creates a paper or real order.
+    // Live PAPER trading path: off unless Trading:PaperLive:Enabled is set; no broker, order or HTTP type is involved.
+    builder.Services.AddSingleton<NiftySignal.Host.PaperLive.PaperLiveBridge>();
     builder.Services.AddSingleton<AdaptiveSourceTickReader>();
     builder.Services.AddSingleton<AdaptiveHistoricalBootstrapService>();
     builder.Services.AddSingleton<AdaptiveSessionCoordinator>();

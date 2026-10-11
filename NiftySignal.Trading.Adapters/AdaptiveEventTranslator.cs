@@ -375,22 +375,7 @@ public sealed class AdaptiveEventTranslator
     private TranslatedBar ToBar(AdaptiveCompletedBarPackage package)
     {
         var bar = package.FutureBar;
-        var target = _freeze.Definition.BaseBarVolume;
-        var valid = bar.IsComplete && AdaptiveReadinessPolicy.IsValid(bar.Volume, target, bar.Open, bar.High, bar.Low, bar.Close, bar.TradeUpdates, bar.StartAvailableAtUtc, bar.EndAvailableAtUtc);
-        var consecutive = AdaptiveReadinessPolicy.ConsecutiveValidBars(_engine.FutureBars, target, bar.BarSeq);
-        var signalStarted = bar.EndAvailableAtUtc >= _freeze.SignalStartUtc;
-        var ready = consecutive >= AdaptiveReadinessPolicy.RequiredBars && signalStarted;
-        var info = new BarInfo(
-            bar.StartAvailableAtUtc,
-            bar.EndAvailableAtUtc,
-            bar.Volume,
-            bar.TradeUpdates,
-            valid,
-            consecutive,
-            AdaptiveReadinessPolicy.RequiredBars,
-            signalStarted,
-            ready,
-            _readinessSpec);
+        var info = BarReadiness.Build(bar, _engine.FutureBars, _freeze.Definition.BaseBarVolume, _freeze.SignalStartUtc, _readinessSpec);
         var evt = new BarCompletedEvent(bar.EndAvailableAtUtc, bar.BarSeq, _freeze.FutureToken, info);
         return new TranslatedBar(evt, MetricsOf(package));
     }

@@ -101,8 +101,7 @@ internal static class LiveHarness
                     var events = g.Events.Where(e => e switch
                     {
                         BarCompletedEvent b => run.DurableBarCursor is not { } bar || b.BarSeq > bar,
-                        QuoteEvent q => run.DurableQuoteCursor is not { } quote || q.SourceId > quote,
-                        _ => true,
+                        _ => run.DurableGroupCursor is not { } at || e.AvailableAt > at,
                     }).ToList();
                     if (events.Count > 0)
                     {

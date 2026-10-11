@@ -22,7 +22,8 @@ public sealed class AdaptiveObserverWorker(
     AdaptiveCommentaryService commentary,
     DashboardPushClient dashboardPush,
     AdaptiveCommentaryNotificationGate notificationGate,
-    ILogger<AdaptiveObserverWorker> logger) : BackgroundService
+    ILogger<AdaptiveObserverWorker> logger,
+    PaperLive.PaperLiveBridge? paperLive = null) : BackgroundService
 {
     static readonly TimeSpan IstOffset = TimeSpan.FromHours(5.5);
     static readonly TimeOnly MarketOpen = new(9, 15);
@@ -112,6 +113,9 @@ public sealed class AdaptiveObserverWorker(
                         await DelayAsync(TimeSpan.FromSeconds(1), stoppingToken);
                         continue;
                     }
+
+                    // The live PAPER path (off by default) is told that a session starts or was recovered; it never throws into this loop.
+                    paperLive?.OnSessionStarted(_live);
                 }
 
                 await PollLiveAsync(_live, nowUtc, stoppingToken);
@@ -244,6 +248,7 @@ public sealed class AdaptiveObserverWorker(
             live.LastProcessedAvailableAt = groupTime;
             live.LastProcessedTickId = group.Max(x=>x.Tick.Id);
 
+            var groupBars = new List<(AdaptiveCompletedBarPackage Package, bool Verified)>();
             foreach (var package in packages)
             {
                 completedBars++;
@@ -286,7 +291,11 @@ public sealed class AdaptiveObserverWorker(
                 }
                 using (AdaptiveLiveTelemetry.Source.StartActivity("bar.observations"))
                     await observations.ProcessPackageAsync(source, observer, live.Context, package, ct);
+                // A bar is handed to the paper path only when its persisted projection and sidecars are verified (the same integrity gate commentary uses).
+                groupBars.Add((package, !live.UnverifiedSidecars.ContainsKey(package.FutureBar.BarSeq) && !(live.CommentaryCapBeforeBar is { } cap && package.FutureBar.BarSeq >= cap)));
             }
+
+            paperLive?.OnGroup(groupTime, group, groupBars, live);
 
             processed=groupEnd;
         }
@@ -295,6 +304,9 @@ public sealed class AdaptiveObserverWorker(
         {
             live.Pending.RemoveRange(0, processed);
         }
+
+        // Every group at or before the stable cutoff has been processed: the paper path may advance its clock to it (deadlines, max hold, the 15:10 liquidation).
+        paperLive?.OnPollCompleted(stableCutoff);
 
         // Operational runtime row: throttled (see RuntimePersistInterval). Completed bars and explicit flushes write immediately.
         if (ShouldFlushRuntime(forceRuntimeFlush, completedBars, live.LastRuntimeFlushUtc, nowUtc))
@@ -322,6 +334,7 @@ public sealed class AdaptiveObserverWorker(
 
             // Drain the persisted source and ordering buffer before resolving H5 at close.
             await PollLiveAsync(live, DateTimeOffset.UtcNow + StableOrderingLag, ct, forceRuntimeFlush: true);
+            paperLive?.OnSessionClosing();
             await observations.FinalizeSessionAsync(source, observer, live.Context, ct);
             await persistence.SetRuntimeStatusAsync(
                 observer,
