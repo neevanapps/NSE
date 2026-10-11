@@ -1,0 +1,176 @@
+@page "/paper-live"
+@attribute [Authorize]
+@rendermode InteractiveServer
+@implements IDisposable
+@using NiftySignal.Dashboard.Services
+@inject PaperLiveDataService Data
+
+@* READ-ONLY view of the live PAPER trading path (docs/TRADING_ENGINE_PHASE1_CONTRACT.md section B.7). There is no button, form or command on this page: it cannot buy, sell, cancel,
+   kill or change anything. Everything shown is read from the durable trading ledger. *@
+
+<PageTitle>Paper trading (read-only)</PageTitle>
+
+<div class="dashboard-shell" style="padding:12px 20px;">
+    <div style="padding: 4px 0 12px;">
+        <a href="/" class="login-link">&larr; Back to dashboard</a>
+    </div>
+    <h1 style="font-size:20px;">Paper trading <span class="badge badge-neutral">PAPER ONLY - read-only</span></h1>
+
+    @if (!Data.Configured)
+    {
+        <p class="text-faint">The paper-trading database is not configured for this dashboard (ConnectionStrings:TradingPaperLive).</p>
+    }
+    else if (_error is not null)
+    {
+        <p class="text-faint">The paper-trading ledger could not be read: @_error</p>
+    }
+    else if (_view is null)
+    {
+        <p class="text-faint">No paper-trading run has been recorded yet.</p>
+    }
+    else
+    {
+        var s = _view.Status;
+        var stale = !s.Completed && s.LastStepEngineTime is { } last && DateTimeOffset.UtcNow - last > TimeSpan.FromMinutes(2);
+        <div class="panel">
+            <div class="panel-title">Engine status <span class="mono text-dim">@s.RunId</span></div>
+            @foreach (var p in s.Problems)
+            {
+                <div class="badge badge-bear" style="display:block; margin:4px 0;">@p</div>
+            }
+            <table class="data-table">
+                <tbody>
+                    <tr><td>Trade date</td><td>@s.TradeDate.ToString("yyyy-MM-dd")</td><td>Session</td><td>@(s.Completed ? "finished (final close done)" : "running")</td></tr>
+                    <tr><td>Last finalized bar</td><td>@(s.LastBarSeq?.ToString() ?? "none yet")</td><td>Last input group</td><td>@Ist(s.LastGroupAt)</td></tr>
+                    <tr><td>Last committed step (engine time)</td><td>@Ist(s.LastStepEngineTime) @if (stale) { <span class="badge badge-bear">no commit for over 2 minutes</span> }</td><td>Last recovery event</td><td>@(s.LastRecoveryOutcome ?? "-") <span class="text-dim">@s.LastRecoveryDetail</span></td></tr>
+                    <tr><td>Steps / inputs / outputs</td><td>@s.Steps / @s.Inputs / @s.Outputs</td><td>Owner</td><td class="mono">@(s.OwnerId ?? "-")</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="panel">
+            <div class="panel-title">Risk and capital</div>
+            <table class="data-table">
+                <tbody>
+                    <tr><td>Global capital</td><td>@Money(_view.Risk.GlobalCapital)</td><td>Committed (open exposure)</td><td>@Money(_view.Risk.OpenExposure) @(_view.Risk.CapitalInUsePct is { } pct ? $"({pct}%)" : "")</td></tr>
+                    <tr><td>Trades today</td><td>@_view.Risk.GlobalTrades</td><td>Realized net P&amp;L</td><td>@Money(_view.Risk.GlobalRealizedNet)</td></tr>
+                    <tr><td>Feed integrity</td><td>@_view.Risk.IntegrityState</td><td>Active kill switches</td><td>@(_view.Risk.KillSwitches.Count == 0 ? "none" : string.Join(", ", _view.Risk.KillSwitches))</td></tr>
+                </tbody>
+            </table>
+            <div class="panel-title" style="margin-top:10px;">Latest rejected entries</div>
+            @if (_view.Risk.Rejections.Count == 0)
+            {
+                <div class="text-faint" style="font-size:13px;">None.</div>
+            }
+            else
+            {
+                <div class="scroll-x"><table class="data-table">
+                    <thead><tr><th>Time (IST)</th><th>Variant</th><th>Stage</th><th>Reasons</th><th>Bar</th></tr></thead>
+                    <tbody>
+                    @foreach (var r in _view.Risk.Rejections)
+                    {
+                        <tr><td>@Ist(r.At)</td><td>@r.StrategyId/@r.VariantId</td><td>@r.Stage</td><td>@r.Reasons</td><td>@r.BarSeq</td></tr>
+                    }
+                    </tbody>
+                </table></div>
+            }
+        </div>
+
+        <div class="panel">
+            <div class="panel-title">Open positions <span class="mono text-dim">@_view.Open.Count</span></div>
+            @if (_view.Open.Count == 0)
+            {
+                <div class="text-faint" style="font-size:13px;">No open positions.</div>
+            }
+            else
+            {
+                <div class="scroll-x"><table class="data-table">
+                    <thead><tr><th>Variant</th><th>Contract</th><th>Dir</th><th>Entry (IST)</th><th>Avg entry</th><th>Qty (left)</th><th>TP1</th><th>Stop</th><th>Max-hold</th><th>Last bid</th><th>Unrealized</th><th>MFE</th><th>MAE</th><th>Cov.</th><th>As of</th></tr></thead>
+                    <tbody>
+                    @foreach (var p in _view.Open)
+                    {
+                        <tr>
+                            <td>@p.StrategyId/@p.VariantId</td><td>@p.Symbol</td><td>@p.Direction (@p.OptionType)</td><td>@Ist(p.EntryAt)</td><td>@p.AvgEntryPrice</td><td>@p.EntryQuantity (@p.RemainingQuantity)</td>
+                            <td>@p.Tp1State @p.Tp1Level</td><td>@p.StopLevel</td><td>@Ist(p.MaxHoldDeadline)</td><td>@p.LastBid</td><td>@p.UnrealizedPnl @if (p.ExitPending) { <span class="badge badge-neutral">exit pending</span> }</td>
+                            <td>@p.Mfe (@p.MfePct%)</td><td>@p.Mae (@p.MaePct%)</td><td>@p.Coverage</td><td>@Ist(p.AsOf)</td>
+                        </tr>
+                    }
+                    </tbody>
+                </table></div>
+            }
+        </div>
+
+        <div class="panel">
+            <div class="panel-title">Closed trades <span class="mono text-dim">@_view.Closed.Count</span></div>
+            @if (_view.Closed.Count == 0)
+            {
+                <div class="text-faint" style="font-size:13px;">No closed trades.</div>
+            }
+            else
+            {
+                <div class="scroll-x"><table class="data-table">
+                    <thead><tr><th>Variant</th><th>Contract</th><th>Dir</th><th>Entry</th><th>Exit</th><th>Reason</th><th>Avg in / out</th><th>Qty</th><th>Gross</th><th>Costs</th><th>Net</th><th>MFE</th><th>MAE</th><th>Cov.</th><th>Bars in / out</th></tr></thead>
+                    <tbody>
+                    @foreach (var t in _view.Closed)
+                    {
+                        <tr>
+                            <td>@t.StrategyId/@t.VariantId</td><td>@t.Symbol</td><td>@t.Direction (@t.OptionType)</td><td>@Ist(t.EntryAt)</td><td>@Ist(t.ExitAt)</td><td>@t.ExitReason</td><td>@t.AvgEntryPrice / @t.AvgExitPrice</td><td>@t.Quantity</td>
+                            <td>@t.Gross</td><td>@t.Costs</td><td>@t.Net</td><td>@t.Mfe (@t.MfePct%)</td><td>@t.Mae (@t.MaePct%)</td><td>@t.Coverage</td><td>@t.EntryBarSeq / @t.ExitBarSeq</td>
+                        </tr>
+                    }
+                    </tbody>
+                </table></div>
+            }
+        </div>
+
+        <div class="panel">
+            <div class="panel-title">Family and variant summary</div>
+            <div class="scroll-x"><table class="data-table">
+                <thead><tr><th>Scope</th><th>Trades</th><th>Open</th><th>Closed</th><th>Wins</th><th>Losses</th><th>Closed net</th><th>Consecutive losses</th><th>Avg MFE</th><th>Avg MAE</th></tr></thead>
+                <tbody>
+                @foreach (var f in _view.Families)
+                {
+                    <tr><td><b>@f.Scope</b> (family)</td><td>@f.Trades</td><td>@f.Open</td><td>@f.Closed</td><td>@f.Wins</td><td>@f.Losses</td><td>@f.ClosedNet.ToString("0.00")</td><td>@f.ConsecutiveLosses</td><td>@Num(f.AvgMfe)</td><td>@Num(f.AvgMae)</td></tr>
+                }
+                @foreach (var v in _view.Variants)
+                {
+                    <tr><td>@v.Scope</td><td>@v.Trades</td><td>@v.Open</td><td>@v.Closed</td><td>@v.Wins</td><td>@v.Losses</td><td>@v.ClosedNet.ToString("0.00")</td><td>@v.ConsecutiveLosses</td><td>@Num(v.AvgMfe)</td><td>@Num(v.AvgMae)</td></tr>
+                }
+                </tbody>
+            </table></div>
+        </div>
+    }
+</div>
+
+@code {
+    private PaperLiveView? _view;
+    private string? _error;
+    private System.Threading.Timer? _timer;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await RefreshAsync();
+        _timer = new System.Threading.Timer(async _ => { await InvokeAsync(async () => { await RefreshAsync(); StateHasChanged(); }); }, null, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5));
+    }
+
+    private async Task RefreshAsync()
+    {
+        try
+        {
+            _view = await Data.LoadLatestAsync();
+            _error = null;
+        }
+        catch (Exception e)
+        {
+            _error = e.Message;
+        }
+    }
+
+    private static string Ist(DateTimeOffset? at) => at is { } a ? a.ToOffset(TimeSpan.FromHours(5.5)).ToString("HH:mm:ss") : "-";
+
+    private static string Money(decimal? value) => value is { } v ? v.ToString("N2") : "-";
+
+    private static string Num(decimal? value) => value is { } v ? v.ToString("0.00") : "-";
+
+    public void Dispose() => _timer?.Dispose();
+}

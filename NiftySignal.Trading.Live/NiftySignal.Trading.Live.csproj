@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The live PAPER trading bridge (docs/TRADING_ENGINE_PHASE1_CONTRACT.md section B.6): turns the Adaptive Observer's finalized bars and the option quotes of the same
+       availability groups into canonical engine input for a durable LiveEngineRun. PAPER ONLY: it has no reference to any broker, order, HTTP or ingestion assembly (a test
+       proves the whole dependency graph), it never rebuilds bars from ticks, and it never throws into its caller. Disabled unless Trading:PaperLive:Enabled is set. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NiftySignal.Trading.Core\NiftySignal.Trading.Core.csproj" />
+    <ProjectReference Include="..\NiftySignal.Trading.Adapters\NiftySignal.Trading.Adapters.csproj" />
+    <ProjectReference Include="..\NiftySignal.Trading.Recovery\NiftySignal.Trading.Recovery.csproj" />
+    <ProjectReference Include="..\NiftySignal.Trading.Signals\NiftySignal.Trading.Signals.csproj" />
+  </ItemGroup>
+
+</Project>

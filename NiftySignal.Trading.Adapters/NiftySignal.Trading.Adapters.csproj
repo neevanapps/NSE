@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- CP5 adapters for the shared trading engine (docs/TRADING_ENGINE_PHASE1_CONTRACT.md section A.16): ONE AdaptiveEventTranslator used by
+       the historical adapter and the non-hosted live-paper adapter library, plus the run-diff comparer. Pure: no I/O, no wall clock, no
+       randomness, no database. Reading recorded rows from PostgreSQL lives in the tools/TradingRunDiff harness, never here. NiftySignal.Tests
+       contains a banned-API guard over this assembly. -->
+  <ItemGroup>
+    <ProjectReference Include="..\NiftySignal.Trading.Core\NiftySignal.Trading.Core.csproj" />
+    <ProjectReference Include="..\NiftySignal.AdaptiveObserver\NiftySignal.AdaptiveObserver.csproj" />
+  </ItemGroup>
+
+</Project>

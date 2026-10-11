@@ -33,5 +33,7 @@
     <ProjectReference Include="..\NiftySignal.Rules\NiftySignal.Rules.csproj" />
     <ProjectReference Include="..\NiftySignal.Execution\NiftySignal.Execution.csproj" />
     <ProjectReference Include="..\NiftySignal.VolumeBarData\NiftySignal.VolumeBarData.csproj" />
+    <ProjectReference Include="..\NiftySignal.Trading.Live\NiftySignal.Trading.Live.csproj" />
+    <ProjectReference Include="..\NiftySignal.Trading.Data\NiftySignal.Trading.Data.csproj" />
   </ItemGroup>
 </Project>

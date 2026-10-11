@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Base strategies for the shared trading engine. CP2 contains only the plumbing strategy (no edge claim). Pure: no I/O, no clock. -->
+  <ItemGroup>
+    <ProjectReference Include="..\NiftySignal.Trading.Core\NiftySignal.Trading.Core.csproj" />
+  </ItemGroup>
+
+</Project>

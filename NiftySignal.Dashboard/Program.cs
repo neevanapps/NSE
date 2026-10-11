@@ -56,6 +56,20 @@ builder.Services.AddSignalR();
 builder.Services.AddDbContextFactory<NiftySignalDbContext>(options =>
     options.UseNpgsql(builder.Configuration.GetConnectionString("NiftySignalDb")));
 
+// Read-only view of the live PAPER trading ledger (the "trading" schema). Registered only when its connection string exists; the connection itself is opened
+// read-only, so this process cannot change the ledger even by mistake. There is no write path and no broker/order code behind this registration.
+{
+    var paperLiveConnection = builder.Configuration.GetConnectionString("TradingPaperLive");
+    if (!string.IsNullOrWhiteSpace(paperLiveConnection))
+    {
+        var readOnly = new NpgsqlConnectionStringBuilder(paperLiveConnection) { Options = "-c default_transaction_read_only=on" }.ConnectionString;
+        builder.Services.AddDbContextFactory<NiftySignal.Trading.Data.TradingDbContext>(options =>
+            options.UseNpgsql(readOnly, npgsql => npgsql.MigrationsHistoryTable("__ef_migrations_history", NiftySignal.Trading.Data.TradingDbContext.SchemaName)));
+    }
+}
+
+builder.Services.AddSingleton(sp => new PaperLiveDataService(sp.GetService<IDbContextFactory<NiftySignal.Trading.Data.TradingDbContext>>()));
+
 // Phase F of docs/LIVE_PARITY_PLAN.md: same separate-database override NiftySignal.Host's own
 // VolumeBarDbContext registration already uses (see NiftySignal.Host/Program.cs) -- same
 // server/credentials as NiftySignalDb, different Database= override

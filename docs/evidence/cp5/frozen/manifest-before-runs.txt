@@ -1,0 +1,15 @@
+﻿source commit : 98c9d1becc09f3f6db1ff9d6850e6640c4f94d48
+branch        : trading-engine-phase1-contract
+tree clean    : True
+sdk           : 10.0.401
+configuration : Release (dotnet build tools/TradingRunDiff -c Release --no-incremental, built once)
+output folder : tools\TradingRunDiff\bin\Release\net10.0
+assemblies (SHA-256, full):
+  NiftySignal.AdaptiveObserver.dll         2E7D00017D8BBE57E730BC19A49D384C5C3C20DE7AD7ACEC38B50CE42C3C324A
+  NiftySignal.Domain.dll                   A2C3831F0C802F973FD54658453917705716B5AC68D598A50DB2495CC1A76CEF
+  NiftySignal.Persistence.dll              9E0C5D0F2936EA28F6DE9A0810003B4094E4EE38534C1157D7A6C4D618C44186
+  NiftySignal.Pricing.dll                  C2A02D7688CA530FE4B37164A22E91E897B81E69B00FCC1AE4447AD041A220B1
+  NiftySignal.Trading.Adapters.dll         8188BB6D5CE029EF92E6B49493748C589EED0677434935989E7D01FDBF8FBC78
+  NiftySignal.Trading.Core.dll             370BE33BB8D93ABC80A468BED64E096474CAC85262256DAD04BD9E1191B0A259
+  NiftySignal.Trading.Signals.dll          887C15D84A0F49BB797C168EC92A1591EA97A2C3366DFA29FBFA100EFC1D93DD
+  TradingRunDiff.dll                       16440351F3984E65FE53FE0B2FF2513A87B85F8B773D484E16FA9B9E1C75D509

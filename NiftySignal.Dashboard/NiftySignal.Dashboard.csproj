@@ -13,6 +13,8 @@
     <ProjectReference Include="..\NiftySignal.Execution\NiftySignal.Execution.csproj" />
     <ProjectReference Include="..\NiftySignal.Rules\NiftySignal.Rules.csproj" />
     <ProjectReference Include="..\NiftySignal.Ingestion\NiftySignal.Ingestion.csproj" />
+    <!-- read-only view of the paper trading ledger (docs/TRADING_ENGINE_PHASE1_CONTRACT.md section B.7): reads the trading schema, never writes it -->
+    <ProjectReference Include="..\NiftySignal.Trading.Data\NiftySignal.Trading.Data.csproj" />
     <!-- Phase F of docs/LIVE_PARITY_PLAN.md: read-only access to VolumeBarDbContext's live
          tables (LiveOptionsScoreRow/LiveEntrySignalRow/LivePaperTradeRow) for the new
          /live-options-score page. This project never writes to any VolumeBarDbContext table. -->
