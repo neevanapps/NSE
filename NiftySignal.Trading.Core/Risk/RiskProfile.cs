@@ -157,6 +157,10 @@ public sealed record RiskProfile
             if (Global is not null)
             {
                 errors.AddRange(Global.Validate("Global"));
+                if (Global.MaxConsecutiveLosses is not null)
+                {
+                    errors.Add("Global.MaxConsecutiveLosses is not enforced by PaperLiveV1 (only variant and family streaks are): it must stay unset rather than be silently ignored.");
+                }
             }
 
             foreach (var (strategyId, limits) in Families)

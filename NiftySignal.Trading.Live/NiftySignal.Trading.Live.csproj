@@ -5,6 +5,7 @@
        proves the whole dependency graph), it never rebuilds bars from ticks, and it never throws into its caller. Disabled unless Trading:PaperLive:Enabled is set. -->
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Binder" />
   </ItemGroup>
 
   <ItemGroup>

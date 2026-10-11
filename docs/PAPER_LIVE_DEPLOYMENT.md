@@ -28,7 +28,7 @@ The Host refuses to start a run on a database whose `schema_versions` row is mis
 
 ## 3. VM-local configuration (do not commit)
 
-`appsettings.Local.json` of the **Host**:
+`appsettings.Local.json` of the **Host**. **Every number below is an EXAMPLE to show the shape; the operator chooses the actual limits. No limit has a source default**: a limit that is not configured is not enforced.
 
 ```json
 {
@@ -36,20 +36,58 @@ The Host refuses to start a run on a database whose `schema_versions` row is mis
   "Trading": {
     "PaperLive": {
       "Enabled": true,
-      "Capital": 0,
-      "BrokeragePerOrder": 0,
+      "Capital": 500000,
+      "BrokeragePerOrder": 20,
       "OptionTickSize": 0.05,
+      "Risk": {
+        "Global": { "MaxTradesPerDay": 12, "MaxDailyLoss": 15000 },
+        "Families": {
+          "X": { "MaxTradesPerDay": 6, "MaxDailyLoss": 8000, "MaxConsecutiveLosses": 3 }
+        },
+        "Variants": {
+          "X/X1": { "MaxTradesPerDay": 3, "MaxDailyLoss": 4000, "MaxConsecutiveLosses": 2 },
+          "X/X2": { "MaxConsecutiveLosses": 2 }
+        }
+      },
       "PlumbingFamily": { "Enabled": false }
     }
   }
 }
 ```
 
-`Capital` and `BrokeragePerOrder` are **required and have no default** (the values above are placeholders; the operator decides them; `0` is not a valid capital). With a missing value the bridge reports `Halted` with the reason and trades nothing. `OptionTickSize` is the exchange tick of the option contracts (0.05 for NSE index options) and is also required.
+What each setting does (all are entry gates; none liquidates or touches an existing position; counts and losses are per IST trading day; the daily loss is the REALIZED net P&L in rupees, a TP1 leg counts as soon as it fills):
+
+| Setting | Scope | Meaning |
+|---|---|---|
+| `Capital` | whole account | the ONE shared pool of committed premium (open positions at average entry price x open quantity plus entry orders still working, over all families and variants); an entry that would exceed it is blocked. Required, positive. |
+| `Risk:Global:MaxTradesPerDay` / `MaxDailyLoss` | whole account | trades (filled entries) / realized loss across everything. There is **no** `Global:MaxConsecutiveLosses`: the engine does not enforce it, so configuring it is refused (see below). |
+| `Risk:Families:<StrategyId>:MaxTradesPerDay` / `MaxDailyLoss` / `MaxConsecutiveLosses` | one strategy family | all variants of the family count together; never limits position capacity. |
+| `Risk:Variants:<StrategyId>/<VariantId>:...` | one variant | the same three limits for exactly that `(StrategyId, VariantId)`. |
+
+`BrokeragePerOrder` and `OptionTickSize` are required with no default; `Capital` must be positive. A future strategy needs **no source change** to get its limits: they are configuration keyed by its ids.
+
+**Validation (fail closed, visible).** Any of the following makes the state `Halted` with `configuration invalid: ...` in the Host log and no run is opened: a limit of zero or less; a malformed `StrategyId` or `StrategyId/VariantId` key; a key duplicated up to letter case; a key that is not an enforced limit (a misspelling, or `Global:MaxConsecutiveLosses`) or an unknown risk scope; an unreadable value; a configured family or variant that is not among the registered strategies (checked only when strategies are registered; with none registered nothing is invented and the keys are only checked for form).
 
 `appsettings.Local.json` of the **Dashboard**: `"ConnectionStrings": { "TradingPaperLive": "<same database, read-only role>" }`.
 
-**No strategy is registered by default**: with `Enabled=true` and no strategy the state is `NoStrategies` — nothing trades and nothing is journaled. The only available family is the TEST/PLUMBING script (`PlumbingFamily.Enabled=true` with explicit `Windows`, e.g. `{ "FromBarSeq": 5, "ToBarSeq": 5, "Direction": "Long" }`, optional `TradeSlPct`, `Tp1Pct`, `Tp1Proportion`, `MaxHoldMinutes`). It claims no edge and exists to prove the plumbing; it must not be left enabled for normal operation.
+**No strategy is registered by default.** `Enabled=true` with zero registered strategy families gives the state `NoStrategies`: no trades, no trading run and no journal (nothing is written to the trading database at all). That is safe, but it also means enabling PaperLive alone does not exercise the live path.
+
+**Minimum controlled infrastructure smoke test (ONE clearly labelled paper trade).** The TEST/PLUMBING family is a fixed script, not a strategy: it enters on the bar numbers you list and claims no edge. Never enable it automatically and never leave it on:
+
+```json
+"Risk": {
+  "Global": { "MaxTradesPerDay": 1 },
+  "Families": { "PLUMBING": { "MaxTradesPerDay": 1 } }
+},
+"PlumbingFamily": {
+  "Enabled": true,
+  "StrategyId": "PLUMBING", "VariantId": "P1",
+  "Windows": [ { "FromBarSeq": 12, "ToBarSeq": 12, "Direction": "Long" } ],
+  "TradeSlPct": 0.10, "Tp1Pct": 0.10, "Tp1Proportion": 0.5, "MaxHoldMinutes": 10
+}
+```
+
+It enters once on the first completed bar numbered 12 (if the window is missed, nothing happens), appears as `PLUMBING/P1` on `/paper-live`, and leaves by its stop, TP1, the 10-minute max hold or the 15:10 liquidation. The trade count is capped at one by both the account and the family limit. Capital must cover one entry (about 650 units times the premium, roughly 65 000 to 100 000).
 
 ## 4. Deployment procedure (when approved)
 
@@ -59,7 +97,7 @@ Outside market hours (a restart resets the Observer warm-up state; see CLAUDE.md
 
 1. Host service running; the log shows `Starting NiftySignal Host`, the expected build identity and **no** `PAPER-LIVE HALTED` line.
 2. `trading` schema present and compatible (the Host logs the halt reason otherwise).
-3. Configuration as intended: `Enabled`, `Capital`, `BrokeragePerOrder`, `OptionTickSize`; the plumbing family on only if a smoke test is planned.
+3. Configuration as intended: `Enabled`, `Capital`, `BrokeragePerOrder`, `OptionTickSize` and the whole `Risk` block (section 3); the plumbing family on only if a smoke test is planned.
 4. Dashboard `/paper-live` loads (before the first run it says "No paper-trading run has been recorded yet").
 5. Observer healthy as usual (existing checks).
 
@@ -91,3 +129,19 @@ Paper only (no broker / order / HTTP / ingestion assembly in the path; `Broker` 
 * Quotes and bars that were never delivered while the Host was down are not reconstructed; the engine is told of the gap.
 * A run whose process was down at the final close is not finalized automatically (flagged on the Dashboard; operator decision).
 * No real strategy exists yet; the rules of the first real family, its variants and their risk limits are a separate decision.
+
+## 11. Latency: the handoff to the Observer is SYNCHRONOUS (answer from the code)
+
+`AdaptiveObserverWorker.PollLiveAsync` calls `PaperLiveBridge.OnGroup` inline for every availability group, after the group bars were persisted, and `OnPollCompleted` once per poll. Both run the translation, the engine, and — when a step is due — the PostgreSQL commit **on the Observer thread**: `LiveEngineRun` calls `BlockingRunStoreAdapter`, which blocks on the async store (`Task.Run(...).GetAwaiter().GetResult()`) with a 30-second timeout. Therefore:
+
+* **Can a slow trading-database commit delay the Observer? YES.** The Observer processes nothing else while the call is running; the next poll (nominal cadence 250 ms) starts late by the full duration. A hung commit holds the Observer for up to 30 s, after which the instance is faulted, rebuilt from durable data (which can itself wait on the database) and, after three consecutive failures, halted. The paper path never throws into the Observer, but it is **not** isolated from its timing.
+* Only the steps that are due touch the database (a step ends on any output, on every completed bar, and after 30 s of engine time; plain quote groups only update memory), so most handoffs cost microseconds and a commit is paid a few times a minute.
+* The consistency model was deliberately not changed: the synchronous design keeps ordering (input, outputs, derived rows committed together, in group order) and durability (a bar the Observer moved past is already durable). A background queue would weaken both and is only to be proposed if the numbers below show it is needed — **STOP for review before any such change**.
+
+**Instrumentation (to measure tomorrow).** `PaperLiveStatus.Handoff` (`PaperLiveCoordinator.Status`) reports: handoffs, slow handoffs (over 250 ms, the Observer polling cadence; a PLACEHOLDER threshold, not tuned), last / max handoff, slowest commit, number of commits and peak inputs / outputs in one step. A warning `Paper-live handoff was slow: ...` is logged at most once a minute and aggregates the count since the previous warning (no per-handoff spam).
+
+**Evidence (SYNTHETIC full-day session, local PostgreSQL; no recorded NIFTY session exists on the development machine):** 145 183 availability groups, 220 047 journaled inputs (219 535 quotes, 511 bars), 2 926 outputs, 2 436 commits, 59.8 s total including the Observer engine; commit p50 / p95 / p99 / max = 15.4 / 58.5 / 179.6 / 252.7 ms; handoff p50 / p95 / p99 / max = 0.01 / 0.03 / 13.8 / 252.9 ms; **1 handoff exceeded 250 ms**; peak 339 inputs and 11 outputs in one step; 116 MiB for the trading schema (222 973 journal rows). Three runs on the same idle machine gave a maximum commit of 241, 318 and 253 ms, so the worst case sits around the 250 ms Observer cadence even locally: **a real session on the VM can plausibly exceed it more often**, which is exactly what the instrumentation will show. This is synthetic evidence, not a production measurement. Reproduce with `PaperLivePerformanceTests` (writes `nse-paperlive-performance.txt` to the temp directory).
+
+## 12. Operator kill channel: ENGINE-ONLY — no live operator channel
+
+The engine supports global, family and variant kill / reset scopes (`OperatorCommandEvent`), and a recorded kill is journaled and restored by replay. But **nothing in the Host or the Dashboard can issue such a command**: the Dashboard is intentionally read-only and the Host has no endpoint, file or message that creates an `OperatorCommandEvent`. For the paper test the only operational stop is the **global emergency stop**: set `Trading:PaperLive:Enabled=false` and restart the Host (open paper positions then stay unresolved in the ledger and are flagged on the Dashboard). **Family and variant kills are not operationally exposed yet.** The limits in section 3 are the available automatic brakes.

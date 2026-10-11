@@ -40,6 +40,12 @@ public sealed record LiveQuote(string Token, long SourceId, bool IsFuture, decim
 /// <summary>A completed finalized bar. <paramref name="Verified"/> is false when the Observer could not establish the integrity of the bar's persisted rows; such a bar is never given to the engine.</summary>
 public sealed record LiveBar(long BarSeq, DateTimeOffset EndAvailableAt, BarInfo Info, bool Verified);
 
+/// <summary>
+/// How long the paper path kept its caller (the Observer poll loop) waiting. The handoff is SYNCHRONOUS: the Observer thread runs the engine and the database commit before it
+/// goes on, so a slow database delays the Observer by exactly this much. <see cref="SlowHandoffs"/> counts handoffs above <see cref="PaperLiveCoordinator.SlowHandoffThreshold"/>.
+/// </summary>
+public sealed record PaperLiveHandoffStats(long Handoffs, long SlowHandoffs, double LastMillis, double MaxMillis, double MaxCommitMillis, int Commits, int PeakStepInputs, int PeakStepOutputs);
+
 public sealed record PaperLiveStatus(
     PaperLiveState State,
     string Detail,
@@ -48,7 +54,8 @@ public sealed record PaperLiveStatus(
     long? ProcessedBarCursor,
     DateTimeOffset? DurableGroupCursor,
     DateTimeOffset? LastActivityUtc,
-    int Recoveries);
+    int Recoveries,
+    PaperLiveHandoffStats Handoff);
 
 /// <summary>
 /// The live paper bridge's brain (contract section B.6). It receives, per availability group, the group's quotes and the bars the Adaptive Observer FINALIZED in it, and turns
@@ -67,6 +74,20 @@ public sealed class PaperLiveCoordinator : IDisposable
 {
     private const int MaxConsecutiveFaults = 3;
 
+    /// <summary>
+    /// A handoff slower than this is reported. PLACEHOLDER: the Observer polls every 250 ms, so a handoff longer than one poll interval makes the Observer miss a cycle; the value is the
+    /// cadence itself, not a tuned number.
+    /// </summary>
+    public static readonly TimeSpan SlowHandoffThreshold = TimeSpan.FromMilliseconds(250);
+
+    private static readonly TimeSpan SlowLogInterval = TimeSpan.FromSeconds(60);
+    private long _handoffs;
+    private long _slowHandoffs;
+    private long _slowSinceLog;
+    private double _lastHandoffMs;
+    private double _maxHandoffMs;
+    private DateTimeOffset _lastSlowLog = DateTimeOffset.MinValue;
+
     private readonly PaperLiveOptions _options;
     private readonly IReadOnlyList<PaperLiveStrategy> _strategies;
     private readonly Func<IRunStore> _storeFactory;
@@ -77,6 +98,7 @@ public sealed class PaperLiveCoordinator : IDisposable
     private readonly object _gate = new();
     private LiveRunSpec? _spec;
     private LiveEngineRun? _run;
+    private TimedRunStore? _timed;
     private LiveSessionInfo? _session;
     private PaperLiveState _state;
     private string _detail = string.Empty;
@@ -101,9 +123,19 @@ public sealed class PaperLiveCoordinator : IDisposable
         _detail = _state switch
         {
             PaperLiveState.Disabled => "Trading:PaperLive:Enabled is false",
-            PaperLiveState.NoStrategies => "enabled, but no strategy family is registered: nothing can trade",
+            PaperLiveState.NoStrategies => "enabled, but no strategy family is registered: nothing can trade and nothing is journaled",
             _ => "waiting for a session",
         };
+
+        // an invalid risk configuration is refused up front, whether or not a strategy is registered: it must never be silently ignored
+        if (options.Enabled)
+        {
+            var riskErrors = options.ValidateRisk(strategies);
+            if (riskErrors.Count > 0)
+            {
+                Halt("configuration invalid: " + string.Join(" ", riskErrors), null);
+            }
+        }
     }
 
     public PaperLiveStatus Status
@@ -112,12 +144,17 @@ public sealed class PaperLiveCoordinator : IDisposable
         {
             lock (_gate)
             {
-                return new PaperLiveStatus(_state, _detail, _spec?.Settings.RunId, _run?.DurableBarCursor, _run?.ProcessedBarCursor, _run?.DurableGroupCursor, _lastActivity, _recoveries);
+                var commits = _timed?.CommitMillis;
+                var handoff = new PaperLiveHandoffStats(_handoffs, _slowHandoffs, _lastHandoffMs, _maxHandoffMs, commits is { Count: > 0 } ? commits.Max() : 0d, commits?.Count ?? 0, _timed?.PeakStepInputs ?? 0, _timed?.PeakStepOutputs ?? 0);
+                return new PaperLiveStatus(_state, _detail, _spec?.Settings.RunId, _run?.DurableBarCursor, _run?.ProcessedBarCursor, _run?.DurableGroupCursor, _lastActivity, _recoveries, handoff);
             }
         }
     }
 
     public LiveEngineRun? Run => _run;
+
+    /// <summary>The duration in milliseconds of every commit of the current run instance (measurement).</summary>
+    public IReadOnlyList<double> CommitMillis => _timed?.CommitMillis ?? Array.Empty<double>();
 
     public static string RunIdOf(LiveSessionInfo session) => $"paper-live-v1:{session.TradeDate:yyyy-MM-dd}:{session.SessionId}";
 
@@ -127,7 +164,7 @@ public sealed class PaperLiveCoordinator : IDisposable
     public void StartSession(LiveSessionInfo session)
     {
         ArgumentNullException.ThrowIfNull(session);
-        if (_state is PaperLiveState.Disabled or PaperLiveState.NoStrategies)
+        if (_state is PaperLiveState.Disabled or PaperLiveState.NoStrategies or PaperLiveState.Halted)
         {
             return;
         }
@@ -135,7 +172,7 @@ public sealed class PaperLiveCoordinator : IDisposable
         try
         {
             DisposeRun();
-            var errors = _options.Validate();
+            var errors = _options.Validate().Concat(_options.ValidateRisk(_strategies)).ToList();
             if (errors.Count > 0)
             {
                 Halt("configuration invalid: " + string.Join(" ", errors), null);
@@ -191,6 +228,19 @@ public sealed class PaperLiveCoordinator : IDisposable
     /// <summary>One availability group: the quotes of the group and the bars finalized in it. Never throws.</summary>
     public void OnGroup(DateTimeOffset at, IReadOnlyList<LiveQuote> quotes, IReadOnlyList<LiveBar> bars)
     {
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        try
+        {
+            OnGroupCore(at, quotes, bars);
+        }
+        finally
+        {
+            Measure(started, "group");
+        }
+    }
+
+    private void OnGroupCore(DateTimeOffset at, IReadOnlyList<LiveQuote> quotes, IReadOnlyList<LiveBar> bars)
+    {
         if (!Ready())
         {
             return;
@@ -217,18 +267,55 @@ public sealed class PaperLiveCoordinator : IDisposable
     /// <summary>The clock may advance to <paramref name="watermark"/>: no undelivered input is available before it. Never throws.</summary>
     public void OnHeartbeat(DateTimeOffset watermark)
     {
-        if (!Ready())
-        {
-            return;
-        }
-
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
         try
         {
+            if (!Ready())
+            {
+                return;
+            }
+
             _run!.Advance(watermark);
         }
         catch (Exception e)
         {
             Fail(e, "advancing the clock");
+        }
+        finally
+        {
+            Measure(started, "heartbeat");
+        }
+    }
+
+    /// <summary>Records how long the caller was held (only while a run is open) and warns, at most once a minute, when handoffs exceeded <see cref="SlowHandoffThreshold"/>.</summary>
+    private void Measure(long started, string what)
+    {
+        if (_run is null)
+        {
+            return;
+        }
+
+        var elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(started);
+        lock (_gate)
+        {
+            _handoffs++;
+            _lastHandoffMs = elapsed.TotalMilliseconds;
+            _maxHandoffMs = Math.Max(_maxHandoffMs, _lastHandoffMs);
+            if (elapsed > SlowHandoffThreshold)
+            {
+                _slowHandoffs++;
+                _slowSinceLog++;
+            }
+        }
+
+        var now = _clock();
+        if (_slowSinceLog > 0 && now - _lastSlowLog >= SlowLogInterval)
+        {
+            _log.LogWarning(
+                "Paper-live handoff was slow: {Count} handoff(s) over {Threshold} ms since the last report (latest {What} {Latest:0} ms, max {Max:0} ms, slowest commit {Commit:0} ms). The Observer thread waits for this call.",
+                _slowSinceLog, SlowHandoffThreshold.TotalMilliseconds, what, _lastHandoffMs, _maxHandoffMs, _timed?.CommitMillis is { Count: > 0 } c ? c.Max() : 0d);
+            _slowSinceLog = 0;
+            _lastSlowLog = now;
         }
     }
 
@@ -312,7 +399,8 @@ public sealed class PaperLiveCoordinator : IDisposable
         DisposeRun();
         try
         {
-            var store = _storeFactory();
+            _timed = new TimedRunStore(_storeFactory());
+            var store = _timed;
             _beforeOpen?.Invoke(_spec!.Settings.RunId).GetAwaiter().GetResult();
             _run = LiveEngineRun.Open(store, _ownerId, _spec!);
             _recoveries++;

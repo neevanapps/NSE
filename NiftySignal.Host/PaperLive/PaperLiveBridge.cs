@@ -20,7 +20,7 @@ namespace NiftySignal.Host.PaperLive;
 /// </summary>
 public sealed class PaperLiveBridge(IConfiguration configuration, ILogger<PaperLiveBridge> logger) : IDisposable
 {
-    private readonly PaperLiveOptions _options = configuration.GetSection(PaperLiveOptions.SectionName).Get<PaperLiveOptions>() ?? new PaperLiveOptions();
+    private readonly PaperLiveOptions _options = PaperLiveOptions.Bind(configuration);
     private PaperLiveCoordinator? _coordinator;
     private PostgresRunStore? _store;
     private string? _futureToken;
@@ -30,7 +30,7 @@ public sealed class PaperLiveBridge(IConfiguration configuration, ILogger<PaperL
     public bool Enabled => _options.Enabled;
 
     public PaperLiveStatus Status => _coordinator?.Status
-        ?? new PaperLiveStatus(_options.Enabled ? PaperLiveState.Idle : PaperLiveState.Disabled, _options.Enabled ? "waiting for a session" : "Trading:PaperLive:Enabled is false", null, null, null, null, null, 0);
+        ?? new PaperLiveStatus(_options.Enabled ? PaperLiveState.Idle : PaperLiveState.Disabled, _options.Enabled ? "waiting for a session" : "Trading:PaperLive:Enabled is false", null, null, null, null, null, 0, new PaperLiveHandoffStats(0, 0, 0, 0, 0, 0, 0, 0));
 
     internal void OnSessionStarted(AdaptiveObserverWorker.LiveState live)
     {
