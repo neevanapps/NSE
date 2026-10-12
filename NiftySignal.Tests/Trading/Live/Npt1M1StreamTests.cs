@@ -1,3 +1,6 @@
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using NiftySignal.AdaptiveObserver;
 using NiftySignal.Host.Npt1Stream;
@@ -153,6 +156,37 @@ public class Npt1M1StreamTests
         Assert.True(telemetry.GroupsSkippedCatchUp > 0);
         Assert.Equal(groups.SelectMany(g => g.Bars).Count(), store.Stored.Count);                                                      // every frame is stored, including the withheld ones
         Assert.Equal(groups.SelectMany(g => g.Bars).Count(), (int)telemetry.BarsProduced);
+    }
+
+    [Fact]
+    public void TheWorker_ResolvesFromTheHostRegistrations_AndDoesNothingWhileNoNpt1StrategyIsEnabled()
+    {
+        // the registrations of NiftySignal.Host/Program.cs (only added when a strategy is enabled), with a dummy connection that is never opened
+        var configuration = new Microsoft.Extensions.Configuration.ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["Trading:PaperLive:Enabled"] = "true",
+            ["Trading:PaperLive:Strategies:NPT1-MD5:Enabled"] = "true",
+            ["Trading:PaperLive:Capital"] = "1000000",
+            ["Trading:PaperLive:BrokeragePerOrder"] = "0",
+            ["Trading:PaperLive:OptionTickSize"] = "0.05",
+        }).Build();
+        var services = new Microsoft.Extensions.DependencyInjection.ServiceCollection();
+        services.AddLogging();
+        services.AddSingleton<Microsoft.Extensions.Configuration.IConfiguration>(configuration);
+        services.AddDbContext<NiftySignal.Persistence.NiftySignalDbContext>(o => o.UseNpgsql("Host=localhost;Database=never_opened"));
+        services.AddDbContext<NiftySignal.Npt1M1.Data.Npt1M1DbContext>(o => o.UseNpgsql("Host=localhost;Database=never_opened"));
+        services.AddSingleton<NiftySignal.Npt1M1.Data.Npt1TickReader>();
+        services.AddSingleton<NiftySignal.Npt1M1.Data.M1SessionBuilder>();
+        services.AddSingleton<Npt1M1Telemetry>();
+        services.AddSingleton<EfFrameStore>();
+        services.AddHostedService<Npt1M1Worker>();
+
+        using var provider = services.BuildServiceProvider(new Microsoft.Extensions.DependencyInjection.ServiceProviderOptions { ValidateScopes = true, ValidateOnBuild = true });
+
+        var worker = Assert.Single(provider.GetServices<Microsoft.Extensions.Hosting.IHostedService>());
+        Assert.IsType<Npt1M1Worker>(worker);
+        Assert.True(PaperLiveOptions.Bind(configuration).AnyNpt1Enabled);
+        Assert.Empty(PaperLiveOptions.Bind(configuration).Validate());
     }
 
     [Fact]

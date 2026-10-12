@@ -130,4 +130,5 @@ GST 18% of exchange+SEBI, brokerage 0). A separate versioned schedule `npt1-froz
 * After a restart the strategies re-warm from live bars (14 / 20 / 11 consecutive bars); bars completed while nobody observed are not replayed as decisions (the specification forbids fabricated downtime trades).
 * A contract whose lot size does not divide 650 stops the NPT1 run at configuration time (fail closed) instead of cancelling one entry.
 * The 15:00 protocol closes at the held token's latest positive bid even if it is old (the age is recorded). A position that never had a two-sided quote cannot exist (entry needs one), so the "no bid" branch is a defensive path.
+* The first run on a machine computes the prior-session volumes of up to 35 earlier dates from the raw ticks (minutes); the worker does this at 09:15, later days add one date.
 * Sealed data: no date after 2026-10-01 was opened; the parity tool refuses such dates.

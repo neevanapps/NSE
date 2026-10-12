@@ -74,6 +74,7 @@ public sealed class Npt1M1Worker(
     private PostgresRunStore? _store;
     private DaySession? _day;
     private DateOnly? _unavailableDay;
+    private DateOnly? _historyEnsuredFor;
 
     private sealed class DaySession
     {
@@ -135,6 +136,14 @@ public sealed class Npt1M1Worker(
                     continue;
                 }
 
+                if (_historyEnsuredFor != day)
+                {
+                    // Prior-session volumes are computed from the raw ticks once per date and kept in npt1m1.volume_history. Doing it as soon as the day starts (09:15) keeps the first run's
+                    // longer computation (up to 35 prior dates) out of the 09:30:07 freeze.
+                    await EnsureHistoryAsync(day, now, stoppingToken);
+                    _historyEnsuredFor = day;
+                }
+
                 if (_day is null || _day.Day != day)
                 {
                     _day = await TryStartAsync(day, now, stoppingToken);
@@ -158,6 +167,22 @@ public sealed class Npt1M1Worker(
                 _day = null;
                 await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken);
             }
+        }
+    }
+
+    private async Task EnsureHistoryAsync(DateOnly day, DateTimeOffset now, CancellationToken ct)
+    {
+        try
+        {
+            await using var scope = scopes.CreateAsyncScope();
+            var source = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
+            var store = scope.ServiceProvider.GetRequiredService<Npt1M1DbContext>();
+            var history = await builder.EnsureVolumeHistoryAsync(source, store, day, now, ct);
+            logger.LogInformation("NPT1 M1 prior-session volume history ready for {Day}: {Dates} dates, {Eligible} baseline-eligible.", day, history.Count, history.Count(h => h.BaselineEligible));
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            logger.LogError(e, "NPT1 M1 prior-session volume history could not be prepared; the session freeze will retry it.");
         }
     }
 
