@@ -57,7 +57,8 @@ public sealed record BarMetrics(
     BandSideMetrics Put,
     IReadOnlyList<string> KnownGaps);
 
-public sealed record TranslatedBar(BarCompletedEvent Event, BarMetrics Metrics);
+/// <param name="Package">The adaptive engine's own completed-bar package this event was derived from (read-only provenance for stream producers that need more metrics than <see cref="BarMetrics"/> carries, e.g. the NPT1 M1 frame).</param>
+public sealed record TranslatedBar(BarCompletedEvent Event, BarMetrics Metrics, NiftySignal.AdaptiveObserver.AdaptiveCompletedBarPackage? Package = null);
 
 /// <summary>All events of one availability instant, in the engine's group order (spot, options, future, then bars).</summary>
 public sealed record TranslatedGroup(DateTimeOffset AvailableAt, long Ordinal, IReadOnlyList<TranslatedQuote> Quotes, IReadOnlyList<TranslatedBar> Bars)

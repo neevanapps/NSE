@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The NPT1 M1 producer (docs/NPT1_M1_PRODUCER_PLAN.md): produces the research M1 bar clock and the finalized NPT1 strategy frames for PAPER trading, in parallel to and independent of
+       the production Adaptive Observer (adaptive-v1), which it only REFERENCES (public types) and never modifies. Pure and deterministic: ordered cleaned availability groups in,
+       finalized immutable frames out. No database, no clock, no broker. -->
+  <ItemGroup>
+    <ProjectReference Include="..\NiftySignal.AdaptiveObserver\NiftySignal.AdaptiveObserver.csproj" />
+    <ProjectReference Include="..\NiftySignal.Trading.Adapters\NiftySignal.Trading.Adapters.csproj" />
+    <ProjectReference Include="..\NiftySignal.Trading.Core\NiftySignal.Trading.Core.csproj" />
+  </ItemGroup>
+
+</Project>

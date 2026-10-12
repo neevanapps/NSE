@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- NPT1 M1 producer parity check: replays ONE authorized development session (never after 2026-10-01) from the recorded tick database through the M1 producer and compares every bar
+       (clock boundaries, readiness, m, w, strict PE delta, band centre / expiry) and the session freeze with the research export of the same session. Read-only against the recorded
+       tick database; no writes, no Host, no broker. Not a profitability experiment. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../NiftySignal.Npt1M1.Data/NiftySignal.Npt1M1.Data.csproj" />
+    <ProjectReference Include="../../NiftySignal.Trading.Live/NiftySignal.Trading.Live.csproj" />
+  </ItemGroup>
+
+</Project>
