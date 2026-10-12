@@ -68,7 +68,18 @@ builder.Services.AddDbContextFactory<NiftySignalDbContext>(options =>
     }
 }
 
-builder.Services.AddSingleton(sp => new PaperLiveDataService(sp.GetService<IDbContextFactory<NiftySignal.Trading.Data.TradingDbContext>>()));
+// Read-only view of the NPT1 M1 producer's own schema (npt1m1) on the same paper-live database: stream health only; absent or unreadable it simply shows nothing.
+{
+    var paperLiveConnection = builder.Configuration.GetConnectionString("TradingPaperLive");
+    if (!string.IsNullOrWhiteSpace(paperLiveConnection))
+    {
+        var readOnly = new NpgsqlConnectionStringBuilder(paperLiveConnection) { Options = "-c default_transaction_read_only=on" }.ConnectionString;
+        builder.Services.AddDbContextFactory<NiftySignal.Npt1M1.Data.Npt1M1DbContext>(options =>
+            options.UseNpgsql(readOnly, npgsql => npgsql.MigrationsHistoryTable("__ef_migrations_history", NiftySignal.Npt1M1.Data.Npt1M1DbContext.Schema)));
+    }
+}
+
+builder.Services.AddSingleton(sp => new PaperLiveDataService(sp.GetService<IDbContextFactory<NiftySignal.Trading.Data.TradingDbContext>>(), null, sp.GetService<IDbContextFactory<NiftySignal.Npt1M1.Data.Npt1M1DbContext>>()));
 
 // Phase F of docs/LIVE_PARITY_PLAN.md: same separate-database override NiftySignal.Host's own
 // VolumeBarDbContext registration already uses (see NiftySignal.Host/Program.cs) -- same

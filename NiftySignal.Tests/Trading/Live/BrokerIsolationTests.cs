@@ -16,7 +16,7 @@ public class BrokerIsolationTests
 {
     private static readonly string[] PaperPathAssemblies =
     {
-        "NiftySignal.Trading.Core", "NiftySignal.Trading.Adapters", "NiftySignal.Trading.Recovery", "NiftySignal.Trading.Data", "NiftySignal.Trading.Signals", "NiftySignal.Trading.Live",
+        "NiftySignal.Trading.Core", "NiftySignal.Trading.Adapters", "NiftySignal.Trading.Recovery", "NiftySignal.Trading.Data", "NiftySignal.Trading.Signals", "NiftySignal.Trading.Live", "NiftySignal.Npt1M1",
     };
 
     /// <summary>Product assemblies that can talk to a broker, place orders, call the network or send messages. None may be reachable from the paper path.</summary>
@@ -103,6 +103,46 @@ public class BrokerIsolationTests
     }
 
     [Fact]
+    public void TheNpt1M1DataAssembly_ReadsTicksOnly_NoBrokerOrderOrMessagingAssemblyIsReachable()
+    {
+        // it legitimately reads the tick database (Persistence / Domain / the database driver) but must not reach a broker, an order endpoint, the notifier or the legacy rules / execution stack
+        var closure = Closure(new[] { "NiftySignal.Npt1M1.Data" });
+        foreach (var forbidden in new[] { "NiftySignal.Ingestion", "NiftySignal.Execution", "NiftySignal.Notifications", "NiftySignal.Rules", "NiftySignal.Host", "NiftySignal.Dashboard", "Microsoft.AspNetCore.SignalR.Client", "Websocket.Client" })
+        {
+            Assert.DoesNotContain(forbidden, closure.Keys);
+        }
+
+        foreach (var type in closure["NiftySignal.Npt1M1.Data"].GetTypes().Concat(closure["NiftySignal.Npt1M1"].GetTypes()))
+        {
+            var members = type.GetMembers(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly);
+            var text = type.FullName + " " + string.Join(" ", members.Select(m => m.Name));
+            foreach (var word in ForbiddenWords)
+            {
+                Assert.False(text.Contains(word, StringComparison.OrdinalIgnoreCase), $"{type.FullName} mentions '{word}'");
+            }
+        }
+    }
+
+    [Fact]
+    public void TheNpt1StreamHostGlue_HasNoBrokerOrNetworkDependency()
+    {
+        var types = typeof(NiftySignal.Host.Npt1Stream.Npt1M1Worker).Assembly.GetTypes().Where(t => t.Namespace == typeof(NiftySignal.Host.Npt1Stream.Npt1M1Worker).Namespace).ToList();
+        Assert.NotEmpty(types);
+        foreach (var type in types)
+        {
+            var referenced = type.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly).Select(f => f.FieldType)
+                .Concat(type.GetConstructors().SelectMany(c => c.GetParameters().Select(p => p.ParameterType)))
+                .Concat(type.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly).SelectMany(m => m.GetParameters().Select(p => p.ParameterType).Append(m.ReturnType)));
+            foreach (var t in referenced)
+            {
+                var assembly = t.Assembly.GetName().Name!;
+                Assert.DoesNotContain(assembly, ForbiddenAssemblies.Where(f => f is not ("NiftySignal.Host" or "NiftySignal.Persistence")));
+                Assert.False((t.Namespace ?? string.Empty).StartsWith("System.Net", StringComparison.Ordinal), $"{type.Name} uses {t.FullName}");
+            }
+        }
+    }
+
+    [Fact]
     public void TheHostGlueOfThePaperPath_HasNoBrokerOrNetworkDependency()
     {
         var types = typeof(PaperLiveBridge).Assembly.GetTypes().Where(t => t.Namespace == typeof(PaperLiveBridge).Namespace).ToList();
@@ -150,7 +190,15 @@ public class BrokerIsolationTests
         Assert.Empty(PaperLiveSetup.Strategies(new PaperLiveOptions { Enabled = true, Capital = 1m }));            // enabled alone registers no strategy
 
         var shipped = File.ReadAllText(Path.Combine(TradingRepo.Root(), "NiftySignal.Host", "appsettings.json"));
-        Assert.Matches(@"""PaperLive""\s*:\s*\{\s*""Enabled""\s*:\s*false\s*\}", shipped);
+        Assert.Matches(@"""PaperLive""\s*:\s*\{\s*""Enabled""\s*:\s*false", shipped);
+        foreach (var id in PaperLiveOptions.Npt1StrategyIds)
+        {
+            Assert.Matches($@"""{id}""\s*:\s*\{{\s*""Enabled""\s*:\s*false\s*\}}", shipped);                // every NPT1 strategy ships OFF
+        }
+
+        Assert.Empty(PaperLiveSetup.Npt1Strategies(defaults));
+        Assert.Empty(PaperLiveSetup.Npt1Strategies(new PaperLiveOptions { Enabled = true, Capital = 1m }));         // enabled alone registers no NPT1 strategy
+        Assert.False(new PaperLiveOptions { Enabled = true, Strategies = new Dictionary<string, StrategyToggleOptions> { ["NPT1-MD5"] = new() } }.AnyNpt1Enabled);
     }
 }
 

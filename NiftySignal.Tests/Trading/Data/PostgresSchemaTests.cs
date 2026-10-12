@@ -88,7 +88,7 @@ public class PostgresSchemaTests
         var row = await db.SchemaVersions.SingleAsync();
         Assert.Equal(TradingSchema.Component, row.Component);
         Assert.True(SchemaCompatibility.CheckSchema(row).Compatible);
-        Assert.Single(await db.Database.GetAppliedMigrationsAsync());
+        Assert.Equal(2, (await db.Database.GetAppliedMigrationsAsync()).Count());
         Assert.Empty(await db.Database.GetPendingMigrationsAsync());
 
         var tables = await TablesAsync();

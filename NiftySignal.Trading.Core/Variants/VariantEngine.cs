@@ -42,7 +42,7 @@ public static class ContractFixation
 /// the events and the scheduler passed to the callbacks.
 /// </para>
 /// </summary>
-public sealed class VariantEngine : IEngineHandler
+public sealed partial class VariantEngine : IEngineHandler
 {
     private readonly TradingConfig _config;
     private readonly ConfigHash _configHash;
@@ -202,6 +202,11 @@ public sealed class VariantEngine : IEngineHandler
             w.Line("episode", o.EpisodeId);
             w.Line("episodeStart", o.EpisodeStartBarSeq);
             w.Line("side", o.Side);
+            if (o.NextBarSignalSeq is { } nextBarSignal)
+            {
+                w.Line("nextBarSignalSeq", nextBarSignal);
+            }
+
             w.Line("createdAt", o.CreatedAt);
             w.Line("state", o.State);
             w.Line("contract", o.Contract is null ? null : $"{o.Contract.Token}|{o.Contract.Side}|{StateWriter.Dec(o.Contract.Strike)}|{o.Contract.Expiry:yyyy-MM-dd}|{o.Contract.LotSize}|{StateWriter.Dec(o.Contract.TickSize)}");
@@ -222,6 +227,11 @@ public sealed class VariantEngine : IEngineHandler
         }
 
         _quotes.WriteState(w);
+        if (_variants.Any(IsBarClocked))
+        {
+            TwoSided.WriteState(w);
+        }
+
         _candles.WriteState(w);
     }
 
@@ -262,10 +272,11 @@ public sealed class VariantEngine : IEngineHandler
         }
 
         _candles.Observe(quote);
+        TwoSided.Update(quote);
         var snapshot = _quotes.Get(quote.Token)!;
         foreach (var v in _variants)
         {
-            if (v.Active is { State: OpportunityState.Waiting, Contract: { } contract } opportunity
+            if (v.Active is { State: OpportunityState.Waiting, Contract: { } contract, NextBarSignalSeq: null } opportunity
                 && string.Equals(contract.Token, quote.Token, StringComparison.Ordinal))
             {
                 EvaluateEntry(v, opportunity, snapshot, quote.AvailableAt, "EntryQuote", quote.SourceId);
@@ -327,6 +338,12 @@ public sealed class VariantEngine : IEngineHandler
 
     private void OnBarForVariant(VariantState v, BarCompletedEvent bar, VariantDecision decision, IEngineScheduler scheduler)
     {
+        if (v.Spec.EntryCondition is NextCompletedBarEntrySpec policy)
+        {
+            OnBarBarClocked(v, bar, decision, policy, scheduler);
+            return;
+        }
+
         var now = bar.AvailableAt;
         var attributed = new AttributedDecision(v.Key, decision.Action, decision.Direction, decision.ReasonCode, decision.Detail, _sourceSessionId, bar.BarSeq, bar.AvailableAt);
         v.LastDecision = attributed;
@@ -661,6 +678,13 @@ public sealed class VariantEngine : IEngineHandler
 
         slot.State = SlotState.Free;
         slot.OwnerOpportunityId = null;
+        if (v.Spec.EntryCondition is NextCompletedBarEntrySpec)
+        {
+            // A bar-clocked entry is never re-armed: a cancelled next-bar attempt is simply gone (a raw strategy asks again on a later bar, a crossover waits for a new event).
+            Terminal(v, opportunity, OpportunityState.Cancelled, now, outcome.Kind.ToString());
+            return;
+        }
+
         if (opportunity.CancelRequested)
         {
             switch (opportunity.CancelReason)

@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Persistence and source access of the NPT1 M1 producer (docs/NPT1_M1_PRODUCER_PLAN.md): the schema npt1m1 (own tables, own migration), the read-only raw tick reader and the M1 session builder.
+       Nothing here writes to the raw tick database, the adaptive-v1 database or the trading ledger. -->
+  <ItemGroup>
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NiftySignal.Npt1M1\NiftySignal.Npt1M1.csproj" />
+    <ProjectReference Include="..\NiftySignal.Persistence\NiftySignal.Persistence.csproj" />
+    <ProjectReference Include="..\NiftySignal.Domain\NiftySignal.Domain.csproj" />
+  </ItemGroup>
+
+</Project>

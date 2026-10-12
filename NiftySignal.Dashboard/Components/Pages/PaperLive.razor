@@ -48,6 +48,48 @@
             </table>
         </div>
 
+        @if (_npt1 is not null)
+        {
+            <div class="panel">
+                <div class="panel-title">NPT1 strategies <span class="badge badge-neutral">each strategy has its own position and ledger</span></div>
+                <div class="text-faint" style="font-size:12px; margin-bottom:6px;">@_npt1.Note</div>
+                @if (_npt1.Stream is { } st)
+                {
+                    <table class="data-table"><tbody>
+                        <tr><td>M1 stream</td><td>@st.Status @if (st.DivergentFrames > 0) { <span class="badge badge-bear">@st.DivergentFrames divergent frame(s)</span> }</td><td>Last heartbeat</td><td>@Ist(st.LastHeartbeat)</td></tr>
+                        <tr><td>Last M1 bar</td><td>@st.LastBarSeq (ended @Ist(st.LastBarEnd))</td><td>Base bar volume</td><td>@(st.BaseBarVolume?.ToString("N0") ?? "-") <span class="text-dim">@st.BarSizeStatus, opening @(st.OpeningVolume?.ToString("N0") ?? "-")</span></td></tr>
+                        <tr><td>Polls / rows read</td><td>@st.Polls.ToString("N0") / @st.RowsRead.ToString("N0")</td><td>Poll ms (last / max)</td><td>@st.LastPollMillis.ToString("0.0") / @st.MaxPollMillis.ToString("0.0")</td></tr>
+                    </tbody></table>
+                }
+                else
+                {
+                    <div class="text-faint" style="font-size:13px;">M1 stream health is not available (the npt1m1 schema is absent or unreadable).</div>
+                }
+
+                @foreach (var n in _npt1.Strategies)
+                {
+                    <div class="panel-title" style="margin-top:12px;">@n.StrategyId <span class="badge badge-neutral">@n.State</span></div>
+                    <table class="data-table"><tbody>
+                        <tr><td>Trades / wins</td><td>@n.Trades / @n.Wins</td><td>Gross / fees / net</td><td>@n.Gross.ToString("N2") / @n.Fees.ToString("N2") / <b>@n.Net.ToString("N2")</b></td></tr>
+                        <tr><td>Open position</td><td>@(n.Open is { } o ? $"{o.OptionType} {o.Symbol} entry {o.AvgEntryPrice} x{o.RemainingQuantity} (bid {o.LastBid}, unrealized {o.UnrealizedPnl})" : "none")</td><td>MFE / MAE (open)</td><td>@(n.Open is { } op ? $"{op.Mfe} / {op.Mae} ({op.Coverage})" : "-")</td></tr>
+                        <tr><td>Capital committed by this strategy</td><td>@Money(n.OpenCommitted)</td><td></td><td></td></tr>
+                    </tbody></table>
+                    @if (n.Decisions.Count > 0)
+                    {
+                        <div class="scroll-x"><table class="data-table">
+                            <thead><tr><th>Time (IST)</th><th>Stage</th><th>Outcome</th><th>What it saw / did</th></tr></thead>
+                            <tbody>
+                            @foreach (var d in n.Decisions)
+                            {
+                                <tr><td>@Ist(d.At)</td><td>@d.Stage</td><td>@d.Outcome</td><td class="mono" style="font-size:11px;">@d.Detail</td></tr>
+                            }
+                            </tbody>
+                        </table></div>
+                    }
+                }
+            </div>
+        }
+
         <div class="panel">
             <div class="panel-title">Risk and capital</div>
             <table class="data-table">
@@ -144,6 +186,7 @@
 
 @code {
     private PaperLiveView? _view;
+    private Npt1View? _npt1;
     private string? _error;
     private System.Threading.Timer? _timer;
 
@@ -158,6 +201,7 @@
         try
         {
             _view = await Data.LoadLatestAsync();
+            _npt1 = _view is null ? null : await Data.LoadNpt1Async(_view);
             _error = null;
         }
         catch (Exception e)

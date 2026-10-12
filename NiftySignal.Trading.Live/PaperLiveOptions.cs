@@ -45,6 +45,12 @@ public sealed class PlumbingFamilyOptions
     public int? MaxHoldMinutes { get; set; }
 }
 
+/// <summary>Enable switch of one named strategy (<c>Trading:PaperLive:Strategies:{id}:Enabled</c>). Source default: off.</summary>
+public sealed class StrategyToggleOptions
+{
+    public bool Enabled { get; set; }
+}
+
 /// <summary>
 /// Configuration of the live paper path (<c>Trading:PaperLive</c>). <b>Source defaults keep it OFF</b>: <see cref="Enabled"/> is false, no strategy is registered, and an
 /// enabled instance with a missing required value refuses to start (fail closed, visibly) instead of assuming anything: costs are never assumed zero, the tick size is never
@@ -69,6 +75,22 @@ public sealed class PaperLiveOptions
     public decimal? OptionTickSize { get; set; }
 
     public PlumbingFamilyOptions PlumbingFamily { get; set; } = new();
+
+    /// <summary>
+    /// Named strategies (<c>Strategies:NPT1-MD5|NPT1-MDX3|NPT1-PE5:Enabled</c>). All OFF in source. They are driven by the NPT1 M1 producer (a separate, parallel stream), never by the
+    /// Adaptive Observer's bars, and run in their own durable run.
+    /// </summary>
+    public Dictionary<string, StrategyToggleOptions> Strategies { get; set; } = new();
+
+    /// <summary>The ids of the three NPT1 strategies, in registration order.</summary>
+    public static readonly string[] Npt1StrategyIds = { "NPT1-MD5", "NPT1-MDX3", "NPT1-PE5" };
+
+    /// <summary>True when <paramref name="id"/> is switched on in <see cref="Strategies"/> and paper-live itself is enabled.</summary>
+    public bool IsStrategyEnabled(string id)
+        => Enabled && Strategies.FirstOrDefault(kv => string.Equals(kv.Key, id, StringComparison.OrdinalIgnoreCase)).Value is { Enabled: true };
+
+    /// <summary>At least one NPT1 strategy is enabled (the NPT1 M1 stream should then run).</summary>
+    public bool AnyNpt1Enabled => Npt1StrategyIds.Any(IsStrategyEnabled);
 
     public PaperLiveRiskOptions Risk { get; set; } = new();
 
@@ -212,6 +234,24 @@ public sealed class PaperLiveOptions
             errors.Add("Trading:PaperLive:ConnectionStringName must name a connection string.");
         }
 
+        foreach (var key in Strategies.Keys.Where(k => !Npt1StrategyIds.Contains(k, StringComparer.OrdinalIgnoreCase)))
+        {
+            errors.Add($"Trading:PaperLive:Strategies:{key} is not a known strategy (known: {string.Join(", ", Npt1StrategyIds)}); it would be silently ignored, so it is refused.");
+        }
+
+        if (AnyNpt1Enabled)
+        {
+            if (PlumbingFamily.Enabled)
+            {
+                errors.Add("An NPT1 strategy and the plumbing family cannot both be enabled: the NPT1 streams run in their own run and the test family must never share a session with them.");
+            }
+
+            if (BrokeragePerOrder is { } brokerage && brokerage != 0m)
+            {
+                errors.Add("Trading:PaperLive:BrokeragePerOrder must be 0 for the NPT1 strategies: the frozen NPT1 fee model has no brokerage.");
+            }
+        }
+
         if (PlumbingFamily.Enabled)
         {
             if (PlumbingFamily.Windows.Count == 0)
@@ -268,7 +308,11 @@ public sealed class PaperLiveRiskOptions
 }
 
 /// <summary>A strategy family together with the variants (configuration) it is run with.</summary>
-public sealed record PaperLiveStrategy(IStrategyFamily Family, IReadOnlyList<VariantSpec> Variants);
+/// <param name="Fresh">Creates a NEW instance of a family that owns state (the NPT1 windows): every (re)open of a durable run must start from a fresh instance, because the run rebuilds the state by replaying the journal. Null = the family is stateless.</param>
+public sealed record PaperLiveStrategy(IStrategyFamily Family, IReadOnlyList<VariantSpec> Variants, Func<IStrategyFamily>? Fresh = null)
+{
+    public IStrategyFamily NewFamily() => Fresh?.Invoke() ?? Family;
+}
 
 /// <summary>Builds the strategies and the trading configuration of the live paper path from <see cref="PaperLiveOptions"/>.</summary>
 public static class PaperLiveSetup
@@ -294,6 +338,65 @@ public static class PaperLiveSetup
         }
 
         return list;
+    }
+
+    /// <summary>
+    /// The enabled NPT1 strategies (each a family with the single variant MAIN): fixed 650 units, the bar-clocked next-completed-bar entry policy of the live profile
+    /// (<c>npt1-live1500-v1</c>), no stop, target, TP1, trailing, max hold, trade limit or cooldown. Empty unless explicitly enabled.
+    /// </summary>
+    public static IReadOnlyList<PaperLiveStrategy> Npt1Strategies(PaperLiveOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        var list = new List<PaperLiveStrategy>();
+        foreach (var id in PaperLiveOptions.Npt1StrategyIds.Where(options.IsStrategyEnabled))
+        {
+            Func<IStrategyFamily> create = () => id switch
+            {
+                "NPT1-MD5" => new Npt1Md5Family(),
+                "NPT1-MDX3" => new Npt1Mdx3Family(),
+                "NPT1-PE5" => new Npt1Pe5Family(),
+                _ => throw new InvalidOperationException($"Unknown NPT1 strategy {id}."),
+            };
+            var family = create();
+            var spec = new VariantSpec
+            {
+                StrategyId = id,
+                VariantId = Npt1FamilyBase.MainVariant,
+                EntryCondition = new NextCompletedBarEntrySpec(),
+                Sizing = new NiftySignal.Trading.Core.Sizing.FixedQuantitySpec { Units = Npt1Quantity },
+                Exit = new ExitSpec(),
+            };
+            list.Add(new PaperLiveStrategy(family, new[] { spec }, create));
+        }
+
+        return list;
+    }
+
+    /// <summary>The fixed NPT1 paper quantity (units, not lots).</summary>
+    public const int Npt1Quantity = 650;
+
+    /// <summary>
+    /// The NPT1 trading configuration: the live session profile (entries fill in [09:30:00, 15:00:00), terminal protocol at 15:00:00), the frozen NPT1 fee schedule, one global capital pool
+    /// (<c>Trading:PaperLive:Capital</c>, never chosen here) and the same risk limits mechanism as every other run. Strategy P&amp;L stays per strategy.
+    /// </summary>
+    public static TradingConfig Npt1Config(PaperLiveOptions options, IReadOnlyList<PaperLiveStrategy> strategies)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(strategies);
+        var brokerage = options.BrokeragePerOrder ?? throw new InvalidOperationException("Trading:PaperLive:BrokeragePerOrder is not set.");
+        var familyLimits = options.Risk.Families.ToDictionary(f => f.Key, f => (f.Value ?? new ScopeLimitOptions()).ToLimits(), StringComparer.Ordinal);
+        var variantLimits = options.Risk.Variants.ToDictionary(v => v.Key, v => (v.Value ?? new ScopeLimitOptions()).ToLimits(), StringComparer.Ordinal);
+        var variants = strategies.SelectMany(s => s.Variants)
+            .Select(v => variantLimits.TryGetValue(v.StrategyId + "/" + v.VariantId, out var limits) ? v with { Limits = limits } : v)
+            .ToList();
+        return new TradingConfig
+        {
+            ConfigVersion = "npt1-paperlive-v1",
+            Costs = new CostsConfig { Schedules = new[] { NseIndexOptionsCostSchedules.Npt1FrozenV1(new FlatBrokerage { Amount = brokerage, Unit = BrokerageUnit.PerOrder }) } },
+            Session = SessionConfig.Npt1Live1500(),
+            Variants = variants.ToDictionary(v => v.StrategyId + "/" + v.VariantId),
+            Risk = RiskProfile.PaperLiveV1(options.Capital, options.Risk.Global?.ToLimits(), familyLimits),
+        };
     }
 
     /// <summary>The PaperLiveV1 trading configuration: fixed session rules, one global capital pool, explicit costs.</summary>

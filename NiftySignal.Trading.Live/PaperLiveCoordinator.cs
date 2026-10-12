@@ -3,6 +3,7 @@ using NiftySignal.Trading.Adapters;
 using NiftySignal.Trading.Core.Events;
 using NiftySignal.Trading.Core.Execution;
 using NiftySignal.Trading.Core.Instruments;
+using NiftySignal.Trading.Core.Strategies;
 using NiftySignal.Trading.Recovery;
 
 namespace NiftySignal.Trading.Live;
@@ -38,7 +39,7 @@ public sealed record LiveSessionInfo(string SessionId, DateOnly TradeDate, IRead
 public sealed record LiveQuote(string Token, long SourceId, bool IsFuture, decimal Bid, decimal Ask, decimal Last, long BidQty, long AskQty);
 
 /// <summary>A completed finalized bar. <paramref name="Verified"/> is false when the Observer could not establish the integrity of the bar's persisted rows; such a bar is never given to the engine.</summary>
-public sealed record LiveBar(long BarSeq, DateTimeOffset EndAvailableAt, BarInfo Info, bool Verified);
+public sealed record LiveBar(long BarSeq, DateTimeOffset EndAvailableAt, BarInfo Info, bool Verified, AdaptiveStrategyFrame? Frame = null);
 
 /// <summary>
 /// How long the paper path kept its caller (the Observer poll loop) waiting. The handoff is SYNCHRONOUS: the Observer thread runs the engine and the database commit before it
@@ -187,7 +188,7 @@ public sealed class PaperLiveCoordinator : IDisposable
                 session.TradeDate,
                 session.Contracts,
                 config,
-                _strategies.ToDictionary(s => s.Family.StrategyId, s => s.Family),
+                FreshFamilies(),
                 new RunSettings { RunId = RunIdOf(session), RunMode = "PaperLive" },
                 session.SessionId,
                 "adaptive-observer:finalized-bars+option-quotes/1",
@@ -356,7 +357,7 @@ public sealed class PaperLiveCoordinator : IDisposable
                 _degradedByGate = false;
             }
 
-            events.Add(new BarCompletedEvent(bar.EndAvailableAt, bar.BarSeq, _session!.FutureToken, bar.Info));
+            events.Add(new BarCompletedEvent(bar.EndAvailableAt, bar.BarSeq, _session!.FutureToken, bar.Info, bar.Frame));
             cursor = bar.BarSeq;
         }
 
@@ -394,11 +395,15 @@ public sealed class PaperLiveCoordinator : IDisposable
         return _state == PaperLiveState.Live && _run is not null;
     }
 
+    /// <summary>A new instance of every family: a stateful family must never carry the state of a previous (failed or replayed) run into the next one.</summary>
+    private IReadOnlyDictionary<string, IStrategyFamily> FreshFamilies() => _strategies.ToDictionary(s => s.Family.StrategyId, s => s.NewFamily());
+
     private void OpenRun(string reason)
     {
         DisposeRun();
         try
         {
+            _spec = _spec! with { Strategies = FreshFamilies() };
             _timed = new TimedRunStore(_storeFactory());
             var store = _timed;
             _beforeOpen?.Invoke(_spec!.Settings.RunId).GetAwaiter().GetResult();

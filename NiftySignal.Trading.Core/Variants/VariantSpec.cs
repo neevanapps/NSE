@@ -137,6 +137,24 @@ public sealed record VariantSpec
             }
         }
 
+        if (EntryCondition is NextCompletedBarEntrySpec nb)
+        {
+            if (nb.AskMin <= 0m || nb.AskMax < nb.AskMin || nb.AskTarget < nb.AskMin || nb.AskTarget > nb.AskMax)
+            {
+                errors.Add($"Variant '{VariantId}': the next-bar ask band [{nb.AskMin},{nb.AskMax}] with target {nb.AskTarget} is not valid.");
+            }
+
+            if (nb.MaxQuoteAge < TimeSpan.Zero || string.IsNullOrWhiteSpace(nb.PolicyLabel) || !Enum.IsDefined(nb.TerminalMode))
+            {
+                errors.Add($"Variant '{VariantId}': the next-bar policy needs a non-negative quote age, a defined terminal mode and a policy label.");
+            }
+
+            if (Exit.TradeSlPct is not null || Exit.Tp1Pct is not null || Exit.FinalTpPct is not null || Exit.MaxHold is not null)
+            {
+                errors.Add($"Variant '{VariantId}': a next-bar variant exits by signal and by the terminal protocol only (no stop, target, TP1 or max hold).");
+            }
+        }
+
         return errors;
     }
 }

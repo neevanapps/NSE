@@ -38,6 +38,18 @@ public sealed record SessionConfig
     /// </summary>
     public static SessionConfig PaperLiveV1() => new() { LiquidationStart = new TimeOnly(15, 10, 0), FinalClose = new TimeOnly(15, 35, 0), SessionEnd = new TimeOnly(15, 35, 0) };
 
+    /// <summary>
+    /// The NPT1 PROSPECTIVE live session (<c>npt1-live1500-v1</c>): entries fill from 09:30:00 (inclusive) to 15:00:00 (exclusive); at 15:00:00 the terminal-close protocol of the bar-clocked
+    /// variants starts (no generic 15:10 liquidation exists for them); the hard end 15:35:00 reports a position that never found a bid as unresolved.
+    /// </summary>
+    public static SessionConfig Npt1Live1500() => new() { EntryClose = new TimeOnly(15, 0, 0), LiquidationStart = new TimeOnly(15, 0, 0), FinalClose = new TimeOnly(15, 35, 0), SessionEnd = new TimeOnly(15, 35, 0) };
+
+    /// <summary>
+    /// The NPT1 HISTORICAL-PARITY session (<c>npt1-hist1100-v1</c>), for verifying the implementation against the frozen research timing ONLY: entries until 11:00, exits continue, the terminal objective
+    /// is 15:00 (closed at the last completed bar ending at or before it). Never used live.
+    /// </summary>
+    public static SessionConfig Npt1HistoricalParity1100() => new() { EntryClose = new TimeOnly(11, 0, 0), LiquidationStart = new TimeOnly(15, 0, 0), FinalClose = new TimeOnly(15, 35, 0), SessionEnd = new TimeOnly(15, 35, 0) };
+
     /// <summary>Returns human-readable validation errors (empty when valid).</summary>
     public IReadOnlyList<string> Validate()
     {

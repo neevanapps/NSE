@@ -241,4 +241,23 @@ public static class NseIndexOptionsCostSchedules
         SourceStatus = StatusText,
         ProvisionalComponents = Provisional,
     };
+
+    public const string Npt1StatusText =
+        "NPT1 FROZEN FEE MODEL (Nifty_Paper_Three_V1_20261012): brokerage 0; STT 0.15% sell; exchange 0.03503% buy+sell; SEBI 0.000001 buy+sell; stamp 0.003% buy; GST 18% of exchange+SEBI. " +
+        "Differs from nse-index-options-2026-04-01-provisional ONLY in the exchange rate (0.03503% instead of 0.03553%); that global schedule is unchanged.";
+
+    /// <summary>The fee model the three NPT1 strategies were measured with. A separate, versioned schedule: the global 2026-04-01 schedule is not edited. Brokerage is passed explicitly (the frozen model uses 0).</summary>
+    public static CostScheduleEntry Npt1FrozenV1(BrokerageSpec brokerage) => new()
+    {
+        Version = "npt1-frozen-fees-v1",
+        EffectiveFrom = new DateOnly(2026, 4, 1),
+        Brokerage = brokerage,
+        SttSellRate = 0.0015m,
+        ExchangeTransactionRate = 0.0003503m,
+        SebiTurnoverRate = 0.000001m,
+        StampBuyRate = 0.00003m,
+        GstRate = 0.18m,
+        SourceStatus = Npt1StatusText,
+        ProvisionalComponents = Array.Empty<string>(),
+    };
 }

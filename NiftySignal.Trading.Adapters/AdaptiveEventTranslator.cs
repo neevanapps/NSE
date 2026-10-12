@@ -377,7 +377,7 @@ public sealed class AdaptiveEventTranslator
         var bar = package.FutureBar;
         var info = BarReadiness.Build(bar, _engine.FutureBars, _freeze.Definition.BaseBarVolume, _freeze.SignalStartUtc, _readinessSpec);
         var evt = new BarCompletedEvent(bar.EndAvailableAtUtc, bar.BarSeq, _freeze.FutureToken, info);
-        return new TranslatedBar(evt, MetricsOf(package));
+        return new TranslatedBar(evt, MetricsOf(package), package);
     }
 
     // ------------------------------------------------------------------ derived metrics (captured at the bar's own boundary)

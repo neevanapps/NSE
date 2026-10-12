@@ -1600,8 +1600,8 @@ namespace NiftySignal.Trading.Data.Migrations
                         new
                         {
                             Component = "trading-engine",
-                            CodecVersion = "trading-codec/4",
-                            MinimumCompatibleCode = "trading-engine/paperlive-v1",
+                            CodecVersion = "trading-codec/5",
+                            MinimumCompatibleCode = "trading-engine/npt1-v1",
                             SchemaVersion = 1,
                             StateDigestVersion = "trading-state/1"
                         });

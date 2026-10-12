@@ -35,5 +35,6 @@
     <ProjectReference Include="..\NiftySignal.VolumeBarData\NiftySignal.VolumeBarData.csproj" />
     <ProjectReference Include="..\NiftySignal.Trading.Live\NiftySignal.Trading.Live.csproj" />
     <ProjectReference Include="..\NiftySignal.Trading.Data\NiftySignal.Trading.Data.csproj" />
+    <ProjectReference Include="..\NiftySignal.Npt1M1.Data\NiftySignal.Npt1M1.Data.csproj" />
   </ItemGroup>
 </Project>

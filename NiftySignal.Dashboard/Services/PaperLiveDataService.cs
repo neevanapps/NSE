@@ -61,7 +61,7 @@ public sealed record PaperLiveView(
 /// rejections and a few decoded outputs — through a context whose connection is opened read-only. It cannot place, change or cancel anything: there is no write method, no broker, no
 /// command of any kind. The figures shown come from the durable ledger (outputs and the rows derived from them), never from the Host's memory.
 /// </summary>
-public sealed partial class PaperLiveDataService(IDbContextFactory<TradingDbContext>? factory, Func<DateOnly>? today = null)
+public sealed partial class PaperLiveDataService(IDbContextFactory<TradingDbContext>? factory, Func<DateOnly>? today = null, IDbContextFactory<NiftySignal.Npt1M1.Data.Npt1M1DbContext>? npt1 = null)
 {
     public bool Configured => factory is not null;
 

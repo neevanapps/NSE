@@ -82,6 +82,8 @@ public enum ReasonCode
     EventQuarantined,
     SessionEnded,
     Other,
+    TerminalClose,
+    DelayedTerminalClose,
 }
 
 /// <summary>
@@ -234,6 +236,8 @@ public static class AuditTrail
         ExitReason.StrategyExit => ReasonCode.StrategyExit,
         ExitReason.ManualKill => ReasonCode.ManualKill,
         ExitReason.MaxHold => ReasonCode.MaxHold,
+        ExitReason.TerminalClose => ReasonCode.TerminalClose,
+        ExitReason.DelayedTerminalClose => ReasonCode.DelayedTerminalClose,
         _ => ReasonCode.SessionLiquidation,
     };
 

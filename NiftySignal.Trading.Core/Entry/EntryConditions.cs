@@ -32,6 +32,41 @@ public sealed record AskBelowCandleMaSpec : EntryConditionSpec
     public override string Kind => "AskBelowCandleMA";
 }
 
+/// <summary>How a bar-clocked variant is closed at its terminal time.</summary>
+public enum NextBarTerminalMode
+{
+    /// <summary>PROSPECTIVE live protocol: at the terminal instant (a wall-clock/engine deadline) the position is closed at the held token's actually observed bid, never backdated; with no usable bid it stays visibly pending and may be closed later as a DelayedTerminalClose.</summary>
+    LiveObservedBid = 0,
+
+    /// <summary>HISTORICAL PARITY replay only: the terminal close uses the bid at the end of the last completed bar that ended at or before the terminal instant (known only retrospectively; unavailable online).</summary>
+    HistoricalLastBarEnd = 1,
+}
+
+/// <summary>
+/// Bar-clocked entry policy (the NPT1 execution contract): a strategy signal on completed bar t freezes ONE contract and creates a pending entry that can fill ONLY on the immediately following
+/// completed bar t+1, at that bar's executable ask, if every condition still holds; otherwise it is cancelled (never postponed, never substituted). The signal bar itself never fills.
+/// All numbers are the frozen research constants; they are part of the hashed configuration, and <see cref="PolicyLabel"/> names the timing policy so a prospective result can never be mistaken for a
+/// different window's.
+/// </summary>
+public sealed record NextCompletedBarEntrySpec : EntryConditionSpec
+{
+    public decimal AskMin { get; init; } = 100m;
+
+    public decimal AskMax { get; init; } = 150m;
+
+    /// <summary>Contract ranking tie-break target: smaller absolute distance of the ask to this premium wins.</summary>
+    public decimal AskTarget { get; init; } = 125m;
+
+    /// <summary>The executable quote must be at most this old at the bar end (and not newer than the bar end).</summary>
+    public TimeSpan MaxQuoteAge { get; init; } = TimeSpan.FromSeconds(2);
+
+    public NextBarTerminalMode TerminalMode { get; init; } = NextBarTerminalMode.LiveObservedBid;
+
+    public string PolicyLabel { get; init; } = "npt1-live1500-v1";
+
+    public override string Kind => "NextCompletedBar";
+}
+
 public enum ConditionOutcome
 {
     Satisfied = 0,
