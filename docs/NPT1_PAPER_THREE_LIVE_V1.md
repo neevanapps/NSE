@@ -70,9 +70,43 @@ Refused at start: NPT1 together with the plumbing family, an unknown strategy ke
 (adds migration `Npt1CodecV5`: codec 5, engine label `trading-engine/npt1-v1`); (2) `NiftySignal.Npt1M1.Data/Sql/npt1m1-schema.idempotent.sql`; (3) set the switches. Both scripts are idempotent
 and are never applied implicitly by the application.
 
-## 6. Verification evidence
+## 6. Verification evidence (all on authorized development data, dates <= 2026-10-01)
 
-See the final report of the session (M1 producer parity on 17 development sessions, historical 11:00 parity of the three strategies on the 15 frozen dates, restart, performance).
+**M1 producer parity** (`tools/Npt1M1Parity`, local copy of the tick database, research exports `bar-size-v2/M1`): 17 of 17 development sessions (2026-09-08 .. 2026-10-01) identical bar by bar: bar count,
+start/end instants, `flag_ready`, `m`, `w`, `P`, band centre; base-bar volume and opening volume of the freeze equal the export's session state (including the `insufficient_history` fallback sessions of 09-08..09-15);
+the ported prior-session volume history reproduces `volume_history_dev.csv` on all 10 recomputed sessions.
+
+**Historical 11:00 parity** (historical-parity profile, the 15 frozen dates, no tuning; reference = `All_151_Simulations_Entry_Cutoff_1100.xlsx`, Trades sheet):
+
+| strategy | reference trades / wins / gross / fees / net | this implementation | trade by trade |
+|---|---|---|---|
+| NPT1-MD5 | 44 / 25 / 145,210.00 / 8,365.05 / 136,844.95 | 44 / 25 / 145,210.00 / 8,365.11 / 136,844.89 | 44 of 44 identical (times, strike, ask, bid, gross, MAE, MFE) |
+| NPT1-MDX3 | 12 / 8 / 198,997.50 / 2,566.00 / 196,431.50 | 12 / 8 / 198,997.50 / 2,565.98 / 196,431.52 | 12 of 12 identical |
+| NPT1-PE5 | 106 / 45 / 89,732.50 / 19,889.41 / 69,843.09 | 106 / 45 / 89,732.50 / 19,889.51 / 69,842.99 | 105 of 106 identical; 1 trade differs in MAE/MFE only |
+
+* The fee differences (a few paise) are the reference's unrounded fees against this ledger's per-component paise rounding. P&L before fees is identical.
+* The one excursion difference (2026-09-22 CE23250, entry 10:58:02): the research table has no row for the contract on four intermediate bars (it left the ATM±2 band and the 09:30 anchor basket), so the research recorded
+  no marks there; this implementation marks the real bar-end bids (MAE −6,467.50 / MFE +390 instead of −4,615 / 0). Entry, exit and P&L are identical. This is a data-availability artifact of the evidence, not a rule.
+* One real divergence was found by this comparison and fixed before it matched: the contract candidate set (§3); every other trade matched on the first complete run.
+
+**Tests** (`dotnet test`, local PostgreSQL test database): 2,178 passed, 0 failed, 0 skipped. Build: 0 errors; 3 warnings that exist on master in files this work does not touch (2× xUnit2000 in
+`NiftySignal.Tests/AdaptiveObserver`, 1× CS0219 in `tools/AdaptiveLivePerformance`). New: execution-policy tests, strategy tests against an independent reference model on tie-heavy random data, 11 end-to-end
+and restart tests, Postgres schema/dashboard/reversal tests, configuration tests, broker-isolation additions.
+
+**Performance** (synthetic full day, 223k source rows, local PostgreSQL, `Npt1PerformanceTests` and the unchanged adaptive-v1 `PaperLivePerformanceTests` for comparison):
+
+| | NPT1 stream (M1 producer + 3 strategies) | adaptive-v1 paper bridge (existing) |
+|---|---|---|
+| commit ms p95 / p99 / max | 62.6 / 68.2 / 220.0 | 137.9 / 169.4 / 261.1 |
+| per-group handoff ms p95 / p99 / max | 0.03 / 0.12 / 195.2 | 0.04 / 20.6 / 193.1 |
+| journal growth per day | 214,478 rows, 110.9 MiB | 222,973 rows, 116.1 MiB |
+| M1 producer ms per poll p50 / p95 / p99 / max | 2.3 / 5.1 / 8.4 / 31.7 | - |
+
+Real-data replay of the busiest development day (2026-09-22, 2,376,347 rows): database read 93-95 s, M1 producer 10 s CPU for the whole day (about 0.1 ms per 250 ms poll), trading engine 2.6 s, peak working
+set 282 MiB (producer only). The M1 stream reads the same rows as adaptive-v1 with its own reader: tick reads are 2x, nothing more; it never runs inside the Observer's poll loop. Bar completion latency in live
+operation is bounded by the 2 s ordering lag plus the poll interval (same as adaptive-v1); it cannot be measured without live data.
+
+Found by the Postgres measurement: a same-step reversal (exit and opposite entry on one bar) violated `ux_positions_open_slot`, rebuilt the run (a ~3 s stall) and could halt it; fixed in `PostgresRunStore.Commit` with a regression test.
 
 ## 7. Capital
 
@@ -84,3 +118,16 @@ on the same bar. `Trading:PaperLive:Capital` is the single global gate (open pos
 `NseIndexOptionsCostSchedules.From20260401` (the global schedule) uses an exchange rate of 0.03553%; the frozen NPT1 model uses 0.03503%. Everything else is identical (STT 0.15% sell, SEBI 0.000001, stamp 0.003% buy,
 GST 18% of exchange+SEBI, brokerage 0). A separate versioned schedule `npt1-frozen-fees-v1` is used for the NPT1 run; the global schedule is unchanged. Costs are rounded to paise per component per fill
 (the research sheet is unrounded: a sum difference of a few paise over dozens of trades).
+
+## 9. Limits, interpretations and what is NOT verified
+
+* Not deployed, not merged, schemas not applied anywhere, the VM untouched. Never run against a live feed: the Host worker (`Npt1M1Worker`) is covered by its building blocks (producer determinism, stream
+  processor policy, EF frame store on PostgreSQL, durable run, restart) but its live polling loop has not run against a real market day.
+* The `/paper-live` NPT1 section builds and its data service is tested against PostgreSQL; the page itself was not rendered in a browser here.
+* Candidate set (§3) is derived from the frozen evidence, not stated in the specification. A fill bar whose frozen contract left the candidate set is NOT cancelled (the quote exists in a live feed); the
+  evidence has no case of it. If the owner wants the stricter reading, it is a one-line rule in `ProcessPendingEntry`.
+* Quote age = bar end minus the availability of the contract's latest TWO-SIDED quote (bid > 0, ask >= bid), kept across later one-sided updates.
+* After a restart the strategies re-warm from live bars (14 / 20 / 11 consecutive bars); bars completed while nobody observed are not replayed as decisions (the specification forbids fabricated downtime trades).
+* A contract whose lot size does not divide 650 stops the NPT1 run at configuration time (fail closed) instead of cancelling one entry.
+* The 15:00 protocol closes at the held token's latest positive bid even if it is old (the age is recorded). A position that never had a two-sided quote cannot exist (entry needs one), so the "no bid" branch is a defensive path.
+* Sealed data: no date after 2026-10-01 was opened; the parity tool refuses such dates.
