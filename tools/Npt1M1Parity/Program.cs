@@ -88,6 +88,11 @@ if (refState.TryGetValue("residual_center_strike", out var rc) && freeze.Report.
 }
 
 var producer = new M1BarProducer(freeze);
+var readWatch = new Stopwatch();
+var offerWatch = new Stopwatch();
+var releaseWatch = new Stopwatch();
+var engineWatch = new Stopwatch();
+var cpuStart = Process.GetCurrentProcess().TotalProcessorTime;
 
 // --trade: the same groups also drive the three NPT1 strategies in the HISTORICAL-PARITY profile (entries until 11:00, terminal close at the last bar end <= 15:00) for the parity check against the frozen research trades.
 TradingEngine? engine = null;
@@ -161,7 +166,9 @@ long afterId = 0;
 long rowsRead = 0;
 while (true)
 {
+    readWatch.Start();
     var batch = await reader.ReadAfterIdAsync(db, tokens, afterId, day, 100_000, CancellationToken.None);
+    readWatch.Stop();
     if (batch.Count == 0)
     {
         break;
@@ -175,14 +182,21 @@ while (true)
             continue;                                       // the research export reads no row after 15:35 IST
         }
 
+        offerWatch.Start();
         producer.Offer(row);
+        offerWatch.Stop();
     }
 
     rowsRead += batch.Count;
-    foreach (var g in producer.Release())
+    releaseWatch.Start();
+    var released = producer.Release();
+    releaseWatch.Stop();
+    foreach (var g in released)
     {
         bars.AddRange(g.Bars);
+        engineWatch.Start();
         Feed(g);
+        engineWatch.Stop();
     }
 }
 
@@ -242,6 +256,7 @@ if (engine is not null && loop is not null)
 }
 
 Console.WriteLine($"replayed {rowsRead} rows in {sw.Elapsed.TotalSeconds:0.0}s -> {bars.Count} M1 bars; quarantined {producer.Counters.Quarantined}");
+Console.WriteLine($"TIMING db read {readWatch.Elapsed.TotalSeconds:0.0}s | producer offer {offerWatch.Elapsed.TotalSeconds:0.0}s | producer release (groups, adaptive engine) {releaseWatch.Elapsed.TotalSeconds:0.0}s | trading engine (if --trade) {engineWatch.Elapsed.TotalSeconds:0.0}s | process CPU {(Process.GetCurrentProcess().TotalProcessorTime - cpuStart).TotalSeconds:0.0}s | peak working set {Process.GetCurrentProcess().PeakWorkingSet64 / 1024 / 1024} MiB");
 
 var reference = ReadWide(wide);
 Console.WriteLine($"reference bars: {reference.Count}");

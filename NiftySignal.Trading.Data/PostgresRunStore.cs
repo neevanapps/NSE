@@ -345,6 +345,22 @@ public sealed class PostgresRunStore : IAsyncRunStore, IAsyncDisposable
         var slots = await EntrySlotsAsync(db, runId, batch.Outputs).ConfigureAwait(false);
         var mapped = ProjectionMapper.Map(runId, batch.Outputs, identities, id => slots.TryGetValue(id, out var s) ? s : null);
 
+        // A step may close a position and open the next one in the same slot (a bar-clocked reversal: the exit and the opposite entry fill on the same completed bar). The partial unique index allows ONE open
+        // position per slot, so the closures of positions that already exist are written FIRST; only then do this step's new positions take the slot.
+        var openedInThisStep = mapped.Positions.Select(p => p.PositionId).ToHashSet(StringComparer.Ordinal);
+        foreach (var closure in mapped.Closures.Where(c => !openedInThisStep.Contains(c.PositionId)))
+        {
+            var existing = await db.Positions.SingleOrDefaultAsync(p => p.RunId == runId && p.PositionId == closure.PositionId).ConfigureAwait(false)
+                           ?? throw new ConflictFaultException($"Output {closure.ClosedOutputSeq} closes position '{closure.PositionId}', which does not exist.");
+            if (existing.ClosedOutputSeq is not null)
+            {
+                throw new ConflictFaultException($"Position '{closure.PositionId}' is already closed at output {existing.ClosedOutputSeq}.");
+            }
+
+            ProjectionMapper.ApplyClosure(existing, closure);
+        }
+
+        await db.SaveChangesAsync().ConfigureAwait(false);
         db.Orders.AddRange(mapped.Orders);
         db.Positions.AddRange(mapped.Positions);
         await db.SaveChangesAsync().ConfigureAwait(false);
@@ -364,7 +380,7 @@ public sealed class PostgresRunStore : IAsyncRunStore, IAsyncDisposable
 
         db.RiskCheckpoints.Add(new RiskCheckpointEntity { RunId = runId, StepSeq = step.StepSeq, SourceOutputSeq = ledger.LastOutputSeq, CountersText = ledger.ToText(), CountersHash = ledger.Hash() });
 
-        foreach (var closure in mapped.Closures)
+        foreach (var closure in mapped.Closures.Where(c => openedInThisStep.Contains(c.PositionId)))
         {
             var position = db.Positions.Local.FirstOrDefault(p => p.RunId == runId && p.PositionId == closure.PositionId)
                            ?? await db.Positions.SingleOrDefaultAsync(p => p.RunId == runId && p.PositionId == closure.PositionId).ConfigureAwait(false)

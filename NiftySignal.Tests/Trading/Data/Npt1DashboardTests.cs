@@ -24,6 +24,34 @@ public class Npt1DashboardTests
     }
 
     [PostgresFact]
+    public async Task AReversal_ClosingAndOpeningTheSameSlotInOneStep_IsCommittedToPostgresWithoutAFaultOrRebuild()
+    {
+        // an exit and the opposite entry fill on the SAME completed bar: one step closes the slot-0 position and opens the next one in slot 0 (the partial unique index allows one open position per slot)
+        using var fixture = new PostgresContractFixture();
+        var options = Npt1Harness.Options(Npt1Harness.All);
+        var strategies = PaperLiveSetup.Npt1Strategies(options);
+        using var coordinator = new PaperLiveCoordinator(options, strategies, () => new BlockingRunStoreAdapter(fixture.Store), NullLogger.Instance, "host", configFactory: _ => PaperLiveSetup.Npt1Config(options, strategies));
+        coordinator.StartSession(Npt1Harness.Session());
+        var feeder = new Npt1Harness.Feeder(coordinator, Clock.Ist(10, 0));
+        Func<int, (double? M, double? W, long? P)> reversing = k => (k < 22 ? 0d : k < 30 ? 1d : -3d, 1d, k < 22 ? 0L : k < 30 ? -100L : k < 34 ? 400L : -300L);
+        for (var k = 1; k <= 70; k++)
+        {
+            feeder.Bar(k, metrics: reversing);
+        }
+
+        Assert.Equal(PaperLiveState.Live, coordinator.Status.State);
+        Assert.Equal(1, coordinator.Status.Recoveries);                         // the initial open only: no store fault, no rebuild
+        var sameBar = coordinator.Run!.Engine.Outputs.OfType<NiftySignal.Trading.Core.Execution.PositionClosed>()
+            .Join(coordinator.Run.Engine.Outputs.OfType<NiftySignal.Trading.Core.Execution.PositionOpened>(), c => (c.Variant, c.At), o => (o.Variant, o.At), (c, o) => c).ToList();
+        Assert.NotEmpty(sameBar);                                               // the scenario really contains same-bar reversals
+
+        var service = new PaperLiveDataService(new Factory(PostgresTestDatabase.ConnectionString!), () => Clock.Day);
+        var view = await service.LoadLatestAsync();
+        Assert.Empty(view!.Status.Problems);
+        Assert.True(view.Closed.Count >= sameBar.Count);
+    }
+
+    [PostgresFact]
     public async Task EachNpt1Strategy_IsShownOnItsOwn_WithItsPosition_Ledger_AndAuditedDecisions()
     {
         using var fixture = new PostgresContractFixture();
