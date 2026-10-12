@@ -539,7 +539,7 @@ public sealed partial class ExecutionEngine
             intent.Contract.LotSize,
             decision?.SourceSessionId ?? _variants.SourceSessionId,
             decision?.BarSeq ?? _variants.LastBarSeq,
-            intent.At,
+            position.BarClocked ? decision?.BarAvailableAt ?? intent.At : intent.At,
             quote.Bid,
             quote.Ask,
             quote.AvailableAt,

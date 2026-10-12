@@ -84,7 +84,8 @@ public static class InputCodec
                         f.GetProperty("peStrictDelta") is { ValueKind: JsonValueKind.Number } pe ? pe.GetInt64() : null,
                         OptDouble(f, "bandCenter"),
                         f.GetProperty("bandExpiry") is { ValueKind: JsonValueKind.String } be ? DateOnly.ParseExact(be.GetString()!, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture) : null,
-                        f.GetProperty("bandUnavailable") is { ValueKind: JsonValueKind.String } bu ? bu.GetString() : null);
+                        f.GetProperty("bandUnavailable") is { ValueKind: JsonValueKind.String } bu ? bu.GetString() : null,
+                        f.TryGetProperty("candidateStrikes", out var bs) && bs.ValueKind == JsonValueKind.String ? bs.GetString() : null);
                 }
 
                 return new BarCompletedEvent(r.At, r.SourceId, r.Token, info, frame);
@@ -177,6 +178,15 @@ public static class InputCodec
                 else
                 {
                     w.WriteNull("bandUnavailable");
+                }
+
+                if (f.CandidateStrikes is { } strikes)
+                {
+                    w.WriteString("candidateStrikes", strikes);
+                }
+                else
+                {
+                    w.WriteNull("candidateStrikes");
                 }
 
                 w.WriteEndObject();

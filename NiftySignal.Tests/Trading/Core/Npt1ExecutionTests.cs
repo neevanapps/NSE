@@ -77,12 +77,14 @@ internal sealed class Npt1Kit
     public QuoteEvent Q(DateTimeOffset at, string token, decimal? bid, decimal? ask)
         => new(at, EventKind.OptionQuote, ++_id, token, bid, ask, null, 100000, 100000);
 
-    public static AdaptiveStrategyFrame Frame(DateTimeOffset end, long seq, double? centre = 24000d, DateOnly? expiry = null)
-        => new("npt1-m1-test", Clock.Day, seq, end.AddMinutes(-1), end, true, true, (int)seq, "npt1-m1-v1", "test", "test", 0.1d, 5d, 0L, centre, expiry ?? Expiry, null);
+    public static AdaptiveStrategyFrame Frame(DateTimeOffset end, long seq, double? centre = 24000d, DateOnly? expiry = null, string? candidateStrikes = null)
+        => new("npt1-m1-test", Clock.Day, seq, end.AddMinutes(-1), end, true, true, (int)seq, "npt1-m1-v1", "test", "test", 0.1d, 5d, 0L, centre, expiry ?? Expiry, null, candidateStrikes);
 
-    public void Bar(DateTimeOffset end, long seq, double? centre = 24000d, DateOnly? expiry = null, params QuoteEvent[] quotes)
+    public void Bar(DateTimeOffset end, long seq, double? centre = 24000d, DateOnly? expiry = null, params QuoteEvent[] quotes) => BarWithBand(end, seq, null, centre, expiry, quotes);
+
+    public void BarWithBand(DateTimeOffset end, long seq, string? candidateStrikes, double? centre = 24000d, DateOnly? expiry = null, params QuoteEvent[] quotes)
     {
-        var bar = new BarCompletedEvent(end, seq, "FUT", null, Frame(end, seq, centre, expiry));
+        var bar = new BarCompletedEvent(end, seq, "FUT", null, Frame(end, seq, centre, expiry, candidateStrikes));
         foreach (var group in quotes.Cast<EngineEvent>().Append(bar).GroupBy(e => e.AvailableAt).OrderBy(g => g.Key))
         {
             Loop.ProcessGroup(group.ToArray());
@@ -233,6 +235,30 @@ public class Npt1ExecutionTests
     }
 
     [Fact]
+    public void OnlyContractsOfTheCandidateStrikes_AreCandidates_AContractOutsideThemIsNeverPicked()
+    {
+        // centre 24000, band strikes 24000 and 24050 only: CE23950 has the better ask distance but is not in the band
+        var kit = LongAt(3);
+        var quotes = new[]
+        {
+            kit.Q(Npt1Kit.T(3).AddMilliseconds(-100), "CE23950", 124m, 125m),
+            kit.Q(Npt1Kit.T(3).AddMilliseconds(-100), "CE24000", 94m, 95m),                    // in the band but below ask 100
+            kit.Q(Npt1Kit.T(3).AddMilliseconds(-100), "CE24050", 129m, 130m),
+        };
+        kit.BarWithBand(Npt1Kit.T(3), 3, "24000|24050", 24000d, null, quotes);
+        kit.BarWithBand(Npt1Kit.T(4), 4, "24000|24050", 24000d, null,
+            kit.Q(Npt1Kit.T(4).AddMilliseconds(-100), "CE23950", 124m, 125m), kit.Q(Npt1Kit.T(4).AddMilliseconds(-100), "CE24000", 94m, 95m), kit.Q(Npt1Kit.T(4).AddMilliseconds(-100), "CE24050", 129m, 130m));
+
+        Assert.Equal("CE24050", Assert.Single(kit.Out<FillRecord>()).Token);
+
+        // and when no band member qualifies there is no trade, however good a contract outside the band looks
+        var none = LongAt(3);
+        none.BarWithBand(Npt1Kit.T(3), 3, "24000", 24000d, null, none.Q(Npt1Kit.T(3).AddMilliseconds(-100), "CE23950", 124m, 125m), none.Q(Npt1Kit.T(3).AddMilliseconds(-100), "CE24000", 94m, 95m));
+        none.BarWithBand(Npt1Kit.T(4), 4, "24000", 24000d, null, none.Q(Npt1Kit.T(4).AddMilliseconds(-100), "CE23950", 124m, 125m));
+        Assert.Empty(none.Out<FillRecord>());
+    }
+
+    [Fact]
     public void ABandForAnotherExpiry_SelectsNothing()
     {
         var kit = LongAt(3);
@@ -256,6 +282,17 @@ public class Npt1ExecutionTests
         ok.Bar(Clock.Ist(14, 58, 59), 3, quotes: ok.Q(Clock.Ist(14, 58, 59).AddMilliseconds(-100), Ce, 119m, 120m));
         ok.Bar(okFill, 4, quotes: ok.Q(okFill.AddMilliseconds(-100), Ce, 119m, 120m));
         Assert.Single(ok.Out<FillRecord>());
+
+        // mid-morning fills are allowed in the live profile (the 11:00 cutoff belongs to the historical-parity profile only)
+        foreach (var (h, m, sec) in new[] { (10, 59, 0), (11, 1, 0), (13, 30, 0) })
+        {
+            var mid = LongAt(3);
+            var sig = Clock.Ist(h, m, sec).AddSeconds(-30);
+            var fill = Clock.Ist(h, m, sec);
+            mid.Bar(sig, 3, quotes: mid.Q(sig.AddMilliseconds(-100), Ce, 119m, 120m));
+            mid.Bar(fill, 4, quotes: mid.Q(fill.AddMilliseconds(-100), Ce, 119m, 120m));
+            Assert.Single(mid.Out<FillRecord>());
+        }
 
         var early = LongAt(3);
         var s = Clock.Ist(9, 29, 0);

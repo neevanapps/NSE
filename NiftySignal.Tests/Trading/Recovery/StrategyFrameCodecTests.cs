@@ -8,7 +8,7 @@ public class StrategyFrameCodecTests
     private static readonly DateTimeOffset End = new(2026, 10, 12, 4, 31, 0, TimeSpan.Zero);
 
     private static AdaptiveStrategyFrame Frame(double? micro, double? usable, long? delta, double? centre, DateOnly? expiry)
-        => new("npt1-m1-v1:2026-10-12", new DateOnly(2026, 10, 12), 7, End.AddSeconds(-61), End, true, true, 7, "npt1-m1-v1", "spec", "micro-v1", micro, usable, delta, centre, expiry, expiry is null ? "NoBand" : null);
+        => new("npt1-m1-v1:2026-10-12", new DateOnly(2026, 10, 12), 7, End.AddSeconds(-61), End, true, true, 7, "npt1-m1-v1", "spec", "micro-v1", micro, usable, delta, centre, expiry, expiry is null ? "NoBand" : null, expiry is null ? null : "23950|24000|24050");
 
     [Theory]
     [InlineData(0.1234567890123, 41.5, -3L, 24050d, true)]

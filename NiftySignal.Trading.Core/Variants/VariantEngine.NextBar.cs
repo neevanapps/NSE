@@ -161,8 +161,11 @@ public sealed partial class VariantEngine
         }
 
         var center = Convert.ToDecimal(centerValue, CultureInfo.InvariantCulture);
+        var band = frame.CandidateStrikes is { Length: > 0 } strikeText
+            ? strikeText.Split('|').Select(x => decimal.Parse(x, NumberStyles.Float, CultureInfo.InvariantCulture)).ToHashSet()
+            : null;
         var rows = new List<(OptionContract Contract, decimal Ask, TimeSpan Age, string Verdict)>();
-        foreach (var contract in _universe.Where(c => c.Side == side && c.Expiry == expiry))
+        foreach (var contract in _universe.Where(c => c.Side == side && c.Expiry == expiry && (band is null || band.Contains(c.Strike))))
         {
             var quote = TwoSided.LastTwoSided(contract.Token);
             if (quote is null)

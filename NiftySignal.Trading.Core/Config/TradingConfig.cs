@@ -69,7 +69,22 @@ public sealed record TradingConfig
         errors.AddRange(Integrity.Validate());
         if (Risk.Name == RiskProfile.PaperLiveV1Name)
         {
-            if (Session.EntryOpen != new TimeOnly(9, 30, 0) || Session.EntryClose != new TimeOnly(15, 0, 0) || Session.LiquidationStart != new TimeOnly(15, 10, 0))
+            var barClocked = Variants.Values.Count(v => v.EntryCondition is Entry.NextCompletedBarEntrySpec);
+            if (barClocked > 0 && barClocked != Variants.Count)
+            {
+                errors.Add("Bar-clocked (NPT1) variants run in their own session profile and cannot share a configuration with other variants.");
+            }
+            else if (barClocked > 0)
+            {
+                // NPT1: entries fill from 09:30:00; live profile = entries until 15:00:00 (exclusive) with the terminal protocol AT 15:00:00; the historical-parity profile (verification only) ends entries at 11:00:00.
+                var live = Session.EntryClose == new TimeOnly(15, 0, 0);
+                var parity = Session.EntryClose == new TimeOnly(11, 0, 0);
+                if (Session.EntryOpen != new TimeOnly(9, 30, 0) || !(live || parity) || Session.LiquidationStart != new TimeOnly(15, 0, 0))
+                {
+                    errors.Add("NPT1 variants fix the session rules: entries from 09:30:00 until 15:00:00 (live; 11:00:00 only for the historical-parity profile) and the terminal protocol at 15:00:00 (use SessionConfig.Npt1Live1500() / Npt1HistoricalParity1100()).");
+                }
+            }
+            else if (Session.EntryOpen != new TimeOnly(9, 30, 0) || Session.EntryClose != new TimeOnly(15, 0, 0) || Session.LiquidationStart != new TimeOnly(15, 10, 0))
             {
                 errors.Add("PaperLiveV1 fixes the session rules: entries from 09:30:00 until (not including) 15:00:00 and mandatory liquidation from 15:10:00 (use SessionConfig.PaperLiveV1()).");
             }

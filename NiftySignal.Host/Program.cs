@@ -201,6 +201,24 @@ try
     builder.Services.AddSingleton<AdaptiveEndedSessionRecoveryService>();
     builder.Services.AddHostedService<AdaptiveObserverWorker>();
 
+    // NPT1 M1 stream (PAPER only, off by default): a separate, parallel producer of the research M1 bar clock with its own hosted worker, reader, schema (npt1m1) and paper run.
+    // Registered only when Trading:PaperLive:Enabled and at least one Trading:PaperLive:Strategies:NPT1-* is true. adaptive-v1 above is not touched by it.
+    if (NiftySignal.Trading.Live.PaperLiveOptions.Bind(builder.Configuration).AnyNpt1Enabled)
+    {
+        builder.Services.AddDbContext<NiftySignal.Npt1M1.Data.Npt1M1DbContext>(options =>
+        {
+            var paper = NiftySignal.Trading.Live.PaperLiveOptions.Bind(builder.Configuration);
+            var connection = builder.Configuration.GetConnectionString(paper.ConnectionStringName)
+                ?? throw new InvalidOperationException($"ConnectionStrings:{paper.ConnectionStringName} is not set.");
+            options.UseNpgsql(connection, o => o.MigrationsHistoryTable("__ef_migrations_history", NiftySignal.Npt1M1.Data.Npt1M1DbContext.Schema));
+        });
+        builder.Services.AddSingleton<NiftySignal.Npt1M1.Data.Npt1TickReader>();
+        builder.Services.AddSingleton<NiftySignal.Npt1M1.Data.M1SessionBuilder>();
+        builder.Services.AddSingleton<NiftySignal.Host.Npt1Stream.Npt1M1Telemetry>();
+        builder.Services.AddSingleton<NiftySignal.Host.Npt1Stream.EfFrameStore>();
+        builder.Services.AddHostedService<NiftySignal.Host.Npt1Stream.Npt1M1Worker>();
+    }
+
     var host = builder.Build();
 
     // Self-provisioning: a fresh machine gets its schema on first run.

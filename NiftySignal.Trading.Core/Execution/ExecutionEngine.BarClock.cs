@@ -40,7 +40,7 @@ public sealed partial class ExecutionEngine : IBarClockExecution
     {
         foreach (var position in BookOf(variant).Positions.Where(p => p.State == PositionState.Open && p.BarClocked))
         {
-            if (position.LastBidObservationAt == now || _variants.TwoSided.LastTwoSided(position.Contract.Token) is not { } quote)
+            if (position.LastBarEndBidAt == now || _variants.TwoSided.LastTwoSided(position.Contract.Token) is not { } quote)
             {
                 continue;
             }
@@ -50,15 +50,20 @@ public sealed partial class ExecutionEngine : IBarClockExecution
     }
 
     /// <summary>
-    /// Records the held contract's bid at a completed-bar end. The bid is the latest two-sided quote at or before the bar end; a quote older than the policy's age limit is still the mark (the research
-    /// marks bar-end bids) but the observation is flagged as a GAP so a stale mark is always visible.
+    /// Records the held contract's bid at a completed-bar end. The bid is the latest two-sided quote at or before the bar end. The excursion (MAE / MFE) is marked only on a FRESH bid (not older than the
+    /// policy's quote age): a stale bid is counted as a GAP and never invented into a mark, exactly as the research replay logs quote gaps instead of marking them. The latest bid is still remembered for the
+    /// historical-parity terminal close, which (like every signal exit) is not gated on age.
     /// </summary>
     private void ObserveBarEndBid(Position position, QuoteSnapshot quote, DateTimeOffset now)
     {
         var bid = quote.Bid!.Value;
+        position.LastBarEndBid = bid;
+        position.LastBarEndBidAt = now;
+        position.LastBarEndBidSourceId = quote.SourceId;
         if (now - quote.AvailableAt > PolicyOf(position.Variant).MaxQuoteAge)
         {
             position.BidObservationGaps++;
+            return;
         }
 
         position.BidObservations++;
@@ -66,9 +71,6 @@ public sealed partial class ExecutionEngine : IBarClockExecution
         position.MinBid = position.MinBid is { } min ? Math.Min(min, bid) : bid;
         position.FirstBidObservationAt ??= now;
         position.LastBidObservationAt = now;
-        position.LastBarEndBid = bid;
-        position.LastBarEndBidAt = now;
-        position.LastBarEndBidSourceId = quote.SourceId;
     }
 
     public void ProcessPendingExit(VariantKey variant, BarCompletedEvent bar, IEngineScheduler s)

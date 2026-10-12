@@ -131,6 +131,8 @@ public sealed record BarInfo(
 /// <param name="BandCenterStrike">Centre strike of the band chosen for this bar; null when the band was unavailable.</param>
 /// <param name="BandExpiry">Expiry of the band contracts; null when the band was unavailable.</param>
 /// <param name="BandUnavailableReason">Why the band was unavailable, when it was.</param>
+/// <param name="CandidateStrikes">The strikes whose contracts may be chosen on this bar, as invariant text joined by '|' in ascending order, e.g. <c>23350|23400|23450|23500|23550</c>: the strikes of this bar's changing ATM+-2 band UNITED
+/// with the strikes of the session's frozen 09:30 anchor basket. That union is exactly the set of contracts the frozen research evidence could choose among (its per-bar contract table lists those and no others); null when the band was unavailable.</param>
 public sealed record AdaptiveStrategyFrame(
     string AdaptiveSessionId,
     DateOnly TradeDate,
@@ -148,7 +150,8 @@ public sealed record AdaptiveStrategyFrame(
     long? PeBandContractStrictDelta,
     double? BandCenterStrike,
     DateOnly? BandExpiry,
-    string? BandUnavailableReason);
+    string? BandUnavailableReason,
+    string? CandidateStrikes = null);
 
 /// <summary>
 /// A completed adaptive bar. <see cref="EngineEvent.AvailableAt"/> is the bar's closing-tick availability time, so the
