@@ -167,7 +167,7 @@ public class OutputCodecTests
         var encodedX = OutputCodec.Encode(xa);
         var encodedY = OutputCodec.Encode(ya);
 
-        Assert.Equal("trading-codec/4", OutputCodec.Version);
+        Assert.Equal("trading-codec/5", OutputCodec.Version);
         Assert.Contains("\"Variant\":\"X/A\"", encodedX, StringComparison.Ordinal);
         Assert.NotEqual(encodedX, encodedY);
         Assert.NotEqual(OutputCodec.ContentHash(encodedX), OutputCodec.ContentHash(encodedY));

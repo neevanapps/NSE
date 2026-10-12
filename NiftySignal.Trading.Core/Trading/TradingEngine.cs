@@ -123,6 +123,7 @@ public sealed class TradingEngine : IEngineHandler
         var gate = new CompositeGate(this);
         Variants.EntryGate = gate;
         Execution.EntryGate = gate;
+        Variants.BarClock = Execution;
         Variants.StrategyExitRequested = (variantKey, scheduler) => Execution.RequestStrategyExitForVariant(variantKey, scheduler);
         Admission = new EventAdmission(q => _outputs.Add(q));
     }
@@ -302,7 +303,11 @@ public sealed class TradingEngine : IEngineHandler
             switch (output)
             {
                 case EntryIntent intent:
-                    Execution.RegisterEntry(intent, scheduler);
+                    if (Variants.GetVariant(intent.Variant).Spec.EntryCondition is not Entry.NextCompletedBarEntrySpec)
+                    {
+                        Execution.RegisterEntry(intent, scheduler);
+                    }
+
                     break;
                 case CancelRequest cancel:
                     Execution.RequestCancel(cancel, scheduler);

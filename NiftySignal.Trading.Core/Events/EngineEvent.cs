@@ -119,13 +119,45 @@ public sealed record BarInfo(
     string ReadinessSpec);
 
 /// <summary>
+/// The immutable, causal strategy input of ONE finalized bar of a bar-clocked stream (the NPT1 M1 stream): the exact metrics a strategy may use, produced by the stream's own
+/// producer from the authoritative finalized bar and its verified sidecars. A strategy never queries a database, never recomputes an Adaptive metric and never sees anything that was not
+/// known when the bar completed. Every metric is nullable-aware: <c>null</c> means UNAVAILABLE and is never treated as zero. The frame is journaled with the bar event (canonical input), so a
+/// replay hands a strategy the very same values.
+/// </summary>
+/// <param name="AdaptiveSessionId">The stream's session identity (never the adaptive-v1 session id).</param>
+/// <param name="MicroDevTimeWeighted">Futures micro price minus mid, time weighted over the bar (index points); null when the bar had no usable book seconds.</param>
+/// <param name="MicroDevUsableSeconds">Seconds of the bar with a usable micro deviation (the weight of <paramref name="MicroDevTimeWeighted"/>); null when the metric was not produced.</param>
+/// <param name="PeBandContractStrictDelta">Strict-classified buy minus sell CONTRACT quantity over the changing ATM+-2 PE basket for this bar; null when the band was unavailable.</param>
+/// <param name="BandCenterStrike">Centre strike of the band chosen for this bar; null when the band was unavailable.</param>
+/// <param name="BandExpiry">Expiry of the band contracts; null when the band was unavailable.</param>
+/// <param name="BandUnavailableReason">Why the band was unavailable, when it was.</param>
+public sealed record AdaptiveStrategyFrame(
+    string AdaptiveSessionId,
+    DateOnly TradeDate,
+    long BarSeq,
+    DateTimeOffset StartAvailableAt,
+    DateTimeOffset EndAvailableAt,
+    bool Ready,
+    bool IsValid,
+    int ConsecutiveValidBars,
+    string ModelVersion,
+    string ReadinessSpec,
+    string MicrostructureVersion,
+    double? MicroDevTimeWeighted,
+    double? MicroDevUsableSeconds,
+    long? PeBandContractStrictDelta,
+    double? BandCenterStrike,
+    DateOnly? BandExpiry,
+    string? BandUnavailableReason);
+
+/// <summary>
 /// A completed adaptive bar. <see cref="EngineEvent.AvailableAt"/> is the bar's closing-tick availability time, so the
 /// event is ordered after every quote of the group that completed it. <see cref="Info"/> carries readiness evidence; null means
 /// "not supplied" (CP0–CP4 test harnesses), in which case the core applies no readiness gate to entries.
 /// </summary>
 public sealed record BarCompletedEvent : EngineEvent
 {
-    public BarCompletedEvent(DateTimeOffset endAvailableAt, long barSeq, string token, BarInfo? info = null)
+    public BarCompletedEvent(DateTimeOffset endAvailableAt, long barSeq, string token, BarInfo? info = null, AdaptiveStrategyFrame? frame = null)
         : base(endAvailableAt, EventKind.BarCompleted, barSeq, token)
     {
         if (info is not null && info.EndAvailableAt != endAvailableAt)
@@ -133,10 +165,19 @@ public sealed record BarCompletedEvent : EngineEvent
             throw new ArgumentException("BarInfo.EndAvailableAt must equal the bar event's AvailableAt.", nameof(info));
         }
 
+        if (frame is not null && (frame.EndAvailableAt != endAvailableAt || frame.BarSeq != barSeq))
+        {
+            throw new ArgumentException("The strategy frame must describe exactly this bar (BarSeq and EndAvailableAt).", nameof(frame));
+        }
+
         Info = info;
+        Frame = frame;
     }
 
     public long BarSeq => SourceId;
 
     public BarInfo? Info { get; }
+
+    /// <summary>The strategy input frame of a bar-clocked stream; null for streams that do not carry one.</summary>
+    public AdaptiveStrategyFrame? Frame { get; }
 }

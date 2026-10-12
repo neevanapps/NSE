@@ -1,4 +1,5 @@
 using NiftySignal.Trading.Core.Config;
+using NiftySignal.Trading.Core.Entry;
 using NiftySignal.Trading.Core.Costs;
 using NiftySignal.Trading.Core.Exits;
 using NiftySignal.Trading.Core.Events;
@@ -32,7 +33,7 @@ namespace NiftySignal.Trading.Core.Execution;
 /// execution time &lt; EntryClose (entries) / &lt; SessionEnd (exits) and &lt; order expiry.
 /// </para>
 /// </summary>
-public sealed class ExecutionEngine
+public sealed partial class ExecutionEngine
 {
     public const string MaturePrefix = "exec-mature:";
     public const string ExpirePrefix = "exec-expire:";
@@ -238,6 +239,15 @@ public sealed class ExecutionEngine
                 w.Line("firstExitFillAt", p.FirstExitFillAt);
                 w.Line("maxBidAtFirstExit", p.MaxBidAtFirstExit);
                 w.Line("minBidAtFirstExit", p.MinBidAtFirstExit);
+                if (p.BarClocked)
+                {
+                    w.Line("barClockExitRequestedBar", p.BarClockExitRequestedBar);
+                    w.Line("barClockExitRequestedAt", p.BarClockExitRequestedAt);
+                    w.Line("terminalRequestedAt", p.TerminalRequestedAt);
+                    w.Line("lastBarEndBid", p.LastBarEndBid);
+                    w.Line("lastBarEndBidAt", p.LastBarEndBidAt);
+                }
+
                 foreach (var x in p.ExitOrders)
                 {
                     using var xs = w.Scope("exit/" + x.Id);
@@ -470,7 +480,14 @@ public sealed class ExecutionEngine
         var costs = _costs.Compute(TradeSide.Buy, notional);
         position.EntryCosts = costs.Total;
         book.Positions.Add(position);
+        position.BarClocked = variant.Spec.EntryCondition is NextCompletedBarEntrySpec;
         ObserveBid(position, quote, execTime);
+        if (position.BarClocked && quote.Bid is { } entryBid)
+        {
+            position.LastBarEndBid = entryBid;
+            position.LastBarEndBidAt = execTime;
+            position.LastBarEndBidSourceId = quote.SourceId;
+        }
         book.Cash -= notional + costs.Total;
         book.Fills++;
         if (belowBand)
@@ -638,6 +655,17 @@ public sealed class ExecutionEngine
         {
             foreach (var position in book.Positions.ToList())
             {
+                if (position.State == PositionState.Open && position.BarClocked)
+                {
+                    // Bar-clocked positions are marked at completed-bar ends only; the one thing a tick does is close a terminal close that found no bid.
+                    if (position.Contract.Token == quote.Token)
+                    {
+                        TryDelayedTerminalClose(book, position, snapshot, s);
+                    }
+
+                    continue;
+                }
+
                 if (position.State == PositionState.Open && position.Contract.Token == quote.Token)
                 {
                     ObserveBid(position, snapshot, s.Now);
@@ -953,6 +981,12 @@ public sealed class ExecutionEngine
                 {
                     foreach (var position in book.Positions.Where(p => p.State == PositionState.Open).ToList())
                     {
+                        if (position.BarClocked)
+                        {
+                            TerminalClose(book, position, s);
+                            continue;
+                        }
+
                         var available = position.OpenQuantity - position.ReservedExitQuantity;
                         if (available > 0)
                         {

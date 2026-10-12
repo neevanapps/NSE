@@ -63,6 +63,9 @@ public sealed class Opportunity
 
     public int SelectionAttempts { get; internal set; }
 
+    /// <summary>Bar-clocked variants: the completed bar whose signal created this opportunity. The frozen contract may fill only on bar <c>NextBarSignalSeq + 1</c>; null for other entry policies.</summary>
+    public long? NextBarSignalSeq { get; internal set; }
+
     /// <summary>Premium (limit x quantity) of the entry intent currently outstanding for this opportunity; 0 when none. Counts against the shared capital.</summary>
     public decimal IntentPremium { get; internal set; }
 

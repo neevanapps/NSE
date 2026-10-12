@@ -144,7 +144,9 @@ public class TradingModelTests
     {
         using var db = NewContext();
         var migrations = db.GetService<IMigrationsAssembly>().Migrations.Keys.ToList();
-        Assert.EndsWith("InitialTradingSchema", Assert.Single(migrations), StringComparison.Ordinal);
+        Assert.Equal(2, migrations.Count);
+        Assert.EndsWith("InitialTradingSchema", migrations[0], StringComparison.Ordinal);
+        Assert.EndsWith("Npt1CodecV5", migrations[1], StringComparison.Ordinal);
 
         var script = File.ReadAllText(Path.Combine(RepoRoot(), "NiftySignal.Trading.Data", "Sql", "trading-schema.idempotent.sql"));
         Assert.Contains("CREATE SCHEMA trading", script, StringComparison.Ordinal);

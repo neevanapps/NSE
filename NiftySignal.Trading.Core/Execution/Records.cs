@@ -23,6 +23,12 @@ public enum ExitReason
 
     /// <summary>The position reached its maximum holding time (measured from the entry fill).</summary>
     MaxHold = 6,
+
+    /// <summary>Bar-clocked variants (NPT1): closed at the terminal instant (15:00 live) at the held token's observed bid, or at the last completed bar end in the historical-parity mode.</summary>
+    TerminalClose = 7,
+
+    /// <summary>Bar-clocked variants: the terminal close found no usable bid at the terminal instant; closed LATER at the first observed bid. Recorded distinctly from a successful terminal close.</summary>
+    DelayedTerminalClose = 8,
 }
 
 public enum OrderStatus
@@ -188,6 +194,24 @@ public sealed class Position
 
     /// <summary>Instant at which the max-hold exit fires (entry fill time + MaxHold); null when the variant has no max hold.</summary>
     public DateTimeOffset? MaxHoldDeadline { get; internal set; }
+
+    // ---- bar-clocked execution (NPT1): excursion is observed at completed-bar ends; signal exits and the terminal close are requested here and filled on a later completed bar / the first usable bid.
+    public bool BarClocked { get; internal set; }
+
+    /// <summary>Completed bar on which a signal exit was requested; the exit may fill on a LATER completed bar only. Null = none pending.</summary>
+    public long? BarClockExitRequestedBar { get; internal set; }
+
+    public DateTimeOffset? BarClockExitRequestedAt { get; internal set; }
+
+    /// <summary>When the terminal close was requested and found no usable bid (the position waits for one); null otherwise.</summary>
+    public DateTimeOffset? TerminalRequestedAt { get; internal set; }
+
+    /// <summary>Latest bar-end held-contract bid and its instant (used by the historical-parity terminal mode).</summary>
+    public decimal? LastBarEndBid { get; internal set; }
+
+    public DateTimeOffset? LastBarEndBidAt { get; internal set; }
+
+    public long? LastBarEndBidSourceId { get; internal set; }
 
     internal Scheduling.DeadlineHandle? MaxHoldHandle { get; set; }
 

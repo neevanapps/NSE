@@ -136,3 +136,49 @@ public sealed class QuoteHistory
         }
     }
 }
+
+/// <summary>
+/// The latest TWO-SIDED quote per token (bid &gt; 0, ask &gt;= bid) and the latest quote with a POSITIVE BID per token, each kept across later one-sided updates. This is the as-of quote of the bar-clocked
+/// execution policy ("the contract's quote at the bar end", with its age), which looks back to the last usable quote instead of treating a one-sided update as "no quote". The plain
+/// <see cref="QuoteBook"/> (latest update, cleared by a one-sided one) is unchanged.
+/// </summary>
+public sealed class TwoSidedQuotes
+{
+    private readonly Dictionary<string, QuoteSnapshot> _twoSided = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, QuoteSnapshot> _positiveBid = new(StringComparer.Ordinal);
+
+    public void Update(QuoteEvent quote)
+    {
+        ArgumentNullException.ThrowIfNull(quote);
+        var snapshot = QuoteSnapshot.From(quote);
+        if (snapshot.IsExecutable)
+        {
+            _twoSided[quote.Token] = snapshot;
+        }
+
+        if (snapshot.Bid is > 0m)
+        {
+            _positiveBid[quote.Token] = snapshot;
+        }
+    }
+
+    public QuoteSnapshot? LastTwoSided(string token) => _twoSided.TryGetValue(token, out var q) ? q : null;
+
+    public QuoteSnapshot? LastPositiveBid(string token) => _positiveBid.TryGetValue(token, out var q) ? q : null;
+
+    public void WriteState(StateWriter w)
+    {
+        using var scope = w.Scope("twoSidedQuotes");
+        foreach (var token in _twoSided.Keys.Order(StringComparer.Ordinal))
+        {
+            var q = _twoSided[token];
+            w.Line("two/" + token, $"{q.Bid.Dec()}|{q.Ask.Dec()}|{q.AvailableAt.UtcTicks}|{q.SourceId}");
+        }
+
+        foreach (var token in _positiveBid.Keys.Order(StringComparer.Ordinal))
+        {
+            var q = _positiveBid[token];
+            w.Line("bid/" + token, $"{q.Bid.Dec()}|{q.Ask.Dec()}|{q.AvailableAt.UtcTicks}|{q.SourceId}");
+        }
+    }
+}

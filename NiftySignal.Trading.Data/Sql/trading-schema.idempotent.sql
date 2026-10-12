@@ -737,3 +737,22 @@ BEGIN
 END $EF$;
 COMMIT;
 
+START TRANSACTION;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261012024336_Npt1CodecV5') THEN
+    UPDATE trading.schema_versions SET codec_version = 'trading-codec/5', minimum_compatible_code = 'trading-engine/npt1-v1'
+    WHERE component = 'trading-engine';
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM trading.__ef_migrations_history WHERE "MigrationId" = '20261012024336_Npt1CodecV5') THEN
+    INSERT INTO trading.__ef_migrations_history ("MigrationId", "ProductVersion")
+    VALUES ('20261012024336_Npt1CodecV5', '10.0.11');
+    END IF;
+END $EF$;
+COMMIT;
+

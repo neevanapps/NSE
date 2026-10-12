@@ -153,7 +153,7 @@ public sealed record CompatibilityIdentity(
     string SourceManifestHash)
 {
     /// <summary>The engine behaviour label of this checkpoint of the code base. Bump it with any behaviour or state-layout change.</summary>
-    public const string CurrentEngine = "trading-engine/paperlive-v1";
+    public const string CurrentEngine = "trading-engine/npt1-v1";
 
     public string CanonicalText()
         => string.Create(CultureInfo.InvariantCulture, $"{CodecVersion}|{StateDigestVersion}|{EngineCompatibilityId}|{ConfigSchemaVersion}|{ConfigHash}|{FreezeHash}|{TranslatorOptionsHash}|{ReadinessSpec}|{RetentionHash}|{StrategiesIdentity}|{DurableOptionsHash}|{SourceManifestHash}");
