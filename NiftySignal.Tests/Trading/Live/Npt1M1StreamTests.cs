@@ -159,7 +159,7 @@ public class Npt1M1StreamTests
     }
 
     [Fact]
-    public void TheWorker_ResolvesFromTheHostRegistrations_AndDoesNothingWhileNoNpt1StrategyIsEnabled()
+    public async Task TheWorker_ResolvesFromTheHostRegistrations_AndDoesNothingWhileNoNpt1StrategyIsEnabled()
     {
         // the registrations of NiftySignal.Host/Program.cs (only added when a strategy is enabled), with a dummy connection that is never opened
         var configuration = new Microsoft.Extensions.Configuration.ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
@@ -179,9 +179,11 @@ public class Npt1M1StreamTests
         services.AddSingleton<NiftySignal.Npt1M1.Data.M1SessionBuilder>();
         services.AddSingleton<Npt1M1Telemetry>();
         services.AddSingleton<EfFrameStore>();
+        services.Configure<NiftySignal.Host.DashboardPushOptions>(o => o.HubUrl = "http://localhost:1/hub");
+        services.AddSingleton<NiftySignal.Host.DashboardPushClient>();
         services.AddHostedService<Npt1M1Worker>();
 
-        using var provider = services.BuildServiceProvider(new Microsoft.Extensions.DependencyInjection.ServiceProviderOptions { ValidateScopes = true, ValidateOnBuild = true });
+        await using var provider = services.BuildServiceProvider(new Microsoft.Extensions.DependencyInjection.ServiceProviderOptions { ValidateScopes = true, ValidateOnBuild = true });
 
         var worker = Assert.Single(provider.GetServices<Microsoft.Extensions.Hosting.IHostedService>());
         Assert.IsType<Npt1M1Worker>(worker);

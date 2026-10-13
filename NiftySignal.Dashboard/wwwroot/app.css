@@ -260,3 +260,12 @@ table.data-table {
     .blazor-error-boundary::after {
         content: "An error has occurred."
     }
+
+/* NPT1 paper page (simplified): header line, live P&L colours, collapsed diagnostics */
+.paper-header-line { display: flex; flex-wrap: wrap; gap: 18px; align-items: baseline; font-size: 14px; }
+.paper-strategy-states { display: flex; gap: 10px; margin-top: 8px; flex-wrap: wrap; }
+.paper-live-ok { color: #2e9d57; }
+.paper-live-warn { color: #d08a1a; }
+.paper-pnl-up { color: #2e9d57; font-weight: 600; }
+.paper-pnl-down { color: #d1493f; font-weight: 600; }
+.paper-diagnostics > summary { list-style: revert; }

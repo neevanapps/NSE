@@ -13,9 +13,13 @@ namespace NiftySignal.Dashboard.Hubs;
 /// no longer have to round-trip through Postgres and a poll timer to reach the Live Quote
 /// panel.
 /// </summary>
-public sealed class MarketDataHub(LiveDataService liveData, AdaptiveObserverDataService adaptiveObserver) : Hub
+public sealed class MarketDataHub(LiveDataService liveData, AdaptiveObserverDataService adaptiveObserver, Npt1LiveQuotes npt1Quotes) : Hub
 {
-    public void PushTick(Tick tick) => liveData.ApplyPushedTick(tick);
+    public void PushTick(Tick tick)
+    {
+        liveData.ApplyPushedTick(tick);
+        npt1Quotes.Apply(tick);                              // in-memory only: ticks of the options held by the NPT1 paper strategies feed the live bid P&L
+    }
 
     /// <summary>
     /// Signal-only (2026-09-07, no payload) -- a paper trade changed (entry/partial-book/exit)
@@ -24,7 +28,11 @@ public sealed class MarketDataHub(LiveDataService liveData, AdaptiveObserverData
     /// the next tick. Trade events are single digits per day, so this never meaningfully adds
     /// load -- unlike ticks, there's no need to carry the row itself over the wire.
     /// </summary>
-    public Task PushTradesChanged() => liveData.RefreshTradesAsync();
+    public Task PushTradesChanged()
+    {
+        npt1Quotes.NotifyTradesChanged();                    // the paper page re-reads the durable open positions
+        return liveData.RefreshTradesAsync();
+    }
 
     /// <summary>
     /// Host calls this only after a completed adaptive-bar package commits. The payload is an

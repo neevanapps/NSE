@@ -150,3 +150,28 @@
     color: var(--text-dim);
     font-style: italic;
 }
+
+.fixed-strike-header {
+    display: flex;
+    gap: 18px;
+    align-items: center;
+    flex-wrap: wrap;
+    padding: 6px 0 8px;
+    font-size: .9rem;
+}
+
+.fixed-strike-header select {
+    min-width: 6.5rem;
+}
+
+.adaptive-diagnostics > summary {
+    cursor: pointer;
+    color: var(--text-dim);
+    font-size: .85rem;
+    padding: 4px 0;
+}
+
+/* Pinned captures (Telegram screenshots) show the moving-band grid exactly as before: no summary line. */
+.adaptive-diagnostics-capture > summary {
+    display: none;
+}

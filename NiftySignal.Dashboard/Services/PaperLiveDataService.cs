@@ -28,11 +28,11 @@ public sealed record PaperLiveRunStatus(
 public sealed record PaperOpenPosition(
     string StrategyId, string VariantId, string PositionId, string Direction, string OptionType, string Symbol, string Strike, DateTimeOffset EntryAt,
     string AvgEntryPrice, long EntryQuantity, long RemainingQuantity, string Tp1State, string? StopLevel, string? Tp1Level, DateTimeOffset? MaxHoldDeadline,
-    string? LastBid, string? UnrealizedPnl, string? Mfe, string? Mae, string? MfePct, string? MaePct, string? Coverage, bool ExitPending, DateTimeOffset AsOf);
+    string? LastBid, string? UnrealizedPnl, string? Mfe, string? Mae, string? MfePct, string? MaePct, string? Coverage, bool ExitPending, DateTimeOffset AsOf, string Token = "");
 
 public sealed record PaperClosedTrade(
     string StrategyId, string VariantId, string PositionId, string Direction, string OptionType, string Symbol, DateTimeOffset EntryAt, DateTimeOffset ExitAt, string ExitReason,
-    string AvgEntryPrice, string AvgExitPrice, long Quantity, string Gross, string Costs, string Net, string? Mfe, string? Mae, string? MfePct, string? MaePct, string? Coverage, long EntryBarSeq, long ExitBarSeq);
+    string AvgEntryPrice, string AvgExitPrice, long Quantity, string Gross, string Costs, string Net, string? Mfe, string? Mae, string? MfePct, string? MaePct, string? Coverage, long EntryBarSeq, long ExitBarSeq, string Strike = "", string Token = "");
 
 public sealed record PaperScopeSummary(string Scope, int Trades, int Open, int Closed, int Wins, int Losses, decimal ClosedNet, int ConsecutiveLosses, decimal? AvgMfe, decimal? AvgMae);
 
@@ -167,12 +167,12 @@ public sealed partial class PaperLiveDataService(IDbContextFactory<TradingDbCont
         => new(
             p.StrategyId, p.VariantId, p.PositionId, p.Direction, p.OptionType, p.Symbol, p.StrikeText, Instant(p.EntryFillUtcTicks), p.AvgEntryPriceText, p.EntryQuantity,
             s?.RemainingQuantity ?? p.EntryQuantity, s?.Tp1State ?? "NotTriggered", p.StopLevelText, p.Tp1LevelText, p.MaxHoldDeadlineUtcTicks is { } d ? Instant(d) : null,
-            s?.LastBidText, s?.UnrealizedPnlText, s?.MfeText, s?.MaeText, s?.MfePctText, s?.MaePctText, s?.ExcursionCoverage, s?.ExitPending ?? false, s is null ? Instant(p.EntryFillUtcTicks) : Instant(s.AsOfUtcTicks));
+            s?.LastBidText, s?.UnrealizedPnlText, s?.MfeText, s?.MaeText, s?.MfePctText, s?.MaePctText, s?.ExcursionCoverage, s?.ExitPending ?? false, s is null ? Instant(p.EntryFillUtcTicks) : Instant(s.AsOfUtcTicks), p.Token);
 
     private static PaperClosedTrade ClosedOf(PositionEntity p)
         => new(
             p.StrategyId, p.VariantId, p.PositionId, p.Direction, p.OptionType, p.Symbol, Instant(p.EntryFillUtcTicks), Instant(p.ExitUtcTicks!.Value), p.FinalExitReason!, p.AvgEntryPriceText, p.AvgExitPriceText!,
-            p.EntryQuantity, p.GrossPnlText!, p.TotalCostsText!, p.NetPnlText!, p.MfeText, p.MaeText, p.MfePctText, p.MaePctText, p.ExcursionCoverage, p.EntryBarSeq, p.ExitBarSeq!.Value);
+            p.EntryQuantity, p.GrossPnlText!, p.TotalCostsText!, p.NetPnlText!, p.MfeText, p.MaeText, p.MfePctText, p.MaePctText, p.ExcursionCoverage, p.EntryBarSeq, p.ExitBarSeq!.Value, p.StrikeText, p.Token);
 
     private static PaperScopeSummary Summarize(string scope, IEnumerable<PositionEntity> positions, int consecutiveLosses)
     {

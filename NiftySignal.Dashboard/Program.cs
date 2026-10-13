@@ -79,6 +79,7 @@ builder.Services.AddDbContextFactory<NiftySignalDbContext>(options =>
     }
 }
 
+builder.Services.AddSingleton<Npt1LiveQuotes>();
 builder.Services.AddSingleton(sp => new PaperLiveDataService(sp.GetService<IDbContextFactory<NiftySignal.Trading.Data.TradingDbContext>>(), null, sp.GetService<IDbContextFactory<NiftySignal.Npt1M1.Data.Npt1M1DbContext>>()));
 
 // Phase F of docs/LIVE_PARITY_PLAN.md: same separate-database override NiftySignal.Host's own

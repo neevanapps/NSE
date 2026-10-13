@@ -586,3 +586,42 @@ public sealed class AdaptiveCommentaryNotificationJobRow
     public int Attempts { get; set; }
     public string? LastError { get; set; }
 }
+
+/// <summary>
+/// Sidecar: one row per (session, completed bar, option contract) of the frozen weekly option universe - the per-strike observational projection behind the fixed-strike Options history
+/// (metrics contract option-strike-v1). NOT an ATM±2 aggregate, never part of the parity-protected core rows. Missing values are NULL, never zero.
+/// </summary>
+public sealed class AdaptiveOptionStrikeBarRow
+{
+    public long Id { get; set; }
+    public long SessionId { get; set; }
+    public int BarSeq { get; set; }
+    public required string MetricsVersion { get; set; }
+    public DateTimeOffset EndAvailableAtUtc { get; set; }
+    public DateOnly Expiry { get; set; }
+    public double Strike { get; set; }
+    public OptionType Side { get; set; }
+    public required string Token { get; set; }
+    public required string TradingSymbol { get; set; }
+    public double? PriceStart { get; set; }
+    public double? PriceEnd { get; set; }
+    public double? PriceChange { get; set; }
+    public long TotalQuantity { get; set; }
+    public long StrictBuy { get; set; }
+    public long StrictSell { get; set; }
+    public long StrictUnknown { get; set; }
+    public long StrictDelta { get; set; }
+    public long EnrichedBuy { get; set; }
+    public long EnrichedSell { get; set; }
+    public long EnrichedUnknown { get; set; }
+    public long EnrichedDelta { get; set; }
+    public long TradeUpdates { get; set; }
+    public long? OiStart { get; set; }
+    public long? OiEnd { get; set; }
+    public long? OiDelta { get; set; }
+    public double? IvStart { get; set; }
+    public double? IvEnd { get; set; }
+    public double? IvChange { get; set; }
+    public double? ActivityPerSecond { get; set; }
+    public double? QuoteAgeEndSeconds { get; set; }
+}

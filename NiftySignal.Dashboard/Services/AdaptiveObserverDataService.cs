@@ -168,6 +168,42 @@ public sealed class AdaptiveObserverDataService(
             invalidFutures, invalidOptions, basisSupplemental, invalidBasis);
     }
 
+    /// <summary>
+    /// History of ONE exact expiry + strike + CE token + PE token over the displayed completed bars. Reads only the persisted per-strike sidecar by the indexed
+    /// (session, expiry, strike) key; a missing table (Dashboard started before the migration) or a bar without rows yields unavailable cells, never another strike.
+    /// </summary>
+    public async Task<FixedStrikeHistory?> LoadFixedStrikeHistoryAsync(
+        long sessionId, FixedStrikeCatalog catalog, double strike, IReadOnlyList<(int BarSeq, DateTimeOffset EndAvailableAtUtc)> bars, CancellationToken ct = default)
+    {
+        var contract = catalog.Find(strike);
+        if (contract is null)
+        {
+            return null;
+        }
+
+        var seqs = bars.Select(b => b.BarSeq).ToArray();
+        IReadOnlyList<AdaptiveOptionStrikeBarRow> stored = Array.Empty<AdaptiveOptionStrikeBarRow>();
+        if (seqs.Length > 0)
+        {
+            try
+            {
+                await using var db = await dbFactory.CreateDbContextAsync(ct);
+                var version = OptionStrikeBarMetrics.MetricsVersion;
+                var expiry = catalog.Expiry;
+                stored = await db.OptionStrikeBars.AsNoTracking()
+                    .Where(x => x.SessionId == sessionId && x.Expiry == expiry && x.Strike == strike && x.MetricsVersion == version
+                        && seqs.Contains(x.BarSeq))
+                    .ToListAsync(ct);
+            }
+            catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedTable)
+            {
+                // not migrated yet: every cell is unavailable
+            }
+        }
+
+        return FixedStrikeProjection.Assemble(catalog, contract, bars, stored);
+    }
+
     /// <summary>Bars (of the displayed range) whose sidecar carries a durable failed-verification marker. Tolerates a not-yet-migrated schema.</summary>
     static async Task<IReadOnlySet<int>> LoadInvalidBarsAsync(
         AdaptiveObserverDbContext db, long sessionId, string component, string version, int[] seqs, CancellationToken ct)

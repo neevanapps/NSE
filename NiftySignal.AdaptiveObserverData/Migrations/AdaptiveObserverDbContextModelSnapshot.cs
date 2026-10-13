@@ -909,6 +909,120 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                     b.ToTable("adaptive_option_residual_bars", (string)null);
                 });
 
+            modelBuilder.Entity("NiftySignal.AdaptiveObserverData.AdaptiveOptionStrikeBarRow", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<double?>("ActivityPerSecond")
+                        .HasColumnType("double precision");
+
+                    b.Property<int>("BarSeq")
+                        .HasColumnType("integer");
+
+                    b.Property<DateTimeOffset>("EndAvailableAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<long>("EnrichedBuy")
+                        .HasColumnType("bigint");
+
+                    b.Property<long>("EnrichedDelta")
+                        .HasColumnType("bigint");
+
+                    b.Property<long>("EnrichedSell")
+                        .HasColumnType("bigint");
+
+                    b.Property<long>("EnrichedUnknown")
+                        .HasColumnType("bigint");
+
+                    b.Property<DateOnly>("Expiry")
+                        .HasColumnType("date");
+
+                    b.Property<double?>("IvChange")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("IvEnd")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("IvStart")
+                        .HasColumnType("double precision");
+
+                    b.Property<string>("MetricsVersion")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<long?>("OiDelta")
+                        .HasColumnType("bigint");
+
+                    b.Property<long?>("OiEnd")
+                        .HasColumnType("bigint");
+
+                    b.Property<long?>("OiStart")
+                        .HasColumnType("bigint");
+
+                    b.Property<double?>("PriceChange")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("PriceEnd")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("PriceStart")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("QuoteAgeEndSeconds")
+                        .HasColumnType("double precision");
+
+                    b.Property<long>("SessionId")
+                        .HasColumnType("bigint");
+
+                    b.Property<int>("Side")
+                        .HasColumnType("integer");
+
+                    b.Property<long>("StrictBuy")
+                        .HasColumnType("bigint");
+
+                    b.Property<long>("StrictDelta")
+                        .HasColumnType("bigint");
+
+                    b.Property<long>("StrictSell")
+                        .HasColumnType("bigint");
+
+                    b.Property<long>("StrictUnknown")
+                        .HasColumnType("bigint");
+
+                    b.Property<double>("Strike")
+                        .HasColumnType("double precision");
+
+                    b.Property<string>("Token")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<long>("TotalQuantity")
+                        .HasColumnType("bigint");
+
+                    b.Property<long>("TradeUpdates")
+                        .HasColumnType("bigint");
+
+                    b.Property<string>("TradingSymbol")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("SessionId", "BarSeq", "Token", "MetricsVersion")
+                        .IsUnique();
+
+                    b.HasIndex("SessionId", "Expiry", "Strike", "Side", "BarSeq");
+
+                    b.ToTable("adaptive_option_strike_bars", (string)null);
+                });
+
             modelBuilder.Entity("NiftySignal.AdaptiveObserverData.AdaptiveOptionsSupplementalRow", b =>
                 {
                     b.Property<long>("Id")
@@ -1820,6 +1934,15 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                 });
 
             modelBuilder.Entity("NiftySignal.AdaptiveObserverData.AdaptiveOptionResidualBarRow", b =>
+                {
+                    b.HasOne("NiftySignal.AdaptiveObserverData.AdaptiveSessionStateRow", null)
+                        .WithMany()
+                        .HasForeignKey("SessionId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("NiftySignal.AdaptiveObserverData.AdaptiveOptionStrikeBarRow", b =>
                 {
                     b.HasOne("NiftySignal.AdaptiveObserverData.AdaptiveSessionStateRow", null)
                         .WithMany()
