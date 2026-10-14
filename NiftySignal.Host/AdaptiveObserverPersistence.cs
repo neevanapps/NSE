@@ -61,6 +61,59 @@ public sealed class AdaptiveObserverPersistence(ILogger<AdaptiveObserverPersiste
         return new AdaptivePersistResult(true, false, package.FutureBar.BarSeq);
     }
 
+
+    /// <summary>
+    /// Fixed-clock sessions are frozen at 09:15, before the 09:30 residual anchor exists. When the engine freezes that anchor (causally, from its own ordered ticks) it is stored ONCE in the
+    /// session row and its components. A restart replays the same ticks to the same anchor; an already stored anchor is verified and never overwritten (a mismatch is logged, not repaired).
+    /// Returns true when this call stored it.
+    /// </summary>
+    public async Task<bool> PersistResidualAnchorOnceAsync(AdaptiveObserverDbContext db, long sessionId, OptionResidualAnchor? anchor, DateTimeOffset nowUtc, CancellationToken ct)
+    {
+        if (anchor is null)
+        {
+            return false;
+        }
+
+        var row = await db.Sessions.SingleAsync(x => x.Id == sessionId, ct);
+        if (row.Future0930.HasValue)
+        {
+            if (Math.Abs(row.Future0930.Value - anchor.Future0930) > DoubleTolerance || row.ResidualCenterStrike != anchor.CenterStrike)
+            {
+                logger.LogError("Adaptive residual anchor mismatch (stored anchor left untouched): session={SessionId}, stored future={Stored}, recomputed={Recomputed}", sessionId, row.Future0930, anchor.Future0930);
+            }
+
+            return false;
+        }
+
+        await using var transaction = await db.Database.BeginTransactionAsync(ct);
+        row.Future0930 = anchor.Future0930;
+        row.SyntheticWeeklyUnderlying0930 = anchor.SyntheticUnderlying0930;
+        row.ResidualCenterStrike = anchor.CenterStrike;
+        row.ResidualAnchorCompletedAtUtc = nowUtc;
+        foreach (var component in anchor.Calls.Concat(anchor.Puts))
+        {
+            db.ResidualAnchorComponents.Add(new AdaptiveResidualAnchorComponentRow
+            {
+                SessionId = sessionId,
+                Side = component.Instrument.OptionType,
+                Strike = component.Instrument.Strike,
+                Token = component.Instrument.Token,
+                TradingSymbol = component.Instrument.TradingSymbol,
+                LotSize = component.Instrument.LotSize,
+                IsCenterStrike = component.IsCenterStrike,
+                Price0930 = component.Price0930,
+                ImpliedVolatility0930 = component.ImpliedVolatility0930,
+                QuoteTimestampUtc = component.QuoteTimestampUtc,
+                QuoteAgeSeconds = component.QuoteAgeSeconds,
+            });
+        }
+
+        await db.SaveChangesAsync(ct);
+        await transaction.CommitAsync(ct);
+        logger.LogInformation("Adaptive 09:30 residual anchor frozen for session {SessionId}: center={Center}, future={Future}", sessionId, anchor.CenterStrike, anchor.Future0930);
+        return true;
+    }
+
     public async Task UpdatePartialRuntimeAsync(
         AdaptiveObserverDbContext db,
         long sessionId,

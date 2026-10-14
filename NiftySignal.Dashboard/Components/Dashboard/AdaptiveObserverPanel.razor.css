@@ -194,10 +194,17 @@
     font-weight: 600;
 }
 
+/* Sign only, never magnitude: a subtle tint on Direction cells (positive / negative); zero and unavailable stay neutral. */
 ::deep .adaptive-direction.val-pos {
-    color: var(--up, #3fb950);
+    background: rgba(63, 185, 80, .16);
 }
 
 ::deep .adaptive-direction.val-neg {
-    color: var(--down, #f85149);
+    background: rgba(248, 81, 73, .16);
+}
+
+/* The OPTION CONTEXT grid has only a handful of columns: size it to its content instead of stretching a narrow Seq column across the page. */
+.adaptive-table[data-grid="options-context"] {
+    width: auto;
+    min-width: 40%;
 }

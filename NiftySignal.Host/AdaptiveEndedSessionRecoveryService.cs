@@ -18,7 +18,7 @@ public sealed class AdaptiveEndedSessionRecoveryService(
     {
         var ended = await (from session in db.Sessions
             join runtime in db.Runtime on session.Id equals runtime.SessionId
-            where session.ModelVersion == OpeningVolumeProjectionV1.ModelVersion && !session.IsHistoricalSeed && runtime.RuntimeStatus != AdaptiveRuntimeStatus.Closed
+            where (session.ModelVersion == OpeningVolumeProjectionV1.ModelVersion || session.ModelVersion == AdaptiveFixedClockV1.ModelVersion) && !session.IsHistoricalSeed && runtime.RuntimeStatus != AdaptiveRuntimeStatus.Closed
                 && (session.TradeDate < todayIst || (includeToday && session.TradeDate == todayIst))
             orderby session.TradeDate
             select session).ToListAsync(ct);

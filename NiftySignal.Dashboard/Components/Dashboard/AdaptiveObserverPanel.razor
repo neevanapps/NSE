@@ -5,6 +5,7 @@
 @using NiftySignal.Domain
 @implements IAsyncDisposable
 @inject AdaptiveObserverDataService AdaptiveData
+@inject AdaptiveResearchService Research
 
 <section class="adaptive-observer" data-requested-rows="@_rowCount" data-capture-ready="@(_captureReady ? "true" : "false")">
     <div class="adaptive-title-row">
@@ -45,14 +46,27 @@
     }
     else
     {
+        @if (_research is not null)
+        {
+            <ResearchHeader Model="_research" />
+        }
+
         <div class="adaptive-session-grid">
             <Metric Label="Runtime" Value="@(CaptureMode ? "Completed snapshot" : _snapshot.Runtime.RuntimeStatus.ToString())" />
             <Metric Label="Base bar" Value="@FmtInt(_snapshot.Session.BaseBarVolume)" />
             <Metric Label="Rolling volume" Value="@FmtInt(_snapshot.Session.RollingWindowVolume)" />
-            <Metric Label="Expected day volume" Value="@Fmt0(_snapshot.Session.EstimatedFullDayVolume)" />
-            <Metric Label="Observed opening volume" Value="@FmtInt(_snapshot.Session.OpeningVolume)" />
-            <Metric Label="Estimator input" Value="@FmtInt(_snapshot.Session.EstimatorInputOpeningVolume ?? _snapshot.Session.OpeningVolume)" />
-            <Metric Label="Calibration" Value="@(_snapshot.Session.UsesMedianOpeningFallback ? $"Historical median ({_snapshot.Session.MedianOpeningSampleCount} sessions)" : "Observed opening")" />
+            @if (AdaptiveFixedClockV1.IsFixedClock(_snapshot.Session.ModelVersion))
+            {
+                <Metric Label="Clock" Value="@AdaptiveFixedClockV1.Describe(_snapshot.Session.ModelVersion)" />
+                <Metric Label="Strong/Weak calibration" Value="@(_snapshot.Session.StrongThreshold is null ? "uncalibrated" : $"{_snapshot.Session.StrongThresholdPriorStateCount} prior fixed-clock states")" />
+            }
+            else
+            {
+                <Metric Label="Expected day volume" Value="@Fmt0(_snapshot.Session.EstimatedFullDayVolume)" />
+                <Metric Label="Observed opening volume" Value="@FmtInt(_snapshot.Session.OpeningVolume)" />
+                <Metric Label="Estimator input" Value="@FmtInt(_snapshot.Session.EstimatorInputOpeningVolume ?? _snapshot.Session.OpeningVolume)" />
+                <Metric Label="Calibration" Value="@(_snapshot.Session.UsesMedianOpeningFallback ? $"Historical median ({_snapshot.Session.MedianOpeningSampleCount} sessions)" : "Observed opening")" />
+            }
             <Metric Label="Valid-bar warm-up" Value="@($"{_snapshot.ConsecutiveValidBars}/{AdaptiveReadinessPolicy.RequiredBars}")" />
             <Metric Label="Strong threshold" Value="@FmtSigned(_snapshot.Session.StrongThreshold, 4)" />
             <Metric Label="Completed bars" Value="@_snapshot.Runtime.LastCompletedBarSeq.ToString()" />
@@ -218,8 +232,6 @@
             }
         </GridSection>
 
-        @if (!CaptureMode)
-        {
         <GridSection Title="OPTIONS — FIXED STRIKE HISTORY">
             @if (_catalog is null)
             {
@@ -227,7 +239,18 @@
             }
             else
             {
-                <div class="fixed-strike-header" data-testid="fixed-strike-header">
+                @if (CaptureMode)
+                {
+                    <div class="fixed-strike-header" data-testid="fixed-strike-header">
+                        <span>Expiry: <b>@_catalog.Expiry.ToString("dd-MMM-yyyy")</b></span>
+                        <span>Auto follow center: <b>ON</b></span>
+                        <span>Selected strike: <b>@FmtStrike(_research?.SelectedStrike)</b></span>
+                        <span>Current center: <b>@FmtStrike(_research?.Center)</b></span>
+                    </div>
+                }
+                else
+                {
+                    <div class="fixed-strike-header" data-testid="fixed-strike-header">
                     <span>Expiry: <b>@_catalog.Expiry.ToString("dd-MMM-yyyy")</b></span>
                     <label>
                         Auto follow center:
@@ -245,6 +268,7 @@
                     </label>
                     <span>Current center: <b>@FmtStrike(_sel.CurrentCenter)</b></span>
                 </div>
+                }
                 @if (_fixed is null)
                 {
                     <div class="adaptive-pending">@(_sel.SelectedStrike is null ? "Waiting for the first completed bar's center." : $"Strike {FmtStrike(_sel.SelectedStrike)} is not in the frozen option universe.")</div>
@@ -255,7 +279,7 @@
                         Every row below is exactly @_fixed.Expiry.ToString("dd-MMM-yyyy") · strike @FmtStrike(_fixed.Strike) · CE @(_fixed.Contract.CeSymbol ?? "—") · PE @(_fixed.Contract.PeSymbol ?? "—").
                         A bar without a stored row for this strike shows — (no other strike is ever substituted).
                     </div>
-                    var coreRows = _fixed.Rows.Select(r => (Row: r, D: OptionDirectionRatios.Core(r.Ce, r.Pe))).ToList();
+                    var coreRows = _fixed.Rows.Select(r => (Row: r, D: OptionDirectionRatios.Core(r))).ToList();
                     var ctxRows = _fixed.Rows.Select(r => (Row: r, D: OptionDirectionRatios.Context(r.Ce, r.Pe))).ToList();
                     <div class="adaptive-subtitle">CORE DIRECTION <span class="text-faint">raw (ratio %) — Direction = CE − PE, except OI = PE − CE</span></div>
                     <div class="adaptive-table-wrap">
@@ -264,6 +288,7 @@
                             <tr>
                                 <th>Seq</th><th>End IST</th>
                                 <th>CE Price Δ</th><th>PE Price Δ</th><th>Price Dir</th>
+                                <th>CE Roll ΔPx</th><th>PE Roll ΔPx</th><th>Roll Price Dir</th>
                                 <th>CE Strict Δ</th><th>PE Strict Δ</th><th>Strict Dir</th>
                                 <th>CE Enriched Δ</th><th>PE Enriched Δ</th><th>Enriched Dir</th>
                                 <th>CE OI Δ</th><th>PE OI Δ</th><th>OI Dir (PE−CE)</th>
@@ -278,6 +303,7 @@
                                     <td class="sticky-col">@r.BarSeq</td>
                                     <td>@FmtIst(r.EndAvailableAtUtc)</td>
                                     @DirectionCells(d.Price, 2)
+                                    @DirectionCells(d.RollPrice, 2)
                                     @DirectionCells(d.Strict, 0)
                                     @DirectionCells(d.Enriched, 0)
                                     @DirectionCells(d.Oi, 0)
@@ -291,6 +317,7 @@
                                     <td class="sticky-col">AVG</td>
                                     <td>@coreRows.Count rows</td>
                                     @DirectionCells(OptionDirectionRatios.Average(coreRows.Select(x => x.D.Price)), 2)
+                                    @DirectionCells(OptionDirectionRatios.Average(coreRows.Select(x => x.D.RollPrice)), 2)
                                     @DirectionCells(OptionDirectionRatios.Average(coreRows.Select(x => x.D.Strict)), 0)
                                     @DirectionCells(OptionDirectionRatios.Average(coreRows.Select(x => x.D.Enriched)), 0)
                                     @DirectionCells(OptionDirectionRatios.Average(coreRows.Select(x => x.D.Oi)), 0)
@@ -336,10 +363,11 @@
                 }
             }
         </GridSection>
-        }
 
         @* The moving ATM±2 aggregate view is kept unchanged as a diagnostic (collapsed by default). Pinned captures (Telegram screenshots) render it open, exactly as before. *@
-        <details class="adaptive-diagnostics @(CaptureMode ? "adaptive-diagnostics-capture" : "")" open="@CaptureMode">
+        @if (!CaptureMode)
+        {
+        <details class="adaptive-diagnostics">
             <summary>Diagnostics — Dynamic ATM±2 band (moving basket: rows of different centers are different instruments)</summary>
         <GridSection Title="Options — ATM ±2 inside the same futures bar timestamps">
             @if (!ShowDiagnostic)
@@ -554,6 +582,7 @@
             }
         </GridSection>
         </details>
+        }
 
         <GridSection Title="CE / PE theoretical residual — fixed 09:30 diagnostic">
             <div class="adaptive-grid-toolbar">
@@ -567,6 +596,10 @@
                 <span class="adaptive-note">Strike composition is frozen at 09:30 for the entire session.</span>
             </div>
 
+            @if (!_snapshot.Session.Future0930.HasValue && AdaptiveFixedClockV1.IsFixedClock(_snapshot.Session.ModelVersion))
+            {
+                <div class="adaptive-pending" data-testid="residual-anchor-pending">The 09:30 IST residual anchor is frozen separately from the 09:15 volume clock: residual values are unavailable until it exists (and stay unavailable if its quotes were stale).</div>
+            }
             <div class="adaptive-anchor-grid">
                 <Metric Label="Future at 09:30" Value="@Fmt(_snapshot.Session.Future0930, 2)" />
                 <Metric Label="Synthetic weekly at 09:30" Value="@Fmt(_snapshot.Session.SyntheticWeeklyUnderlying0930, 2)" />
@@ -712,6 +745,7 @@
     readonly FixedStrikeSelection _sel = new();
     FixedStrikeCatalog? _catalog;
     FixedStrikeHistory? _fixed;
+    ResearchModel? _research;
     long? _selSession;
     readonly SemaphoreSlim _reloadGate = new(1, 1);
     PeriodicTimer? _headerTimer;
@@ -724,8 +758,12 @@
         {
             try
             {
-                _snapshot = CaptureSessionId is null ? null : await AdaptiveData.LoadSnapshotAsync(10,
-                    captureSessionId: CaptureSessionId, throughBarSeq: CaptureBarSeq);
+                // One pinned view of the target completed bar: grids, selected strike, data quality, events and strategy state are all as-of that boundary.
+                var view = CaptureSessionId is null ? null : await Research.LoadPinnedAsync(CaptureSessionId.Value, CaptureBarSeq);
+                _snapshot = view?.Snapshot;
+                _catalog = view?.Catalog;
+                _fixed = view?.Fixed;
+                _research = view?.Model;
                 if (CaptureSessionId is not null && _snapshot is null) throw new InvalidOperationException("Capture session is unavailable.");
                 _captureReady = true;
             }
@@ -849,11 +887,31 @@
         if (_snapshot is null || _catalog is null || _sel.SelectedStrike is not { } strike)
         {
             _fixed = null;
+            await RefreshResearchAsync(ct);
             return;
         }
 
         var bars = _snapshot.Futures.Select(x => (x.Bar.BarSeq, x.Bar.EndAvailableAtUtc)).ToList();
-        _fixed = await AdaptiveData.LoadFixedStrikeHistoryAsync(_snapshot.Session.Id, _catalog, strike, bars, ct);
+        _fixed = await AdaptiveData.LoadFixedStrikeHistoryAsync(_snapshot.Session.Id, _catalog, strike, bars, ct, _snapshot.Session.RollingWindowBars);
+        await RefreshResearchAsync(ct);
+    }
+
+    async Task RefreshResearchAsync(CancellationToken ct)
+    {
+        if (_snapshot is null)
+        {
+            _research = null;
+            return;
+        }
+
+        try
+        {
+            _research = await Research.BuildAsync(_snapshot, _fixed, _sel.SelectedStrike, _sel.CurrentCenter, _sel.AutoFollow, pinned: false, ct: ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _research = null;              // the research header is informational: a failed read never takes the grids down
+        }
     }
 
     async Task OnStrikeChosen(ChangeEventArgs e)
@@ -987,7 +1045,7 @@
 
     static RenderFragment DirectionCells(SideDirection d, int rawDecimals) => __b =>
     {
-        __b.AddMarkupContent(0, $"<td>{RatioFormat.Cell(d.Ce, rawDecimals)}</td><td>{RatioFormat.Cell(d.Pe, rawDecimals)}</td><td class=\"adaptive-direction {RatioFormat.SignClass(d.Direction)}\">{RatioFormat.Cell(d.Direction, rawDecimals)}</td>");
+        __b.AddMarkupContent(0, $"<td>{RatioFormat.Cell(d.Ce, rawDecimals)}</td><td>{RatioFormat.Cell(d.Pe, rawDecimals)}</td><td class=\"adaptive-direction {RatioFormat.SignClass(d.Direction)}\" data-direction-sign=\"{RatioFormat.SignName(d.Direction)}\">{RatioFormat.Cell(d.Direction, rawDecimals)}</td>");
     };
 
     sealed record FuturesAvgRow(double? Duration, double? Urgency, double? BarPx, double? RollPx, RatioPart Strict, RatioPart Enriched, RatioPart MicroDev, RatioPart Ofi, double? RollOi, double? Basis, double? Efficiency);

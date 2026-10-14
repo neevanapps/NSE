@@ -1,0 +1,58 @@
+.research-header {
+    border: 1px solid var(--border, #2a3340);
+    border-radius: 6px;
+    padding: 8px 12px;
+    margin: 8px 0;
+    background: var(--surface);
+    font-size: .85rem;
+}
+
+.research-title {
+    font-weight: 700;
+    letter-spacing: .06em;
+    margin-bottom: 4px;
+}
+
+.research-line {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 18px;
+    line-height: 1.5;
+}
+
+.research-build {
+    color: var(--text-dim);
+    font-size: .75rem;
+    overflow-wrap: anywhere;
+}
+
+.research-quality-ok {
+    color: var(--text-dim);
+}
+
+.research-quality-issues {
+    font-weight: 600;
+}
+
+.research-events {
+    border: 1px solid var(--border, #2a3340);
+    border-radius: 6px;
+    padding: 6px 12px;
+    margin: 6px 0 10px;
+    font-size: .8rem;
+}
+
+.research-events-title {
+    font-weight: 600;
+    letter-spacing: .04em;
+    margin-bottom: 2px;
+}
+
+.research-event-time {
+    font-family: var(--mono, monospace);
+    margin-right: 6px;
+}
+
+.research-event-empty {
+    color: var(--text-dim);
+}

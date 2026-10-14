@@ -12,10 +12,23 @@ public interface IAdaptiveScreenshotRenderer
     Task CaptureAsync(AdaptiveScreenshotJobRow job, string path, CancellationToken ct);
 }
 
+/// <summary>One primary grid every research capture must contain. <see cref="StartsAtTarget"/>: its first body row is the target completed bar (the residual grid is legitimately empty before the 09:30 anchor).</summary>
+public sealed record RequiredCaptureGrid(string Grid, bool StartsAtTarget);
+
 public sealed class AdaptiveScreenshotRenderer(IOptions<AdaptiveScreenshotOptions> settings,
     IOptionsMonitor<CookieAuthenticationOptions> cookieOptions, IOptions<DashboardAuthOptions> auth) : IAdaptiveScreenshotRenderer
 {
     public const string AuthenticationScheme = "AdaptiveCapture";
+
+    /// <summary>The stable identities of the primary research grids (data-grid attributes in AdaptiveObserverPanel).</summary>
+    public static readonly IReadOnlyList<RequiredCaptureGrid> RequiredGrids =
+    [
+        new("futures-compact", true), new("options-core-direction", true), new("options-context", true), new("residual-compact", false),
+    ];
+
+    /// <summary>Other blocks a research capture must contain (data-testid): the identity header, its data-quality line and the recent-events strip.</summary>
+    public static readonly IReadOnlyList<string> RequiredBlocks = ["research-header", "research-data-quality", "recent-events"];
+
     public async Task CaptureAsync(AdaptiveScreenshotJobRow job, string path, CancellationToken ct)
     {
         var origin = settings.Value.LocalUri(); // Never send a privileged cookie to a configured external URL.
@@ -48,24 +61,35 @@ public sealed class AdaptiveScreenshotRenderer(IOptions<AdaptiveScreenshotOption
         await page.Locator(".quote-panel[data-capture-ready='true']").WaitForAsync();
         await Microsoft.Playwright.Assertions.Expect(page.Locator(".quote-panel")).ToHaveCountAsync(1);
         await Microsoft.Playwright.Assertions.Expect(page.Locator(".adaptive-capture")).ToHaveAttributeAsync("data-job-id", job.Id.ToString());
+        // The pinned quote renders once, normally, at the top of the document: never sticky in a capture.
+        if (await page.Locator(".quote-panel").EvaluateAsync<string>("e => getComputedStyle(e).position") == "sticky")
+            throw new InvalidOperationException("Capture Live Quote must not be sticky; image not uploaded.");
         if (job.SessionId is not null)
         {
-            await Microsoft.Playwright.Assertions.Expect(page.Locator(".adaptive-table")).ToHaveCountAsync(3);
-            foreach (var table in await page.Locator(".adaptive-table").AllAsync())
-                if (job.TargetBarSeq > 0)
-                    await Microsoft.Playwright.Assertions.Expect(table.Locator("tbody tr td:first-child").First).ToHaveTextAsync(job.TargetBarSeq.ToString());
+            // Required PRIMARY content is verified by stable identities, not by counting tables (Diagnostics and any future table must not break a capture).
+            // A capture that is missing any of them is refused rather than sent partially.
+            foreach (var required in RequiredGrids)
+                if (await page.Locator($".adaptive-table[data-grid='{required.Grid}']").CountAsync() != 1)
+                    throw new InvalidOperationException($"Required capture grid '{required.Grid}' did not render; image not uploaded.");
+            foreach (var testId in RequiredBlocks)
+                if (await page.Locator($"[data-testid='{testId}']").CountAsync() < 1)
+                    throw new InvalidOperationException($"Required capture block '{testId}' did not render; image not uploaded.");
+            if (job.TargetBarSeq > 0)
+                foreach (var required in RequiredGrids.Where(x => x.StartsAtTarget))
+                    await Microsoft.Playwright.Assertions.Expect(page.Locator($".adaptive-table[data-grid='{required.Grid}'] tbody tr td:first-child").First).ToHaveTextAsync(job.TargetBarSeq.ToString());
         }
         // Wide tables scroll in the human UI. Expand capture to expose every column, not just the viewport.
+        const string PrimaryTables = ".adaptive-capture .adaptive-table";
         for (var pass = 0; pass < 3; pass++)
         {
-            var overflow = await page.EvaluateAsync<int>("() => Math.ceil(Math.max(0,...Array.from(document.querySelectorAll('.adaptive-table')).map(t=>t.scrollWidth-t.parentElement.clientWidth)))");
+            var overflow = await page.EvaluateAsync<int>("() => Math.ceil(Math.max(0,...Array.from(document.querySelectorAll('" + PrimaryTables + "')).map(t=>t.scrollWidth-t.parentElement.clientWidth)))");
             if (overflow <= 1) break;
             var width = page.ViewportSize!.Width + overflow + 32;
             if (width > 10000) throw new InvalidOperationException("Capture table exceeds safe image width.");
             await page.SetViewportSizeAsync(width, 1080);
             await page.EvaluateAsync("() => new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))");
         }
-        if (!await page.EvaluateAsync<bool>("() => Array.from(document.querySelectorAll('.adaptive-table')).every(t=>t.scrollWidth<=t.parentElement.clientWidth+1)"))
+        if (!await page.EvaluateAsync<bool>("() => Array.from(document.querySelectorAll('" + PrimaryTables + "')).every(t=>t.scrollWidth<=t.parentElement.clientWidth+1)"))
             throw new InvalidOperationException("Capture would hide grid columns; image not uploaded.");
         ct.ThrowIfCancellationRequested();
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);

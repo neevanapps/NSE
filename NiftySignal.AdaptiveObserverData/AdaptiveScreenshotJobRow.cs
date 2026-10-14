@@ -1,6 +1,6 @@
 namespace NiftySignal.AdaptiveObserverData;
 
-public enum AdaptiveScreenshotKind { Initialization = 0, FiveBars = 1, PreLiveTest = 2 }
+public enum AdaptiveScreenshotKind { Initialization = 0, FiveBars = 1, PreLiveTest = 2, EventTriggered = 3 }
 public enum AdaptiveScreenshotStatus { Pending = 0, Capturing = 1, Sending = 2, Sent = 3, DeliveryUncertain = 4 }
 
 /// <summary>Notification outbox only. Never participates in adaptive calculations.</summary>

@@ -15,7 +15,13 @@ public sealed class AdaptiveObserverEngine
     readonly DateTimeOffset _signalStartUtc;
     readonly IReadOnlyList<ObserverOptionInstrument> _options;
     readonly HashSet<string> _optionTokens;
-    readonly OptionResidualAnchor? _residualAnchor;
+    OptionResidualAnchor? _residualAnchor;
+    // Fixed-clock sessions start their bars at 09:15 and cannot know the 09:30 residual anchor at construction. The engine then freezes it ITSELF, causally, from the
+    // option quotes and the last futures tick it has already processed at <= the cutoff (live and replay run the same code on the same ordered ticks, so the anchor is identical).
+    readonly DateTimeOffset? _selfAnchorCutoffUtc;
+    bool _selfAnchorAttempted;
+    CleanObserverTick? _lastFutureAtOrBeforeCutoff;
+    public const double SelfAnchorMaxQuoteAgeSeconds = 5d;
 
     readonly AdaptiveTradeFlowEnricher _futureEnricher = new();
     readonly ExactAdaptiveFuturesBarBuilder _futureBars;
@@ -60,8 +66,10 @@ public sealed class AdaptiveObserverEngine
         IReadOnlyList<ObserverOptionInstrument> options,
         OptionResidualAnchor? residualAnchor,
         string? spotToken = null,
-        bool projectStrikes = false)
+        bool projectStrikes = false,
+        DateTimeOffset? selfAnchorCutoffUtc = null)
     {
+        _selfAnchorCutoffUtc = residualAnchor is null ? selfAnchorCutoffUtc : null;
         _projectStrikes = projectStrikes;
         _spotToken = string.IsNullOrWhiteSpace(spotToken) ? null : spotToken;
         _session = session;
@@ -76,6 +84,13 @@ public sealed class AdaptiveObserverEngine
     }
 
     public IReadOnlyList<ExactAdaptiveBar> FutureBars => _futureBars.Bars;
+
+    /// <summary>The residual anchor in force (supplied at construction or frozen by the engine at the self-anchor cutoff); null while unavailable.</summary>
+    public OptionResidualAnchor? ResidualAnchor => _residualAnchor;
+
+    /// <summary>True once the engine has made its one self-anchor attempt (the anchor may still be null when quotes were stale or missing).</summary>
+    public bool SelfAnchorAttempted => _selfAnchorAttempted;
+
     public AdaptivePartialBarStatus PartialBar =>
         new(_futureBars.PartialVolume, _session.BaseBarVolume, _futureBars.PartialBarStartedAtUtc);
 
@@ -143,8 +158,31 @@ public sealed class AdaptiveObserverEngine
         finally { _processingAvailabilityGroup=false; }
     }
 
+    void FreezeSelfAnchorIfDue(DateTimeOffset at)
+    {
+        if (_selfAnchorCutoffUtc is not { } cutoff || _selfAnchorAttempted || at <= cutoff)
+        {
+            return;
+        }
+
+        // The first input strictly after the cutoff: everything processed so far is <= the cutoff, so the engine's own latest quotes ARE the quotes at the cutoff.
+        _selfAnchorAttempted = true;
+        if (_lastFutureAtOrBeforeCutoff is { } future && (cutoff - future.AvailableAt).TotalSeconds <= SelfAnchorMaxQuoteAgeSeconds)
+        {
+            _residualAnchor = OptionResidualModel.BuildAnchor(
+                cutoff, _optionExpiry, future.Last, _options,
+                _latestOptionQuotes.Where(x => x.Value.AvailableAt <= cutoff).ToDictionary(x => x.Key, x => x.Value, StringComparer.Ordinal),
+                _riskFreeRate, SelfAnchorMaxQuoteAgeSeconds);
+        }
+    }
+
     IReadOnlyList<AdaptiveCompletedBarPackage> ProcessFuture(CleanObserverTick tick)
     {
+        if (_selfAnchorCutoffUtc is { } anchorCutoff && tick.AvailableAt <= anchorCutoff)
+        {
+            _lastFutureAtOrBeforeCutoff = tick;
+        }
+
         _microstructure.Observe(tick);
         _basis.ObserveFuture(tick);
         var e = _futureEnricher.Process(tick);
@@ -368,6 +406,7 @@ public sealed class AdaptiveObserverEngine
 
     void EnsureOrder(CleanObserverTick tick)
     {
+        FreezeSelfAnchorIfDue(tick.AvailableAt);
         if (_lastAvailableAt.HasValue)
         {
             var cmp = tick.AvailableAt.CompareTo(_lastAvailableAt.Value);

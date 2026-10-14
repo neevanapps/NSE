@@ -1,0 +1,42 @@
+@using NiftySignal.Dashboard.Services
+@* Research snapshot identity: a screenshot taken weeks ago must explain itself without the database. Every value is as-of the displayed completed boundary. *@
+<div class="research-header" data-testid="research-header" data-pinned="@(Model.Pinned ? "true" : "false")" data-bar="@Model.BarSeq"
+     data-boundary="@(Model.BoundaryUtc?.ToString("O") ?? "")" data-strike="@(Model.SelectedStrike?.ToString("0") ?? "")" data-expiry="@(Model.Expiry?.ToString("yyyy-MM-dd") ?? "")"
+     data-model="@Model.ModelVersion" data-quality="@(Model.DataQualityIssues.Count == 0 ? "ok" : "issues")">
+    <div class="research-title">NIFTY RESEARCH SNAPSHOT</div>
+    <div class="research-line" data-testid="research-when">
+        <span>@Model.TradeDate.ToString("dd-MMM-yyyy")</span>
+        <span>@(Model.BoundaryUtc is { } b ? ResearchFormat.IstTime(b) + " IST" : "—")</span>
+        <span>Bar @Model.BarSeq</span>
+    </div>
+    <div class="research-line" data-testid="research-clock">Clock: @Model.ClockText</div>
+    <div class="research-line" data-testid="research-selection">
+        <span>Expiry: @(Model.Expiry?.ToString("dd-MMM-yyyy") ?? "—")</span>
+        <span>Selected strike: @ResearchFormat.Strike(Model.SelectedStrike)</span>
+        <span>Center: @ResearchFormat.Strike(Model.Center)</span>
+        <span>Auto Follow: @(Model.AutoFollow ? "ON" : "OFF")</span>
+    </div>
+    <div class="research-line" data-testid="research-boundary">Completed boundary: @(Model.BoundaryUtc is { } cb ? ResearchFormat.IstTime(cb) : "—")</div>
+    <div class="research-line research-quality @(Model.DataQualityIssues.Count == 0 ? "research-quality-ok" : "research-quality-issues")" data-testid="research-data-quality">@Model.DataQuality</div>
+    <div class="research-line" data-testid="research-strategies">NPT1: @Model.StrategyState</div>
+    <div class="research-line research-build" data-testid="research-build">@Model.BuildText</div>
+</div>
+
+<div class="research-events" data-testid="recent-events">
+    <div class="research-events-title">RECENT EVENTS <span class="text-faint">(@Model.EventPolicy)</span></div>
+    @if (Model.Events.Count == 0)
+    {
+        <div class="research-event-empty">no events in range</div>
+    }
+    else
+    {
+        @foreach (var e in Model.Events)
+        {
+            <div class="research-event" data-event-id="@e.Id" data-event-kind="@e.Kind"><span class="research-event-time">@ResearchFormat.IstTime(e.AtUtc)</span> @e.Text</div>
+        }
+    }
+</div>
+
+@code {
+    [Parameter, EditorRequired] public ResearchModel Model { get; set; } = default!;
+}

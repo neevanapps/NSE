@@ -42,7 +42,14 @@ public sealed record FixedStrikeCatalog(DateOnly Expiry, IReadOnlyList<FixedStri
 }
 
 /// <summary>One displayed completed bar of the fixed strike. A side without a stored row stays null: it is shown as unavailable and NEVER replaced by another strike.</summary>
-public sealed record FixedStrikeRow(int BarSeq, DateTimeOffset EndAvailableAtUtc, AdaptiveOptionStrikeBarRow? Ce, AdaptiveOptionStrikeBarRow? Pe);
+public sealed record FixedStrikeRow(int BarSeq, DateTimeOffset EndAvailableAtUtc, AdaptiveOptionStrikeBarRow? Ce, AdaptiveOptionStrikeBarRow? Pe,
+    RollPrice? CeRoll = null, RollPrice? PeRoll = null);
+
+/// <summary>
+/// Rolling price change of ONE exact contract over the last N completed bars: PriceEnd of the current bar minus PriceStart of the first bar of the window. Built only from that contract's own persisted
+/// per-strike rows (same session, expiry, strike and token); it never reads the moving ATM±2 band's rolling values.
+/// </summary>
+public sealed record RollPrice(double Delta, double StartPrice);
 
 public sealed record FixedStrikeHistory(DateOnly Expiry, double Strike, FixedStrikeContract Contract, IReadOnlyList<FixedStrikeRow> Rows);
 
@@ -53,7 +60,8 @@ public static class FixedStrikeProjection
         FixedStrikeCatalog catalog,
         FixedStrikeContract contract,
         IReadOnlyList<(int BarSeq, DateTimeOffset EndAvailableAtUtc)> bars,
-        IEnumerable<AdaptiveOptionStrikeBarRow> stored)
+        IEnumerable<AdaptiveOptionStrikeBarRow> stored,
+        int rollWindowBars = 0)
     {
         // Identity filter: a stored row counts only when it is exactly this expiry, this strike AND this side's token.
         var byBar = stored
@@ -63,12 +71,35 @@ public static class FixedStrikeProjection
                 && (r.MetricsVersion == OptionStrikeBarMetrics.MetricsVersion || r.MetricsVersion == OptionStrikeBarMetrics.LegacyMetricsVersion))
             .GroupBy(r => (r.BarSeq, r.Side))
             .ToDictionary(g => g.Key, g => g.OrderByDescending(r => r.MetricsVersion == OptionStrikeBarMetrics.MetricsVersion).First());   // latest supported version wins, v1 is the fallback
+        // A rolling window is comparable only when EVERY bar of the window has a stored row for this exact side/token; anything less is unavailable (never bridged, never another strike).
+        RollPrice? Roll(int seq, OptionType side)
+        {
+            if (rollWindowBars <= 1 || seq - rollWindowBars + 1 < 1)
+            {
+                return null;
+            }
+
+            for (var k = seq - rollWindowBars + 1; k <= seq; k++)
+            {
+                if (!byBar.ContainsKey((k, side)))
+                {
+                    return null;
+                }
+            }
+
+            var first = byBar[(seq - rollWindowBars + 1, side)].PriceStart;
+            var last = byBar[(seq, side)].PriceEnd;
+            return first is { } a && last is { } z ? new RollPrice(z - a, a) : null;
+        }
+
         var rows = bars.OrderByDescending(b => b.BarSeq)
             .Select(b => new FixedStrikeRow(
                 b.BarSeq,
                 b.EndAvailableAtUtc,
                 byBar.GetValueOrDefault((b.BarSeq, OptionType.Call)),
-                byBar.GetValueOrDefault((b.BarSeq, OptionType.Put))))
+                byBar.GetValueOrDefault((b.BarSeq, OptionType.Put)),
+                Roll(b.BarSeq, OptionType.Call),
+                Roll(b.BarSeq, OptionType.Put)))
             .ToList();
         return new FixedStrikeHistory(catalog.Expiry, contract.Strike, contract, rows);
     }

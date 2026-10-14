@@ -28,7 +28,8 @@ public sealed record AdaptiveObserverSessionContext(
 public sealed class AdaptiveSessionCoordinator(
     AdaptiveSourceTickReader tickReader,
     IOptionsMonitor<PricingOptions> pricing,
-    ILogger<AdaptiveSessionCoordinator> logger)
+    ILogger<AdaptiveSessionCoordinator> logger,
+    AdaptiveClockMode clockMode = AdaptiveClockMode.OpeningVolumeV1)
 {
     static readonly TimeSpan IstOffset = TimeSpan.FromHours(5.5);
     static readonly TimeOnly MarketOpen = new(9, 15);
@@ -42,13 +43,22 @@ public sealed class AdaptiveSessionCoordinator(
         DateTimeOffset nowUtc,
         CancellationToken ct)
     {
+        // A session that already exists keeps the model it was frozen with (a restart, or an adaptive-v1 session created before the fixed clock existed).
         var existing = await observer.Sessions
             .AsNoTracking()
-            .SingleOrDefaultAsync(x => x.TradeDate == day && x.ModelVersion == OpeningVolumeProjectionV1.ModelVersion, ct);
+            .Where(x => x.TradeDate == day && !x.IsHistoricalSeed
+                && (x.ModelVersion == OpeningVolumeProjectionV1.ModelVersion || x.ModelVersion == AdaptiveFixedClockV1.ModelVersion))
+            .OrderByDescending(x => x.Id)
+            .FirstOrDefaultAsync(ct);
 
         if (existing is not null)
         {
             return await LoadContextAsync(source, observer, existing, ct);
+        }
+
+        if (clockMode == AdaptiveClockMode.Fixed13650)
+        {
+            return await TryCreateFixedAsync(source, observer, day, nowUtc, ct);
         }
 
         var cutoffUtc = ToUtc(day, SelectionTime);
@@ -272,13 +282,122 @@ public sealed class AdaptiveSessionCoordinator(
             useMedian ? observationStart : cutoffUtc);
     }
 
+
+    /// <summary>
+    /// Freezes a fixed 13,650-contract session as soon as the 09:15 IST open has passed and the day NIFTY future and weekly options are resolved. Nothing here waits for 09:30:
+    /// the residual anchor columns stay empty and are filled once, later, from the engine own causal 09:30 state. The Strong threshold comes ONLY from prior fixed-clock sessions
+    /// (never from adaptive-v1 rolling states); with too few of them the threshold stays null and Strong/Weak is uncalibrated.
+    /// </summary>
+    async Task<AdaptiveObserverSessionContext?> TryCreateFixedAsync(
+        NiftySignalDbContext source, AdaptiveObserverDbContext observer, DateOnly day, DateTimeOffset nowUtc, CancellationToken ct)
+    {
+        var openUtc = ToUtc(day, MarketOpen);
+        if (nowUtc < openUtc)
+        {
+            return null;
+        }
+
+        var future = await source.Instruments.AsNoTracking()
+            .Where(i => i.AsOfDate == day && i.Underlying == "NIFTY" && i.InstrumentType == InstrumentType.Future)
+            .OrderBy(i => i.ExpiryDate).FirstOrDefaultAsync(ct);
+        if (future is null)
+        {
+            logger.LogInformation("Adaptive observer: NIFTY future is not resolved yet for {TradeDate}", day);
+            return null;
+        }
+
+        var optionRows = await source.Instruments.AsNoTracking()
+            .Where(i => i.AsOfDate == day && i.Underlying == "NIFTY" && i.InstrumentType == InstrumentType.Option && i.ExpiryDate != null && i.StrikePrice != null)
+            .OrderBy(i => i.ExpiryDate).ThenBy(i => i.StrikePrice).ToListAsync(ct);
+        var weeklyExpiry = optionRows.Select(x => x.ExpiryDate!.Value).Distinct().OrderBy(x => x).FirstOrDefault();
+        if (weeklyExpiry == default)
+        {
+            logger.LogInformation("Adaptive observer: weekly NIFTY options are not resolved yet for {TradeDate}", day);
+            return null;
+        }
+
+        var optionDescriptors = optionRows.Where(x => x.ExpiryDate == weeklyExpiry).Select(ToDescriptor).ToList();
+        var (strongThreshold, priorCount) = await FixedClockStrongThresholdAsync(observer, day, ct);
+        var riskFreeRate = pricing.CurrentValue.RiskFreeRate;
+        var build = BuildIdentity.Current();
+        var row = new AdaptiveSessionStateRow
+        {
+            TradeDate = day,
+            ModelVersion = AdaptiveFixedClockV1.ModelVersion,
+            SourceBranch = build.SourceBranch,
+            SourceCommitSha = build.CommitSha,
+            BuildUtc = build.BuildUtc ?? nowUtc,
+            IsHistoricalSeed = false,
+            FutureToken = future.Token,
+            FutureSymbol = future.TradingSymbol,
+            FutureExpiry = future.ExpiryDate ?? day,
+            LotSize = future.LotSize,
+            RiskFreeRate = riskFreeRate,
+            OptionUniverseJson = JsonSerializer.Serialize(optionDescriptors),
+            OpeningWindowStartUtc = openUtc,
+            OpeningWindowEndUtc = ToUtc(day, SelectionTime),     // the 09:30 residual-anchor / signal boundary, NOT a bar-size input
+            OpeningVolume = 0,
+            UsesMedianOpeningFallback = false,
+            ObservationStartUtc = openUtc,
+            EstimatorName = AdaptiveFixedClockV1.EstimatorName,
+            BaseBarVolume = AdaptiveFixedClockV1.BarVolume,
+            RollingWindowBars = AdaptiveFixedClockV1.RollingWindowBars,
+            RollingWindowVolume = AdaptiveFixedClockV1.BarVolume * AdaptiveFixedClockV1.RollingWindowBars,
+            StrongQuantile = AdaptiveWeak2Classifier.StrongQuantile,
+            StrongThreshold = strongThreshold,
+            StrongThresholdPriorStateCount = priorCount,
+            WeeklyOptionExpiry = weeklyExpiry,
+            CreatedAtUtc = nowUtc,
+        };
+
+        await using var transaction = await observer.Database.BeginTransactionAsync(ct);
+        observer.Sessions.Add(row);
+        await observer.SaveChangesAsync(ct);
+        observer.Runtime.Add(new AdaptiveObserverRuntimeRow { SessionId = row.Id, RuntimeStatus = AdaptiveRuntimeStatus.Calibrating, LastHeartbeatUtc = nowUtc });
+        await observer.SaveChangesAsync(ct);
+        await transaction.CommitAsync(ct);
+
+        logger.LogInformation(
+            "Adaptive fixed-clock session frozen for {TradeDate}: base={BaseVolume}, strong={StrongThreshold} (prior fixed-session states={Prior}), source={Branch}@{Sha}",
+            day, row.BaseBarVolume, strongThreshold, priorCount, row.SourceBranch, row.SourceCommitSha);
+        return ContextOfFixed(row, optionDescriptors, anchor: null);
+    }
+
+    /// <summary>
+    /// The daily Strong threshold of the fixed clock: the frozen Strong quantile of |StrictDeltaRatioTotal| over the rolling states of PRIOR fixed-clock sessions only. Todays data cannot enter
+    /// (prior dates only, frozen into the session row at creation). Returns (null, 0) when fewer than the minimum number of eligible prior sessions exist.
+    /// </summary>
+    internal static async Task<(double? Threshold, int PriorStateCount)> FixedClockStrongThresholdAsync(AdaptiveObserverDbContext observer, DateOnly day, CancellationToken ct)
+    {
+        var priorSessionIds = await observer.Sessions.AsNoTracking()
+            .Where(x => x.ModelVersion == AdaptiveFixedClockV1.ModelVersion && x.TradeDate < day && (!x.IsHistoricalSeed || x.OpeningCoverageMinutes == 15))
+            .Select(x => x.Id).ToArrayAsync(ct);
+        if (priorSessionIds.Length < AdaptiveFixedClockV1.MinimumPriorSessionsForStrongThreshold)
+        {
+            return (null, 0);
+        }
+
+        var ratios = await observer.RollingStates.AsNoTracking()
+            .Where(x => priorSessionIds.Contains(x.SessionId)).Select(x => Math.Abs(x.StrictDeltaRatioTotal)).ToListAsync(ct);
+        return ratios.Count == 0 ? (null, 0) : (AdaptiveWeak2Classifier.ComputeStrongThreshold(ratios), ratios.Count);
+    }
+
+    static AdaptiveObserverSessionContext ContextOfFixed(AdaptiveSessionStateRow row, IReadOnlyList<ObserverOptionInstrument> options, OptionResidualAnchor? anchor) =>
+        new(row,
+            new AdaptiveSessionDefinition(row.TradeDate, row.FutureToken, row.FutureSymbol, row.FutureExpiry, row.LotSize, row.BaseBarVolume, row.RollingWindowBars),
+            row.WeeklyOptionExpiry ?? throw new InvalidOperationException($"Adaptive session {row.Id} has no weekly option expiry."),
+            options,
+            anchor,
+            row.OpeningWindowEndUtc);                 // actionable / residual evaluation starts at 09:30; bars before it are still observed and persisted
+
     async Task<AdaptiveObserverSessionContext> LoadContextAsync(
         NiftySignalDbContext source,
         AdaptiveObserverDbContext observer,
         AdaptiveSessionStateRow row,
         CancellationToken ct)
     {
-        if (row.OpeningVolume <= 0 && !row.UsesMedianOpeningFallback)
+        var isFixed = AdaptiveFixedClockV1.IsFixedClock(row.ModelVersion);
+        if (!isFixed && row.OpeningVolume <= 0 && !row.UsesMedianOpeningFallback)
             throw new InvalidOperationException($"Adaptive session {row.Id} has an invalid zero opening estimate; it cannot be silently refrozen. Review and rebuild this session explicitly.");
         var expiry = row.WeeklyOptionExpiry
             ?? throw new InvalidOperationException($"Adaptive session {row.Id} has no weekly option expiry.");
@@ -315,6 +434,11 @@ public sealed class AdaptiveSessionCoordinator(
                     calls,
                     puts);
             }
+        }
+
+        if (isFixed)
+        {
+            return ContextOfFixed(row, options, anchor);
         }
 
         return new AdaptiveObserverSessionContext(

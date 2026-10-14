@@ -42,6 +42,9 @@ public static class RatioFormat
 
     /// <summary>Colour class that preserves the visual sign of a direction / delta cell.</summary>
     public static string SignClass(RatioPart p) => p.Raw is > 0d ? "val-pos" : p.Raw is < 0d ? "val-neg" : string.Empty;
+
+    /// <summary>Sign only: "pos", "neg", "zero" or "none" (unavailable). No magnitude threshold exists anywhere.</summary>
+    public static string SignName(RatioPart p) => p.Raw is not { } r || !double.IsFinite(r) ? "none" : r > 0d ? "pos" : r < 0d ? "neg" : "zero";
 }
 
 /// <summary>Aggregation of the VISIBLE rows into the AVG row. Ratios are SUM(numerator) / SUM(denominator), never an average of percentages.</summary>
@@ -116,7 +119,7 @@ public static class FuturesRatios
 /// <summary>One fixed-strike row's direction metrics (CE, PE and the combined direction), each as a <see cref="RatioPart"/>.</summary>
 public sealed record SideDirection(RatioPart Ce, RatioPart Pe, RatioPart Direction);
 
-public sealed record CoreDirectionRow(SideDirection Price, SideDirection Strict, SideDirection Enriched, SideDirection Oi, SideDirection MicroDev, SideDirection Ofi);
+public sealed record CoreDirectionRow(SideDirection Price, SideDirection RollPrice, SideDirection Strict, SideDirection Enriched, SideDirection Oi, SideDirection MicroDev, SideDirection Ofi);
 
 public sealed record OptionContextRow(SideDirection Iv, SideDirection Activity);
 
@@ -154,8 +157,21 @@ public static class OptionDirectionRatios
         var enriched = DeltaOverBase(ce?.EnrichedDelta, EnrichedTotal(ce), pe?.EnrichedDelta, EnrichedTotal(pe), 1d);
         // Open interest is the one metric whose direction is PE - CE (put build-up is the bullish reading).
         var oi = DeltaOverBase(ce?.OiDelta, Pos(ce?.OiStart) ? ce!.OiStart : null, pe?.OiDelta, Pos(pe?.OiStart) ? pe!.OiStart : null, -1d);
-        return new CoreDirectionRow(price, strict, enriched, oi, MicroDev(ce, pe), Ofi(ce, pe));
+        return new CoreDirectionRow(price, RollPriceOf(null, null), strict, enriched, oi, MicroDev(ce, pe), Ofi(ce, pe));
     }
+
+    /// <summary>
+    /// Fixed-strike CORE DIRECTION row including the one rolling family that belongs to the primary view: Roll ΔPx, computed from the SAME exact contracts over the rolling window
+    /// (never the moving band's rolling value). CE/PE ratio = roll delta / rolling-start price (start must be &gt; 0); Direction = CE - PE over the combined rolling-start prices.
+    /// </summary>
+    public static CoreDirectionRow Core(FixedStrikeRow row)
+    {
+        var core = Core(row.Ce, row.Pe);
+        return core with { RollPrice = RollPriceOf(row.CeRoll, row.PeRoll) };
+    }
+
+    static SideDirection RollPriceOf(RollPrice? ce, RollPrice? pe) =>
+        DeltaOverBase(ce?.Delta, Pos(ce?.StartPrice) ? ce!.StartPrice : null, pe?.Delta, Pos(pe?.StartPrice) ? pe!.StartPrice : null, 1d);
 
     static RatioPart MicroSide(AdaptiveOptionStrikeBarRow? r)
     {

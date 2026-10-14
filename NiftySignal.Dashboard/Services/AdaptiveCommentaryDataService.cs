@@ -31,7 +31,7 @@ public sealed class AdaptiveCommentaryDataService(IDbContextFactory<AdaptiveObse
             await using var db = await dbFactory.CreateDbContextAsync(ct);
             var today = DateOnly.FromDateTime(DateTimeOffset.UtcNow.ToOffset(IstOffset).DateTime);
             var session = await db.Sessions.AsNoTracking()
-                .Where(x => x.TradeDate == today && x.ModelVersion == OpeningVolumeProjectionV1.ModelVersion)
+                .Where(x => x.TradeDate == today && (x.ModelVersion == OpeningVolumeProjectionV1.ModelVersion || x.ModelVersion == AdaptiveFixedClockV1.ModelVersion))
                 .OrderByDescending(x => x.Id).FirstOrDefaultAsync(ct);
             if (session is null) return new AdaptiveCommentaryPanelModel(null, null, []);
 

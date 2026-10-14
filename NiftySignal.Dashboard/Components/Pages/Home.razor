@@ -11,10 +11,14 @@
 
     @* Existing access-token controls and Live Quote remain on the primary page unchanged.
        The adaptive observer starts below them. *@
+    @* Live Quote: a direct child of the shell so it can stay pinned while the whole page scrolls (sticky only works within its parent). *@
+    <LiveQuotePanel />
+
     <div class="dashboard-grid">
         <FlatTradeLoginPanel />
-        <LiveQuotePanel />
     </div>
+
+    <ToastHost />
 
     <CommentaryPanel />
 

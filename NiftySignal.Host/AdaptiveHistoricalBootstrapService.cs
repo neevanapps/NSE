@@ -83,6 +83,148 @@ public sealed class AdaptiveHistoricalBootstrapService(
             throw new InvalidOperationException($"Adaptive history is incomplete: required frozen discovery sessions missing: {string.Join(", ", missingDiscovery)}. Daily strong threshold will not be frozen from a partial history.");
     }
 
+
+    /// <summary>
+    /// Rebuilds the prior trading days on the FIXED 13,650-contract clock from the same persisted raw futures ticks, so the daily Strong threshold of the fixed clock is calibrated only from
+    /// fixed-clock distributions (never from adaptive-v1 rolling states). Idempotent: a day that already has a fixed-clock session is skipped; a day that cannot be rebuilt completely
+    /// (incomplete 09:15-09:30 coverage, too few bars) is skipped and does not calibrate. Failures never stop the live observer: with too few eligible days the threshold stays null (uncalibrated).
+    /// </summary>
+    public async Task<int> EnsurePriorFixedSessionsAsync(
+        NiftySignalDbContext source,
+        AdaptiveObserverDbContext observer,
+        DateOnly beforeDay,
+        CancellationToken ct)
+    {
+        var candidateDays = (await source.Instruments.AsNoTracking()
+            .Where(x => x.Underlying == "NIFTY" && x.InstrumentType == InstrumentType.Future && x.AsOfDate < beforeDay)
+            .Select(x => x.AsOfDate).Distinct().OrderBy(x => x).ToListAsync(ct))
+            .TakeLast(AdaptiveFixedClockV1.MaxHistoryDaysToRebuild).ToList();
+        var existing = (await observer.Sessions.AsNoTracking()
+            .Where(x => x.ModelVersion == AdaptiveFixedClockV1.ModelVersion && x.TradeDate < beforeDay)
+            .Select(x => x.TradeDate).ToListAsync(ct)).ToHashSet();
+
+        var seeded = 0;
+        foreach (var day in candidateDays)
+        {
+            if (existing.Contains(day))
+            {
+                continue;
+            }
+
+            try
+            {
+                if (await SeedFixedOneAsync(source, observer, day, ct))
+                {
+                    seeded++;
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                observer.ChangeTracker.Clear();
+                logger.LogWarning(ex, "Adaptive fixed-clock history skipped {TradeDate}.", day);
+            }
+        }
+
+        return seeded;
+    }
+
+    async Task<bool> SeedFixedOneAsync(NiftySignalDbContext source, AdaptiveObserverDbContext observer, DateOnly day, CancellationToken ct)
+    {
+        var future = await source.Instruments.AsNoTracking()
+            .Where(x => x.AsOfDate == day && x.Underlying == "NIFTY" && x.InstrumentType == InstrumentType.Future)
+            .OrderBy(x => x.ExpiryDate).FirstOrDefaultAsync(ct);
+        if (future is null)
+        {
+            return false;
+        }
+
+        var openUtc = ToUtc(day, Open);
+        var cutoffUtc = ToUtc(day, Cutoff);
+        var clean = await tickReader.ReadCleanSessionAsync(source, day, new[] { future.Token }, ToUtc(day, Close), ct);
+        var ticks = clean.Select(x => x.Tick).Where(x => x.AvailableAt >= openUtc).ToArray();      // the clock starts at 09:15, exactly like the live engine
+        if (ticks.Length < 2)
+        {
+            return false;
+        }
+
+        var coveredMinutes = AdaptiveOpeningCoverage.CoveredMinutes(ticks, openUtc, cutoffUtc);
+        if (coveredMinutes != 15)
+        {
+            logger.LogWarning("Adaptive fixed-clock history {TradeDate}: incomplete 09:15-09:30 coverage; excluded from calibration.", day);
+            return false;
+        }
+
+        var definition = new AdaptiveSessionDefinition(day, future.Token, future.TradingSymbol, future.ExpiryDate ?? day, future.LotSize, AdaptiveFixedClockV1.BarVolume, AdaptiveFixedClockV1.RollingWindowBars);
+        var enricher = new AdaptiveTradeFlowEnricher();
+        var builder = new ExactAdaptiveFuturesBarBuilder(definition);
+        foreach (var tick in ticks)
+        {
+            builder.Add(enricher.Process(tick));
+        }
+
+        var completeBars = builder.Bars.Where(x => x.IsComplete).ToArray();
+        if (completeBars.Length < definition.RollingWindowBars)
+        {
+            logger.LogWarning("Adaptive fixed-clock history {TradeDate}: only {Bars} complete bars; not seeding.", day, completeBars.Length);
+            return false;
+        }
+
+        var flow = AdaptiveFlowEvolutionTracker.Build(completeBars);
+        var (strongThreshold, priorCount) = await AdaptiveSessionCoordinator.FixedClockStrongThresholdAsync(observer, day, ct);
+        if (strongThreshold.HasValue)
+        {
+            AdaptiveWeak2Classifier.Apply(flow, strongThreshold.Value);
+        }
+
+        var build = BuildIdentity.Current();
+        await using var tx = await observer.Database.BeginTransactionAsync(ct);
+        var session = new AdaptiveSessionStateRow
+        {
+            TradeDate = day,
+            ModelVersion = AdaptiveFixedClockV1.ModelVersion,
+            SourceBranch = build.SourceBranch,
+            SourceCommitSha = build.CommitSha,
+            BuildUtc = build.BuildUtc ?? DateTimeOffset.UtcNow,
+            IsHistoricalSeed = true,
+            FutureToken = future.Token,
+            FutureSymbol = future.TradingSymbol,
+            FutureExpiry = future.ExpiryDate ?? day,
+            LotSize = future.LotSize,
+            OpeningWindowStartUtc = openUtc,
+            OpeningWindowEndUtc = cutoffUtc,
+            OpeningCoverageMinutes = coveredMinutes,
+            ObservationStartUtc = openUtc,
+            EstimatorName = AdaptiveFixedClockV1.EstimatorName,
+            BaseBarVolume = AdaptiveFixedClockV1.BarVolume,
+            RollingWindowBars = definition.RollingWindowBars,
+            RollingWindowVolume = definition.RollingWindowVolume,
+            StrongQuantile = AdaptiveWeak2Classifier.StrongQuantile,
+            StrongThreshold = strongThreshold,
+            StrongThresholdPriorStateCount = priorCount,
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+        };
+        observer.Sessions.Add(session);
+        await observer.SaveChangesAsync(ct);
+        observer.RollingStates.AddRange(flow.Where(x => x.Rolling is not null).Select(x => MapRolling(session.Id, x)));
+        observer.Runtime.Add(new AdaptiveObserverRuntimeRow
+        {
+            SessionId = session.Id,
+            RuntimeStatus = AdaptiveRuntimeStatus.Closed,
+            LastHeartbeatUtc = DateTimeOffset.UtcNow,
+            LastCompletedBarSeq = completeBars[^1].BarSeq,
+            CurrentPartialBarVolume = 0,
+        });
+        await observer.SaveChangesAsync(ct);
+        await tx.CommitAsync(ct);
+        observer.ChangeTracker.Clear();
+
+        logger.LogInformation(
+            "Adaptive fixed-clock history seeded {TradeDate}: ticks={Ticks}, bars={Bars}, rolling={Rolling}, strong={Strong} (prior states {Prior})",
+            day, ticks.Length, completeBars.Length, flow.Count(x => x.Rolling is not null), strongThreshold, priorCount);
+        return true;
+    }
+
     async Task<bool> SeedOneAsync(
         NiftySignalDbContext source,
         AdaptiveObserverDbContext observer,
