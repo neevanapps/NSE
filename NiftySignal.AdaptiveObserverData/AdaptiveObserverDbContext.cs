@@ -23,6 +23,7 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
     public DbSet<AdaptiveCommentaryRuntimeRow> CommentaryRuntime => Set<AdaptiveCommentaryRuntimeRow>();
     public DbSet<AdaptiveCommentaryNotificationJobRow> CommentaryNotificationJobs => Set<AdaptiveCommentaryNotificationJobRow>();
     public DbSet<AdaptiveOptionsSupplementalRow> OptionsSupplemental => Set<AdaptiveOptionsSupplementalRow>();
+    public DbSet<AdaptiveOptionStrikeBarRow> OptionStrikeBars => Set<AdaptiveOptionStrikeBarRow>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -205,6 +206,17 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
             e.Property(x => x.ActivePhase).HasConversion<string>().HasMaxLength(16);
             e.Property(x => x.ActiveSupportingFamilies).HasMaxLength(128);
             e.Property(x => x.CommentaryVersion).HasMaxLength(32);
+            e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
+        });
+        modelBuilder.Entity<AdaptiveOptionStrikeBarRow>(e =>
+        {
+            e.ToTable("adaptive_option_strike_bars");
+            e.HasIndex(x => new { x.SessionId, x.BarSeq, x.Token, x.MetricsVersion }).IsUnique();
+            // the fixed-strike history query: one contract pair over the latest bars of a session
+            e.HasIndex(x => new { x.SessionId, x.Expiry, x.Strike, x.Side, x.BarSeq });
+            e.Property(x => x.MetricsVersion).HasMaxLength(64);
+            e.Property(x => x.Token).HasMaxLength(64);
+            e.Property(x => x.TradingSymbol).HasMaxLength(128);
             e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
         });
         modelBuilder.Entity<AdaptiveOptionsSupplementalRow>(e =>

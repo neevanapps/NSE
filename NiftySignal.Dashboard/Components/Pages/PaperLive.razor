@@ -4,6 +4,7 @@
 @implements IDisposable
 @using NiftySignal.Dashboard.Services
 @inject PaperLiveDataService Data
+@inject Npt1LiveQuotes Quotes
 
 @* READ-ONLY view of the live PAPER trading path (docs/TRADING_ENGINE_PHASE1_CONTRACT.md section B.7). There is no button, form or command on this page: it cannot buy, sell, cancel,
    kill or change anything. Everything shown is read from the durable trading ledger. *@
@@ -14,7 +15,7 @@
     <div style="padding: 4px 0 12px;">
         <a href="/" class="login-link">&larr; Back to dashboard</a>
     </div>
-    <h1 style="font-size:20px;">Paper trading <span class="badge badge-neutral">PAPER ONLY - read-only</span></h1>
+    <h1 style="font-size:20px;">NPT1 PAPER — TODAY <span class="badge badge-neutral">PAPER ONLY - read-only</span></h1>
 
     @if (!Data.Configured)
     {
@@ -32,6 +33,102 @@
     {
         var s = _view.Status;
         var stale = !s.Completed && s.LastStepEngineTime is { } last && DateTimeOffset.UtcNow - last > TimeSpan.FromMinutes(2);
+
+        @if (_today is { } td)
+        {
+            var now = DateTimeOffset.UtcNow;
+            var running = PaperTodayProjection.Running(td.Open, Quotes.Snapshot(), now);
+            <div class="panel" data-testid="paper-header">
+                <div class="paper-header-line">
+                    <b>@td.Header.TradeDate.ToString("dd-MMM-yyyy")</b>
+                    <span>M1: <b class="@(td.Header.M1Status == "LIVE" ? "paper-live-ok" : "paper-live-warn")">@td.Header.M1Status</b></span>
+                    <span>Bar: <b>@(td.Header.Bar?.ToString() ?? "—")</b></span>
+                    <span>Capital: <b>@Rupees(td.Header.Capital)</b></span>
+                    <span>Open exposure: <b>@Rupees(td.Header.OpenExposure)</b></span>
+                    <span>Integrity: <b>@td.Header.Integrity</b></span>
+                </div>
+                <div class="paper-strategy-states" data-testid="paper-strategy-states">
+                    @foreach (var row in td.Strategies)
+                    {
+                        <span class="badge badge-neutral">@ShortName(row.StrategyId) &nbsp; @row.State</span>
+                    }
+                </div>
+            </div>
+
+            <div class="panel" data-testid="running-trades">
+                <div class="panel-title">RUNNING TRADES <span class="mono text-dim">@running.Count</span></div>
+                @if (running.Count == 0)
+                {
+                    <div class="text-faint" style="font-size:13px;">No running trades.</div>
+                }
+                else
+                {
+                    <div class="scroll-x"><table class="data-table">
+                        <thead><tr><th>Strategy</th><th>Side</th><th>Strike</th><th>Symbol</th><th>Entry time</th><th>Entry price</th><th>Bid</th><th>Ask</th><th>LTP</th><th>Qty</th>
+                            <th title="Tick-level display value = (current bid - entry price) x quantity. It is not stored and does not change the strategy ledger.">Live P&amp;L @@ Bid</th>
+                            <th title="MFE / MAE follow the tested bar-end strategy definition (not tick level).">MFE</th><th>MAE</th><th>Holding</th><th>Quote age</th><th>Exit pending</th></tr></thead>
+                        <tbody>
+                        @foreach (var r in running)
+                        {
+                            <tr data-token="@r.Token">
+                                <td>@ShortName(r.StrategyId)</td><td>@r.Side</td><td>@r.Strike</td><td>@r.Symbol</td><td>@Ist(r.EntryAt)</td><td>@Px(r.EntryPrice)</td>
+                                <td>@Px(r.Bid)</td><td>@Px(r.Ask)</td><td>@Px(r.Ltp)</td><td>@r.Quantity</td>
+                                <td class="@PnlClass(r.LivePnlAtBid)" data-testid="live-pnl">@Money(r.LivePnlAtBid)</td>
+                                <td>@Money(r.Mfe)</td><td>@Money(r.Mae)</td>
+                                <td>@Span(r.HoldingTime)</td>
+                                <td>@(r.QuoteAge is { } age ? Span(age) : "no quote")</td>
+                                <td>@(r.ExitPending ? "YES" : "—")</td>
+                            </tr>
+                        }
+                        </tbody>
+                    </table></div>
+                    <div class="text-faint" style="font-size:12px; margin-top:4px;">Live P&amp;L is a tick-level display value at the executable bid. MFE / MAE follow the tested bar-end strategy definition.</div>
+                }
+            </div>
+
+            <div class="panel" data-testid="completed-trades">
+                <div class="panel-title">TODAY'S COMPLETED TRADES <span class="mono text-dim">@td.Completed.Count</span></div>
+                @if (td.Completed.Count == 0)
+                {
+                    <div class="text-faint" style="font-size:13px;">No completed trades today.</div>
+                }
+                else
+                {
+                    <div class="scroll-x"><table class="data-table">
+                        <thead><tr><th>Strategy</th><th>Side</th><th>Strike</th><th>Symbol</th><th>Entry time</th><th>Entry price</th><th>Exit time</th><th>Exit price</th><th>Qty</th><th>Exit reason</th><th>Gross</th><th>Fees</th><th>Net</th><th>MFE</th><th>MAE</th></tr></thead>
+                        <tbody>
+                        @foreach (var c in td.Completed)
+                        {
+                            <tr>
+                                <td>@ShortName(c.StrategyId)</td><td>@c.Side</td><td>@c.Strike</td><td>@c.Symbol</td><td>@Ist(c.EntryAt)</td><td>@Px(c.EntryPrice)</td><td>@Ist(c.ExitAt)</td><td>@Px(c.ExitPrice)</td>
+                                <td>@c.Quantity</td><td>@c.ExitReason</td><td>@Money(c.Gross)</td><td>@Money(c.Fees)</td><td class="@PnlClass(c.Net)">@Money(c.Net)</td><td>@Money(c.Mfe)</td><td>@Money(c.Mae)</td>
+                            </tr>
+                        }
+                        </tbody>
+                    </table></div>
+                }
+            </div>
+
+            <div class="panel" data-testid="strategy-summary">
+                <div class="panel-title">TODAY'S STRATEGY SUMMARY <span class="text-dim" style="font-size:12px;">(each strategy on its own; not a portfolio result)</span></div>
+                <table class="data-table">
+                    <thead><tr><th>Strategy</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Closed Net</th><th>Current state</th></tr></thead>
+                    <tbody>
+                    @foreach (var row in td.Strategies)
+                    {
+                        <tr><td>@ShortName(row.StrategyId)</td><td>@row.Trades</td><td>@row.Wins</td><td>@row.Losses</td><td class="@PnlClass(row.ClosedNet)">@Money(row.ClosedNet)</td><td>@row.State</td></tr>
+                    }
+                    </tbody>
+                </table>
+            </div>
+        }
+        else
+        {
+            <div class="panel"><div class="text-faint" style="font-size:13px;">No NPT1 paper run is recorded for today.</div></div>
+        }
+
+        <details class="panel paper-diagnostics" data-testid="paper-diagnostics">
+        <summary class="panel-title" style="cursor:pointer;">Diagnostics</summary>
         <div class="panel">
             <div class="panel-title">Engine status <span class="mono text-dim">@s.RunId</span></div>
             @foreach (var p in s.Problems)
@@ -181,11 +278,15 @@
                 </tbody>
             </table></div>
         </div>
+        </details>
     }
 </div>
 
 @code {
     private PaperLiveView? _view;
+    private PaperTodayView? _today;
+    private System.Threading.Timer? _uiTimer;
+    private int _renderPending;
     private Npt1View? _npt1;
     private string? _error;
     private System.Threading.Timer? _timer;
@@ -193,6 +294,10 @@
     protected override async Task OnInitializedAsync()
     {
         await RefreshAsync();
+        Quotes.QuoteUpdated += OnQuote;
+        Quotes.TradesChanged += OnTradesChanged;
+        // age / holding-time labels only: no data access
+        _uiTimer = new System.Threading.Timer(_ => { _ = InvokeAsync(StateHasChanged); }, null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
         _timer = new System.Threading.Timer(async _ => { await InvokeAsync(async () => { await RefreshAsync(); StateHasChanged(); }); }, null, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5));
     }
 
@@ -200,8 +305,12 @@
     {
         try
         {
+            var today = TodayIst();
             _view = await Data.LoadLatestAsync();
             _npt1 = _view is null ? null : await Data.LoadNpt1Async(_view);
+            _today = _view is null ? null : PaperTodayProjection.Build(_view, _npt1, today, DateTimeOffset.UtcNow);
+            // The durable ledger decides which tokens are held; live quotes then flow in from the existing tick push for exactly those tokens.
+            Quotes.SetWatched(_today?.Open.Select(p => p.Token) ?? []);
             _error = null;
         }
         catch (Exception e)
@@ -216,5 +325,38 @@
 
     private static string Num(decimal? value) => value is { } v ? v.ToString("0.00") : "-";
 
-    public void Dispose() => _timer?.Dispose();
+    private static DateOnly TodayIst() => DateOnly.FromDateTime(DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromHours(5.5)).Date);
+
+    // Ticks of a held contract can arrive many times a second: coalesce them into at most one render per 250 ms.
+    private void OnQuote()
+    {
+        if (Interlocked.Exchange(ref _renderPending, 1) == 1) return;
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(250);
+            Interlocked.Exchange(ref _renderPending, 0);
+            await InvokeAsync(StateHasChanged);
+        });
+    }
+
+    // A paper trade opened or closed on the Host: re-read the durable open positions now instead of waiting for the 5 s refresh.
+    private void OnTradesChanged() => _ = InvokeAsync(async () => { await RefreshAsync(); StateHasChanged(); });
+
+    private static string ShortName(string strategyId) => strategyId.StartsWith("NPT1-", StringComparison.Ordinal) ? strategyId[5..] : strategyId;
+
+    private static string Rupees(decimal? v) => v is { } x ? "₹" + x.ToString("N0") : "—";
+
+    private static string Px(decimal? v) => v is { } x ? x.ToString("0.00") : "—";
+
+    private static string Span(TimeSpan t) => t.TotalHours >= 1 ? $"{(int)t.TotalHours}h {t.Minutes:00}m" : t.TotalMinutes >= 1 ? $"{(int)t.TotalMinutes}m {t.Seconds:00}s" : $"{t.TotalSeconds:0.0}s";
+
+    private static string PnlClass(decimal? v) => v is > 0m ? "paper-pnl-up" : v is < 0m ? "paper-pnl-down" : string.Empty;
+
+    public void Dispose()
+    {
+        Quotes.QuoteUpdated -= OnQuote;
+        Quotes.TradesChanged -= OnTradesChanged;
+        _timer?.Dispose();
+        _uiTimer?.Dispose();
+    }
 }

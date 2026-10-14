@@ -180,6 +180,120 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
         Status = b.Status,
     };
 
+    /// <summary>
+    /// Per-strike sidecar (option-strike-v1): inserts the bar's rows when none exist, otherwise verifies the stored rows against the recomputed ones and leaves them untouched
+    /// (a mismatch is logged and counted, never overwritten). Failures are swallowed after logging: the core observer and every consumer of the other sidecars are unaffected.
+    /// </summary>
+    public async Task<SupplementalOutcome> PersistOrVerifyStrikesAsync(AdaptiveObserverDbContext db, long sessionId, AdaptiveCompletedBarPackage package, CancellationToken ct)
+    {
+        if (package.OptionStrikes is not { Count: > 0 } strikes)
+        {
+            return SupplementalOutcome.Skipped;
+        }
+
+        var expected = strikes.Select(x => MapStrike(sessionId, package.FutureBar.BarSeq, package.FutureBar.EndAvailableAtUtc, x)).ToList();
+        try
+        {
+            var version = OptionStrikeBarMetrics.MetricsVersion;
+            var existing = await db.OptionStrikeBars.AsNoTracking()
+                .Where(x => x.SessionId == sessionId && x.BarSeq == package.FutureBar.BarSeq && x.MetricsVersion == version)
+                .ToListAsync(ct);
+            if (existing.Count == 0)
+            {
+                db.OptionStrikeBars.AddRange(expected);
+                await db.SaveChangesAsync(ct);
+                return SupplementalOutcome.Inserted;
+            }
+
+            var byToken = existing.ToDictionary(x => x.Token, StringComparer.Ordinal);
+            string? difference = existing.Count != expected.Count ? $"row count {existing.Count} vs {expected.Count}" : null;
+            foreach (var row in expected)
+            {
+                difference ??= byToken.TryGetValue(row.Token, out var stored) ? FirstDifference(stored, row) : $"token {row.Token} missing";
+            }
+
+            if (difference is null)
+            {
+                return SupplementalOutcome.Verified;
+            }
+
+            Interlocked.Increment(ref _mismatches);
+            logger.LogError("Adaptive per-strike projection mismatch (rows left untouched): session={SessionId}, bar={BarSeq}, {Difference}", sessionId, package.FutureBar.BarSeq, difference);
+            return SupplementalOutcome.Mismatch;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                foreach (var row in expected)
+                {
+                    if (db.Entry(row).State != EntityState.Detached)
+                    {
+                        db.Entry(row).State = EntityState.Detached;
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                // The context itself is unusable; nothing more to protect.
+            }
+
+            Interlocked.Increment(ref _failures);
+            logger.LogError(ex, "Adaptive per-strike projection write failed (core observer unaffected): session={SessionId}, bar={BarSeq}", sessionId, package.FutureBar.BarSeq);
+            return SupplementalOutcome.Failed;
+        }
+    }
+
+    public static AdaptiveOptionStrikeBarRow MapStrike(long sessionId, int barSeq, DateTimeOffset endUtc, OptionStrikeBarMetrics m) => new()
+    {
+        SessionId = sessionId,
+        BarSeq = barSeq,
+        MetricsVersion = OptionStrikeBarMetrics.MetricsVersion,
+        EndAvailableAtUtc = endUtc,
+        Expiry = m.Expiry,
+        Strike = m.Strike,
+        Side = m.Side,
+        Token = m.Token,
+        TradingSymbol = m.TradingSymbol,
+        PriceStart = m.PriceStart,
+        PriceEnd = m.PriceEnd,
+        PriceChange = m.PriceChange,
+        TotalQuantity = m.TotalQuantity,
+        StrictBuy = m.StrictBuy,
+        StrictSell = m.StrictSell,
+        StrictUnknown = m.StrictUnknown,
+        StrictDelta = m.StrictDelta,
+        EnrichedBuy = m.EnrichedBuy,
+        EnrichedSell = m.EnrichedSell,
+        EnrichedUnknown = m.EnrichedUnknown,
+        EnrichedDelta = m.EnrichedDelta,
+        TradeUpdates = m.TradeUpdates,
+        OiStart = m.OiStart,
+        OiEnd = m.OiEnd,
+        OiDelta = m.OiDelta,
+        IvStart = m.IvStart,
+        IvEnd = m.IvEnd,
+        IvChange = m.IvChange,
+        ActivityPerSecond = m.ActivityPerSecond,
+        QuoteAgeEndSeconds = m.QuoteAgeEndSeconds,
+    };
+
+    static string? FirstDifference(AdaptiveOptionStrikeBarRow a, AdaptiveOptionStrikeBarRow b)
+    {
+        string? D(string name, double? x, double? y) => (x is null) != (y is null) || (x is { } xv && y is { } yv && Math.Abs(xv - yv) > DoubleTolerance) ? $"{a.Token}.{name} {x} vs {y}" : null;
+        string? L(string name, long? x, long? y) => x != y ? $"{a.Token}.{name} {x} vs {y}" : null;
+        return D(nameof(a.PriceStart), a.PriceStart, b.PriceStart) ?? D(nameof(a.PriceEnd), a.PriceEnd, b.PriceEnd) ?? D(nameof(a.PriceChange), a.PriceChange, b.PriceChange)
+            ?? L(nameof(a.TotalQuantity), a.TotalQuantity, b.TotalQuantity) ?? L(nameof(a.StrictBuy), a.StrictBuy, b.StrictBuy) ?? L(nameof(a.StrictSell), a.StrictSell, b.StrictSell)
+            ?? L(nameof(a.StrictUnknown), a.StrictUnknown, b.StrictUnknown) ?? L(nameof(a.EnrichedBuy), a.EnrichedBuy, b.EnrichedBuy) ?? L(nameof(a.EnrichedSell), a.EnrichedSell, b.EnrichedSell)
+            ?? L(nameof(a.EnrichedUnknown), a.EnrichedUnknown, b.EnrichedUnknown) ?? L(nameof(a.TradeUpdates), a.TradeUpdates, b.TradeUpdates)
+            ?? L(nameof(a.OiStart), a.OiStart, b.OiStart) ?? L(nameof(a.OiEnd), a.OiEnd, b.OiEnd)
+            ?? D(nameof(a.IvStart), a.IvStart, b.IvStart) ?? D(nameof(a.IvEnd), a.IvEnd, b.IvEnd) ?? D(nameof(a.ActivityPerSecond), a.ActivityPerSecond, b.ActivityPerSecond);
+    }
+
     /// <summary>Same insert-if-missing / verify-if-present contract for the options sidecar.</summary>
     public async Task<SupplementalOutcome> PersistOrVerifyOptionsAsync(
         AdaptiveObserverDbContext db,
@@ -296,6 +410,8 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
     /// </summary>
     public async Task<bool> PersistAndVerifyAsync(AdaptiveObserverDbContext db, AdaptiveSessionStateRow session, AdaptiveCompletedBarPackage package, CancellationToken ct)
     {
+        // The per-strike projection is a display sidecar: its outcome NEVER changes the verification result the commentary / paper path consumes.
+        await PersistOrVerifyStrikesAsync(db, session.Id, package, ct);
         for (var attempt = 0; attempt < 2; attempt++)
         {
             var futures = await PersistOrVerifyFuturesAsync(db, session.Id, package, ct);

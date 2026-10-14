@@ -94,7 +94,8 @@ public sealed class AdaptiveStateRecoveryService(
             context.SignalStartUtc,
             context.Options,
             context.ResidualAnchor,
-            spotToken);
+            spotToken,
+            projectStrikes: true);
 
         var reconciled = 0;
         var replayTriggers = new HashSet<int>();

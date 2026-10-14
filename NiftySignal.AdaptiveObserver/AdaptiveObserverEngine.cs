@@ -36,6 +36,10 @@ public sealed class AdaptiveObserverEngine
     readonly string? _spotToken;
     readonly FuturesBasisTracker _basis = new();
 
+    // Per-strike observational projection (opt-in; read-only over the flow state, changes no core output). Start snapshots are those of the current bar's start boundary.
+    readonly bool _projectStrikes;
+    Dictionary<string, InstrumentFlowSnapshot>? _strikeStart;
+
     BandContext? _currentBand;
     IReadOnlyList<double>? _previousBandStrikes;
     DateTimeOffset? _lastAvailableAt;
@@ -55,8 +59,10 @@ public sealed class AdaptiveObserverEngine
         DateTimeOffset signalStartUtc,
         IReadOnlyList<ObserverOptionInstrument> options,
         OptionResidualAnchor? residualAnchor,
-        string? spotToken = null)
+        string? spotToken = null,
+        bool projectStrikes = false)
     {
+        _projectStrikes = projectStrikes;
         _spotToken = string.IsNullOrWhiteSpace(spotToken) ? null : spotToken;
         _session = session;
         _optionExpiry = optionExpiry;
@@ -148,6 +154,7 @@ public sealed class AdaptiveObserverEngine
         if (!hadStarted && _futureBars.PartialBarStartedAtUtc.HasValue && _currentBand is null)
         {
             _currentBand = SelectBandContext(_futureBars.PartialBarStartedAtUtc.Value, tick.Last);
+            CaptureStrikeStart();
         }
 
         if (completed.Count == 0)
@@ -185,9 +192,30 @@ public sealed class AdaptiveObserverEngine
             // The supplemental needs the NEXT selection's synthetic underlying (the same instant as the bar end) for end-of-bar IV,
             // so it is attached after the core package and the next band context exist. It reads state; it changes none.
             packages[^1] = packages[^1] with { OptionsSupplemental = BuildOptionsSupplemental(bar, finishedBand, optionBand, _currentBand) };
+            if (_projectStrikes)
+            {
+                var strikeStart = _strikeStart;
+                packages[^1] = packages[^1] with
+                {
+                    OptionStrikes = AdaptiveStrikeProjection.Build(
+                        _options, bar.StartAvailableAtUtc, bar.EndAvailableAtUtc, bar.DurationSeconds, _riskFreeRate,
+                        finishedBand?.Selection?.SyntheticUnderlying, _currentBand?.Selection?.SyntheticUnderlying,
+                        token => strikeStart is not null && strikeStart.TryGetValue(token, out var s) ? s : null,
+                        _optionFlow.Snapshot),
+                };
+                CaptureStrikeStart();
+            }
         }
 
         return packages;
+    }
+
+    void CaptureStrikeStart()
+    {
+        if (_projectStrikes)
+        {
+            _strikeStart = _options.ToDictionary(o => o.Token, o => _optionFlow.Snapshot(o.Token), StringComparer.Ordinal);
+        }
     }
 
     OptionsSupplementalBar BuildOptionsSupplemental(ExactAdaptiveBar bar, BandContext? start, OptionBandBarResult band, BandContext? next) =>

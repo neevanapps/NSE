@@ -60,6 +60,7 @@ public sealed class Npt1M1Worker(
     M1SessionBuilder builder,
     EfFrameStore frames,
     Npt1M1Telemetry telemetry,
+    DashboardPushClient dashboardPush,
     ILogger<Npt1M1Worker> logger) : BackgroundService
 {
     private static readonly TimeSpan Ist = TimeSpan.FromHours(5.5);
@@ -89,6 +90,7 @@ public sealed class Npt1M1Worker(
         public int LastBarSeq { get; set; }
         public DateTimeOffset? LastBarEnd { get; set; }
         public double MaxPollMs { get; set; }
+        public int OutputsScanned { get; set; }
     }
 
     public PaperLiveStatus? Status => _coordinator?.Status;
@@ -314,6 +316,8 @@ public sealed class Npt1M1Worker(
             logger.LogInformation("NPT1 M1 replay of {Day} complete: {Rows} rows, {Bars} M1 bars, {Skipped} catch-up groups withheld from the engine.", s.Day, rows, telemetry.BarsProduced, telemetry.GroupsSkippedCatchUp);
         }
 
+        await NotifyTradeChangesAsync(s, ct);
+
         // Every group at or before the stable cutoff has been handled: the paper run may advance its clock (deadlines, the 15:00 terminal protocol).
         s.Feed.OnHeartbeat(now - StableOrderingLag);
         var elapsed = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
@@ -323,6 +327,40 @@ public sealed class Npt1M1Worker(
         {
             s.LastRuntime = now;
             await WriteRuntimeAsync(s, now, elapsed, "Running", null, ct);
+        }
+    }
+
+    /// <summary>
+    /// The existing Host -> Dashboard invalidation (no payload): tells the Dashboard that a paper trade opened or closed so it re-reads the durable open positions at once. Best effort and display only;
+    /// it carries no trading state and never delays or changes the paper run.
+    /// </summary>
+    private async Task NotifyTradeChangesAsync(DaySession s, CancellationToken ct)
+    {
+        var run = _coordinator?.Run;
+        if (run is null)
+        {
+            return;
+        }
+
+        var outputs = run.Engine.Outputs;
+        var changed = false;
+        if (outputs.Count < s.OutputsScanned)
+        {
+            s.OutputsScanned = 0;                                    // the run was rebuilt: scan its outputs again
+            changed = true;
+        }
+
+        for (; s.OutputsScanned < outputs.Count; s.OutputsScanned++)
+        {
+            if (outputs[s.OutputsScanned] is NiftySignal.Trading.Core.Execution.PositionOpened or NiftySignal.Trading.Core.Execution.PositionClosed)
+            {
+                changed = true;
+            }
+        }
+
+        if (changed)
+        {
+            await dashboardPush.PushTradesChangedAsync(ct);
         }
     }
 

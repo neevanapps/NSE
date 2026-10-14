@@ -33,7 +33,9 @@ public sealed record AdaptiveCompletedBarPackage(
     // Supplemental center-contract options observations (sidecar-persisted). Never part of the parity-protected core rows.
     OptionsSupplementalBar? OptionsSupplemental = null,
     // Supplemental futures-minus-spot basis observation with the approved 5-second spot freshness rule (null when the session has no frozen spot instrument).
-    FuturesBasisBar? Basis = null);
+    FuturesBasisBar? Basis = null,
+    // Per-strike observational projection of the frozen weekly option universe (sidecar-persisted; null unless the engine was created with projectStrikes). Never part of the parity-protected core rows.
+    IReadOnlyList<OptionStrikeBarMetrics>? OptionStrikes = null);
 
 public sealed record AdaptivePartialBarStatus(
     long AccumulatedVolume,

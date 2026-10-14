@@ -201,6 +201,87 @@
             }
         </GridSection>
 
+        @if (!CaptureMode)
+        {
+        <GridSection Title="OPTIONS — FIXED STRIKE HISTORY">
+            @if (_catalog is null)
+            {
+                <div class="adaptive-pending">The frozen option universe of this session is not available.</div>
+            }
+            else
+            {
+                <div class="fixed-strike-header" data-testid="fixed-strike-header">
+                    <span>Expiry: <b>@_catalog.Expiry.ToString("dd-MMM-yyyy")</b></span>
+                    <label>
+                        Auto follow center:
+                        <input type="checkbox" disabled="@(!_interactiveReady)" aria-label="Auto follow center" checked="@_sel.AutoFollow" @onchange="OnAutoFollowChanged" />
+                        <b>@(_sel.AutoFollow ? "ON" : "OFF")</b>
+                    </label>
+                    <label>
+                        Selected strike:
+                        <select disabled="@(!_interactiveReady)" aria-label="Selected strike" value="@(_sel.SelectedStrike?.ToString("0"))" @onchange="OnStrikeChosen">
+                            @foreach (var k in _catalog.Strikes)
+                            {
+                                <option value="@k.Strike.ToString("0")" selected="@(_sel.SelectedStrike == k.Strike)">@k.Strike.ToString("0")</option>
+                            }
+                        </select>
+                    </label>
+                    <span>Current center: <b>@FmtStrike(_sel.CurrentCenter)</b></span>
+                </div>
+                @if (_fixed is null)
+                {
+                    <div class="adaptive-pending">@(_sel.SelectedStrike is null ? "Waiting for the first completed bar's center." : $"Strike {FmtStrike(_sel.SelectedStrike)} is not in the frozen option universe.")</div>
+                }
+                else
+                {
+                    <div class="adaptive-note" data-testid="fixed-strike-identity">
+                        Every row below is exactly @_fixed.Expiry.ToString("dd-MMM-yyyy") · strike @FmtStrike(_fixed.Strike) · CE @(_fixed.Contract.CeSymbol ?? "—") · PE @(_fixed.Contract.PeSymbol ?? "—").
+                        A bar without a stored row for this strike shows — (no other strike is ever substituted).
+                    </div>
+                    <div class="adaptive-table-wrap">
+                        <table class="adaptive-table adaptive-table-compact" data-grid="options-fixed-strike" data-strike="@_fixed.Strike.ToString("0")">
+                            <thead>
+                            <tr>
+                                <th>Seq</th><th>End IST</th>
+                                <th>CE Price Δ</th><th>PE Price Δ</th>
+                                <th>CE Strict Δ</th><th>PE Strict Δ</th>
+                                <th>CE Enriched Δ</th><th>PE Enriched Δ</th>
+                                <th>CE OI Δ</th><th>PE OI Δ</th>
+                                <th>CE ΔIV</th><th>PE ΔIV</th>
+                                <th>CE Activity</th><th>PE Activity</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            @foreach (var r in _fixed.Rows)
+                            {
+                                <tr>
+                                    <td class="sticky-col">@r.BarSeq</td>
+                                    <td>@FmtIst(r.EndAvailableAtUtc)</td>
+                                    <td>@FmtSigned(r.Ce?.PriceChange, 2)</td>
+                                    <td>@FmtSigned(r.Pe?.PriceChange, 2)</td>
+                                    <td>@(r.Ce is null ? "—" : FmtSigned(r.Ce.StrictDelta))</td>
+                                    <td>@(r.Pe is null ? "—" : FmtSigned(r.Pe.StrictDelta))</td>
+                                    <td>@(r.Ce is null ? "—" : FmtSigned(r.Ce.EnrichedDelta))</td>
+                                    <td>@(r.Pe is null ? "—" : FmtSigned(r.Pe.EnrichedDelta))</td>
+                                    <td>@FmtSigned(r.Ce?.OiDelta)</td>
+                                    <td>@FmtSigned(r.Pe?.OiDelta)</td>
+                                    <td>@FmtSigned(r.Ce?.IvChange, 2)</td>
+                                    <td>@FmtSigned(r.Pe?.IvChange, 2)</td>
+                                    <td>@Fmt(r.Ce?.ActivityPerSecond, 1)</td>
+                                    <td>@Fmt(r.Pe?.ActivityPerSecond, 1)</td>
+                                </tr>
+                            }
+                            </tbody>
+                        </table>
+                    </div>
+                }
+            }
+        </GridSection>
+        }
+
+        @* The moving ATM±2 aggregate view is kept unchanged as a diagnostic (collapsed by default). Pinned captures (Telegram screenshots) render it open, exactly as before. *@
+        <details class="adaptive-diagnostics @(CaptureMode ? "adaptive-diagnostics-capture" : "")" open="@CaptureMode">
+            <summary>Diagnostics — Dynamic ATM±2 band (moving basket: rows of different centers are different instruments)</summary>
         <GridSection Title="Options — ATM ±2 inside the same futures bar timestamps">
             @if (!ShowDiagnostic)
             {
@@ -413,6 +494,7 @@
             }
             }
         </GridSection>
+        </details>
 
         <GridSection Title="CE / PE theoretical residual — fixed 09:30 diagnostic">
             <div class="adaptive-grid-toolbar">
@@ -548,6 +630,11 @@
     string _optionSide = "BOTH";
     string _measurement = "NOTIONAL";
     string _residualVariant = "BAND";
+    // Fixed-strike Options history: the selection state machine, the frozen strike catalog and the currently displayed history.
+    readonly FixedStrikeSelection _sel = new();
+    FixedStrikeCatalog? _catalog;
+    FixedStrikeHistory? _fixed;
+    long? _selSession;
     readonly SemaphoreSlim _reloadGate = new(1, 1);
     PeriodicTimer? _headerTimer;
     CancellationTokenSource? _cts;
@@ -640,6 +727,7 @@
                 if (_disposed) return;
                 _snapshot = await AdaptiveData.LoadSnapshotAsync(_rowCount, ct);
                 _loadError = null;
+                if (!CaptureMode) await RefreshFixedStrikeAsync(ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
             catch (Exception ex)
@@ -650,6 +738,70 @@
             if (!_disposed) await InvokeAsync(StateHasChanged);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+    }
+
+    /// <summary>Applies a (possibly new) completed bar to the selection state and reloads the WHOLE displayed grid for the selected strike.</summary>
+    async Task RefreshFixedStrikeAsync(CancellationToken ct)
+    {
+        if (_snapshot is null)
+        {
+            _fixed = null;
+            return;
+        }
+
+        if (_selSession != _snapshot.Session.Id)
+        {
+            _sel.Reset();
+            _catalog = FixedStrikeCatalog.FromSession(_snapshot.Session);
+            _selSession = _snapshot.Session.Id;
+        }
+
+        var latest = _snapshot.Options.FirstOrDefault();             // bars are newest first
+        if (latest is not null)
+        {
+            _sel.OnCompletedBar(latest.BarSeq, latest.Call?.CenterStrike ?? latest.Put?.CenterStrike);
+        }
+
+        _sel.EnsureInitialized();
+        await LoadFixedAsync(ct);
+    }
+
+    async Task LoadFixedAsync(CancellationToken ct)
+    {
+        if (_snapshot is null || _catalog is null || _sel.SelectedStrike is not { } strike)
+        {
+            _fixed = null;
+            return;
+        }
+
+        var bars = _snapshot.Futures.Select(x => (x.Bar.BarSeq, x.Bar.EndAvailableAtUtc)).ToList();
+        _fixed = await AdaptiveData.LoadFixedStrikeHistoryAsync(_snapshot.Session.Id, _catalog, strike, bars, ct);
+    }
+
+    async Task OnStrikeChosen(ChangeEventArgs e)
+    {
+        if (!double.TryParse(e.Value?.ToString(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var strike)) return;
+        _sel.SelectManually(strike);                                  // a manual choice turns Auto follow OFF
+        await ReloadFixedAsync();
+    }
+
+    async Task OnAutoFollowChanged(ChangeEventArgs e)
+    {
+        _sel.SetAutoFollow(e.Value is true || string.Equals(e.Value?.ToString(), "true", StringComparison.OrdinalIgnoreCase));
+        await ReloadFixedAsync();
+    }
+
+    async Task ReloadFixedAsync()
+    {
+        try
+        {
+            await _reloadGate.WaitAsync(_cts?.Token ?? CancellationToken.None);
+            try { await LoadFixedAsync(_cts?.Token ?? CancellationToken.None); }
+            catch (Exception ex) when (ex is not OperationCanceledException) { _loadError = $"Fixed-strike read failed: {ex.Message}"; }
+            finally { _reloadGate.Release(); }
+        }
+        catch (OperationCanceledException) { return; }
+        if (!_disposed) await InvokeAsync(StateHasChanged);
     }
 
     IEnumerable<AdaptiveOptionResidualBarRow> SelectedResidualRows =>
