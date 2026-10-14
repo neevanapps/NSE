@@ -181,7 +181,7 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
     };
 
     /// <summary>
-    /// Per-strike sidecar (option-strike-v1): inserts the bar's rows when none exist, otherwise verifies the stored rows against the recomputed ones and leaves them untouched
+    /// Per-strike sidecar (option-strike-v2): inserts the bar's rows when none exist, otherwise verifies the stored rows against the recomputed ones and leaves them untouched
     /// (a mismatch is logged and counted, never overwritten). Failures are swallowed after logging: the core observer and every consumer of the other sidecars are unaffected.
     /// </summary>
     public async Task<SupplementalOutcome> PersistOrVerifyStrikesAsync(AdaptiveObserverDbContext db, long sessionId, AdaptiveCompletedBarPackage package, CancellationToken ct)
@@ -280,6 +280,12 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
         IvChange = m.IvChange,
         ActivityPerSecond = m.ActivityPerSecond,
         QuoteAgeEndSeconds = m.QuoteAgeEndSeconds,
+        TobTimeWeighted = m.TobTimeWeighted,
+        MicroDevTimeWeighted = m.MicroDevTimeWeighted,
+        TobUsableSeconds = m.TobUsableSeconds,
+        NetOfi = m.NetOfi,
+        GrossOfi = m.GrossOfi,
+        OfiTransitions = m.OfiTransitions,
     };
 
     static string? FirstDifference(AdaptiveOptionStrikeBarRow a, AdaptiveOptionStrikeBarRow b)
@@ -291,7 +297,10 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
             ?? L(nameof(a.StrictUnknown), a.StrictUnknown, b.StrictUnknown) ?? L(nameof(a.EnrichedBuy), a.EnrichedBuy, b.EnrichedBuy) ?? L(nameof(a.EnrichedSell), a.EnrichedSell, b.EnrichedSell)
             ?? L(nameof(a.EnrichedUnknown), a.EnrichedUnknown, b.EnrichedUnknown) ?? L(nameof(a.TradeUpdates), a.TradeUpdates, b.TradeUpdates)
             ?? L(nameof(a.OiStart), a.OiStart, b.OiStart) ?? L(nameof(a.OiEnd), a.OiEnd, b.OiEnd)
-            ?? D(nameof(a.IvStart), a.IvStart, b.IvStart) ?? D(nameof(a.IvEnd), a.IvEnd, b.IvEnd) ?? D(nameof(a.ActivityPerSecond), a.ActivityPerSecond, b.ActivityPerSecond);
+            ?? D(nameof(a.IvStart), a.IvStart, b.IvStart) ?? D(nameof(a.IvEnd), a.IvEnd, b.IvEnd) ?? D(nameof(a.ActivityPerSecond), a.ActivityPerSecond, b.ActivityPerSecond)
+            ?? D(nameof(a.TobTimeWeighted), a.TobTimeWeighted, b.TobTimeWeighted) ?? D(nameof(a.MicroDevTimeWeighted), a.MicroDevTimeWeighted, b.MicroDevTimeWeighted)
+            ?? D(nameof(a.TobUsableSeconds), a.TobUsableSeconds, b.TobUsableSeconds) ?? L(nameof(a.NetOfi), a.NetOfi, b.NetOfi) ?? L(nameof(a.GrossOfi), a.GrossOfi, b.GrossOfi)
+            ?? L(nameof(a.OfiTransitions), a.OfiTransitions, b.OfiTransitions);
     }
 
     /// <summary>Same insert-if-missing / verify-if-present contract for the options sidecar.</summary>
@@ -498,6 +507,7 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
         InvalidBookSeconds = m.InvalidBookSeconds,
         TobUsableSeconds = m.TobUsableSeconds,
         MicroDevUsableSeconds = m.MicroDevUsableSeconds,
+        GrossOfi = m.GrossOfi,
     };
 
     static string? FirstDifference<TRow>(TRow actual, TRow expected) where TRow : class

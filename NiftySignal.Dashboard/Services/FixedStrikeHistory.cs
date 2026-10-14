@@ -60,9 +60,9 @@ public static class FixedStrikeProjection
             .Where(r => r.Expiry == catalog.Expiry && r.Strike == contract.Strike
                 && ((r.Side == OptionType.Call && contract.CeToken is not null && r.Token == contract.CeToken)
                     || (r.Side == OptionType.Put && contract.PeToken is not null && r.Token == contract.PeToken))
-                && r.MetricsVersion == OptionStrikeBarMetrics.MetricsVersion)
+                && (r.MetricsVersion == OptionStrikeBarMetrics.MetricsVersion || r.MetricsVersion == OptionStrikeBarMetrics.LegacyMetricsVersion))
             .GroupBy(r => (r.BarSeq, r.Side))
-            .ToDictionary(g => g.Key, g => g.First());
+            .ToDictionary(g => g.Key, g => g.OrderByDescending(r => r.MetricsVersion == OptionStrikeBarMetrics.MetricsVersion).First());   // latest supported version wins, v1 is the fallback
         var rows = bars.OrderByDescending(b => b.BarSeq)
             .Select(b => new FixedStrikeRow(
                 b.BarSeq,

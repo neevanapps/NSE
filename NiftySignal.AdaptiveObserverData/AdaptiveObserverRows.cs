@@ -385,6 +385,8 @@ public sealed class AdaptiveFuturesSupplementalRow
     public double TobUsableSeconds { get; set; }
     /// <summary>Seconds with a usable MicroDev (same condition as TOB; kept separate so the two can diverge in a later version).</summary>
     public double MicroDevUsableSeconds { get; set; }
+    /// <summary>futures-micro-v3: SUM(|OFI event|) over the valid transitions of the bar (denominator of the OFI ratio). Null for v2 rows and when there was no valid transition.</summary>
+    public long? GrossOfi { get; set; }
 }
 
 /// <summary>
@@ -624,4 +626,12 @@ public sealed class AdaptiveOptionStrikeBarRow
     public double? IvChange { get; set; }
     public double? ActivityPerSecond { get; set; }
     public double? QuoteAgeEndSeconds { get; set; }
+
+    // option-strike-v2 only (NULL on v1 rows, and NULL whenever the contract's Level-1 book gave no usable evidence in the bar).
+    public double? TobTimeWeighted { get; set; }
+    public double? MicroDevTimeWeighted { get; set; }
+    public double? TobUsableSeconds { get; set; }
+    public long? NetOfi { get; set; }
+    public long? GrossOfi { get; set; }
+    public int? OfiTransitions { get; set; }
 }

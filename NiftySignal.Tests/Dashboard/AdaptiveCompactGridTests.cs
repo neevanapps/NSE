@@ -479,8 +479,8 @@ public sealed class AdaptiveCompactGridTests
         { ["CaptureMode"] = true, ["CaptureSessionId"] = 1L, ["CaptureBarSeq"] = 12 });
 
         Assert.Equal(3, Regex.Matches(html, "<table[ >]").Count);
-        Assert.Equal(["Seq", "End IST", "Dur s", "Urgency", "Bar ΔPx", "Roll ΔPx", "Strict Δ", "Enriched Δ", "Roll Strict", "Roll Enriched",
-            "|Strict| Δ", "MicroDev", "OFI", "Roll OI Δ", "ΔBasis", "Roll Efficiency", "Evolution", "State"], Headers(html, 0));
+        Assert.Equal(["Seq", "End IST", "Dur s", "Urgency", "Bar ΔPx", "Roll ΔPx", "Strict Δ", "Enriched Δ",
+            "MicroDev", "OFI", "Roll OI Δ", "ΔBasis", "Roll Efficiency", "Evolution", "State"], Headers(html, 0));
         Assert.Equal(["Seq", "End IST", "Center", "Roll?", "CE ΔPx", "PE ΔPx", "CE Roll ΔPx", "PE Roll ΔPx", "CE Strict Δ", "PE Strict Δ",
             "CE Enriched Δ", "PE Enriched Δ", "CE Roll Strict", "PE Roll Strict", "CE OI Δ", "PE OI Δ", "CE Position", "PE Position",
             "CE ΔIV", "PE ΔIV", "IV Skew", "Vol PCR", "Roll Vol PCR"], Headers(html, 1));
@@ -502,10 +502,10 @@ public sealed class AdaptiveCompactGridTests
         var rows = FirstRows(html, 0, 2);
         // Bar 12: zero duration => Urgency unavailable; rolling values from the persisted rolling row.
         // MicroDev / OFI come from the versioned sidecar row for that bar.
-        Assert.Equal(["12", "09:42:00", "0.0", "—", "+1.50", "-7.25", "+123", "-456", "-777", "-888", "-99", "+0.123", "-400", "+4242", "+1.75", "0.500", "Weakening", "Weak2"], rows[0]);
+        Assert.Equal(["12", "09:42:00", "0.0", "—", "+1.50", "-7.25", "123 (12.30)", "-456 (—)", "0.12 (—)", "-400 (—)", "+4242", "+1.75", "0.500", "Weakening", "Weak2"], rows[0]);
         // Bar 11: 1000 / 50s = 20.0 volume per second; it has no sidecar row, so MicroDev / OFI are unavailable (not zero).
         Assert.Equal("20.0", rows[1][3]);
-        Assert.Equal(["—", "—"], rows[1][11..13]);
+        Assert.Equal(["—", "—"], rows[1][8..10]);
     }
 
     [Fact]
@@ -539,8 +539,8 @@ public sealed class AdaptiveCompactGridTests
 
         Assert.Contains("failed replay verification and are withheld", html);
         var futures = FirstRows(html, 0, 1)[0];
-        Assert.Equal(["—", "—"], futures[11..13]);                          // MicroDev / OFI withheld, never shown as stored values or zero
-        Assert.Equal("-777", futures[8]);                                   // core rolling values for the same bar are untouched
+        Assert.Equal(["—", "—"], futures[8..10]);                          // MicroDev / OFI withheld, never shown as stored values or zero
+        Assert.Equal("+4242", futures[10]);                                  // core rolling values for the same bar are untouched
         var options = FirstRows(html, 1, 1)[0];
         Assert.Equal(["—", "—", "—", "—", "—", "—", "—", "—", "—"], options[14..23]);   // options sidecar columns withheld
         Assert.Equal("+321", options[8]);                                   // core band values for the same bar are untouched
@@ -578,8 +578,87 @@ public sealed class AdaptiveCompactGridTests
 
         Assert.Contains("Diagnostic view", html);
         Assert.Equal(3, Regex.Matches(html, "<table[ >]").Count);
-        Assert.Equal(18, Headers(html, 0).Length);
+        Assert.Equal(15, Headers(html, 0).Length);
         Assert.DoesNotContain("Strict ratio", html);                   // diagnostic wide tables are not rendered by default
         Assert.DoesNotContain("Legacy Bridged", html);
+    }
+
+    [Fact]
+    public async Task LiveFixedStrikeView_RendersCoreDirectionAndOptionContext_WithAvgRows_AndKeepsLegacyAtmGridUnderDiagnostics()
+    {
+        var factory = await SeedGridAsync();
+        await using (var db = factory.CreateDbContext())
+        {
+            var session = await db.Sessions.SingleAsync();
+            session.OptionUniverseJson = OptionJson(); session.WeeklyOptionExpiry = Day.AddDays(6);
+            session.TradeDate = DateOnly.FromDateTime(DateTimeOffset.UtcNow.ToOffset(Ist).DateTime);
+            foreach (var seq in new[] { 11, 12 })
+                foreach (var (side, token) in new[] { (OptionType.Call, "CE25000"), (OptionType.Put, "PE25000") })
+                {
+                    var ce = side == OptionType.Call;
+                    db.OptionStrikeBars.Add(new()
+                    {
+                        SessionId = 1, BarSeq = seq, MetricsVersion = OptionStrikeBarMetrics.MetricsVersion, EndAvailableAtUtc = Open930.AddMinutes(seq), Expiry = Day.AddDays(6), Strike = 25000,
+                        Side = side, Token = token, TradingSymbol = token, PriceStart = 100, PriceEnd = ce ? 105 : 96, PriceChange = ce ? 5 : -4, TotalQuantity = ce ? 1000 : 500,
+                        StrictDelta = ce ? 300 : -200, EnrichedBuy = 100, EnrichedSell = 100, EnrichedUnknown = 0, EnrichedDelta = ce ? 50 : -50, OiStart = 10000, OiDelta = ce ? 1000 : 3000,
+                        IvStart = 20, IvChange = ce ? 1 : -1, ActivityPerSecond = ce ? 30 : 10, TobTimeWeighted = ce ? 0.6 : -0.2, MicroDevTimeWeighted = ce ? 0.3 : -0.1, TobUsableSeconds = 40,
+                        NetOfi = ce ? 300 : -100, GrossOfi = ce ? 1000 : 500, OfiTransitions = 3,
+                    });
+                }
+            await db.SaveChangesAsync();
+        }
+
+        var html = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new());
+
+        Assert.Contains("OPTIONS — FIXED STRIKE HISTORY", html);
+        Assert.Contains("data-grid=\"options-core-direction\" data-strike=\"25000\"", html);
+        Assert.Contains("data-grid=\"options-context\" data-strike=\"25000\"", html);
+        Assert.Equal(["Seq", "End IST", "CE Price Δ", "PE Price Δ", "Price Dir", "CE Strict Δ", "PE Strict Δ", "Strict Dir", "CE Enriched Δ", "PE Enriched Δ", "Enriched Dir",
+            "CE OI Δ", "PE OI Δ", "OI Dir (PE−CE)", "CE MicroDev", "PE MicroDev", "MicroDev Dir", "CE OFI", "PE OFI", "OFI Dir"], HeadersOf(html, "options-core-direction"));
+        Assert.Equal(["Seq", "End IST", "CE ΔIV", "PE ΔIV", "IV Dir", "CE Activity", "PE Activity", "Activity Dir"], HeadersOf(html, "options-context"));
+
+        var core = RowsOf(html, "options-core-direction");
+        var bar12 = core.Single(r => r[0] == "12");
+        Assert.Equal(["12", "09:42:00", "5.00 (5.00)", "-4.00 (-4.00)", "9.00 (4.50)", "300 (30.00)", "-200 (-40.00)", "500 (33.33)", "50 (25.00)", "-50 (-25.00)", "100 (25.00)",
+            "1000 (10.00)", "3000 (30.00)", "2000 (10.00)", "0.30 (60.00)", "-0.10 (-20.00)", "0.40 (40.00)", "300 (30.00)", "-100 (-20.00)", "400 (26.67)"], bar12);
+        var avg = core.Single(r => r[0] == "AVG");
+        Assert.Equal("10 rows", avg[1]);                                                            // all visible rows; bars without a stored row are simply excluded from each metric
+        Assert.Equal("500 (33.33)", avg[7]);                                                              // aggregate numerator / denominator, identical rows here
+        var bar11 = core.Single(r => r[0] == "11");
+        Assert.Equal(bar12[2..], bar11[2..]);                                                             // both bars of the SAME strike
+
+        var context = RowsOf(html, "options-context");
+        Assert.Equal(["12", "09:42:00", "1.00 (5.00)", "-1.00 (-5.00)", "2.00 (10.00)", "30.0 (75.00)", "10.0 (25.00)", "20.0 (50.00)"], context.Single(r => r[0] == "12"));
+        Assert.Single(context, r => r[0] == "AVG");
+
+        // Futures + residual AVG rows, and the legacy moving ATM±2 grid inside the collapsed Diagnostics section.
+        Assert.Contains("data-testid=\"futures-avg\"", html);
+        Assert.Contains("data-testid=\"residual-avg\"", html);
+        Assert.DoesNotContain("Roll Strict", Regex.Match(html, "data-grid=\"futures-compact\".*?</table>", RegexOptions.Singleline).Value);
+        var diagnostics = Regex.Match(html, "<details class=\"adaptive-diagnostics.*?</details>", RegexOptions.Singleline).Value;
+        Assert.Contains("data-grid=\"options-compact\"", diagnostics);
+        Assert.DoesNotContain("options-core-direction", diagnostics);
+        var residualAvg = RowsOf(html, "residual-compact").Single(r => r[0] == "AVG");
+        Assert.Equal("—", residualAvg[10]);                                                               // categorical columns are not averaged
+        Assert.Equal("—", residualAvg[11]);
+        Assert.Equal("+12.50", RatioFormatCompatible(residualAvg[2]));
+    }
+
+    static string RatioFormatCompatible(string v) => v.StartsWith('-') ? v : "+" + v;
+
+    static string[] HeadersOf(string html, string grid)
+    {
+        var table = Regex.Match(html, "<table[^>]*data-grid=\"" + grid + "\".*?</table>", RegexOptions.Singleline).Value;
+        var head = Regex.Match(table, "<thead.*?</thead>", RegexOptions.Singleline).Value;
+        return Regex.Matches(head, "<th(?: [^>]*)?>(.*?)</th>", RegexOptions.Singleline).Select(m => System.Net.WebUtility.HtmlDecode(m.Groups[1].Value.Trim())).ToArray();
+    }
+
+    static string[][] RowsOf(string html, string grid)
+    {
+        var table = Regex.Match(html, "<table[^>]*data-grid=\"" + grid + "\".*?</table>", RegexOptions.Singleline).Value;
+        var body = Regex.Match(table, "<tbody.*?</tbody>", RegexOptions.Singleline).Value;
+        return Regex.Matches(body, "<tr[ >].*?</tr>", RegexOptions.Singleline)
+            .Select(r => Regex.Matches(r.Value, "<td[^>]*>(.*?)</td>", RegexOptions.Singleline)
+                .Select(c => System.Net.WebUtility.HtmlDecode(Regex.Replace(c.Groups[1].Value, "<[^>]+>", "").Trim())).ToArray()).ToArray();
     }
 }

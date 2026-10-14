@@ -107,9 +107,8 @@
                     <tr>
                         <th>Seq</th><th>End IST</th><th>Dur s</th><th>Urgency</th>
                         <th>Bar ΔPx</th><th>Roll ΔPx</th>
-                        <th>Strict Δ</th><th>Enriched Δ</th>
-                        <th>Roll Strict</th><th>Roll Enriched</th><th>|Strict| Δ</th>
-                        <th>MicroDev</th><th>OFI</th>
+                        <th title="raw Strict delta (Strict delta / volume, %)">Strict Δ</th><th title="raw Enriched delta (Enriched delta / classified volume, %)">Enriched Δ</th>
+                        <th title="time-weighted MicroDev (time-weighted TOB x 100)">MicroDev</th><th title="net OFI (net OFI / gross OFI, %)">OFI</th>
                         <th>Roll OI Δ</th><th>ΔBasis</th><th>Roll Efficiency</th>
                         <th>Evolution</th><th>State</th>
                     </tr>
@@ -125,18 +124,36 @@
                             <td>@Fmt(AdaptiveGridProjection.Urgency(x.Bar.Volume, x.Bar.DurationSeconds), 1)</td>
                             <td>@FmtSigned(x.Bar.BarPriceDisplacement, 2)</td>
                             <td>@FmtSigned(r?.PriceDisplacement, 2)</td>
-                            <td>@FmtSigned(x.Bar.StrictDelta)</td>
-                            <td>@FmtSigned(x.Bar.EnrichedDelta)</td>
-                            <td>@FmtSigned(r?.StrictDelta)</td>
-                            <td>@FmtSigned(r?.EnrichedDelta)</td>
-                            <td>@FmtSigned(r?.RollingStrictAbsDeltaChange)</td>
-                            <td>@FmtSigned(Supplemental(x.Bar.BarSeq)?.MicroDevTimeWeighted, 3)</td>
-                            <td>@FmtSigned(Supplemental(x.Bar.BarSeq)?.Ofi)</td>
+                            @{ var fr = FuturesRatios.Build(x.Bar, Supplemental(x.Bar.BarSeq)); }
+                            <td>@RatioFormat.Cell(fr.Strict)</td>
+                            <td>@RatioFormat.Cell(fr.Enriched)</td>
+                            <td>@RatioFormat.Cell(fr.MicroDev, 2)</td>
+                            <td>@RatioFormat.Cell(fr.Ofi)</td>
                             <td>@FmtSigned(r?.OiChange)</td>
                             <td>@FmtSigned(Basis(x.Bar.BarSeq)?.DeltaBasis, 2)</td>
                             <td>@Fmt(r?.Efficiency, 3)</td>
                             <td>@(r?.StrictDominanceEvolution ?? "—")</td>
                             <td><span class="state-badge">@((r?.State).ToString() ?? "—")</span></td>
+                        </tr>
+                    }
+                    @if (_snapshot.Futures.Count > 0)
+                    {
+                        var avg = FuturesAverage();
+                        <tr class="adaptive-avg-row" data-testid="futures-avg">
+                            <td class="sticky-col">AVG</td>
+                            <td>@_snapshot.Futures.Count rows</td>
+                            <td>@RatioFormat.Plain(avg.Duration, 1)</td>
+                            <td>@RatioFormat.Plain(avg.Urgency, 1)</td>
+                            <td>@RatioFormat.Plain(avg.BarPx, 2)</td>
+                            <td>@RatioFormat.Plain(avg.RollPx, 2)</td>
+                            <td>@RatioFormat.Cell(avg.Strict)</td>
+                            <td>@RatioFormat.Cell(avg.Enriched)</td>
+                            <td>@RatioFormat.Cell(avg.MicroDev, 2)</td>
+                            <td>@RatioFormat.Cell(avg.Ofi)</td>
+                            <td>@RatioFormat.Plain(avg.RollOi, 1)</td>
+                            <td>@RatioFormat.Plain(avg.Basis, 2)</td>
+                            <td>@RatioFormat.Plain(avg.Efficiency, 3)</td>
+                            <td>—</td><td>—</td>
                         </tr>
                     }
                     </tbody>
@@ -238,37 +255,79 @@
                         Every row below is exactly @_fixed.Expiry.ToString("dd-MMM-yyyy") · strike @FmtStrike(_fixed.Strike) · CE @(_fixed.Contract.CeSymbol ?? "—") · PE @(_fixed.Contract.PeSymbol ?? "—").
                         A bar without a stored row for this strike shows — (no other strike is ever substituted).
                     </div>
+                    var coreRows = _fixed.Rows.Select(r => (Row: r, D: OptionDirectionRatios.Core(r.Ce, r.Pe))).ToList();
+                    var ctxRows = _fixed.Rows.Select(r => (Row: r, D: OptionDirectionRatios.Context(r.Ce, r.Pe))).ToList();
+                    <div class="adaptive-subtitle">CORE DIRECTION <span class="text-faint">raw (ratio %) — Direction = CE − PE, except OI = PE − CE</span></div>
                     <div class="adaptive-table-wrap">
-                        <table class="adaptive-table adaptive-table-compact" data-grid="options-fixed-strike" data-strike="@_fixed.Strike.ToString("0")">
+                        <table class="adaptive-table adaptive-table-compact" data-grid="options-core-direction" data-strike="@_fixed.Strike.ToString("0")">
                             <thead>
                             <tr>
                                 <th>Seq</th><th>End IST</th>
-                                <th>CE Price Δ</th><th>PE Price Δ</th>
-                                <th>CE Strict Δ</th><th>PE Strict Δ</th>
-                                <th>CE Enriched Δ</th><th>PE Enriched Δ</th>
-                                <th>CE OI Δ</th><th>PE OI Δ</th>
-                                <th>CE ΔIV</th><th>PE ΔIV</th>
-                                <th>CE Activity</th><th>PE Activity</th>
+                                <th>CE Price Δ</th><th>PE Price Δ</th><th>Price Dir</th>
+                                <th>CE Strict Δ</th><th>PE Strict Δ</th><th>Strict Dir</th>
+                                <th>CE Enriched Δ</th><th>PE Enriched Δ</th><th>Enriched Dir</th>
+                                <th>CE OI Δ</th><th>PE OI Δ</th><th>OI Dir (PE−CE)</th>
+                                <th>CE MicroDev</th><th>PE MicroDev</th><th>MicroDev Dir</th>
+                                <th>CE OFI</th><th>PE OFI</th><th>OFI Dir</th>
                             </tr>
                             </thead>
                             <tbody>
-                            @foreach (var r in _fixed.Rows)
+                            @foreach (var (r, d) in coreRows)
                             {
                                 <tr>
                                     <td class="sticky-col">@r.BarSeq</td>
                                     <td>@FmtIst(r.EndAvailableAtUtc)</td>
-                                    <td>@FmtSigned(r.Ce?.PriceChange, 2)</td>
-                                    <td>@FmtSigned(r.Pe?.PriceChange, 2)</td>
-                                    <td>@(r.Ce is null ? "—" : FmtSigned(r.Ce.StrictDelta))</td>
-                                    <td>@(r.Pe is null ? "—" : FmtSigned(r.Pe.StrictDelta))</td>
-                                    <td>@(r.Ce is null ? "—" : FmtSigned(r.Ce.EnrichedDelta))</td>
-                                    <td>@(r.Pe is null ? "—" : FmtSigned(r.Pe.EnrichedDelta))</td>
-                                    <td>@FmtSigned(r.Ce?.OiDelta)</td>
-                                    <td>@FmtSigned(r.Pe?.OiDelta)</td>
-                                    <td>@FmtSigned(r.Ce?.IvChange, 2)</td>
-                                    <td>@FmtSigned(r.Pe?.IvChange, 2)</td>
-                                    <td>@Fmt(r.Ce?.ActivityPerSecond, 1)</td>
-                                    <td>@Fmt(r.Pe?.ActivityPerSecond, 1)</td>
+                                    @DirectionCells(d.Price, 2)
+                                    @DirectionCells(d.Strict, 0)
+                                    @DirectionCells(d.Enriched, 0)
+                                    @DirectionCells(d.Oi, 0)
+                                    @DirectionCells(d.MicroDev, 2)
+                                    @DirectionCells(d.Ofi, 0)
+                                </tr>
+                            }
+                            @if (coreRows.Count > 0)
+                            {
+                                <tr class="adaptive-avg-row" data-testid="options-core-avg">
+                                    <td class="sticky-col">AVG</td>
+                                    <td>@coreRows.Count rows</td>
+                                    @DirectionCells(OptionDirectionRatios.Average(coreRows.Select(x => x.D.Price)), 2)
+                                    @DirectionCells(OptionDirectionRatios.Average(coreRows.Select(x => x.D.Strict)), 0)
+                                    @DirectionCells(OptionDirectionRatios.Average(coreRows.Select(x => x.D.Enriched)), 0)
+                                    @DirectionCells(OptionDirectionRatios.Average(coreRows.Select(x => x.D.Oi)), 0)
+                                    @DirectionCells(OptionDirectionRatios.Average(coreRows.Select(x => x.D.MicroDev)), 2)
+                                    @DirectionCells(OptionDirectionRatios.Average(coreRows.Select(x => x.D.Ofi)), 0)
+                                </tr>
+                            }
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="adaptive-subtitle">OPTION CONTEXT <span class="text-faint">same strike · IV raw in IV points · Activity = traded quantity per second</span></div>
+                    <div class="adaptive-table-wrap">
+                        <table class="adaptive-table adaptive-table-compact" data-grid="options-context" data-strike="@_fixed.Strike.ToString("0")">
+                            <thead>
+                            <tr>
+                                <th>Seq</th><th>End IST</th>
+                                <th>CE ΔIV</th><th>PE ΔIV</th><th>IV Dir</th>
+                                <th>CE Activity</th><th>PE Activity</th><th>Activity Dir</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            @foreach (var (r, d) in ctxRows)
+                            {
+                                <tr>
+                                    <td class="sticky-col">@r.BarSeq</td>
+                                    <td>@FmtIst(r.EndAvailableAtUtc)</td>
+                                    @DirectionCells(d.Iv, 2)
+                                    @DirectionCells(d.Activity, 1)
+                                </tr>
+                            }
+                            @if (ctxRows.Count > 0)
+                            {
+                                <tr class="adaptive-avg-row" data-testid="options-context-avg">
+                                    <td class="sticky-col">AVG</td>
+                                    <td>@ctxRows.Count rows</td>
+                                    @DirectionCells(OptionDirectionRatios.Average(ctxRows.Select(x => x.D.Iv)), 2)
+                                    @DirectionCells(OptionDirectionRatios.Average(ctxRows.Select(x => x.D.Activity)), 1)
                                 </tr>
                             }
                             </tbody>
@@ -552,6 +611,25 @@
                                 <td>@r.Relationship</td>
                                 <td>@r.MaxQuoteAgeSeconds.ToString("0.00")</td>
                             }
+                        </tr>
+                    }
+                    @if (SelectedResidualRows.Any(r => r.IsAvailable))
+                    {
+                        var av = SelectedResidualRows.Where(r => r.IsAvailable).ToList();
+                        var dv = av.Select(r => DerivedResidual(r.BarSeq)).ToList();
+                        <tr class="adaptive-avg-row" data-testid="residual-avg">
+                            <td class="sticky-col">AVG</td>
+                            <td>@av.Count rows</td>
+                            <td>@RatioFormat.Plain(RatioAverage.Mean(av.Select(r => (double?)r.FutureChangeFrom0930)), 2)</td>
+                            <td>@PctAvg(RatioAverage.Mean(av.Select(r => (double?)r.CEResidualPct)))</td>
+                            <td>@PctAvg(RatioAverage.Mean(dv.Select(d => d?.CeResidualDeltaPct)))</td>
+                            <td>@PctAvg(RatioAverage.Mean(av.Select(r => (double?)r.PEResidualPct)))</td>
+                            <td>@PctAvg(RatioAverage.Mean(dv.Select(d => d?.PeResidualDeltaPct)))</td>
+                            <td>@PctAvg(RatioAverage.Mean(av.Select(r => (double?)r.DirectionalResidualPct)))</td>
+                            <td>@PctAvg(RatioAverage.Mean(dv.Select(d => d?.AdjacentDirectionalResidualDelta)))</td>
+                            <td>@PctAvg(RatioAverage.Mean(dv.Select(d => d?.StraddleResidualPct)))</td>
+                            <td>—</td><td>—</td>
+                            <td>@RatioFormat.Plain(RatioAverage.Mean(av.Select(r => (double?)r.MaxQuoteAgeSeconds)), 2)</td>
                         </tr>
                     }
                     </tbody>
@@ -904,6 +982,34 @@
 
     AdaptiveFuturesSupplementalRow? Supplemental(int barSeq) =>
         _snapshot?.FuturesSupplemental is { } map && map.TryGetValue(barSeq, out var row) ? row : null;
+
+    static string PctAvg(double? x) => x is { } v ? RatioFormat.Plain(v, 2) + "%" : "—";
+
+    static RenderFragment DirectionCells(SideDirection d, int rawDecimals) => __b =>
+    {
+        __b.AddMarkupContent(0, $"<td>{RatioFormat.Cell(d.Ce, rawDecimals)}</td><td>{RatioFormat.Cell(d.Pe, rawDecimals)}</td><td class=\"adaptive-direction {RatioFormat.SignClass(d.Direction)}\">{RatioFormat.Cell(d.Direction, rawDecimals)}</td>");
+    };
+
+    sealed record FuturesAvgRow(double? Duration, double? Urgency, double? BarPx, double? RollPx, RatioPart Strict, RatioPart Enriched, RatioPart MicroDev, RatioPart Ofi, double? RollOi, double? Basis, double? Efficiency);
+
+    // AVG of the VISIBLE rows only: arithmetic means of the continuous columns; ratios are SUM(numerator)/SUM(denominator); categorical columns are not averaged.
+    FuturesAvgRow FuturesAverage()
+    {
+        var rows = _snapshot?.Futures ?? [];
+        var ratios = rows.Select(x => FuturesRatios.Build(x.Bar, Supplemental(x.Bar.BarSeq))).ToList();
+        return new FuturesAvgRow(
+            RatioAverage.Mean(rows.Select(x => (double?)x.Bar.DurationSeconds)),
+            RatioAverage.Mean(rows.Select(x => AdaptiveGridProjection.Urgency(x.Bar.Volume, x.Bar.DurationSeconds))),
+            RatioAverage.Mean(rows.Select(x => (double?)x.Bar.BarPriceDisplacement)),
+            RatioAverage.Mean(rows.Select(x => (double?)x.Rolling?.PriceDisplacement)),
+            RatioAverage.Aggregate(ratios.Select(r => r.Strict)),
+            RatioAverage.Aggregate(ratios.Select(r => r.Enriched)),
+            RatioAverage.Aggregate(ratios.Select(r => r.MicroDev)),
+            RatioAverage.Aggregate(ratios.Select(r => r.Ofi)),
+            RatioAverage.Mean(rows.Select(x => (double?)x.Rolling?.OiChange)),
+            RatioAverage.Mean(rows.Select(x => Basis(x.Bar.BarSeq)?.DeltaBasis)),
+            RatioAverage.Mean(rows.Select(x => (double?)x.Rolling?.Efficiency)));
+    }
 
     static double? Relative(double? a, double? b) => a.HasValue && b.HasValue ? a.Value - b.Value : null;
     static string BoolMark(bool x) => x ? "YES" : "—";

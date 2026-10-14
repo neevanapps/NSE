@@ -189,9 +189,10 @@ public sealed class AdaptiveObserverDataService(
             {
                 await using var db = await dbFactory.CreateDbContextAsync(ct);
                 var version = OptionStrikeBarMetrics.MetricsVersion;
+                var legacy = OptionStrikeBarMetrics.LegacyMetricsVersion;
                 var expiry = catalog.Expiry;
                 stored = await db.OptionStrikeBars.AsNoTracking()
-                    .Where(x => x.SessionId == sessionId && x.Expiry == expiry && x.Strike == strike && x.MetricsVersion == version
+                    .Where(x => x.SessionId == sessionId && x.Expiry == expiry && x.Strike == strike && (x.MetricsVersion == version || x.MetricsVersion == legacy)
                         && seqs.Contains(x.BarSeq))
                     .ToListAsync(ct);
             }
@@ -271,10 +272,12 @@ public sealed class AdaptiveObserverDataService(
         try
         {
             var version = FuturesMicrostructureBar.MetricsVersion;
+            var legacy = FuturesMicrostructureBar.LegacyMetricsVersion;
             var rows = await db.FuturesSupplemental.AsNoTracking()
-                .Where(x => x.SessionId == sessionId && x.MetricsVersion == version && seqs.Contains(x.BarSeq))
+                .Where(x => x.SessionId == sessionId && (x.MetricsVersion == version || x.MetricsVersion == legacy) && seqs.Contains(x.BarSeq))
                 .ToListAsync(ct);
-            return rows.ToDictionary(x => x.BarSeq);
+            // latest supported version wins per bar; a v2 row (no GrossOfi) is a valid fallback with an unavailable OFI ratio
+            return rows.GroupBy(x => x.BarSeq).ToDictionary(g => g.Key, g => g.OrderByDescending(r => r.MetricsVersion == version).First());
         }
         catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedTable)
         {

@@ -175,3 +175,29 @@
 .adaptive-diagnostics-capture > summary {
     display: none;
 }
+
+/* Ratio grids: AVG (visible rows) footer, sub-grid titles and direction columns. */
+::deep .adaptive-avg-row td {
+    border-top: 2px solid var(--border, #2a3340);
+    font-weight: 600;
+}
+
+::deep .adaptive-subtitle {
+    margin: 10px 0 4px;
+    font-size: .8rem;
+    font-weight: 600;
+    letter-spacing: .04em;
+}
+
+::deep .adaptive-direction {
+    border-left: 1px solid var(--border, #2a3340);
+    font-weight: 600;
+}
+
+::deep .adaptive-direction.val-pos {
+    color: var(--up, #3fb950);
+}
+
+::deep .adaptive-direction.val-neg {
+    color: var(--down, #f85149);
+}

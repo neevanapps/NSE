@@ -201,7 +201,8 @@ public sealed class AdaptiveObserverEngine
                         _options, bar.StartAvailableAtUtc, bar.EndAvailableAtUtc, bar.DurationSeconds, _riskFreeRate,
                         finishedBand?.Selection?.SyntheticUnderlying, _currentBand?.Selection?.SyntheticUnderlying,
                         token => strikeStart is not null && strikeStart.TryGetValue(token, out var s) ? s : null,
-                        _optionFlow.Snapshot),
+                        _optionFlow.Snapshot,
+                        token => _optionBooks.TryGetValue(token, out var tracker) ? tracker.Complete(bar.StartAvailableAtUtc, bar.EndAvailableAtUtc) : null),
                 };
                 CaptureStrikeStart();
             }

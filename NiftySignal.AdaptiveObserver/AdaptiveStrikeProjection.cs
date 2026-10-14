@@ -34,10 +34,23 @@ public sealed record OptionStrikeBarMetrics(
     double? IvEnd,
     double? IvChange,
     double? ActivityPerSecond,
-    double? QuoteAgeEndSeconds)
+    double? QuoteAgeEndSeconds,
+    double? TobTimeWeighted = null,
+    double? MicroDevTimeWeighted = null,
+    double? TobUsableSeconds = null,
+    long? NetOfi = null,
+    long? GrossOfi = null,
+    int? OfiTransitions = null)
 {
-    /// <summary>Identifies the calculation contract. Change it whenever any formula, boundary or freshness rule changes.</summary>
-    public const string MetricsVersion = "option-strike-v1";
+    /// <summary>
+    /// Identifies the calculation contract. Change it whenever any formula, boundary or freshness rule changes.
+    /// v2 = every v1 value (unchanged) + the contract's own Level-1 book metrics from the SAME per-token <see cref="FuturesMicrostructureTracker"/> the observer already feeds:
+    /// time-weighted TOB / MicroDev, TOB-usable seconds, net OFI and gross OFI (SUM |e_i|). v1 rows (no book metrics) stay in place and are never rewritten.
+    /// </summary>
+    public const string MetricsVersion = "option-strike-v2";
+
+    /// <summary>The previous contract (no book metrics). Still readable by the Dashboard for sessions that only have v1 rows; never written any more.</summary>
+    public const string LegacyMetricsVersion = "option-strike-v1";
 }
 
 /// <summary>Pure builder of the per-strike rows of one completed bar. No state, no clock, no I/O.</summary>
@@ -57,7 +70,8 @@ public static class AdaptiveStrikeProjection
         double? startUnderlying,
         double? endUnderlying,
         Func<string, InstrumentFlowSnapshot?> start,
-        Func<string, InstrumentFlowSnapshot> end)
+        Func<string, InstrumentFlowSnapshot> end,
+        Func<string, FuturesMicrostructureBar?>? book = null)
     {
         var rows = new List<OptionStrikeBarMetrics>(universe.Count);
         foreach (var i in universe.OrderBy(x => x.Strike).ThenBy(x => x.OptionType).ThenBy(x => x.Token, StringComparer.Ordinal))
@@ -86,6 +100,7 @@ public static class AdaptiveStrikeProjection
 
             var ivStart = Iv(s, startUtc, startUnderlying);
             var ivEnd = Iv(e, endUtc, endUnderlying);
+            var micro = book?.Invoke(i.Token);       // this token's own book over the bar; null when the book was never observed
             rows.Add(new OptionStrikeBarMetrics(
                 i.Token, i.TradingSymbol, i.ExpiryDate, i.Strike, i.OptionType,
                 priceStart, priceEnd, priceStart is { } p0 && priceEnd is { } p1 ? p1 - p0 : null,
@@ -95,7 +110,8 @@ public static class AdaptiveStrikeProjection
                 oiStart, oiEnd, oiStart is { } o0 && oiEnd is { } o1 ? o1 - o0 : null,
                 ivStart, ivEnd, ivStart is { } v0 && ivEnd is { } v1 ? v1 - v0 : null,
                 durationSeconds > 0d ? total / durationSeconds : null,
-                e.LastAvailableAt is { } at2 && at2 <= endUtc ? (endUtc - at2).TotalSeconds : null));
+                e.LastAvailableAt is { } at2 && at2 <= endUtc ? (endUtc - at2).TotalSeconds : null,
+                micro?.TobTimeWeighted, micro?.MicroDevTimeWeighted, micro is null ? null : micro.TobUsableSeconds, micro?.Ofi, micro?.GrossOfi, micro?.OfiTransitions));
         }
 
         return rows;

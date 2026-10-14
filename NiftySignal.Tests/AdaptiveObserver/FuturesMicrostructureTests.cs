@@ -213,7 +213,8 @@ public sealed class FuturesMicrostructureTests
     [Fact]
     public void MetricsVersionsAreBumped_ForTheChangedOfiSemantics()
     {
-        Assert.Equal("futures-micro-v2", FuturesMicrostructureBar.MetricsVersion);
+        Assert.Equal("futures-micro-v3", FuturesMicrostructureBar.MetricsVersion);
+        Assert.Equal("futures-micro-v2", FuturesMicrostructureBar.LegacyMetricsVersion);
         Assert.Equal("options-supp-v2", OptionsSupplementalBar.MetricsVersion);
     }
 
