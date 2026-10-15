@@ -20,7 +20,7 @@ public sealed class OptionsSupplementalTests
         var existing = typeof(AdaptiveOptionBandCalculator).GetMethod(nameof(AdaptiveOptionBandCalculator.Select))!
             .GetParameters().Single(p => p.Name == "maxQuoteAgeSeconds").DefaultValue;
         Assert.Equal(5d, existing);
-        Assert.Equal((double)existing!, OptionsSupplementalBar.QuoteFreshnessSeconds);
+        Assert.Equal(OptionsSupplementalBar.QuoteFreshnessSeconds, (double)existing!);
     }
 
     static readonly DateTimeOffset T0 = new(2026, 10, 8, 4, 0, 0, TimeSpan.Zero);

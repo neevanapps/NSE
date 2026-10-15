@@ -80,6 +80,12 @@
                                 <td>@(r.ExitPending ? "YES" : "—")</td>
                             </tr>
                         }
+                        @{ var rt = PaperTotals.Running(running); }
+                        <tr class="paper-total-row" data-testid="running-total">
+                            <td>TOTAL</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+                            <td class="@PnlClass(rt.Total)" data-testid="running-total-pnl" title="Sum of the quoted positions' Live P&amp;L @@ Bid; a position without a usable bid is never counted as zero.">@rt.Text</td>
+                            <td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+                        </tr>
                         </tbody>
                     </table></div>
                     <div class="text-faint" style="font-size:12px; margin-top:4px;">Live P&amp;L is a tick-level display value at the executable bid. MFE / MAE follow the tested bar-end strategy definition.</div>
@@ -104,6 +110,11 @@
                                 <td>@c.Quantity</td><td>@c.ExitReason</td><td>@Money(c.Gross)</td><td>@Money(c.Fees)</td><td class="@PnlClass(c.Net)">@Money(c.Net)</td><td>@Money(c.Mfe)</td><td>@Money(c.Mae)</td>
                             </tr>
                         }
+                        @{ var ct = PaperTotals.Completed(td.Completed); }
+                        <tr class="paper-total-row" data-testid="completed-total">
+                            <td>TOTAL</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+                            <td data-testid="completed-total-gross">@Money(ct.Gross)</td><td data-testid="completed-total-fees">@Money(ct.Fees)</td><td class="@PnlClass(ct.Net)" data-testid="completed-total-net">@Money(ct.Net)</td><td>—</td><td>—</td>
+                        </tr>
                         </tbody>
                     </table></div>
                 }

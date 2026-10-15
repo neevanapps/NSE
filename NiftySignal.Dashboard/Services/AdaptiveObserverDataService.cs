@@ -169,6 +169,53 @@ public sealed class AdaptiveObserverDataService(
     }
 
     /// <summary>
+    /// DAY AVG inputs: ALL completed bars of the session from the start through <paramref name="throughBarSeq"/> (a screenshot of bar 196 never reads bar 197+), the sidecars of those bars and, for the
+    /// fixed-strike grids, ONLY the selected expiry/strike/CE-PE tokens (never the option universe). Read-only; callers cache by session/bar/strike so a quote tick never re-runs it.
+    /// </summary>
+    public async Task<DayAverageData?> LoadDayAverageDataAsync(
+        long sessionId, int throughBarSeq, FixedStrikeCatalog? catalog, double? strike, int rollWindowBars, IReadOnlyList<AdaptiveResidualAnchorComponentRow> anchors, CancellationToken ct = default)
+    {
+        if (throughBarSeq <= 0)
+        {
+            return null;
+        }
+
+        List<AdaptiveFutureBarRow> bars;
+        List<AdaptiveFuturesGridRow> futures;
+        Dictionary<int, AdaptiveFuturesSupplementalRow> sup;
+        Dictionary<int, AdaptiveBasisSupplementalRow> basis;
+        List<AdaptiveOptionResidualBarRow> residuals;
+        await using (var db = await dbFactory.CreateDbContextAsync(ct))
+        {
+            bars = await db.FutureBars.AsNoTracking()
+                .Where(x => x.SessionId == sessionId && x.BarSeq <= throughBarSeq)
+                .OrderByDescending(x => x.BarSeq)
+                .ToListAsync(ct);
+            var seqs = bars.Select(x => x.BarSeq).ToArray();
+            var rolling = (await db.RollingStates.AsNoTracking()
+                .Where(x => x.SessionId == sessionId && x.EndBarSeq <= throughBarSeq)
+                .ToListAsync(ct)).ToDictionary(x => x.EndBarSeq);
+            futures = bars.Select(x => new AdaptiveFuturesGridRow(x, rolling.GetValueOrDefault(x.BarSeq))).ToList();
+
+            var invalidFutures = await LoadInvalidBarsAsync(db, sessionId, AdaptiveProjectionComponents.FuturesSupplemental, FuturesMicrostructureBar.MetricsVersion, seqs, ct);
+            var invalidBasis = await LoadInvalidBarsAsync(db, sessionId, AdaptiveProjectionComponents.BasisSupplemental, FuturesBasisBar.MetricsVersion, seqs, ct);
+            sup = (await LoadFuturesSupplementalAsync(db, sessionId, seqs, ct)).Where(x => !invalidFutures.Contains(x.Key)).ToDictionary(x => x.Key, x => x.Value);
+            basis = (await LoadBasisSupplementalAsync(db, sessionId, seqs, ct)).Where(x => !invalidBasis.Contains(x.Key)).ToDictionary(x => x.Key, x => x.Value);
+            residuals = await db.OptionResidualBars.AsNoTracking()
+                .Where(x => x.SessionId == sessionId && x.BarSeq <= throughBarSeq)
+                .ToListAsync(ct);
+        }
+
+        FixedStrikeHistory? fixedHistory = null;
+        if (catalog is not null && strike is { } k)
+        {
+            fixedHistory = await LoadFixedStrikeHistoryAsync(sessionId, catalog, k, bars.Select(b => (b.BarSeq, b.EndAvailableAtUtc)).ToList(), ct, rollWindowBars);
+        }
+
+        return new DayAverageData(sessionId, throughBarSeq, bars.Count, strike, futures, sup, basis, fixedHistory, residuals, anchors);
+    }
+
+    /// <summary>
     /// History of ONE exact expiry + strike + CE token + PE token over the displayed completed bars. Reads only the persisted per-strike sidecar by the indexed
     /// (session, expiry, strike) key; a missing table (Dashboard started before the migration) or a bar without rows yields unavailable cells, never another strike.
     /// </summary>

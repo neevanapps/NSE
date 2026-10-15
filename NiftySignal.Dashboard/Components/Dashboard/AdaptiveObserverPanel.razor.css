@@ -208,3 +208,26 @@
     width: auto;
     min-width: 40%;
 }
+
+/* DAY AVG: second summary row below AVG (whole session through the boundary). */
+::deep .adaptive-day-avg-row td {
+    border-top: 1px dashed var(--border, #2a3340);
+    font-weight: 600;
+}
+
+/* Cells emitted as markup content (DirectionCells) do not carry this component's CSS-isolation attribute, so they need ::deep rules to be right-aligned and padded like the Futures grid cells. */
+::deep .adaptive-table td {
+    white-space: nowrap;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+    border-right: 1px solid var(--border);
+    text-align: right;
+}
+
+::deep .adaptive-table td:first-child {
+    text-align: center;
+}
+
+::deep .adaptive-table td.adaptive-pending {
+    text-align: left;
+}
