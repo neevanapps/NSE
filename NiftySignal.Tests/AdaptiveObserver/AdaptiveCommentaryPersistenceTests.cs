@@ -97,7 +97,7 @@ public sealed class AdaptiveCommentaryPersistenceTests
         Assert.Equal(events[^1].Id, runtime.CurrentEventId);
         Assert.Equal(CommentaryEventType.BuyerExpansion, runtime.CurrentEventType);
         Assert.Equal(events[0].Id, events[1].PreviousEventId);
-        Assert.Equal(events[^1].EventIdentity, $"commentary-v1:1:16:BuyerExpansion:New:Long");
+        Assert.Equal($"commentary-v1:1:16:BuyerExpansion:New:Long", events[^1].EventIdentity);
     }
 
     [Fact]

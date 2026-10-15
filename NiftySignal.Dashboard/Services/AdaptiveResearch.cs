@@ -31,7 +31,7 @@ public sealed record ResearchModel(
     bool Pinned);
 
 /// <summary>The pinned view of one completed bar: the whole snapshot, the fixed-strike history of the strike the bar's own center selects, and the research model describing it.</summary>
-public sealed record PinnedResearchView(AdaptiveObserverSnapshot Snapshot, FixedStrikeCatalog? Catalog, FixedStrikeHistory? Fixed, ResearchModel Model);
+public sealed record PinnedResearchView(AdaptiveObserverSnapshot Snapshot, FixedStrikeCatalog? Catalog, FixedStrikeHistory? Fixed, ResearchModel Model, DayAverageData? Day = null);
 
 public static class ResearchFormat
 {
@@ -240,7 +240,18 @@ public sealed class AdaptiveResearchService(
         }
 
         var model = await BuildAsync(snapshot, fixedHistory, selected, center, autoFollow: true, pinned: true, quoteUnavailable, ct);
-        return new PinnedResearchView(snapshot, catalog, fixedHistory, model);
+        // DAY AVG: every completed bar of this session from the start THROUGH the pinned target bar only (the runtime boundary of the pinned snapshot), for the same selected strike.
+        DayAverageData? day = null;
+        try
+        {
+            day = await data.LoadDayAverageDataAsync(sessionId, snapshot.Runtime.LastCompletedBarSeq, catalog, selected, snapshot.Session.RollingWindowBars, snapshot.ResidualAnchors, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            day = null;                 // DAY AVG is informational: a failed read shows it as unavailable and never fails the capture
+        }
+
+        return new PinnedResearchView(snapshot, catalog, fixedHistory, model, day);
     }
 
     public async Task<ResearchModel> BuildAsync(

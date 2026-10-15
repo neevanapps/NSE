@@ -278,3 +278,6 @@ table.data-table {
     padding: 3px 5px;
     white-space: nowrap;
 }
+
+/* NPT1 paper page: TOTAL footer rows */
+.paper-total-row td { border-top: 2px solid var(--border, #2a3340); font-weight: 700; }

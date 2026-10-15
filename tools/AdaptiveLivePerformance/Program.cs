@@ -202,7 +202,6 @@ const string SourceDb = "perf_source";
 var sourceCounter = new SqlCounter();
 var observerCounter = new SqlCounter();
 var recorder = new StageRecorder(observerCounter);
-string currentObserverDb = "perf_observer";
 
 #if !BASELINE
 var gateOptions = new AdaptiveCommentaryTelegramOptions { Enabled = false };    // no Telegram, ever, from this harness

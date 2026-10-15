@@ -142,3 +142,35 @@ public static class PaperTodayProjection
         return now - stream.LastHeartbeat <= TimeSpan.FromSeconds(30) ? "LIVE" : "STALE";
     }
 }
+
+/// <summary>TOTAL of the running trades' tick-level Live P&amp;L @ bid. A position without a usable bid is NEVER counted as zero: the total is then partial (Quoted / Count) or unavailable.</summary>
+public sealed record RunningPnlTotal(decimal? Total, int Quoted, int Count)
+{
+    public bool IsComplete => Count > 0 && Quoted == Count;
+
+    public bool IsPartial => Quoted > 0 && Quoted < Count;
+
+    public bool IsUnavailable => Quoted == 0;
+
+    /// <summary>"+4,235.50" when all quoted, "PARTIAL +2,840.50 · 2/3 quoted" when some are missing, "—" when none is usable.</summary>
+    public string Text => Total is not { } t || Quoted == 0
+        ? "—"
+        : IsPartial ? $"PARTIAL {Signed(t)} · {Quoted}/{Count} quoted" : Signed(t);
+
+    static string Signed(decimal v) => v.ToString("+#,##0.00;-#,##0.00;0.00", CultureInfo.InvariantCulture);
+}
+
+/// <summary>TOTAL of today's durable closed trades (sums of the ledger values already loaded; nothing is recalculated).</summary>
+public sealed record CompletedTradesTotal(decimal Gross, decimal Fees, decimal Net, int Count);
+
+public static class PaperTotals
+{
+    public static RunningPnlTotal Running(IReadOnlyList<RunningTradeRow> running)
+    {
+        var quoted = running.Where(r => r.LivePnlAtBid is not null).ToList();
+        return new RunningPnlTotal(quoted.Count == 0 ? null : quoted.Sum(r => r.LivePnlAtBid!.Value), quoted.Count, running.Count);
+    }
+
+    public static CompletedTradesTotal Completed(IReadOnlyList<CompletedTradeRow> completed) =>
+        new(completed.Sum(c => c.Gross), completed.Sum(c => c.Fees), completed.Sum(c => c.Net), completed.Count);
+}

@@ -425,4 +425,74 @@ public class FixedStrikeAndPaperTodayTests
         Assert.DoesNotContain("Max-hold", primary, StringComparison.Ordinal);
         Assert.DoesNotContain("<th>Stop</th>", primary, StringComparison.Ordinal);
     }
+
+    // ------------------------------------------------------------------ TOTAL rows
+
+    [Fact]
+    public void RunningTotal_SumsTheLivePnlAtBid_WhenEveryPositionIsQuoted()
+    {
+        var open = new[] { Open("NPT1-MD5", "A", entry: "120.00", qty: 650), Open("NPT1-PE5", "B", entry: "100.00", qty: 650) };
+        var quotes = new Dictionary<string, LiveOptionQuote> { ["A"] = new("A", 125m, 127m, 140m, Now), ["B"] = new("B", 90m, 92m, 100m, Now) };
+        var running = PaperTodayProjection.Running(open, quotes, Now);
+
+        var total = PaperTotals.Running(running);
+
+        Assert.Equal(running.Sum(r => r.LivePnlAtBid!.Value), total.Total);
+        Assert.Equal((125m - 120m) * 650 + (90m - 100m) * 650, total.Total);
+        Assert.True(total.IsComplete);
+        Assert.False(total.IsPartial);
+        Assert.Equal("-3,250.00", total.Text);
+    }
+
+    [Fact]
+    public void RunningTotal_IsMarkedPartial_NeverTreatingAMissingBidAsZero()
+    {
+        var open = new[] { Open("NPT1-MD5", "A", entry: "120.00", qty: 100), Open("NPT1-PE5", "B", entry: "100.00", qty: 100), Open("NPT1-MDX3", "C", entry: "50.00", qty: 100) };
+        var quotes = new Dictionary<string, LiveOptionQuote>
+        {
+            ["A"] = new("A", 130m, 131m, 130m, Now),
+            ["B"] = new("B", 105m, 106m, 105m, Now),
+            ["C"] = new("C", null, 51m, 50m, Now),                                     // no bid: unusable
+        };
+
+        var total = PaperTotals.Running(PaperTodayProjection.Running(open, quotes, Now));
+
+        Assert.Equal(1500m, total.Total);                                                // (10 + 5) x 100, the third position contributes NOTHING (not zero-as-a-quote)
+        Assert.Equal((2, 3), (total.Quoted, total.Count));
+        Assert.True(total.IsPartial);
+        Assert.Equal("PARTIAL +1,500.00 · 2/3 quoted", total.Text);
+    }
+
+    [Fact]
+    public void RunningTotal_IsUnavailable_WhenNoPositionHasAUsableBid_AndEmptyWhenNothingRuns()
+    {
+        var running = PaperTodayProjection.Running(new[] { Open("NPT1-MD5", "A"), Open("NPT1-PE5", "B") }, new Dictionary<string, LiveOptionQuote>(), Now);
+
+        var none = PaperTotals.Running(running);
+
+        Assert.Null(none.Total);
+        Assert.True(none.IsUnavailable);
+        Assert.Equal("—", none.Text);
+        Assert.Equal("—", PaperTotals.Running(Array.Empty<RunningTradeRow>()).Text);
+    }
+
+    [Fact]
+    public void CompletedTotals_AreTheSumsOfTheDurableLedgerValues_AndWriteNothing()
+    {
+        var closed = new[] { Closed("NPT1-MD5", "6250.00", Now.AddMinutes(-30)), Closed("NPT1-PE5", "-1000.50", Now.AddMinutes(-20)), Closed("NPT1-MDX3", "750.25", Now.AddMinutes(-10)) };
+        var page = PaperTodayProjection.Build(View(Today, Array.Empty<PaperOpenPosition>(), closed), null, Today, Now);
+
+        var total = PaperTotals.Completed(page.Completed);
+
+        Assert.Equal(page.Completed.Sum(c => c.Gross), total.Gross);
+        Assert.Equal(page.Completed.Sum(c => c.Fees), total.Fees);
+        Assert.Equal(page.Completed.Sum(c => c.Net), total.Net);
+        Assert.Equal(3 * 6500m, total.Gross);                                              // the fixture ledger has Gross 6500.00 / Fees 250.00 on every trade
+        Assert.Equal(3 * 250m, total.Fees);
+        Assert.Equal(6250.00m - 1000.50m + 750.25m, total.Net);
+        Assert.Equal(3, total.Count);
+        Assert.Equal(new CompletedTradesTotal(0m, 0m, 0m, 0), PaperTotals.Completed(Array.Empty<CompletedTradeRow>()));
+        // Pure functions over already-projected rows: they hold no ledger, database or writer (the type has no state at all).
+        Assert.Empty(typeof(PaperTotals).GetFields(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic));
+    }
 }

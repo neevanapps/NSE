@@ -170,6 +170,26 @@
                             <td>—</td><td>—</td>
                         </tr>
                     }
+                    @if (_day is { BarCount: > 0 } dayF)
+                    {
+                        var davg = dayF.FuturesAverage();
+                        <tr class="adaptive-avg-row adaptive-day-avg-row" data-testid="futures-day-avg">
+                            <td class="sticky-col">DAY AVG</td>
+                            <td>@dayF.BarCount bars</td>
+                            <td>@RatioFormat.Plain(davg.Duration, 1)</td>
+                            <td>@RatioFormat.Plain(davg.Urgency, 1)</td>
+                            <td>@RatioFormat.Plain(davg.BarPx, 2)</td>
+                            <td>@RatioFormat.Plain(davg.RollPx, 2)</td>
+                            <td>@RatioFormat.Cell(davg.Strict)</td>
+                            <td>@RatioFormat.Cell(davg.Enriched)</td>
+                            <td>@RatioFormat.Cell(davg.MicroDev, 2)</td>
+                            <td>@RatioFormat.Cell(davg.Ofi)</td>
+                            <td>@RatioFormat.Plain(davg.RollOi, 1)</td>
+                            <td>@RatioFormat.Plain(davg.Basis, 2)</td>
+                            <td>@RatioFormat.Plain(davg.Efficiency, 3)</td>
+                            <td>—</td><td>—</td>
+                        </tr>
+                    }
                     </tbody>
                 </table>
             </div>
@@ -280,6 +300,10 @@
                         A bar without a stored row for this strike shows — (no other strike is ever substituted).
                     </div>
                     var coreRows = _fixed.Rows.Select(r => (Row: r, D: OptionDirectionRatios.Core(r))).ToList();
+                    var coreAvg = OptionAverages.Core(coreRows.Select(x => x.D));
+                    var ctxAvg = OptionAverages.Context(coreRows.Select(x => x.D), _fixed.Rows.Select(r => OptionDirectionRatios.Context(r.Ce, r.Pe)));
+                    // DAY AVG is the history of the SAME exact strike/contract pair (a different strike's history is never shown under this one).
+                    (OptionsCoreAverage Core, OptionsContextAverage Context)? dayFixed = _day?.Fixed is { } df && df.Strike == _fixed.Strike && df.Contract == _fixed.Contract ? OptionAverages.Of(df) : null;
                     var ctxRows = _fixed.Rows.Select(r => (Row: r, D: OptionDirectionRatios.Context(r.Ce, r.Pe))).ToList();
                     <div class="adaptive-subtitle">CORE DIRECTION <span class="text-faint">raw (ratio %) — Direction = CE − PE, except OI = PE − CE</span></div>
                     <div class="adaptive-table-wrap">
@@ -287,8 +311,6 @@
                             <thead>
                             <tr>
                                 <th>Seq</th><th>End IST</th>
-                                <th>CE Price Δ</th><th>PE Price Δ</th><th>Price Dir</th>
-                                <th>CE Roll ΔPx</th><th>PE Roll ΔPx</th><th>Roll Price Dir</th>
                                 <th>CE Strict Δ</th><th>PE Strict Δ</th><th>Strict Dir</th>
                                 <th>CE Enriched Δ</th><th>PE Enriched Δ</th><th>Enriched Dir</th>
                                 <th>CE OI Δ</th><th>PE OI Δ</th><th>OI Dir (PE−CE)</th>
@@ -302,8 +324,6 @@
                                 <tr>
                                     <td class="sticky-col">@r.BarSeq</td>
                                     <td>@FmtIst(r.EndAvailableAtUtc)</td>
-                                    @DirectionCells(d.Price, 2)
-                                    @DirectionCells(d.RollPrice, 2)
                                     @DirectionCells(d.Strict, 0)
                                     @DirectionCells(d.Enriched, 0)
                                     @DirectionCells(d.Oi, 0)
@@ -316,13 +336,23 @@
                                 <tr class="adaptive-avg-row" data-testid="options-core-avg">
                                     <td class="sticky-col">AVG</td>
                                     <td>@coreRows.Count rows</td>
-                                    @DirectionCells(OptionDirectionRatios.Average(coreRows.Select(x => x.D.Price)), 2)
-                                    @DirectionCells(OptionDirectionRatios.Average(coreRows.Select(x => x.D.RollPrice)), 2)
-                                    @DirectionCells(OptionDirectionRatios.Average(coreRows.Select(x => x.D.Strict)), 0)
-                                    @DirectionCells(OptionDirectionRatios.Average(coreRows.Select(x => x.D.Enriched)), 0)
-                                    @DirectionCells(OptionDirectionRatios.Average(coreRows.Select(x => x.D.Oi)), 0)
-                                    @DirectionCells(OptionDirectionRatios.Average(coreRows.Select(x => x.D.MicroDev)), 2)
-                                    @DirectionCells(OptionDirectionRatios.Average(coreRows.Select(x => x.D.Ofi)), 0)
+                                    @DirectionCells(coreAvg.Strict, 0)
+                                    @DirectionCells(coreAvg.Enriched, 0)
+                                    @DirectionCells(coreAvg.Oi, 0)
+                                    @DirectionCells(coreAvg.MicroDev, 2)
+                                    @DirectionCells(coreAvg.Ofi, 0)
+                                </tr>
+                            }
+                            @if (dayFixed is { } dc && _day is not null)
+                            {
+                                <tr class="adaptive-avg-row adaptive-day-avg-row" data-testid="options-core-day-avg">
+                                    <td class="sticky-col">DAY AVG</td>
+                                    <td>@_day.BarCount bars</td>
+                                    @DirectionCells(dc.Core.Strict, 0)
+                                    @DirectionCells(dc.Core.Enriched, 0)
+                                    @DirectionCells(dc.Core.Oi, 0)
+                                    @DirectionCells(dc.Core.MicroDev, 2)
+                                    @DirectionCells(dc.Core.Ofi, 0)
                                 </tr>
                             }
                             </tbody>
@@ -334,6 +364,8 @@
                             <thead>
                             <tr>
                                 <th>Seq</th><th>End IST</th>
+                                <th>CE Price Δ</th><th>PE Price Δ</th><th>Price Dir</th>
+                                <th>CE Roll ΔPx</th><th>PE Roll ΔPx</th><th>Roll Price Dir</th>
                                 <th>CE ΔIV</th><th>PE ΔIV</th><th>IV Dir</th>
                                 <th>CE Activity</th><th>PE Activity</th><th>Activity Dir</th>
                             </tr>
@@ -341,9 +373,12 @@
                             <tbody>
                             @foreach (var (r, d) in ctxRows)
                             {
+                                var pr = OptionDirectionRatios.Core(r);
                                 <tr>
                                     <td class="sticky-col">@r.BarSeq</td>
                                     <td>@FmtIst(r.EndAvailableAtUtc)</td>
+                                    @DirectionCells(pr.Price, 2)
+                                    @DirectionCells(pr.RollPrice, 2)
                                     @DirectionCells(d.Iv, 2)
                                     @DirectionCells(d.Activity, 1)
                                 </tr>
@@ -353,8 +388,21 @@
                                 <tr class="adaptive-avg-row" data-testid="options-context-avg">
                                     <td class="sticky-col">AVG</td>
                                     <td>@ctxRows.Count rows</td>
-                                    @DirectionCells(OptionDirectionRatios.Average(ctxRows.Select(x => x.D.Iv)), 2)
-                                    @DirectionCells(OptionDirectionRatios.Average(ctxRows.Select(x => x.D.Activity)), 1)
+                                    @DirectionCells(ctxAvg.Price, 2)
+                                    @DirectionCells(ctxAvg.RollPrice, 2)
+                                    @DirectionCells(ctxAvg.Iv, 2)
+                                    @DirectionCells(ctxAvg.Activity, 1)
+                                </tr>
+                            }
+                            @if (dayFixed is { } dx && _day is not null)
+                            {
+                                <tr class="adaptive-avg-row adaptive-day-avg-row" data-testid="options-context-day-avg">
+                                    <td class="sticky-col">DAY AVG</td>
+                                    <td>@_day.BarCount bars</td>
+                                    @DirectionCells(dx.Context.Price, 2)
+                                    @DirectionCells(dx.Context.RollPrice, 2)
+                                    @DirectionCells(dx.Context.Iv, 2)
+                                    @DirectionCells(dx.Context.Activity, 1)
                                 </tr>
                             }
                             </tbody>
@@ -665,6 +713,25 @@
                             <td>@RatioFormat.Plain(RatioAverage.Mean(av.Select(r => (double?)r.MaxQuoteAgeSeconds)), 2)</td>
                         </tr>
                     }
+                    @if (_day is { BarCount: > 0 } dayR)
+                    {
+                        // Only AVAILABLE residual observations through the boundary count: pre-09:30 unavailable rows are excluded, never zero.
+                        var dr = dayR.ResidualAverage(_residualVariant == "ATM" ? ResidualVariant.Atm : ResidualVariant.AtmPlusMinus2);
+                        <tr class="adaptive-avg-row adaptive-day-avg-row" data-testid="residual-day-avg">
+                            <td class="sticky-col">DAY AVG</td>
+                            <td>@dayR.BarCount bars</td>
+                            <td>@RatioFormat.Plain(dr.FutureChange, 2)</td>
+                            <td>@PctAvg(dr.CePct)</td>
+                            <td>@PctAvg(dr.CeDeltaPct)</td>
+                            <td>@PctAvg(dr.PePct)</td>
+                            <td>@PctAvg(dr.PeDeltaPct)</td>
+                            <td>@PctAvg(dr.DirectionalPct)</td>
+                            <td>@PctAvg(dr.AdjacentDirectionalDelta)</td>
+                            <td>@PctAvg(dr.StraddlePct)</td>
+                            <td>—</td><td>—</td>
+                            <td>@RatioFormat.Plain(dr.QuoteAge, 2)</td>
+                        </tr>
+                    }
                     </tbody>
                 </table>
             </div>
@@ -746,6 +813,8 @@
     FixedStrikeCatalog? _catalog;
     FixedStrikeHistory? _fixed;
     ResearchModel? _research;
+    // DAY AVG inputs (all completed bars of the session through the current boundary); reloaded only when the completed bar or the selected strike changes, never on a quote tick.
+    DayAverageData? _day;
     long? _selSession;
     readonly SemaphoreSlim _reloadGate = new(1, 1);
     PeriodicTimer? _headerTimer;
@@ -764,6 +833,7 @@
                 _catalog = view?.Catalog;
                 _fixed = view?.Fixed;
                 _research = view?.Model;
+                _day = view?.Day;
                 if (CaptureSessionId is not null && _snapshot is null) throw new InvalidOperationException("Capture session is unavailable.");
                 _captureReady = true;
             }
@@ -887,13 +957,41 @@
         if (_snapshot is null || _catalog is null || _sel.SelectedStrike is not { } strike)
         {
             _fixed = null;
+            await RefreshDayAsync(ct);
             await RefreshResearchAsync(ct);
             return;
         }
 
         var bars = _snapshot.Futures.Select(x => (x.Bar.BarSeq, x.Bar.EndAvailableAtUtc)).ToList();
         _fixed = await AdaptiveData.LoadFixedStrikeHistoryAsync(_snapshot.Session.Id, _catalog, strike, bars, ct, _snapshot.Session.RollingWindowBars);
+        await RefreshDayAsync(ct);
         await RefreshResearchAsync(ct);
+    }
+
+    async Task RefreshDayAsync(CancellationToken ct)
+    {
+        if (_snapshot is null)
+        {
+            _day = null;
+            return;
+        }
+
+        var through = _snapshot.Futures.FirstOrDefault()?.Bar.BarSeq ?? 0;
+        var strike = _catalog is not null ? _sel.SelectedStrike : null;
+        var key = $"{_snapshot.Session.Id}|{through}|{strike}";
+        if (_day is not null && _day.Key == key)
+        {
+            return;                                   // same session, same completed bar, same strike: nothing to re-read
+        }
+
+        try
+        {
+            _day = await AdaptiveData.LoadDayAverageDataAsync(_snapshot.Session.Id, through, _catalog, strike, _snapshot.Session.RollingWindowBars, _snapshot.ResidualAnchors, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _day = null;                              // DAY AVG is informational: a failed read hides the row, never the grids
+        }
     }
 
     async Task RefreshResearchAsync(CancellationToken ct)
@@ -1048,26 +1146,9 @@
         __b.AddMarkupContent(0, $"<td>{RatioFormat.Cell(d.Ce, rawDecimals)}</td><td>{RatioFormat.Cell(d.Pe, rawDecimals)}</td><td class=\"adaptive-direction {RatioFormat.SignClass(d.Direction)}\" data-direction-sign=\"{RatioFormat.SignName(d.Direction)}\">{RatioFormat.Cell(d.Direction, rawDecimals)}</td>");
     };
 
-    sealed record FuturesAvgRow(double? Duration, double? Urgency, double? BarPx, double? RollPx, RatioPart Strict, RatioPart Enriched, RatioPart MicroDev, RatioPart Ofi, double? RollOi, double? Basis, double? Efficiency);
-
-    // AVG of the VISIBLE rows only: arithmetic means of the continuous columns; ratios are SUM(numerator)/SUM(denominator); categorical columns are not averaged.
-    FuturesAvgRow FuturesAverage()
-    {
-        var rows = _snapshot?.Futures ?? [];
-        var ratios = rows.Select(x => FuturesRatios.Build(x.Bar, Supplemental(x.Bar.BarSeq))).ToList();
-        return new FuturesAvgRow(
-            RatioAverage.Mean(rows.Select(x => (double?)x.Bar.DurationSeconds)),
-            RatioAverage.Mean(rows.Select(x => AdaptiveGridProjection.Urgency(x.Bar.Volume, x.Bar.DurationSeconds))),
-            RatioAverage.Mean(rows.Select(x => (double?)x.Bar.BarPriceDisplacement)),
-            RatioAverage.Mean(rows.Select(x => (double?)x.Rolling?.PriceDisplacement)),
-            RatioAverage.Aggregate(ratios.Select(r => r.Strict)),
-            RatioAverage.Aggregate(ratios.Select(r => r.Enriched)),
-            RatioAverage.Aggregate(ratios.Select(r => r.MicroDev)),
-            RatioAverage.Aggregate(ratios.Select(r => r.Ofi)),
-            RatioAverage.Mean(rows.Select(x => (double?)x.Rolling?.OiChange)),
-            RatioAverage.Mean(rows.Select(x => Basis(x.Bar.BarSeq)?.DeltaBasis)),
-            RatioAverage.Mean(rows.Select(x => (double?)x.Rolling?.Efficiency)));
-    }
+    // AVG of the VISIBLE rows only (same implementation as DAY AVG): arithmetic means of the continuous columns; ratios are SUM(numerator)/SUM(denominator); categorical columns are not averaged.
+    FuturesAvgRow FuturesAverage() =>
+        FuturesAverages.Compute(_snapshot?.Futures ?? [], Supplemental, Basis);
 
     static double? Relative(double? a, double? b) => a.HasValue && b.HasValue ? a.Value - b.Value : null;
     static string BoolMark(bool x) => x ? "YES" : "—";
