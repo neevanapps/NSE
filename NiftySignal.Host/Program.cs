@@ -187,7 +187,13 @@ try
     builder.Services.AddSingleton<NiftySignal.Host.PaperLive.PaperLiveBridge>();
     builder.Services.AddSingleton<AdaptiveSourceTickReader>();
     builder.Services.AddSingleton<AdaptiveHistoricalBootstrapService>();
-    builder.Services.AddSingleton<AdaptiveSessionCoordinator>();
+    // New adaptive sessions use the fixed 13,650-contract clock (config Adaptive:Clock:Mode = OpeningVolumeV1 restores the legacy estimator for NEW sessions). Existing sessions keep their frozen model.
+    builder.Services.AddSingleton(sp => new AdaptiveSessionCoordinator(
+        sp.GetRequiredService<AdaptiveSourceTickReader>(),
+        sp.GetRequiredService<Microsoft.Extensions.Options.IOptionsMonitor<NiftySignal.Domain.Configuration.PricingOptions>>(),
+        sp.GetRequiredService<ILogger<AdaptiveSessionCoordinator>>(),
+        Enum.TryParse<NiftySignal.AdaptiveObserver.AdaptiveClockMode>(builder.Configuration["Adaptive:Clock:Mode"], true, out var clockMode)
+            ? clockMode : NiftySignal.AdaptiveObserver.AdaptiveClockMode.Fixed13650));
     builder.Services.AddSingleton<AdaptiveObserverPersistence>();
     builder.Services.AddSingleton<AdaptiveSupplementalPersistence>();
     builder.Services.AddSingleton<AdaptiveSessionSupplementalService>();

@@ -173,7 +173,7 @@ public sealed class AdaptiveObserverDataService(
     /// (session, expiry, strike) key; a missing table (Dashboard started before the migration) or a bar without rows yields unavailable cells, never another strike.
     /// </summary>
     public async Task<FixedStrikeHistory?> LoadFixedStrikeHistoryAsync(
-        long sessionId, FixedStrikeCatalog catalog, double strike, IReadOnlyList<(int BarSeq, DateTimeOffset EndAvailableAtUtc)> bars, CancellationToken ct = default)
+        long sessionId, FixedStrikeCatalog catalog, double strike, IReadOnlyList<(int BarSeq, DateTimeOffset EndAvailableAtUtc)> bars, CancellationToken ct = default, int rollWindowBars = 0)
     {
         var contract = catalog.Find(strike);
         if (contract is null)
@@ -181,7 +181,11 @@ public sealed class AdaptiveObserverDataService(
             return null;
         }
 
-        var seqs = bars.Select(b => b.BarSeq).ToArray();
+        var displayed = bars.Select(b => b.BarSeq).ToArray();
+        // The rolling window of the earliest displayed bar reaches back (window - 1) bars; those earlier rows of the SAME contract are read too.
+        var seqs = displayed.Length == 0 || rollWindowBars <= 1
+            ? displayed
+            : Enumerable.Range(Math.Max(1, displayed.Min() - (rollWindowBars - 1)), displayed.Max() - Math.Max(1, displayed.Min() - (rollWindowBars - 1)) + 1).ToArray();
         IReadOnlyList<AdaptiveOptionStrikeBarRow> stored = Array.Empty<AdaptiveOptionStrikeBarRow>();
         if (seqs.Length > 0)
         {
@@ -189,9 +193,10 @@ public sealed class AdaptiveObserverDataService(
             {
                 await using var db = await dbFactory.CreateDbContextAsync(ct);
                 var version = OptionStrikeBarMetrics.MetricsVersion;
+                var legacy = OptionStrikeBarMetrics.LegacyMetricsVersion;
                 var expiry = catalog.Expiry;
                 stored = await db.OptionStrikeBars.AsNoTracking()
-                    .Where(x => x.SessionId == sessionId && x.Expiry == expiry && x.Strike == strike && x.MetricsVersion == version
+                    .Where(x => x.SessionId == sessionId && x.Expiry == expiry && x.Strike == strike && (x.MetricsVersion == version || x.MetricsVersion == legacy)
                         && seqs.Contains(x.BarSeq))
                     .ToListAsync(ct);
             }
@@ -201,7 +206,7 @@ public sealed class AdaptiveObserverDataService(
             }
         }
 
-        return FixedStrikeProjection.Assemble(catalog, contract, bars, stored);
+        return FixedStrikeProjection.Assemble(catalog, contract, bars, stored, rollWindowBars);
     }
 
     /// <summary>Bars (of the displayed range) whose sidecar carries a durable failed-verification marker. Tolerates a not-yet-migrated schema.</summary>
@@ -271,10 +276,12 @@ public sealed class AdaptiveObserverDataService(
         try
         {
             var version = FuturesMicrostructureBar.MetricsVersion;
+            var legacy = FuturesMicrostructureBar.LegacyMetricsVersion;
             var rows = await db.FuturesSupplemental.AsNoTracking()
-                .Where(x => x.SessionId == sessionId && x.MetricsVersion == version && seqs.Contains(x.BarSeq))
+                .Where(x => x.SessionId == sessionId && (x.MetricsVersion == version || x.MetricsVersion == legacy) && seqs.Contains(x.BarSeq))
                 .ToListAsync(ct);
-            return rows.ToDictionary(x => x.BarSeq);
+            // latest supported version wins per bar; a v2 row (no GrossOfi) is a valid fallback with an unavailable OFI ratio
+            return rows.GroupBy(x => x.BarSeq).ToDictionary(g => g.Key, g => g.OrderByDescending(r => r.MetricsVersion == version).First());
         }
         catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedTable)
         {
@@ -300,7 +307,7 @@ public sealed class AdaptiveObserverDataService(
         try
         {
             return await db.Sessions.AsNoTracking()
-                .Where(x => x.TradeDate == todayIst && x.ModelVersion == OpeningVolumeProjectionV1.ModelVersion)
+                .Where(x => x.TradeDate == todayIst && (x.ModelVersion == OpeningVolumeProjectionV1.ModelVersion || x.ModelVersion == AdaptiveFixedClockV1.ModelVersion))
                 .OrderByDescending(x => x.Id)
                 .FirstOrDefaultAsync(ct);
         }

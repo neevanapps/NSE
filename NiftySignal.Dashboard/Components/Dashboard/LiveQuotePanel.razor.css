@@ -1,9 +1,28 @@
 .quote-panel {
     grid-column: span 12;
+}
+
+/* Interactive Dashboard: the Live Quote stays visible while scrolling. It is a DIRECT child of the dashboard shell (see Home.razor): a sticky element can only stick inside its own
+   parent box, so inside the short login/quote grid it used to scroll away with it. z-index sits above the grid headers (2) so nothing is covered by them. */
+.quote-panel-sticky {
     position: sticky;
-    top: 8px;
-    z-index: 5;
+    top: 0;
+    z-index: 40;
     box-shadow: 0 4px 12px rgba(0,0,0,0.35);
+}
+
+/* Screenshot capture: never sticky; the pinned quote renders once, normally, at the top of the document. */
+.quote-panel-capture {
+    position: static;
+    box-shadow: none;
+}
+
+@media (max-width: 700px) {
+    /* A multi-row quote would cover a phone viewport: below this width it scrolls with the page. */
+    .quote-panel-sticky {
+        position: static;
+        box-shadow: none;
+    }
 }
 
 .quote-row {

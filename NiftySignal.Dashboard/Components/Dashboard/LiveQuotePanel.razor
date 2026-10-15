@@ -10,7 +10,7 @@
 @* Resolved lazily and only in capture mode, so normal Dashboard behaviour has no new dependency. *@
 @inject IServiceProvider Services
 
-    <div class="panel quote-panel" data-testid="live-quote" data-capture-ready="@(CaptureMode ? (_captureReady ? "true" : "false") : null)">
+    <div class="panel quote-panel @(CaptureMode ? "quote-panel-capture" : "quote-panel-sticky")" data-testid="live-quote" data-capture-ready="@(CaptureMode ? (_captureReady ? "true" : "false") : null)">
         <div class="panel-title">NIFTY Live Quote
             @if (CaptureMode)
             {

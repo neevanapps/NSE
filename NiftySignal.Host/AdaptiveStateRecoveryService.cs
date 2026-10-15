@@ -95,7 +95,9 @@ public sealed class AdaptiveStateRecoveryService(
             context.Options,
             context.ResidualAnchor,
             spotToken,
-            projectStrikes: true);
+            projectStrikes: true,
+            selfAnchorCutoffUtc: AdaptiveFixedClockV1.IsFixedClock(context.Session.ModelVersion) ? context.Session.OpeningWindowEndUtc : null);
+        var anchorStored = !AdaptiveFixedClockV1.IsFixedClock(context.Session.ModelVersion) || context.ResidualAnchor is not null;
 
         var reconciled = 0;
         var replayTriggers = new HashSet<int>();
@@ -110,6 +112,12 @@ public sealed class AdaptiveStateRecoveryService(
                 packages = engine.ProcessAvailabilityGroup(items);
             lastAvailable = group.Key;
             lastTickId = items.Max(x=>x.Tick.Id);
+            if (!anchorStored && engine.SelfAnchorAttempted)
+            {
+                // The engine froze the 09:30 anchor on this boundary; it is stored before any bar that depends on it.
+                await persistence.PersistResidualAnchorOnceAsync(observer, context.Session.Id, engine.ResidualAnchor, DateTimeOffset.UtcNow, ct);
+                anchorStored = true;
+            }
 
             foreach (var package in packages)
             {

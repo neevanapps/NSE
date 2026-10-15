@@ -175,3 +175,36 @@
 .adaptive-diagnostics-capture > summary {
     display: none;
 }
+
+/* Ratio grids: AVG (visible rows) footer, sub-grid titles and direction columns. */
+::deep .adaptive-avg-row td {
+    border-top: 2px solid var(--border, #2a3340);
+    font-weight: 600;
+}
+
+::deep .adaptive-subtitle {
+    margin: 10px 0 4px;
+    font-size: .8rem;
+    font-weight: 600;
+    letter-spacing: .04em;
+}
+
+::deep .adaptive-direction {
+    border-left: 1px solid var(--border, #2a3340);
+    font-weight: 600;
+}
+
+/* Sign only, never magnitude: a subtle tint on Direction cells (positive / negative); zero and unavailable stay neutral. */
+::deep .adaptive-direction.val-pos {
+    background: rgba(63, 185, 80, .16);
+}
+
+::deep .adaptive-direction.val-neg {
+    background: rgba(248, 81, 73, .16);
+}
+
+/* The OPTION CONTEXT grid has only a handful of columns: size it to its content instead of stretching a narrow Seq column across the page. */
+.adaptive-table[data-grid="options-context"] {
+    width: auto;
+    min-width: 40%;
+}

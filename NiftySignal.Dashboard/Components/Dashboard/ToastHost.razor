@@ -1,0 +1,130 @@
+@using NiftySignal.Dashboard.Services
+@implements IDisposable
+@inject AdaptiveObserverDataService AdaptiveData
+@inject AdaptiveCommentaryDataService CommentaryData
+@inject PaperLiveDataService Paper
+@inject Npt1LiveQuotes Quotes
+
+@* UI-only notifications: no sound, no trading action, no Telegram. The first load of each source only sets its baseline, so opening or refreshing the page never replays today's history. *@
+<div class="toast-stack" data-testid="toast-stack" aria-live="polite">
+    @foreach (var t in _visible)
+    {
+        <div class="toast-item toast-@t.Candidate.Tone" data-toast-id="@t.Candidate.Id" data-toast-kind="@t.Candidate.Kind" role="status">
+            <button type="button" class="toast-close" aria-label="Dismiss" @onclick="() => Dismiss(t)">×</button>
+            <div class="toast-title">@t.Candidate.Title</div>
+            @foreach (var line in t.Candidate.Lines)
+            {
+                <div class="toast-line">@line</div>
+            }
+        </div>
+    }
+</div>
+
+@code {
+    const int MaxVisible = 3;
+    static readonly TimeSpan Lifetime = TimeSpan.FromSeconds(10);
+
+    sealed record Shown(ToastCandidate Candidate, DateTimeOffset ExpiresAt);
+
+    readonly ToastTracker _tracker = new();
+    readonly List<Shown> _visible = [];
+    readonly SemaphoreSlim _gate = new(1, 1);
+    PeriodicTimer? _expiry;
+    CancellationTokenSource? _cts;
+    bool _disposed;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _cts = new CancellationTokenSource();
+        AdaptiveData.Updated += OnAdaptive;
+        Quotes.TradesChanged += OnTrades;
+        await CheckCommentaryAsync();
+        await CheckTradesAsync();
+        _expiry = new PeriodicTimer(TimeSpan.FromSeconds(1));
+        _ = ExpireLoopAsync(_cts.Token);
+    }
+
+    void OnAdaptive() => _ = InvokeAsync(CheckCommentaryAsync);
+
+    void OnTrades() => _ = InvokeAsync(CheckTradesAsync);
+
+    async Task CheckCommentaryAsync()
+    {
+        if (_disposed) return;
+        try
+        {
+            var model = await CommentaryData.LoadLatestAsync(10, _cts?.Token ?? CancellationToken.None);
+            Offer(_tracker.Observe("commentary", model.Events.Select(ToastFactory.FromCommentary)));
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // informational only: a failed read shows nothing and is retried on the next push
+        }
+    }
+
+    async Task CheckTradesAsync()
+    {
+        if (_disposed) return;
+        try
+        {
+            var today = DateOnly.FromDateTime(DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromHours(5.5)).DateTime);
+            var view = Paper.Configured ? await Paper.LoadLatestAsync(today, _cts?.Token ?? CancellationToken.None) : null;
+            Offer(_tracker.Observe("trades", ToastFactory.FromLedger(view, today)));
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+        }
+    }
+
+    void Offer(IReadOnlyList<ToastCandidate> fresh)
+    {
+        if (fresh.Count == 0 || _disposed) return;
+        lock (_visible)
+        {
+            foreach (var c in fresh)
+            {
+                _visible.Add(new Shown(c, DateTimeOffset.UtcNow + Lifetime));
+            }
+
+            while (_visible.Count > MaxVisible)
+            {
+                _visible.RemoveAt(0);
+            }
+        }
+
+        _ = InvokeAsync(StateHasChanged);
+    }
+
+    async Task ExpireLoopAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (_expiry is not null && await _expiry.WaitForNextTickAsync(ct))
+            {
+                bool changed;
+                lock (_visible)
+                {
+                    changed = _visible.RemoveAll(s => s.ExpiresAt <= DateTimeOffset.UtcNow) > 0;
+                }
+
+                if (changed) await InvokeAsync(StateHasChanged);
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    void Dismiss(Shown t)
+    {
+        lock (_visible) { _visible.Remove(t); }
+    }
+
+    public void Dispose()
+    {
+        _disposed = true;
+        AdaptiveData.Updated -= OnAdaptive;
+        Quotes.TradesChanged -= OnTrades;
+        _cts?.Cancel();
+        _expiry?.Dispose();
+        _cts?.Dispose();
+    }
+}

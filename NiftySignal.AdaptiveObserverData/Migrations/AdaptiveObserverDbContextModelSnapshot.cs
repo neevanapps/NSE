@@ -459,6 +459,9 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                     b.Property<int>("BookStateChanges")
                         .HasColumnType("integer");
 
+                    b.Property<long?>("GrossOfi")
+                        .HasColumnType("bigint");
+
                     b.Property<int>("InvalidBookEvents")
                         .HasColumnType("integer");
 
@@ -941,6 +944,9 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                     b.Property<DateOnly>("Expiry")
                         .HasColumnType("date");
 
+                    b.Property<long?>("GrossOfi")
+                        .HasColumnType("bigint");
+
                     b.Property<double?>("IvChange")
                         .HasColumnType("double precision");
 
@@ -954,6 +960,15 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                         .IsRequired()
                         .HasMaxLength(64)
                         .HasColumnType("character varying(64)");
+
+                    b.Property<double?>("MicroDevTimeWeighted")
+                        .HasColumnType("double precision");
+
+                    b.Property<long?>("NetOfi")
+                        .HasColumnType("bigint");
+
+                    b.Property<int?>("OfiTransitions")
+                        .HasColumnType("integer");
 
                     b.Property<long?>("OiDelta")
                         .HasColumnType("bigint");
@@ -995,6 +1010,12 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                         .HasColumnType("bigint");
 
                     b.Property<double>("Strike")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("TobTimeWeighted")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("TobUsableSeconds")
                         .HasColumnType("double precision");
 
                     b.Property<string>("Token")

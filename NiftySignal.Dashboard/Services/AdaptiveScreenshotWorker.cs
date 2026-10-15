@@ -7,7 +7,7 @@ namespace NiftySignal.Dashboard.Services;
 
 public sealed class AdaptiveScreenshotWorker(IDbContextFactory<AdaptiveObserverDbContext> factory,
     AdaptiveScreenshotProcessor processor, IOptions<AdaptiveScreenshotOptions> options,
-    IOptions<TelegramOptions> telegram, IHostApplicationLifetime lifetime, ILogger<AdaptiveScreenshotWorker> logger) : BackgroundService
+    IOptions<TelegramOptions> telegram, IHostApplicationLifetime lifetime, ILogger<AdaptiveScreenshotWorker> logger, PaperLiveDataService? paper = null) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -33,7 +33,8 @@ public sealed class AdaptiveScreenshotWorker(IDbContextFactory<AdaptiveObserverD
                     {
                         await AdaptiveScreenshotSchedule.RecoverInterruptedAsync(db, stoppingToken);
                         var now = DateTimeOffset.UtcNow;
-                        await AdaptiveScreenshotSchedule.EnqueueAsync(db, DateOnly.FromDateTime(now.ToOffset(TimeSpan.FromHours(5.5)).DateTime), now, stoppingToken);
+                        await AdaptiveScreenshotSchedule.EnqueueAsync(db, DateOnly.FromDateTime(now.ToOffset(TimeSpan.FromHours(5.5)).DateTime), now, stoppingToken,
+                            paper is { Configured: true } ? async (d, c) => ResearchEvents.FromLedger(await paper.LoadLatestAsync(d, c)).Select(e => new ScreenshotEventCandidate(e.Id, e.AtUtc, e.Kind)).ToList() : null);
                         await processor.ProcessOneAsync(db, now, stoppingToken);
                     }
                     finally { await db.Database.ExecuteSqlRawAsync("SELECT pg_advisory_unlock(73063005)", CancellationToken.None); }

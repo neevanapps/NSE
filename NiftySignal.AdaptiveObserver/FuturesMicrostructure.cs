@@ -47,14 +47,20 @@ public sealed record FuturesMicrostructureBar(
     double ValidBookSeconds,
     double InvalidBookSeconds,
     double TobUsableSeconds,
-    double MicroDevUsableSeconds)
+    double MicroDevUsableSeconds,
+    long? GrossOfi = null)
 {
     /// <summary>
     /// Identifies the calculation contract. Change it whenever any formula or boundary rule changes.
     /// v2: OFI is null (not 0) unless at least one valid baseline-to-next transition happened inside the bar, and TOB/MicroDev coverage is
     /// reported separately from structurally-valid-price time.
+    /// v3: adds <see cref="GrossOfi"/> = SUM(|e_i|) over the same valid transitions (the denominator of the normalized OFI ratio). Every other value is
+    /// identical to v2; v2 rows stay in place and are never overwritten (readers prefer v3 and fall back to v2).
     /// </summary>
-    public const string MetricsVersion = "futures-micro-v2";
+    public const string MetricsVersion = "futures-micro-v3";
+
+    /// <summary>The previous contract (no GrossOfi). Readable as a fallback by the Dashboard; the Host writes only the current version.</summary>
+    public const string LegacyMetricsVersion = "futures-micro-v2";
 }
 
 /// <summary>
@@ -123,7 +129,7 @@ public sealed class FuturesMicrostructureTracker
         Extent(reference);
         var cursor = start;
         var baseline = reference is { IsValid: true } ? reference : null;
-        long ofi = 0;
+        long ofi = 0, grossOfi = 0;
         var transitions = 0;
         var invalidEvents = 0;
         for (var i = firstInside; i < lastInside; i++)
@@ -142,7 +148,9 @@ public sealed class FuturesMicrostructureTracker
             {
                 if (baseline is { } previous)
                 {
-                    ofi += Contribution(previous, next);
+                    var e = Contribution(previous, next);
+                    ofi += e;
+                    grossOfi += Math.Abs(e);
                     transitions++;
                 }
 
@@ -177,7 +185,8 @@ public sealed class FuturesMicrostructureTracker
             validSeconds,
             invalidSeconds,
             tobSeconds,
-            microSeconds);
+            microSeconds,
+            transitions > 0 ? grossOfi : null);
     }
 
     /// <summary>

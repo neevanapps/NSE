@@ -41,6 +41,7 @@ public sealed class AdaptiveObserverWorker(
 
     LiveState? _live;
     DateOnly? _historyBootstrappedFor;
+    DateOnly? _fixedHistoryFor;
 
     internal sealed class LiveState(
         AdaptiveObserverSessionContext context,
@@ -57,6 +58,8 @@ public sealed class AdaptiveObserverWorker(
         /// <summary>Recovery hands back raw-Id-ordered pending rows; sort once, then only after new ticks are appended.</summary>
         public bool PendingNeedsSort { get; set; } = recovered.Pending.Count > 1;
         public DateTimeOffset? LastRuntimeFlushUtc { get; set; }
+        /// <summary>Fixed-clock sessions store their 09:30 residual anchor once, when the engine freezes it (see AdaptiveObserverPersistence.PersistResidualAnchorOnceAsync).</summary>
+        public bool AnchorStored { get; set; } = !AdaptiveFixedClockV1.IsFixedClock(context.Session.ModelVersion) || context.ResidualAnchor is not null || recovered.Engine.SelfAnchorAttempted;
         /// <summary>Completed bars whose sidecar integrity is unknown (a write/verify failed). Commentary never evaluates at or past the first of them.</summary>
         public SortedDictionary<int, AdaptiveCompletedBarPackage> UnverifiedSidecars { get; } = new();
         /// <summary>Bars found unverified during recovery (no package retained to retry); commentary stays capped before them until the next recovery.</summary>
@@ -93,6 +96,12 @@ public sealed class AdaptiveObserverWorker(
                     }
 
                     _live = null;
+                    // Pre-market on a trading weekday: rebuild the prior days on the fixed 13,650 clock now, so the live start at 09:15 never waits for it.
+                    if (weekday && time < MarketOpen && _fixedHistoryFor != day)
+                    {
+                        await EnsureFixedHistoryAsync(day, stoppingToken);
+                    }
+
                     // Not preemptible: once started a slow reconstruction cannot notice 09:15, so it never starts on weekday mornings.
                     if (ShouldRunEndedSessionRecovery(weekday, time))
                     {
@@ -152,6 +161,27 @@ public sealed class AdaptiveObserverWorker(
             scope.ServiceProvider.GetRequiredService<AdaptiveObserverDbContext>(),todayIst,includeToday,ct);
     }
 
+    async Task EnsureFixedHistoryAsync(DateOnly day, CancellationToken ct)
+    {
+        _fixedHistoryFor = day;
+        try
+        {
+            await using var scope = scopeFactory.CreateAsyncScope();
+            var seeded = await historicalBootstrap.EnsurePriorFixedSessionsAsync(
+                scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>(), scope.ServiceProvider.GetRequiredService<AdaptiveObserverDbContext>(), day, ct);
+            if (seeded > 0)
+            {
+                logger.LogInformation("Adaptive fixed-clock history ready for {TradeDay}: {Seeded} prior day(s) rebuilt.", day, seeded);
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            // Never blocks the observer: the Strong threshold simply stays uncalibrated when too few prior fixed-clock days exist.
+            logger.LogError(ex, "Adaptive fixed-clock history bootstrap failed; Strong/Weak calibration may be unavailable today.");
+        }
+    }
+
     /// <summary>Validation tooling only: treats historical bootstrap as already done for <paramref name="day"/>.</summary>
     internal void MarkHistoricalBootstrapDone(DateOnly day) => _historyBootstrappedFor = day;
 
@@ -165,6 +195,11 @@ public sealed class AdaptiveObserverWorker(
         {
             await historicalBootstrap.EnsurePriorSessionsAsync(source, observer, day, ct);
             _historyBootstrappedFor = day;
+        }
+
+        if (_fixedHistoryFor != day)
+        {
+            await EnsureFixedHistoryAsync(day, ct);
         }
 
         var context = await coordinator.TryGetOrCreateAsync(source, observer, day, nowUtc, ct);
@@ -247,6 +282,11 @@ public sealed class AdaptiveObserverWorker(
                 packages = live.Engine.ProcessAvailabilityGroup(group);
             live.LastProcessedAvailableAt = groupTime;
             live.LastProcessedTickId = group.Max(x=>x.Tick.Id);
+            if (!live.AnchorStored && live.Engine.SelfAnchorAttempted)
+            {
+                await persistence.PersistResidualAnchorOnceAsync(observer, live.Context.Session.Id, live.Engine.ResidualAnchor, nowUtc, ct);
+                live.AnchorStored = true;
+            }
 
             var groupBars = new List<(AdaptiveCompletedBarPackage Package, bool Verified)>();
             foreach (var package in packages)

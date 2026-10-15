@@ -269,3 +269,12 @@ table.data-table {
 .paper-pnl-up { color: #2e9d57; font-weight: 600; }
 .paper-pnl-down { color: #d1493f; font-weight: 600; }
 .paper-diagnostics > summary { list-style: revert; }
+
+
+/* Telegram screenshots only: modestly tighter grids so the wide fixed-strike CORE DIRECTION table stays readable instead of becoming an enormous image. The interactive Dashboard is unaffected. */
+.adaptive-capture .adaptive-table th,
+.adaptive-capture .adaptive-table td {
+    font-size: .72rem;
+    padding: 3px 5px;
+    white-space: nowrap;
+}
