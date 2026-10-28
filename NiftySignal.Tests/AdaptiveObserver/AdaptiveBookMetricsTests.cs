@@ -129,7 +129,8 @@ public sealed class AdaptiveBookMetricsTests
 
         Assert.True(withTob > 0, "the synthetic session must exercise real option books");
         Assert.True(withOfi > 0);
-        Assert.Equal("option-strike-v2", OptionStrikeBarMetrics.MetricsVersion);
+        Assert.Equal("option-strike-v3", OptionStrikeBarMetrics.MetricsVersion);
+        Assert.Equal("option-strike-v2", OptionStrikeBarMetrics.PreviousMetricsVersion);
         Assert.Equal("option-strike-v1", OptionStrikeBarMetrics.LegacyMetricsVersion);
     }
 
@@ -179,7 +180,7 @@ public sealed class AdaptiveBookMetricsTests
         var service = new AdaptiveSupplementalPersistence(NullLogger<AdaptiveSupplementalPersistence>.Instance);
 
         Assert.Equal(SupplementalOutcome.Inserted, await service.PersistOrVerifyStrikesAsync(db, 1, package, default));
-        Assert.All(db.OptionStrikeBars, r => Assert.Equal("option-strike-v2", r.MetricsVersion));
+        Assert.All(db.OptionStrikeBars, r => Assert.Equal("option-strike-v3", r.MetricsVersion));
         var stored = await db.OptionStrikeBars.AsNoTracking().FirstAsync(x => x.NetOfi != null && x.TobTimeWeighted != null);
         var source = package.OptionStrikes!.Single(s => s.Token == stored.Token);
         Assert.Equal((source.TobTimeWeighted, source.MicroDevTimeWeighted, source.NetOfi, source.GrossOfi, source.OfiTransitions), (stored.TobTimeWeighted, stored.MicroDevTimeWeighted, stored.NetOfi, stored.GrossOfi, stored.OfiTransitions));

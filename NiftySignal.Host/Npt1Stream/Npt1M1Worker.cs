@@ -265,7 +265,10 @@ public sealed class Npt1M1Worker(
             Producer = producer,
             Processor = processor,
             Feed = feed,
-            Tokens = freeze.Freeze.Options.Select(o => o.Token).Append(freeze.Freeze.FutureToken).Distinct(StringComparer.Ordinal).ToArray(),
+            // The spot instrument is read too (spot ATM contract): its rows feed the producer's engine only; they are not quotes.
+            Tokens = freeze.Freeze.Options.Select(o => o.Token).Append(freeze.Freeze.FutureToken)
+                .Concat(string.IsNullOrWhiteSpace(freeze.Freeze.SpotToken) ? [] : [freeze.Freeze.SpotToken!])
+                .Distinct(StringComparer.Ordinal).ToArray(),
         };
     }
 

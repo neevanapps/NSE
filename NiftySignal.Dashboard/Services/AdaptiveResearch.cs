@@ -276,7 +276,7 @@ public sealed class AdaptiveResearchService(
             ResearchDataQuality.Text(issues), issues,
             boundary is { } sb ? ResearchEvents.StrategyStateAsOf(ledger, session.TradeDate, sb) : "strategy state unavailable",
             shown, selectionPolicy,
-            $"{session.ModelVersion} | session source {ShortSha(session.SourceCommitSha)} | Dashboard {ShortSha(build.CommitSha)}",
+            $"{session.ModelVersion} | ATM {AtmCenterRules.Describe(session.AtmRuleVersion)} | session source {ShortSha(session.SourceCommitSha)} | Dashboard {ShortSha(build.CommitSha)}",
             pinned);
     }
 

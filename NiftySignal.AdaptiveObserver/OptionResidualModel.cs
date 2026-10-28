@@ -12,12 +12,15 @@ public static class OptionResidualModel
         IReadOnlyList<ObserverOptionInstrument> chain,
         IReadOnlyDictionary<string, OptionQuoteSnapshot> quotes,
         double riskFreeRate,
-        double maxQuoteAgeSeconds = 5d)
+        double maxQuoteAgeSeconds = 5d,
+        AtmCenterRule centerRule = AtmCenterRule.SyntheticForwardLegacy,
+        double? spot = null)
     {
+        // Under the spot rule the anchor center is the strike nearest the fresh spot at the anchor time; no spot -> no anchor (never another price).
         var selection = AdaptiveOptionBandCalculator.Select(
-            atUtc, expiry, future0930, chain, quotes, riskFreeRate, maxQuoteAgeSeconds, halfWidth:2)
+            atUtc, expiry, future0930, chain, quotes, riskFreeRate, maxQuoteAgeSeconds, halfWidth:2, centerRule, spot)
             ?? AdaptiveOptionBandCalculator.Select(atUtc, expiry, future0930, chain, quotes,
-                riskFreeRate, maxQuoteAgeSeconds, halfWidth:0);
+                riskFreeRate, maxQuoteAgeSeconds, halfWidth:0, centerRule, spot);
 
         if (selection is null)
         {

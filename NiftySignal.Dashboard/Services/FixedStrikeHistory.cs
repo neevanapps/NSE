@@ -56,6 +56,10 @@ public sealed record FixedStrikeHistory(DateOnly Expiry, double Strike, FixedStr
 /// <summary>Pure assembly of the fixed-strike rows: exactly one expiry + strike + CE token + PE token, aligned to the displayed completed bars.</summary>
 public static class FixedStrikeProjection
 {
+    /// <summary>Higher = newer contract. v3 adds Delta/Vega, v2 adds the book metrics; a bar's cell is never filled from a different bar or strike.</summary>
+    static int VersionRank(string version) =>
+        version == OptionStrikeBarMetrics.MetricsVersion ? 3 : version == OptionStrikeBarMetrics.PreviousMetricsVersion ? 2 : 1;
+
     public static FixedStrikeHistory Assemble(
         FixedStrikeCatalog catalog,
         FixedStrikeContract contract,
@@ -68,9 +72,9 @@ public static class FixedStrikeProjection
             .Where(r => r.Expiry == catalog.Expiry && r.Strike == contract.Strike
                 && ((r.Side == OptionType.Call && contract.CeToken is not null && r.Token == contract.CeToken)
                     || (r.Side == OptionType.Put && contract.PeToken is not null && r.Token == contract.PeToken))
-                && (r.MetricsVersion == OptionStrikeBarMetrics.MetricsVersion || r.MetricsVersion == OptionStrikeBarMetrics.LegacyMetricsVersion))
+                && (r.MetricsVersion == OptionStrikeBarMetrics.MetricsVersion || r.MetricsVersion == OptionStrikeBarMetrics.PreviousMetricsVersion || r.MetricsVersion == OptionStrikeBarMetrics.LegacyMetricsVersion))
             .GroupBy(r => (r.BarSeq, r.Side))
-            .ToDictionary(g => g.Key, g => g.OrderByDescending(r => r.MetricsVersion == OptionStrikeBarMetrics.MetricsVersion).First());   // latest supported version wins, v1 is the fallback
+            .ToDictionary(g => g.Key, g => g.OrderByDescending(r => VersionRank(r.MetricsVersion)).First());   // latest supported version wins (v3, then v2, then v1)
         // A rolling window is comparable only when EVERY bar of the window has a stored row for this exact side/token; anything less is unavailable (never bridged, never another strike).
         RollPrice? Roll(int seq, OptionType side)
         {

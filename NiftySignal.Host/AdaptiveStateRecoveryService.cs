@@ -50,6 +50,14 @@ public sealed class AdaptiveStateRecoveryService(
             }
         }
 
+        // The ATM rule is part of the session's frozen contract: a stamped session replays under the rule it was created with, an unstamped (older) one under the legacy rule. An unknown stamp throws.
+        var atmRule = AtmCenterRules.FromVersion(context.Session.AtmRuleVersion);
+        if (atmRule == AtmCenterRule.SpotV1 && string.IsNullOrWhiteSpace(spotToken))
+        {
+            logger.LogWarning("Adaptive session {SessionId} uses {Rule} but has no frozen spot instrument; the weekly ATM±2 band stays unavailable for this session (no fallback to another price).",
+                context.Session.Id, AtmCenterRules.SpotV1Version);
+        }
+
         var tokens = context.Options.Select(x => x.Token)
             .Append(context.Definition.FutureToken)
             .Concat(string.IsNullOrWhiteSpace(spotToken) ? [] : [spotToken!])
@@ -96,7 +104,8 @@ public sealed class AdaptiveStateRecoveryService(
             context.ResidualAnchor,
             spotToken,
             projectStrikes: true,
-            selfAnchorCutoffUtc: AdaptiveFixedClockV1.IsFixedClock(context.Session.ModelVersion) ? context.Session.OpeningWindowEndUtc : null);
+            selfAnchorCutoffUtc: AdaptiveFixedClockV1.IsFixedClock(context.Session.ModelVersion) ? context.Session.OpeningWindowEndUtc : null,
+            atmRule: atmRule);
         var anchorStored = !AdaptiveFixedClockV1.IsFixedClock(context.Session.ModelVersion) || context.ResidualAnchor is not null;
 
         var reconciled = 0;

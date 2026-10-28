@@ -13,8 +13,16 @@ public static class AdaptiveOptionBandCalculator
         IReadOnlyDictionary<string, OptionQuoteSnapshot> latestQuotes,
         double riskFreeRate,
         double maxQuoteAgeSeconds = 5d,
-        int halfWidth = 2)
+        int halfWidth = 2,
+        AtmCenterRule centerRule = AtmCenterRule.SyntheticForwardLegacy,
+        double? spot = null)
     {
+        // The spot rule never substitutes another price: no valid spot, no band. (The futures reference below only picks the candidate strikes of the synthetic forward, which still prices IV.)
+        if (centerRule == AtmCenterRule.SpotV1 && !(spot is { } s0 && s0 > 0d && double.IsFinite(s0)))
+        {
+            return null;
+        }
+
         var sameExpiry = chain.Where(x => x.ExpiryDate == expiry).ToList();
         var strikes = sameExpiry.Select(x => x.Strike).Distinct().OrderBy(x => x).ToArray();
         if (strikes.Length < (halfWidth * 2) + 1)
@@ -50,7 +58,9 @@ public static class AdaptiveOptionBandCalculator
             return null;
         }
 
-        var center = strikes.OrderBy(k => Math.Abs(k - synthetic.Value)).ThenBy(k => k).First();
+        var center = centerRule == AtmCenterRule.SpotV1
+            ? AtmCenterRules.NearestStrike(strikes, spot!.Value)
+            : strikes.OrderBy(k => Math.Abs(k - synthetic.Value)).ThenBy(k => k).First();
         var centerIndex = Array.IndexOf(strikes, center);
         if (centerIndex < halfWidth || centerIndex + halfWidth >= strikes.Length)
         {

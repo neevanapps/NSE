@@ -17,7 +17,9 @@ public sealed record M1FreezeReport(
     string ObservationStartUtc,
     int OptionContracts,
     string? AnchorCenterStrike,
-    string Fingerprint);
+    string Fingerprint,
+    string? SpotToken = null,
+    string? AtmRuleVersion = null);
 
 /// <summary>The frozen M1 session, its report and the complete provenance of the base bar volume decision.</summary>
 public sealed record M1Freeze(SessionFreeze Freeze, M1FreezeReport Report, BarSizeDecision Decision);
@@ -40,8 +42,15 @@ public static class M1SessionFreeze
         IReadOnlyList<ObserverOptionInstrument> descriptors,
         IReadOnlyDictionary<string, decimal> tickSizes,
         IEnumerable<SourceTick> rows,
-        IReadOnlyList<PriorSession> priors)
+        IReadOnlyList<PriorSession> priors,
+        string spotToken)
     {
+        // npt1-m1-v2 is the spot ATM contract: a freeze without a spot identity would be labelled spot-atm-v1 yet have no band all day. The caller must refuse such a day (M1SessionBuilder does).
+        if (string.IsNullOrWhiteSpace(spotToken))
+        {
+            throw new ArgumentException("An npt1-m1-v2 freeze needs the frozen NIFTY spot token.", nameof(spotToken));
+        }
+
         var open = M1Time.IstTime(day, 9, 15);
         var cutoff = M1Time.IstTime(day, 9, 30);
         var through = cutoff.AddSeconds(5);
@@ -101,7 +110,11 @@ public static class M1SessionFreeze
                 }
             }
 
-            anchor = OptionResidualModel.BuildAnchor(cutoff, weeklyExpiry, f0.Last, descriptors, latest, RiskFreeRate, 5d);
+            // M1 runs under the spot ATM contract (npt1-m1-v2): the anchor center is the strike nearest the spot in force at 09:30, fresh by the same rule as the engine (0 <= age <= 5 s).
+            // No fresh spot -> no anchor (the residual diagnostic is then unavailable); no other price is substituted.
+            var freshSpot = AtmCenterRules.FreshSpot(
+                preClean.Where(x => x.Token == spotToken).OrderBy(x => x.Tick.AvailableAt).ThenBy(x => x.Tick.Id).Select(x => (x.Tick.AvailableAt, x.Tick.Last)), cutoff);
+            anchor = OptionResidualModel.BuildAnchor(cutoff, weeklyExpiry, f0.Last, descriptors, latest, RiskFreeRate, 5d, AtmCenterRule.SpotV1, freshSpot);
         }
 
         var freeze = new SessionFreeze(
@@ -114,10 +127,13 @@ public static class M1SessionFreeze
             descriptors,
             anchor,
             tickSizes,
-            M1Identity.ModelVersion);
+            M1Identity.ModelVersion,
+            spotToken,
+            AtmCenterRules.SpotV1Version);
 
         var fingerprintText = new StringBuilder();
         fingerprintText.Append(CultureInfo.InvariantCulture, $"{day:yyyy-MM-dd}|{weeklyExpiry:yyyy-MM-dd}|{future.Token}|{future.LotSize}|{baseVolume}|{openingVolume}|{covered}|{cutoff:O}|{open:O}|{freeze.ModelVersion}\n");
+        fingerprintText.Append(CultureInfo.InvariantCulture, $"spot|{freeze.SpotToken ?? "none"}|{freeze.AtmRuleVersion}\n");
         foreach (var o in descriptors.OrderBy(d => d.Token, StringComparer.Ordinal))
         {
             fingerprintText.Append(CultureInfo.InvariantCulture, $"{o.Token}|{o.OptionType}|{o.Strike:R}|{o.ExpiryDate:yyyy-MM-dd}|{o.LotSize}|{tickSizes[o.Token]}\n");
@@ -142,7 +158,9 @@ public static class M1SessionFreeze
             open.ToString("O", CultureInfo.InvariantCulture),
             descriptors.Count,
             anchor?.CenterStrike.ToString("R", CultureInfo.InvariantCulture),
-            Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(fingerprintText.ToString()))).ToLowerInvariant());
+            Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(fingerprintText.ToString()))).ToLowerInvariant(),
+            spotToken,
+            AtmCenterRules.SpotV1Version);
         return new M1Freeze(freeze, report, decision);
     }
 }

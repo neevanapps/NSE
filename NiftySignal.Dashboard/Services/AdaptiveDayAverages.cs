@@ -33,7 +33,7 @@ public static class FuturesAverages
 /// <summary>Aggregates of the fixed-strike rows (CORE DIRECTION metrics and OPTION CONTEXT metrics). Pure: the rows decide the identity (one session / expiry / strike / CE token / PE token).</summary>
 public sealed record OptionsCoreAverage(SideDirection Strict, SideDirection Enriched, SideDirection Oi, SideDirection MicroDev, SideDirection Ofi);
 
-public sealed record OptionsContextAverage(SideDirection Price, SideDirection RollPrice, SideDirection Iv, SideDirection Activity);
+public sealed record OptionsContextAverage(SideDirection Price, SideDirection RollPrice, SideDirection Iv, SideDirection Activity, SideDirection Delta, SideDirection Vega);
 
 public static class OptionAverages
 {
@@ -56,7 +56,9 @@ public static class OptionAverages
             OptionDirectionRatios.Average(c.Select(r => r.Price)),
             OptionDirectionRatios.Average(c.Select(r => r.RollPrice)),
             OptionDirectionRatios.Average(x.Select(r => r.Iv)),
-            OptionDirectionRatios.Average(x.Select(r => r.Activity)));
+            OptionDirectionRatios.Average(x.Select(r => r.Activity)),
+            OptionDirectionRatios.Average(x.Select(r => r.Delta)),
+            OptionDirectionRatios.Average(x.Select(r => r.Vega)));
     }
 
     /// <summary>Aggregate of ALL rows of a fixed-strike history (the caller has already bounded it to the target boundary).</summary>

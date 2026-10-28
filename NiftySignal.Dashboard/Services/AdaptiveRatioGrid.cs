@@ -121,7 +121,7 @@ public sealed record SideDirection(RatioPart Ce, RatioPart Pe, RatioPart Directi
 
 public sealed record CoreDirectionRow(SideDirection Price, SideDirection RollPrice, SideDirection Strict, SideDirection Enriched, SideDirection Oi, SideDirection MicroDev, SideDirection Ofi);
 
-public sealed record OptionContextRow(SideDirection Iv, SideDirection Activity);
+public sealed record OptionContextRow(SideDirection Iv, SideDirection Activity, SideDirection Delta, SideDirection Vega);
 
 /// <summary>
 /// The fixed-strike CORE DIRECTION and OPTION CONTEXT metrics. Direction is CE minus PE everywhere EXCEPT open interest, where it is PE minus CE.
@@ -233,7 +233,27 @@ public static class OptionDirectionRatios
         var ceAct = new RatioPart(ceA, ceA, total);
         var peAct = new RatioPart(peA, peA, total);
         var actDir = ceA is { } x && peA is { } y ? new RatioPart(x - y, x - y, total) : RatioPart.None;
-        return new OptionContextRow(new SideDirection(ceIv, peIv, ivDir), new SideDirection(ceAct, peAct, actDir));
+        return new OptionContextRow(new SideDirection(ceIv, peIv, ivDir), new SideDirection(ceAct, peAct, actDir),
+            GreekChange(ce?.DeltaChange, ce?.DeltaStart, pe?.DeltaChange, pe?.DeltaStart),
+            GreekChange(ce?.VegaChange, ce?.VegaStart, pe?.VegaChange, pe?.VegaStart));
+    }
+
+    /// <summary>
+    /// A Black-Scholes Greek CHANGE over the bar (option-strike-v3: end - start, stored raw, never scaled), laid out exactly like IV: CE and PE raw change with ratio = change / |own start| (as a percentage),
+    /// Direction = CE change - PE change over the AVERAGE of the two |start| values. |start| because a put delta is negative. A side without a stored change (v1/v2 row, no IV) is unavailable, never zero.
+    /// </summary>
+    static SideDirection GreekChange(double? ceChange, double? ceStart, double? peChange, double? peStart)
+    {
+        static double? Base(double? start) => start is { } s && double.IsFinite(s) && s != 0d ? Math.Abs(s) : null;
+        var ce = RatioPart.Of(ceChange, ceChange, Base(ceStart));
+        var pe = RatioPart.Of(peChange, peChange, Base(peStart));
+        RatioPart dir = RatioPart.None;
+        if (ceChange is { } c && peChange is { } p)
+        {
+            dir = Base(ceStart) is { } cb && Base(peStart) is { } pb ? RatioPart.Of(c - p, c - p, (cb + pb) / 2d) : RatioPart.Of(c - p, null, null);
+        }
+
+        return new SideDirection(ce, pe, dir);
     }
 
     public static SideDirection Average(IEnumerable<SideDirection> rows, Func<SideDirection, SideDirection> select) => Average(rows.Select(select));

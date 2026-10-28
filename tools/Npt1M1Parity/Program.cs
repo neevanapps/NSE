@@ -48,7 +48,16 @@ var weekly = optionRows.Select(x => x.ExpiryDate!.Value).Distinct().OrderBy(x =>
 var nearest = optionRows.Where(x => x.ExpiryDate == weekly).ToList();
 var descriptors = nearest.Select(i => new ObserverOptionInstrument(i.Token, i.TradingSymbol, i.OptionType, (double)i.StrikePrice!.Value, i.ExpiryDate!.Value, i.LotSize)).ToList();
 var tickSizes = nearest.ToDictionary(i => i.Token, i => i.TickSize > 0m ? i.TickSize : 0.05m, StringComparer.Ordinal);
-var tokens = descriptors.Select(d => d.Token).Append(future.Token).Distinct(StringComparer.Ordinal).ToArray();
+// npt1-m1-v2 centers its band on the spot: the unique NIFTY Index instrument is read with the future and options (the research package this tool compares against used the legacy synthetic-forward center,
+// so a band/anchor-center mismatch against it is EXPECTED under v2; the checks below compare it and report any difference).
+var spotResolution = await NiftySpotInstrument.ResolveAsync(db, day, CancellationToken.None);
+if (spotResolution.Token is not { } spotToken)
+{
+    Console.Error.WriteLine($"REFUSED: npt1-m1-v2 needs exactly one NIFTY Index instrument for {day:yyyy-MM-dd}; found {spotResolution.CandidateCount}.");
+    return 2;
+}
+
+var tokens = descriptors.Select(d => d.Token).Append(future.Token).Append(spotToken).Distinct(StringComparer.Ordinal).ToArray();
 var futureInstrument = new FutureInstrument(future.Token, future.TradingSymbol, future.ExpiryDate ?? day, future.LotSize);
 
 var failures = new List<string>();
@@ -76,7 +85,7 @@ if (a.ContainsKey("compute-history"))
 
 var sw = Stopwatch.StartNew();
 var freezeRows = await reader.ReadWindowAsync(db, tokens, day, M1Time.IstTime(day, 9, 30).AddSeconds(5), CancellationToken.None);
-var freeze = M1SessionFreeze.Build(day, weekly, futureInstrument, descriptors, tickSizes, freezeRows, VolumeHistory.Eligible(history));
+var freeze = M1SessionFreeze.Build(day, weekly, futureInstrument, descriptors, tickSizes, freezeRows, VolumeHistory.Eligible(history), spotToken);
 var refState = ReadState(state);
 Console.WriteLine($"freeze: base bar {freeze.Report.BaseBarVolume} (reference {refState.GetValueOrDefault("base_bar_volume")}), opening {freeze.Report.OpeningVolume} (reference {refState.GetValueOrDefault("opening_volume")}), status {freeze.Decision.MethodStatus}, fallback {freeze.Decision.FallbackSource}");
 Check(freeze.Report.BaseBarVolume.ToString(CultureInfo.InvariantCulture) == refState.GetValueOrDefault("base_bar_volume"), "base bar volume");

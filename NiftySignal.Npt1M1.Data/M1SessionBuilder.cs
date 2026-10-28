@@ -54,14 +54,23 @@ public sealed class M1SessionBuilder(Npt1TickReader reader)
         var nearest = optionRows.Where(x => x.ExpiryDate == weekly).ToList();
         var descriptors = nearest.Select(i => new ObserverOptionInstrument(i.Token, i.TradingSymbol, i.OptionType, (double)i.StrikePrice!.Value, i.ExpiryDate!.Value, i.LotSize)).ToList();
         var tickSizes = nearest.ToDictionary(i => i.Token, i => i.TickSize > 0m ? i.TickSize : fallbackTickSize, StringComparer.Ordinal);
-        var tokens = descriptors.Select(d => d.Token).Append(future.Token).Distinct(StringComparer.Ordinal).ToArray();
+
+        // The frozen spot instrument (spot ATM contract, npt1-m1-v2): the unique NIFTY Index instrument of the trade date's master, the same identity rule as the adaptive observer's supplemental freeze.
+        // Not exactly one -> the session is refused (loudly); a spot-less M1 stream would silently have no band all day.
+        var spot = await NiftySpotInstrument.ResolveAsync(source, day, ct);
+        if (spot.Token is not { } spotToken)
+        {
+            return new M1SessionAttempt(null, false, $"npt1-m1-v2 needs exactly one NIFTY Index (spot) instrument in the instrument master of {day:yyyy-MM-dd}; found {spot.CandidateCount}.");
+        }
+
+        var tokens = descriptors.Select(d => d.Token).Append(future.Token).Append(spotToken).Distinct(StringComparer.Ordinal).ToArray();
 
         var rows = await reader.ReadWindowAsync(source, tokens, day, cutoff.AddSeconds(5), ct);
         var history = await EnsureVolumeHistoryAsync(source, store, day, nowUtc, ct);
         var priors = VolumeHistory.Eligible(history);
         try
         {
-            var freeze = M1SessionFreeze.Build(day, weekly, future, descriptors, tickSizes, rows, priors);
+            var freeze = M1SessionFreeze.Build(day, weekly, future, descriptors, tickSizes, rows, priors, spotToken);
             return new M1SessionAttempt(new M1SessionBuild(freeze, future, history, rows), false, "frozen");
         }
         catch (InvalidOperationException e) when (e.Message.StartsWith("The stored futures stream does not cross 09:30", StringComparison.Ordinal))

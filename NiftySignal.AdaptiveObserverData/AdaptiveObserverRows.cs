@@ -45,6 +45,8 @@ public sealed class AdaptiveSessionStateRow
     public double? ResidualCenterStrike { get; set; }
     public DateTimeOffset? ResidualAnchorCompletedAtUtc { get; set; }
     public required DateTimeOffset CreatedAtUtc { get; set; }
+    // The ATM center contract this session was frozen under (AtmCenterRules): "spot-atm-v1", or NULL = a session created before it (legacy synthetic-forward center). Never rewritten.
+    public string? AtmRuleVersion { get; set; }
 }
 
 public sealed class AdaptiveFutureBarRow
@@ -634,4 +636,13 @@ public sealed class AdaptiveOptionStrikeBarRow
     public long? NetOfi { get; set; }
     public long? GrossOfi { get; set; }
     public int? OfiTransitions { get; set; }
+
+    // option-strike-v3 only (NULL on v1/v2 rows, and NULL whenever IV is NULL). Black-Scholes Delta/Vega at the bar start/end from the same inputs as IvStart/IvEnd; Change = End - Start.
+    // Vega is per 1.00 volatility (NiftySignal.Pricing convention), Delta is the raw option delta; nothing is scaled.
+    public double? DeltaStart { get; set; }
+    public double? DeltaEnd { get; set; }
+    public double? DeltaChange { get; set; }
+    public double? VegaStart { get; set; }
+    public double? VegaEnd { get; set; }
+    public double? VegaChange { get; set; }
 }

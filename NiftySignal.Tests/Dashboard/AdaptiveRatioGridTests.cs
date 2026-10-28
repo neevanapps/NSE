@@ -291,4 +291,63 @@ public class AdaptiveRatioGridTests
         Assert.Equal("option-strike-v1", bar2.Ce!.MetricsVersion);
         Assert.Null(bar2.Pe);                                                     // no substitution from another token / strike / version
     }
+
+    [Fact]
+    public void FixedStrikeProjection_PrefersV3_ThenV2_ThenV1_PerBarAndSide_NeverMixingGreeksAcrossBarsOrSides()
+    {
+        var expiry = new DateOnly(2026, 10, 19);
+        var catalog = new FixedStrikeCatalog(expiry, [new FixedStrikeContract(25000, "CE", "CE25000", "PE", "PE25000")]);
+        AdaptiveOptionStrikeBarRow Row(int bar, OptionType side, string version, double? deltaChange = null) => new()
+        {
+            SessionId = 1, BarSeq = bar, MetricsVersion = version, EndAvailableAtUtc = T, Expiry = expiry, Strike = 25000, Side = side,
+            Token = side == OptionType.Call ? "CE" : "PE", TradingSymbol = "X", DeltaChange = deltaChange,
+        };
+        var stored = new[]
+        {
+            Row(1, OptionType.Call, "option-strike-v1"), Row(1, OptionType.Call, "option-strike-v2"), Row(1, OptionType.Call, "option-strike-v3", 0.02),   // all three: v3 wins
+            Row(1, OptionType.Put, "option-strike-v2"),                                                                                                   // v2 only
+            Row(2, OptionType.Call, "option-strike-v3", 0.03),                                                                                            // v3 on one side only
+            Row(2, OptionType.Put, "option-strike-v1"),
+        };
+        var h = FixedStrikeProjection.Assemble(catalog, catalog.Strikes[0], [(1, T), (2, T)], stored);
+        var bar1 = h.Rows.Single(r => r.BarSeq == 1);
+        Assert.Equal("option-strike-v3", bar1.Ce!.MetricsVersion);
+        Assert.Equal(0.02, bar1.Ce.DeltaChange);
+        Assert.Equal("option-strike-v2", bar1.Pe!.MetricsVersion);
+        Assert.Null(bar1.Pe.DeltaChange);                                         // a v2 row never borrows a Greek from the v3 row beside it
+        var bar2 = h.Rows.Single(r => r.BarSeq == 2);
+        Assert.Equal(0.03, bar2.Ce!.DeltaChange);
+        Assert.Equal("option-strike-v1", bar2.Pe!.MetricsVersion);
+
+        // The direction metric of a half-available pair is unavailable, not CE - 0.
+        var ctx = OptionDirectionRatios.Context(bar2.Ce, bar2.Pe);
+        Assert.Null(ctx.Delta.Direction.Raw);
+        Assert.Equal("—", RatioFormat.Cell(ctx.Delta.Pe));
+    }
+
+    [Fact]
+    public void GreekChange_MirrorsTheIvLayout_UsesAbsoluteStartForTheRatio_AndIsUnavailableWithoutAStoredChange()
+    {
+        AdaptiveOptionStrikeBarRow Row(OptionType side, double? start, double? change) => new()
+        {
+            SessionId = 1, BarSeq = 1, MetricsVersion = "option-strike-v3", EndAvailableAtUtc = T, Expiry = new DateOnly(2026, 10, 19), Strike = 25000, Side = side, Token = "X", TradingSymbol = "X",
+            DeltaStart = start, DeltaChange = change, VegaStart = start is null ? null : Math.Abs(start.Value) * 6000, VegaChange = change is null ? null : change * 1000,
+        };
+        var ctx = OptionDirectionRatios.Context(Row(OptionType.Call, 0.5, 0.02), Row(OptionType.Put, -0.4, 0.01));
+        Assert.Equal(0.02, ctx.Delta.Ce.Raw);
+        Assert.Equal(0.02 / 0.5 * 100d, ctx.Delta.Ce.Ratio!.Value, 9);
+        Assert.Equal(0.01 / 0.4 * 100d, ctx.Delta.Pe.Ratio!.Value, 9);            // |-0.4|, the base is positive
+        Assert.Equal(0.02 - 0.01, ctx.Delta.Direction.Raw!.Value, 12);              // CE - PE, like IV
+        Assert.Equal((0.02 - 0.01) / ((0.5 + 0.4) / 2d) * 100d, ctx.Delta.Direction.Ratio!.Value, 9);
+        Assert.Equal(20d, ctx.Vega.Ce.Raw!.Value, 9);                               // raw, never scaled by 100
+
+        var zeroStart = OptionDirectionRatios.Context(Row(OptionType.Call, 0d, 0.02), Row(OptionType.Put, -0.4, 0.01));
+        Assert.Equal(0.02, zeroStart.Delta.Ce.Raw);
+        Assert.Null(zeroStart.Delta.Ce.Ratio);                                      // no ratio on a zero start
+        Assert.Null(zeroStart.Delta.Direction.Ratio);
+
+        var none = OptionDirectionRatios.Context(Row(OptionType.Call, null, null), Row(OptionType.Put, null, null));
+        Assert.Null(none.Delta.Ce.Raw); Assert.Null(none.Vega.Direction.Raw);
+        Assert.Equal("—", RatioFormat.Cell(none.Delta.Direction));
+    }
 }

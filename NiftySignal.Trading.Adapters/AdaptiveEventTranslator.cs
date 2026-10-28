@@ -43,6 +43,10 @@ public sealed class AdaptiveEventTranslator
     private readonly AdaptiveIncrementalTickNormalizer _normalizer = new();
     private readonly HashSet<string> _optionTokens;
     private readonly SortedSet<Buffered> _buffer = new(new BufferedOrder());
+    // Spot rows (spot ATM rule only). They are admitted, validated and normalised exactly like every other row, but they are NOT quotes and never form an availability group of their own:
+    // they wait here and are handed to the engine (which keeps its own causal spot history) just before the first released group at or after their availability.
+    private readonly SortedSet<Buffered> _spotBuffer = new(new BufferedOrder());
+    private readonly string? _spotToken;
     private readonly Dictionary<long, (string Fingerprint, DateTimeOffset Received)> _seen = new();
     private readonly Queue<(long Id, DateTimeOffset Received)> _seenOrder = new();
     private readonly Dictionary<string, ResidualReadingPoint> _previousResidual = new(StringComparer.Ordinal);
@@ -89,7 +93,10 @@ public sealed class AdaptiveEventTranslator
             freeze.StrongThreshold,
             freeze.SignalStartUtc,
             freeze.Options,
-            freeze.ResidualAnchor);
+            freeze.ResidualAnchor,
+            spotToken: freeze.SpotToken,
+            atmRule: AtmCenterRules.FromVersion(freeze.AtmRuleVersion));
+        _spotToken = string.IsNullOrWhiteSpace(freeze.SpotToken) ? null : freeze.SpotToken;
         _optionTokens = freeze.Options.Select(o => o.Token).ToHashSet(StringComparer.Ordinal);
         _readinessSpec = _options.ReadinessSpec(freeze);
         _baskets = new Dictionary<string, (ResidualBases?, string)>(StringComparer.Ordinal)
@@ -160,9 +167,10 @@ public sealed class AdaptiveEventTranslator
         }
 
         _input++;
-        if (row.Token != _freeze.FutureToken && !_optionTokens.Contains(row.Token))
+        var isSpot = _spotToken is not null && row.Token == _spotToken;
+        if (row.Token != _freeze.FutureToken && !_optionTokens.Contains(row.Token) && !isSpot)
         {
-            return Refuse(row, RowRejection.UnknownToken, "Token is neither the session future nor a frozen option.");
+            return Refuse(row, RowRejection.UnknownToken, "Token is neither the session future, a frozen option nor the frozen spot instrument.");
         }
 
         if (row.ExchangeTimestamp.Year < 2000 || row.ReceivedAt.Year < 2000)
@@ -249,6 +257,13 @@ public sealed class AdaptiveEventTranslator
             }
         }
 
+        if (isSpot)
+        {
+            _spotBuffer.Add(new Buffered(row.Token, tick, row, basis));
+            _translated++;
+            return RowDisposition.Accepted;
+        }
+
         _buffer.Add(new Buffered(row.Token, tick, row, basis));
         _maxBuffered = Math.Max(_maxBuffered, _buffer.Count);
         _translated++;
@@ -289,6 +304,16 @@ public sealed class AdaptiveEventTranslator
 
     private TranslatedGroup Translate(DateTimeOffset at, IReadOnlyList<Buffered> rows)
     {
+        // Every spot row available at or before this group is handed to the engine first (the engine answers "the spot in force at t" causally and never uses a later one).
+        while (_spotBuffer.Count > 0 && _spotBuffer.Min!.Tick.AvailableAt <= at)
+        {
+            var spot = _spotBuffer.Min;
+            _spotBuffer.Remove(spot);
+            _engine.Process(spot.Token, spot.Tick);
+            _lastReleasedRow[spot.Token] = spot.Source.Fingerprint();
+            _highestReleasedId = Math.Max(_highestReleasedId, spot.Source.Id);
+        }
+
         var packages = _engine.ProcessAvailabilityGroup(rows.Select(r => (r.Token, r.Tick)).ToArray());
 
         var quotes = new List<TranslatedQuote>(rows.Count);

@@ -45,6 +45,8 @@ public sealed record SourceTick(
 /// <param name="ResidualAnchor">Frozen 09:30 residual anchor, or null when it could not be built.</param>
 /// <param name="TickSizes">Effective-date tick size per option token (from the instrument master of the trade date).</param>
 /// <param name="ModelVersion">Opening-volume model version of the frozen session (provenance of the readiness state).</param>
+/// <param name="SpotToken">Frozen NIFTY spot/index instrument token (null = none; the legacy sessions and their tests). Required by the spot ATM rule.</param>
+/// <param name="AtmRuleVersion">ATM center contract of the frozen session (<see cref="AtmCenterRules"/>): "spot-atm-v1", or null = the legacy synthetic-forward center.</param>
 public sealed record SessionFreeze(
     AdaptiveSessionDefinition Definition,
     DateOnly WeeklyOptionExpiry,
@@ -55,7 +57,9 @@ public sealed record SessionFreeze(
     IReadOnlyList<ObserverOptionInstrument> Options,
     OptionResidualAnchor? ResidualAnchor,
     IReadOnlyDictionary<string, decimal> TickSizes,
-    string ModelVersion)
+    string ModelVersion,
+    string? SpotToken = null,
+    string? AtmRuleVersion = null)
 {
     public DateOnly TradeDate => Definition.TradeDate;
 
