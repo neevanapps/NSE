@@ -44,6 +44,7 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
             e.ToTable("adaptive_sessions");
             e.HasIndex(x => new { x.TradeDate, x.ModelVersion }).IsUnique();
             e.Property(x => x.ModelVersion).HasMaxLength(64);
+            e.Property(x => x.AtmRuleVersion).HasMaxLength(32);
             e.Property(x => x.SourceBranch).HasMaxLength(128);
             e.Property(x => x.SourceCommitSha).HasMaxLength(64);
             e.Property(x => x.FutureToken).HasMaxLength(32);

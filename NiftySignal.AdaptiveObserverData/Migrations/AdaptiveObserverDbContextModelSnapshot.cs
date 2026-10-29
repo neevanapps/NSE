@@ -926,6 +926,15 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                     b.Property<int>("BarSeq")
                         .HasColumnType("integer");
 
+                    b.Property<double?>("DeltaChange")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("DeltaEnd")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("DeltaStart")
+                        .HasColumnType("double precision");
+
                     b.Property<DateTimeOffset>("EndAvailableAtUtc")
                         .HasColumnType("timestamp with time zone");
 
@@ -1033,6 +1042,15 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                         .IsRequired()
                         .HasMaxLength(128)
                         .HasColumnType("character varying(128)");
+
+                    b.Property<double?>("VegaChange")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("VegaEnd")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("VegaStart")
+                        .HasColumnType("double precision");
 
                     b.HasKey("Id");
 
@@ -1554,6 +1572,10 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                         .HasColumnType("bigint");
 
                     NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<string>("AtmRuleVersion")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
 
                     b.Property<long>("BaseBarVolume")
                         .HasColumnType("bigint");

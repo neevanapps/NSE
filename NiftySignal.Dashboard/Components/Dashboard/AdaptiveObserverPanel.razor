@@ -358,15 +358,16 @@
                             </tbody>
                         </table>
                     </div>
-                    <div class="adaptive-subtitle">OPTION CONTEXT <span class="text-faint">same strike · IV raw in IV points · Activity = traded quantity per second</span></div>
+                    <div class="adaptive-subtitle">OPTION CONTEXT <span class="text-faint">same strike · IV raw in IV points · ΔDelta / ΔVega = bar change (end − start) of the Black-Scholes Greek, raw (Vega per 1.00 vol; blank until option-strike-v3 rows exist) · Activity = traded quantity per second</span></div>
                     <div class="adaptive-table-wrap">
                         <table class="adaptive-table adaptive-table-compact" data-grid="options-context" data-strike="@_fixed.Strike.ToString("0")">
                             <thead>
                             <tr>
                                 <th>Seq</th><th>End IST</th>
                                 <th>CE Price Δ</th><th>PE Price Δ</th><th>Price Dir</th>
-                                <th>CE Roll ΔPx</th><th>PE Roll ΔPx</th><th>Roll Price Dir</th>
                                 <th>CE ΔIV</th><th>PE ΔIV</th><th>IV Dir</th>
+                                <th>CE ΔDelta</th><th>PE ΔDelta</th><th>Delta Dir</th>
+                                <th>CE ΔVega</th><th>PE ΔVega</th><th>Vega Dir</th>
                                 <th>CE Activity</th><th>PE Activity</th><th>Activity Dir</th>
                             </tr>
                             </thead>
@@ -378,8 +379,9 @@
                                     <td class="sticky-col">@r.BarSeq</td>
                                     <td>@FmtIst(r.EndAvailableAtUtc)</td>
                                     @DirectionCells(pr.Price, 2)
-                                    @DirectionCells(pr.RollPrice, 2)
                                     @DirectionCells(d.Iv, 2)
+                                    @DirectionCells(d.Delta, 4)
+                                    @DirectionCells(d.Vega, 2)
                                     @DirectionCells(d.Activity, 1)
                                 </tr>
                             }
@@ -389,8 +391,9 @@
                                     <td class="sticky-col">AVG</td>
                                     <td>@ctxRows.Count rows</td>
                                     @DirectionCells(ctxAvg.Price, 2)
-                                    @DirectionCells(ctxAvg.RollPrice, 2)
                                     @DirectionCells(ctxAvg.Iv, 2)
+                                    @DirectionCells(ctxAvg.Delta, 4)
+                                    @DirectionCells(ctxAvg.Vega, 2)
                                     @DirectionCells(ctxAvg.Activity, 1)
                                 </tr>
                             }
@@ -400,8 +403,9 @@
                                     <td class="sticky-col">DAY AVG</td>
                                     <td>@_day.BarCount bars</td>
                                     @DirectionCells(dx.Context.Price, 2)
-                                    @DirectionCells(dx.Context.RollPrice, 2)
                                     @DirectionCells(dx.Context.Iv, 2)
+                                    @DirectionCells(dx.Context.Delta, 4)
+                                    @DirectionCells(dx.Context.Vega, 2)
                                     @DirectionCells(dx.Context.Activity, 1)
                                 </tr>
                             }

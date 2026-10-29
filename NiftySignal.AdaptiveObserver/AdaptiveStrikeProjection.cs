@@ -40,16 +40,26 @@ public sealed record OptionStrikeBarMetrics(
     double? TobUsableSeconds = null,
     long? NetOfi = null,
     long? GrossOfi = null,
-    int? OfiTransitions = null)
+    int? OfiTransitions = null,
+    double? DeltaStart = null,
+    double? DeltaEnd = null,
+    double? DeltaChange = null,
+    double? VegaStart = null,
+    double? VegaEnd = null,
+    double? VegaChange = null)
 {
     /// <summary>
     /// Identifies the calculation contract. Change it whenever any formula, boundary or freshness rule changes.
-    /// v2 = every v1 value (unchanged) + the contract's own Level-1 book metrics from the SAME per-token <see cref="FuturesMicrostructureTracker"/> the observer already feeds:
-    /// time-weighted TOB / MicroDev, TOB-usable seconds, net OFI and gross OFI (SUM |e_i|). v1 rows (no book metrics) stay in place and are never rewritten.
+    /// v3 = every v2 value (unchanged) + the contract's Black-Scholes Delta and Vega at the bar start and end and their change (<c>change = end - start</c>), computed from the SAME inputs and solved
+    /// volatility as <c>IvStart</c>/<c>IvEnd</c>. Vega keeps the NiftySignal.Pricing convention (per 1.00 volatility, not per vol point); nothing is scaled. They are null whenever IV is null
+    /// (no fresh mid, no band underlying, or no solution), never zero. v2 rows (no Greeks) and v1 rows stay in place and are never rewritten or relabelled.
     /// </summary>
-    public const string MetricsVersion = "option-strike-v2";
+    public const string MetricsVersion = "option-strike-v3";
 
-    /// <summary>The previous contract (no book metrics). Still readable by the Dashboard for sessions that only have v1 rows; never written any more.</summary>
+    /// <summary>The previous contract (book metrics, no Greeks). Still readable by the Dashboard for bars that only have v2 rows; never written any more.</summary>
+    public const string PreviousMetricsVersion = "option-strike-v2";
+
+    /// <summary>The oldest contract (no book metrics). Still readable by the Dashboard for sessions that only have v1 rows; never written any more.</summary>
     public const string LegacyMetricsVersion = "option-strike-v1";
 }
 
@@ -91,15 +101,20 @@ public static class AdaptiveStrikeProjection
             var oiStart = s?.OpenInterest;
             var oiEnd = e.OpenInterest;
 
-            double? Iv(InstrumentFlowSnapshot? snapshot, DateTimeOffset at, double? underlying)
+            // IV (in vol points) and the Black-Scholes Delta / Vega at the SAME instant from the SAME inputs (fresh mid, synthetic underlying, time to expiry, rate) and the SAME solved volatility,
+            // so Delta/Vega are exactly consistent with IvStart/IvEnd. Vega keeps the NiftySignal.Pricing convention (dPrice/dSigma for a full 1.00 vol move, not per vol point); Delta is the raw option delta.
+            (double? Iv, double? Delta, double? Vega) Point(InstrumentFlowSnapshot? snapshot, DateTimeOffset at, double? underlying)
             {
-                if (snapshot is null || underlying is not { } u || OptionsSupplementalCalculator.FreshMid(snapshot, at) is not { } mid) return null;
+                if (snapshot is null || underlying is not { } u || OptionsSupplementalCalculator.FreshMid(snapshot, at) is not { } mid) return (null, null, null);
                 var t = TimeToExpiry.YearsUntilExpiry(i.ExpiryDate, at);
-                return AdaptiveResearchPricing.SolveIv(i.OptionType, mid, u, i.Strike, t, riskFreeRate) is { } iv ? iv * 100d : null;
+                if (AdaptiveResearchPricing.SolveIv(i.OptionType, mid, u, i.Strike, t, riskFreeRate) is not { } sigma) return (null, null, null);
+                if (!(u > 0d) || !(t > 0d) || !(sigma > 0d)) return (sigma * 100d, null, null);
+                var g = BlackScholes.Calculate(i.OptionType, u, i.Strike, t, riskFreeRate, sigma).Greeks;
+                return (sigma * 100d, g.Delta, g.Vega);
             }
 
-            var ivStart = Iv(s, startUtc, startUnderlying);
-            var ivEnd = Iv(e, endUtc, endUnderlying);
+            var (ivStart, deltaStart, vegaStart) = Point(s, startUtc, startUnderlying);
+            var (ivEnd, deltaEnd, vegaEnd) = Point(e, endUtc, endUnderlying);
             var micro = book?.Invoke(i.Token);       // this token's own book over the bar; null when the book was never observed
             rows.Add(new OptionStrikeBarMetrics(
                 i.Token, i.TradingSymbol, i.ExpiryDate, i.Strike, i.OptionType,
@@ -111,7 +126,9 @@ public static class AdaptiveStrikeProjection
                 ivStart, ivEnd, ivStart is { } v0 && ivEnd is { } v1 ? v1 - v0 : null,
                 durationSeconds > 0d ? total / durationSeconds : null,
                 e.LastAvailableAt is { } at2 && at2 <= endUtc ? (endUtc - at2).TotalSeconds : null,
-                micro?.TobTimeWeighted, micro?.MicroDevTimeWeighted, micro is null ? null : micro.TobUsableSeconds, micro?.Ofi, micro?.GrossOfi, micro?.OfiTransitions));
+                micro?.TobTimeWeighted, micro?.MicroDevTimeWeighted, micro is null ? null : micro.TobUsableSeconds, micro?.Ofi, micro?.GrossOfi, micro?.OfiTransitions,
+                deltaStart, deltaEnd, deltaStart is { } d0 && deltaEnd is { } d1 ? d1 - d0 : null,
+                vegaStart, vegaEnd, vegaStart is { } g0 && vegaEnd is { } g1 ? g1 - g0 : null));
         }
 
         return rows;

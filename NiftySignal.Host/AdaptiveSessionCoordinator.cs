@@ -99,7 +99,9 @@ public sealed class AdaptiveSessionCoordinator(
 
         var nearestOptions = optionRows.Where(x => x.ExpiryDate == weeklyExpiry).ToList();
         var optionDescriptors = nearestOptions.Select(ToDescriptor).ToList();
-        var tokens = optionDescriptors.Select(x => x.Token).Append(future.Token).Distinct(StringComparer.Ordinal).ToArray();
+        // spot-atm-v1: the NIFTY spot (the unique Index instrument of the day's master, the same identity the supplemental freeze uses) is read too, for the 09:30 anchor center.
+        var spotInstrument = await NiftySpotInstrument.ResolveAsync(source, day, ct);
+        var tokens = optionDescriptors.Select(x => x.Token).Append(future.Token).Concat(spotInstrument.Token is { } st ? [st] : []).Distinct(StringComparer.Ordinal).ToArray();
 
         // Read through "now", not merely cutoff, so readiness can prove the persisted futures
         // stream actually crossed 09:30. Calculations below still use only <= cutoff data.
@@ -181,6 +183,10 @@ public sealed class AdaptiveSessionCoordinator(
             && (cutoffUtc - future0930Tick.AvailableAt).TotalSeconds <= ResidualQuoteMaxAgeSeconds)
         {
             var quotes = BuildLatestQuotesAt(clean, optionDescriptors, cutoffUtc);
+            // The anchor center is the strike nearest the spot in force at the cutoff (0 <= age <= 5 s). No unique spot instrument or no fresh spot -> no anchor; nothing else is substituted.
+            var spotAtCutoff = spotInstrument.Token is { } spotToken
+                ? AtmCenterRules.FreshSpot(clean.Where(x => x.Token == spotToken).OrderBy(x => x.Tick.AvailableAt).ThenBy(x => x.Tick.Id).Select(x => (x.Tick.AvailableAt, x.Tick.Last)), cutoffUtc)
+                : null;
             anchor = OptionResidualModel.BuildAnchor(
                 cutoffUtc,
                 weeklyExpiry,
@@ -188,7 +194,9 @@ public sealed class AdaptiveSessionCoordinator(
                 optionDescriptors,
                 quotes,
                 riskFreeRate,
-                ResidualQuoteMaxAgeSeconds);
+                ResidualQuoteMaxAgeSeconds,
+                AtmCenterRule.SpotV1,
+                spotAtCutoff);
         }
 
         var build = BuildIdentity.Current();
@@ -232,6 +240,8 @@ public sealed class AdaptiveSessionCoordinator(
             ResidualCenterStrike = anchor?.CenterStrike,
             ResidualAnchorCompletedAtUtc = anchor is null ? null : nowUtc,
             CreatedAtUtc = nowUtc,
+            // Every NEW session of either clock is frozen under the spot ATM contract. Only sessions created before this change are unstamped (the legacy synthetic-forward center).
+            AtmRuleVersion = AtmCenterRules.SpotV1Version,
         };
 
         await using var transaction = await observer.Database.BeginTransactionAsync(ct);
@@ -348,6 +358,8 @@ public sealed class AdaptiveSessionCoordinator(
             StrongThresholdPriorStateCount = priorCount,
             WeeklyOptionExpiry = weeklyExpiry,
             CreatedAtUtc = nowUtc,
+            // Frozen under the spot ATM contract (the engine self-anchors at 09:30 from the same fresh spot). The opening-volume path above is stamped the same way.
+            AtmRuleVersion = AtmCenterRules.SpotV1Version,
         };
 
         await using var transaction = await observer.Database.BeginTransactionAsync(ct);

@@ -41,6 +41,8 @@ public sealed class AdaptiveObserverEngine
     // spot input cannot change any core output or the engine's ordering strictness (08-Oct plan section 9.6).
     readonly string? _spotToken;
     readonly FuturesBasisTracker _basis = new();
+    // Versioned ATM center contract of this session (default = the legacy synthetic-forward rule, so every existing caller is unchanged).
+    readonly AtmCenterRule _atmRule;
 
     // Per-strike observational projection (opt-in; read-only over the flow state, changes no core output). Start snapshots are those of the current bar's start boundary.
     readonly bool _projectStrikes;
@@ -67,8 +69,10 @@ public sealed class AdaptiveObserverEngine
         OptionResidualAnchor? residualAnchor,
         string? spotToken = null,
         bool projectStrikes = false,
-        DateTimeOffset? selfAnchorCutoffUtc = null)
+        DateTimeOffset? selfAnchorCutoffUtc = null,
+        AtmCenterRule atmRule = AtmCenterRule.SyntheticForwardLegacy)
     {
+        _atmRule = atmRule;
         _selfAnchorCutoffUtc = residualAnchor is null ? selfAnchorCutoffUtc : null;
         _projectStrikes = projectStrikes;
         _spotToken = string.IsNullOrWhiteSpace(spotToken) ? null : spotToken;
@@ -101,6 +105,14 @@ public sealed class AdaptiveObserverEngine
     {
         if (_spotToken is not null && string.Equals(token, _spotToken, StringComparison.Ordinal))
         {
+            // Under spot-atm-v1 the spot CHOOSES persisted band centers, so a spot observation at or before an instant that was already processed would change what a replay chooses at that instant
+            // (live and replay would disagree and a restart would fail strict core verification). It is therefore held to the same contract as every other input: refuse it and force deterministic
+            // recovery, which replays the ticks in availability order. The legacy rule keeps the old behaviour (the spot only feeds the basis sidecar, a late tick is ignored and counted).
+            if (_atmRule == AtmCenterRule.SpotV1 && _lastAvailableAt is { } processed && tick.AvailableAt <= processed)
+            {
+                throw new InvalidOperationException("Spot tick arrived after its instant was already processed (spot-atm-v1 band centers depend on it); deterministic recovery required.");
+            }
+
             _basis.ObserveSpot(tick);
             return Array.Empty<AdaptiveCompletedBarPackage>();
         }
@@ -172,7 +184,8 @@ public sealed class AdaptiveObserverEngine
             _residualAnchor = OptionResidualModel.BuildAnchor(
                 cutoff, _optionExpiry, future.Last, _options,
                 _latestOptionQuotes.Where(x => x.Value.AvailableAt <= cutoff).ToDictionary(x => x.Key, x => x.Value, StringComparer.Ordinal),
-                _riskFreeRate, SelfAnchorMaxQuoteAgeSeconds);
+                _riskFreeRate, SelfAnchorMaxQuoteAgeSeconds,
+                _atmRule, _atmRule == AtmCenterRule.SpotV1 ? _basis.FreshSpotAt(cutoff) : null);
         }
     }
 
@@ -319,13 +332,26 @@ public sealed class AdaptiveObserverEngine
 
     BandContext SelectBandContext(DateTimeOffset at, double futurePrice)
     {
+        // spot-atm-v1: the center comes from the spot in force at THIS instant (never later, at most 5 s old). No fresh spot = no band; no other price is substituted.
+        double? spot = null;
+        if (_atmRule == AtmCenterRule.SpotV1)
+        {
+            spot = _basis.FreshSpotAt(at);
+            if (spot is null)
+            {
+                return new BandContext(null, new Dictionary<string, InstrumentFlowSnapshot>(), false, AtmCenterRules.SpotUnavailableReason);
+            }
+        }
+
         var selection = AdaptiveOptionBandCalculator.Select(
             at,
             _optionExpiry,
             futurePrice,
             _options,
             _latestOptionQuotes,
-            _riskFreeRate);
+            _riskFreeRate,
+            centerRule: _atmRule,
+            spot: spot);
 
         if (selection is null)
         {

@@ -27,21 +27,15 @@ public sealed class AdaptiveSessionSupplementalService(ILogger<AdaptiveSessionSu
             return existing.SpotToken;
         }
 
-        var candidates = await source.Instruments.AsNoTracking()
-            .Where(i => i.AsOfDate == session.TradeDate && i.Underlying == "NIFTY" && i.InstrumentType == InstrumentType.Index)
-            .Select(i => new { i.Token, i.TradingSymbol })
-            .Distinct()
-            .ToListAsync(ct);
-
-        var unique = candidates.Count == 1 ? candidates[0] : null;
+        var resolution = await NiftySpotInstrument.ResolveAsync(source, session.TradeDate, ct);
         var row = new AdaptiveSessionSupplementalRow
         {
             SessionId = session.Id,
             MetricsVersion = MetricsVersion,
-            SpotToken = unique?.Token,
-            SpotSymbol = unique?.TradingSymbol,
-            ResolutionProvenance = unique is null
-                ? $"unresolved: {candidates.Count} NIFTY Index instruments in the {session.TradeDate:yyyy-MM-dd} instrument master"
+            SpotToken = resolution.Token,
+            SpotSymbol = resolution.Symbol,
+            ResolutionProvenance = !resolution.IsUnique
+                ? $"unresolved: {resolution.CandidateCount} NIFTY Index instruments in the {session.TradeDate:yyyy-MM-dd} instrument master"
                 : "unique NIFTY Index instrument in the trade date's instrument master",
             ResolvedAtUtc = DateTimeOffset.UtcNow,
         };

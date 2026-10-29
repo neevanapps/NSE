@@ -240,10 +240,12 @@ public sealed class AdaptiveObserverDataService(
             {
                 await using var db = await dbFactory.CreateDbContextAsync(ct);
                 var version = OptionStrikeBarMetrics.MetricsVersion;
+                var previous = OptionStrikeBarMetrics.PreviousMetricsVersion;
                 var legacy = OptionStrikeBarMetrics.LegacyMetricsVersion;
                 var expiry = catalog.Expiry;
                 stored = await db.OptionStrikeBars.AsNoTracking()
-                    .Where(x => x.SessionId == sessionId && x.Expiry == expiry && x.Strike == strike && (x.MetricsVersion == version || x.MetricsVersion == legacy)
+                    .Where(x => x.SessionId == sessionId && x.Expiry == expiry && x.Strike == strike
+                        && (x.MetricsVersion == version || x.MetricsVersion == previous || x.MetricsVersion == legacy)
                         && seqs.Contains(x.BarSeq))
                     .ToListAsync(ct);
             }

@@ -625,14 +625,14 @@ public sealed class AdaptiveCompactGridTests
         Assert.Contains("data-grid=\"options-context\" data-strike=\"25000\"", html);
         Assert.Equal(["Seq", "End IST", "CE Strict Δ", "PE Strict Δ", "Strict Dir", "CE Enriched Δ", "PE Enriched Δ", "Enriched Dir",
             "CE OI Δ", "PE OI Δ", "OI Dir (PE−CE)", "CE MicroDev", "PE MicroDev", "MicroDev Dir", "CE OFI", "PE OFI", "OFI Dir"], HeadersOf(html, "options-core-direction"));
-        Assert.Equal(["Seq", "End IST", "CE Price Δ", "PE Price Δ", "Price Dir", "CE Roll ΔPx", "PE Roll ΔPx", "Roll Price Dir", "CE ΔIV", "PE ΔIV", "IV Dir", "CE Activity", "PE Activity", "Activity Dir"],
+        Assert.Equal(["Seq", "End IST", "CE Price Δ", "PE Price Δ", "Price Dir", "CE ΔIV", "PE ΔIV", "IV Dir", "CE ΔDelta", "PE ΔDelta", "Delta Dir", "CE ΔVega", "PE ΔVega", "Vega Dir", "CE Activity", "PE Activity", "Activity Dir"],
             HeadersOf(html, "options-context"));
-        // The whole price family (plain and rolling) moved from CORE DIRECTION to OPTION CONTEXT; Roll ΔPx is still the ONLY rolling family of the primary Options grids.
+        // The plain price family moved from CORE DIRECTION to OPTION CONTEXT; the three Roll ΔPx columns were replaced by the Delta and Vega change columns, so no rolling family is left in the primary Options grids.
         Assert.DoesNotContain(HeadersOf(html, "options-core-direction"), h => h.Contains("Price") || h.Contains("Roll", StringComparison.OrdinalIgnoreCase) || h.Contains("ΔPx"));
-        Assert.Equal(["CE Roll ΔPx", "PE Roll ΔPx", "Roll Price Dir"], HeadersOf(html, "options-context").Where(h => h.Contains("Roll", StringComparison.OrdinalIgnoreCase)));
+        Assert.DoesNotContain(HeadersOf(html, "options-context"), h => h.Contains("Roll", StringComparison.OrdinalIgnoreCase));
         Assert.DoesNotContain(HeadersOf(html, "options-context"), h => h.Contains("Roll Strict") || h.Contains("Roll OI") || h.Contains("Roll Enriched") || h.Contains("Roll Vol") || h.Contains("Efficiency"));
         Assert.All(new[] { "Strict", "Enriched", "OI", "MicroDev", "OFI" }, f => Assert.Contains(HeadersOf(html, "options-core-direction"), h => h.Contains(f)));
-        Assert.All(new[] { "ΔIV", "Activity" }, f => Assert.Contains(HeadersOf(html, "options-context"), h => h.Contains(f)));
+        Assert.All(new[] { "ΔIV", "ΔDelta", "ΔVega", "Activity" }, f => Assert.Contains(HeadersOf(html, "options-context"), h => h.Contains(f)));
 
         var core = RowsOf(html, "options-core-direction");
         var bar12 = core.Single(r => r[0] == "12");
@@ -645,7 +645,7 @@ public sealed class AdaptiveCompactGridTests
         Assert.Equal(bar12[2..], bar11[2..]);                                                             // both bars of the SAME strike
 
         var context = RowsOf(html, "options-context");
-        Assert.Equal(["12", "09:42:00", "5.00 (5.00)", "-4.00 (-4.00)", "9.00 (4.50)", "—", "—", "—", "1.00 (5.00)", "-1.00 (-5.00)", "2.00 (10.00)", "30.0 (75.00)", "10.0 (25.00)", "20.0 (50.00)"], context.Single(r => r[0] == "12"));
+        Assert.Equal(["12", "09:42:00", "5.00 (5.00)", "-4.00 (-4.00)", "9.00 (4.50)", "1.00 (5.00)", "-1.00 (-5.00)", "2.00 (10.00)", "—", "—", "—", "—", "—", "—", "30.0 (75.00)", "10.0 (25.00)", "20.0 (50.00)"], context.Single(r => r[0] == "12"));   // the seeded rows carry no Greeks: six unavailable cells, never zero
         Assert.Single(context, r => r[0] == "AVG");
 
         // Futures + residual AVG rows, and the legacy moving ATM±2 grid inside the collapsed Diagnostics section.
@@ -661,6 +661,48 @@ public sealed class AdaptiveCompactGridTests
         Assert.Equal("+12.50", RatioFormatCompatible(residualAvg[2]));
     }
 
+
+    [Fact]
+    public async Task LiveFixedStrikeView_BindsDeltaAndVegaChangeColumns_FromV3Rows_AndShowsDashesForRowsWithoutGreeks()
+    {
+        var factory = await SeedGridAsync();
+        await using (var db = factory.CreateDbContext())
+        {
+            var session = await db.Sessions.SingleAsync();
+            session.OptionUniverseJson = OptionJson(); session.WeeklyOptionExpiry = Day.AddDays(6);
+            session.TradeDate = DateOnly.FromDateTime(DateTimeOffset.UtcNow.ToOffset(Ist).DateTime);
+            foreach (var (seq, version) in new[] { (11, OptionStrikeBarMetrics.PreviousMetricsVersion), (12, OptionStrikeBarMetrics.MetricsVersion) })
+                foreach (var (side, token) in new[] { (OptionType.Call, "CE25000"), (OptionType.Put, "PE25000") })
+                {
+                    var ce = side == OptionType.Call;
+                    var v3 = version == OptionStrikeBarMetrics.MetricsVersion;
+                    db.OptionStrikeBars.Add(new()
+                    {
+                        SessionId = 1, BarSeq = seq, MetricsVersion = version, EndAvailableAtUtc = Open930.AddMinutes(seq), Expiry = Day.AddDays(6), Strike = 25000,
+                        Side = side, Token = token, TradingSymbol = token, PriceStart = 100, PriceEnd = 105, PriceChange = 5, TotalQuantity = 1000,
+                        IvStart = 20, IvChange = 1, ActivityPerSecond = 10,
+                        // a put delta is negative; the change is end - start, stored raw (not scaled)
+                        DeltaStart = v3 ? (ce ? 0.5 : -0.5) : null, DeltaEnd = v3 ? (ce ? 0.52 : -0.485) : null, DeltaChange = v3 ? (ce ? 0.02 : 0.015) : null,
+                        VegaStart = v3 ? 3000 : null, VegaEnd = v3 ? (ce ? 3040 : 3036) : null, VegaChange = v3 ? (ce ? 40 : 36) : null,
+                    });
+                }
+            await db.SaveChangesAsync();
+        }
+
+        var html = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new());
+        var context = RowsOf(html, "options-context");
+
+        // 12 (v3): Delta CE 0.02 on |start| 0.5 = 4 %, PE 0.015 on |-0.5| = 3 %, Direction (CE - PE) = 0.005 over the average |start| 0.5 = 1 %; Vega the same way on 3000.
+        var bar12 = context.Single(r => r[0] == "12");
+        Assert.Equal(["0.0200 (4.00)", "0.0150 (3.00)", "0.0050 (1.00)", "40.00 (1.33)", "36.00 (1.20)", "4.00 (0.13)"], bar12[8..14]);
+        // 11 (v2, no Greeks stored): six unavailable cells, never zero, and the IV / price columns of the same row are untouched.
+        var bar11 = context.Single(r => r[0] == "11");
+        Assert.All(bar11[8..14], c => Assert.Equal("—", c));
+        Assert.Equal(bar12[2..8], bar11[2..8]);
+        // AVG covers only the rows that carry Greeks (bar 11 is excluded from each Greek metric, not counted as zero).
+        var avg = context.Single(r => r[0] == "AVG");
+        Assert.Equal(["0.0200 (4.00)", "0.0150 (3.00)", "0.0050 (1.00)"], avg[8..11]);
+    }
 
     // ------------------------------------------------------------------ DAY AVG (whole session through the boundary) next to the visible-rows AVG
 
@@ -730,7 +772,7 @@ public sealed class AdaptiveCompactGridTests
     }
 
     [Fact]
-    public async Task Live_ContextDayAvg_AggregatesPriceAndRollPriceFromTheSameExactStrike()
+    public async Task Live_ContextDayAvg_AggregatesPriceFromTheSameExactStrike_AndLeavesGreeksUnavailable()
     {
         var factory = await SeedDayAvgAsync();
         var html = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new());
@@ -739,8 +781,8 @@ public sealed class AdaptiveCompactGridTests
         var day = ctx.Single(r => r[0] == "DAY AVG");
         // Price (CE): bars 1, 11, 12 each +5 on a start of 100 -> SUM(change) / SUM(start) = 15 / 300 = 5.00 %.
         Assert.Equal("5.00 (5.00)", day[2]);
-        Assert.Equal(14, day.Length);
-        Assert.Equal("—", day[5]);                                                           // no exact-strike rolling window is complete: unavailable, never zero
+        Assert.Equal(17, day.Length);
+        Assert.All(day[8..14], c => Assert.Equal("—", c));                                   // Delta and Vega change: the seeded rows have none, so unavailable, never zero
     }
 
     [Fact]
@@ -922,9 +964,31 @@ public sealed class AdaptiveCompactGridTests
             Assert.Single(System.Text.RegularExpressions.Regex.Matches(html, "data-testid=\"" + testId + "\""));
         Assert.Equal(4, System.Text.RegularExpressions.Regex.Matches(html, "<table[ >]").Count);          // futures, core, context, residual: no diagnostic table slipped in
         Assert.Contains("NIFTY RESEARCH SNAPSHOT", html);
-        // Direction-sign markup only on Direction cells: five families x (rows + AVG + DAY AVG) in CORE, four (price, roll price, IV, activity) in CONTEXT, none on CE / PE cells.
+        // Direction-sign markup only on Direction cells: five families x (rows + AVG + DAY AVG) in CORE, five (price, IV, delta, vega, activity) in CONTEXT, none on CE / PE cells.
         var coreRows = RowsOf(html, "options-core-direction").Length;
-        Assert.Equal(coreRows * 5 + RowsOf(html, "options-context").Length * 4, System.Text.RegularExpressions.Regex.Matches(html, "data-direction-sign=").Count);
+        Assert.Equal(coreRows * 5 + RowsOf(html, "options-context").Length * 5, System.Text.RegularExpressions.Regex.Matches(html, "data-direction-sign=").Count);
+    }
+
+    [Fact]
+    public async Task Capture_ProvenanceLine_ShowsTheAtmContract_SoLegacyAndSpotSessionsAreDistinguishable()
+    {
+        var factory = await SeedResearchAsync();
+        var args = new Dictionary<string, object?> { ["CaptureMode"] = true, ["CaptureSessionId"] = 1L, ["CaptureBarSeq"] = 12 };
+        string BuildLine(string html) => System.Text.RegularExpressions.Regex.Match(html, "data-testid=\"research-build\"[^>]*>([^<]*)<").Groups[1].Value;
+
+        var rawHtml = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), args);
+        var legacy = BuildLine(rawHtml);
+        Assert.Contains("| ATM synthetic-forward (legacy) |", legacy);                     // an unstamped session is labelled legacy, never blank
+
+        await using (var db = factory.CreateDbContext())
+        {
+            (await db.Sessions.SingleAsync()).AtmRuleVersion = AtmCenterRules.SpotV1Version;
+            await db.SaveChangesAsync();
+        }
+
+        var spot = BuildLine(await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), args));
+        Assert.Contains("| ATM spot-atm-v1 |", spot);
+        Assert.NotEqual(legacy, spot);
     }
 
     [Fact]

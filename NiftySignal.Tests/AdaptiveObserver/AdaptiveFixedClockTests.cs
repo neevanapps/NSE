@@ -65,11 +65,14 @@ public sealed class AdaptiveFixedClockTests
         Assert.Null(s.StrongThreshold);                                        // no fixed-clock history yet: uncalibrated, never borrowed
         Assert.Equal(0, s.StrongThresholdPriorStateCount);
         Assert.Equal(AdaptiveRuntimeStatus.Calibrating, (await db.Runtime.SingleAsync()).RuntimeStatus);
+        Assert.Equal(AtmCenterRules.SpotV1Version, s.AtmRuleVersion);          // a new fixed session is frozen under the spot ATM contract...
+        Assert.Equal(AdaptiveFixedClockV1.ModelVersion, s.ModelVersion);       // ...while its model identity (history keys) is unchanged
 
         var restarted = await coordinator.TryGetOrCreateAsync(source, db, Day, Open.AddHours(2), default);          // a late restart reloads the same frozen session
         Assert.Equal(s.Id, restarted!.Session.Id);
         Assert.Equal(13_650, restarted.Definition.BaseBarVolume);
         Assert.Equal(Cutoff, restarted.SignalStartUtc);
+        Assert.Equal(AtmCenterRules.SpotV1Version, restarted.Session.AtmRuleVersion);     // a restart reloads the stamp it was frozen with
         Assert.Single(await db.Sessions.ToListAsync());
     }
 
@@ -86,6 +89,8 @@ public sealed class AdaptiveFixedClockTests
         var context = await Coordinator(AdaptiveClockMode.Fixed13650).TryGetOrCreateAsync(source, db, Day, Open.AddHours(1), default);
         Assert.Equal("adaptive-v1", context!.Session.ModelVersion);
         Assert.Equal(16_250, context.Definition.BaseBarVolume);
+        Assert.Null(context.Session.AtmRuleVersion);                             // an older session is never relabelled: it keeps the legacy synthetic-forward center
+        Assert.Equal(AtmCenterRule.SyntheticForwardLegacy, AtmCenterRules.FromVersion(context.Session.AtmRuleVersion));
         Assert.Single(await db.Sessions.ToListAsync());                          // no fixed session was added next to it
     }
 

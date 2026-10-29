@@ -52,6 +52,8 @@ public sealed class FuturesBasisTracker
     static readonly TimeSpan Freshness = TimeSpan.FromSeconds(FuturesBasisBar.SpotFreshnessSeconds);
 
     readonly List<State> _states = [];
+    // Every accepted spot observation in arrival order (AvailableAt is non-decreasing), so the spot in force at ANY past instant can be answered causally.
+    readonly List<(DateTimeOffset At, double Price)> _spotHistory = [];
     double? _futurePrice;
     double? _spotPrice;
     DateTimeOffset _spotAt;
@@ -83,7 +85,31 @@ public sealed class FuturesBasisTracker
         if (!(tick.Last > 0d) || !double.IsFinite(tick.Last)) return;
         _spotPrice = tick.Last;
         _spotAt = tick.AvailableAt;
+        _spotHistory.Add((tick.AvailableAt, tick.Last));
         Record(tick.AvailableAt);
+    }
+
+    /// <summary>
+    /// The spot price in force at <paramref name="at"/> for the ATM center (spot-atm-v1): the latest accepted spot with <c>SpotAt &lt;= at</c>, and only when it is fresh by the SAME rule as the basis,
+    /// <c>0 &lt;= at - SpotAt &lt;= <see cref="FuturesBasisBar.SpotFreshnessSeconds"/></c> (inclusive). A later spot (SpotAt &gt; at) is never used; a stale or missing spot returns null.
+    /// </summary>
+    public double? FreshSpotAt(DateTimeOffset at)
+    {
+        int lo = 0, hi = _spotHistory.Count;
+        while (lo < hi)
+        {
+            var mid = lo + (hi - lo) / 2;
+            if (_spotHistory[mid].At <= at) lo = mid + 1; else hi = mid;
+        }
+
+        if (lo == 0)
+        {
+            return null;
+        }
+
+        var (spotAt, price) = _spotHistory[lo - 1];
+        var age = at - spotAt;
+        return age >= TimeSpan.Zero && age <= Freshness ? price : null;
     }
 
     void Record(DateTimeOffset at)

@@ -181,7 +181,7 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
     };
 
     /// <summary>
-    /// Per-strike sidecar (option-strike-v2): inserts the bar's rows when none exist, otherwise verifies the stored rows against the recomputed ones and leaves them untouched
+    /// Per-strike sidecar (option-strike-v3): inserts the bar's rows when none exist, otherwise verifies the stored rows against the recomputed ones and leaves them untouched
     /// (a mismatch is logged and counted, never overwritten). Failures are swallowed after logging: the core observer and every consumer of the other sidecars are unaffected.
     /// </summary>
     public async Task<SupplementalOutcome> PersistOrVerifyStrikesAsync(AdaptiveObserverDbContext db, long sessionId, AdaptiveCompletedBarPackage package, CancellationToken ct)
@@ -286,6 +286,12 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
         NetOfi = m.NetOfi,
         GrossOfi = m.GrossOfi,
         OfiTransitions = m.OfiTransitions,
+        DeltaStart = m.DeltaStart,
+        DeltaEnd = m.DeltaEnd,
+        DeltaChange = m.DeltaChange,
+        VegaStart = m.VegaStart,
+        VegaEnd = m.VegaEnd,
+        VegaChange = m.VegaChange,
     };
 
     static string? FirstDifference(AdaptiveOptionStrikeBarRow a, AdaptiveOptionStrikeBarRow b)
@@ -300,7 +306,9 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
             ?? D(nameof(a.IvStart), a.IvStart, b.IvStart) ?? D(nameof(a.IvEnd), a.IvEnd, b.IvEnd) ?? D(nameof(a.ActivityPerSecond), a.ActivityPerSecond, b.ActivityPerSecond)
             ?? D(nameof(a.TobTimeWeighted), a.TobTimeWeighted, b.TobTimeWeighted) ?? D(nameof(a.MicroDevTimeWeighted), a.MicroDevTimeWeighted, b.MicroDevTimeWeighted)
             ?? D(nameof(a.TobUsableSeconds), a.TobUsableSeconds, b.TobUsableSeconds) ?? L(nameof(a.NetOfi), a.NetOfi, b.NetOfi) ?? L(nameof(a.GrossOfi), a.GrossOfi, b.GrossOfi)
-            ?? L(nameof(a.OfiTransitions), a.OfiTransitions, b.OfiTransitions);
+            ?? L(nameof(a.OfiTransitions), a.OfiTransitions, b.OfiTransitions)
+            ?? D(nameof(a.DeltaStart), a.DeltaStart, b.DeltaStart) ?? D(nameof(a.DeltaEnd), a.DeltaEnd, b.DeltaEnd) ?? D(nameof(a.DeltaChange), a.DeltaChange, b.DeltaChange)
+            ?? D(nameof(a.VegaStart), a.VegaStart, b.VegaStart) ?? D(nameof(a.VegaEnd), a.VegaEnd, b.VegaEnd) ?? D(nameof(a.VegaChange), a.VegaChange, b.VegaChange);
     }
 
     /// <summary>Same insert-if-missing / verify-if-present contract for the options sidecar.</summary>
