@@ -17,6 +17,7 @@ namespace NiftySignal.Tests.PaperEngineV2;
 /// Phase 6g: INDEPENDENT measurements of the V2 engine for 1 / 10 / 30 strategies over a full 330-bar session - in memory (engine only) and against the local PostgreSQL test database (journal + ledger + alert outbox, with
 /// full-size frames of 284 metrics x 5 windows). The assertions are deliberately loose regression guards (the observer thread never waits on any of this; see the 6b handoff tests); the numbers go to the output and the progress log.
 /// </summary>
+[Collection("PostgresTradingTests")]
 public class ExecutionPerformanceTests(ITestOutputHelper output)
 {
     const int Bars = 330;
