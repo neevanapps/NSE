@@ -64,3 +64,18 @@ New `NiftySignal.PaperEngineV2.Alerts` + additive migration `AddAlertOutbox` (ta
 Test-only phase (`IsolationReleaseBlockerTests`, 8 tests): the engine path (Core, Frames, Execution, Data) has a transitive assembly closure that reaches no Ingestion / Execution(broker) / Notifications / Host / Dashboard / Trading.Live / Adapters / Signals / Recovery / Trading.Data / Npt1M1 / Observer / SignalR / Websocket assembly and none of its own assemblies references `System.Net.Http`; the Alerts path reaches only the Notifications text sender; no NPT1 / observer / Host project references a V2 project and the Host's source, JSON config and project file contain no V2 mention (so V2 is disabled by default and cannot be started); V2 sources contain no order-submission / broker / live-authorisation / sell-to-open vocabulary; strategy JSON carrying `live`, `liveEnabled`, `liveAuthorized`, `broker`, `sell`, `sellToOpen`, `short`, `writeOptions` is refused; the NPT1 verified-bar gate (`IsBarVerifiedForPaper`) and the frozen NPT1 fee schedule are unchanged in behaviour; the owner script only touches the `pev2` schema.
 * NPT1 evidence: no file under the NPT1 / Trading / Npt1M1 / Host production paths was modified by 6a–6f (the only production edits on this branch outside V2 are the earlier Market Summary / commentary-removal phases, which preserved the gate and are covered by their own tests).
 * **Full suite on the committed tree: 2558 passed, 0 failed, 0 skipped** (PostgreSQL included).
+
+## Phase 6g – performance for 1 / 10 / 30 strategies — `b47bb9c`
+`ExecutionPerformanceTests` (6 tests; numbers also appended to `%TEMP%\paper-v2-execution-perf.txt`). One full 330-bar session per case, this development machine, Release-equivalent JIT after warm-up, local PostgreSQL. Assertions are loose regression guards only (p99 < 20 ms in memory, < 500 ms durable); the observer thread never waits on any of this (6b handoff).
+
+| Strategies | Engine in memory, per frame (p50 / p95 / p99 / max) | Alloc / frame | Durable pipeline incl. journal + ledger + alert outbox, per frame (p50 / p95 / p99 / max) | Events / session |
+|---|---|---|---|---|
+| 1 | 0.6 / 2.1 / 4.4 / 51.8 µs | 0.4 KB | 0.9 / 1.4 / 2.4 / 5.3 ms | 83 |
+| 10 | 3.4 / 12.6 / 34.4 / 45.6 µs | 4.1 KB | 0.9 / 4.6 / 5.2 / 6.6 ms | 827 |
+| 30 | 9.6 / 36.0 / 102.8 / 123.8 µs | 12.2 KB | 1.0 / 11.0 / 18.4 / 32.3 ms | 2480 (2180 outbox rows with all classes on) |
+
+* Full-size frames: 284 metrics × 5 windows → canonical payload ≈ 36 KB/frame, ≈ 4.2 MB of `pev2_frames` per 330-bar session (≈ 13 KB/bar table size incl. index; 90-day retention ≈ 250 MB at one session per day).
+* The durable cost is dominated by synchronous ledger / outbox inserts (one statement per event) at 30 strategies; bars are ~1 minute apart (fixed 13,650-volume bars), so even the 32 ms maximum is < 0.1 % of a bar. A batch insert is the obvious optimisation if event volume ever grows; not needed.
+* The synthetic scenario trades heavily (≈ 80 events per strategy per session); real activity depends on the strategies. Queue capacity / max lag defaults are still required parameters: these numbers support e.g. capacity 64 and a 5 s lag limit, but that choice stays with the owner.
+* Concurrency note found by the full suite: the PostgreSQL perf tests initially ran in parallel with the schema tests that drop/recreate `pev2` (flaky failures); fixed by joining the shared `PostgresTradingTests` collection. A concurrent-dispatcher test assumed one round drains the outbox (SKIP LOCKED defers locked rows); fixed in the test, behaviour unchanged.
+* **Full suite on the committed tree: 2564 passed, 0 failed, 0 skipped** (PostgreSQL included).
