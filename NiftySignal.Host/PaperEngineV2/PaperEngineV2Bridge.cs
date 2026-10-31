@@ -22,13 +22,14 @@ public sealed class PaperEngineV2Bridge : IHostedService, IAsyncDisposable
     readonly IServiceScopeFactory _scopes;
     readonly ILogger<PaperEngineV2Bridge> _log;
     readonly ITelegramTextSender? _telegram;
+    readonly TimeProvider _clock;
     V2Runtime? _runtime;
     V2SessionInfo? _session;
     QuoteBook? _book;
 
-    public PaperEngineV2Bridge(IConfiguration configuration, IServiceScopeFactory scopes, ILogger<PaperEngineV2Bridge> log, ITelegramTextSender? telegram = null)
+    public PaperEngineV2Bridge(IConfiguration configuration, IServiceScopeFactory scopes, ILogger<PaperEngineV2Bridge> log, ITelegramTextSender? telegram = null, TimeProvider? clock = null)
     {
-        _options = Bind(configuration); _scopes = scopes; _log = log; _telegram = telegram;
+        _options = Bind(configuration); _scopes = scopes; _log = log; _telegram = telegram; _clock = clock ?? TimeProvider.System;
     }
 
     public bool Enabled => _options.Enabled;
@@ -52,6 +53,7 @@ public sealed class PaperEngineV2Bridge : IHostedService, IAsyncDisposable
             MaxProcessingLag = double.TryParse(s["MaxProcessingLagSeconds"], inv, out var lag) ? TimeSpan.FromSeconds(lag) : TimeSpan.Zero,
             FramesToClearGap = int.TryParse(s["FramesToClearGap"], out var clear) ? clear : 0,
             NoticeCapacity = int.TryParse(s["NoticeCapacity"], out var nc) ? nc : 256,
+            AlertPollInterval = TimeSpan.FromMilliseconds(int.TryParse(s["AlertPollIntervalMs"], out var ap) && ap > 0 ? ap : 2000),
             TerminalRetryUntil = TimeOnly.TryParse(s["TerminalRetryUntil"], out var t) ? t : default,
             CostScheduleVersion = s["CostScheduleVersion"],
             BrokeragePerOrder = decimal.TryParse(s["BrokeragePerOrder"], inv, out var b) ? b : null,
@@ -70,7 +72,7 @@ public sealed class PaperEngineV2Bridge : IHostedService, IAsyncDisposable
                 () => _scopes.CreateScope().ServiceProvider.GetRequiredService<AdaptiveObserverDbContext>(),
                 () => _scopes.CreateScope().ServiceProvider.GetRequiredService<NiftySignalDbContext>());
             IAlertTransport? transport = _options.AnyAlertEnabled && _telegram is not null ? new TelegramAlertTransport(_telegram) : null;
-            _runtime = new V2Runtime(_options, new InputSourceFrameFactory(source), transport, TimeProvider.System, _log);
+            _runtime = new V2Runtime(_options, new InputSourceFrameFactory(source), transport, _clock, _log);
             await _runtime.StartAsync(cancellationToken);
         }
         catch (Exception ex)

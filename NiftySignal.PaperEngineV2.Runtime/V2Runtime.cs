@@ -196,7 +196,11 @@ public sealed class V2Runtime : IAsyncDisposable
             await dispatcher.ResolveInterruptedAsync(ct);
             while (!ct.IsCancellationRequested)
             {
-                try { await dispatcher.DispatchAsync(AlertDispatcher.MaxBatch, ct); }
+                try
+                {
+                    DispatchReport report;
+                    do { report = await dispatcher.DispatchAsync(AlertDispatcher.MaxBatch, ct); } while (report.Claimed >= AlertDispatcher.MaxBatch);        // drain a backlog before sleeping
+                }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
                 catch (Exception ex) { _log?.LogWarning(ex, "V2 alert dispatch failed; it is retried (alerts stay in the durable outbox)."); }
                 await Task.Delay(_options.AlertPollInterval, _clock, ct);

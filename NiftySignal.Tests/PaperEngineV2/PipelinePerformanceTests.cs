@@ -24,7 +24,9 @@ public class PipelineIsolationTests
     [Fact]
     public void ObserverAndTradingAssemblies_DoNotReferenceV2_SoNpt1CannotWaitOnOrFailBecauseOfIt()
     {
-        foreach (var name in new[] { "NiftySignal.Host", "NiftySignal.Trading.Core", "NiftySignal.Trading.Live", "NiftySignal.Trading.Signals", "NiftySignal.Trading.Adapters", "NiftySignal.Trading.Recovery", "NiftySignal.Trading.Data", "NiftySignal.Npt1M1", "NiftySignal.AdaptiveObserver", "NiftySignal.AdaptiveObserverData" })
+        // Owner-authorised Host integration: the Host (and only the Host) uses V2 types, from the Runtime, Frames and Alerts assemblies.
+        Assert.All(Assembly.Load("NiftySignal.Host").GetReferencedAssemblies().Where(r => r.Name!.StartsWith("NiftySignal.PaperEngineV2", StringComparison.Ordinal)), r => Assert.Contains(r.Name, new[] { "NiftySignal.PaperEngineV2.Runtime", "NiftySignal.PaperEngineV2.Frames", "NiftySignal.PaperEngineV2.Alerts" }));      // types used by the bridge only
+        foreach (var name in new[] { "NiftySignal.Trading.Core", "NiftySignal.Trading.Live", "NiftySignal.Trading.Signals", "NiftySignal.Trading.Adapters", "NiftySignal.Trading.Recovery", "NiftySignal.Trading.Data", "NiftySignal.Npt1M1", "NiftySignal.AdaptiveObserver", "NiftySignal.AdaptiveObserverData" })
             Assert.DoesNotContain(Assembly.Load(name).GetReferencedAssemblies(), r => r.Name!.StartsWith("NiftySignal.PaperEngineV2", StringComparison.Ordinal));
     }
 
