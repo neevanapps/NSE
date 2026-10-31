@@ -380,6 +380,28 @@ public class RuntimeTests
         Assert.Equal(V2RuntimeState.Running, rt.State);
     }
 
+    [PostgresFact]
+    public async Task RealConnectionLoss_AllBackendsTerminatedMidSession_RecoversWithoutDuplicates()
+    {
+        var db = await InstalledAsync();
+        var clock = new ManualClock(FrameFixtures.T0);
+        await using var rt = new V2Runtime(Options(StrategyDir("S01"), clear: 2), new FrameMapFactory(s => ExecFixtures.Fr(s)), null, clock);
+        await rt.StartAsync(default);
+        await Pump(rt, clock, [1, 2, 3]);
+        // a real interruption: the server drops every other connection to this database (pooled runtime connections included)
+        await using (var kill = db.CreateCommand("SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid()")) await kill.ExecuteNonQueryAsync();
+        for (var seq = 4; seq <= 10; seq++) { clock.Now = FrameFixtures.End(seq).AddMilliseconds(100); Assert.True(rt.TryEnqueue(Notice(seq))); await Task.Delay(150); }
+        await Until(() => rt.Snapshot().Consumer is { Faulted: false } && rt.Snapshot().Consumer!.Processed >= 3, "recovered after the connection loss", 80);
+        Assert.Equal(V2RuntimeState.Running, rt.State);
+        await Task.Delay(500);
+        // never a duplicate frame or disposition row, whatever was lost during the outage is visible as a gap rather than invented
+        Assert.Equal(0, await ScalarAsync(db, "SELECT count(*) - count(DISTINCT bar_seq) FROM pev2.pev2_frames"));
+        Assert.Equal(0, await ScalarAsync(db, "SELECT count(*) - count(DISTINCT frame_hash) FROM pev2.pev2_frames"));
+        var journaled = await ScalarAsync(db, "SELECT count(*) FROM pev2.pev2_frames");
+        var gapBars = await ScalarAsync(db, "SELECT coalesce(sum(to_bar_seq - from_bar_seq + 1), 0) FROM pev2.pev2_gaps");
+        Assert.True(journaled + gapBars >= 3, $"journaled {journaled}, gap bars {gapBars}");
+    }
+
     sealed class ThrowOnceProcessor(IFrameProcessor inner, Func<bool> boom) : IFrameProcessor
     {
         public ValueTask ProcessAsync(MarketStateFrame frame, MarketStateFrame? previous, FrameDisposition d, CancellationToken ct) =>
