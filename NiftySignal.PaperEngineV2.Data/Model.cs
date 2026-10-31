@@ -8,7 +8,7 @@ namespace NiftySignal.PaperEngineV2.Data;
 /// <summary>The schema version this build writes and understands. Bump together with a reviewed migration.</summary>
 public static class V2Schema
 {
-    public const int CurrentVersion = 1;
+    public const int CurrentVersion = 2;
     public const string Component = "paper-engine-v2";
     public const string SchemaName = "pev2";
     public const string JournalSchema = "pev2-journal/1";
@@ -108,6 +108,34 @@ public sealed class ConfigRow
     public long RecordedUtcTicks { get; set; }
 }
 
+public sealed class AlertOutboxRow
+{
+    public string AlertId { get; set; } = string.Empty;
+
+    public string AlertClass { get; set; } = string.Empty;
+
+    public string StrategyId { get; set; } = string.Empty;
+
+    public string EventId { get; set; } = string.Empty;
+
+    public string MessageText { get; set; } = string.Empty;
+
+    /// <summary>0 Pending, 1 Sent, 2 Uncertain (never resent automatically), 3 Failed (attempts exhausted), 4 Expired (stale), 5 Sending (claimed; an interrupted claim is resolved to Uncertain).</summary>
+    public int Status { get; set; }
+
+    public int Attempts { get; set; }
+
+    public long CreatedUtcTicks { get; set; }
+
+    public long NextAttemptUtcTicks { get; set; }
+
+    public long? SentUtcTicks { get; set; }
+
+    public long? TelegramMessageId { get; set; }
+
+    public string? LastError { get; set; }
+}
+
 /// <summary>
 /// The model of the <c>pev2</c> schema. Own schema and own migration history table, so it can share the trading database without touching any trading.* table. Instants are stored as UTC ticks (bigint, exact);
 /// payloads are text (authoritative, canonical). Nothing here connects, creates or migrates by itself.
@@ -127,6 +155,8 @@ public sealed class PaperEngineV2DbContext(DbContextOptions<PaperEngineV2DbConte
     public DbSet<EventRow> Events => Set<EventRow>();
 
     public DbSet<ConfigRow> Configs => Set<ConfigRow>();
+
+    public DbSet<AlertOutboxRow> AlertOutbox => Set<AlertOutboxRow>();
 
     static PropertyBuilder<string> Text(PropertyBuilder<string> p, int max) => p.HasMaxLength(max).UseCollation("C");
 
@@ -191,6 +221,19 @@ public sealed class PaperEngineV2DbContext(DbContextOptions<PaperEngineV2DbConte
             Text(b.Property(e => e.StrategyId), 64);
             b.Property(e => e.CanonicalJson).HasColumnType("text");
             b.HasIndex(e => new { e.StrategyId, e.Version });
+        });
+
+        modelBuilder.Entity<AlertOutboxRow>(b =>
+        {
+            b.ToTable("pev2_alert_outbox");
+            b.HasKey(e => e.AlertId);
+            Text(b.Property(e => e.AlertId), 300);
+            Text(b.Property(e => e.AlertClass), 32);
+            Text(b.Property(e => e.StrategyId), 64);
+            Text(b.Property(e => e.EventId), 256);
+            b.Property(e => e.MessageText).HasColumnType("text");
+            b.Property(e => e.LastError).HasColumnType("text");
+            b.HasIndex(e => new { e.Status, e.NextAttemptUtcTicks });
         });
 
         // snake_case column names, derived mechanically so the idempotent script reads naturally

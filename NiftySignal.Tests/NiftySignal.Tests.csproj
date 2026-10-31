@@ -43,6 +43,7 @@
     <ProjectReference Include="..\NiftySignal.PaperEngineV2.Core\NiftySignal.PaperEngineV2.Core.csproj" />
     <ProjectReference Include="..\NiftySignal.PaperEngineV2.Execution\NiftySignal.PaperEngineV2.Execution.csproj" />
     <ProjectReference Include="..\NiftySignal.PaperEngineV2.Data\NiftySignal.PaperEngineV2.Data.csproj" />
+    <ProjectReference Include="..\NiftySignal.PaperEngineV2.Alerts\NiftySignal.PaperEngineV2.Alerts.csproj" />
     <ProjectReference Include="..\NiftySignal.PaperEngineV2.Frames\NiftySignal.PaperEngineV2.Frames.csproj" />
     <ProjectReference Include="..\NiftySignal.Npt1M1.Data\NiftySignal.Npt1M1.Data.csproj" />
   </ItemGroup>

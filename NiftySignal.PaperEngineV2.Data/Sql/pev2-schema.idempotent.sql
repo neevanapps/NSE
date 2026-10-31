@@ -180,3 +180,50 @@ BEGIN
 END $EF$;
 COMMIT;
 
+START TRANSACTION;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM pev2.__pev2_migrations_history WHERE "MigrationId" = '20261031091214_AddAlertOutbox') THEN
+    CREATE TABLE pev2.pev2_alert_outbox (
+        alert_id character varying(300) COLLATE "C" NOT NULL,
+        alert_class character varying(32) COLLATE "C" NOT NULL,
+        strategy_id character varying(64) COLLATE "C" NOT NULL,
+        event_id character varying(256) COLLATE "C" NOT NULL,
+        message_text text NOT NULL,
+        status integer NOT NULL,
+        attempts integer NOT NULL,
+        created_utc_ticks bigint NOT NULL,
+        next_attempt_utc_ticks bigint NOT NULL,
+        sent_utc_ticks bigint,
+        telegram_message_id bigint,
+        last_error text,
+        CONSTRAINT "PK_pev2_alert_outbox" PRIMARY KEY (alert_id)
+    );
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM pev2.__pev2_migrations_history WHERE "MigrationId" = '20261031091214_AddAlertOutbox') THEN
+    UPDATE pev2.pev2_schema_versions SET schema_version = 2
+    WHERE component = 'paper-engine-v2';
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM pev2.__pev2_migrations_history WHERE "MigrationId" = '20261031091214_AddAlertOutbox') THEN
+    CREATE INDEX "IX_pev2_alert_outbox_status_next_attempt_utc_ticks" ON pev2.pev2_alert_outbox (status, next_attempt_utc_ticks);
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM pev2.__pev2_migrations_history WHERE "MigrationId" = '20261031091214_AddAlertOutbox') THEN
+    INSERT INTO pev2.__pev2_migrations_history ("MigrationId", "ProductVersion")
+    VALUES ('20261031091214_AddAlertOutbox', '10.0.11');
+    END IF;
+END $EF$;
+COMMIT;
+

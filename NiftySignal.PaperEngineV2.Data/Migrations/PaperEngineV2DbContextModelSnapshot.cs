@@ -22,6 +22,75 @@ namespace NiftySignal.PaperEngineV2.Data.Migrations
 
             NpgsqlModelBuilderExtensions.UseIdentityByDefaultColumns(modelBuilder);
 
+            modelBuilder.Entity("NiftySignal.PaperEngineV2.Data.AlertOutboxRow", b =>
+                {
+                    b.Property<string>("AlertId")
+                        .HasMaxLength(300)
+                        .HasColumnType("character varying(300)")
+                        .HasColumnName("alert_id")
+                        .UseCollation("C");
+
+                    b.Property<string>("AlertClass")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)")
+                        .HasColumnName("alert_class")
+                        .UseCollation("C");
+
+                    b.Property<int>("Attempts")
+                        .HasColumnType("integer")
+                        .HasColumnName("attempts");
+
+                    b.Property<long>("CreatedUtcTicks")
+                        .HasColumnType("bigint")
+                        .HasColumnName("created_utc_ticks");
+
+                    b.Property<string>("EventId")
+                        .IsRequired()
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)")
+                        .HasColumnName("event_id")
+                        .UseCollation("C");
+
+                    b.Property<string>("LastError")
+                        .HasColumnType("text")
+                        .HasColumnName("last_error");
+
+                    b.Property<string>("MessageText")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("message_text");
+
+                    b.Property<long>("NextAttemptUtcTicks")
+                        .HasColumnType("bigint")
+                        .HasColumnName("next_attempt_utc_ticks");
+
+                    b.Property<long?>("SentUtcTicks")
+                        .HasColumnType("bigint")
+                        .HasColumnName("sent_utc_ticks");
+
+                    b.Property<int>("Status")
+                        .HasColumnType("integer")
+                        .HasColumnName("status");
+
+                    b.Property<string>("StrategyId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("strategy_id")
+                        .UseCollation("C");
+
+                    b.Property<long?>("TelegramMessageId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("telegram_message_id");
+
+                    b.HasKey("AlertId");
+
+                    b.HasIndex("Status", "NextAttemptUtcTicks");
+
+                    b.ToTable("pev2_alert_outbox", "pev2");
+                });
+
             modelBuilder.Entity("NiftySignal.PaperEngineV2.Data.ConfigRow", b =>
                 {
                     b.Property<string>("ConfigHash")
@@ -276,7 +345,7 @@ namespace NiftySignal.PaperEngineV2.Data.Migrations
                         {
                             Component = "paper-engine-v2",
                             JournalSchema = "pev2-journal/1",
-                            SchemaVersion = 1
+                            SchemaVersion = 2
                         });
                 });
 #pragma warning restore 612, 618

@@ -17,6 +17,7 @@
   <Project Path="NiftySignal.PaperEngineV2.Core/NiftySignal.PaperEngineV2.Core.csproj" />
   <Project Path="NiftySignal.PaperEngineV2.Execution/NiftySignal.PaperEngineV2.Execution.csproj" />
   <Project Path="NiftySignal.PaperEngineV2.Data/NiftySignal.PaperEngineV2.Data.csproj" />
+  <Project Path="NiftySignal.PaperEngineV2.Alerts/NiftySignal.PaperEngineV2.Alerts.csproj" />
   <Project Path="NiftySignal.PaperEngineV2.Frames/NiftySignal.PaperEngineV2.Frames.csproj" />
   <Project Path="NiftySignal.Npt1M1/NiftySignal.Npt1M1.csproj" />
   <Project Path="NiftySignal.Npt1M1.Data/NiftySignal.Npt1M1.Data.csproj" />

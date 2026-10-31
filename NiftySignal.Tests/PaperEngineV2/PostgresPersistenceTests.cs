@@ -83,11 +83,11 @@ public class PostgresPersistenceTests
         var db = await FreshAsync();
         Assert.True((await V2SchemaCheck.CheckAsync(db, default)).Compatible);
 
-        await ExecAsync(db, "UPDATE pev2.pev2_schema_versions SET schema_version = 2");
+        await ExecAsync(db, "UPDATE pev2.pev2_schema_versions SET schema_version = 3");
         Assert.Contains("newer", Assert.Single((await V2SchemaCheck.CheckAsync(db, default)).Problems));
         await ExecAsync(db, "UPDATE pev2.pev2_schema_versions SET schema_version = 0");
         Assert.Contains("older", Assert.Single((await V2SchemaCheck.CheckAsync(db, default)).Problems));
-        await ExecAsync(db, "UPDATE pev2.pev2_schema_versions SET schema_version = 1, journal_schema = 'other/9'");
+        await ExecAsync(db, "UPDATE pev2.pev2_schema_versions SET schema_version = 2, journal_schema = 'other/9'");
         Assert.Contains("journal schema", Assert.Single((await V2SchemaCheck.CheckAsync(db, default)).Problems));
         await ExecAsync(db, "DELETE FROM pev2.pev2_schema_versions");
         Assert.False((await V2SchemaCheck.CheckAsync(db, default)).Compatible);

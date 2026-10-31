@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Paper Engine V2 trade alerts (Phase 6e): a durable, idempotent outbox in the pev2 schema and a dispatcher that sends plain-text "V2 SHADOW" messages through an abstract transport.
+       Every alert class is OFF by default (per-event opt-in). Telegram is only an adapter over the existing acknowledged text sender; no broker, ingestion or Dashboard reference. -->
+  <ItemGroup>
+    <ProjectReference Include="..\NiftySignal.PaperEngineV2.Data\NiftySignal.PaperEngineV2.Data.csproj" />
+    <ProjectReference Include="..\NiftySignal.Notifications\NiftySignal.Notifications.csproj" />
+  </ItemGroup>
+
+</Project>
