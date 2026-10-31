@@ -1,0 +1,165 @@
+@using NiftySignal.Dashboard.Services
+@using NiftySignal.MarketSummary
+@using SummaryMetric = NiftySignal.MarketSummary.Metric
+
+@* Primary Market Summary: the Futures Summary and the four option summaries (ATM, ITM, OTM, TOTAL), five rows each (5 / 10 / 50 / 100 Bars / Day), completed bars only, one fixed basket for every window.
+   Pure presentation of MarketSummaryView; all arithmetic is in NiftySignal.MarketSummary (docs/MARKET_SUMMARY_METRICS.md). Unavailable values render as — , never as zero. *@
+<section class="adaptive-grid-section market-summary" data-testid="market-summary">
+    <h3>MARKET SUMMARY <span class="text-faint">completed bars only · windows end at the same completed bar · Direction = CE − PE, OI = PE − CE · Delta ×100 / Vega ×100 are display scaling only</span></h3>
+    @if (View is null || View.UnavailableReason is not null)
+    {
+        <div class="adaptive-pending" data-testid="market-summary-unavailable">Market summary unavailable: @(View?.UnavailableReason ?? "not loaded").</div>
+    }
+    else
+    {
+        var basket = View.Basket!;
+        <div class="adaptive-note" data-testid="market-summary-basket">
+            Basket (fixed for all windows): expiry @basket.Expiry.ToString("dd-MMM-yyyy") · centre @basket.Center.ToString("0") · step @(basket.Step?.ToString("0.##") ?? "—") · through completed bar @View.EndBarSeq.
+            @if (basket.Problems.Count > 0)
+            {
+                <span class="adaptive-alert" data-testid="market-summary-problems">@string.Join("; ", basket.Problems)</span>
+            }
+        </div>
+
+        <div class="adaptive-subtitle">FUTURES SUMMARY</div>
+        <div class="adaptive-table-wrap">
+            <table class="adaptive-table adaptive-table-compact" data-grid="summary-futures">
+                <thead>
+                <tr>
+                    <th>Window</th><th>Coverage</th><th>Price Δ</th><th>Volume</th>
+                    <th title="raw Strict delta (Strict delta / volume, %)">Strict Δ</th><th title="raw Enriched delta (/ classified volume, %)">Enriched Δ</th>
+                    <th title="usable-seconds weighted MicroDev (TOB x 100)">MicroDev</th><th title="net OFI (net / gross, %)">OFI</th><th>OI Δ</th><th>Activity /s</th>
+                </tr>
+                </thead>
+                <tbody>
+                @foreach (var r in View.Futures)
+                {
+                    <tr data-window="@r.Window.Name">
+                        <td class="sticky-col">@r.Window.Name</td>
+                        <td title="@CoverageTitle(r.Coverage)" data-coverage="@r.Coverage.Status">@r.Coverage.Text</td>
+                        @if (r.Coverage.Status == CoverageStatus.Insufficient)
+                        {
+                            @for (var i = 0; i < 8; i++) { <td>—</td> }
+                        }
+                        else
+                        {
+                            <td>@Cell(r.Price, 2)</td><td>@r.Volume.ToString("N0")</td><td>@Cell(r.Strict)</td><td>@Cell(r.Enriched)</td><td>@Cell(r.MicroDev, 2)</td><td>@Cell(r.Ofi)</td><td>@Cell(r.Oi)</td>
+                            <td>@RatioFormat.Plain(r.Activity, 1)</td>
+                        }
+                    </tr>
+                }
+                </tbody>
+            </table>
+        </div>
+
+        @foreach (var g in View.Grids)
+        {
+            var name = g.Kind.ToString().ToUpperInvariant();
+            <div class="adaptive-subtitle" data-testid="@($"summary-{name.ToLowerInvariant()}-title")">@name SUMMARY <span class="text-faint">@Describe(g, basket)</span></div>
+            <div class="adaptive-table-wrap">
+                <table class="adaptive-table adaptive-table-compact" data-grid="@($"summary-{name.ToLowerInvariant()}-core")">
+                    <thead>
+                    <tr>
+                        <th>Window</th><th>Coverage</th>
+                        <th>CE Price Δ</th><th>PE Price Δ</th><th>Price Dir</th>
+                        <th>CE Roll ΔPx</th><th>PE Roll ΔPx</th><th>Roll Dir</th>
+                        <th>CE Strict</th><th>PE Strict</th><th>Strict Dir</th>
+                        <th>CE Enriched</th><th>PE Enriched</th><th>Enriched Dir</th>
+                        <th>CE OI Δ</th><th>PE OI Δ</th><th>OI Dir</th>
+                        <th>CE MicroDev</th><th>PE MicroDev</th><th>MicroDev Dir</th>
+                        <th>CE OFI</th><th>PE OFI</th><th>OFI Dir</th>
+                    </tr>
+                    </thead>
+                    <tbody>
+                    @foreach (var r in g.Rows)
+                    {
+                        <tr data-window="@r.Window.Name">
+                            <td class="sticky-col">@r.Window.Name</td>
+                            <td title="@CoverageTitle(r.Coverage)" data-coverage="@r.Coverage.Status">@r.Coverage.Text@Deficits(r.Coverage, CoreFamilies)</td>
+                            @Triple(r, s => s.Price, d => d.Price, 2)
+                            @Triple(r, s => s.Roll, d => d.Roll, 2)
+                            @Triple(r, s => s.Strict, d => d.Strict, 0)
+                            @Triple(r, s => s.Enriched, d => d.Enriched, 0)
+                            @Triple(r, s => s.Oi, d => d.Oi, 0)
+                            @Triple(r, s => s.MicroDev, d => d.MicroDev, 2)
+                            @Triple(r, s => s.Ofi, d => d.Ofi, 0)
+                        </tr>
+                    }
+                    </tbody>
+                </table>
+            </div>
+            <div class="adaptive-table-wrap">
+                <table class="adaptive-table adaptive-table-compact" data-grid="@($"summary-{name.ToLowerInvariant()}-context")">
+                    <thead>
+                    <tr>
+                        <th>Window</th><th>Coverage</th>
+                        <th>CE ΔIV</th><th>PE ΔIV</th><th>IV Dir</th>
+                        <th>CE ΔDelta ×100</th><th>PE ΔDelta ×100</th><th>Delta Dir ×100</th>
+                        <th>CE ΔVega ×100</th><th>PE ΔVega ×100</th><th>Vega Dir ×100</th>
+                        <th>CE Activity /s</th><th>PE Activity /s</th><th>Activity Dir</th>
+                    </tr>
+                    </thead>
+                    <tbody>
+                    @foreach (var r in g.Rows)
+                    {
+                        <tr data-window="@r.Window.Name">
+                            <td class="sticky-col">@r.Window.Name</td>
+                            <td title="@CoverageTitle(r.Coverage)" data-coverage="@r.Coverage.Status">@r.Coverage.Text@Deficits(r.Coverage, ContextFamilies)</td>
+                            @Triple(r, s => s.Iv, d => d.Iv, 2)
+                            @Triple(r, s => s.Delta, d => d.Delta, 2, scale100: true)
+                            @Triple(r, s => s.Vega, d => d.Vega, 2, scale100: true)
+                            @ActivityTriple(r)
+                        </tr>
+                    }
+                    </tbody>
+                </table>
+            </div>
+        }
+    }
+</section>
+
+@code {
+    [Parameter] public MarketSummaryView? View { get; set; }
+
+    static string Cell(SummaryMetric m, int rawDecimals = 0) => RatioFormat.Cell(new RatioPart(m.Raw, m.Num, m.Den), rawDecimals);
+
+    static readonly string[] CoreFamilies = ["Price", "Roll", "Strict", "Enriched", "Oi", "MicroDev", "Ofi"];
+    static readonly string[] ContextFamilies = ["Iv", "Delta", "Vega", "Activity"];
+
+    /// <summary>Visible per-family coverage, only where a metric family has fewer usable contracts than the grid expects (e.g. " · OFI 0/10 · Delta 0/10"). Nothing is shown when every family is complete.</summary>
+    static string Deficits(Coverage c, string[] families)
+    {
+        if (c.Status == CoverageStatus.Insufficient || c.Families is null) return "";
+        var parts = families.Where(f => c.FamilyCount(f) < c.Expected).Select(f => $"{f} {c.FamilyCount(f)}/{c.Expected}").ToList();
+        return parts.Count == 0 ? "" : " · " + string.Join(" · ", parts);
+    }
+
+    static string CoverageTitle(Coverage c) =>
+        c.Status == CoverageStatus.Full ? "all expected contracts have every bar of the window"
+        : $"{(string.IsNullOrEmpty(c.Reason) ? "" : c.Reason + "; ")}missing/partial: {(c.MissingTokens.Count == 0 ? "none listed" : string.Join(", ", c.MissingTokens))}";
+
+    static string Describe(GridSummary g, Basket b) =>
+        $"{g.Expected} contracts: " + string.Join(", ", b.For(g.Kind).Select(c => c.Token is null ? $"{(c.IsCall ? "CE" : "PE")} offset {c.Offset:+0;-0;0} (unresolved)" : $"{(c.IsCall ? "CE" : "PE")} {c.Strike:0}"));
+
+    static RatioPart Scaled(SummaryMetric m, bool scale100) => new(scale100 ? DisplayScale.Times100(m.Raw) : m.Raw, m.Num, m.Den);
+
+    RenderFragment Triple(WindowSummary r, Func<SideSummary, SummaryMetric> side, Func<DirectionSummary, SummaryMetric> dir, int decimals, bool scale100 = false) => builder =>
+    {
+        var seq = 0;
+        void Td(string text) { builder.OpenElement(seq++, "td"); builder.AddContent(seq++, text); builder.CloseElement(); }
+        if (r.Ce is null && r.Pe is null) { Td("—"); Td("—"); Td("—"); return; }
+        Td(r.Ce is null ? "—" : RatioFormat.Cell(Scaled(side(r.Ce), scale100), decimals));
+        Td(r.Pe is null ? "—" : RatioFormat.Cell(Scaled(side(r.Pe), scale100), decimals));
+        Td(r.Direction is null ? "—" : RatioFormat.Cell(Scaled(dir(r.Direction), scale100), decimals));
+    };
+
+    RenderFragment ActivityTriple(WindowSummary r) => builder =>
+    {
+        var seq = 0;
+        void Td(string text) { builder.OpenElement(seq++, "td"); builder.AddContent(seq++, text); builder.CloseElement(); }
+        if (r.Ce is null && r.Pe is null) { Td("—"); Td("—"); Td("—"); return; }
+        Td(r.Ce is null ? "—" : RatioFormat.Plain(r.Ce.Activity, 1));
+        Td(r.Pe is null ? "—" : RatioFormat.Plain(r.Pe.Activity, 1));
+        Td(r.Direction is null ? "—" : Cell(r.Direction.Activity, 1));
+    };
+}

@@ -20,9 +20,12 @@ public sealed class AdaptiveScreenshotRenderer(IOptions<AdaptiveScreenshotOption
 {
     public const string AuthenticationScheme = "AdaptiveCapture";
 
-    /// <summary>The stable identities of the primary research grids (data-grid attributes in AdaptiveObserverPanel).</summary>
+    /// <summary>The stable identities of the primary research grids (data-grid attributes in AdaptiveObserverPanel): the new Market Summary grids first, then the existing detailed diagnostic grids.</summary>
     public static readonly IReadOnlyList<RequiredCaptureGrid> RequiredGrids =
     [
+        new("summary-futures", false),
+        new("summary-atm-core", false), new("summary-atm-context", false), new("summary-itm-core", false), new("summary-itm-context", false),
+        new("summary-otm-core", false), new("summary-otm-context", false), new("summary-total-core", false), new("summary-total-context", false),
         new("futures-compact", true), new("options-core-direction", true), new("options-context", true), new("residual-compact", false),
     ];
 

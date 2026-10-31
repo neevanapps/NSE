@@ -21,14 +21,18 @@ public static class DisplayScale
 public enum CoverageStatus { Full, Partial, Insufficient }
 
 /// <summary>Per grid / window coverage, e.g. <c>10/10 – FULL</c>, <c>8/10 – PARTIAL</c>, <c>— – INSUFFICIENT DATA</c>.</summary>
-public sealed record Coverage(int Included, int Expected, CoverageStatus Status, string Reason, IReadOnlyList<string> MissingTokens)
+public sealed record Coverage(int Included, int Expected, CoverageStatus Status, string Reason, IReadOnlyList<string> MissingTokens, int? LevelIncluded = null, IReadOnlyDictionary<string, int>? Families = null)
 {
+    /// <summary><see cref="Included"/> counts contracts with EVERY bar of the window (flow metrics); <see cref="LevelIncluded"/> counts contracts with at least the first and last bar (start-to-end level metrics).</summary>
     public string Text => Status switch
     {
         CoverageStatus.Full => $"{Included}/{Expected} – FULL",
-        CoverageStatus.Partial => $"{Included}/{Expected} – PARTIAL",
+        CoverageStatus.Partial => LevelIncluded is { } l && l != Included ? $"{Included}/{Expected} – PARTIAL (levels {l}/{Expected})" : $"{Included}/{Expected} – PARTIAL",
         _ => "— – INSUFFICIENT DATA",
     };
+
+    /// <summary>Per metric family: how many contracts (CE + PE) actually carry a usable value in this window - e.g. OFI is 0 on v1 rows, Delta/Vega 0 before option-strike-v3. A null COLUMN is not a missing ROW: those contracts still count in <see cref="Included"/>.</summary>
+    public int FamilyCount(string family) => Families is not null && Families.TryGetValue(family, out var n) ? n : 0;
 
     public static Coverage Insufficient(int expected, string reason, IReadOnlyList<string>? missing = null) =>
         new(0, expected, CoverageStatus.Insufficient, reason, missing ?? []);

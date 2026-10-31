@@ -151,22 +151,60 @@ public class MarketSummaryTests
     }
 
     [Fact]
-    public void Compute_MissingBarOfOneContract_ExcludesItAndReportsPartial()
+    public void Compute_InteriorHole_ExcludesFlowMetricsButKeepsLevelMetrics()
     {
         var b = BasketAt();
-        var (h, _) = Data(b, 30, skip: (seq, tok) => tok == "CE25900" && seq == 28);
+        var (h, all) = Data(b, 30, skip: (seq, tok) => tok == "CE25900" && seq == 28);
         var total = OptionSummaryCalculator.Compute(b, GridKind.Total, h, 30);
-        Assert.Equal("9/10 – PARTIAL", total.Rows[0].Coverage.Text);
-        Assert.Equal(new[] { "CE25900" }, total.Rows[0].Coverage.MissingTokens);
-        Assert.Equal(4, total.Rows[0].Ce!.Contracts);
-        var atm = OptionSummaryCalculator.Compute(b, GridKind.Atm, h, 30);
-        Assert.All(atm.Rows.Take(2), r => Assert.Equal(CoverageStatus.Full, r.Coverage.Status));   // other grids unaffected
-        var itm = OptionSummaryCalculator.Compute(b, GridKind.Itm, h, 30);
-        Assert.Equal("3/4 – PARTIAL", itm.Rows[0].Coverage.Text);
-        // a contract with no rows at all in a one-contract grid is INSUFFICIENT, not zero
+        var w = total.Rows[0];                                   // bars 26..30; bar 28 of CE25900 is missing
+        Assert.Equal("9/10 – PARTIAL (levels 10/10)", w.Coverage.Text);
+        Assert.Equal(new[] { "CE25900" }, w.Coverage.MissingTokens);
+        Assert.Equal(4, w.Ce!.Contracts);                        // flow metrics: the contract is not summed (no zero-fill, no partial sum)
+        Assert.Equal(5, w.Ce.LevelContracts);                    // level metrics: end minus start spans the hole exactly
+        var complete = all.Where(x => x.IsCall && x.Token != "CE25900" && x.BarSeq >= 26).Sum(x => x.TotalQuantity);
+        Assert.Equal(complete, w.Ce.Volume);
+        var chg = all.Where(x => x.IsCall && x.BarSeq >= 26).GroupBy(x => x.Token)
+            .Select(t => t.OrderBy(x => x.BarSeq).Last().PriceEnd!.Value - t.OrderBy(x => x.BarSeq).First().PriceStart!.Value).ToList();
+        Assert.Equal(5, chg.Count);
+        Assert.Equal(chg.Average(), w.Ce.Price.Raw!.Value, 9);   // includes the contract with the hole
+        // other grids are unaffected; ITM holds CE25900
+        Assert.All(OptionSummaryCalculator.Compute(b, GridKind.Atm, h, 30).Rows.Take(2), r => Assert.Equal(CoverageStatus.Full, r.Coverage.Status));
+        Assert.Equal("3/4 – PARTIAL (levels 4/4)", OptionSummaryCalculator.Compute(b, GridKind.Itm, h, 30).Rows[0].Coverage.Text);
+        // the 50-bar window cannot be formed at 30 bars; Day (bars 1..30) contains the hole too
+        Assert.Equal("9/10 – PARTIAL (levels 10/10)", total.Rows[4].Coverage.Text);
+    }
+
+    [Fact]
+    public void Compute_HoleAtWindowEdge_ExcludesTheContractEntirely()
+    {
+        var b = BasketAt();
+        var (h, _) = Data(b, 30, skip: (seq, tok) => tok == "CE25900" && seq == 30);       // last bar missing
+        var w = OptionSummaryCalculator.Compute(b, GridKind.Total, h, 30).Rows[0];
+        Assert.Equal("9/10 – PARTIAL", w.Coverage.Text);
+        Assert.Equal(4, w.Ce!.LevelContracts);
+        var (h1, _) = Data(b, 30, skip: (seq, tok) => tok == "PE26000" && seq == 26);      // first bar of the 5-bar window missing
+        Assert.Equal(4, OptionSummaryCalculator.Compute(b, GridKind.Total, h1, 30).Rows[0].Pe!.LevelContracts);
+        // a one-contract grid whose contracts have no rows at all is INSUFFICIENT, not zero
         var (h2, _) = Data(b, 30, skip: (_, tok) => tok == "CE26000" || tok == "PE26000");
         var atm2 = OptionSummaryCalculator.Compute(b, GridKind.Atm, h2, 30);
         Assert.All(atm2.Rows, r => { Assert.Equal("— – INSUFFICIENT DATA", r.Coverage.Text); Assert.Null(r.Ce); });
+    }
+
+    [Fact]
+    public void Compute_WholeBarMissing_NeverZeroFillsEarlierOrLaterFlow()
+    {
+        var b = BasketAt();
+        var (h, _) = Data(b, 30, skip: (seq, _) => seq == 28);       // sidecar persistence failed for the whole bar
+        var g = OptionSummaryCalculator.Compute(b, GridKind.Atm, h, 30);
+        var five = g.Rows[0];
+        Assert.Equal(CoverageStatus.Partial, five.Coverage.Status);
+        Assert.Equal(0, five.Coverage.Included);                     // no contract has every bar
+        Assert.Null(five.Ce!.Volume);                                // unavailable, not 0
+        Assert.Null(five.Ce.Strict.Raw);
+        Assert.Null(five.Ce.Activity);
+        Assert.NotNull(five.Ce.Price.Raw);                           // level change still spans the hole
+        // a window that does not contain bar 28 is untouched
+        Assert.Equal(CoverageStatus.Full, OptionSummaryCalculator.Compute(b, GridKind.Atm, h, 27).Rows[0].Coverage.Status);
     }
 
     [Fact]

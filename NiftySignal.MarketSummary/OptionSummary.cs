@@ -2,7 +2,7 @@ namespace NiftySignal.MarketSummary;
 
 /// <summary>One side (CE or PE) of one grid / window: the aggregate of that side's INCLUDED contracts. See docs/MARKET_SUMMARY_METRICS.md for every rule.</summary>
 public sealed record SideSummary(
-    int Contracts, long Volume,
+    int Contracts, int LevelContracts, long? Volume,
     Metric Strict, Metric Enriched, Metric Ofi, Metric MicroDev,
     Metric Price, Metric Roll,
     double? IvLevel, Metric Iv,
@@ -18,17 +18,24 @@ public sealed record GridSummary(GridKind Kind, int Expected, IReadOnlyList<Wind
 
 /// <summary>
 /// Pure aggregation of the exact ten contracts of ONE fixed basket over the five windows, for completed bars through <c>endBarSeq</c> only. The same basket (same centre, expiry, tokens) is used for every
-/// window - history is never re-classified by each bar's own centre. A contract is INCLUDED in a window only when a stored row exists for EVERY bar of the window (no bridging, no substitution).
+/// window - history is never re-classified by each bar's own centre. Missing rows are integrity gaps (the producer writes a row for every frozen-universe contract in every bar, zero-activity ones included, in one
+/// transaction - docs/MARKET_SUMMARY_METRICS.md section 5), so they are never zero-filled, bridged or substituted: FLOW metrics (volume, strict, enriched, OFI, MicroDev, activity) need a row for EVERY bar of
+/// the window; LEVEL metrics (price, IV, Delta, Vega, OI: end minus start) need only the first and last bar, because the end of bar k equals the start of bar k+1 and the change telescopes across an interior hole.
 /// </summary>
 public static class OptionSummaryCalculator
 {
     /// <summary>The length of the exact-strike rolling price window (equals AdaptiveFixedClockV1.RollingWindowBars; the existing fixed-strike Roll ΔPx uses the same ten bars).</summary>
     public const int RollBars = 10;
 
-    public static IReadOnlyList<GridSummary> ComputeAll(Basket basket, ContractHistory history, int endBarSeq) =>
-        new[] { GridKind.Atm, GridKind.Itm, GridKind.Otm, GridKind.Total }.Select(k => Compute(basket, k, history, endBarSeq)).ToList();
+    public static IReadOnlyList<GridSummary> ComputeAll(Basket basket, ContractHistory history, int endBarSeq)
+    {
+        var cache = new Dictionary<(string Token, int From), ContractWindow?>();      // a contract's window is identical in every grid that contains it
+        return new[] { GridKind.Atm, GridKind.Itm, GridKind.Otm, GridKind.Total }.Select(k => Compute(basket, k, history, endBarSeq, cache)).ToList();
+    }
 
-    public static GridSummary Compute(Basket basket, GridKind kind, ContractHistory history, int endBarSeq)
+    public static GridSummary Compute(Basket basket, GridKind kind, ContractHistory history, int endBarSeq) => Compute(basket, kind, history, endBarSeq, null);
+
+    static GridSummary Compute(Basket basket, GridKind kind, ContractHistory history, int endBarSeq, Dictionary<(string Token, int From), ContractWindow?>? cache)
     {
         var expected = Basket.Expected(kind);
         var contracts = basket.For(kind);
@@ -45,21 +52,47 @@ public static class OptionSummaryCalculator
             foreach (var c in contracts)
             {
                 if (c.Token is null) { missing.Add($"unresolved {(c.IsCall ? "CE" : "PE")} offset {c.Offset:+0;-0;0}"); continue; }
-                var cw = ContractWindow.Build(c.Token, from, endBarSeq, history);
+                ContractWindow? cw;
+                if (cache is null) cw = ContractWindow.Build(c.Token, from, endBarSeq, history);
+                else if (!cache.TryGetValue((c.Token, from), out cw)) cache[(c.Token, from)] = cw = ContractWindow.Build(c.Token, from, endBarSeq, history);
                 if (cw is null) { missing.Add(c.Token); continue; }
+                if (!cw.FlowComplete) missing.Add(c.Token);
                 (c.IsCall ? ce : pe).Add(cw);
             }
 
-            var included = ce.Count + pe.Count;
-            if (included == 0) { rows.Add(new(w, from, endBarSeq, Coverage.Insufficient(expected, "no contract has every bar of the window", missing), null, null, null)); continue; }
+            var included = ce.Count(x => x.FlowComplete) + pe.Count(x => x.FlowComplete);
+            var levelIncluded = ce.Count + pe.Count;
+            if (levelIncluded == 0) { rows.Add(new(w, from, endBarSeq, Coverage.Insufficient(expected, "no contract has every bar of the window", missing), null, null, null)); continue; }
             var status = included == expected ? CoverageStatus.Full : CoverageStatus.Partial;
-            var cov = new Coverage(included, expected, status, status == CoverageStatus.Full ? "" : "contracts missing rows for the window", missing);
+            var cov = new Coverage(included, expected, status, status == CoverageStatus.Full ? "" : "contracts missing rows for the window", missing, levelIncluded, FamilyCounts(ce.Concat(pe)));
             var ceS = Side(ce);
             var peS = Side(pe);
             rows.Add(new(w, from, endBarSeq, cov, ceS, peS, ceS is not null && peS is not null ? Direction(ceS, peS) : null));
         }
 
         return new GridSummary(kind, expected, rows);
+    }
+
+    public static readonly IReadOnlyList<string> Families = ["Strict", "Enriched", "Price", "Roll", "Oi", "MicroDev", "Ofi", "Iv", "Delta", "Vega", "Activity"];
+
+    static IReadOnlyDictionary<string, int> FamilyCounts(IEnumerable<ContractWindow> cws)
+    {
+        var l = cws.ToList();
+        static bool Chg(double? s, double? e, Func<double, bool> ok) => s is { } a && e is { } b && double.IsFinite(a) && double.IsFinite(b) && ok(a);
+        return new Dictionary<string, int>
+        {
+            ["Strict"] = l.Count(c => c.FlowComplete),
+            ["Enriched"] = l.Count(c => c.FlowComplete),
+            ["Price"] = l.Count(c => Chg(c.PriceStart, c.PriceEnd, x => x > 0d)),
+            ["Roll"] = l.Count(c => c.RollN > 0),
+            ["Oi"] = l.Count(c => c.OiStart is > 0 && c.OiEnd is not null),
+            ["MicroDev"] = l.Count(c => c.FlowComplete && c.MdW > 0d),
+            ["Ofi"] = l.Count(c => c.FlowComplete && c.OfiNet is not null),
+            ["Iv"] = l.Count(c => Chg(c.IvStart, c.IvEnd, x => x > 0d)),
+            ["Delta"] = l.Count(c => Chg(c.DeltaStart, c.DeltaEnd, x => x != 0d)),
+            ["Vega"] = l.Count(c => Chg(c.VegaStart, c.VegaEnd, x => x != 0d)),
+            ["Activity"] = l.Count(c => c.FlowComplete && c.ActivityRate is not null),
+        };
     }
 
     // ---- per-contract window accumulation -------------------------------------------------------------------------------------------------------------------------------------------
@@ -75,16 +108,20 @@ public static class OptionSummaryCalculator
         public double RollSum, RollStartSum;
         public int RollN;
 
+        /// <summary>True when a stored row exists for every bar of the window; flow fields are only meaningful then.</summary>
+        public bool FlowComplete = true;
+
         public double? ActivityRate => ActDur > 0d ? ActQty / ActDur : null;
 
         public static ContractWindow? Build(string token, int from, int to, ContractHistory h)
         {
             var cw = new ContractWindow();
+            var series = h.Series(token);
             ContractBar? first = null, last = null;
             for (var b = from; b <= to; b++)
             {
-                var bar = h.Get(token, b);
-                if (bar is null) return null;
+                var bar = b < series.Length ? series[b] : null;
+                if (bar is null) { cw.FlowComplete = false; continue; }
                 first ??= bar;
                 last = bar;
                 cw.Qty += bar.TotalQuantity;
@@ -98,7 +135,14 @@ public static class OptionSummaryCalculator
                 }
 
                 if (h.BarDurationSeconds.TryGetValue(b, out var dur) && dur > 0d) { cw.ActQty += bar.TotalQuantity; cw.ActDur += dur; }
-                if (b - RollBars + 1 >= 1 && Roll(token, b, h) is { } r) { cw.RollSum += r.Delta; cw.RollStartSum += r.Start; cw.RollN++; }
+                if (b - RollBars + 1 >= 1 && Roll(series, b) is { } r) { cw.RollSum += r.Delta; cw.RollStartSum += r.Start; cw.RollN++; }
+            }
+
+            // The level metrics need the window's FIRST and LAST bar; a hole there makes the contract unusable for the window.
+            if (from >= series.Length || to >= series.Length || series[from] is null || series[to] is null) return null;
+            if (!cw.FlowComplete)
+            {
+                cw.Qty = cw.StrictDelta = cw.EnrichedDelta = cw.EnrichedTotal = 0; cw.OfiNet = cw.OfiGross = null; cw.MdNum = cw.TobNum = cw.MdW = 0d; cw.ActQty = cw.ActDur = 0d;
             }
 
             cw.PriceStart = first!.PriceStart; cw.PriceEnd = last!.PriceEnd;
@@ -110,23 +154,25 @@ public static class OptionSummaryCalculator
         }
 
         /// <summary>Exact-strike roll: PriceEnd of bar b minus PriceStart of bar b-9. Valid only when every bar of those ten has a stored row (no bridging) and the start price is positive.</summary>
-        static (double Delta, double Start)? Roll(string token, int b, ContractHistory h)
+        static (double Delta, double Start)? Roll(ContractBar?[] series, int b)
         {
-            for (var k = b - RollBars + 1; k <= b; k++) if (h.Get(token, k) is null) return null;
-            var s = h.Get(token, b - RollBars + 1)!.PriceStart;
-            var e = h.Get(token, b)!.PriceEnd;
+            if (b >= series.Length) return null;
+            for (var k = b - RollBars + 1; k <= b; k++) if (series[k] is null) return null;
+            var s = series[b - RollBars + 1]!.PriceStart;
+            var e = series[b]!.PriceEnd;
             return s is > 0d && e is { } ev && double.IsFinite(ev) && double.IsFinite(s.Value) ? (ev - s.Value, s.Value) : null;
         }
     }
 
     // ---- side aggregation (cross-contract) ------------------------------------------------------------------------------------------------------------------------------------------
 
-    static SideSummary? Side(List<ContractWindow> cs)
+    static SideSummary? Side(List<ContractWindow> all)
     {
-        if (cs.Count == 0) return null;
-        var qty = cs.Sum(c => c.Qty);
-        var strict = new Metric(cs.Sum(c => c.StrictDelta), cs.Sum(c => c.StrictDelta), qty);
-        var enriched = new Metric(cs.Sum(c => c.EnrichedDelta), cs.Sum(c => c.EnrichedDelta), cs.Sum(c => c.EnrichedTotal));
+        if (all.Count == 0) return null;
+        var cs = all.Where(c => c.FlowComplete).ToList();      // flow metrics: only contracts with every bar of the window
+        long? qty = cs.Count == 0 ? null : cs.Sum(c => c.Qty);
+        var strict = cs.Count == 0 ? Metric.None : new Metric(cs.Sum(c => c.StrictDelta), cs.Sum(c => c.StrictDelta), qty);
+        var enriched = cs.Count == 0 ? Metric.None : new Metric(cs.Sum(c => c.EnrichedDelta), cs.Sum(c => c.EnrichedDelta), cs.Sum(c => c.EnrichedTotal));
 
         var ofiV = cs.Where(c => c.OfiNet is not null).ToList();
         var ofi = ofiV.Count == 0 ? Metric.None : new Metric(ofiV.Sum(c => c.OfiNet!.Value), ofiV.Sum(c => c.OfiNet!.Value), ofiV.Sum(c => c.OfiGross!.Value));
@@ -135,21 +181,22 @@ public static class OptionSummaryCalculator
         var mw = micro.Sum(c => c.MdW);
         var microDev = micro.Count == 0 ? Metric.None : new Metric(micro.Sum(c => c.MdNum) / mw, micro.Sum(c => c.TobNum), mw);
 
-        var price = Change(cs, c => c.PriceStart, c => c.PriceEnd, start => start > 0d);
-        var iv = Change(cs, c => c.IvStart, c => c.IvEnd, start => start > 0d);
-        var delta = Change(cs, c => c.DeltaStart, c => c.DeltaEnd, start => start != 0d);
-        var vega = Change(cs, c => c.VegaStart, c => c.VegaEnd, start => start != 0d);
+        // level metrics (start -> end) and Roll use every contract that has the window's first and last bar
+        var price = Change(all, c => c.PriceStart, c => c.PriceEnd, start => start > 0d);
+        var iv = Change(all, c => c.IvStart, c => c.IvEnd, start => start > 0d);
+        var delta = Change(all, c => c.DeltaStart, c => c.DeltaEnd, start => start != 0d);
+        var vega = Change(all, c => c.VegaStart, c => c.VegaEnd, start => start != 0d);
 
-        var rollC = cs.Where(c => c.RollN > 0).ToList();
+        var rollC = all.Where(c => c.RollN > 0).ToList();
         var roll = rollC.Count == 0 ? Metric.None : new Metric(rollC.Average(c => c.RollSum / c.RollN), rollC.Sum(c => c.RollSum), rollC.Sum(c => c.RollStartSum));
 
-        var oiC = cs.Where(c => c.OiStart is > 0 && c.OiEnd is not null).ToList();
+        var oiC = all.Where(c => c.OiStart is > 0 && c.OiEnd is not null).ToList();
         var oi = oiC.Count == 0 ? Metric.None : new Metric(oiC.Sum(c => c.OiEnd!.Value - c.OiStart!.Value), oiC.Sum(c => c.OiEnd!.Value - c.OiStart!.Value), oiC.Sum(c => c.OiStart!.Value));
 
         var act = cs.Where(c => c.ActivityRate is not null).ToList();
-        return new SideSummary(cs.Count, qty, strict, enriched, ofi, microDev, price, roll,
-            Average(cs.Select(c => c.IvEnd)), iv,
-            Average(cs.Select(c => c.DeltaEnd)), delta, Average(cs.Select(c => c.VegaEnd)), vega,
+        return new SideSummary(cs.Count, all.Count, qty, strict, enriched, ofi, microDev, price, roll,
+            Average(all.Select(c => c.IvEnd)), iv,
+            Average(all.Select(c => c.DeltaEnd)), delta, Average(all.Select(c => c.VegaEnd)), vega,
             oi, act.Count == 0 ? null : act.Sum(c => c.ActivityRate!.Value));
     }
 

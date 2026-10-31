@@ -258,6 +258,53 @@ public sealed class AdaptiveObserverDataService(
         return FixedStrikeProjection.Assemble(catalog, contract, bars, stored, rollWindowBars);
     }
 
+    /// <summary>
+    /// The Market Summary grids for ONE session, pinned at completed bar <paramref name="endBarSeq"/> (no bar after it is read). The basket is the session's frozen weekly expiry resolved around
+    /// <paramref name="centreStrike"/> - the strike the Dashboard has selected (Auto Follow = the authoritative centre of the latest completed bar; manual pin = the pinned strike; a historical capture =
+    /// the centre of the target bar). One scoped query reads the ten exact tokens; a missing table or missing rows yields coverage gaps, never another strike.
+    /// </summary>
+    public async Task<MarketSummaryView> LoadMarketSummaryAsync(long sessionId, int endBarSeq, FixedStrikeCatalog? catalog, double? centreStrike, CancellationToken ct = default)
+    {
+        if (catalog is null || centreStrike is not { } centre || endBarSeq < 1)
+        {
+            return MarketSummaryView.Unavailable(endBarSeq, catalog is null ? "no frozen option universe for this session" : centreStrike is null ? "no centre strike selected" : "no completed bar");
+        }
+
+        var basket = NiftySignal.MarketSummary.BasketResolver.Resolve(catalog.Expiry, centre, MarketSummaryMapper.Listed(catalog));
+        var tokens = basket.Contracts.Where(c => c.Token is not null).Select(c => c.Token!).ToHashSet(StringComparer.Ordinal);
+        List<AdaptiveFutureBarRow> bars;
+        Dictionary<int, AdaptiveFuturesSupplementalRow> sup;
+        List<AdaptiveOptionStrikeBarRow> stored = [];
+        await using (var db = await dbFactory.CreateDbContextAsync(ct))
+        {
+            bars = await db.FutureBars.AsNoTracking().Where(x => x.SessionId == sessionId && x.BarSeq <= endBarSeq).OrderBy(x => x.BarSeq).ToListAsync(ct);
+            var seqs = bars.Select(x => x.BarSeq).ToArray();
+            var invalidFutures = await LoadInvalidBarsAsync(db, sessionId, AdaptiveProjectionComponents.FuturesSupplemental, FuturesMicrostructureBar.MetricsVersion, seqs, ct);
+            sup = (await LoadFuturesSupplementalAsync(db, sessionId, seqs, ct)).Where(x => !invalidFutures.Contains(x.Key)).ToDictionary(x => x.Key, x => x.Value);
+            if (tokens.Count > 0)
+            {
+                // Scoped by the indexed (SessionId, Expiry, Strike, Side, BarSeq) key: the five strikes of the basket only, never the whole universe. The exact-token filter is applied by the mapper.
+                var strikeArray = basket.Contracts.Where(c => c.Strike is not null).Select(c => c.Strike!.Value).Distinct().ToArray();
+                var expiry = catalog.Expiry;
+                try
+                {
+                    stored = await db.OptionStrikeBars.AsNoTracking()
+                        .Where(x => x.SessionId == sessionId && x.Expiry == expiry && strikeArray.Contains(x.Strike) && x.BarSeq <= endBarSeq)
+                        .ToListAsync(ct);
+                }
+                catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedTable)
+                {
+                    // not migrated yet: every contract is a coverage gap
+                }
+            }
+        }
+
+        var futures = bars.ToDictionary(b => b.BarSeq, b => MarketSummaryMapper.FuturesBarOf(b, sup.GetValueOrDefault(b.BarSeq)));
+        var history = new NiftySignal.MarketSummary.ContractHistory(MarketSummaryMapper.ContractBars(stored, tokens, catalog.Expiry, endBarSeq), bars.ToDictionary(b => b.BarSeq, b => b.DurationSeconds));
+        return new MarketSummaryView(endBarSeq, basket, NiftySignal.MarketSummary.FuturesSummaryCalculator.Compute(futures, endBarSeq),
+            NiftySignal.MarketSummary.OptionSummaryCalculator.ComputeAll(basket, history, endBarSeq), null);
+    }
+
     /// <summary>Bars (of the displayed range) whose sidecar carries a durable failed-verification marker. Tolerates a not-yet-migrated schema.</summary>
     static async Task<IReadOnlySet<int>> LoadInvalidBarsAsync(
         AdaptiveObserverDbContext db, long sessionId, string component, string version, int[] seqs, CancellationToken ct)

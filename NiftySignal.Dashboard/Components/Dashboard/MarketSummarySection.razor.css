@@ -1,0 +1,86 @@
+/* Market Summary grids. This component has its own CSS-isolation scope, so the shared "adaptive" table look is restated here (the panel's scoped rules do not reach child-component markup). Compact on purpose: 23 core columns must fit a 1920 px capture. */
+.adaptive-grid-section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+}
+
+.adaptive-grid-section h3 {
+    margin: 0 0 10px;
+    font-size: .95rem;
+}
+
+.adaptive-subtitle {
+    margin: 10px 0 4px;
+    font-size: .8rem;
+    font-weight: 600;
+    letter-spacing: .04em;
+}
+
+.adaptive-note {
+    margin: 4px 0 8px;
+    color: var(--text-dim);
+    font-size: .78rem;
+}
+
+.adaptive-pending {
+    color: var(--text-dim);
+    font-style: italic;
+}
+
+.adaptive-alert {
+    display: block;
+    color: var(--warn, #dbab09);
+}
+
+.adaptive-table-wrap {
+    overflow-x: auto;
+    max-width: 100%;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+}
+
+.adaptive-table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: .7rem;
+    font-variant-numeric: tabular-nums;
+}
+
+.adaptive-table th,
+.adaptive-table td {
+    white-space: nowrap;
+    padding: 4px 5px;
+    border-bottom: 1px solid var(--border);
+    border-right: 1px solid var(--border);
+    text-align: right;
+}
+
+.adaptive-table th {
+    background: var(--surface);
+    color: var(--text-dim);
+    font-weight: 600;
+}
+
+.adaptive-table td:first-child,
+.adaptive-table th:first-child {
+    text-align: left;
+}
+
+/* The coverage text (with per-family deficits) wraps instead of widening the table: no horizontal overflow at 1920 px. */
+.adaptive-table td[data-coverage] {
+    text-align: left;
+    font-size: .66rem;
+    white-space: normal;
+    min-width: 8rem;
+    max-width: 14rem;
+}
+
+.adaptive-table td[data-coverage="Partial"] {
+    color: var(--warn, #dbab09);
+}
+
+.adaptive-table td[data-coverage="Insufficient"] {
+    color: var(--text-dim);
+}

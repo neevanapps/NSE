@@ -808,7 +808,8 @@ public sealed class AdaptiveCompactGridTests
         Assert.Equal("11 bars", RowsOf(at11, "options-core-direction").Single(r => r[0] == "DAY AVG")[1]);
         Assert.Equal("11 bars", RowsOf(at11, "options-context").Single(r => r[0] == "DAY AVG")[1]);
         Assert.Equal("11 bars", RowsOf(at11, "residual-compact").Single(r => r[0] == "DAY AVG")[1]);
-        Assert.Equal(4, System.Text.RegularExpressions.Regex.Matches(at11, "<table[ >]").Count);
+        Assert.Equal(4, System.Text.RegularExpressions.Regex.Matches(at11, "<table(?![^>]*data-grid=\"summary-)[ >]").Count);     // the four existing detailed grids are unchanged
+        Assert.Equal(9, System.Text.RegularExpressions.Regex.Matches(at11, "<table[^>]*data-grid=\"summary-").Count);                // plus the Market Summary grids
         Assert.Contains("data-testid=\"futures-avg\"", at11);
         Assert.Contains("data-testid=\"futures-day-avg\"", at11);
         Assert.Contains("data-testid=\"options-core-day-avg\"", at11);
@@ -962,7 +963,8 @@ public sealed class AdaptiveCompactGridTests
             Assert.Single(System.Text.RegularExpressions.Regex.Matches(html, "<table[^>]*data-grid=\"" + required.Grid + "\""));
         foreach (var testId in AdaptiveScreenshotRenderer.RequiredBlocks)
             Assert.Single(System.Text.RegularExpressions.Regex.Matches(html, "data-testid=\"" + testId + "\""));
-        Assert.Equal(4, System.Text.RegularExpressions.Regex.Matches(html, "<table[ >]").Count);          // futures, core, context, residual: no diagnostic table slipped in
+        Assert.Equal(4, System.Text.RegularExpressions.Regex.Matches(html, "<table(?![^>]*data-grid=\"summary-)[ >]").Count);          // futures, core, context, residual: no diagnostic table slipped in
+        Assert.Equal(9, System.Text.RegularExpressions.Regex.Matches(html, "<table[^>]*data-grid=\"summary-").Count);                    // futures summary + ATM/ITM/OTM/TOTAL core and context
         Assert.Contains("NIFTY RESEARCH SNAPSHOT", html);
         // Direction-sign markup only on Direction cells: five families x (rows + AVG + DAY AVG) in CORE, five (price, IV, delta, vega, activity) in CONTEXT, none on CE / PE cells.
         var coreRows = RowsOf(html, "options-core-direction").Length;

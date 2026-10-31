@@ -40,4 +40,16 @@ public sealed class ContractHistory
     public IReadOnlyDictionary<int, double> BarDurationSeconds { get; }
 
     public ContractBar? Get(string token, int barSeq) => _byToken.TryGetValue(token, out var m) && m.TryGetValue(barSeq, out var b) ? b : null;
+
+    readonly Dictionary<string, ContractBar?[]> _series = new(StringComparer.Ordinal);
+
+    /// <summary>The token's rows indexed by BarSeq (index 0 unused; null = no stored row). Built once per token, so window loops index an array instead of hashing per bar.</summary>
+    public ContractBar?[] Series(string token)
+    {
+        if (_series.TryGetValue(token, out var cached)) return cached;
+        var max = _byToken.TryGetValue(token, out var m) && m.Count > 0 ? m.Keys.Max() : 0;
+        var arr = new ContractBar?[max + 1];
+        if (m is not null) foreach (var kv in m) if (kv.Key >= 0) arr[kv.Key] = kv.Value;
+        return _series[token] = arr;
+    }
 }
