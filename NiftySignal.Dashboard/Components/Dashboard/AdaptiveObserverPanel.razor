@@ -139,13 +139,13 @@
                             <td>@FmtIst(x.Bar.EndAvailableAtUtc)</td>
                             <td>@x.Bar.DurationSeconds.ToString("0.0")</td>
                             <td>@Fmt(AdaptiveGridProjection.Urgency(x.Bar.Volume, x.Bar.DurationSeconds), 1)</td>
-                            <td>@FmtSigned(x.Bar.BarPriceDisplacement, 2)</td>
-                            <td>@FmtSigned(r?.PriceDisplacement, 2)</td>
+                            <td class="@Sc(x.Bar.BarPriceDisplacement)" data-sign="@RatioFormat.SignName(x.Bar.BarPriceDisplacement)">@FmtSigned(x.Bar.BarPriceDisplacement, 2)</td>
+                            <td class="@Sc(r?.PriceDisplacement)" data-sign="@RatioFormat.SignName(r?.PriceDisplacement)">@FmtSigned(r?.PriceDisplacement, 2)</td>
                             @{ var fr = FuturesRatios.Build(x.Bar, Supplemental(x.Bar.BarSeq)); }
-                            <td>@RatioFormat.Cell(fr.Strict)</td>
-                            <td>@RatioFormat.Cell(fr.Enriched)</td>
-                            <td>@RatioFormat.Cell(fr.MicroDev, 2)</td>
-                            <td>@RatioFormat.Cell(fr.Ofi)</td>
+                            <td class="@Sc(fr.Strict)" data-sign="@RatioFormat.SignName(fr.Strict)">@RatioFormat.Cell(fr.Strict)</td>
+                            <td class="@Sc(fr.Enriched)" data-sign="@RatioFormat.SignName(fr.Enriched)">@RatioFormat.Cell(fr.Enriched)</td>
+                            <td class="@Sc(fr.MicroDev)" data-sign="@RatioFormat.SignName(fr.MicroDev)">@RatioFormat.Cell(fr.MicroDev, 2)</td>
+                            <td class="@Sc(fr.Ofi)" data-sign="@RatioFormat.SignName(fr.Ofi)">@RatioFormat.Cell(fr.Ofi)</td>
                             <td>@FmtSigned(r?.OiChange)</td>
                             <td>@FmtSigned(Basis(x.Bar.BarSeq)?.DeltaBasis, 2)</td>
                             <td>@Fmt(r?.Efficiency, 3)</td>
@@ -161,12 +161,12 @@
                             <td>@_snapshot.Futures.Count rows</td>
                             <td>@RatioFormat.Plain(avg.Duration, 1)</td>
                             <td>@RatioFormat.Plain(avg.Urgency, 1)</td>
-                            <td>@RatioFormat.Plain(avg.BarPx, 2)</td>
-                            <td>@RatioFormat.Plain(avg.RollPx, 2)</td>
-                            <td>@RatioFormat.Cell(avg.Strict)</td>
-                            <td>@RatioFormat.Cell(avg.Enriched)</td>
-                            <td>@RatioFormat.Cell(avg.MicroDev, 2)</td>
-                            <td>@RatioFormat.Cell(avg.Ofi)</td>
+                            <td class="@Sc(avg.BarPx)" data-sign="@RatioFormat.SignName(avg.BarPx)">@RatioFormat.Plain(avg.BarPx, 2)</td>
+                            <td class="@Sc(avg.RollPx)" data-sign="@RatioFormat.SignName(avg.RollPx)">@RatioFormat.Plain(avg.RollPx, 2)</td>
+                            <td class="@Sc(avg.Strict)" data-sign="@RatioFormat.SignName(avg.Strict)">@RatioFormat.Cell(avg.Strict)</td>
+                            <td class="@Sc(avg.Enriched)" data-sign="@RatioFormat.SignName(avg.Enriched)">@RatioFormat.Cell(avg.Enriched)</td>
+                            <td class="@Sc(avg.MicroDev)" data-sign="@RatioFormat.SignName(avg.MicroDev)">@RatioFormat.Cell(avg.MicroDev, 2)</td>
+                            <td class="@Sc(avg.Ofi)" data-sign="@RatioFormat.SignName(avg.Ofi)">@RatioFormat.Cell(avg.Ofi)</td>
                             <td>@RatioFormat.Plain(avg.RollOi, 1)</td>
                             <td>@RatioFormat.Plain(avg.Basis, 2)</td>
                             <td>@RatioFormat.Plain(avg.Efficiency, 3)</td>
@@ -181,12 +181,12 @@
                             <td>@dayF.BarCount bars</td>
                             <td>@RatioFormat.Plain(davg.Duration, 1)</td>
                             <td>@RatioFormat.Plain(davg.Urgency, 1)</td>
-                            <td>@RatioFormat.Plain(davg.BarPx, 2)</td>
-                            <td>@RatioFormat.Plain(davg.RollPx, 2)</td>
-                            <td>@RatioFormat.Cell(davg.Strict)</td>
-                            <td>@RatioFormat.Cell(davg.Enriched)</td>
-                            <td>@RatioFormat.Cell(davg.MicroDev, 2)</td>
-                            <td>@RatioFormat.Cell(davg.Ofi)</td>
+                            <td class="@Sc(davg.BarPx)" data-sign="@RatioFormat.SignName(davg.BarPx)">@RatioFormat.Plain(davg.BarPx, 2)</td>
+                            <td class="@Sc(davg.RollPx)" data-sign="@RatioFormat.SignName(davg.RollPx)">@RatioFormat.Plain(davg.RollPx, 2)</td>
+                            <td class="@Sc(davg.Strict)" data-sign="@RatioFormat.SignName(davg.Strict)">@RatioFormat.Cell(davg.Strict)</td>
+                            <td class="@Sc(davg.Enriched)" data-sign="@RatioFormat.SignName(davg.Enriched)">@RatioFormat.Cell(davg.Enriched)</td>
+                            <td class="@Sc(davg.MicroDev)" data-sign="@RatioFormat.SignName(davg.MicroDev)">@RatioFormat.Cell(davg.MicroDev, 2)</td>
+                            <td class="@Sc(davg.Ofi)" data-sign="@RatioFormat.SignName(davg.Ofi)">@RatioFormat.Cell(davg.Ofi)</td>
                             <td>@RatioFormat.Plain(davg.RollOi, 1)</td>
                             <td>@RatioFormat.Plain(davg.Basis, 2)</td>
                             <td>@RatioFormat.Plain(davg.Efficiency, 3)</td>
@@ -221,23 +221,23 @@
                             <td class="sticky-col">@x.Bar.BarSeq</td>
                             <td>@FmtIst(x.Bar.EndAvailableAtUtc)</td>
                             <td>@x.Bar.DurationSeconds.ToString("0.0")</td>
-                            <td>@FmtSigned(x.Bar.BarPriceDisplacement, 2)</td>
-                            <td>@FmtSigned(x.Bar.StrictDelta)</td>
-                            <td>@FmtSigned(x.Bar.StrictDeltaRatioTotal, 3)</td>
+                            <td class="@Sc(x.Bar.BarPriceDisplacement)" data-sign="@RatioFormat.SignName(x.Bar.BarPriceDisplacement)">@FmtSigned(x.Bar.BarPriceDisplacement, 2)</td>
+                            <td class="@Sc(x.Bar.StrictDelta)" data-sign="@RatioFormat.SignName(x.Bar.StrictDelta)">@FmtSigned(x.Bar.StrictDelta)</td>
+                            <td class="@Sc(x.Bar.StrictDeltaRatioTotal)" data-sign="@RatioFormat.SignName(x.Bar.StrictDeltaRatioTotal)">@FmtSigned(x.Bar.StrictDeltaRatioTotal, 3)</td>
                             <td>@FmtPct01(x.Bar.StrictCoverage)</td>
-                            <td>@FmtSigned(x.Bar.EnrichedDelta)</td>
-                            <td>@FmtSigned(x.Bar.EnrichedDeltaRatio, 3)</td>
+                            <td class="@Sc(x.Bar.EnrichedDelta)" data-sign="@RatioFormat.SignName(x.Bar.EnrichedDelta)">@FmtSigned(x.Bar.EnrichedDelta)</td>
+                            <td class="@Sc(x.Bar.EnrichedDeltaRatio)" data-sign="@RatioFormat.SignName(x.Bar.EnrichedDeltaRatio)">@FmtSigned(x.Bar.EnrichedDeltaRatio, 3)</td>
                             <td>@x.Bar.TradeUpdates</td>
-                            <td>@FmtSigned(r?.PriceDisplacement, 2)</td>
-                            <td>@FmtSigned(r?.StrictDelta)</td>
-                            <td>@FmtSigned(r?.StrictDeltaRatioTotal, 3)</td>
+                            <td class="@Sc(r?.PriceDisplacement)" data-sign="@RatioFormat.SignName(r?.PriceDisplacement)">@FmtSigned(r?.PriceDisplacement, 2)</td>
+                            <td class="@Sc(r?.StrictDelta)" data-sign="@RatioFormat.SignName(r?.StrictDelta)">@FmtSigned(r?.StrictDelta)</td>
+                            <td class="@Sc(r?.StrictDeltaRatioTotal)" data-sign="@RatioFormat.SignName(r?.StrictDeltaRatioTotal)">@FmtSigned(r?.StrictDeltaRatioTotal, 3)</td>
                             <td>@FmtPct01(r?.StrictQuoteCoverage)</td>
-                            <td>@FmtSigned(r?.EnrichedDelta)</td>
-                            <td>@FmtSigned(r?.EnrichedDeltaRatio, 3)</td>
+                            <td class="@Sc(r?.EnrichedDelta)" data-sign="@RatioFormat.SignName(r?.EnrichedDelta)">@FmtSigned(r?.EnrichedDelta)</td>
+                            <td class="@Sc(r?.EnrichedDeltaRatio)" data-sign="@RatioFormat.SignName(r?.EnrichedDeltaRatio)">@FmtSigned(r?.EnrichedDeltaRatio, 3)</td>
                             <td>@FmtSigned(r?.RollingStrictAbsDeltaChange)</td>
                             <td>@FmtSigned(r?.RollingEnrichedDeltaChange)</td>
                             <td>@Fmt(r?.Efficiency, 3)</td>
-                            <td>@FmtSigned(r?.ReturnBps, 2)</td>
+                            <td class="@Sc(r?.ReturnBps)" data-sign="@RatioFormat.SignName(r?.ReturnBps)">@FmtSigned(r?.ReturnBps, 2)</td>
                             <td>@FmtSigned(r?.OiChange)</td>
                             <td>@FmtPct01(r?.OiChangePct)</td>
                             <td>@Fmt(r?.VolumePerSecond, 1)</td>
@@ -1232,6 +1232,10 @@
         var decimalPart = decimals > 0 ? "." + new string('0', decimals) : string.Empty;
         return x.Value.ToString($"+0{decimalPart};-0{decimalPart};0{decimalPart}");
     }
+    static string Sc(double? v) => RatioFormat.SignedClass(v);
+    static string Sc(long? v) => RatioFormat.SignedClass(v);
+    static string Sc(long v) => RatioFormat.SignedClass(v);
+    static string Sc(RatioPart v) => RatioFormat.SignedClass(v);
     static string FmtSigned(long? x) => x.HasValue ? x.Value.ToString("+0;-0;0") : "—";
     static string FmtSigned(long x) => x.ToString("+0;-0;0");
     static string FmtPct01(double? x) => x.HasValue ? $"{x.Value * 100:0.0}%" : "—";

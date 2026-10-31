@@ -44,7 +44,7 @@
                         }
                         else
                         {
-                            <td>@Cell(r.Price, 2)</td><td>@r.Volume.ToString("N0")</td><td>@Cell(r.Strict)</td><td>@Cell(r.Enriched)</td><td>@Cell(r.MicroDev, 2)</td><td>@Cell(r.Ofi)</td><td>@Cell(r.Oi)</td>
+                            <td class="@Sc(r.Price)" data-sign="@RatioFormat.SignName(r.Price.Raw)">@Cell(r.Price, 2)</td><td>@r.Volume.ToString("N0")</td><td class="@Sc(r.Strict)" data-sign="@RatioFormat.SignName(r.Strict.Raw)">@Cell(r.Strict)</td><td class="@Sc(r.Enriched)" data-sign="@RatioFormat.SignName(r.Enriched.Raw)">@Cell(r.Enriched)</td><td class="@Sc(r.MicroDev)" data-sign="@RatioFormat.SignName(r.MicroDev.Raw)">@Cell(r.MicroDev, 2)</td><td class="@Sc(r.Ofi)" data-sign="@RatioFormat.SignName(r.Ofi.Raw)">@Cell(r.Ofi)</td><td>@Cell(r.Oi)</td>
                             <td>@RatioFormat.Plain(r.Activity, 1)</td>
                         }
                         @VixCells(View, r.Window.Name)
@@ -122,6 +122,8 @@
 
 @code {
     [Parameter] public MarketSummaryView? View { get; set; }
+
+    static string Sc(SummaryMetric m) => RatioFormat.SignedClass(m.Raw);
 
     static string Cell(SummaryMetric m, int rawDecimals = 0) => RatioFormat.Cell(new RatioPart(m.Raw, m.Num, m.Den), rawDecimals);
 

@@ -45,6 +45,17 @@ public static class RatioFormat
 
     /// <summary>Sign only: "pos", "neg", "zero" or "none" (unavailable). No magnitude threshold exists anywhere.</summary>
     public static string SignName(RatioPart p) => p.Raw is not { } r || !double.IsFinite(r) ? "none" : r > 0d ? "pos" : r < 0d ? "neg" : "zero";
+
+    /// <summary>Futures-grid directional tint (same CSS colours as the Options Direction cells, without the Direction column's border / weight). Sign only; zero, null and non-finite stay neutral.</summary>
+    public static string SignedClass(double? v) => v is { } x && double.IsFinite(x) ? x > 0d ? "adaptive-signed val-pos" : x < 0d ? "adaptive-signed val-neg" : string.Empty : string.Empty;
+
+    public static string SignedClass(long? v) => SignedClass(v is { } x ? (double)x : null);
+
+    public static string SignedClass(RatioPart p) => SignedClass(p.Raw);
+
+    public static string SignName(double? v) => v is not { } x || !double.IsFinite(x) ? "none" : x > 0d ? "pos" : x < 0d ? "neg" : "zero";
+
+    public static string SignName(long? v) => SignName(v is { } x ? (double)x : null);
 }
 
 /// <summary>Aggregation of the VISIBLE rows into the AVG row. Ratios are SUM(numerator) / SUM(denominator), never an average of percentages.</summary>

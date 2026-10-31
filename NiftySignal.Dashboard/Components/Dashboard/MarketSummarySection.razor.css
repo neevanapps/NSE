@@ -84,3 +84,12 @@
 .adaptive-table td[data-coverage="Insufficient"] {
     color: var(--text-dim);
 }
+
+/* Futures directional tint: sign only (positive = bullish, negative = bearish), same colours as the Options Direction cells; zero and unavailable stay neutral. */
+.adaptive-signed.val-pos {
+    background: rgba(63, 185, 80, .16);
+}
+
+.adaptive-signed.val-neg {
+    background: rgba(248, 81, 73, .16);
+}

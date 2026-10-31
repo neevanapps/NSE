@@ -231,3 +231,12 @@
 ::deep .adaptive-table td.adaptive-pending {
     text-align: left;
 }
+
+/* Futures directional tint: sign only (positive = bullish, negative = bearish), same colours as the Options Direction cells; zero and unavailable stay neutral. */
+::deep .adaptive-signed.val-pos {
+    background: rgba(63, 185, 80, .16);
+}
+
+::deep .adaptive-signed.val-neg {
+    background: rgba(248, 81, 73, .16);
+}
