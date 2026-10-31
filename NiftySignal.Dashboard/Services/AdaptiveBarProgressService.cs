@@ -30,7 +30,7 @@ public sealed record BarProgress(long? Quantity, long Target, double? Percent, i
 /// <summary>
 /// One shared, bounded-cadence reader of the authoritative runtime row (a single indexed read per second for the WHOLE Dashboard, however many browser circuits are open, and none while nobody is
 /// subscribed). No second tick pipeline, no per-tick work and no database WRITE: the Host already persists the builder's partial volume at most once a second. Subscribers are told only when the value
-/// changed. The displayed quantity can therefore trail the live builder by the Host's 1 s flush plus its 2 s stable-ordering lag.
+/// changed (quantity, bar, status or heartbeat). The displayed quantity can therefore trail the live builder by the Host's 1 s flush plus its 2 s stable-ordering lag.
 /// </summary>
 public sealed class AdaptiveBarProgressService(AdaptiveObserverDataService data, ILogger<AdaptiveBarProgressService> logger) : IDisposable
 {
@@ -107,9 +107,9 @@ public sealed class AdaptiveBarProgressService(AdaptiveObserverDataService data,
             _session = null;
         }
 
-        // The heartbeat moves every flush; only a change of what is DISPLAYED wakes the subscribers.
+        // What is displayed includes the runtime heartbeat ("as of"), which the Host moves about once a second: a Host that stopped (or is replaying) must show an AGING timestamp, never a frozen "live" quantity.
         var changed = next.Quantity != Current.Quantity || next.Target != Current.Target || next.LastCompletedBarSeq != Current.LastCompletedBarSeq
-            || next.UnavailableReason != Current.UnavailableReason || next.RuntimeStatus != Current.RuntimeStatus;
+            || next.UnavailableReason != Current.UnavailableReason || next.RuntimeStatus != Current.RuntimeStatus || next.HeartbeatUtc != Current.HeartbeatUtc;
         Current = next;
         if (changed) Changed?.Invoke();
     }

@@ -72,3 +72,15 @@ Consequences, implemented and tested:
 * **Freshness limit: 60 s, PROVISIONAL.** Derived from the real cadence (local copy, 23 sessions 2026-09-04..2026-10-09, 09:15-15:30 IST, distinct exchange timestamps): median gap 2-3 s, p95 7-22 s, p99 13-46 s, largest gap 35-336 s. 60 s exceeds every sampled session's p99; it is deliberately not the 5 s spot rule. The limit is inclusive. To be re-derived as sessions accumulate.
 * **Missing data:** an observation older than the limit gives a Stale point (value withheld, age shown), none at all gives Missing; Change and % need BOTH points usable. Nothing is backfilled, interpolated, carried across a gap, or guessed; no fabricated history. A failed or unconfigured VIX read leaves the rest of the summary untouched and says why in the cell title.
 * **Pinned screenshots:** the same rule at the target bar's boundaries, so no future observation can appear.
+
+### 6.1 Freshness evidence (validation, local copy, 22 sessions 2026-09-04..2026-10-09)
+
+Instrument mapping confirmed: `instruments` rows for token `26017` = "India VIX", `InstrumentType.Vix`, underlying NIFTY, present on all 32 as-of dates of the local copy (exactly one per date). Share of market time (09:00-15:30 IST) that would be reported **stale** for a given limit, i.e. time spent more than the limit past the last distinct exchange timestamp:
+
+| limit | worst session | median session | sessions since 2026-09-29 |
+|---|---|---|---|
+| 30 s | 9.7 % (09-04) | ~1.7 % | 0.03-0.8 % |
+| **60 s (policy)** | 3.5 % (09-04), 2.7 % (09-21) | ~0.2 % | 0.00-0.03 % |
+| 120 s | 1.1 % (09-21) | 0 % | 0.00 % |
+
+The feed was visibly sparser in September (p99 gap 25-46 s) than in the October sessions (p99 13-20 s), so 60 s is justified by the recent cadence and exceeds every session's p99 gap, but an early-September-style feed would show the VIX unavailable for a few percent of the day. **Recommendation (not applied):** keep 60 s; if a dense-feed assumption is judged too tight, 120 s would cut the worst-session stale share to about 1 % at the cost of calling a two-minute-old VIX current. The policy is a constant (`VixSummaryCalculator.FreshnessLimit`) and was not changed. Note a gap can also mean the value genuinely did not change (no tick is a possible quiet market), which a feed with no heartbeat cannot distinguish; stale therefore means "not confirmed within the limit", shown as such.

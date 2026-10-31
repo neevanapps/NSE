@@ -320,7 +320,7 @@
     AdaptiveBarProgressService? _progressService;
     BarProgress? _progress;
 
-    string ProgressMeta => _progress is null ? "" : _progress.UnavailableReason is { } why ? why : $"last completed bar {_progress.LastCompletedBarSeq} · {_progress.RuntimeStatus}";
+    string ProgressMeta => _progress is null ? "" : _progress.UnavailableReason is { } why ? why : $"last completed bar {_progress.LastCompletedBarSeq} · {_progress.RuntimeStatus} · as of {(_progress.HeartbeatUtc is { } hb ? hb.ToOffset(TimeSpan.FromHours(5.5)).ToString("HH:mm:ss") + " IST" : "—")}";
 
     void OnProgressChanged()
     {

@@ -81,20 +81,22 @@ public class BarProgressTests
         Assert.Equal("10,420 / 13,650 – 76.3%", svc.Current.QuantityText);
         Assert.Equal(1, notified);
 
-        await using (var db = f.CreateDbContext()) { var r = await db.Runtime.SingleAsync(); r.LastHeartbeatUtc = Now.AddSeconds(1); await db.SaveChangesAsync(); }       // heartbeat only
-        await svc.RefreshAsync();
+        await svc.RefreshAsync();                                                   // nothing changed at all: no notification
         Assert.Equal(1, notified);
+        await using (var db = f.CreateDbContext()) { var r = await db.Runtime.SingleAsync(); r.LastHeartbeatUtc = Now.AddSeconds(1); await db.SaveChangesAsync(); }       // heartbeat only: the "as of" time moves, so subscribers re-render
+        await svc.RefreshAsync();
+        Assert.Equal(2, notified);
 
         await using (var db = f.CreateDbContext()) { var r = await db.Runtime.SingleAsync(); r.CurrentPartialBarVolume = 12_900; await db.SaveChangesAsync(); }
         await svc.RefreshAsync();
         Assert.Equal("12,900 / 13,650 – 94.5%", svc.Current.QuantityText);
-        Assert.Equal(2, notified);
+        Assert.Equal(3, notified);
 
         await using (var db = f.CreateDbContext()) { var r = await db.Runtime.SingleAsync(); r.LastCompletedBarSeq = 42; r.CurrentPartialBarVolume = 310; await db.SaveChangesAsync(); }    // bar 42 completed, the builder reset
         await svc.RefreshAsync();
         Assert.Equal("310 / 13,650 – 2.3%", svc.Current.QuantityText);
         Assert.Equal(42, svc.Current.LastCompletedBarSeq);
-        Assert.Equal(3, notified);
+        Assert.Equal(4, notified);
     }
 
     [Fact]
@@ -132,6 +134,7 @@ public class BarProgressTests
         Assert.Contains("data-testid=\"bar-progress\"", html);
         Assert.Contains("10,420 / 13,650 – 76.3%", html);
         Assert.Contains("last completed bar 41", html);
+        Assert.Contains(" IST", html);                                                  // the heartbeat "as of" time: a stopped Host shows an aging timestamp, not a frozen live value
         Assert.Contains("quote-panel-sticky", html);                                    // the same sticky panel carries it: quote and quantity stay together
         svc.Dispose();
     }
@@ -160,5 +163,33 @@ public class BarProgressTests
         Assert.DoesNotContain("10,420", html);                                           // the live partial quantity never leaks into a pinned capture
         Assert.Contains("quote-panel-capture", html);
         Assert.DoesNotContain("quote-panel-sticky", html);
+    }
+
+    [Fact]
+    public void AuthoritativeBuilder_PartialVolumeNeverReachesTheTarget_OversizedUpdatesAreSplit_AndEveryCompletedBarIsExact()
+    {
+        var day = new DateOnly(2026, 10, 7);
+        const long target = 13_650;
+        var session = new NiftySignal.AdaptiveObserver.AdaptiveSessionDefinition(day, "FUT", "NIFTYFUT", day.AddDays(20), 65, target);
+        var builder = new NiftySignal.AdaptiveObserver.ExactAdaptiveFuturesBarBuilder(session);
+        var t = DateTimeOffset.Parse("2026-10-07T03:45:00Z");
+        var rng = new Random(13);
+        long total = 0, cumulative = 1_000;
+        long id = 1;
+        builder.Add(new NiftySignal.AdaptiveObserver.EnrichedObserverTick(new NiftySignal.AdaptiveObserver.CleanObserverTick(id++, t, t, 100, 99, 101, 10, 10, cumulative, 1000), 0, NiftySignal.AdaptiveObserver.ObserverTradeSide.Unknown, NiftySignal.AdaptiveObserver.ObserverTradeSide.Unknown));
+        for (var i = 0; i < 5_000; i++)
+        {
+            var size = rng.Next(0, 10) == 0 ? rng.Next(20_000, 70_000) : rng.Next(1, 900);       // one update in ten is bigger than a whole bar (up to ~5 bars)
+            cumulative += size; total += size;
+            var at = t.AddMilliseconds(i * 50 + 50);
+            builder.Add(new NiftySignal.AdaptiveObserver.EnrichedObserverTick(new NiftySignal.AdaptiveObserver.CleanObserverTick(id++, at, at, 100, 99, 101, 10, 10, cumulative, 1000), size, NiftySignal.AdaptiveObserver.ObserverTradeSide.Buy, NiftySignal.AdaptiveObserver.ObserverTradeSide.Buy));
+            Assert.InRange(builder.PartialVolume, 0, target - 1);                                  // never at or above the target: a bar that reaches it is completed and the partial restarts below it
+            var p = BarProgress.From(Session(target), Runtime(builder.PartialVolume, builder.Bars.Count));
+            Assert.NotNull(p.Quantity);                                                            // therefore the progress is always representable, never "unavailable"
+        }
+
+        Assert.All(builder.Bars.Where(b => b.IsComplete), b => Assert.Equal(target, b.Volume));
+        Assert.Equal(total, builder.Bars.Where(b => b.IsComplete).Sum(b => b.Volume) + builder.PartialVolume);     // no tick counted twice, none lost
+        Assert.True(builder.SplitUpdates > 100);
     }
 }

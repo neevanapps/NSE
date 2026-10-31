@@ -51,7 +51,7 @@
 .adaptive-table th,
 .adaptive-table td {
     white-space: nowrap;
-    padding: 4px 5px;
+    padding: 4px 3px;
     border-bottom: 1px solid var(--border);
     border-right: 1px solid var(--border);
     text-align: right;
@@ -73,7 +73,7 @@
     text-align: left;
     font-size: .66rem;
     white-space: normal;
-    min-width: 8rem;
+    min-width: 7rem;
     max-width: 14rem;
 }
 
