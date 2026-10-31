@@ -1,14 +1,13 @@
 using System.Globalization;
 using Microsoft.EntityFrameworkCore;
 using NiftySignal.AdaptiveObserver;
-using NiftySignal.AdaptiveObserver.Commentary;
 using NiftySignal.AdaptiveObserverData;
 using NiftySignal.Domain;
 using Npgsql;
 
 namespace NiftySignal.Dashboard.Services;
 
-/// <summary>One durable event shown in the RECENT EVENTS strip (a persisted commentary event or a ledger open / close).</summary>
+/// <summary>One durable event shown in the RECENT EVENTS strip (a ledger open / close of a paper position).</summary>
 public sealed record ResearchEvent(string Id, DateTimeOffset AtUtc, string Kind, string Text);
 
 /// <summary>Everything the research identity header, the data-quality line and the event strip show. Every field is as-of the displayed completed boundary.</summary>
@@ -50,7 +49,7 @@ public static class ResearchFormat
 /// </summary>
 public static class ResearchDataQuality
 {
-    public static IReadOnlyList<string> Evaluate(AdaptiveObserverSnapshot snapshot, FixedStrikeHistory? fixedHistory, bool quoteUnavailable, bool commentaryDegraded)
+    public static IReadOnlyList<string> Evaluate(AdaptiveObserverSnapshot snapshot, FixedStrikeHistory? fixedHistory, bool quoteUnavailable)
     {
         var issues = new List<string>();
         var invalid = snapshot.InvalidSupplementalBarCount;
@@ -87,11 +86,6 @@ public static class ResearchDataQuality
             issues.Add("pinned quote unavailable");
         }
 
-        if (commentaryDegraded)
-        {
-            issues.Add("commentary degraded");
-        }
-
         if (AdaptiveFixedClockV1.IsFixedClock(snapshot.Session.ModelVersion) && snapshot.Session.StrongThreshold is null)
         {
             issues.Add("Strong/Weak uncalibrated");
@@ -108,10 +102,6 @@ public static class ResearchEvents
 {
     public const int LatestCount = 3;
     public const int SincePreviousCap = 6;
-
-    public static ResearchEvent FromCommentary(AdaptiveCommentaryEventRow e) => new(
-        $"c:{e.Id}", e.OccurredAtUtc, "Commentary",
-        $"Commentary {e.Lifecycle.ToString().ToUpperInvariant()} {CommentaryRenderer.Title(e.EventType)} | Bias {e.EventBias.ToString().ToUpperInvariant()} | {e.MarketRegime.ToString().ToUpperInvariant()} | {e.EvidenceAgreement.ToString().ToUpperInvariant()}");
 
     /// <summary>Durable NPT1 open / close events of the ledger (the three paper strategies only).</summary>
     public static IEnumerable<ResearchEvent> FromLedger(PaperLiveView? view)
@@ -196,7 +186,7 @@ public static class ResearchCaption
 }
 
 /// <summary>
-/// Builds the research model of a snapshot. Reads durable sources only (commentary tables, the trading ledger, the screenshot outbox) and is pinned: with <c>pinned</c> every value comes from rows at or
+/// Builds the research model of a snapshot. Reads durable sources only (the trading ledger, the screenshot outbox) and is pinned: with <c>pinned</c> every value comes from rows at or
 /// before the target bar's boundary.
 /// </summary>
 public sealed class AdaptiveResearchService(
@@ -262,13 +252,12 @@ public sealed class AdaptiveResearchService(
         var newest = snapshot.Futures.FirstOrDefault()?.Bar;
         var barSeq = newest?.BarSeq ?? 0;
         var boundary = newest?.EndAvailableAtUtc;
-        var (events, policy, degraded) = boundary is { } b ? await LoadEventsAsync(session, barSeq, b, pinned, ct) : ((IReadOnlyList<ResearchEvent>)[], "no completed bar yet", false);
         var ledger = paper is { Configured: true } ? await SafeLedgerAsync(session.TradeDate, ct) : null;
         var ledgerEvents = ResearchEvents.FromLedger(ledger);
-        var all = events.Concat(ledgerEvents);
+        var all = ledgerEvents;
         var sinceUtc = pinned && boundary is { } bb ? await PreviousCaptureBoundaryAsync(session.Id, barSeq, ct) : null;
-        var (shown, selectionPolicy) = boundary is { } bd ? ResearchEvents.Select(all, bd, sinceUtc) : ((IReadOnlyList<ResearchEvent>)[], policy);
-        var issues = ResearchDataQuality.Evaluate(snapshot, fixedHistory, quoteUnavailable, degraded);
+        var (shown, selectionPolicy) = boundary is { } bd ? ResearchEvents.Select(all, bd, sinceUtc) : ((IReadOnlyList<ResearchEvent>)[], "no completed bar yet");
+        var issues = ResearchDataQuality.Evaluate(snapshot, fixedHistory, quoteUnavailable);
         var build = BuildIdentity.Current();
         return new ResearchModel(
             session.TradeDate, barSeq, boundary, session.ModelVersion, AdaptiveFixedClockV1.Describe(session.ModelVersion),
@@ -313,31 +302,6 @@ public sealed class AdaptiveResearchService(
         catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedTable)
         {
             return null;
-        }
-    }
-
-    async Task<(IReadOnlyList<ResearchEvent> Events, string Policy, bool Degraded)> LoadEventsAsync(AdaptiveSessionStateRow session, int barSeq, DateTimeOffset boundary, bool pinned, CancellationToken ct)
-    {
-        try
-        {
-            await using var db = await dbFactory.CreateDbContextAsync(ct);
-            var version = CommentaryEvaluator.Version;
-            var health = await db.ProjectionHealth.AsNoTracking()
-                .Where(x => x.SessionId == session.Id && x.Component == AdaptiveProjectionComponents.Commentary && x.Version == version).AnyAsync(ct);
-            var runtime = await db.CommentaryRuntime.AsNoTracking().SingleOrDefaultAsync(x => x.SessionId == session.Id && x.CommentaryVersion == version, ct);
-            var verifiedThrough = runtime?.LastEvaluatedBarSeq ?? 0;
-            var query = db.CommentaryEvents.AsNoTracking().Where(x => x.SessionId == session.Id && x.CommentaryVersion == version && x.BarSeq <= barSeq && x.OccurredAtUtc <= boundary);
-            if (health)
-            {
-                query = query.Where(x => x.BarSeq <= verifiedThrough);          // quarantined rows are never shown as current
-            }
-
-            var rows = await query.OrderByDescending(x => x.BarSeq).ThenByDescending(x => x.Id).Take(40).ToListAsync(ct);
-            return (rows.Select(ResearchEvents.FromCommentary).ToList(), "durable commentary events", health);
-        }
-        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedTable)
-        {
-            return ([], "commentary tables unavailable", false);
         }
     }
 }

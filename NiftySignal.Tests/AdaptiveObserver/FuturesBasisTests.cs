@@ -277,10 +277,10 @@ public sealed class FuturesBasisTests
         Assert.Equal(SupplementalOutcome.Skipped, await service.PersistOrVerifyBasisAsync(db, 1, noSpot, default));
     }
 
-    // ---- integrity + commentary wiring ----
+    // ---- integrity ----
 
     [Fact]
-    public async Task BasisMismatch_IsMarkedDurably_AndCommentaryFrameTreatsItAsUnavailable()
+    public async Task BasisMismatch_IsMarkedDurably_AndNeverOverwritten()
     {
         var engine = Engine("SPOT"); var bars = new List<AdaptiveCompletedBarPackage>();
         foreach (var f in FuturesStream(400))
@@ -295,33 +295,6 @@ public sealed class FuturesBasisTests
         var marker = await db.ProjectionHealth.AsNoTracking().SingleAsync();
         Assert.Equal((AdaptiveProjectionComponents.BasisSupplemental, FuturesBasisBar.MetricsVersion, package.FutureBar.BarSeq), (marker.Component, marker.Version, marker.BarSeq));
         Assert.Equal(777, (await db.BasisSupplemental.AsNoTracking().SingleAsync()).DeltaBasis);          // never overwritten
-
-        var session = Session();
-        db.Sessions.Add(session); db.FutureBars.Add(new AdaptiveFutureBarRow
-        {
-            SessionId = 1, BarSeq = package.FutureBar.BarSeq, StartAvailableAtUtc = T0, EndAvailableAtUtc = T0.AddMinutes(1), Volume = 1, TradeUpdates = 1, Open = 1, High = 1, Low = 1, Close = 1, DurationSeconds = 60,
-        });
-        await db.SaveChangesAsync(); db.ChangeTracker.Clear();
-        var frame = await new AdaptiveCommentaryFrameLoader().LoadAsync(db, session, package.FutureBar.BarSeq, default);
-        Assert.Null(frame!.DeltaBasis);                                                                    // known-invalid => unavailable evidence, not 777
-    }
-
-    [Fact]
-    public async Task ValidBasisSidecar_FeedsTheCommentaryBasisFamily_AndStaleOrMissingBasisIsUnavailable()
-    {
-        await using var db = Observer();
-        var session = Session(); db.Sessions.Add(session);
-        for (var seq = 1; seq <= 3; seq++)
-            db.FutureBars.Add(new AdaptiveFutureBarRow { SessionId = 1, BarSeq = seq, StartAvailableAtUtc = T0, EndAvailableAtUtc = T0.AddMinutes(seq), Volume = 1, TradeUpdates = 1, Open = 1, High = 1, Low = 1, Close = 1, DurationSeconds = 60 });
-        db.BasisSupplemental.AddRange(
-            new AdaptiveBasisSupplementalRow { SessionId = 1, BarSeq = 1, MetricsVersion = FuturesBasisBar.MetricsVersion, DeltaBasis = 3.25, BasisStart = 100, BasisEnd = 103.25, Status = FuturesBasisBar.StatusUsable },
-            new AdaptiveBasisSupplementalRow { SessionId = 1, BarSeq = 2, MetricsVersion = FuturesBasisBar.MetricsVersion, DeltaBasis = null, Status = FuturesBasisBar.StatusStaleEnd },
-            new AdaptiveBasisSupplementalRow { SessionId = 1, BarSeq = 3, MetricsVersion = "futures-basis-v1", DeltaBasis = 9, Status = "x" });   // another contract: never read
-        await db.SaveChangesAsync();
-        var loader = new AdaptiveCommentaryFrameLoader();
-        Assert.Equal(3.25, (await loader.LoadAsync(db, session, 1, default))!.DeltaBasis);
-        Assert.Null((await loader.LoadAsync(db, session, 2, default))!.DeltaBasis);       // stale: neither support nor contradiction
-        Assert.Null((await loader.LoadAsync(db, session, 3, default))!.DeltaBasis);       // other version / missing row
     }
 
     [Fact]

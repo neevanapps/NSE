@@ -22,13 +22,6 @@ public class ResearchDashboardTests
     // Toasts
     // =====================================================================================
 
-    static AdaptiveCommentaryEventRow Commentary(string identity, CommentaryLifecycle lifecycle = CommentaryLifecycle.Flipped, EventBias bias = EventBias.Short, int minutes = 10) => new()
-    {
-        Id = minutes, SessionId = 1, TradeDate = Day, BarSeq = minutes, OccurredAtUtc = T0.AddMinutes(minutes), EventType = CommentaryEventType.SellerExpansion, EventBias = bias,
-        MarketRegime = MarketRegime.Bearish, Lifecycle = lifecycle, EvidenceAgreement = EvidenceAgreement.High, Severity = CommentarySeverity.High, PrimaryEvidenceJson = "[]",
-        ConfirmationEvidenceJson = "[]", ContradictionEvidenceJson = "[]", DataQualityJson = "[]", RenderedCommentary = "x", CommentaryVersion = CommentaryEvaluator.Version, EventIdentity = identity,
-    };
-
     static PaperClosedTrade Closed(string id, string net, string strategy = "NPT1-MDX3") =>
         new(strategy, "MAIN", id, "Long", "PE", "SYM", T0.AddMinutes(20), T0.AddMinutes(30), "OppositeSignal", "118.30", "131.20", 650, "8385.00", "0.00", net, "20.00", "-3.00", null, null, "Complete", 3, 5, "25200", "TKN");
 
@@ -39,29 +32,32 @@ public class ResearchDashboardTests
         new PaperLiveRunStatus("run", date, false, "owner", 1, 1, 1, 10, T0, T0, null, null, 350000m, Array.Empty<string>()), open, closed, [], [],
         new PaperRiskPanel(350000m, 0m, 0m, 0, 0m, "Healthy", [], []));
 
+    static IReadOnlyList<ToastCandidate> ClosedToasts(int from, int to) =>
+        ToastFactory.FromLedger(View(Day, [], Enumerable.Range(from, to - from + 1).Select(i => Closed($"p{i}", "10.00")).ToList()), Day).ToList();
+
     [Fact]
     public void Toasts_TheFirstObservationOnlyEstablishesABaseline_NoHistoricalStorm()
     {
         var tracker = new ToastTracker();
-        var history = Enumerable.Range(1, 30).Select(i => ToastFactory.FromCommentary(Commentary($"id{i}", minutes: i))).ToList();
-        Assert.Empty(tracker.Observe("commentary", history));                       // opening the page / a browser refresh replays nothing
-        Assert.Empty(tracker.Observe("commentary", history));
-        Assert.Equal(30, tracker.SeenCount);
+        var history = ClosedToasts(1, 30);
+        Assert.Empty(tracker.Observe("trades", history));                           // opening the page / a browser refresh / a reconnect replays nothing
+        Assert.Empty(tracker.Observe("trades", history));
+        Assert.Equal(60, tracker.SeenCount);                                        // a closed trade is two durable identities: its open and its close
 
-        var fresh = tracker.Observe("commentary", history.Append(ToastFactory.FromCommentary(Commentary("id31", minutes: 31))));
-        Assert.Equal("commentary:id31", Assert.Single(fresh).Id);                       // a NEW event after the baseline: exactly one toast
-        Assert.Empty(tracker.Observe("commentary", history.Append(ToastFactory.FromCommentary(Commentary("id31", minutes: 31)))));   // the same durable identity never toasts twice
+        var fresh = tracker.Observe("trades", ClosedToasts(1, 31));
+        Assert.Equal(["open:p31", "close:p31"], fresh.Select(c => c.Id));           // a NEW trade after the baseline: exactly its two toasts
+        Assert.Empty(tracker.Observe("trades", ClosedToasts(1, 31)));              // the same durable identity never toasts twice
     }
 
     [Fact]
     public void Toasts_EachSourceHasItsOwnBaseline_AndAnUnrelatedRefreshAddsNothing()
     {
         var tracker = new ToastTracker();
-        Assert.Empty(tracker.Observe("commentary", []));
+        Assert.Empty(tracker.Observe("other", []));
         var ledger = ToastFactory.FromLedger(View(Day, [Open("p1")], [Closed("p2", "5000.00")]), Day).ToList();
-        Assert.Empty(tracker.Observe("trades", ledger));                            // trades baseline is separate from the commentary baseline
+        Assert.Empty(tracker.Observe("trades", ledger));                            // the trades baseline is separate from every other source's baseline
         Assert.Empty(tracker.Observe("trades", ledger));                            // an unrelated ledger refresh: nothing new
-        Assert.Empty(tracker.Observe("commentary", []));
+        Assert.Empty(tracker.Observe("other", []));
 
         var opened = tracker.Observe("trades", ToastFactory.FromLedger(View(Day, [Open("p1"), Open("p3")], [Closed("p2", "5000.00")]), Day));
         Assert.Equal("open:p3", Assert.Single(opened).Id);
@@ -83,21 +79,15 @@ public class ResearchDashboardTests
     public void Toasts_TheTrackerIsBounded()
     {
         var tracker = new ToastTracker(capacity: 20);
-        tracker.Observe("commentary", []);
-        for (var i = 0; i < 100; i++) tracker.Observe("commentary", [ToastFactory.FromCommentary(Commentary($"e{i}", minutes: i % 59 + 1))]);
+        tracker.Observe("trades", []);
+        for (var i = 0; i < 100; i++) tracker.Observe("trades", [ToastFactory.FromClosed(Closed($"e{i}", "1.00"))]);
         Assert.Equal(20, tracker.SeenCount);
     }
 
     [Fact]
     public void Toasts_ContentUsesThePersistedTerminology_AndTheDurableLedger()
     {
-        var c = ToastFactory.FromCommentary(Commentary("x", CommentaryLifecycle.Flipped, EventBias.Short));
-        Assert.Equal("COMMENTARY", c.Title);
-        Assert.Contains("FLIPPED → SHORT", c.Lines);
-        Assert.Contains("Regime BEARISH", c.Lines);
-        Assert.Contains("Agreement HIGH", c.Lines);
-        Assert.Contains("09:25:00", c.Lines);                                        // IST time of the persisted event
-        Assert.DoesNotContain(c.Lines, l => l.Contains('%') || l.Contains("probab", StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(Enum.GetNames<ToastKind>(), n => n.Contains("Commentary", StringComparison.OrdinalIgnoreCase));      // commentary toasts no longer exist
 
         var open = ToastFactory.FromOpen(Open("p1"));
         Assert.Equal("TRADE OPENED", open.Title);
@@ -116,7 +106,7 @@ public class ResearchDashboardTests
         var injected = typeof(ToastHost).GetProperties(BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Public)
             .Where(p => p.GetCustomAttribute<InjectAttribute>() is not null).Select(p => p.PropertyType).ToHashSet();
         Assert.Equal(
-            new HashSet<Type> { typeof(AdaptiveObserverDataService), typeof(AdaptiveCommentaryDataService), typeof(PaperLiveDataService), typeof(Npt1LiveQuotes) }, injected);   // read-only sources only
+            new HashSet<Type> { typeof(PaperLiveDataService), typeof(Npt1LiveQuotes) }, injected);   // read-only sources only
         var written = typeof(ToastHost).Assembly.GetType("NiftySignal.Dashboard.Components.Dashboard.ToastHost")!;
         Assert.DoesNotContain(written.GetMethods(BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Public | BindingFlags.DeclaredOnly), m => m.Name.Contains("Send", StringComparison.OrdinalIgnoreCase) || m.Name.Contains("Order", StringComparison.OrdinalIgnoreCase));
     }
@@ -282,21 +272,21 @@ public class ResearchDashboardTests
     [Fact]
     public void DataQuality_IsOkOnlyWhenNothingKnownIsMissing_AndNamesEachFact()
     {
-        var ok = ResearchDataQuality.Evaluate(Snapshot(SessionRow()), null, false, false);
+        var ok = ResearchDataQuality.Evaluate(Snapshot(SessionRow()), null, false);
         Assert.Empty(ok);
         Assert.Equal("Data: OK", ResearchDataQuality.Text(ok));
 
-        var invalid = ResearchDataQuality.Evaluate(Snapshot(SessionRow(), invalidFutures: new HashSet<int> { 3 }), null, false, false);
+        var invalid = ResearchDataQuality.Evaluate(Snapshot(SessionRow(), invalidFutures: new HashSet<int> { 3 }), null, false);
         Assert.Equal(["1 projection(s) failed verification"], invalid);
         Assert.NotEqual("Data: OK", ResearchDataQuality.Text(invalid));              // never "OK" with a known-invalid projection in range
 
         var basis = new Dictionary<int, AdaptiveBasisSupplementalRow> { [4] = new() { SessionId = 1, BarSeq = 4, MetricsVersion = "v", Status = "StaleEnd" }, [5] = new() { SessionId = 1, BarSeq = 5, MetricsVersion = "v", Status = FuturesBasisBar.StatusUsable } };
-        Assert.Equal(["Basis stale/unavailable in 1 bar(s)"], ResearchDataQuality.Evaluate(Snapshot(SessionRow(), basis: basis), null, false, false));
+        Assert.Equal(["Basis stale/unavailable in 1 bar(s)"], ResearchDataQuality.Evaluate(Snapshot(SessionRow(), basis: basis), null, false));
 
-        var all = ResearchDataQuality.Evaluate(Snapshot(SessionRow(strong: null)), null, quoteUnavailable: true, commentaryDegraded: true);
-        Assert.Equal(["pinned quote unavailable", "commentary degraded", "Strong/Weak uncalibrated"], all);
-        Assert.Equal("Data: pinned quote unavailable | commentary degraded | Strong/Weak uncalibrated", ResearchDataQuality.Text(all));
-        Assert.Empty(ResearchDataQuality.Evaluate(Snapshot(SessionRow("adaptive-v1", strong: null)), null, false, false));     // uncalibrated is a fixed-clock fact only
+        var all = ResearchDataQuality.Evaluate(Snapshot(SessionRow(strong: null)), null, quoteUnavailable: true);
+        Assert.Equal(["pinned quote unavailable", "Strong/Weak uncalibrated"], all);
+        Assert.Equal("Data: pinned quote unavailable | Strong/Weak uncalibrated", ResearchDataQuality.Text(all));
+        Assert.Empty(ResearchDataQuality.Evaluate(Snapshot(SessionRow("adaptive-v1", strong: null)), null, false));     // uncalibrated is a fixed-clock fact only
     }
 
     [Fact]
@@ -304,7 +294,7 @@ public class ResearchDashboardTests
     {
         var (catalog, contract) = Catalog();
         var history = FixedStrikeProjection.Assemble(catalog, contract, Bars(1, 2), [Row(1, OptionType.Call, 1, 2), Row(1, OptionType.Put, 1, 2), Row(2, OptionType.Call, 1, 2)]);
-        Assert.Equal(["1 unavailable fixed-strike option row(s)"], ResearchDataQuality.Evaluate(Snapshot(SessionRow()), history, false, false));
+        Assert.Equal(["1 unavailable fixed-strike option row(s)"], ResearchDataQuality.Evaluate(Snapshot(SessionRow()), history, false));
     }
 
     [Fact]
@@ -312,8 +302,8 @@ public class ResearchDashboardTests
     {
         var all = new[]
         {
-            new ResearchEvent("a", T0.AddMinutes(5), "Commentary", "A"), new ResearchEvent("b", T0.AddMinutes(10), "Trade", "B"), new ResearchEvent("c", T0.AddMinutes(20), "Trade", "C"),
-            new ResearchEvent("d", T0.AddMinutes(30), "Commentary", "D"), new ResearchEvent("e", T0.AddMinutes(31), "Commentary", "E-future"),
+            new ResearchEvent("a", T0.AddMinutes(5), "Trade", "A"), new ResearchEvent("b", T0.AddMinutes(10), "Trade", "B"), new ResearchEvent("c", T0.AddMinutes(20), "Trade", "C"),
+            new ResearchEvent("d", T0.AddMinutes(30), "Trade", "D"), new ResearchEvent("e", T0.AddMinutes(31), "Trade", "E-future"),
         };
         var boundary = T0.AddMinutes(30);
         var (latest, latestPolicy) = ResearchEvents.Select(all, boundary, null);
@@ -400,7 +390,7 @@ public class ResearchDashboardTests
     {
         Id = 0, SessionId = session, TradeDate = Day, BarSeq = 1, OccurredAtUtc = at, EventType = CommentaryEventType.BuyerExpansion, EventBias = EventBias.Long, MarketRegime = MarketRegime.Bullish, Lifecycle = lifecycle,
         EvidenceAgreement = EvidenceAgreement.High, Severity = CommentarySeverity.Info, PrimaryEvidenceJson = "[]", ConfirmationEvidenceJson = "[]", ContradictionEvidenceJson = "[]", DataQualityJson = "[]",
-        RenderedCommentary = "x", CommentaryVersion = CommentaryEvaluator.Version, EventIdentity = $"{CommentaryEvaluator.Version}:{session}:{id}",
+        RenderedCommentary = "x", CommentaryVersion = "commentary-v1", EventIdentity = $"commentary-v1:{session}:{id}",
     };
 
     [Fact]
@@ -441,7 +431,7 @@ public class ResearchDashboardTests
     {
         await using var db = Observer();
         var s = await Seed(db, AdaptiveFixedClockV1.ModelVersion, completed: 11, createdAt: T0.AddSeconds(103));
-        // commentary: a Confirmed and a Flipped event inside bar 8 (same boundary), a mere Strengthening (ignored), and one inside scheduled bar 6
+        // HISTORICAL commentary rows (the feature was removed, its tables are kept): none of them may schedule a capture any more
         db.CommentaryEvents.AddRange(
             CommentaryAt(s.Id, 1, T0.AddMinutes(7).AddSeconds(10), CommentaryLifecycle.Confirmed),
             CommentaryAt(s.Id, 2, T0.AddMinutes(7).AddSeconds(40), CommentaryLifecycle.Flipped),
@@ -453,10 +443,11 @@ public class ResearchDashboardTests
         await AdaptiveScreenshotSchedule.EnqueueAsync(db, Day, T0.AddHours(1), default, (_, _) => Task.FromResult(ledger));
         var jobs = await db.ScreenshotJobs.OrderBy(j => j.TargetBarSeq).ToListAsync();
         Assert.Equal(
-            new[] { (1, AdaptiveScreenshotKind.Initialization), (6, AdaptiveScreenshotKind.FiveBars), (8, AdaptiveScreenshotKind.EventTriggered), (9, AdaptiveScreenshotKind.EventTriggered),
+            new[] { (1, AdaptiveScreenshotKind.Initialization), (6, AdaptiveScreenshotKind.FiveBars), (9, AdaptiveScreenshotKind.EventTriggered),
                 (10, AdaptiveScreenshotKind.EventTriggered), (11, AdaptiveScreenshotKind.FiveBars) },
             jobs.Select(j => (j.TargetBarSeq, j.Kind)).ToArray());
-        Assert.Single(jobs, j => j.TargetBarSeq == 8);                                                        // two commentary events on one boundary: ONE screenshot
+        Assert.DoesNotContain(jobs, j => j.TargetBarSeq == 8);                                                // the Confirmed / Flipped commentary rows of bar 8 trigger nothing
+        Assert.Equal(4, await db.CommentaryEvents.CountAsync());                                              // history preserved, not deleted
         Assert.Single(jobs, j => j.TargetBarSeq == 6);                                                        // the event inside a scheduled bar adds no second capture
         Assert.DoesNotContain(jobs, j => j.Kind == AdaptiveScreenshotKind.EventTriggered && j.TargetBarSeq == 6);
 

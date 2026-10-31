@@ -1,12 +1,10 @@
 using System.Globalization;
-using NiftySignal.AdaptiveObserver.Commentary;
-using NiftySignal.AdaptiveObserverData;
 
 namespace NiftySignal.Dashboard.Services;
 
-public enum ToastKind { Commentary, TradeOpened, TradeClosed }
+public enum ToastKind { TradeOpened, TradeClosed }
 
-/// <summary>A candidate toast built from a durable row (commentary event identity, paper position id). Never contains anything that could be written back anywhere.</summary>
+/// <summary>A candidate toast built from a durable row (paper position id). Never contains anything that could be written back anywhere.</summary>
 public sealed record ToastCandidate(string Id, ToastKind Kind, DateTimeOffset AtUtc, string Title, IReadOnlyList<string> Lines, string Tone);
 
 /// <summary>
@@ -56,13 +54,6 @@ public static class ToastFactory
     static readonly TimeSpan Ist = TimeSpan.FromHours(5.5);
 
     static string Time(DateTimeOffset at) => at.ToOffset(Ist).ToString("HH:mm:ss", CultureInfo.InvariantCulture);
-
-    /// <summary>Uses the persisted event terminology only (lifecycle, bias, regime, evidence agreement); no probability is invented.</summary>
-    public static ToastCandidate FromCommentary(AdaptiveCommentaryEventRow e) => new(
-        $"commentary:{e.EventIdentity}", ToastKind.Commentary, e.OccurredAtUtc, "COMMENTARY",
-        [Time(e.OccurredAtUtc), $"{e.Lifecycle.ToString().ToUpperInvariant()} → {e.EventBias.ToString().ToUpperInvariant()}", CommentaryRenderer.Title(e.EventType),
-            $"Regime {e.MarketRegime.ToString().ToUpperInvariant()}", $"Agreement {e.EvidenceAgreement.ToString().ToUpperInvariant()}"],
-        "neutral");
 
     public static ToastCandidate FromOpen(PaperOpenPosition p) => new(
         $"open:{p.PositionId}", ToastKind.TradeOpened, p.EntryAt, "TRADE OPENED",

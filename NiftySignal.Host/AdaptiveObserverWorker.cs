@@ -19,9 +19,7 @@ public sealed class AdaptiveObserverWorker(
     AdaptiveWeak2ObservationService observations,
     AdaptiveEndedSessionRecoveryService endedSessionRecovery,
     AdaptiveSupplementalPersistence supplemental,
-    AdaptiveCommentaryService commentary,
     DashboardPushClient dashboardPush,
-    AdaptiveCommentaryNotificationGate notificationGate,
     ILogger<AdaptiveObserverWorker> logger,
     PaperLive.PaperLiveBridge? paperLive = null) : BackgroundService
 {
@@ -60,12 +58,16 @@ public sealed class AdaptiveObserverWorker(
         public DateTimeOffset? LastRuntimeFlushUtc { get; set; }
         /// <summary>Fixed-clock sessions store their 09:30 residual anchor once, when the engine freezes it (see AdaptiveObserverPersistence.PersistResidualAnchorOnceAsync).</summary>
         public bool AnchorStored { get; set; } = !AdaptiveFixedClockV1.IsFixedClock(context.Session.ModelVersion) || context.ResidualAnchor is not null || recovered.Engine.SelfAnchorAttempted;
-        /// <summary>Completed bars whose sidecar integrity is unknown (a write/verify failed). Commentary never evaluates at or past the first of them.</summary>
+        /// <summary>Completed bars whose sidecar integrity is unknown (a write/verify failed). The paper path never receives a verified bar at or past the first of them (see <see cref="PaperVerifiedCapBeforeBar"/>).</summary>
         public SortedDictionary<int, AdaptiveCompletedBarPackage> UnverifiedSidecars { get; } = new();
-        /// <summary>Bars found unverified during recovery (no package retained to retry); commentary stays capped before them until the next recovery.</summary>
+        /// <summary>Bars found unverified during recovery (no package retained to retry); the paper path stays capped before them until the next recovery.</summary>
         public SortedSet<int> RecoveryUnverifiedBars { get; } = new(recovered.UnverifiedSidecarBars);
 
-        public int? CommentaryCapBeforeBar
+        /// <summary>
+        /// The fail-closed gate of the paper path, UNCHANGED by the removal of commentary (it was always derived only from the two sidecar-integrity sets above, never from commentary state): the first bar whose
+        /// sidecar integrity is unknown, live or found in recovery. A bar at or after it is handed to the paper engine as unverified.
+        /// </summary>
+        public int? PaperVerifiedCapBeforeBar
         {
             get
             {
@@ -217,13 +219,11 @@ public sealed class AdaptiveObserverWorker(
         }
 
         var recovered = await recovery.RecoverAsync(source, observer, context, through, ct);
-        // Catch the commentary checkpoint up to every persisted completed bar (restart or mid-session deployment); idempotent by event identity.
-        // Always a non-notifying backfill, and never past a bar whose sidecar integrity could not be established.
-        await notificationGate.SyncAsync(observer, ct);
-        await commentary.ProcessAllCompletedAsync(observer, context.Session,
-            recovered.UnverifiedSidecarBars.Count > 0 ? recovered.UnverifiedSidecarBars.Min() : null, ct);
         return new LiveState(context, recovered);
     }
+
+    /// <summary>The paper hand-off condition: the bar's own sidecars are verified AND it lies before the first bar of unknown integrity (fail closed until the next recovery).</summary>
+    internal static bool IsBarVerifiedForPaper(int barSeq, bool ownSidecarUnverified, int? cap) => !ownSidecarUnverified && !(cap is { } c && barSeq >= c);
 
     /// <summary>Runtime-row cadence decision (see <see cref="RuntimePersistInterval"/>): forced, a completed bar, the first poll, or the interval elapsed.</summary>
     internal static bool ShouldFlushRuntime(bool force, int completedBars, DateTimeOffset? lastFlushUtc, DateTimeOffset nowUtc) =>
@@ -299,7 +299,7 @@ public sealed class AdaptiveObserverWorker(
                     saved = await persistence.PersistOrVerifyAsync(observer, live.Context.Session, package, nowUtc, ct);
                 // Supplemental sidecar rows are inserted/verified before the Dashboard is told, so a push never races ahead of them.
                 // The call never throws into the core observer (sidecar problems are logged and counted). A sidecar whose integrity could not be
-                // established (write/verify failed) is never read by commentary: commentary stops before it and the sidecar is retried each bar.
+                // established (write/verify failed) is never handed to the paper path as verified (see PaperVerifiedCapBeforeBar) and the sidecar is retried each bar.
                 using (AdaptiveLiveTelemetry.Source.StartActivity("bar.sidecars"))
                 {
                     if (!await supplemental.PersistAndVerifyAsync(observer, live.Context.Session, package, ct))
@@ -307,12 +307,6 @@ public sealed class AdaptiveObserverWorker(
                     foreach (var earlier in live.UnverifiedSidecars.Where(x => x.Key != package.FutureBar.BarSeq).ToArray())
                         if (await supplemental.PersistAndVerifyAsync(observer, live.Context.Session, earlier.Value, ct))
                             live.UnverifiedSidecars.Remove(earlier.Key);
-                }
-                // Commentary reads the PERSISTED core + sidecar rows of this bar (identical inputs to a later replay) and never throws into the core observer.
-                using (AdaptiveLiveTelemetry.Source.StartActivity("bar.commentary"))
-                {
-                    var mode = await notificationGate.SyncAsync(observer, ct);
-                    await commentary.ProcessThroughAsync(observer, live.Context.Session, package.FutureBar.BarSeq, mode, ct, live.CommentaryCapBeforeBar);
                 }
                 if (saved.Inserted)
                 {
@@ -331,8 +325,8 @@ public sealed class AdaptiveObserverWorker(
                 }
                 using (AdaptiveLiveTelemetry.Source.StartActivity("bar.observations"))
                     await observations.ProcessPackageAsync(source, observer, live.Context, package, ct);
-                // A bar is handed to the paper path only when its persisted projection and sidecars are verified (the same integrity gate commentary uses).
-                groupBars.Add((package, !live.UnverifiedSidecars.ContainsKey(package.FutureBar.BarSeq) && !(live.CommentaryCapBeforeBar is { } cap && package.FutureBar.BarSeq >= cap)));
+                // A bar is handed to the paper path only when its persisted projection and sidecars are verified.
+                groupBars.Add((package, IsBarVerifiedForPaper(package.FutureBar.BarSeq, live.UnverifiedSidecars.ContainsKey(package.FutureBar.BarSeq), live.PaperVerifiedCapBeforeBar)));
             }
 
             paperLive?.OnGroup(groupTime, group, groupBars, live);

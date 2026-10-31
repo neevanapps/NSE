@@ -24,7 +24,7 @@ public sealed record ResidualDerivedPoint(
 
 /// <summary>
 /// Shared pure projection of the new residual metrics (08-Oct plan section 32.4). No database and no wall clock: it is used by the Dashboard,
-/// by the commentary frame builder and by tests/replay, so all of them see the same numbers.
+/// and by tests/replay, so all of them see the same numbers.
 ///
 /// Delta semantics are ADJACENT-BAR: a delta exists only when the immediately preceding completed bar (BarSeq - 1) had an available residual for the
 /// same variant. A reading is never compared with an earlier valid reading across an unavailable bar. This deliberately differs from the legacy

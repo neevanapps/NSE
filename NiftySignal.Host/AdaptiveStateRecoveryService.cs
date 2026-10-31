@@ -135,7 +135,7 @@ public sealed class AdaptiveStateRecoveryService(
                 using (AdaptiveLiveTelemetry.Source.StartActivity("recovery.core"))
                     result = await persistence.PersistOrVerifyAsync(observer, context.Session, package, DateTimeOffset.UtcNow, ct);
                 // Replay recomputes the supplemental metrics: verify rows that exist, insert the ones that do not (mid-session backfill).
-                // A bar whose sidecar integrity cannot be established is remembered so commentary never evaluates at or past it.
+                // A bar whose sidecar integrity cannot be established is remembered so the paper path never receives it (or any later bar) as verified.
                 if (supplemental is not null)
                 {
                     using (AdaptiveLiveTelemetry.Source.StartActivity("recovery.sidecars"))

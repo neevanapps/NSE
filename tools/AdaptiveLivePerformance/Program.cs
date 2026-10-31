@@ -3,7 +3,7 @@
 // Drives the REAL production live path (AdaptiveObserverWorker.PollLiveAsync / TryStartOrRecoverAsync / CloseCurrentSessionAsync and
 // AdaptiveStateRecoveryService) against an ISOLATED writable PostgreSQL cluster. The historical source database is only ever READ (the
 // connection is opened with default_transaction_read_only=on and the isolated cluster must be a different host:port). Nothing is sent to
-// Telegram (commentary notifications are disabled in this harness), the Dashboard push client is never connected, and nothing is deployed.
+// Telegram (no Telegram path exists in this harness), the Dashboard push client is never connected, and nothing is deployed.
 //
 // Environment (connection strings are never printed):
 //   ADAPTIVE_PERF_SOURCE       read-only historical source (the NiftySignal tick database copy)
@@ -203,9 +203,6 @@ var sourceCounter = new SqlCounter();
 var observerCounter = new SqlCounter();
 var recorder = new StageRecorder(observerCounter);
 
-#if !BASELINE
-var gateOptions = new AdaptiveCommentaryTelegramOptions { Enabled = false };    // no Telegram, ever, from this harness
-#endif
 Func<string, DbContextOptions<AdaptiveObserverDbContext>> observerOptions = db => new DbContextOptionsBuilder<AdaptiveObserverDbContext>()
     .UseNpgsql(DbCs(db)).AddInterceptors(new CountingInterceptor(observerCounter)).Options;
 
@@ -265,14 +262,9 @@ AdaptiveObserverWorker NewWorker(string observerDb)
     s.AddDbContext<AdaptiveObserverDbContext>(o => o.UseNpgsql(DbCs(observerDb)).AddInterceptors(new CountingInterceptor(observerCounter)));
     s.AddOptions<PricingOptions>();
     s.Configure<DashboardPushOptions>(o => o.HubUrl = "http://127.0.0.1:1/hubs/never-connected");
-#if !BASELINE
-    s.AddSingleton<IOptionsMonitor<AdaptiveCommentaryTelegramOptions>>(new StaticMonitor<AdaptiveCommentaryTelegramOptions>(gateOptions));
-    s.AddSingleton<IOptionsMonitor<TelegramOptions>>(new StaticMonitor<TelegramOptions>(new TelegramOptions { BotToken = "", ChatId = "" }));
-    s.AddSingleton<AdaptiveCommentaryNotificationGate>();
-#endif
     s.AddSingleton<AdaptiveSourceTickReader>(); s.AddSingleton<AdaptiveHistoricalBootstrapService>(); s.AddSingleton<AdaptiveSessionCoordinator>();
-    s.AddSingleton<AdaptiveObserverPersistence>(); s.AddSingleton<AdaptiveSupplementalPersistence>(); s.AddSingleton<AdaptiveCommentaryFrameLoader>();
-    s.AddSingleton<AdaptiveCommentaryService>(); s.AddSingleton<AdaptiveWeak2ObservationService>();
+    s.AddSingleton<AdaptiveObserverPersistence>(); s.AddSingleton<AdaptiveSupplementalPersistence>();
+    s.AddSingleton<AdaptiveWeak2ObservationService>();
     s.AddSingleton<AdaptiveStateRecoveryService>(); s.AddSingleton<AdaptiveEndedSessionRecoveryService>(); s.AddSingleton<DashboardPushClient>();
     if (Env("ADAPTIVE_PERF_BASIS", "1") != "0") s.AddSingleton<AdaptiveSessionSupplementalService>();
     s.AddSingleton<AdaptiveObserverWorker>();
@@ -332,8 +324,6 @@ async Task<Dictionary<string, object>> DigestAsync(string observerDb)
     var resid = await db.OptionResidualBars.AsNoTracking().OrderBy(x => x.BarSeq).ThenBy(x => x.Variant).ToListAsync(); d["residuals"] = new { n = resid.Count, hash = Hash(resid, "SessionId") };
     var fs = await db.FuturesSupplemental.AsNoTracking().OrderBy(x => x.BarSeq).ToListAsync(); d["futuresSupplemental"] = new { n = fs.Count, hash = Hash(fs, "SessionId") };
     var os = await db.OptionsSupplemental.AsNoTracking().OrderBy(x => x.BarSeq).ToListAsync(); d["optionsSupplemental"] = new { n = os.Count, hash = Hash(os, "SessionId") };
-    var ev = await db.CommentaryEvents.AsNoTracking().OrderBy(x => x.BarSeq).ThenBy(x => x.EventIdentity).ToListAsync();
-    d["commentaryEvents"] = new { n = ev.Count, hash = Hash(ev, "SessionId", "PreviousEventId", "CreatedAtUtc") };
     var wk = await db.Weak2Observations.AsNoTracking().OrderBy(x => x.TriggerBarSeq).ToListAsync(); d["weak2Observations"] = new { n = wk.Count, hash = Hash(wk, "SessionId") };
     d["projectionHealthRows"] = await db.ProjectionHealth.CountAsync();
     return d;
@@ -473,23 +463,6 @@ async Task<SimResult> SimulateAsync(DayData d, Staged staged, string observerDb,
         ["retainedOptionBookStates"] = OptionBookStates(live).States,
     };
 
-    // commentary stage by outcome: no event / ordinary lifecycle event / Telegram-eligible event (jobs are suppressed in this harness, so an eligible
-    // event costs a few extra commands in production for the outbox row)
-    {
-        await using var cdb = new AdaptiveObserverDbContext(observerOptions(observerDb));
-        var events = await cdb.CommentaryEvents.AsNoTracking().Select(x => new { x.BarSeq, x.ShouldNotifyTelegram }).ToListAsync();
-        var byBar = events.GroupBy(x => x.BarSeq).ToDictionary(g => g.Key, g => g.Any(x => x.ShouldNotifyTelegram));
-        var classes = new Dictionary<string, List<(double Ms, double Sql)>> { ["noMaterialEvent"] = new(), ["lifecycleEvent"] = new(), ["telegramEligibleEvent"] = new() };
-        foreach (var (bar, stages2) in recorder.PerBar)
-        {
-            if (!stages2.TryGetValue("bar.commentary", out var c)) continue;
-            var key = byBar.TryGetValue(bar, out var eligible) ? (eligible ? "telegramEligibleEvent" : "lifecycleEvent") : "noMaterialEvent";
-            classes[key].Add(c);
-        }
-
-        summary["commentaryByOutcome"] = classes.ToDictionary(k => k.Key, k => (object)new { bars = k.Value.Count, ms = Stats.Summary(k.Value.Select(x => x.Ms)), sql = Stats.Summary(k.Value.Select(x => x.Sql)) });
-    }
-
     // per-completed-bar pipeline distribution
     var barTotals = recorder.PerBar.Select(kv => kv.Value.TryGetValue("bar", out var b) ? b.Ms : double.NaN).Where(x => !double.IsNaN(x)).ToList();
     summary["completedBarPipelineMs"] = Stats.Summary(barTotals);
@@ -498,7 +471,7 @@ async Task<SimResult> SimulateAsync(DayData d, Staged staged, string observerDb,
 
 // ---------------------------------------------------------------- mid-session ABRUPT restart-continuation validation
 // RUN A: one uninterrupted production live path. RUN B: the same session, but at a chosen point the whole process state is destroyed WITHOUT any
-// graceful close (worker, engine, normalizer, pending buffer, trackers, commentary service, notification gate, DbContexts, DI container, pooled
+// graceful close (worker, engine, normalizer, pending buffer, trackers, DbContexts, DI container, pooled
 // connections), a completely new service provider / worker is built, and TryStartOrRecoverAsync reconstructs everything from the persisted source
 // ticks and the adaptive database only; live polling then continues to the same horizon. Final persisted state must be identical.
 (AdaptiveObserverWorker Worker, ServiceProvider Provider) NewWorkerWithProvider(string observerDb)
@@ -509,14 +482,9 @@ async Task<SimResult> SimulateAsync(DayData d, Staged staged, string observerDb,
     s.AddDbContext<AdaptiveObserverDbContext>(o => o.UseNpgsql(DbCs(observerDb)).AddInterceptors(new CountingInterceptor(observerCounter)));
     s.AddOptions<PricingOptions>();
     s.Configure<DashboardPushOptions>(o => o.HubUrl = "http://127.0.0.1:1/hubs/never-connected");
-#if !BASELINE
-    s.AddSingleton<IOptionsMonitor<AdaptiveCommentaryTelegramOptions>>(new StaticMonitor<AdaptiveCommentaryTelegramOptions>(new AdaptiveCommentaryTelegramOptions { Enabled = false }));
-    s.AddSingleton<IOptionsMonitor<TelegramOptions>>(new StaticMonitor<TelegramOptions>(new TelegramOptions { BotToken = "", ChatId = "" }));
-    s.AddSingleton<AdaptiveCommentaryNotificationGate>();
-#endif
     s.AddSingleton<AdaptiveSourceTickReader>(); s.AddSingleton<AdaptiveHistoricalBootstrapService>(); s.AddSingleton<AdaptiveSessionCoordinator>();
-    s.AddSingleton<AdaptiveObserverPersistence>(); s.AddSingleton<AdaptiveSupplementalPersistence>(); s.AddSingleton<AdaptiveCommentaryFrameLoader>();
-    s.AddSingleton<AdaptiveCommentaryService>(); s.AddSingleton<AdaptiveWeak2ObservationService>();
+    s.AddSingleton<AdaptiveObserverPersistence>(); s.AddSingleton<AdaptiveSupplementalPersistence>();
+    s.AddSingleton<AdaptiveWeak2ObservationService>();
     s.AddSingleton<AdaptiveStateRecoveryService>(); s.AddSingleton<AdaptiveEndedSessionRecoveryService>(); s.AddSingleton<DashboardPushClient>();
     if (Env("ADAPTIVE_PERF_BASIS", "1") != "0") s.AddSingleton<AdaptiveSessionSupplementalService>();
     s.AddSingleton<AdaptiveObserverWorker>();
@@ -569,14 +537,11 @@ async Task<Dictionary<string, List<string>>> DumpAsync(string observerDb, long s
         ["SessionSupplemental(frozen spot identity)"] = Rows(await db.SessionSupplemental.AsNoTracking().Where(x => x.SessionId == sessionId).ToListAsync()),
         ["BasisSupplemental"] = Rows(await db.BasisSupplemental.AsNoTracking().Where(x => x.SessionId == sessionId).OrderBy(x => x.BarSeq).ThenBy(x => x.MetricsVersion).ToListAsync()),
         ["ProjectionHealth"] = Rows(await db.ProjectionHealth.AsNoTracking().Where(x => x.SessionId == sessionId).OrderBy(x => x.BarSeq).ToListAsync()),
-        ["CommentaryEvents"] = Rows(await db.CommentaryEvents.AsNoTracking().Where(x => x.SessionId == sessionId).OrderBy(x => x.BarSeq).ThenBy(x => x.EventIdentity).ToListAsync()),
-        ["CommentaryRuntime"] = Rows(await db.CommentaryRuntime.AsNoTracking().Where(x => x.SessionId == sessionId).ToListAsync()),
-        ["CommentaryNotificationJobs"] = Rows(await db.CommentaryNotificationJobs.AsNoTracking().ToListAsync()),
         ["Runtime(deterministic fields)"] = Rows(await db.Runtime.AsNoTracking().Where(x => x.SessionId == sessionId).ToListAsync(),
             "LastCompletedBarSeq", "CurrentPartialBarVolume", "CurrentPartialBarStartedAtUtc", "LastProcessedSourceAvailableAtUtc", "LastProcessedSourceTickId", "RuntimeStatus"),
     };
 
-    // Derived-only metrics evaluated from the persisted rows exactly as the Dashboard / commentary frame do.
+    // Derived-only metrics evaluated from the persisted rows exactly as the Dashboard does.
     var bars = await db.FutureBars.AsNoTracking().Where(x => x.SessionId == sessionId).OrderBy(x => x.BarSeq).ToListAsync();
     d["Derived: Urgency"] = bars.Select(b => $"{b.BarSeq}:{AdaptiveMetricMath.Urgency(b.Volume, b.DurationSeconds)?.ToString("R") ?? "null"}").ToList();
     var anchors = await db.ResidualAnchorComponents.AsNoTracking().Where(x => x.SessionId == sessionId).ToListAsync();
@@ -657,7 +622,6 @@ async Task<(Dictionary<string, List<string>> PreClose, Dictionary<string, List<s
             string Identity() { using var c = new NpgsqlConnection(DbCs(runDb)); c.Open(); using var cmd = new NpgsqlCommand("SELECT coalesce(string_agg(\"SpotToken\" || '|' || \"SpotSymbol\" || '|' || \"ResolutionProvenance\" || '|' || \"ResolvedAtUtc\"::text, ';'), 'none') FROM adaptive_session_supplemental", c); return (string)cmd.ExecuteScalar()!; }
             var identityBefore = Identity();
             var barsPersisted = Count("adaptive_future_bars"); var futSideBefore = Count("adaptive_futures_supplemental_bars"); var optSideBefore = Count("adaptive_options_supplemental_bars");
-            var eventsBefore = Count("adaptive_commentary_events");
             recorder.Reset();
             GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
             var heapBefore = GC.GetTotalMemory(true); var obsBefore = observerCounter.Snapshot(); var srcBefore = sourceCounter.Snapshot();
@@ -674,7 +638,7 @@ async Task<(Dictionary<string, List<string>> PreClose, Dictionary<string, List<s
             }
 
             var barsAfter = Count("adaptive_future_bars"); var futSideAfter = Count("adaptive_futures_supplemental_bars"); var optSideAfter = Count("adaptive_options_supplemental_bars");
-            var eventsAfter = Count("adaptive_commentary_events"); var obsAfter = observerCounter.Snapshot();
+            var obsAfter = observerCounter.Snapshot();
             var stageMs = recorder.DurationsMs.Where(k => k.Key.StartsWith("recovery.", StringComparison.Ordinal)).ToDictionary(k => k.Key, k => Math.Round(k.Value.Sum(), 1));
             before["downtimeSeconds"] = 3;
             var identityAfter = Identity();
@@ -686,7 +650,6 @@ async Task<(Dictionary<string, List<string>> PreClose, Dictionary<string, List<s
                 ["barsPersistedBefore"] = barsPersisted, ["barsPersistedAfter"] = barsAfter,
                 ["futuresSidecarsInserted"] = futSideAfter - futSideBefore, ["futuresSidecarsVerified"] = Math.Min(futSideBefore, barsAfter),
                 ["optionsSidecarsInserted"] = optSideAfter - optSideBefore, ["optionsSidecarsVerified"] = Math.Min(optSideBefore, barsAfter),
-                ["commentaryEventsBefore"] = eventsBefore, ["commentaryEventsAfter"] = eventsAfter, ["commentaryEventsBackfilled"] = eventsAfter - eventsBefore,
                 ["pendingTicksRetainedBehindStableLag"] = live.Pending.Count, ["recoveredCompletedBars"] = Complete(live), ["recoveredPartialVolume"] = live.Engine.PartialBar.AccumulatedVolume,
                 ["recoveredPartialStartIst"] = live.Engine.PartialBar.StartedAtUtc is { } ps ? (ps + ist).ToString("HH:mm:ss.fff") : "none",
                 ["workingSetPeakMb"] = Mb(mem.PeakWorkingSet), ["managedHeapBeforeMb"] = Mb(heapBefore), ["managedHeapPeakMb"] = Mb(mem.PeakManagedHeap),
@@ -804,7 +767,6 @@ async Task<List<Dictionary<string, object>>> RestartValidationAsync(DayData d, S
         var pre = Compare(a.PreClose, b.PreClose); var post = Compare(a.PostClose, b.PostClose);
         var sameState = a.Info["finalPartialVolume"].Equals(b.Info["finalPartialVolume"]) && a.Info["finalPartialStartedUtc"].Equals(b.Info["finalPartialStartedUtc"]) && a.Info["finalPendingFingerprint"].Equals(b.Info["finalPendingFingerprint"])
             && a.Info["lastProcessedTickId"].Equals(b.Info["lastProcessedTickId"]) && a.Info["lastProcessedAvailableAtUtc"].Equals(b.Info["lastProcessedAvailableAtUtc"]) && a.Info["finalCompletedBars"].Equals(b.Info["finalCompletedBars"]);
-        var jobs = b.PostClose["CommentaryNotificationJobs"].Count;
         var health = b.PostClose["ProjectionHealth"].Count;
         results.Add(new()
         {
@@ -812,9 +774,9 @@ async Task<List<Dictionary<string, object>>> RestartValidationAsync(DayData d, S
             ["equalAtHorizon"] = pre["allEqual"], ["equalAfterClose"] = post["allEqual"], ["liveStateEqualAtHorizon"] = sameState, ["tablesAfterClose"] = post["tables"], ["tablesAtHorizon"] = pre["tables"],
             ["structuralDiff"] = ((List<string>)post["structuralDiff"]).Concat((List<string>)pre["structuralDiff"]).ToList(),
             ["liveStateA"] = LiveState(a.Info), ["liveStateB"] = LiveState(b.Info),
-            ["notificationJobs"] = jobs, ["projectionHealthRows"] = health, ["weak2RowsA"] = weak2Rows.Count, ["weak2RowsB"] = b.PostClose["Weak2Observations"].Count,
+            ["projectionHealthRows"] = health, ["weak2RowsA"] = weak2Rows.Count, ["weak2RowsB"] = b.PostClose["Weak2Observations"].Count,
         });
-        Console.WriteLine($"RESTART CASE {c.Name}: horizon-equal={pre["allEqual"]} after-close-equal={post["allEqual"]} liveState-equal={sameState} jobs={jobs} health={health} recoveryMs={((Dictionary<string, object>)b.Info["recovery"])["wallMs"]}");
+        Console.WriteLine($"RESTART CASE {c.Name}: horizon-equal={pre["allEqual"]} after-close-equal={post["allEqual"]} liveState-equal={sameState} health={health} recoveryMs={((Dictionary<string, object>)b.Info["recovery"])["wallMs"]}");
         foreach (var line in ((List<string>)post["structuralDiff"]).Take(5)) Console.WriteLine("   DIFF " + line);
     }
 
@@ -966,8 +928,8 @@ async Task<List<Dictionary<string, object>>> StressAsync(DayData d, Staged stage
     results.Add(result.Summary);
     Console.WriteLine($"STRESS c={chosenC}x window {(windowStart + ist):HH:mm:ss}-{(windowEnd + ist):HH:mm:ss}: input/s={result.Summary["inputTicksPerRealSecond"]} (target>={2 * maxRate}) poll max={Fmt(result.Summary["pollMsAll"])} maxPending={result.Summary["maxPendingTicks"]} drainSec={result.Summary["drainSecondsAfterIngestEnd"]}");
 
-    // Equivalence vs deterministic unthrottled replay: a fresh recovery over the same horizon verifies every persisted core row, sidecar and
-    // commentary event against the recomputation (throws / mismatch counters on any difference).
+    // Equivalence vs deterministic unthrottled replay: a fresh recovery over the same horizon verifies every persisted core row, sidecar
+    // against the recomputation (throws / mismatch counters on any difference).
     try
     {
         var horizon = result.EndData;                     // the clock of the last live poll: recovery then covers exactly the same ticks
@@ -995,7 +957,6 @@ async Task<Dictionary<string, object>> DashboardAsync(string observerDb, DateOnl
     var observerFactory = new LambdaFactory<AdaptiveObserverDbContext>(() => new AdaptiveObserverDbContext(new DbContextOptionsBuilder<AdaptiveObserverDbContext>().UseNpgsql(DbCs(observerDb)).AddInterceptors(new CountingInterceptor(counter)).Options));
     var sourceFactory = new LambdaFactory<NiftySignalDbContext>(() => new NiftySignalDbContext(new DbContextOptionsBuilder<NiftySignalDbContext>().UseNpgsql(DbCs(SourceDb)).AddInterceptors(new CountingInterceptor(sourceCounterLocal)).Options));
     var data = new AdaptiveObserverDataService(observerFactory, Microsoft.Extensions.Logging.Abstractions.NullLogger<AdaptiveObserverDataService>.Instance);
-    var commentary = new AdaptiveCommentaryDataService(observerFactory);
     var quote = new AdaptiveQuoteAsOfService(sourceFactory, observerFactory);
     await using var db = observerFactory.CreateDbContext();
     var sessionId = await db.Sessions.Select(x => x.Id).FirstAsync();
@@ -1015,7 +976,6 @@ async Task<Dictionary<string, object>> DashboardAsync(string observerDb, DateOnl
         await Time("LoadRuntimeAsync (steady-state header refresh, after)", () => data.LoadRuntimeAsync(sessionId), 300),
 #endif
         await Time("LoadSnapshotAsync(10)", async () => { await ((Func<Task>)(async () => { await data.LoadSnapshotAsync(10, captureSessionId: sessionId); }))(); }, 100),
-        await Time("Commentary LoadLatestAsync(5)", () => commentary.LoadLatestAsync(5), 100),
     };
     // The previous header path (before): find today's session, read runtime, recompute ten-bar readiness. Only comparable on the session's own trade date.
     var legacy = await LegacyHeaderCostAsync(observerFactory, sessionId, counter);

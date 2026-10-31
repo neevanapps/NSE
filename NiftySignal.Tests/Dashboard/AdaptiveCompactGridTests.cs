@@ -912,13 +912,14 @@ public sealed class AdaptiveCompactGridTests
                     Side = side, Token = token, TradingSymbol = token, PriceStart = 100, PriceEnd = side == OptionType.Call ? 105 : 96, PriceChange = side == OptionType.Call ? 5 : -4, TotalQuantity = 500,
                     StrictDelta = side == OptionType.Call ? 100 : -50,
                 });
+        // HISTORICAL commentary rows (the feature was removed; its tables are kept): they must stay in the database and never reach the Dashboard or a screenshot.
         AdaptiveCommentaryEventRow Ev(int bar, TimeSpan at, int n) => new()
         {
             SessionId = 1, TradeDate = Day, BarSeq = bar, OccurredAtUtc = Open930.Add(at), EventType = NiftySignal.AdaptiveObserver.Commentary.CommentaryEventType.BuyerExpansion,
             EventBias = NiftySignal.AdaptiveObserver.Commentary.EventBias.Long, MarketRegime = NiftySignal.AdaptiveObserver.Commentary.MarketRegime.Bullish,
             Lifecycle = NiftySignal.AdaptiveObserver.Commentary.CommentaryLifecycle.Confirmed, EvidenceAgreement = NiftySignal.AdaptiveObserver.Commentary.EvidenceAgreement.High,
             Severity = NiftySignal.AdaptiveObserver.Commentary.CommentarySeverity.Info, PrimaryEvidenceJson = "[]", ConfirmationEvidenceJson = "[]", ContradictionEvidenceJson = "[]", DataQualityJson = "[]",
-            RenderedCommentary = "x", CommentaryVersion = NiftySignal.AdaptiveObserver.Commentary.CommentaryEvaluator.Version, EventIdentity = "ev" + n,
+            RenderedCommentary = "x", CommentaryVersion = "commentary-v1", EventIdentity = "ev" + n,
         };
         db.CommentaryEvents.AddRange(Ev(10, TimeSpan.FromMinutes(10), 1), Ev(11, TimeSpan.FromMinutes(11), 2), Ev(11, TimeSpan.FromMinutes(11) + TimeSpan.FromSeconds(5), 3), Ev(12, TimeSpan.FromMinutes(12), 4));
         await db.SaveChangesAsync();
@@ -940,7 +941,9 @@ public sealed class AdaptiveCompactGridTests
         Assert.Contains("Auto Follow: ON", at11);
         Assert.Contains("data-strike=\"25000\"", at11);
         var events11 = System.Text.RegularExpressions.Regex.Matches(at11, "data-event-id=\"([^\"]+)\"").Select(m => m.Groups[1].Value).ToList();
-        Assert.Equal(2, events11.Count);                                                              // ev1 (bar 10) and ev2 (bar 11); ev3 occurred 5 s AFTER the boundary, ev4 on bar 12
+        Assert.Empty(events11);                                                                       // historical commentary rows are preserved in the database but never shown
+        Assert.DoesNotContain("Commentary", at11, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(4, await (await factory.CreateDbContextAsync()).CommentaryEvents.CountAsync());   // ... and nothing was deleted
         var rows11 = RowsOf(at11, "options-core-direction");
         Assert.Equal("11", rows11[0][0]);                                                             // the newest displayed row is the target bar, never a later one
         Assert.DoesNotContain(rows11, r => r[0] == "12");
@@ -950,8 +953,8 @@ public sealed class AdaptiveCompactGridTests
         Assert.Contains("Completed boundary: 09:42:00", at12);
         Assert.Contains("Selected strike: 25050", at12);
         Assert.Contains("data-strike=\"25050\"", at12);
-        Assert.Equal(3, System.Text.RegularExpressions.Regex.Matches(at12, "data-event-id=").Count);   // the latest three at or before 09:42:00
-        Assert.Contains("latest 3 events at or before this boundary", at12);
+        Assert.Empty(System.Text.RegularExpressions.Regex.Matches(at12, "data-event-id="));              // no commentary events; the strip only carries paper trade events
+        Assert.DoesNotContain("Commentary", at12, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

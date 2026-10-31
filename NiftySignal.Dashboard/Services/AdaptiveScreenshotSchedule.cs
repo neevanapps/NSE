@@ -4,7 +4,7 @@ using NiftySignal.AdaptiveObserver;
 
 namespace NiftySignal.Dashboard.Services;
 
-/// <summary>A durable event that may justify an extra screenshot (commentary Confirmed / Flipped, NPT1 trade open / close).</summary>
+/// <summary>A durable event that may justify an extra screenshot (NPT1 paper trade open / close).</summary>
 public sealed record ScreenshotEventCandidate(string Id, DateTimeOffset AtUtc, string Kind);
 
 public static class AdaptiveScreenshotSchedule
@@ -55,7 +55,7 @@ public static class AdaptiveScreenshotSchedule
 
     /// <summary>
     /// Fixed 13,650 clock: the FIRST completed bar, then every fifth completed bar after it (1, 6, 11, ...), completed bars only. In addition, a meaningful durable event
-    /// (commentary Confirmed / Flipped, NPT1 trade open / close) schedules ONE capture of the first completed bar at or after the event, unless that bar already has any capture. Several
+    /// (NPT1 paper trade open / close) schedules ONE capture of the first completed bar at or after the event, unless that bar already has any capture. Several
     /// events that map to the same boundary therefore share one screenshot, which carries the RECENT EVENTS strip.
     /// </summary>
     static async Task EnqueueFixedClockAsync(AdaptiveObserverDbContext db, AdaptiveSessionStateRow session, DateOnly day, DateTimeOffset now,
@@ -101,17 +101,6 @@ public static class AdaptiveScreenshotSchedule
         }
 
         var events = new List<ScreenshotEventCandidate>();
-        var version = NiftySignal.AdaptiveObserver.Commentary.CommentaryEvaluator.Version;
-        try
-        {
-            var commentary = await db.CommentaryEvents.AsNoTracking()
-                .Where(x => x.SessionId == session.Id && x.CommentaryVersion == version && x.BarSeq <= last
-                    && (x.Lifecycle == NiftySignal.AdaptiveObserver.Commentary.CommentaryLifecycle.Confirmed || x.Lifecycle == NiftySignal.AdaptiveObserver.Commentary.CommentaryLifecycle.Flipped))
-                .ToListAsync(ct);
-            events.AddRange(commentary.Select(e => new ScreenshotEventCandidate($"c:{e.Id}", e.OccurredAtUtc, "Commentary")));
-        }
-        catch (Npgsql.PostgresException ex) when (ex.SqlState == Npgsql.PostgresErrorCodes.UndefinedTable) { }
-
         if (ledgerEvents is not null)
         {
             try { events.AddRange(await ledgerEvents(day, ct)); }

@@ -423,11 +423,11 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
     /// <summary>
     /// Persists/verifies both sidecars of a completed bar. Returns true when the integrity of each is established: Skipped, Inserted, Verified,
     /// or Mismatch (durably marked known-invalid, so consumers treat it as unavailable). Returns false when integrity is UNKNOWN (a write/verify
-    /// failed): commentary must not consume that bar's sidecars. One immediate retry absorbs a transient failure; the caller retries later.
+    /// failed): the paper path must not treat that bar as verified. One immediate retry absorbs a transient failure; the caller retries later.
     /// </summary>
     public async Task<bool> PersistAndVerifyAsync(AdaptiveObserverDbContext db, AdaptiveSessionStateRow session, AdaptiveCompletedBarPackage package, CancellationToken ct)
     {
-        // The per-strike projection is a display sidecar: its outcome NEVER changes the verification result the commentary / paper path consumes.
+        // The per-strike projection is a display sidecar: its outcome NEVER changes the verification result the paper path consumess.
         await PersistOrVerifyStrikesAsync(db, session.Id, package, ct);
         for (var attempt = 0; attempt < 2; attempt++)
         {
