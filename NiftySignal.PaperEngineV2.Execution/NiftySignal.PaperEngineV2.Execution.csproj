@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Paper Engine V2 simulated execution (Phase 6c): per-strategy state machines, simulated orders and fills, exits, capital and risk - PAPER ONLY, in memory, no persistence.
+       References only PaperEngineV2.Core and the pure cost types of Trading.Core. No broker, order-submission, HTTP, database or ingestion reference (release-blocker tests assert it). -->
+  <ItemGroup>
+    <ProjectReference Include="..\NiftySignal.PaperEngineV2.Core\NiftySignal.PaperEngineV2.Core.csproj" />
+    <ProjectReference Include="..\NiftySignal.Trading.Core\NiftySignal.Trading.Core.csproj" />
+  </ItemGroup>
+
+</Project>
