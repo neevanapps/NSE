@@ -158,7 +158,7 @@ public class PostgresPersistenceTests
             new EntryOrderPlaced("e3", "S01", "h", 5, t, "i", OptionRight.Put, "PE1", 26000.5, new DateOnly(2026, 10, 13), 65, 650, 126.05m, key, t.AddSeconds(60)),
             new EntryFilled("e4", "S01", "h", 6, t, "i", "p", OptionRight.Call, "CE1", 650, 127.5m, 33.37m, t, 12, 650),
             new ExitRequested("e5", "S01", "h", 7, t, "p", ExitReason.StopLoss, key),
-            new ExitFilled("e6", "S01", "h", 8, t, "p", ExitReason.Terminal, 650, 120.45m, 20.1m, -4553.25m, -4600.55m, t, 13, 1300),
+            new ExitFilled("e6", "S01", "h", 8, t, "p", ExitReason.Terminal, 650, 120.45m, 20.1m, -4553.25m, -4600.55m, t, 13, 1300, 1200.5m, -5100m),
             new PositionUnresolved("e7", "S01", "h", 9, t, "p", "detail"),
             new RiskBreached("e8", "S01", "h", 9, t, -21000.55m, 20000m),
             new StrategyFaulted("e9", "S01", "h", 9, t, "boom"),

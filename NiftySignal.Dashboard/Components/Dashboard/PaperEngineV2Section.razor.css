@@ -1,0 +1,4 @@
+.v2-shadow { margin: 12px 20px; }
+.v2-health { display: flex; flex-wrap: wrap; gap: 16px; font-size: 13px; margin: 6px 0 10px; }
+.v2-warn { color: var(--warn, #c77700); }
+.v2-disabled { opacity: .55; }

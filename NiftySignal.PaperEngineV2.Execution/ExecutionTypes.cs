@@ -78,7 +78,7 @@ public sealed record ExitRequested(string EventId, string StrategyId, string Con
 }
 
 public sealed record ExitFilled(string EventId, string StrategyId, string ConfigHash, int BarSeq, DateTimeOffset At, string PositionId, ExitReason Reason, int Quantity, decimal FillPrice, decimal Fees,
-    decimal GrossPnl, decimal NetPnl, DateTimeOffset QuoteAvailableAt, long QuoteTickId, long DisplayedQuantity) : PaperEvent(EventId, StrategyId, ConfigHash, BarSeq, At)
+    decimal GrossPnl, decimal NetPnl, DateTimeOffset QuoteAvailableAt, long QuoteTickId, long DisplayedQuantity, decimal Mfe, decimal Mae) : PaperEvent(EventId, StrategyId, ConfigHash, BarSeq, At)
 {
     public override string Kind => "ExitFilled";
 }

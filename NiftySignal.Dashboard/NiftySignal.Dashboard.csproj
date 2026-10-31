@@ -17,6 +17,8 @@
     <!-- read-only view of the paper trading ledger (docs/TRADING_ENGINE_PHASE1_CONTRACT.md section B.7): reads the trading schema, never writes it -->
     <ProjectReference Include="..\NiftySignal.Trading.Data\NiftySignal.Trading.Data.csproj" />
     <ProjectReference Include="..\NiftySignal.Npt1M1.Data\NiftySignal.Npt1M1.Data.csproj" />
+    <!-- Paper Engine V2 SHADOW (read-only): the Home page reads the pev2 schema through PaperEngineV2DataService (SELECT only, read-only transaction). Nothing here writes to it. -->
+    <ProjectReference Include="..\NiftySignal.PaperEngineV2.Data\NiftySignal.PaperEngineV2.Data.csproj" />
     <!-- Phase F of docs/LIVE_PARITY_PLAN.md: read-only access to VolumeBarDbContext's live
          tables (LiveOptionsScoreRow/LiveEntrySignalRow/LivePaperTradeRow) for the new
          /live-options-score page. This project never writes to any VolumeBarDbContext table. -->

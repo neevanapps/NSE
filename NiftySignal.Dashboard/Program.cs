@@ -79,6 +79,13 @@ builder.Services.AddDbContextFactory<NiftySignalDbContext>(options =>
     }
 }
 
+// Paper Engine V2 SHADOW view (schema "pev2", same paper-live database): registered only when the connection string exists; read-only connection, SELECT-only service. When V2 is not installed the Home section says so.
+{
+    var v2Connection = builder.Configuration.GetConnectionString("TradingPaperLive");
+    if (!string.IsNullOrWhiteSpace(v2Connection))
+        builder.Services.AddSingleton(new PaperEngineV2DataService(v2Connection));
+}
+
 builder.Services.AddSingleton<Npt1LiveQuotes>();
 builder.Services.AddSingleton(sp => new PaperLiveDataService(sp.GetService<IDbContextFactory<NiftySignal.Trading.Data.TradingDbContext>>(), null, sp.GetService<IDbContextFactory<NiftySignal.Npt1M1.Data.Npt1M1DbContext>>()));
 

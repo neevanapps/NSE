@@ -1,0 +1,44 @@
+@implements IDisposable
+@using NiftySignal.Dashboard.Services
+@inject IServiceProvider Services
+
+@* Loads the V2 SHADOW view (own timer, bounded read-only queries; never touches the observer or the NPT1 ledger) and hands it to the pure section. Absent service = V2 not configured here. *@
+<PaperEngineV2Section View="_view" />
+
+@code {
+    static readonly TimeSpan Refresh = TimeSpan.FromSeconds(15);
+
+    V2HomeView? _view;
+    PaperEngineV2DataService? _service;
+    Timer? _timer;
+    int _busy;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _service = Services.GetService(typeof(PaperEngineV2DataService)) as PaperEngineV2DataService;
+        if (_service is null)
+        {
+            _view = V2HomeView.Unavailable(DateTimeOffset.UtcNow, PaperEngineV2DataService.IstDate(DateTimeOffset.UtcNow), "the V2 database is not configured for this dashboard");
+            return;
+        }
+
+        await LoadAsync();
+        _timer = new Timer(_ => _ = InvokeAsync(LoadAsync), null, Refresh, Refresh);
+    }
+
+    async Task LoadAsync()
+    {
+        if (_service is null || Interlocked.Exchange(ref _busy, 1) == 1) return;
+        try
+        {
+            _view = await _service.LoadAsync(DateTimeOffset.UtcNow, CancellationToken.None);
+            StateHasChanged();
+        }
+        finally
+        {
+            Volatile.Write(ref _busy, 0);
+        }
+    }
+
+    public void Dispose() => _timer?.Dispose();
+}

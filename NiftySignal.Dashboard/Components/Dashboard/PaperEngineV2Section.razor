@@ -1,0 +1,166 @@
+@using System.Globalization
+@using NiftySignal.Dashboard.Services
+
+@* PAPER ENGINE V2 — SHADOW. Pure presentation of V2HomeView: read-only, no button, form or command. Every figure comes from the V2 ledger; a value the ledger does not support renders as a dash, never zero.
+   Strategies are independent virtual books and are never combined into a funded portfolio: the only total is explicitly HYPOTHETICAL. NPT1 is a separate system shown on /paper-live. *@
+<section class="panel v2-shadow" data-testid="v2-shadow">
+    <div class="panel-title">PAPER ENGINE V2 <span class="badge badge-neutral" data-testid="v2-label">V2 SHADOW</span>
+        <span class="text-faint">paper only · read-only · independent virtual books · separate from NPT1 (<a href="/paper-live">NPT1 paper trading</a>)</span></div>
+
+    @if (View is null)
+    {
+        <div class="text-faint" data-testid="v2-loading">Loading V2 SHADOW ledger…</div>
+    }
+    else if (!View.Health.SchemaOk)
+    {
+        <div class="text-faint" data-testid="v2-unavailable">V2 SHADOW is not running on this installation (disabled by default): @string.Join("; ", View.Health.SchemaProblems). Nothing is shown.</div>
+    }
+    else
+    {
+        var h = View.Health;
+        <div class="v2-health" data-testid="v2-health">
+            <span>Trade date <b>@View.TradeDate.ToString("dd-MMM-yyyy")</b></span>
+            <span>Last frame <b>@(h.LastFrameAt is { } lf ? $"bar {h.LastFrameBar} · {Ist(lf)} IST ({Age(View.AsOf - lf)} ago)" : "—")</b></span>
+            <span>Frames today <b>@h.FramesToday</b></span>
+            <span>Entries blocked <b class="@(h.EntryBlockedFramesToday > 0 ? "v2-warn" : "")">@h.EntryBlockedFramesToday</b></span>
+            <span>Gaps today <b class="@(h.GapsToday > 0 ? "v2-warn" : "")">@h.GapsToday</b></span>
+            <span title="Alert outbox: pending / uncertain (never resent automatically) / failed">Alerts <b>@h.AlertsPending / @h.AlertsUncertain / @h.AlertsFailed</b></span>
+            <span>Partial fills <b title="V2 v1 is all-or-none: a partial fill cannot occur">0 (all-or-none)</b></span>
+        </div>
+        @if (View.EventsTruncated)
+        {
+            <div class="v2-warn" data-testid="v2-truncated">Today's ledger exceeds the display bound; figures below cover the first 10,000 events only.</div>
+        }
+
+        <div class="adaptive-subtitle">STRATEGIES (@View.Strategies.Count)</div>
+        @if (View.Strategies.Count == 0)
+        {
+            <div class="text-faint" data-testid="v2-no-strategies">No V2 strategy has been recorded.</div>
+        }
+        else
+        {
+            <div class="scroll-x"><table class="data-table" data-testid="v2-strategies">
+                <thead><tr><th>Strategy</th><th>Ver</th><th>Signal status</th><th>Position</th><th>Contract</th><th>Entry price</th><th>Qty</th><th title="(bid of the latest journaled frame − entry price) × quantity, before exit charges; only with a fresh bid">Unrealized P&amp;L</th><th>Realized P&amp;L (net)</th><th>Trades</th><th>Rejected</th></tr></thead>
+                <tbody>
+                @foreach (var s in View.Strategies)
+                {
+                    <tr data-strategy="@s.StrategyId" class="@(s.Enabled ? "" : "v2-disabled")">
+                        <td>@s.StrategyId</td><td>@(s.Version?.ToString() ?? "—")</td>
+                        <td data-testid="v2-signal">@s.Signal@(s.PendingEntry is { } pe ? $" · {pe}" : "")</td>
+                        @if (s.OpenPositions.Count == 0)
+                        {
+                            <td>@(s.HasActivity ? "flat" : "—")</td><td>—</td><td>—</td><td>—</td><td>—</td>
+                        }
+                        else
+                        {
+                            <td>@string.Join(", ", s.OpenPositions.Select(p => p.Right.ToString().ToUpperInvariant()))</td>
+                            <td>@string.Join(", ", s.OpenPositions.Select(Contract))</td>
+                            <td>@string.Join(", ", s.OpenPositions.Select(p => p.EntryPrice.ToString("0.00", CultureInfo.InvariantCulture)))</td>
+                            <td>@string.Join(", ", s.OpenPositions.Select(p => p.Quantity))</td>
+                            <td class="@PnlClass(s.UnrealizedNow)" data-testid="v2-unrealized">@Money(s.UnrealizedNow)</td>
+                        }
+                        <td class="@PnlClass(s.RealizedNetToday)">@Money(s.RealizedNetToday)</td><td>@(s.HasActivity ? s.TradesToday.ToString() : "—")</td><td>@(s.HasActivity ? s.RejectionsToday.ToString() : "—")</td>
+                    </tr>
+                }
+                </tbody>
+                <tfoot>
+                    <tr class="paper-total-row" data-testid="v2-hypothetical-total">
+                        <td colspan="7" title="Each strategy is an independent virtual book with its own capital. Adding them is arithmetic only; it is not a funded portfolio and no such account exists.">HYPOTHETICAL SUM of independent books — not a funded portfolio</td>
+                        <td class="@PnlClass(View.HypotheticalUnrealized)">@Money(View.HypotheticalUnrealized)</td><td class="@PnlClass(View.HypotheticalRealizedNet)">@Money(View.HypotheticalRealizedNet)</td><td colspan="2"></td>
+                    </tr>
+                </tfoot>
+            </table></div>
+        }
+
+        <div class="adaptive-subtitle">COMPLETED TRADES TODAY (@View.Trades.Count)</div>
+        @if (View.Trades.Count == 0)
+        {
+            <div class="text-faint" data-testid="v2-no-trades">No completed V2 trades today.</div>
+        }
+        else
+        {
+            <div class="scroll-x"><table class="data-table" data-testid="v2-trades">
+                <thead><tr><th>Strategy</th><th>Side</th><th>Contract</th><th>Qty</th><th>Entry time</th><th>Entry</th><th>Exit time</th><th>Exit</th><th>Reason</th><th>Gross</th><th>Charges</th><th>Net</th><th title="Maximum favourable / adverse excursion at bar-end bids, recorded with the exit">MFE</th><th>MAE</th></tr></thead>
+                <tbody>
+                @foreach (var t in View.Trades)
+                {
+                    <tr>
+                        <td>@t.StrategyId</td><td>@t.Right.ToString().ToUpperInvariant()</td><td>@t.Token@(t.Strike is { } k ? $" ({k:0})" : "")</td><td>@t.Quantity</td><td>@Ist(t.EntryAt)</td><td>@Px(t.EntryPrice)</td><td>@Ist(t.ExitAt)</td><td>@Px(t.ExitPrice)</td><td>@t.ExitReason</td>
+                        <td>@Money(t.Gross)</td><td>@Money(t.Charges)</td><td class="@PnlClass(t.Net)">@Money(t.Net)</td><td>@Money(t.Mfe)</td><td>@Money(t.Mae)</td>
+                    </tr>
+                }
+                </tbody>
+            </table></div>
+        }
+
+        <div class="adaptive-subtitle">REJECTED ORDERS TODAY (@View.Rejections.Count)</div>
+        @if (View.Rejections.Count == 0)
+        {
+            <div class="text-faint" data-testid="v2-no-rejections">None.</div>
+        }
+        else
+        {
+            <div class="scroll-x"><table class="data-table" data-testid="v2-rejections">
+                <thead><tr><th>Time (IST)</th><th>Strategy</th><th>Side</th><th>Reason</th><th>Detail</th></tr></thead>
+                <tbody>
+                @foreach (var r in View.Rejections)
+                {
+                    <tr><td>@Ist(r.At)</td><td>@r.StrategyId</td><td>@(r.Right?.ToString().ToUpperInvariant() ?? "—")</td><td>@r.Reason</td><td>@r.Detail</td></tr>
+                }
+                </tbody>
+            </table></div>
+        }
+
+        <div class="adaptive-subtitle">UNRESOLVED EXITS &amp; ENGINE FAILURES (@View.Failures.Count)</div>
+        @if (View.Failures.Count == 0)
+        {
+            <div class="text-faint" data-testid="v2-no-failures">None.</div>
+        }
+        else
+        {
+            <div class="scroll-x"><table class="data-table v2-failures" data-testid="v2-failures">
+                <thead><tr><th>Time (IST)</th><th>Strategy</th><th>Kind</th><th>Detail</th></tr></thead>
+                <tbody>
+                @foreach (var f in View.Failures)
+                {
+                    <tr><td>@Ist(f.At)</td><td>@f.StrategyId</td><td class="v2-warn">@f.Kind</td><td>@f.Detail</td></tr>
+                }
+                </tbody>
+            </table></div>
+        }
+
+        <div class="adaptive-subtitle">INDIVIDUAL STRATEGY PERFORMANCE (today · last 30 days; realized, net of charges)</div>
+        @if (View.Strategies.All(s => s.Performance is null))
+        {
+            <div class="text-faint" data-testid="v2-no-performance">No closed V2 trades in the last 30 days.</div>
+        }
+        else
+        {
+            <div class="scroll-x"><table class="data-table" data-testid="v2-performance">
+                <thead><tr><th>Strategy</th><th>Trades today</th><th>Wins</th><th>Gross</th><th>Charges</th><th>Net today</th><th>Trades 30d</th><th>Wins 30d</th><th>Net 30d</th></tr></thead>
+                <tbody>
+                @foreach (var p in View.Strategies.Where(s => s.Performance is not null).Select(s => s.Performance!))
+                {
+                    <tr><td>@p.StrategyId</td><td>@p.TradesToday</td><td>@p.WinsToday</td><td>@Money(p.GrossToday)</td><td>@Money(p.ChargesToday)</td><td class="@PnlClass(p.NetToday)">@Money(p.NetToday)</td><td>@p.Trades30d</td><td>@p.Wins30d</td><td class="@PnlClass(p.Net30d)">@Money(p.Net30d)</td></tr>
+                }
+                </tbody>
+            </table></div>
+        }
+    }
+</section>
+
+@code {
+    [Parameter] public V2HomeView? View { get; set; }
+
+    static string Money(decimal? v) => v is { } x ? (x >= 0 ? "+" : "") + x.ToString("0.00", CultureInfo.InvariantCulture) : "—";
+
+    static string Px(decimal v) => v.ToString("0.00", CultureInfo.InvariantCulture);
+
+    static string PnlClass(decimal? v) => v is null ? "" : v > 0 ? "paper-pnl-up" : v < 0 ? "paper-pnl-down" : "";
+
+    static string Ist(DateTimeOffset t) => (t + TimeSpan.FromHours(5.5)).ToString("HH:mm:ss", CultureInfo.InvariantCulture);
+
+    static string Age(TimeSpan s) => s.TotalSeconds < 90 ? $"{Math.Max(0, (int)s.TotalSeconds)} s" : $"{(int)s.TotalMinutes} min";
+
+    static string Contract(V2PositionView p) => p.Token + (p.Strike is { } k ? $" ({k:0})" : "");
+}

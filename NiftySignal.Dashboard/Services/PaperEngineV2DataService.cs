@@ -1,0 +1,144 @@
+using System.Text.Json;
+using Npgsql;
+using NiftySignal.PaperEngineV2.Data;
+
+namespace NiftySignal.Dashboard.Services;
+
+/// <summary>
+/// Read-only access to the Paper Engine V2 SHADOW tables (schema <c>pev2</c>) for the Home page. The connection is opened with <c>default_transaction_read_only=on</c> and a statement timeout, every query is a bounded
+/// SELECT (events: time-indexed, at most 10,000 rows; one latest frame; counts), and nothing here ever writes. When V2 is not installed or the schema is incompatible the view says so instead of showing anything.
+/// </summary>
+public sealed class PaperEngineV2DataService : IDisposable
+{
+    static readonly TimeSpan Ist = TimeSpan.FromHours(5.5);
+    static readonly TimeSpan SchemaCacheFor = TimeSpan.FromSeconds(60);
+
+    readonly NpgsqlDataSource _db;
+    readonly PostgresEventStore _events;
+    SchemaVerdict? _schema;
+    DateTimeOffset _schemaAt;
+
+    public PaperEngineV2DataService(string connectionString)
+    {
+        var b = new NpgsqlConnectionStringBuilder(connectionString) { Options = "-c default_transaction_read_only=on -c statement_timeout=5000", ApplicationName = "niftysignal-dashboard-v2-readonly", MaxPoolSize = 4 };
+        _db = NpgsqlDataSource.Create(b.ConnectionString);
+        _events = new PostgresEventStore(_db);
+    }
+
+    public static DateOnly IstDate(DateTimeOffset t) => DateOnly.FromDateTime((t + Ist).DateTime);
+
+    public async Task<V2HomeView> LoadAsync(DateTimeOffset now, CancellationToken ct)
+    {
+        var day = IstDate(now);
+        try
+        {
+            if (_schema is null || now - _schemaAt > SchemaCacheFor || !_schema.Compatible)
+            {
+                _schema = await V2SchemaCheck.CheckAsync(_db, ct);
+                _schemaAt = now;
+            }
+
+            if (!_schema.Compatible) return V2HomeView.Unavailable(now, day, [.. _schema.Problems]);
+
+            var from = new DateTimeOffset(day.ToDateTime(TimeOnly.MinValue), Ist).ToUniversalTime();
+            var to = from.AddDays(1);
+            var configured = await ConfiguredAsync(ct);
+            var events = await _events.ReadAsync(from, to, null, PostgresEventStore.MaxRead, ct);
+            var perf = await PerformanceAsync(from, to, ct);
+            var marks = await LatestMarksAsync(ct);
+            var health = await HealthAsync(from, to, ct);
+            return V2HomeProjection.Build(now, day, health, configured, events, perf, marks, events.Count >= PostgresEventStore.MaxRead);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return V2HomeView.Unavailable(now, day, $"the V2 ledger could not be read ({ex.GetType().Name})");
+        }
+    }
+
+    async Task<IReadOnlyList<V2ConfiguredStrategy>> ConfiguredAsync(CancellationToken ct)
+    {
+        var list = new List<V2ConfiguredStrategy>();
+        await using var c = _db.CreateCommand("SELECT DISTINCT ON (strategy_id) strategy_id, version, canonical_json FROM pev2.pev2_strategy_configs ORDER BY strategy_id, version DESC, recorded_utc_ticks DESC LIMIT 100");
+        await using var r = await c.ExecuteReaderAsync(ct);
+        while (await r.ReadAsync(ct))
+        {
+            var enabled = false;
+            try { using var doc = JsonDocument.Parse(r.GetString(2)); enabled = doc.RootElement.TryGetProperty("enabled", out var e) && e.ValueKind == JsonValueKind.True; }
+            catch (JsonException) { }
+            list.Add(new V2ConfiguredStrategy(r.GetString(0), r.GetInt32(1), enabled));
+        }
+
+        return list;
+    }
+
+    async Task<IReadOnlyList<V2StrategyPerformance>> PerformanceAsync(DateTimeOffset todayFrom, DateTimeOffset todayTo, CancellationToken ct)
+    {
+        var list = new List<V2StrategyPerformance>();
+        await using var c = _db.CreateCommand(@"
+            WITH x AS (SELECT strategy_id, at_utc_ticks,
+                              (payload_json::jsonb ->> 'NetPnl')::numeric AS net, (payload_json::jsonb ->> 'GrossPnl')::numeric AS gross
+                       FROM pev2.pev2_events WHERE kind = 'ExitFilled' AND at_utc_ticks >= $1 AND at_utc_ticks < $2)
+            SELECT strategy_id,
+                   count(*) FILTER (WHERE at_utc_ticks >= $3), count(*) FILTER (WHERE at_utc_ticks >= $3 AND net > 0),
+                   coalesce(sum(gross) FILTER (WHERE at_utc_ticks >= $3), 0), coalesce(sum(net) FILTER (WHERE at_utc_ticks >= $3), 0),
+                   count(*), count(*) FILTER (WHERE net > 0), coalesce(sum(net), 0)
+            FROM x GROUP BY strategy_id ORDER BY strategy_id LIMIT 100");
+        c.Parameters.AddWithValue(todayFrom.AddDays(-30).UtcTicks); c.Parameters.AddWithValue(todayTo.UtcTicks); c.Parameters.AddWithValue(todayFrom.UtcTicks);
+        await using var r = await c.ExecuteReaderAsync(ct);
+        while (await r.ReadAsync(ct))
+        {
+            var grossToday = r.GetDecimal(3); var netToday = r.GetDecimal(4);
+            list.Add(new V2StrategyPerformance(r.GetString(0), (int)r.GetInt64(1), (int)r.GetInt64(2), grossToday, grossToday - netToday, netToday, (int)r.GetInt64(5), (int)r.GetInt64(6), r.GetDecimal(7)));
+        }
+
+        return list;
+    }
+
+    async Task<V2MarkSource?> LatestMarksAsync(CancellationToken ct)
+    {
+        await using var c = _db.CreateCommand("SELECT bar_seq, bar_end_utc_ticks, payload_json FROM pev2.pev2_frames ORDER BY journal_seq DESC LIMIT 1");
+        await using var r = await c.ExecuteReaderAsync(ct);
+        if (!await r.ReadAsync(ct)) return null;
+        var bar = r.GetInt32(0);
+        var at = new DateTimeOffset(r.GetInt64(1), TimeSpan.Zero);
+        var bids = new Dictionary<string, (decimal, DateTimeOffset)>(StringComparer.Ordinal);
+        using var doc = JsonDocument.Parse(r.GetString(2));
+        if (doc.RootElement.TryGetProperty("quotes", out var quotes))
+            foreach (var q in quotes.EnumerateArray())
+                bids[q.GetProperty("token").GetString()!] = ((decimal)q.GetProperty("bid").GetDouble(), q.GetProperty("availableAt").GetDateTimeOffset());
+        return new V2MarkSource(at, bar, bids);
+    }
+
+    async Task<V2EngineHealth> HealthAsync(DateTimeOffset from, DateTimeOffset to, CancellationToken ct)
+    {
+        DateTimeOffset? lastAt = null; int? lastBar = null; var frames = 0; var blocked = 0; var gaps = 0; int pending = 0, uncertain = 0, failed = 0;
+        await using (var c = _db.CreateCommand("SELECT bar_seq, bar_end_utc_ticks FROM pev2.pev2_frames ORDER BY journal_seq DESC LIMIT 1"))
+        await using (var r = await c.ExecuteReaderAsync(ct))
+            if (await r.ReadAsync(ct)) { lastBar = r.GetInt32(0); lastAt = new DateTimeOffset(r.GetInt64(1), TimeSpan.Zero); }
+
+        await using (var c = _db.CreateCommand("SELECT count(*), count(*) FILTER (WHERE NOT d.entries_allowed) FROM pev2.pev2_frames f LEFT JOIN pev2.pev2_dispositions d ON d.session_id = f.session_id AND d.bar_seq = f.bar_seq WHERE f.bar_end_utc_ticks >= $1 AND f.bar_end_utc_ticks < $2"))
+        {
+            c.Parameters.AddWithValue(from.UtcTicks); c.Parameters.AddWithValue(to.UtcTicks);
+            await using var r = await c.ExecuteReaderAsync(ct);
+            if (await r.ReadAsync(ct)) { frames = (int)r.GetInt64(0); blocked = (int)r.GetInt64(1); }
+        }
+
+        await using (var c = _db.CreateCommand("SELECT count(*) FROM pev2.pev2_gaps WHERE session_id IN (SELECT DISTINCT session_id FROM pev2.pev2_frames WHERE bar_end_utc_ticks >= $1 AND bar_end_utc_ticks < $2)"))
+        {
+            c.Parameters.AddWithValue(from.UtcTicks); c.Parameters.AddWithValue(to.UtcTicks);
+            gaps = (int)(long)(await c.ExecuteScalarAsync(ct))!;
+        }
+
+        await using (var c = _db.CreateCommand("SELECT status, count(*) FROM pev2.pev2_alert_outbox WHERE status IN (0, 2, 3) GROUP BY status"))
+        await using (var r = await c.ExecuteReaderAsync(ct))
+            while (await r.ReadAsync(ct))
+            {
+                var n = (int)r.GetInt64(1);
+                switch (r.GetInt32(0)) { case 0: pending = n; break; case 2: uncertain = n; break; default: failed = n; break; }
+            }
+
+        return new V2EngineHealth(true, [], lastAt, lastBar, frames, blocked, gaps, pending, uncertain, failed);
+    }
+
+    public void Dispose() => _db.Dispose();
+}

@@ -201,7 +201,7 @@ public sealed class StrategyRuntime
             p.State = PositionState.Closed; p.ExitPrice = price; p.ExitFees = fees; p.Gross = gross; p.Net = net;
             _cash += (price * p.Quantity) - fees;
             _realizedToday += net;
-            output.Add(new ExitFilled($"{p.Id}:xfill", StrategyId, _config.Identity.Hash, frame.Identity.BarSeq, frame.Identity.BarEndAvailableAt, p.Id, p.ExitReason!.Value, p.Quantity, price, fees, gross, net, q.AvailableAt, q.SourceTickId, q.BidQty));
+            output.Add(new ExitFilled($"{p.Id}:xfill", StrategyId, _config.Identity.Hash, frame.Identity.BarSeq, frame.Identity.BarEndAvailableAt, p.Id, p.ExitReason!.Value, p.Quantity, price, fees, gross, net, q.AvailableAt, q.SourceTickId, q.BidQty, p.Mfe, p.Mae));
         }
     }
 

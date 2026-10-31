@@ -41,7 +41,7 @@ public class AlertTests
     static readonly DecisionKey Key = new(T, 9);
 
     static readonly PaperEvent Opened = new EntryFilled("S01:h:1:5:Call:filled", "S01", "h", 6, T, "i", "S01:h:1:5:Call", OptionRight.Call, "CE26000", 650, 127.5m, 33.37m, T, 12, 650);
-    static readonly PaperEvent Closed = new ExitFilled("S01:h:1:5:Call:xfill", "S01", "h", 8, T, "S01:h:1:5:Call", ExitReason.Terminal, 650, 120.45m, 20.1m, -4553.25m, -4600.55m, T, 13, 1300);
+    static readonly PaperEvent Closed = new ExitFilled("S01:h:1:5:Call:xfill", "S01", "h", 8, T, "S01:h:1:5:Call", ExitReason.Terminal, 650, 120.45m, 20.1m, -4553.25m, -4600.55m, T, 13, 1300, 1200.5m, -5100m);
     static readonly PaperEvent Rejected = new EntryRejected("S01:h:1:5:any:rej:SpreadTooWide", "S01", "h", 5, T, OptionRight.Call, null, RejectionReason.SpreadTooWide, "every in-range contract exceeds the spread limit");
     static readonly StrategyFaulted Faulted = new StrategyFaulted("S01:h:1:9:fault", "S01", "h", 9, T, "InvalidOperationException: boom");
     static readonly PaperEvent Unresolved = new PositionUnresolved("S01:h:1:5:Call:unres", "S01", "h", 9, T, "S01:h:1:5:Call", "not closed by the retry cut-off");
