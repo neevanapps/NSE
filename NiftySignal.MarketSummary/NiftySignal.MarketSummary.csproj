@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Market Summary engine (docs/MARKET_SUMMARY_METRICS.md): pure, deterministic five-window aggregation of persisted per-bar rows (futures + exact option contracts of one fixed ATM±2 basket).
+       No database, no clock, no I/O, no project references: callers map their rows into the plain input records. -->
+
+</Project>
