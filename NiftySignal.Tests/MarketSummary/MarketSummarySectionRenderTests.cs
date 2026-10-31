@@ -89,6 +89,25 @@ public class MarketSummarySectionRenderTests
         Assert.Contains("Market summary unavailable", await RenderAsync(null));
     }
 
+    [Fact]
+    public async Task Render_FuturesSummary_ShowsVixLevelChangeAndAge_StaleAndMissingAsDashes()
+    {
+        var t0 = new DateTimeOffset(2026, 10, 7, 3, 45, 0, TimeSpan.Zero);
+        var windows = SummaryWindow.All.Select((w, i) => new VixWindowSummary(w,
+            new VixPoint(14.0, t0, 3, VixStatus.Fresh),
+            i == 1 ? new VixPoint(null, t0, 90, VixStatus.Stale) : new VixPoint(15.0, t0, 4, VixStatus.Fresh),
+            i == 1 ? null : 1.0, i == 1 ? null : 1.0 / 14.0 * 100d)).ToList();
+        var html = await RenderAsync(View(120) with { Vix = windows });
+        Assert.Contains("VIX Δ%", html);
+        Assert.Contains("15.00", html);
+        Assert.Contains("+1.00", html);
+        Assert.Contains("+7.14", html);
+        Assert.Contains("4s", html);
+        Assert.Contains("stale", html);                                     // the 10-bar window's end observation was 90 s old
+        var none = await RenderAsync(View(120) with { Vix = null, VixUnavailableReason = "no India VIX instrument in the instrument master" });
+        Assert.Contains("VIX unavailable: no India VIX instrument in the instrument master", none);
+    }
+
     /// <summary>Optional: when NSE_RENDER_DUMP_DIR is set, writes the rendered section (with its stylesheet and neutral theme variables) so layout can be inspected in a real browser at 1920 px. Never asserts layout.</summary>
     [Fact]
     public async Task Render_OptionalDumpForBrowserInspection()

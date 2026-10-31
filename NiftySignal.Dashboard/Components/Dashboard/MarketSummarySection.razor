@@ -29,6 +29,7 @@
                     <th>Window</th><th>Coverage</th><th>Price Δ</th><th>Volume</th>
                     <th title="raw Strict delta (Strict delta / volume, %)">Strict Δ</th><th title="raw Enriched delta (/ classified volume, %)">Enriched Δ</th>
                     <th title="usable-seconds weighted MicroDev (TOB x 100)">MicroDev</th><th title="net OFI (net / gross, %)">OFI</th><th>OI Δ</th><th>Activity /s</th>
+                    <th title="India VIX level at the window end (latest valid observation at or before the boundary, within the freshness limit)">VIX</th><th title="VIX change over the window (end − start)">VIX Δ</th><th title="VIX change / start VIX × 100">VIX Δ%</th><th title="age of the end observation at the boundary">VIX age</th>
                 </tr>
                 </thead>
                 <tbody>
@@ -46,6 +47,7 @@
                             <td>@Cell(r.Price, 2)</td><td>@r.Volume.ToString("N0")</td><td>@Cell(r.Strict)</td><td>@Cell(r.Enriched)</td><td>@Cell(r.MicroDev, 2)</td><td>@Cell(r.Ofi)</td><td>@Cell(r.Oi)</td>
                             <td>@RatioFormat.Plain(r.Activity, 1)</td>
                         }
+                        @VixCells(View, r.Window.Name)
                     </tr>
                 }
                 </tbody>
@@ -122,6 +124,26 @@
     [Parameter] public MarketSummaryView? View { get; set; }
 
     static string Cell(SummaryMetric m, int rawDecimals = 0) => RatioFormat.Cell(new RatioPart(m.Raw, m.Num, m.Den), rawDecimals);
+
+    RenderFragment VixCells(MarketSummaryView v, string window) => builder =>
+    {
+        var seq = 0;
+        void Td(string text, string? title = null)
+        {
+            builder.OpenElement(seq++, "td");
+            if (title is not null) builder.AddAttribute(seq++, "title", title);
+            builder.AddContent(seq++, text);
+            builder.CloseElement();
+        }
+
+        var w = v.Vix?.FirstOrDefault(x => x.Window.Name == window);
+        if (w is null) { var why = v.VixUnavailableReason ?? "not loaded"; Td("—", "VIX unavailable: " + why); Td("—"); Td("—"); Td("—"); return; }
+        string Pt(VixPoint p, string fmt) => p.Value is { } x ? x.ToString(fmt, System.Globalization.CultureInfo.InvariantCulture) : p.Status == VixStatus.Stale ? "stale" : "—";
+        Td(Pt(w.End, "0.00"), w.End.Status == VixStatus.Stale ? $"last observation {w.End.AgeSeconds:0}s old at the boundary (limit {VixSummaryCalculator.FreshnessLimit.TotalSeconds:0}s)" : null);
+        Td(w.Change is { } c ? c.ToString("+0.00;-0.00;0.00", System.Globalization.CultureInfo.InvariantCulture) : "—", w.Change is null ? "needs a fresh VIX at both the window start and end" : null);
+        Td(w.ChangePct is { } p ? p.ToString("+0.00;-0.00;0.00", System.Globalization.CultureInfo.InvariantCulture) : "—");
+        Td(w.End.AgeSeconds is { } a ? $"{a:0}s" : "—");
+    };
 
     static readonly string[] CoreFamilies = ["Price", "Roll", "Strict", "Enriched", "Oi", "MicroDev", "Ofi"];
     static readonly string[] ContextFamilies = ["Iv", "Delta", "Vega", "Activity"];

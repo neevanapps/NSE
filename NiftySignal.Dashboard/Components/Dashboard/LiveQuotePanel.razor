@@ -28,6 +28,7 @@
                 <div class="quote-stat">
                     <span class="text-faint">Spot</span>
                     <span class="mono quote-value">@FormatPriceWithChange(SpotPrice, SpotChangeValue)</span>
+                    @if (PercentText(SpotPrice, SpotChangeValue) is { } spotPct) { <span class="text-faint" data-testid="spot-change-pct">@spotPct</span> }
                     @if (CaptureMode) { <span class="text-faint quote-asof">@AsOfText(_pinned?.Spot)</span> }
                 </div>
                 <div class="quote-stat">
@@ -39,6 +40,19 @@
                     <span class="text-faint">VIX</span>
                     <span class="mono quote-value">@FormatPriceWithChange(VixPrice, VixChangeValue)</span>
                     @if (CaptureMode) { <span class="text-faint quote-asof">@AsOfText(_pinned?.Vix)</span> }
+                </div>
+                @* Fixed-volume bar progress: the Host builder's own accumulated quantity (adaptive_observer_runtime, flushed ~1/s) against the bar target, and the last completed BarSeq. Static in a pinned capture. *@
+                <div class="quote-stat" data-testid="bar-progress" title="Current incomplete fixed-volume bar: the quantity accumulated by the bar builder (persisted about once a second, so it can trail the live builder by a few seconds) against the bar target, and the last completed bar.">
+                    <span class="text-faint">Bar qty</span>
+                    @if (CaptureMode)
+                    {
+                        <span class="mono quote-value" data-testid="bar-progress-value">pinned · completed bar @CaptureBarSeq</span>
+                    }
+                    else
+                    {
+                        <span class="mono quote-value" data-testid="bar-progress-value">@(_progress?.QuantityText ?? "unavailable")</span>
+                        <span class="text-faint quote-asof" data-testid="bar-progress-meta">@ProgressMeta</span>
+                    }
                 </div>
                 @* Gamma Flip is derived from the current live option chain; it cannot be reproduced as of a past bar, so a pinned capture omits it. *@
                 @if (!CaptureMode)
@@ -172,6 +186,14 @@
 
         await RefreshSessionValidityAsync();
         SeedSelection();
+        _progressService = Services.GetService<AdaptiveBarProgressService>();
+        if (_progressService is not null)
+        {
+            _progress = _progressService.Current;
+            _progressService.Changed += OnProgressChanged;
+            _progressService.Subscribe();
+        }
+
         Live.Updated += OnLiveUpdated;
         Live.QuoteUpdated += OnQuoteUpdated;
     }
@@ -220,6 +242,10 @@
     }
 
     static string FormatPrice(decimal? price) => price is { } p ? p.ToString("0.00") : "—";
+
+    /// <summary>Change as a percentage of the reference level (price − change); null when the reference is not positive. Display only.</summary>
+    static string? PercentText(decimal? price, decimal? change) =>
+        price is { } p && change is { } c && p - c > 0m ? (c / (p - c) * 100m).ToString("+0.00;-0.00;0.00", System.Globalization.CultureInfo.InvariantCulture) + "%" : null;
 
     static string FormatPriceWithChange(decimal? price, decimal? change)
     {
@@ -291,9 +317,21 @@
         _ = InvokeAsync(() => { if (_disposed) return; SeedSelection(); StateHasChanged(); });
     }
 
+    AdaptiveBarProgressService? _progressService;
+    BarProgress? _progress;
+
+    string ProgressMeta => _progress is null ? "" : _progress.UnavailableReason is { } why ? why : $"last completed bar {_progress.LastCompletedBarSeq} · {_progress.RuntimeStatus}";
+
+    void OnProgressChanged()
+    {
+        if (_disposed) return;
+        _ = InvokeAsync(() => { if (_disposed) return; _progress = _progressService?.Current; StateHasChanged(); });
+    }
+
     public void Dispose()
     {
         _disposed = true;
+        if (_progressService is not null) { _progressService.Changed -= OnProgressChanged; _progressService.Unsubscribe(); }
         Live.Updated -= OnLiveUpdated;
         Live.QuoteUpdated -= OnQuoteUpdated;
     }

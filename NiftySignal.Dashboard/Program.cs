@@ -118,6 +118,8 @@ builder.Services.AddSingleton<LiveDataService>();
 builder.Services.AddSingleton<AdaptiveObserverDataService>();
 builder.Services.AddSingleton<AdaptiveCommentaryDataService>();
 builder.Services.AddSingleton<AdaptiveQuoteAsOfService>();
+builder.Services.AddSingleton<VixSummaryService>();
+builder.Services.AddSingleton<AdaptiveBarProgressService>();
 builder.Services.AddSingleton<AdaptiveResearchService>();
 builder.Services.Configure<AdaptiveScreenshotOptions>(builder.Configuration.GetSection(AdaptiveScreenshotOptions.SectionName));
 builder.Services.Configure<TelegramOptions>(builder.Configuration.GetSection(TelegramOptions.SectionName));

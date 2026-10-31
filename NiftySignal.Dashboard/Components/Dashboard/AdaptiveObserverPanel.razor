@@ -6,6 +6,7 @@
 @implements IAsyncDisposable
 @inject AdaptiveObserverDataService AdaptiveData
 @inject AdaptiveResearchService Research
+@inject IServiceProvider Services
 
 <section class="adaptive-observer" data-requested-rows="@_rowCount" data-capture-ready="@(_captureReady ? "true" : "false")">
     <div class="adaptive-title-row">
@@ -846,7 +847,7 @@
                 if (view?.Catalog is not null && view.Model.SelectedStrike is { } pinnedStrike && _snapshot is not null)
                 {
                     // Pinned capture: the centre / expiry / tokens valid at the TARGET bar, bars through the target only.
-                    _summary = await AdaptiveData.LoadMarketSummaryAsync(_snapshot.Session.Id, _snapshot.Futures.FirstOrDefault()?.Bar.BarSeq ?? 0, view.Catalog, pinnedStrike);
+                    _summary = await WithVixAsync(await AdaptiveData.LoadMarketSummaryAsync(_snapshot.Session.Id, _snapshot.Futures.FirstOrDefault()?.Bar.BarSeq ?? 0, view.Catalog, pinnedStrike), _snapshot.Session.TradeDate, CancellationToken.None);
                 }
                 if (CaptureSessionId is not null && _snapshot is null) throw new InvalidOperationException("Capture session is unavailable.");
                 _captureReady = true;
@@ -984,6 +985,23 @@
         await RefreshResearchAsync(ct);
     }
 
+    /// <summary>Adds the as-of India VIX (informational: a failed or missing VIX read leaves the rest of the summary untouched and says why).</summary>
+    async Task<MarketSummaryView> WithVixAsync(MarketSummaryView view, DateOnly tradeDate, CancellationToken ct)
+    {
+        if (view.Instants is null) return view;
+        var vix = Services.GetService<VixSummaryService>();
+        if (vix is null) return view with { VixUnavailableReason = "VIX service not configured" };
+        try
+        {
+            var r = await vix.LoadAsync(tradeDate, view.Instants, ct);
+            return view with { Vix = r.Windows, VixUnavailableReason = r.UnavailableReason };
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return view with { VixUnavailableReason = $"VIX read failed ({ex.GetType().Name})" };
+        }
+    }
+
     async Task RefreshSummaryAsync(CancellationToken ct)
     {
         if (_snapshot is null)
@@ -1002,7 +1020,7 @@
 
         try
         {
-            _summary = await AdaptiveData.LoadMarketSummaryAsync(_snapshot.Session.Id, through, _catalog, strike, ct);
+            _summary = await WithVixAsync(await AdaptiveData.LoadMarketSummaryAsync(_snapshot.Session.Id, through, _catalog, strike, ct), _snapshot.Session.TradeDate, ct);
             _summaryKey = key;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)

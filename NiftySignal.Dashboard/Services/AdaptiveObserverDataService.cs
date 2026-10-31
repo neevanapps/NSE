@@ -301,8 +301,18 @@ public sealed class AdaptiveObserverDataService(
 
         var futures = bars.ToDictionary(b => b.BarSeq, b => MarketSummaryMapper.FuturesBarOf(b, sup.GetValueOrDefault(b.BarSeq)));
         var history = new NiftySignal.MarketSummary.ContractHistory(MarketSummaryMapper.ContractBars(stored, tokens, catalog.Expiry, endBarSeq), bars.ToDictionary(b => b.BarSeq, b => b.DurationSeconds));
+        // The boundaries of each window (start of its first bar, end of the target bar) for the as-of VIX alignment; bars are completed bars through the target only.
+        var startOf = bars.ToDictionary(b => b.BarSeq, b => b.StartAvailableAtUtc);
+        var endOf = bars.ToDictionary(b => b.BarSeq, b => b.EndAvailableAtUtc);
+        var instants = NiftySignal.MarketSummary.SummaryWindow.All.Select(w =>
+        {
+            var from = w.Bars is { } n ? endBarSeq - n + 1 : 1;
+            return new NiftySignal.MarketSummary.WindowInstant(w,
+                from >= 1 && startOf.TryGetValue(from, out var s) ? s : null,
+                endOf.TryGetValue(endBarSeq, out var e) ? e : null);
+        }).ToList();
         return new MarketSummaryView(endBarSeq, basket, NiftySignal.MarketSummary.FuturesSummaryCalculator.Compute(futures, endBarSeq),
-            NiftySignal.MarketSummary.OptionSummaryCalculator.ComputeAll(basket, history, endBarSeq), null);
+            NiftySignal.MarketSummary.OptionSummaryCalculator.ComputeAll(basket, history, endBarSeq), null, instants);
     }
 
     /// <summary>Bars (of the displayed range) whose sidecar carries a durable failed-verification marker. Tolerates a not-yet-migrated schema.</summary>
