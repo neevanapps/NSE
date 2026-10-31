@@ -354,6 +354,10 @@ public class HostReplayTests
             report.AppendLine($"mfe/mae recorded on {exits.Count} exits; rejection reasons: {string.Join(", ", rej.GroupBy(r => r.Reason).Select(g => $"{g.Key}={g.Count()}"))}");
             report.AppendLine($"alerts: outbox={outbox} sent={sent} expired={expired} fakeSenderTexts={telegram.Texts.Count}");
             report.AppendLine($"dashboard: strategies={view.Strategies.Count} trades={view.Trades.Count} rejections={view.Rejections.Count} failures={view.Failures.Count}");
+            var lagP = new List<long>(); await using (var lc = pev2.CreateCommand("SELECT processing_lag_ms FROM pev2.pev2_dispositions ORDER BY 1")) await using (var lr = await lc.ExecuteReaderAsync()) while (await lr.ReadAsync()) lagP.Add(lr.GetInt64(0));
+            var qsw = System.Diagnostics.Stopwatch.StartNew(); var qview = await svc.LoadAsync(U(day, 15, 35), default); qsw.Stop();
+            var ps = System.Diagnostics.Process.GetCurrentProcess();
+            report.AppendLine($"lag ms: p50={lagP[lagP.Count / 2]} p95={lagP[(int)(lagP.Count * 0.95)]} max={lagP[^1]}; dashboard LoadAsync (warm) {qsw.ElapsedMilliseconds} ms; test process peak working set {ps.PeakWorkingSet64 / 1048576} MB, managed heap {GC.GetTotalMemory(false) / 1048576} MB");
             report.AppendLine($"replay wall time: baseline {baseline.SimulatedMs / 1000.0:0.0}s, with V2 {withV2.SimulatedMs / 1000.0:0.0}s");
             if (keep) report.AppendLine($"KEPT databases: {srcDb}, {obsA}, {obsB}, {pevDb}");
         }
