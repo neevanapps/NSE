@@ -137,7 +137,7 @@ public class HostReplayTests
         s.AddDbContext<AdaptiveObserverDbContext>(o => o.UseNpgsql(DbCs(observerDb)));
         s.AddOptions<PricingOptions>();
         s.Configure<DashboardPushOptions>(o => o.HubUrl = "http://127.0.0.1:1/hubs/never-connected");
-        s.AddSingleton<AdaptiveSourceTickReader>(); s.AddSingleton<AdaptiveHistoricalBootstrapService>(); s.AddSingleton<AdaptiveSessionCoordinator>();
+        s.AddSingleton<AdaptiveSourceTickReader>(); s.AddSingleton<AdaptiveHistoricalBootstrapService>(); s.AddSingleton(sp => new AdaptiveSessionCoordinator(sp.GetRequiredService<AdaptiveSourceTickReader>(), sp.GetRequiredService<Microsoft.Extensions.Options.IOptionsMonitor<PricingOptions>>(), sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<AdaptiveSessionCoordinator>>(), NiftySignal.AdaptiveObserver.AdaptiveClockMode.Fixed13650));
         s.AddSingleton<AdaptiveObserverPersistence>(); s.AddSingleton<AdaptiveSupplementalPersistence>(); s.AddSingleton<AdaptiveWeak2ObservationService>();
         s.AddSingleton<AdaptiveStateRecoveryService>(); s.AddSingleton<AdaptiveEndedSessionRecoveryService>(); s.AddSingleton<DashboardPushClient>();
         s.AddSingleton<AdaptiveSessionSupplementalService>();
@@ -165,7 +165,7 @@ public class HostReplayTests
         var dir = Path.Combine(Path.GetTempPath(), "v2-replay-strategies-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
         // 30 ENABLED configurations with different thresholds, windows and exits over the real summary metrics; what each does on the recorded session is whatever the data produces.
-        var windows = new[] { "5", "10", "20" };
+        var windows = new[] { "5", "10", "50" };          // the metric windows are 5 / 10 / 50 / 100 / Day
         for (var i = 1; i <= count; i++)
         {
             var id = $"R{i:00}";
@@ -239,6 +239,7 @@ public class HostReplayTests
         }
 
         await worker.CloseCurrentSessionAsync(live, default);
+        clock.Set(U(day, 15, 40));          // the recorded close flushes events stamped after the last poll; wall time is never behind an event, so the replay clock must not be either
         if (bridge is not null) await WaitIdleAsync(bridge);
         var extra = new Dictionary<string, string>();
         if (bridge is not null && pev2Db is not null)
@@ -311,6 +312,7 @@ public class HostReplayTests
             var events = await store.ReadAsync(U(day, 3, 0), U(day, 23, 59), null, PostgresEventStore.MaxRead, default);
             var placed = events.OfType<EntryOrderPlaced>().ToList(); var filled = events.OfType<EntryFilled>().ToList(); var exits = events.OfType<ExitFilled>().ToList(); var rej = events.OfType<EntryRejected>().ToList();
 
+            Assert.Equal(strategies, await Scalar("SELECT count(*) FROM pev2.pev2_strategy_configs"));          // every generated file was accepted by the strict validator
             Assert.Equal(frames, disp);
             Assert.True(frames > 0);
             // causality: every fill used a quote that became available strictly after its decision, with the all-or-none full quantity
