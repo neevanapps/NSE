@@ -283,7 +283,15 @@ public class AlertTests
         var b = new AlertDispatcher(db, transport, new AlertOptions(), clock);
         await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => a.DispatchAsync(AlertDispatcher.MaxBatch + 1, default));
         var reports = await Task.WhenAll(a.DispatchAsync(50, default), b.DispatchAsync(50, default), a.DispatchAsync(50, default));
-        Assert.Equal(60, reports.Sum(x => x.Sent));
+        var total = reports.Sum(x => x.Sent);
+        while (true)                                                                         // rows another dispatcher had locked are skipped (not lost): a follow-up round picks them up
+        {
+            var more = await a.DispatchAsync(50, default);
+            if (more.Claimed == 0) break;
+            total += more.Sent;
+        }
+
+        Assert.Equal(60, total);
         Assert.Equal(60, transport.Sent.Distinct().Count());
         Assert.Equal(60, transport.Sent.Count);
         Assert.Equal(60, (await RowsAsync(db)).Count(x => x.Status == (int)AlertStatus.Sent && x.Attempts == 1));
