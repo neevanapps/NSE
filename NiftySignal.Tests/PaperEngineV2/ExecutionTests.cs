@@ -82,6 +82,8 @@ static class ExecFixtures
         }
     }
 
+    public static void Process(PaperEngine engine, MarketStateFrame frame, FrameDisposition disposition) => engine.ProcessAsync(frame, null, disposition, default).AsTask().GetAwaiter().GetResult();
+
     public static PaperEngine Engine(IEnumerable<CompiledStrategy> s, ExecutionOptions? o = null, IPaperEventSink? sink = null) => new(s, o ?? Options(), sink);
 
     public static List<T> Of<T>(PaperEngine e) where T : PaperEvent => e.Events.OfType<T>().ToList();
@@ -157,13 +159,13 @@ public class ExecutionTests
     public void EntriesBlocked_RejectsTheSignal_AndCancelsAPendingOrder()
     {
         var e = ExecFixtures.Engine([ExecFixtures.Strat()]);
-        e.ProcessAsync(ExecFixtures.Fr(5, dir: 10), null, ExecFixtures.Blocked, default).AsTask().Wait();
+        ExecFixtures.Process(e, ExecFixtures.Fr(5, dir: 10), ExecFixtures.Blocked);
         Assert.Empty(ExecFixtures.Of<EntryOrderPlaced>(e));
         Assert.Equal(RejectionReason.EntriesBlocked, Assert.Single(ExecFixtures.Of<EntryRejected>(e)).Reason);
 
         var p = ExecFixtures.Engine([ExecFixtures.Strat()]);
         ExecFixtures.Run(p, [ExecFixtures.Fr(5, dir: 10)]);
-        p.ProcessAsync(ExecFixtures.Fr(6, quotes: [new("CE26000", 125.5, 127)]), null, ExecFixtures.Blocked, default).AsTask().Wait();
+        ExecFixtures.Process(p, ExecFixtures.Fr(6, quotes: [new("CE26000", 125.5, 127)]), ExecFixtures.Blocked);
         Assert.Empty(ExecFixtures.Of<EntryFilled>(p));                                  // blocked before the fill: fail closed, never filled later
         Assert.Contains(ExecFixtures.Of<EntryRejected>(p), r => r.Reason == RejectionReason.EntriesBlocked && r.IntentId is not null);
         ExecFixtures.Run(p, [ExecFixtures.Fr(7, quotes: [new("CE26000", 125.5, 127)])]);
@@ -289,7 +291,7 @@ public class ExecutionTests
         var req = Assert.Single(ExecFixtures.Of<ExitRequested>(e));
         Assert.Equal(ExitReason.Discretionary, req.Reason);
         Assert.Empty(ExecFixtures.Of<ExitFilled>(e));                                    // not on the decision frame
-        e.ProcessAsync(ExecFixtures.Fr(8, quotes: [new("CE26000", 141, 142)]), null, ExecFixtures.Blocked, default).AsTask().Wait();          // entries blocked: exits still fill
+        ExecFixtures.Process(e, ExecFixtures.Fr(8, quotes: [new("CE26000", 141, 142)]), ExecFixtures.Blocked);          // entries blocked: exits still fill
         var x = Assert.Single(ExecFixtures.Of<ExitFilled>(e));
         Assert.Equal(140.5m, x.FillPrice);
         var model = new CostModel(new CostsConfig { Schedules = [ExecFixtures.Schedule()] }, FrameFixtures.Day);
@@ -409,7 +411,7 @@ public class ExecutionTests
         ExecFixtures.Run(e, [ExecFixtures.Fr(5, dir: 10), ExecFixtures.Fr(6, quotes: [new("CE26000", 126.5, 127)])]);
         var nextDay = MarketStateFrame.Create(FrameFixtures.Identity(2, 1) with { TradeDate = FrameFixtures.Day.AddDays(1), BarStartAvailableAt = FrameFixtures.End(1).AddDays(1).AddSeconds(-60), BarEndAvailableAt = FrameFixtures.End(1).AddDays(1) },
             FrameFixtures.BasketId(), [], [], [], new VixAvailability(null, null, "Missing"));
-        e.ProcessAsync(nextDay, null, ExecFixtures.Allowed, default).AsTask().Wait();
+        ExecFixtures.Process(e, nextDay, ExecFixtures.Allowed);
         Assert.Equal(PositionState.Unresolved, e.Runtimes.Single().Positions().Single().State);
     }
 
@@ -502,7 +504,7 @@ public class ExecutionTests
         Assert.Single(e.Events);
     }
 
-    static List<MarketStateFrame> Day()
+    internal static List<MarketStateFrame> Day()
     {
         var frames = new List<MarketStateFrame>();
         for (var i = 1; i <= 60; i++)

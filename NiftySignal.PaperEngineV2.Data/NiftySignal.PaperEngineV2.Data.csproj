@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Paper Engine V2 persistence (Phase 6d): its OWN model, schema ("pev2"), migration history and tables ("pev2_*"), in the existing trading database. Never touches the trading.* tables,
+       never creates a database, never applies a migration (an owner runs the reviewed idempotent script), and the design-time factory uses an unreachable placeholder host.
+       No broker, ingestion or Dashboard reference. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" />
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NiftySignal.PaperEngineV2.Core\NiftySignal.PaperEngineV2.Core.csproj" />
+    <ProjectReference Include="..\NiftySignal.PaperEngineV2.Execution\NiftySignal.PaperEngineV2.Execution.csproj" />
+  </ItemGroup>
+
+</Project>
