@@ -1,8 +1,51 @@
-# Paper Engine V2 – architecture and design (revision 2, DESIGN ONLY)
+# Paper Engine V2 – architecture and design (revision 3: fixed decisions recorded; implementation proceeds phase by phase)
 
 Branch `feature/market-summary-paper-engine-v2`. **Nothing here is implemented.** Revision 2 records the owner's approval of **Option B** (separate `PaperEngineV2.Core` + `PaperEngineV2.Data`, new `pev2_` tables in the existing trading database) and refines the design: independent persistence, observer isolation, time causality, buy-only direction terminology, the future live-selection boundary, and the execution decision matrix. Every default below that is not an existing repo fact is a **PROPOSAL awaiting owner approval** and is flagged `OWNER`. Nothing may be implemented, enabled, migrated or deployed from this document alone.
 
+**Revision 3 (after owner acceptance of revision 2 at `d25ef5a`)** records the owner's FIXED architecture decisions and FROZEN execution defaults in §0 and separates them from the assumptions that still need source verification (§0.3). Where §0 and a later section disagree, **§0 wins**; sections §2.1, §3, §5 and §9 are annotated accordingly. Implementation proceeds one sub-phase at a time (6a first) with a stop at each checkpoint. A passing synthetic simulation never proves real-world execution quality.
+
 Safety envelope (unchanged, applies to every phase): paper only; V2 disabled by default; **no broker interface, router, order submission or live-enabling control exists in Phases 6a–6g**; no change to NPT1 strategies, codec (`trading-codec/5`), engine, bar clock, positions, orders, fills or ledger; no VM / production-database access; no merge to master.
+
+## 0. FIXED decisions, FROZEN defaults, and what still needs verification
+
+### 0.1 FIXED architecture decisions (owner-approved)
+1. **Option B** stays: separate `PaperEngineV2.Core`, separate `PaperEngineV2DbContext`, new `pev2_` tables in the existing trading database; every NPT1 isolation guarantee stays.
+2. **Bounded asynchronous V2 worker.** The observer must NEVER wait on V2 database or evaluation work. Frame sequence and causal timestamps are preserved end to end.
+3. **Fail closed for entries.** Every overflow, missing journal frame or failed persistence operation blocks NEW entries. Sequence gaps are detected and recorded once persistence recovers; the system never claims durable recording while storage itself is unavailable. A missed entry signal is **never executed retroactively**.
+4. **V2 migrations are applied ONLY by an explicit owner-run script** (`pev2-schema.idempotent.sql`). Host start-up only CHECKS schema compatibility (version row + expected tables/columns) and fails V2 closed (V2 inactive, alert) when the schema is missing or incompatible. V2 never auto-migrates. (Supersedes the §2.1 option list.)
+5. **V2 event screenshots** for paper-trade open/close are allowed and configurable; Telegram delivery has a **per-event-class opt-in, OFF by default**.
+6. **`requireFreshVix`** is an allowed optional entry filter, OFF by default.
+7. **Frame-journal retention >= 90 days initially; no automatic pruning in Phase 6.** A configurable retention/archival policy is a documented future item.
+8. **Live boundary (mandatory, design only):** up to 30 simultaneous paper strategies, at most **two** explicitly authorized live strategy IDs ever; authorization is independent of strategy JSON, default OFF and checked at the execution boundary; a strategy can never gain live permission by editing its own config. No broker execution, live router or live enablement is authorized in Phase 6.
+
+### 0.2 FROZEN execution defaults (the V2 contract)
+| # | Frozen default |
+|---|---|
+| 1 | Entry and exit signals are evaluated only on **verified completed bars**. A simulated fill requires a genuinely NEWER market observation than the decision (strictly later availability instant), including across zero-duration split bars (§4). |
+| 2 | **Buy CE or buy PE only.** Select from the signal-time exact ATM±2 basket within the **Rs 100–150 ASK-premium range**. Expiry, strike and token are frozen for the trade. Tie-breakers, in order: **proximity of the ask to Rs 125**, then distance of the strike from the signal-time centre, then stable strike / token ordering. |
+| 3 | Buy at the executable ask, close at the executable bid; configurable conservative slippage; the validated fee model. |
+| 4 | Maximum quote age **2 s initially** for normal fills, subject to the cadence audit in §0.3: if 2 s makes the simulation unreliable or leaves too few valid quotes, **report the evidence; do not silently relax freshness**. |
+| 5 | **All-or-none** simulated orders by default. Partial-fill semantics are implemented only where size units, reliability and lot-multiple constraints are VERIFIED; real exchange fills are never inferred from Level-1 quotes. |
+| 6 | Opposite signal = **Exit only**; no automatic reversal. |
+| 7 | Fixed lots using the actual instrument-master lot size; independent virtual capital per strategy; capital is explicit configuration, never an engine default. |
+| 8 | **Explicit daily-loss, max-trade and max-position controls are mandatory.** Protective entry blocking on breach, plus a separately defined liquidation behaviour. |
+| 9 | Optional JSON stops, targets, trailing exits and max hold, **disabled by default**, evaluated on completed bars; a threshold price is never assumed executable. |
+| 10 | Entries begin 09:30 and cease 15:00 IST. Terminal liquidation is attempted at 15:00; with no valid bid a **PENDING exit** is kept and retried on later eligible quotes; no fictional fill is ever recorded; unresolved positions are reported. |
+| 11 | Reuse the existing date-effective NSE cost schedules and deterministic rounding. |
+| 12 | Typed rejection / cancellation / failure taxonomy with durable event identities. |
+| 13 | Shadow mode = the complete simulated lifecycle with independently journaled signals, orders, fills and ledger entries. |
+| 14 | Independent per-strategy results; any combined total is labelled hypothetical, not a shared funded portfolio. |
+| 15 | Versioned, validated JSON configs loaded at session initialization; changes take effect the FOLLOWING session only; no Dashboard JSON editor; no mid-session rule changes. |
+
+### 0.3 Assumptions that STILL require source verification (not facts)
+| Open item | Why it is not yet fact | How it will be verified |
+|---|---|---|
+| **Real option-quote cadence** vs the 2 s age limit | The branch has measured India VIX cadence (`docs/MARKET_SUMMARY_METRICS.md` §6.1) but **not** option top-of-book cadence; NPT1's 2 s is a research policy and the observer sidecars use 5 s. | Study on the local tick copy: per-token gap distribution for ATM±2 contracts in the Rs 100–150 premium band; share of decision instants with a valid <= 2 s two-sided quote strictly after the decision, per session. Report the evidence; do not change 2 s silently. |
+| **Size-unit reliability** (units vs lots for top-of-book quantities; reliability for liquidity) | Level-1 bid/ask quantities exist in the tick table but their unit and reliability relative to lot size were never verified here. | Audit against the instrument-master lot size and feed documentation before any partial-fill logic; until then all-or-none. |
+| **Lot-size source per trade date** | NPT1 reads lot size from the instrument master; V2 must prove the same field is complete for the signal-time basket. | Instrument-master check in 6c. |
+| **Terminal / pending-exit retry horizon after 15:00** | NPT1 closes a pending terminal exit at the first later bid (`DelayedTerminalClose`) and reports `UnresolvedAtClose` at 15:35; V2 keeps the exit PENDING and retries, with the retry cut-off undefined. | Owner decision (proposal: retry until the 15:35 hard end, then report UNRESOLVED). |
+| **Channel capacity / `MaxProcessingLag` values** | No measurement exists. | Phase 6g benchmarks. |
+| **Stop / target / trailing reference prices** | The executable price at which a stop triggers is not defined by completed-bar data. | Defined in 6c; until then only bar-end bid evaluation with explicit documentation. |
 
 ## 1. Source evidence this design rests on (verified in the repo)
 
@@ -37,7 +80,7 @@ Projects: `NiftySignal.PaperEngineV2.Core` (pure: config schema/validator, metri
 ### 2.1 Independent persistence
 * A **separate `PaperEngineV2DbContext`** with its **own migration history table** (`__pev2_migrations_history`, via `MigrationsHistoryTable`) in the existing trading database. Its migrations are additive (`CREATE TABLE pev2_…`, indexes) and never ALTER/DROP/TRUNCATE any existing object; no foreign key references an NPT1/`trading` table. The existing `TradingDbContext` and its idempotent SQL/model snapshot are not touched.
 * Idempotent SQL script `pev2-schema.idempotent.sql` for owner-applied deployment, same pattern as `trading-schema.idempotent.sql`.
-* **Migration application policy (OWNER):** (a) the V2 context migrates only when `PaperEngineV2:Enabled=true` (nothing happens to the production database while V2 is off — recommended), or (b) always at Host start like the other contexts, or (c) only by the owner-run script. Recommended (a)+(c).
+* **Migration application policy (FIXED, §0.1-4):** migrations are applied ONLY by the explicit owner-run idempotent script; the Host performs a read-only compatibility check at start and keeps V2 closed when the schema is missing or incompatible. The V2 context never calls `Migrate()`.
 * DB roles: the Host role needs INSERT/UPDATE/SELECT on `pev2_*` only for V2; the Dashboard role SELECT only. Verified in the disposable-database tests.
 
 ## 3. Observer isolation, journal and gap handling
@@ -79,14 +122,14 @@ V2 v1 **only BUYS calls and BUYS puts**. The JSON vocabulary makes selling/writi
   "sourceModel": "fixed13650-summary-v1",
   "entry": { "buyCall": <ConditionGroup>, "buyPut": <ConditionGroup> },
   "exit":  { "conditions": <ConditionGroup>, "onOppositeEntrySignal": "Exit" },         // v1: only "Exit"
-  "filters": { "entryFrom": "09:30:00", "entryBefore": "15:00:00" },
-  "instrument": { "basket": "SignalTimeAtmPm2", "premium": { "min": <number>, "max": <number> }, "rank": "NearestCentreThenPremiumMidThenLowerStrikeThenToken" },
+  "filters": { "entryFrom": "09:30:00", "entryBefore": "15:00:00", "requireFreshVix": false },    // §0.2-10 bounds; §0.1-6
+  "instrument": { "basket": "SignalTimeAtmPm2", "premium": { "min": <number>, "max": <number> }, "rank": "PremiumProximityThenCentreDistanceThenStrikeThenToken" },   // frozen §0.2-2: ask nearest Rs 125 (range midpoint), then centre distance, then strike, then token
   "execution": { "fillQuote": "FirstAfterDecision", "entryPrice": "Ask", "exitPrice": "Bid", "slippage": {"entry": <number>, "exit": <number>}, "latencyMs": <int>,
-                 "maxQuoteAgeMs": <int>, "maxSpread": {...}, "entryOrderLifetimeMs": <int>, "maxProcessingLagMs": <int>, "liquidity": {...} },
+                 "maxQuoteAgeMs": <int>, "maxSpread": {...}, "entryOrderLifetimeMs": <int>, "maxProcessingLagMs": <int>, "fillMode": "AllOrNone" },          // frozen §0.2-5; "Partial" is rejected until size units are verified
   "quantity": { "lots": <int> },
   "capital": { "virtualCapital": <number> },
   "position": { "maxConcurrent": <int> },
-  "risk": { "maxDailyLoss": <number>?, "maxDailyTrades": <int>?, "onBreach": { "blockEntries": true, "liquidate": false } },
+  "risk": { "maxDailyLoss": <number>, "maxDailyTrades": <int>, "onBreach": { "blockEntries": true, "liquidation": "None|ExitOpenPositions" } },   // all mandatory (frozen §0.2-8)
   "exits": { "stopLoss": {...}?, "target": {...}?, "trailing": {...}?, "maxHoldBars": <int>? },       // verified completed bars only in v1
   "fees": { "schedule": "<cost schedule id>" } }
 ```
@@ -117,7 +160,7 @@ V2 v1 **only BUYS calls and BUYS puts**. The JSON vocabulary makes selling/writi
 
 `pev2_schema_versions`, `pev2_config_versions` (strategy, version, canonical JSON, SHA-256, validation outcome), `pev2_runs`, `pev2_frames` (unique `(run_id, bar_seq)`; hash; payload; availability keys; `processing_lag_ms`), `pev2_gaps` / `pev2_recovery_log`, `pev2_strategy_state` (checkpoint + digest per strategy per frame), `pev2_signals`, `pev2_orders`, `pev2_fills` (every partial fill is its own row, `(order_id, fill_seq)` unique), `pev2_positions`, `pev2_ledger_entries` (gross, each fee component, net; `ledger_kind`), `pev2_risk_counters`, `pev2_rejections` (typed reason, §9.12), `pev2_events` + `pev2_notification_outbox`. All rows carry `run_id`, `strategy_id`, `config_hash`; idempotency is enforced by unique keys, not by application checks. No FK into `trading`.
 
-## 9. Execution decision matrix (PROPOSED defaults — none owner-approved)
+## 9. Execution decision matrix (revision 2 proposals; the owner has since FROZEN the defaults in §0.2, and where they differ §0.2 governs; the table is kept for its source-evidence column and the remaining open points)
 
 Legend: **Src** = what the repository evidence says; `AGREES` / `DISAGREES` / `NEW`. **OWNER** = needs explicit approval before implementation.
 
