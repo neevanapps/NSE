@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Paper Engine V2 frame builder (Phase 6b): maps the pure Market Summary results of one verified completed fixed-13,650 bar into an immutable MarketStateFrame.
+       Pure: references only PaperEngineV2.Core and MarketSummary. No database, no clock, no I/O, no observer or broker reference. -->
+  <ItemGroup>
+    <ProjectReference Include="..\NiftySignal.PaperEngineV2.Core\NiftySignal.PaperEngineV2.Core.csproj" />
+    <ProjectReference Include="..\NiftySignal.MarketSummary\NiftySignal.MarketSummary.csproj" />
+  </ItemGroup>
+
+</Project>

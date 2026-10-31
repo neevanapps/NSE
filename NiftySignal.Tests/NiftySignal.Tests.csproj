@@ -41,6 +41,7 @@
     <ProjectReference Include="..\NiftySignal.Npt1M1\NiftySignal.Npt1M1.csproj" />
     <ProjectReference Include="..\NiftySignal.MarketSummary\NiftySignal.MarketSummary.csproj" />
     <ProjectReference Include="..\NiftySignal.PaperEngineV2.Core\NiftySignal.PaperEngineV2.Core.csproj" />
+    <ProjectReference Include="..\NiftySignal.PaperEngineV2.Frames\NiftySignal.PaperEngineV2.Frames.csproj" />
     <ProjectReference Include="..\NiftySignal.Npt1M1.Data\NiftySignal.Npt1M1.Data.csproj" />
   </ItemGroup>
 
