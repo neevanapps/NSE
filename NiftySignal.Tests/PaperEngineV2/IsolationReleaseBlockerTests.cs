@@ -60,7 +60,7 @@ public class IsolationReleaseBlockerTests
     }
 
     [Fact]
-    public void NoNpt1ObserverOrHostProject_ReferencesAV2Project()
+    public void NoNpt1ObserverOrHostProject_ReferencesAV2Project_ExceptTheHostToTheRuntimeOnly()
     {
         var root = TradingModelTests.RepoRoot();
         foreach (var proj in Directory.EnumerateFiles(root, "*.csproj", SearchOption.AllDirectories).Where(p => !p.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}") && !p.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}")))
@@ -68,30 +68,53 @@ public class IsolationReleaseBlockerTests
             var name = Path.GetFileNameWithoutExtension(proj);
             if (name.StartsWith("NiftySignal.PaperEngineV2", StringComparison.Ordinal) || name == "NiftySignal.Tests") continue;
             var text = File.ReadAllText(proj);
-            if (name is "NiftySignal.Dashboard") continue;                       // Phase 7 may add a READ-ONLY reference; guarded by its own test then
+            if (name is "NiftySignal.Dashboard") continue;                       // Phase 7: a READ-ONLY reference to the Data project, guarded by HomeV2Tests
+            if (name is "NiftySignal.Host")
+            {
+                // The owner-authorised Host integration references the Runtime project and nothing else of V2.
+                var refs = Regex.Matches(text, @"NiftySignal\.PaperEngineV2\.[A-Za-z]+").Select(m => m.Value).Distinct().ToArray();
+                Assert.Equal(["NiftySignal.PaperEngineV2.Runtime"], refs);
+                continue;
+            }
+
             Assert.DoesNotContain("PaperEngineV2", text, StringComparison.Ordinal);
         }
     }
 
     [Fact]
-    public void Host_ConfigAndSource_DoNotMentionV2_SoItIsDisabledByDefault()
+    public void Host_MentionsV2OnlyInTheBridge_TheHookSites_AndADisabledByDefaultConfig()
     {
         var host = Path.Combine(TradingModelTests.RepoRoot(), "NiftySignal.Host");
+        var allowed = new[] { "PaperEngineV2Bridge.cs", "AdaptiveObserverWorker.cs", "Program.cs", "NiftySignal.Host.csproj", "appsettings.json" };
         foreach (var file in Directory.EnumerateFiles(host, "*", SearchOption.AllDirectories).Where(f => (f.EndsWith(".cs") || f.EndsWith(".json") || f.EndsWith(".csproj"))
                      && !f.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}") && !f.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}") && !f.EndsWith("appsettings.Local.json", StringComparison.Ordinal)))
         {
             var text = File.ReadAllText(file);
-            Assert.DoesNotContain("PaperEngineV2", text, StringComparison.Ordinal);
-            Assert.DoesNotContain("pev2", text, StringComparison.OrdinalIgnoreCase);
+            var mentions = text.Contains("PaperEngineV2", StringComparison.Ordinal) || text.Contains("pev2", StringComparison.OrdinalIgnoreCase);
+            if (!allowed.Contains(Path.GetFileName(file))) Assert.False(mentions, $"{Path.GetFileName(file)} mentions V2 but is not an approved V2 file");
         }
+
+        // V2 is DISABLED by default: the source config has Enabled=false, the options binder's missing-value default is false, and the (owner-local) Development file does not turn it on.
+        var settings = File.ReadAllText(Path.Combine(host, "appsettings.json"));
+        Assert.Matches(@"""PaperEngineV2""\s*:\s*\{\s*""Enabled""\s*:\s*false", settings);
+        Assert.False(NiftySignal.Host.PaperEngineV2.PaperEngineV2Bridge.Bind(new Microsoft.Extensions.Configuration.ConfigurationBuilder().Build()).Enabled);
+        Assert.DoesNotContain("PaperEngineV2", File.ReadAllText(Path.Combine(host, "appsettings.Development.json")), StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void RuntimePath_ReachesNoBrokerIngestionNpt1OrLiveAssembly_AndNoDirectHttp()
+    {
+        var closure = Closure(["NiftySignal.PaperEngineV2.Runtime"]);
+        var banned = Forbidden.Where(f => f is not ("NiftySignal.AdaptiveObserver" or "NiftySignal.Persistence" or "NiftySignal.Notifications")).ToArray();
+        Assert.Empty(closure.Keys.Intersect(banned, StringComparer.Ordinal));
+        Assert.DoesNotContain(closure["NiftySignal.PaperEngineV2.Runtime"].GetReferencedAssemblies(), a => a.Name == "System.Net.Http");
+    }
     [Fact]
     public void V2Sources_ContainNoOrderSubmissionBrokerOrLiveAuthorisationVocabulary()
     {
         var banned = new[] { "PlaceOrder", "SubmitOrder", "BrokerOrder", "FlatTrade", "Flattrade", "NorenApi", "ModifyOrder", "HttpClient", "LiveAuthor", "AllowLive", "LiveStrategy", "SellToOpen", "ShortSell", "WriteOption" };
         var root = TradingModelTests.RepoRoot();
-        foreach (var project in new[] { "NiftySignal.PaperEngineV2.Frames", "NiftySignal.PaperEngineV2.Execution", "NiftySignal.PaperEngineV2.Data", "NiftySignal.PaperEngineV2.Alerts" })
+        foreach (var project in new[] { "NiftySignal.PaperEngineV2.Frames", "NiftySignal.PaperEngineV2.Execution", "NiftySignal.PaperEngineV2.Data", "NiftySignal.PaperEngineV2.Alerts", "NiftySignal.PaperEngineV2.Runtime" })
             foreach (var file in Directory.EnumerateFiles(Path.Combine(root, project), "*.cs", SearchOption.AllDirectories).Where(f => !f.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}") && !f.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}") && !f.Contains($"{Path.DirectorySeparatorChar}Migrations{Path.DirectorySeparatorChar}")))
             {
                 var text = File.ReadAllText(file);

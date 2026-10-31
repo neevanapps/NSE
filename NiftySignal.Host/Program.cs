@@ -185,6 +185,11 @@ try
     // creates a paper or real order.
     // Live PAPER trading path: off unless Trading:PaperLive:Enabled is set; no broker, order or HTTP type is involved.
     builder.Services.AddSingleton<NiftySignal.Host.PaperLive.PaperLiveBridge>();
+    // Paper Engine V2 SHADOW (paper only, no broker): PaperEngineV2:Enabled is false in source; disabled, the bridge is inert (no connection, task or file). Startup only CHECKS the pev2 schema.
+    if (builder.Configuration.GetSection("PaperEngineV2:Alerts").GetChildren().Any(c => string.Equals(c.Value, "true", StringComparison.OrdinalIgnoreCase)))
+        builder.Services.AddHttpClient<NiftySignal.Notifications.ITelegramTextSender, NiftySignal.Notifications.TelegramTextSender>();
+    builder.Services.AddSingleton<NiftySignal.Host.PaperEngineV2.PaperEngineV2Bridge>();
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<NiftySignal.Host.PaperEngineV2.PaperEngineV2Bridge>());
     builder.Services.AddSingleton<AdaptiveSourceTickReader>();
     builder.Services.AddSingleton<AdaptiveHistoricalBootstrapService>();
     // New adaptive sessions use the fixed 13,650-contract clock (config Adaptive:Clock:Mode = OpeningVolumeV1 restores the legacy estimator for NEW sessions). Existing sessions keep their frozen model.

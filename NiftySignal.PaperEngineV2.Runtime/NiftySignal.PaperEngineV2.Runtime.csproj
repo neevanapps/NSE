@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Paper Engine V2 Host runtime (Phase 8+ integration): the glue between the Adaptive Observer's completed bars and the pure V2 engine. Observer side: O(1) non-blocking notice hand-off only.
+       V2 side (own tasks): frame assembly from the persisted sidecars, bounded handoff, durable journal, engine, ledger, alert outbox. Paper / shadow only: no broker, ingestion or order reference. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NiftySignal.PaperEngineV2.Core\NiftySignal.PaperEngineV2.Core.csproj" />
+    <ProjectReference Include="..\NiftySignal.PaperEngineV2.Frames\NiftySignal.PaperEngineV2.Frames.csproj" />
+    <ProjectReference Include="..\NiftySignal.PaperEngineV2.Execution\NiftySignal.PaperEngineV2.Execution.csproj" />
+    <ProjectReference Include="..\NiftySignal.PaperEngineV2.Data\NiftySignal.PaperEngineV2.Data.csproj" />
+    <ProjectReference Include="..\NiftySignal.PaperEngineV2.Alerts\NiftySignal.PaperEngineV2.Alerts.csproj" />
+    <ProjectReference Include="..\NiftySignal.MarketSummary\NiftySignal.MarketSummary.csproj" />
+    <ProjectReference Include="..\NiftySignal.AdaptiveObserver\NiftySignal.AdaptiveObserver.csproj" />
+    <ProjectReference Include="..\NiftySignal.AdaptiveObserverData\NiftySignal.AdaptiveObserverData.csproj" />
+    <ProjectReference Include="..\NiftySignal.Persistence\NiftySignal.Persistence.csproj" />
+    <ProjectReference Include="..\NiftySignal.Domain\NiftySignal.Domain.csproj" />
+    <ProjectReference Include="..\NiftySignal.Trading.Core\NiftySignal.Trading.Core.csproj" />
+  </ItemGroup>
+
+</Project>

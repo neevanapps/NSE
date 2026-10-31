@@ -21,7 +21,8 @@ public sealed class AdaptiveObserverWorker(
     AdaptiveSupplementalPersistence supplemental,
     DashboardPushClient dashboardPush,
     ILogger<AdaptiveObserverWorker> logger,
-    PaperLive.PaperLiveBridge? paperLive = null) : BackgroundService
+    PaperLive.PaperLiveBridge? paperLive = null,
+    PaperEngineV2.PaperEngineV2Bridge? paperEngineV2 = null) : BackgroundService
 {
     static readonly TimeSpan IstOffset = TimeSpan.FromHours(5.5);
     static readonly TimeOnly MarketOpen = new(9, 15);
@@ -127,6 +128,7 @@ public sealed class AdaptiveObserverWorker(
 
                     // The live PAPER path (off by default) is told that a session starts or was recovered; it never throws into this loop.
                     paperLive?.OnSessionStarted(_live);
+                    paperEngineV2?.OnSessionStarted(_live);
                 }
 
                 await PollLiveAsync(_live, nowUtc, stoppingToken);
@@ -330,6 +332,7 @@ public sealed class AdaptiveObserverWorker(
             }
 
             paperLive?.OnGroup(groupTime, group, groupBars, live);
+            paperEngineV2?.OnGroup(group, groupBars);
 
             processed=groupEnd;
         }

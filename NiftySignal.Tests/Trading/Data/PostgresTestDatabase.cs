@@ -101,3 +101,15 @@ public sealed class PostgresFactAttribute : FactAttribute
         }
     }
 }
+
+/// <summary>A theory that is skipped (visibly) when the local test database is not configured.</summary>
+public sealed class PostgresTheoryAttribute : TheoryAttribute
+{
+    public PostgresTheoryAttribute()
+    {
+        if (!PostgresTestDatabase.Available)
+        {
+            Skip = $"{PostgresTestDatabase.Variable} is not set: the local PostgreSQL test database tests are skipped.";
+        }
+    }
+}
