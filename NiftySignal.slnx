@@ -14,6 +14,7 @@
   <Project Path="NiftySignal.Ingestion/NiftySignal.Ingestion.csproj" />
   <Project Path="NiftySignal.Notifications/NiftySignal.Notifications.csproj" />
   <Project Path="NiftySignal.MarketSummary/NiftySignal.MarketSummary.csproj" />
+  <Project Path="NiftySignal.PaperEngineV2.Core/NiftySignal.PaperEngineV2.Core.csproj" />
   <Project Path="NiftySignal.Npt1M1/NiftySignal.Npt1M1.csproj" />
   <Project Path="NiftySignal.Npt1M1.Data/NiftySignal.Npt1M1.Data.csproj" />
   <Project Path="NiftySignal.Persistence/NiftySignal.Persistence.csproj" />

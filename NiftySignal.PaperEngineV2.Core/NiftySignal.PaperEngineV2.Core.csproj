@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Paper Engine V2 core (docs/PAPER_ENGINE_V2_DESIGN.md, Phase 6a): pure strategy configuration, typed metric registry and three-valued condition evaluation.
+       No database, no clock, no I/O, no broker, no project references: a release-blocker test asserts the reference list stays empty. -->
+
+</Project>
