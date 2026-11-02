@@ -6,9 +6,7 @@
 }
 
 .adaptive-title-row,
-.adaptive-current-header,
-.adaptive-grid-toolbar,
-.adaptive-current-meta {
+.adaptive-grid-toolbar {
     display: flex;
     gap: 14px;
     align-items: center;
@@ -59,7 +57,6 @@
     gap: 8px;
 }
 
-.adaptive-current-bar,
 .adaptive-alert {
     background: var(--surface);
     border: 1px solid var(--border);
@@ -70,25 +67,6 @@
 .adaptive-alert-error {
     border-color: var(--bear);
     color: var(--bear);
-}
-
-.adaptive-progress-track {
-    height: 7px;
-    background: var(--surface);
-    border-radius: 4px;
-    overflow: hidden;
-    margin: 8px 0;
-}
-
-.adaptive-progress-fill {
-    height: 100%;
-    background: var(--accent);
-    transition: width .2s linear;
-}
-
-.adaptive-current-meta {
-    color: var(--text-dim);
-    font-size: .78rem;
 }
 
 .adaptive-table-wrap {

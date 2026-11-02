@@ -98,20 +98,8 @@
 
         @if (!CaptureMode)
         {
-        <div class="adaptive-current-bar">
-            <div class="adaptive-current-header">
-                <strong>Current incomplete adaptive bar</strong>
-                <span>@FmtInt(_snapshot.Runtime.CurrentPartialBarVolume) / @FmtInt(_snapshot.Session.BaseBarVolume) (@CurrentProgress.ToString("0.0")%)</span>
-            </div>
-            <div class="adaptive-progress-track">
-                <div class="adaptive-progress-fill" style="@($"width:{CurrentProgress:0.##}%")"></div>
-            </div>
-            <div class="adaptive-current-meta">
-                <span>Started: @FmtIst(_snapshot.Runtime.CurrentPartialBarStartedAtUtc)</span>
-                <span>Recovery: @RecoveryText</span>
-            </div>
-        </div>
-
+        @* The current incomplete adaptive bar (quantity, progress, start, staleness) is presented once, in the sticky NIFTY LIVE QUOTE panel. Only the runtime recovery diagnostic stays here. *@
+        <div class="adaptive-subtitle" data-testid="runtime-recovery">Runtime recovery: @RecoveryText</div>
         }
         <MarketSummarySection View="_summary" />
         <div class="adaptive-subtitle" data-testid="diagnostic-grids-banner">EXISTING DETAILED GRIDS – TEMPORARY DIAGNOSTICS</div>
@@ -1111,10 +1099,6 @@
     long ObservedVolume => _snapshot is null
         ? 0
         : (_snapshot.Runtime.LastCompletedBarSeq * _snapshot.Session.BaseBarVolume) + _snapshot.Runtime.CurrentPartialBarVolume;
-
-    double CurrentProgress => _snapshot is null || _snapshot.Session.BaseBarVolume <= 0
-        ? 0d
-        : Math.Min(100d, 100d * _snapshot.Runtime.CurrentPartialBarVolume / _snapshot.Session.BaseBarVolume);
 
     string ShortSource => _snapshot is null
         ? "—"

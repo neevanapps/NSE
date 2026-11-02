@@ -971,6 +971,18 @@ public sealed class AdaptiveCompactGridTests
     }
 
     [Fact]
+    public async Task LivePanel_HasNoSecondIncompleteBarPresentation_OnlyTheRecoveryDiagnostic()
+    {
+        // The current incomplete bar (quantity, progress, start, staleness) lives only in the sticky live quote; the research panel keeps just the runtime recovery line.
+        var factory = await SeedResearchAsync();
+        var html = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new());
+        Assert.DoesNotContain("Current incomplete adaptive bar", html);
+        Assert.DoesNotContain("adaptive-current-bar", html);
+        Assert.DoesNotContain("adaptive-progress-fill", html);
+        Assert.Single(System.Text.RegularExpressions.Regex.Matches(html, "data-testid=\"runtime-recovery\""));
+    }
+
+    [Fact]
     public async Task Capture_ContainsEveryRequiredPrimaryGridAndBlock_ExactlyOnce()
     {
         var factory = await SeedResearchAsync();
