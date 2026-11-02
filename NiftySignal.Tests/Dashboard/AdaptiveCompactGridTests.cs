@@ -493,7 +493,7 @@ public sealed class AdaptiveCompactGridTests
 
         Assert.Equal(3, Regex.Matches(html, "<table[ >]").Count);
         Assert.Equal(["Seq", "End IST", "Dur s", "Urgency", "Bar ΔPx", "Roll ΔPx", "Strict Δ", "Enriched Δ",
-            "MicroDev", "OFI", "Roll OI Δ", "ΔBasis", "Roll Efficiency", "Evolution", "State"], Headers(html, 0));
+            "MicroDev (Inv)", "OFI", "Roll OI Δ", "ΔBasis", "Roll Efficiency", "Evolution", "State"], Headers(html, 0));
         Assert.Equal(["Seq", "End IST", "Center", "Roll?", "CE ΔPx", "PE ΔPx", "CE Roll ΔPx", "PE Roll ΔPx", "CE Strict Δ", "PE Strict Δ",
             "CE Enriched Δ", "PE Enriched Δ", "CE Roll Strict", "PE Roll Strict", "CE OI Δ", "PE OI Δ", "CE Position", "PE Position",
             "CE ΔIV", "PE ΔIV", "IV Skew", "Vol PCR", "Roll Vol PCR"], Headers(html, 1));
@@ -515,7 +515,7 @@ public sealed class AdaptiveCompactGridTests
         var rows = FirstRows(html, 0, 2);
         // Bar 12: zero duration => Urgency unavailable; rolling values from the persisted rolling row.
         // MicroDev / OFI come from the versioned sidecar row for that bar.
-        Assert.Equal(["12", "09:42:00", "0.0", "—", "+1.50", "-7.25", "123 (12.30)", "-456 (—)", "0.12 (—)", "-400 (—)", "+4242", "+1.75", "0.500", "Weakening", "Weak2"], rows[0]);
+        Assert.Equal(["12", "09:42:00", "0.0", "—", "+1.50", "-7.25", "123 (12.30)", "-456 (—)", "-0.12 (—)", "-400 (—)", "+4242", "+1.75", "0.500", "Weakening", "Weak2"], rows[0]);
         // Bar 11: 1000 / 50s = 20.0 volume per second; it has no sidecar row, so MicroDev / OFI are unavailable (not zero).
         Assert.Equal("20.0", rows[1][3]);
         Assert.Equal(["—", "—"], rows[1][8..10]);
@@ -624,7 +624,7 @@ public sealed class AdaptiveCompactGridTests
         Assert.Contains("data-grid=\"options-core-direction\" data-strike=\"25000\"", html);
         Assert.Contains("data-grid=\"options-context\" data-strike=\"25000\"", html);
         Assert.Equal(["Seq", "End IST", "CE Strict Δ", "PE Strict Δ", "Strict Dir", "CE Enriched Δ", "PE Enriched Δ", "Enriched Dir",
-            "CE OI Δ", "PE OI Δ", "OI Dir (PE−CE)", "CE MicroDev", "PE MicroDev", "MicroDev Dir", "CE OFI", "PE OFI", "OFI Dir"], HeadersOf(html, "options-core-direction"));
+            "CE OI Δ", "PE OI Δ", "OI Dir (PE−CE)", "CE MicroDev (Inv)", "PE MicroDev (Inv)", "MicroDev Dir (Inv)", "CE OFI", "PE OFI", "OFI Dir"], HeadersOf(html, "options-core-direction"));
         Assert.Equal(["Seq", "End IST", "CE Price Δ", "PE Price Δ", "Price Dir", "CE ΔIV", "PE ΔIV", "IV Dir", "CE ΔDelta", "PE ΔDelta", "Delta Dir", "CE ΔVega", "PE ΔVega", "Vega Dir", "CE Activity", "PE Activity", "Activity Dir"],
             HeadersOf(html, "options-context"));
         // The plain price family moved from CORE DIRECTION to OPTION CONTEXT; the three Roll ΔPx columns were replaced by the Delta and Vega change columns, so no rolling family is left in the primary Options grids.
@@ -637,7 +637,7 @@ public sealed class AdaptiveCompactGridTests
         var core = RowsOf(html, "options-core-direction");
         var bar12 = core.Single(r => r[0] == "12");
         Assert.Equal(["12", "09:42:00", "300 (30.00)", "-200 (-40.00)", "500 (33.33)", "50 (25.00)", "-50 (-25.00)", "100 (25.00)",
-            "1000 (10.00)", "3000 (30.00)", "2000 (10.00)", "0.30 (60.00)", "-0.10 (-20.00)", "0.40 (40.00)", "300 (30.00)", "-100 (-20.00)", "400 (26.67)"], bar12);
+            "1000 (10.00)", "3000 (30.00)", "2000 (10.00)", "-0.30 (-60.00)", "0.10 (20.00)", "-0.40 (-40.00)", "300 (30.00)", "-100 (-20.00)", "400 (26.67)"], bar12);
         var avg = core.Single(r => r[0] == "AVG");
         Assert.Equal("10 rows", avg[1]);                                                            // all visible rows; bars without a stored row are simply excluded from each metric
         Assert.Equal("500 (33.33)", avg[4]);                                                               // aggregate numerator / denominator, identical rows here
@@ -659,6 +659,19 @@ public sealed class AdaptiveCompactGridTests
         Assert.Equal("—", residualAvg[10]);                                                               // categorical columns are not averaged
         Assert.Equal("—", residualAvg[11]);
         Assert.Equal("+12.50", RatioFormatCompatible(residualAvg[2]));
+
+        // Sign-only tint (2026-11-02): CE and PE cells of the signed metrics carry their own sign, the Direction cell keeps its own; MicroDev is the INVERTED display value; Activity and unavailable cells stay neutral.
+        string RowMarkup(string grid, string seq) =>
+            Regex.Matches(Regex.Match(html, "<table[^>]*data-grid=\"" + grid + "\".*?</table>", RegexOptions.Singleline).Value, "<tr[^>]*>.*?</tr>", RegexOptions.Singleline)
+                .Select(m => m.Value).Single(r => Regex.IsMatch(r, "sticky-col[^>]*>" + seq + "</td>"));
+        var coreMarkup = RowMarkup("options-core-direction", "12");
+        Assert.Equal(["pos", "neg", "pos", "neg", "pos", "pos", "neg", "pos", "pos", "neg"], Regex.Matches(coreMarkup, "<td class=\"[^\"]*\" data-sign=\"([^\"]*)\"").Select(m => m.Groups[1].Value));
+        Assert.Equal(["pos", "pos", "pos", "neg", "pos"], Regex.Matches(coreMarkup, "data-direction-sign=\"([^\"]*)\"").Select(m => m.Groups[1].Value));      // Strict, Enriched, OI (PE − CE), MicroDev (inverted), OFI
+        var contextMarkup = RowMarkup("options-context", "12");
+        Assert.Equal(["pos", "neg", "pos", "neg", "none", "none", "none", "none", "none", "none"], Regex.Matches(contextMarkup, "<td class=\"[^\"]*\" data-sign=\"([^\"]*)\"").Select(m => m.Groups[1].Value));
+        Assert.DoesNotContain("adaptive-signed", Regex.Match(contextMarkup, "30\\.0 \\(75\\.00\\).*", RegexOptions.Singleline).Value);       // the CE / PE Activity cells are never tinted
+        Assert.Contains("MicroDev is shown INVERTED", html);
+        Assert.Equal(0, Regex.Matches(html, "-0\\.00").Count);                                                                                   // a zero never prints as a negative zero
     }
 
 
@@ -809,7 +822,7 @@ public sealed class AdaptiveCompactGridTests
         Assert.Equal("11 bars", RowsOf(at11, "options-context").Single(r => r[0] == "DAY AVG")[1]);
         Assert.Equal("11 bars", RowsOf(at11, "residual-compact").Single(r => r[0] == "DAY AVG")[1]);
         Assert.Equal(4, System.Text.RegularExpressions.Regex.Matches(at11, "<table(?![^>]*data-grid=\"summary-)[ >]").Count);     // the four existing detailed grids are unchanged
-        Assert.Equal(9, System.Text.RegularExpressions.Regex.Matches(at11, "<table[^>]*data-grid=\"summary-").Count);                // plus the Market Summary grids
+        Assert.Equal(2, System.Text.RegularExpressions.Regex.Matches(at11, "<table[^>]*data-grid=\"summary-").Count);                // plus the two Market Summary grids (Futures and the compact TOTAL)
         Assert.Contains("data-testid=\"futures-avg\"", at11);
         Assert.Contains("data-testid=\"futures-day-avg\"", at11);
         Assert.Contains("data-testid=\"options-core-day-avg\"", at11);
@@ -967,8 +980,19 @@ public sealed class AdaptiveCompactGridTests
         foreach (var testId in AdaptiveScreenshotRenderer.RequiredBlocks)
             Assert.Single(System.Text.RegularExpressions.Regex.Matches(html, "data-testid=\"" + testId + "\""));
         Assert.Equal(4, System.Text.RegularExpressions.Regex.Matches(html, "<table(?![^>]*data-grid=\"summary-)[ >]").Count);          // futures, core, context, residual: no diagnostic table slipped in
-        Assert.Equal(9, System.Text.RegularExpressions.Regex.Matches(html, "<table[^>]*data-grid=\"summary-").Count);                    // futures summary + ATM/ITM/OTM/TOTAL core and context
+        Assert.Equal(2, System.Text.RegularExpressions.Regex.Matches(html, "<table[^>]*data-grid=\"summary-").Count);                    // futures summary + the one compact TOTAL summary
         Assert.Contains("NIFTY RESEARCH SNAPSHOT", html);
+        // The five retained sections appear once each, in order; the removed ATM / ITM / OTM summaries and the old two-table TOTAL are absent; there is no commentary.
+        var order = System.Text.RegularExpressions.Regex.Matches(html, "<table[^>]*data-grid=\"([^\"]+)\"").Select(m => m.Groups[1].Value).ToList();
+        Assert.Equal(["summary-futures", "summary-total", "futures-compact", "options-core-direction", "options-context", "residual-compact"], order);
+        Assert.True(AdaptiveScreenshotRenderer.IsExpectedGridSequence(order));
+        foreach (var gone in new[] { "ATM SUMMARY", "ITM SUMMARY", "OTM SUMMARY", "summary-atm", "summary-itm", "summary-otm", "summary-total-core", "summary-total-context" })
+            Assert.DoesNotContain(gone, html);
+        Assert.Contains("FUTURES SUMMARY", html);
+        Assert.Contains("TOTAL SUMMARY", html);
+        Assert.Contains("OPTIONS — FIXED STRIKE HISTORY", html);
+        Assert.Contains("CE / PE theoretical residual — fixed 09:30 diagnostic", html);
+        Assert.DoesNotContain("Commentary", html, StringComparison.OrdinalIgnoreCase);
         // Direction-sign markup only on Direction cells: five families x (rows + AVG + DAY AVG) in CORE, five (price, IV, delta, vega, activity) in CONTEXT, none on CE / PE cells.
         var coreRows = RowsOf(html, "options-core-direction").Length;
         Assert.Equal(coreRows * 5 + RowsOf(html, "options-context").Length * 5, System.Text.RegularExpressions.Regex.Matches(html, "data-direction-sign=").Count);

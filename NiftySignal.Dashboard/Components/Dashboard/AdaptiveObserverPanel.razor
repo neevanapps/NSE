@@ -125,7 +125,7 @@
                         <th>Seq</th><th>End IST</th><th>Dur s</th><th>Urgency</th>
                         <th>Bar ΔPx</th><th>Roll ΔPx</th>
                         <th title="raw Strict delta (Strict delta / volume, %)">Strict Δ</th><th title="raw Enriched delta (Enriched delta / classified volume, %)">Enriched Δ</th>
-                        <th title="time-weighted MicroDev (time-weighted TOB x 100)">MicroDev</th><th title="net OFI (net OFI / gross OFI, %)">OFI</th>
+                        <th title="time-weighted MicroDev (time-weighted TOB x 100), displayed inverted: displayed = −raw">@MicroDevDisplay.Label</th><th title="net OFI (net OFI / gross OFI, %)">OFI</th>
                         <th>Roll OI Δ</th><th>ΔBasis</th><th>Roll Efficiency</th>
                         <th>Evolution</th><th>State</th>
                     </tr>
@@ -144,7 +144,8 @@
                             @{ var fr = FuturesRatios.Build(x.Bar, Supplemental(x.Bar.BarSeq)); }
                             <td class="@Sc(fr.Strict)" data-sign="@RatioFormat.SignName(fr.Strict)">@RatioFormat.Cell(fr.Strict)</td>
                             <td class="@Sc(fr.Enriched)" data-sign="@RatioFormat.SignName(fr.Enriched)">@RatioFormat.Cell(fr.Enriched)</td>
-                            <td class="@Sc(fr.MicroDev)" data-sign="@RatioFormat.SignName(fr.MicroDev)">@RatioFormat.Cell(fr.MicroDev, 2)</td>
+                            @{ var frMicro = MicroDevDisplay.Invert(fr.MicroDev); }
+                            <td class="@Sc(frMicro)" data-sign="@RatioFormat.SignName(frMicro)">@RatioFormat.Cell(frMicro, 2)</td>
                             <td class="@Sc(fr.Ofi)" data-sign="@RatioFormat.SignName(fr.Ofi)">@RatioFormat.Cell(fr.Ofi)</td>
                             <td>@FmtSigned(r?.OiChange)</td>
                             <td>@FmtSigned(Basis(x.Bar.BarSeq)?.DeltaBasis, 2)</td>
@@ -165,7 +166,8 @@
                             <td class="@Sc(avg.RollPx)" data-sign="@RatioFormat.SignName(avg.RollPx)">@RatioFormat.Plain(avg.RollPx, 2)</td>
                             <td class="@Sc(avg.Strict)" data-sign="@RatioFormat.SignName(avg.Strict)">@RatioFormat.Cell(avg.Strict)</td>
                             <td class="@Sc(avg.Enriched)" data-sign="@RatioFormat.SignName(avg.Enriched)">@RatioFormat.Cell(avg.Enriched)</td>
-                            <td class="@Sc(avg.MicroDev)" data-sign="@RatioFormat.SignName(avg.MicroDev)">@RatioFormat.Cell(avg.MicroDev, 2)</td>
+                            @{ var avgMicro = MicroDevDisplay.Invert(avg.MicroDev); }
+                            <td class="@Sc(avgMicro)" data-sign="@RatioFormat.SignName(avgMicro)">@RatioFormat.Cell(avgMicro, 2)</td>
                             <td class="@Sc(avg.Ofi)" data-sign="@RatioFormat.SignName(avg.Ofi)">@RatioFormat.Cell(avg.Ofi)</td>
                             <td>@RatioFormat.Plain(avg.RollOi, 1)</td>
                             <td>@RatioFormat.Plain(avg.Basis, 2)</td>
@@ -185,7 +187,8 @@
                             <td class="@Sc(davg.RollPx)" data-sign="@RatioFormat.SignName(davg.RollPx)">@RatioFormat.Plain(davg.RollPx, 2)</td>
                             <td class="@Sc(davg.Strict)" data-sign="@RatioFormat.SignName(davg.Strict)">@RatioFormat.Cell(davg.Strict)</td>
                             <td class="@Sc(davg.Enriched)" data-sign="@RatioFormat.SignName(davg.Enriched)">@RatioFormat.Cell(davg.Enriched)</td>
-                            <td class="@Sc(davg.MicroDev)" data-sign="@RatioFormat.SignName(davg.MicroDev)">@RatioFormat.Cell(davg.MicroDev, 2)</td>
+                            @{ var davgMicro = MicroDevDisplay.Invert(davg.MicroDev); }
+                            <td class="@Sc(davgMicro)" data-sign="@RatioFormat.SignName(davgMicro)">@RatioFormat.Cell(davgMicro, 2)</td>
                             <td class="@Sc(davg.Ofi)" data-sign="@RatioFormat.SignName(davg.Ofi)">@RatioFormat.Cell(davg.Ofi)</td>
                             <td>@RatioFormat.Plain(davg.RollOi, 1)</td>
                             <td>@RatioFormat.Plain(davg.Basis, 2)</td>
@@ -308,7 +311,7 @@
                     // DAY AVG is the history of the SAME exact strike/contract pair (a different strike's history is never shown under this one).
                     (OptionsCoreAverage Core, OptionsContextAverage Context)? dayFixed = _day?.Fixed is { } df && df.Strike == _fixed.Strike && df.Contract == _fixed.Contract ? OptionAverages.Of(df) : null;
                     var ctxRows = _fixed.Rows.Select(r => (Row: r, D: OptionDirectionRatios.Context(r.Ce, r.Pe))).ToList();
-                    <div class="adaptive-subtitle">CORE DIRECTION <span class="text-faint">raw (ratio %) — Direction = CE − PE, except OI = PE − CE</span></div>
+                    <div class="adaptive-subtitle">CORE DIRECTION <span class="text-faint">raw (ratio %) — Direction = CE − PE, except OI = PE − CE · @MicroDevDisplay.Legend · tint = sign only</span></div>
                     <div class="adaptive-table-wrap">
                         <table class="adaptive-table adaptive-table-compact" data-grid="options-core-direction" data-strike="@_fixed.Strike.ToString("0")">
                             <thead>
@@ -317,7 +320,7 @@
                                 <th>CE Strict Δ</th><th>PE Strict Δ</th><th>Strict Dir</th>
                                 <th>CE Enriched Δ</th><th>PE Enriched Δ</th><th>Enriched Dir</th>
                                 <th>CE OI Δ</th><th>PE OI Δ</th><th>OI Dir (PE−CE)</th>
-                                <th>CE MicroDev</th><th>PE MicroDev</th><th>MicroDev Dir</th>
+                                <th>CE MicroDev (Inv)</th><th>PE MicroDev (Inv)</th><th>MicroDev Dir (Inv)</th>
                                 <th>CE OFI</th><th>PE OFI</th><th>OFI Dir</th>
                             </tr>
                             </thead>
@@ -330,7 +333,7 @@
                                     @DirectionCells(d.Strict, 0)
                                     @DirectionCells(d.Enriched, 0)
                                     @DirectionCells(d.Oi, 0)
-                                    @DirectionCells(d.MicroDev, 2)
+                                    @DirectionCells(MicroDevDisplay.Invert(d.MicroDev), 2)
                                     @DirectionCells(d.Ofi, 0)
                                 </tr>
                             }
@@ -342,7 +345,7 @@
                                     @DirectionCells(coreAvg.Strict, 0)
                                     @DirectionCells(coreAvg.Enriched, 0)
                                     @DirectionCells(coreAvg.Oi, 0)
-                                    @DirectionCells(coreAvg.MicroDev, 2)
+                                    @DirectionCells(MicroDevDisplay.Invert(coreAvg.MicroDev), 2)
                                     @DirectionCells(coreAvg.Ofi, 0)
                                 </tr>
                             }
@@ -354,7 +357,7 @@
                                     @DirectionCells(dc.Core.Strict, 0)
                                     @DirectionCells(dc.Core.Enriched, 0)
                                     @DirectionCells(dc.Core.Oi, 0)
-                                    @DirectionCells(dc.Core.MicroDev, 2)
+                                    @DirectionCells(MicroDevDisplay.Invert(dc.Core.MicroDev), 2)
                                     @DirectionCells(dc.Core.Ofi, 0)
                                 </tr>
                             }
@@ -385,7 +388,7 @@
                                     @DirectionCells(d.Iv, 2)
                                     @DirectionCells(d.Delta, 4)
                                     @DirectionCells(d.Vega, 2)
-                                    @DirectionCells(d.Activity, 1)
+                                    @DirectionCells(d.Activity, 1, tint: false)
                                 </tr>
                             }
                             @if (ctxRows.Count > 0)
@@ -397,7 +400,7 @@
                                     @DirectionCells(ctxAvg.Iv, 2)
                                     @DirectionCells(ctxAvg.Delta, 4)
                                     @DirectionCells(ctxAvg.Vega, 2)
-                                    @DirectionCells(ctxAvg.Activity, 1)
+                                    @DirectionCells(ctxAvg.Activity, 1, tint: false)
                                 </tr>
                             }
                             @if (dayFixed is { } dx && _day is not null)
@@ -409,7 +412,7 @@
                                     @DirectionCells(dx.Context.Iv, 2)
                                     @DirectionCells(dx.Context.Delta, 4)
                                     @DirectionCells(dx.Context.Vega, 2)
-                                    @DirectionCells(dx.Context.Activity, 1)
+                                    @DirectionCells(dx.Context.Activity, 1, tint: false)
                                 </tr>
                             }
                             </tbody>
@@ -688,13 +691,13 @@
                             {
                                 var d = DerivedResidual(r.BarSeq);
                                 <td>@FmtSigned(r.FutureChangeFrom0930, 2)</td>
-                                <td>@FmtSigned(r.CEResidualPct, 2)%</td>
-                                <td>@FmtPctPoints(d?.CeResidualDeltaPct)</td>
-                                <td>@FmtSigned(r.PEResidualPct, 2)%</td>
-                                <td>@FmtPctPoints(d?.PeResidualDeltaPct)</td>
-                                <td>@FmtSigned(r.DirectionalResidualPct, 2)%</td>
-                                <td>@FmtPctPoints(d?.AdjacentDirectionalResidualDelta)</td>
-                                <td>@FmtPctPoints(d?.StraddleResidualPct)</td>
+                                <td class="@Sc((double?)r.CEResidualPct)" data-sign="@RatioFormat.SignName((double?)r.CEResidualPct)">@FmtSigned(r.CEResidualPct, 2)%</td>
+                                <td class="@Sc(d?.CeResidualDeltaPct)">@FmtPctPoints(d?.CeResidualDeltaPct)</td>
+                                <td class="@Sc((double?)r.PEResidualPct)" data-sign="@RatioFormat.SignName((double?)r.PEResidualPct)">@FmtSigned(r.PEResidualPct, 2)%</td>
+                                <td class="@Sc(d?.PeResidualDeltaPct)">@FmtPctPoints(d?.PeResidualDeltaPct)</td>
+                                <td class="@Sc((double?)r.DirectionalResidualPct)" data-sign="@RatioFormat.SignName((double?)r.DirectionalResidualPct)">@FmtSigned(r.DirectionalResidualPct, 2)%</td>
+                                <td class="@Sc(d?.AdjacentDirectionalResidualDelta)">@FmtPctPoints(d?.AdjacentDirectionalResidualDelta)</td>
+                                <td class="@Sc(d?.StraddleResidualPct)">@FmtPctPoints(d?.StraddleResidualPct)</td>
                                 <td>@DirectionText(r.ResidualDirection)</td>
                                 <td>@r.Relationship</td>
                                 <td>@r.MaxQuoteAgeSeconds.ToString("0.00")</td>
@@ -709,13 +712,13 @@
                             <td class="sticky-col">AVG</td>
                             <td>@av.Count rows</td>
                             <td>@RatioFormat.Plain(RatioAverage.Mean(av.Select(r => (double?)r.FutureChangeFrom0930)), 2)</td>
-                            <td>@PctAvg(RatioAverage.Mean(av.Select(r => (double?)r.CEResidualPct)))</td>
-                            <td>@PctAvg(RatioAverage.Mean(dv.Select(d => d?.CeResidualDeltaPct)))</td>
-                            <td>@PctAvg(RatioAverage.Mean(av.Select(r => (double?)r.PEResidualPct)))</td>
-                            <td>@PctAvg(RatioAverage.Mean(dv.Select(d => d?.PeResidualDeltaPct)))</td>
-                            <td>@PctAvg(RatioAverage.Mean(av.Select(r => (double?)r.DirectionalResidualPct)))</td>
-                            <td>@PctAvg(RatioAverage.Mean(dv.Select(d => d?.AdjacentDirectionalResidualDelta)))</td>
-                            <td>@PctAvg(RatioAverage.Mean(dv.Select(d => d?.StraddleResidualPct)))</td>
+                            <td class="@Sc(RatioAverage.Mean(av.Select(r => (double?)r.CEResidualPct)))">@PctAvg(RatioAverage.Mean(av.Select(r => (double?)r.CEResidualPct)))</td>
+                            <td class="@Sc(RatioAverage.Mean(dv.Select(d => d?.CeResidualDeltaPct)))">@PctAvg(RatioAverage.Mean(dv.Select(d => d?.CeResidualDeltaPct)))</td>
+                            <td class="@Sc(RatioAverage.Mean(av.Select(r => (double?)r.PEResidualPct)))">@PctAvg(RatioAverage.Mean(av.Select(r => (double?)r.PEResidualPct)))</td>
+                            <td class="@Sc(RatioAverage.Mean(dv.Select(d => d?.PeResidualDeltaPct)))">@PctAvg(RatioAverage.Mean(dv.Select(d => d?.PeResidualDeltaPct)))</td>
+                            <td class="@Sc(RatioAverage.Mean(av.Select(r => (double?)r.DirectionalResidualPct)))">@PctAvg(RatioAverage.Mean(av.Select(r => (double?)r.DirectionalResidualPct)))</td>
+                            <td class="@Sc(RatioAverage.Mean(dv.Select(d => d?.AdjacentDirectionalResidualDelta)))">@PctAvg(RatioAverage.Mean(dv.Select(d => d?.AdjacentDirectionalResidualDelta)))</td>
+                            <td class="@Sc(RatioAverage.Mean(dv.Select(d => d?.StraddleResidualPct)))">@PctAvg(RatioAverage.Mean(dv.Select(d => d?.StraddleResidualPct)))</td>
                             <td>—</td><td>—</td>
                             <td>@RatioFormat.Plain(RatioAverage.Mean(av.Select(r => (double?)r.MaxQuoteAgeSeconds)), 2)</td>
                         </tr>
@@ -728,13 +731,13 @@
                             <td class="sticky-col">DAY AVG</td>
                             <td>@dayR.BarCount bars</td>
                             <td>@RatioFormat.Plain(dr.FutureChange, 2)</td>
-                            <td>@PctAvg(dr.CePct)</td>
-                            <td>@PctAvg(dr.CeDeltaPct)</td>
-                            <td>@PctAvg(dr.PePct)</td>
-                            <td>@PctAvg(dr.PeDeltaPct)</td>
-                            <td>@PctAvg(dr.DirectionalPct)</td>
-                            <td>@PctAvg(dr.AdjacentDirectionalDelta)</td>
-                            <td>@PctAvg(dr.StraddlePct)</td>
+                            <td class="@Sc(dr.CePct)">@PctAvg(dr.CePct)</td>
+                            <td class="@Sc(dr.CeDeltaPct)">@PctAvg(dr.CeDeltaPct)</td>
+                            <td class="@Sc(dr.PePct)">@PctAvg(dr.PePct)</td>
+                            <td class="@Sc(dr.PeDeltaPct)">@PctAvg(dr.PeDeltaPct)</td>
+                            <td class="@Sc(dr.DirectionalPct)">@PctAvg(dr.DirectionalPct)</td>
+                            <td class="@Sc(dr.AdjacentDirectionalDelta)">@PctAvg(dr.AdjacentDirectionalDelta)</td>
+                            <td class="@Sc(dr.StraddlePct)">@PctAvg(dr.StraddlePct)</td>
                             <td>—</td><td>—</td>
                             <td>@RatioFormat.Plain(dr.QuoteAge, 2)</td>
                         </tr>
@@ -1203,9 +1206,13 @@
 
     static string PctAvg(double? x) => x is { } v ? RatioFormat.Plain(v, 2) + "%" : "—";
 
-    static RenderFragment DirectionCells(SideDirection d, int rawDecimals) => __b =>
+    /// <summary>CE, PE and Direction cells. The Direction cell keeps its own style (sign only); CE and PE of a SIGNED metric get the same sign-only tint (<paramref name="tint"/>; Activity is never negative, so it passes false).
+    /// A tint is the sign of the defined metric, not a bullish/bearish reading (a positive PE value is not automatically bullish for NIFTY).</summary>
+    static RenderFragment DirectionCells(SideDirection d, int rawDecimals, bool tint = true) => __b =>
     {
-        __b.AddMarkupContent(0, $"<td>{RatioFormat.Cell(d.Ce, rawDecimals)}</td><td>{RatioFormat.Cell(d.Pe, rawDecimals)}</td><td class=\"adaptive-direction {RatioFormat.SignClass(d.Direction)}\" data-direction-sign=\"{RatioFormat.SignName(d.Direction)}\">{RatioFormat.Cell(d.Direction, rawDecimals)}</td>");
+        static string Side(RatioPart p, int decimals, bool tinted) =>
+            $"<td class=\"{(tinted ? RatioFormat.SignedClass(p) : string.Empty)}\" data-sign=\"{(tinted ? RatioFormat.SignName(p) : "none")}\">{RatioFormat.Cell(p, decimals)}</td>";
+        __b.AddMarkupContent(0, $"{Side(d.Ce, rawDecimals, tint)}{Side(d.Pe, rawDecimals, tint)}<td class=\"adaptive-direction {RatioFormat.SignClass(d.Direction)}\" data-direction-sign=\"{RatioFormat.SignName(d.Direction)}\">{RatioFormat.Cell(d.Direction, rawDecimals)}</td>");
     };
 
     // AVG of the VISIBLE rows only (same implementation as DAY AVG): arithmetic means of the continuous columns; ratios are SUM(numerator)/SUM(denominator); categorical columns are not averaged.

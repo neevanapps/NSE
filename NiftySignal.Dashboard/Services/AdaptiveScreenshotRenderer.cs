@@ -20,14 +20,25 @@ public sealed class AdaptiveScreenshotRenderer(IOptions<AdaptiveScreenshotOption
 {
     public const string AuthenticationScheme = "AdaptiveCapture";
 
-    /// <summary>The stable identities of the primary research grids (data-grid attributes in AdaptiveObserverPanel): the new Market Summary grids first, then the existing detailed diagnostic grids.</summary>
+    /// <summary>The stable identities of the primary research grids (data-grid attributes in AdaptiveObserverPanel), in the order they must appear: the Futures and TOTAL Market Summary grids, then the detailed
+    /// Futures grid, the two fixed-strike Options grids and the residual grid (five sections, six data tables, plus the residual table).</summary>
     public static readonly IReadOnlyList<RequiredCaptureGrid> RequiredGrids =
     [
-        new("summary-futures", false),
-        new("summary-atm-core", false), new("summary-atm-context", false), new("summary-itm-core", false), new("summary-itm-context", false),
-        new("summary-otm-core", false), new("summary-otm-context", false), new("summary-total-core", false), new("summary-total-context", false),
+        new("summary-futures", false), new("summary-total", false),
         new("futures-compact", true), new("options-core-direction", true), new("options-context", true), new("residual-compact", false),
     ];
+
+    /// <summary>Grids that must NOT be in a capture: the ATM / ITM / OTM summaries were removed from the presentation (2026-11-02).</summary>
+    public static readonly IReadOnlyList<string> ForbiddenGrids =
+        ["summary-atm-core", "summary-atm-context", "summary-itm-core", "summary-itm-context", "summary-otm-core", "summary-otm-context", "summary-total-core", "summary-total-context"];
+
+    /// <summary>True when every required grid occurs exactly once in <paramref name="documentOrder"/> and in the required relative order, and no forbidden grid occurs.</summary>
+    public static bool IsExpectedGridSequence(IReadOnlyList<string> documentOrder)
+    {
+        if (ForbiddenGrids.Any(documentOrder.Contains)) return false;
+        var seen = documentOrder.Where(g => RequiredGrids.Any(r => r.Grid == g)).ToList();
+        return seen.SequenceEqual(RequiredGrids.Select(r => r.Grid));
+    }
 
     /// <summary>Other blocks a research capture must contain (data-testid): the identity header, its data-quality line and the recent-events strip.</summary>
     public static readonly IReadOnlyList<string> RequiredBlocks = ["research-header", "research-data-quality", "recent-events"];
@@ -74,6 +85,12 @@ public sealed class AdaptiveScreenshotRenderer(IOptions<AdaptiveScreenshotOption
             foreach (var required in RequiredGrids)
                 if (await page.Locator($".adaptive-table[data-grid='{required.Grid}']").CountAsync() != 1)
                     throw new InvalidOperationException($"Required capture grid '{required.Grid}' did not render; image not uploaded.");
+            foreach (var forbidden in ForbiddenGrids)
+                if (await page.Locator($".adaptive-table[data-grid='{forbidden}']").CountAsync() != 0)
+                    throw new InvalidOperationException($"Removed capture grid '{forbidden}' rendered; image not uploaded.");
+            var order = await page.EvaluateAsync<string[]>("() => Array.from(document.querySelectorAll('.adaptive-capture .adaptive-table[data-grid]')).map(t => t.getAttribute('data-grid'))");
+            if (!IsExpectedGridSequence(order))
+                throw new InvalidOperationException($"Capture sections are not in the expected order ({string.Join(", ", order)}); image not uploaded.");
             foreach (var testId in RequiredBlocks)
                 if (await page.Locator($"[data-testid='{testId}']").CountAsync() < 1)
                     throw new InvalidOperationException($"Required capture block '{testId}' did not render; image not uploaded.");

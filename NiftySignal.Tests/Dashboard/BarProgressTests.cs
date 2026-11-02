@@ -47,8 +47,8 @@ public class BarProgressTests
         OpeningWindowStartUtc = Now, OpeningWindowEndUtc = Now, EstimatorName = "x", CreatedAtUtc = Now, BaseBarVolume = target,
     };
 
-    static AdaptiveObserverRuntimeRow Runtime(long partial, int lastBar, DateTimeOffset? heartbeat = null, AdaptiveRuntimeStatus status = AdaptiveRuntimeStatus.Live) =>
-        new() { SessionId = 1, RuntimeStatus = status, LastHeartbeatUtc = heartbeat ?? Now, CurrentPartialBarVolume = partial, LastCompletedBarSeq = lastBar };
+    static AdaptiveObserverRuntimeRow Runtime(long partial, int lastBar, DateTimeOffset? heartbeat = null, AdaptiveRuntimeStatus status = AdaptiveRuntimeStatus.Live, DateTimeOffset? started = null, DateTimeOffset? sourceTick = null) =>
+        new() { SessionId = 1, RuntimeStatus = status, LastHeartbeatUtc = heartbeat ?? Now, CurrentPartialBarVolume = partial, LastCompletedBarSeq = lastBar, CurrentPartialBarStartedAtUtc = started, LastProcessedSourceAvailableAtUtc = sourceTick };
 
     [Fact]
     public void From_FormatsQuantityTargetAndPercent_AndRejectsInconsistentRows()
@@ -127,15 +127,22 @@ public class BarProgressTests
     public async Task StickyPanel_Live_ShowsQuantityAgainstTarget_Percent_AndLastCompletedBar()
     {
         var f = new ObserverFactory();
-        await using (var db = f.CreateDbContext()) { db.Sessions.Add(Session()); db.Runtime.Add(Runtime(10_420, 41)); await db.SaveChangesAsync(); }
+        await using (var db = f.CreateDbContext()) { db.Sessions.Add(Session()); db.Runtime.Add(Runtime(10_420, 41, DateTimeOffset.UtcNow, started: DateTimeOffset.UtcNow.AddSeconds(-90), sourceTick: DateTimeOffset.UtcNow)); await db.SaveChangesAsync(); }
         var svc = new AdaptiveBarProgressService(new AdaptiveObserverDataService(f, NullLogger<AdaptiveObserverDataService>.Instance), NullLogger<AdaptiveBarProgressService>.Instance);
         await svc.RefreshAsync();
         var html = await RenderPanelAsync(s => s.AddSingleton(svc), new());
-        Assert.Contains("data-testid=\"bar-progress\"", html);
-        Assert.Contains("10,420 / 13,650 – 76.3%", html);
-        Assert.Contains("last completed bar 41", html);
-        Assert.Contains(" IST", html);                                                  // the heartbeat "as of" time: a stopped Host shows an aging timestamp, not a frozen live value
-        Assert.Contains("quote-panel-sticky", html);                                    // the same sticky panel carries it: quote and quantity stay together
+        Assert.Contains("data-testid=\"incomplete-bar\"", html);
+        Assert.Contains("Current incomplete adaptive bar — Provisional", html);
+        Assert.Contains("10,420 / 13,650 · 76.3%", html);
+        Assert.Contains("bar 42", html);                                                // the incomplete bar is the one after the last completed bar
+        Assert.Contains("data-state=\"Live\"", html);
+        Assert.Contains("role=\"progressbar\"", html);
+        Assert.Contains("quote-progress-fill", html);
+        Assert.DoesNotContain("Bar qty", html);                                         // the old inline message is gone
+        Assert.Contains(" IST", html);                                                  // source timestamps (heartbeat, last tick) and the Dashboard refresh time are shown separately
+        Assert.Contains("data-testid=\"incomplete-bar-refreshed\"", html);
+        Assert.Contains("Open · High · Low · Last price · Trade-update count — unavailable", html);   // no OHLC / update counter exists in the data contract: said so, never synthesized
+        Assert.Contains("quote-panel-sticky", html);                                    // the same sticky panel carries it: quote and incomplete bar stay together
         svc.Dispose();
     }
 
@@ -143,9 +150,54 @@ public class BarProgressTests
     public async Task StickyPanel_WithoutTheService_ShowsUnavailable_NotAnEstimate()
     {
         var html = await RenderPanelAsync(_ => { }, new());
-        Assert.Contains("data-testid=\"bar-progress\"", html);
+        Assert.Contains("data-testid=\"incomplete-bar\"", html);
+        Assert.Contains("data-state=\"Unavailable\"", html);
         Assert.Contains("unavailable", html);
         Assert.DoesNotContain("/ 13,650", html);
+        Assert.DoesNotContain("quote-progress-fill", html);
+    }
+
+    [Fact]
+    public async Task StickyPanel_IncompleteBarAndProgress_AreInsideThePanel_AndAStaleHeartbeatIsNeverShownAsLive()
+    {
+        var f = new ObserverFactory();
+        await using (var db = f.CreateDbContext()) { db.Sessions.Add(Session()); db.Runtime.Add(Runtime(5_000, 41, DateTimeOffset.UtcNow.AddMinutes(-3), started: DateTimeOffset.UtcNow.AddMinutes(-5))); await db.SaveChangesAsync(); }
+        var svc = new AdaptiveBarProgressService(new AdaptiveObserverDataService(f, NullLogger<AdaptiveObserverDataService>.Instance), NullLogger<AdaptiveBarProgressService>.Instance);
+        await svc.RefreshAsync();
+        var html = await RenderPanelAsync(s => s.AddSingleton(svc), new());
+        Assert.Contains("data-state=\"Stale\"", html);
+        Assert.DoesNotContain("data-state=\"Live\"", html);
+        Assert.Contains("last known state", html);
+        Assert.Contains("quote-progress-stale", html);
+        // one panel: the quote row, then the provisional section, then the progress track at the bottom
+        Assert.True(html.IndexOf("quote-row", StringComparison.Ordinal) < html.IndexOf("data-testid=\"incomplete-bar\"", StringComparison.Ordinal));
+        Assert.True(html.IndexOf("data-testid=\"incomplete-bar\"", StringComparison.Ordinal) < html.IndexOf("data-testid=\"incomplete-bar-progress\"", StringComparison.Ordinal));
+        Assert.Single(System.Text.RegularExpressions.Regex.Matches(html, "quote-panel-sticky"));
+        Assert.DoesNotContain("quote-row", html[html.IndexOf("data-testid=\"incomplete-bar-progress\"", StringComparison.Ordinal)..]);
+        svc.Dispose();
+    }
+
+    [Fact]
+    public async Task HistoricalCapture_IsIdenticalWhateverTheLiveRuntimeRowSays_SoNoPostBoundaryValueCanLeak()
+    {
+        async Task<string> Capture(long partial, int lastBar)
+        {
+            var f = new ObserverFactory();
+            await using (var db = f.CreateDbContext()) { db.Sessions.Add(Session()); db.Runtime.Add(Runtime(partial, lastBar, DateTimeOffset.UtcNow, started: DateTimeOffset.UtcNow)); await db.SaveChangesAsync(); }
+            return await RenderPanelAsync(s =>
+            {
+                s.AddSingleton<IDbContextFactory<AdaptiveObserverDbContext>>(f);
+                s.AddSingleton<AdaptiveQuoteAsOfService>();
+                s.AddSingleton(new AdaptiveBarProgressService(new AdaptiveObserverDataService(f, NullLogger<AdaptiveObserverDataService>.Instance), NullLogger<AdaptiveBarProgressService>.Instance));
+            }, new() { ["CaptureMode"] = true, ["CaptureSessionId"] = 1L, ["CaptureBarSeq"] = 41 });
+        }
+
+        var early = await Capture(100, 41);
+        var later = await Capture(13_000, 90);                      // the live row has moved far past the pinned bar
+        Assert.Equal(early, later);
+        Assert.Contains("Pinned snapshot · completed bar 41", later);
+        Assert.DoesNotContain("13,000", later);
+        Assert.DoesNotContain("bar 91", later);
     }
 
     [Fact]
@@ -159,8 +211,10 @@ public class BarProgressTests
             s.AddSingleton<AdaptiveQuoteAsOfService>();
             s.AddSingleton(new AdaptiveBarProgressService(new AdaptiveObserverDataService(f, NullLogger<AdaptiveObserverDataService>.Instance), NullLogger<AdaptiveBarProgressService>.Instance));
         }, new() { ["CaptureMode"] = true, ["CaptureSessionId"] = 1L, ["CaptureBarSeq"] = 41 });
-        Assert.Contains("pinned · completed bar 41", html);
+        Assert.Contains("Pinned snapshot · completed bar 41", html);
         Assert.DoesNotContain("10,420", html);                                           // the live partial quantity never leaks into a pinned capture
+        Assert.DoesNotContain("quote-progress", html);                                   // no live progress bar in a pinned snapshot
+        Assert.DoesNotContain("Provisional", html);
         Assert.Contains("quote-panel-capture", html);
         Assert.DoesNotContain("quote-panel-sticky", html);
     }

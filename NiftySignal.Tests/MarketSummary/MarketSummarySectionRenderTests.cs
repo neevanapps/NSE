@@ -21,7 +21,7 @@ public class MarketSummarySectionRenderTests
             System.Net.WebUtility.HtmlDecode((await renderer.RenderComponentAsync<MarketSummarySection>(ParameterView.FromDictionary(new Dictionary<string, object?> { ["View"] = view }))).ToHtmlString()));
     }
 
-    static MarketSummaryView View(int bars, Func<int, string, bool>? skip = null)
+    static MarketSummaryView View(int bars, Func<int, string, bool>? skip = null, bool asymmetricDelta = false)
     {
         var listed = Enumerable.Range(0, 9).Select(i => 25_800d + i * 50).Select(s => new ListedStrike(s, $"CE{s:0}", $"PE{s:0}")).ToList();
         var basket = BasketResolver.Resolve(Expiry, 26_000, listed);
@@ -31,7 +31,7 @@ public class MarketSummarySectionRenderTests
             foreach (var c in basket.Contracts)
             {
                 if (skip?.Invoke(seq, c.Token!) == true) continue;
-                all.Add(new ContractBar(seq, c.Token!, c.IsCall, 100, 101 + r.Next(5), 500, 20, 100, 90, 10, 10, 1000, 1010, 12, 12.5, 0.42, 0.45, 5, 5.5, 0.1, 0.2, 10, 10, 50));
+                all.Add(new ContractBar(seq, c.Token!, c.IsCall, 100, 101 + r.Next(5), 500, 20, 100, 90, 10, 10, 1000, 1010, 12, 12.5, 0.42, asymmetricDelta && !c.IsCall ? 0.43 : 0.45, 5, 5.5, 0.1, 0.2, 10, 10, 50));
             }
 
         var durations = Enumerable.Range(1, bars).ToDictionary(i => i, _ => 30d);
@@ -51,21 +51,26 @@ public class MarketSummarySectionRenderTests
     public async Task Render_EveryGridHasExactlyFiveRows_AndWindowLabels()
     {
         var html = await RenderAsync(View(120));
-        foreach (var g in new[] { "summary-futures", "summary-atm-core", "summary-itm-core", "summary-otm-core", "summary-total-core", "summary-atm-context", "summary-itm-context", "summary-otm-context", "summary-total-context" })
+        foreach (var g in new[] { "summary-futures", "summary-total" })
             Assert.Equal(5, BodyRows(html, g));
+        // the ATM / ITM / OTM summaries are no longer presented (2026-11-02), and the old two-table TOTAL is gone
+        foreach (var g in new[] { "summary-atm-core", "summary-itm-core", "summary-otm-core", "summary-total-core", "summary-atm-context", "summary-itm-context", "summary-otm-context", "summary-total-context" })
+            Assert.DoesNotContain($"data-grid=\"{g}\"", html);
+        foreach (var t in new[] { "ATM SUMMARY", "ITM SUMMARY", "OTM SUMMARY" }) Assert.DoesNotContain(t, html);
+        Assert.Equal(2, Regex.Matches(html, "<table").Count);
         foreach (var w in new[] { "5 Bars", "10 Bars", "50 Bars", "100 Bars", "Day" }) Assert.Contains($"data-window=\"{w}\"", html);
         Assert.Contains("10/10 – FULL", html);
-        Assert.Contains("ΔDelta ×100", html);
-        Assert.Contains("ΔVega ×100", html);
+        Assert.Contains("Delta Dir ×100", html);
+        Assert.Contains("Vega Dir ×100", html);
     }
 
     [Fact]
     public async Task Render_DeltaIsScaledBy100ForDisplayOnly()
     {
-        var html = await RenderAsync(View(20));
-        // each contract: DeltaStart .42 -> DeltaEnd .45 over any window => change 0.03 => displayed 3.00
-        Assert.Contains("3.00 (", html);
-        Assert.DoesNotContain("0.03 (", html);
+        var html = await RenderAsync(View(20, asymmetricDelta: true));
+        // CE contracts: DeltaStart .42 -> DeltaEnd .45 (+0.03); PE contracts .42 -> .43 (+0.01); Delta Dir = CE - PE = 0.02 raw => displayed 2.00
+        Assert.Contains("2.00 (", html);
+        Assert.DoesNotContain("0.02 (", html);
     }
 
     [Fact]
@@ -73,7 +78,7 @@ public class MarketSummarySectionRenderTests
     {
         var html = await RenderAsync(View(7));
         Assert.Contains("— – INSUFFICIENT DATA", html);
-        Assert.Equal(5, BodyRows(html, "summary-total-core"));
+        Assert.Equal(5, BodyRows(html, "summary-total"));
         Assert.Contains("10/10 – FULL", html);       // the 5-bar window is complete
     }
 
@@ -82,7 +87,6 @@ public class MarketSummarySectionRenderTests
     {
         var html = await RenderAsync(View(30, (seq, tok) => tok == "CE25900" && seq == 28));
         Assert.Contains("9/10 – PARTIAL (levels 10/10)", html);
-        Assert.Contains("3/4 – PARTIAL (levels 4/4)", html);
         var none = await RenderAsync(MarketSummaryView.Unavailable(0, "no frozen option universe for this session"));
         Assert.Contains("Market summary unavailable: no frozen option universe for this session", none);
         Assert.DoesNotContain("<table", none);

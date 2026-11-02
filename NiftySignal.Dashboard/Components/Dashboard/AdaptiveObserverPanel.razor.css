@@ -203,10 +203,10 @@
     background: rgba(248, 81, 73, .16);
 }
 
-/* The OPTION CONTEXT grid has only a handful of columns: size it to its content instead of stretching a narrow Seq column across the page. */
+/* The OPTION CONTEXT grid fills its whole parent (2026-11-02): the columns share the available width through normal table layout; it only scrolls (inside .adaptive-table-wrap) when the content is wider than the container. */
 .adaptive-table[data-grid="options-context"] {
-    width: auto;
-    min-width: 40%;
+    width: 100%;
+    min-width: 100%;
 }
 
 /* DAY AVG: second summary row below AVG (whole session through the boundary). */

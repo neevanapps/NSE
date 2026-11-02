@@ -107,3 +107,50 @@
     font-size: 11px;
     font-family: var(--font-mono);
 }
+
+/* Current incomplete adaptive bar (provisional): one compact wrapped row under the quote row, then a thin progress track along the bottom of the panel. */
+.incomplete-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 18px;
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px solid var(--border);
+    font-size: 12px;
+}
+
+.incomplete-title {
+    font-weight: 700;
+    letter-spacing: .02em;
+}
+
+.incomplete-bar-stale .quote-value,
+.incomplete-bar-closed .quote-value,
+.incomplete-bar-unavailable .quote-value {
+    opacity: .55;
+}
+
+.quote-progress {
+    height: 5px;
+    margin-top: 6px;
+    background: var(--bg-elevated);
+    border-radius: 3px;
+    overflow: hidden;
+}
+
+.quote-progress-fill {
+    height: 100%;
+    background: var(--accent);
+    transition: width .4s linear;
+}
+
+.quote-progress-stale .quote-progress-fill,
+.quote-progress-closed .quote-progress-fill {
+    background: var(--text-dim);
+    opacity: .5;
+}
+
+.quote-progress-notlive .quote-progress-fill {
+    background: var(--warn, #dbab09);
+}

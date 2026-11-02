@@ -285,7 +285,7 @@ public class HomeV2Tests
     public void LiveQuoteScreenshotsAndGrids_AreUntouchedByTheV2Section()
     {
         // the required screenshot grids and the sticky quote panel are what Phases 1-5 delivered; V2 adds nothing to them
-        Assert.Equal(13, AdaptiveScreenshotRenderer.RequiredGrids.Count);
+        Assert.Equal(6, AdaptiveScreenshotRenderer.RequiredGrids.Count);
         var root = Path.Combine(TradingModelTests.RepoRoot(), "NiftySignal.Dashboard");
         Assert.DoesNotContain("PaperEngineV2", File.ReadAllText(Path.Combine(root, "Services", "AdaptiveScreenshotRenderer.cs")), StringComparison.Ordinal);
         Assert.DoesNotContain("PaperEngineV2", File.ReadAllText(Path.Combine(root, "Components", "Dashboard", "LiveQuotePanel.razor")), StringComparison.Ordinal);

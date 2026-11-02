@@ -2,10 +2,12 @@
 @using NiftySignal.MarketSummary
 @using SummaryMetric = NiftySignal.MarketSummary.Metric
 
-@* Primary Market Summary: the Futures Summary and the four option summaries (ATM, ITM, OTM, TOTAL), five rows each (5 / 10 / 50 / 100 Bars / Day), completed bars only, one fixed basket for every window.
-   Pure presentation of MarketSummaryView; all arithmetic is in NiftySignal.MarketSummary (docs/MARKET_SUMMARY_METRICS.md). Unavailable values render as — , never as zero. *@
+@* Primary Market Summary: the Futures Summary and the one compact TOTAL summary (all ten ATM±2 contracts), five rows each (5 / 10 / 50 / 100 Bars / Day), completed bars only, one fixed basket for every window.
+   The ATM / ITM / OTM summaries are no longer presented (2026-11-02); their aggregation stays in MarketSummaryView / NiftySignal.MarketSummary untouched.
+   Pure presentation of MarketSummaryView; all arithmetic is in NiftySignal.MarketSummary (docs/MARKET_SUMMARY_METRICS.md). Unavailable values render as —, never as zero.
+   MicroDev is displayed inverted (MicroDevDisplay), exactly once, here at render time. *@
 <section class="adaptive-grid-section market-summary" data-testid="market-summary">
-    <h3>MARKET SUMMARY <span class="text-faint">completed bars only · windows end at the same completed bar · Direction = CE − PE, OI = PE − CE · Delta ×100 / Vega ×100 are display scaling only</span></h3>
+    <h3>MARKET SUMMARY <span class="text-faint">completed bars only · windows end at the same completed bar · Direction = CE − PE, OI = PE − CE · Delta ×100 / Vega ×100 are display scaling only · @MicroDevDisplay.Legend</span></h3>
     @if (View is null || View.UnavailableReason is not null)
     {
         <div class="adaptive-pending" data-testid="market-summary-unavailable">Market summary unavailable: @(View?.UnavailableReason ?? "not loaded").</div>
@@ -21,20 +23,21 @@
             }
         </div>
 
-        <div class="adaptive-subtitle">FUTURES SUMMARY</div>
+        <div class="adaptive-subtitle" data-testid="summary-futures-title">FUTURES SUMMARY</div>
         <div class="adaptive-table-wrap">
             <table class="adaptive-table adaptive-table-compact" data-grid="summary-futures">
                 <thead>
                 <tr>
                     <th>Window</th><th>Coverage</th><th>Price Δ</th><th>Volume</th>
                     <th title="raw Strict delta (Strict delta / volume, %)">Strict Δ</th><th title="raw Enriched delta (/ classified volume, %)">Enriched Δ</th>
-                    <th title="usable-seconds weighted MicroDev (TOB x 100)">MicroDev</th><th title="net OFI (net / gross, %)">OFI</th><th>OI Δ</th><th>Activity /s</th>
+                    <th title="usable-seconds weighted MicroDev (TOB x 100), displayed inverted: displayed = −raw">@MicroDevDisplay.Label</th><th title="net OFI (net / gross, %)">OFI</th><th>OI Δ</th><th>Activity /s</th>
                     <th title="India VIX level at the window end (latest valid observation at or before the boundary, within the freshness limit)">VIX</th><th title="VIX change over the window (end − start)">VIX Δ</th><th title="VIX change / start VIX × 100">VIX Δ%</th><th title="age of the end observation at the boundary">VIX age</th>
                 </tr>
                 </thead>
                 <tbody>
                 @foreach (var r in View.Futures)
                 {
+                    var micro = MicroDevDisplay.Invert(r.MicroDev);
                     <tr data-window="@r.Window.Name">
                         <td class="sticky-col">@r.Window.Name</td>
                         <td title="@CoverageTitle(r.Coverage)" data-coverage="@r.Coverage.Status">@r.Coverage.Text</td>
@@ -44,7 +47,7 @@
                         }
                         else
                         {
-                            <td class="@Sc(r.Price)" data-sign="@RatioFormat.SignName(r.Price.Raw)">@Cell(r.Price, 2)</td><td>@r.Volume.ToString("N0")</td><td class="@Sc(r.Strict)" data-sign="@RatioFormat.SignName(r.Strict.Raw)">@Cell(r.Strict)</td><td class="@Sc(r.Enriched)" data-sign="@RatioFormat.SignName(r.Enriched.Raw)">@Cell(r.Enriched)</td><td class="@Sc(r.MicroDev)" data-sign="@RatioFormat.SignName(r.MicroDev.Raw)">@Cell(r.MicroDev, 2)</td><td class="@Sc(r.Ofi)" data-sign="@RatioFormat.SignName(r.Ofi.Raw)">@Cell(r.Ofi)</td><td>@Cell(r.Oi)</td>
+                            <td class="@Sc(r.Price)" data-sign="@RatioFormat.SignName(r.Price.Raw)">@Cell(r.Price, 2)</td><td>@r.Volume.ToString("N0")</td><td class="@Sc(r.Strict)" data-sign="@RatioFormat.SignName(r.Strict.Raw)">@Cell(r.Strict)</td><td class="@Sc(r.Enriched)" data-sign="@RatioFormat.SignName(r.Enriched.Raw)">@Cell(r.Enriched)</td><td class="@Sc(micro)" data-sign="@RatioFormat.SignName(micro.Raw)">@Cell(micro, 2)</td><td class="@Sc(r.Ofi)" data-sign="@RatioFormat.SignName(r.Ofi.Raw)">@Cell(r.Ofi)</td><td>@Cell(r.Oi)</td>
                             <td>@RatioFormat.Plain(r.Activity, 1)</td>
                         }
                         @VixCells(View, r.Window.Name)
@@ -54,63 +57,44 @@
             </table>
         </div>
 
-        @foreach (var g in View.Grids)
+        @if (View.Grids.FirstOrDefault(x => x.Kind == GridKind.Total) is { } total)
         {
-            var name = g.Kind.ToString().ToUpperInvariant();
-            <div class="adaptive-subtitle" data-testid="@($"summary-{name.ToLowerInvariant()}-title")">@name SUMMARY <span class="text-faint">@Describe(g, basket)</span></div>
+            <div class="adaptive-subtitle" data-testid="summary-total-title">TOTAL SUMMARY <span class="text-faint">@Describe(total, basket)</span></div>
             <div class="adaptive-table-wrap">
-                <table class="adaptive-table adaptive-table-compact" data-grid="@($"summary-{name.ToLowerInvariant()}-core")">
+                <table class="adaptive-table adaptive-table-compact" data-grid="summary-total">
                     <thead>
                     <tr>
                         <th>Window</th><th>Coverage</th>
-                        <th>CE Price Δ</th><th>PE Price Δ</th><th>Price Dir</th>
-                        <th>CE Roll ΔPx</th><th>PE Roll ΔPx</th><th>Roll Dir</th>
-                        <th>CE Strict</th><th>PE Strict</th><th>Strict Dir</th>
-                        <th>CE Enriched</th><th>PE Enriched</th><th>Enriched Dir</th>
-                        <th>CE OI Δ</th><th>PE OI Δ</th><th>OI Dir</th>
-                        <th>CE MicroDev</th><th>PE MicroDev</th><th>MicroDev Dir</th>
-                        <th>CE OFI</th><th>PE OFI</th><th>OFI Dir</th>
+                        <th>Price Dir</th><th>Roll Dir</th><th>Strict Dir</th><th>Enriched Dir</th>
+                        <th title="PE − CE">OI Dir</th><th title="displayed inverted: displayed = −raw (CE − PE)">MicroDev Dir (Inv)</th><th>OFI Dir</th>
+                        <th>IV Dir</th><th>Delta Dir ×100</th><th>Vega Dir ×100</th><th>Activity Dir</th>
                     </tr>
                     </thead>
                     <tbody>
-                    @foreach (var r in g.Rows)
+                    @foreach (var r in total.Rows)
                     {
                         <tr data-window="@r.Window.Name">
                             <td class="sticky-col">@r.Window.Name</td>
-                            <td title="@CoverageTitle(r.Coverage)" data-coverage="@r.Coverage.Status">@r.Coverage.Text@Deficits(r.Coverage, CoreFamilies)</td>
-                            @Triple(r, s => s.Price, d => d.Price, 2)
-                            @Triple(r, s => s.Roll, d => d.Roll, 2)
-                            @Triple(r, s => s.Strict, d => d.Strict, 0)
-                            @Triple(r, s => s.Enriched, d => d.Enriched, 0)
-                            @Triple(r, s => s.Oi, d => d.Oi, 0)
-                            @Triple(r, s => s.MicroDev, d => d.MicroDev, 2)
-                            @Triple(r, s => s.Ofi, d => d.Ofi, 0)
-                        </tr>
-                    }
-                    </tbody>
-                </table>
-            </div>
-            <div class="adaptive-table-wrap">
-                <table class="adaptive-table adaptive-table-compact" data-grid="@($"summary-{name.ToLowerInvariant()}-context")">
-                    <thead>
-                    <tr>
-                        <th>Window</th><th>Coverage</th>
-                        <th>CE ΔIV</th><th>PE ΔIV</th><th>IV Dir</th>
-                        <th>CE ΔDelta ×100</th><th>PE ΔDelta ×100</th><th>Delta Dir ×100</th>
-                        <th>CE ΔVega ×100</th><th>PE ΔVega ×100</th><th>Vega Dir ×100</th>
-                        <th>CE Activity /s</th><th>PE Activity /s</th><th>Activity Dir</th>
-                    </tr>
-                    </thead>
-                    <tbody>
-                    @foreach (var r in g.Rows)
-                    {
-                        <tr data-window="@r.Window.Name">
-                            <td class="sticky-col">@r.Window.Name</td>
-                            <td title="@CoverageTitle(r.Coverage)" data-coverage="@r.Coverage.Status">@r.Coverage.Text@Deficits(r.Coverage, ContextFamilies)</td>
-                            @Triple(r, s => s.Iv, d => d.Iv, 2)
-                            @Triple(r, s => s.Delta, d => d.Delta, 2, scale100: true)
-                            @Triple(r, s => s.Vega, d => d.Vega, 2, scale100: true)
-                            @ActivityTriple(r)
+                            <td title="@CoverageTitle(r.Coverage)" data-coverage="@r.Coverage.Status">@r.Coverage.Text@Deficits(r.Coverage, TotalFamilies)</td>
+                            @if (r.Direction is null)
+                            {
+                                @for (var i = 0; i < 11; i++) { <td>—</td> }
+                            }
+                            else
+                            {
+                                var d = r.Direction;
+                                @Dir(d.Price, 2)
+                                @Dir(d.Roll, 2)
+                                @Dir(d.Strict, 0)
+                                @Dir(d.Enriched, 0)
+                                @Dir(d.Oi, 0)
+                                @Dir(MicroDevDisplay.Invert(d.MicroDev), 2)
+                                @Dir(d.Ofi, 0)
+                                @Dir(d.Iv, 2)
+                                @Dir(d.Delta, 2, scale100: true)
+                                @Dir(d.Vega, 2, scale100: true)
+                                @Dir(d.Activity, 1)
+                            }
                         </tr>
                     }
                     </tbody>
@@ -147,8 +131,7 @@
         Td(w.End.AgeSeconds is { } a ? $"{a:0}s" : "—");
     };
 
-    static readonly string[] CoreFamilies = ["Price", "Roll", "Strict", "Enriched", "Oi", "MicroDev", "Ofi"];
-    static readonly string[] ContextFamilies = ["Iv", "Delta", "Vega", "Activity"];
+    static readonly string[] TotalFamilies = ["Price", "Roll", "Strict", "Enriched", "Oi", "MicroDev", "Ofi", "Iv", "Delta", "Vega", "Activity"];
 
     /// <summary>Visible per-family coverage, only where a metric family has fewer usable contracts than the grid expects (e.g. " · OFI 0/10 · Delta 0/10"). Nothing is shown when every family is complete.</summary>
     static string Deficits(Coverage c, string[] families)
@@ -165,25 +148,15 @@
     static string Describe(GridSummary g, Basket b) =>
         $"{g.Expected} contracts: " + string.Join(", ", b.For(g.Kind).Select(c => c.Token is null ? $"{(c.IsCall ? "CE" : "PE")} offset {c.Offset:+0;-0;0} (unresolved)" : $"{(c.IsCall ? "CE" : "PE")} {c.Strike:0}"));
 
-    static RatioPart Scaled(SummaryMetric m, bool scale100) => new(scale100 ? DisplayScale.Times100(m.Raw) : m.Raw, m.Num, m.Den);
-
-    RenderFragment Triple(WindowSummary r, Func<SideSummary, SummaryMetric> side, Func<DirectionSummary, SummaryMetric> dir, int decimals, bool scale100 = false) => builder =>
+    /// <summary>One Direction cell: signed tint on the sign of the defined Direction metric (sign only, no threshold); zero, missing and non-finite stay neutral. ×100 is display scaling and never changes the sign.</summary>
+    static RenderFragment Dir(SummaryMetric m, int decimals, bool scale100 = false) => builder =>
     {
-        var seq = 0;
-        void Td(string text) { builder.OpenElement(seq++, "td"); builder.AddContent(seq++, text); builder.CloseElement(); }
-        if (r.Ce is null && r.Pe is null) { Td("—"); Td("—"); Td("—"); return; }
-        Td(r.Ce is null ? "—" : RatioFormat.Cell(Scaled(side(r.Ce), scale100), decimals));
-        Td(r.Pe is null ? "—" : RatioFormat.Cell(Scaled(side(r.Pe), scale100), decimals));
-        Td(r.Direction is null ? "—" : RatioFormat.Cell(Scaled(dir(r.Direction), scale100), decimals));
-    };
-
-    RenderFragment ActivityTriple(WindowSummary r) => builder =>
-    {
-        var seq = 0;
-        void Td(string text) { builder.OpenElement(seq++, "td"); builder.AddContent(seq++, text); builder.CloseElement(); }
-        if (r.Ce is null && r.Pe is null) { Td("—"); Td("—"); Td("—"); return; }
-        Td(r.Ce is null ? "—" : RatioFormat.Plain(r.Ce.Activity, 1));
-        Td(r.Pe is null ? "—" : RatioFormat.Plain(r.Pe.Activity, 1));
-        Td(r.Direction is null ? "—" : Cell(r.Direction.Activity, 1));
+        var shown = new RatioPart(scale100 ? DisplayScale.Times100(m.Raw) : m.Raw, m.Num, m.Den);
+        builder.OpenElement(0, "td");
+        var cls = RatioFormat.SignedClass(shown.Raw);
+        if (cls.Length > 0) builder.AddAttribute(1, "class", cls);
+        builder.AddAttribute(2, "data-sign", RatioFormat.SignName(shown.Raw));
+        builder.AddContent(3, RatioFormat.Cell(shown, decimals));
+        builder.CloseElement();
     };
 }

@@ -490,11 +490,13 @@ public class ResearchDashboardTests
     [Fact]
     public void Renderer_RequiresNamedPrimaryGrids_NotAnExactTableCount()
     {
-        // The original four detailed grids are unchanged and still required (in the same order, after the Market Summary grids that were added in front of them).
+        // The original four detailed grids are unchanged and still required (in the same order, after the two Market Summary grids: Futures and the compact TOTAL; ATM / ITM / OTM were removed on 2026-11-02).
         var grids = AdaptiveScreenshotRenderer.RequiredGrids.Select(g => g.Grid).ToList();
         Assert.Equal(["futures-compact", "options-core-direction", "options-context", "residual-compact"], grids.TakeLast(4));
-        Assert.Equal(["summary-futures", "summary-atm-core", "summary-atm-context", "summary-itm-core", "summary-itm-context", "summary-otm-core", "summary-otm-context", "summary-total-core", "summary-total-context"], grids.Take(9));
-        Assert.Equal(13, grids.Count);
+        Assert.Equal(["summary-futures", "summary-total"], grids.Take(2));
+        Assert.Equal(6, grids.Count);
+        Assert.Contains("summary-atm-core", AdaptiveScreenshotRenderer.ForbiddenGrids);
+        Assert.DoesNotContain(AdaptiveScreenshotRenderer.ForbiddenGrids, grids.Contains);
         Assert.Equal(["research-header", "research-data-quality", "recent-events"], AdaptiveScreenshotRenderer.RequiredBlocks);
         Assert.False(AdaptiveScreenshotRenderer.RequiredGrids.Single(g => g.Grid == "residual-compact").StartsAtTarget);      // legitimately empty before the 09:30 anchor
         var source = File.ReadAllText(Path.Combine(NiftySignal.Tests.Trading.Data.TradingModelTests.RepoRoot(), "NiftySignal.Dashboard", "Services", "AdaptiveScreenshotRenderer.cs"));

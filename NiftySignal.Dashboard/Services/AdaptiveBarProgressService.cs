@@ -8,7 +8,8 @@ namespace NiftySignal.Dashboard.Services;
 /// (<c>ExactAdaptiveFuturesBarBuilder.PartialVolume</c>, persisted by the Host in <c>adaptive_observer_runtime.CurrentPartialBarVolume</c> about once a second): never an estimate, and the builder resets it
 /// when a bar completes. Unavailable (with a reason) when the runtime row is missing or inconsistent - it is never clamped or guessed.
 /// </summary>
-public sealed record BarProgress(long? Quantity, long Target, double? Percent, int? LastCompletedBarSeq, string? RuntimeStatus, DateTimeOffset? HeartbeatUtc, string? UnavailableReason)
+public sealed record BarProgress(long? Quantity, long Target, double? Percent, int? LastCompletedBarSeq, string? RuntimeStatus, DateTimeOffset? HeartbeatUtc, string? UnavailableReason,
+    DateTimeOffset? StartedAtUtc = null, DateTimeOffset? LastSourceAtUtc = null)
 {
     public static BarProgress Unavailable(string reason) => new(null, 0, null, null, null, null, reason);
 
@@ -22,8 +23,8 @@ public sealed record BarProgress(long? Quantity, long Target, double? Percent, i
         var target = session.BaseBarVolume;
         if (target <= 0) return Unavailable("session bar volume target is not positive");
         if (runtime.CurrentPartialBarVolume < 0 || runtime.CurrentPartialBarVolume > target)
-            return new(null, target, null, runtime.LastCompletedBarSeq, runtime.RuntimeStatus.ToString(), runtime.LastHeartbeatUtc, "partial-bar quantity is outside [0, target]");
-        return new(runtime.CurrentPartialBarVolume, target, runtime.CurrentPartialBarVolume * 100d / target, runtime.LastCompletedBarSeq, runtime.RuntimeStatus.ToString(), runtime.LastHeartbeatUtc, null);
+            return new(null, target, null, runtime.LastCompletedBarSeq, runtime.RuntimeStatus.ToString(), runtime.LastHeartbeatUtc, "partial-bar quantity is outside [0, target]", runtime.CurrentPartialBarStartedAtUtc, runtime.LastProcessedSourceAvailableAtUtc);
+        return new(runtime.CurrentPartialBarVolume, target, runtime.CurrentPartialBarVolume * 100d / target, runtime.LastCompletedBarSeq, runtime.RuntimeStatus.ToString(), runtime.LastHeartbeatUtc, null, runtime.CurrentPartialBarStartedAtUtc, runtime.LastProcessedSourceAvailableAtUtc);
     }
 }
 
@@ -109,7 +110,7 @@ public sealed class AdaptiveBarProgressService(AdaptiveObserverDataService data,
 
         // What is displayed includes the runtime heartbeat ("as of"), which the Host moves about once a second: a Host that stopped (or is replaying) must show an AGING timestamp, never a frozen "live" quantity.
         var changed = next.Quantity != Current.Quantity || next.Target != Current.Target || next.LastCompletedBarSeq != Current.LastCompletedBarSeq
-            || next.UnavailableReason != Current.UnavailableReason || next.RuntimeStatus != Current.RuntimeStatus || next.HeartbeatUtc != Current.HeartbeatUtc;
+            || next.UnavailableReason != Current.UnavailableReason || next.StartedAtUtc != Current.StartedAtUtc || next.LastSourceAtUtc != Current.LastSourceAtUtc || next.RuntimeStatus != Current.RuntimeStatus || next.HeartbeatUtc != Current.HeartbeatUtc;
         Current = next;
         if (changed) Changed?.Invoke();
     }

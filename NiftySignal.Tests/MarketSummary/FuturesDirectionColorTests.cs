@@ -50,7 +50,8 @@ public class FuturesDirectionColorTests
             (Regex.Match(m.Groups[1].Value, "class=\"([^\"]*)\"").Groups[1].Value, Regex.Match(m.Groups[1].Value, "data-sign=\"([^\"]*)\"").Groups[1].Value, m.Groups[2].Value)).ToList();
     }
 
-    static readonly int[] Directional = [2, 4, 5, 6, 7];          // Price, Strict, Enriched, MicroDev, OFI
+    static readonly int[] Directional = [2, 4, 5, 6, 7];          // Price, Strict, Enriched, MicroDev (displayed INVERTED), OFI
+    const int MicroDevColumn = 6;
     static readonly int[] NeverTinted = [0, 1, 3, 8, 9, 10, 11, 12, 13];
 
     [Theory]
@@ -63,7 +64,12 @@ public class FuturesDirectionColorTests
         foreach (var w in new[] { "5 Bars", "10 Bars", "50 Bars", "100 Bars", "Day" })
         {
             var cells = Cells(html, w);
-            foreach (var c in Directional) { Assert.Equal(cssClass, cells[c].Class); Assert.Equal(signName, cells[c].Sign); }
+            foreach (var c in Directional)
+            {
+                // MicroDev is shown inverted (2026-11-02): a positive raw value is displayed negative (red) and vice versa; every other tinted column keeps its own sign
+                var (expectedClass, expectedSign) = c == MicroDevColumn ? sign switch { 1 => ("adaptive-signed val-neg", "neg"), -1 => ("adaptive-signed val-pos", "pos"), _ => (cssClass, signName) } : (cssClass, signName);
+                Assert.Equal(expectedClass, cells[c].Class); Assert.Equal(expectedSign, cells[c].Sign);
+            }
             foreach (var c in NeverTinted) Assert.DoesNotContain("val-", cells[c].Class);
         }
     }
@@ -163,7 +169,7 @@ public class FuturesDirectionColorTests
         var src = File.ReadAllText(Path.Combine(NiftySignal.Tests.Trading.Data.TradingModelTests.RepoRoot(), "NiftySignal.Dashboard", "Components", "Dashboard", "AdaptiveObserverPanel.razor"));
         var tinted = Regex.Matches(src, @"class=""@Sc\(([^)]*)\)""").Select(m => m.Groups[1].Value).ToList();
         Assert.NotEmpty(tinted);
-        Assert.All(tinted, t => Assert.Matches(@"PriceDisplacement|StrictDelta|EnrichedDelta|ReturnBps|\.(Strict|Enriched|MicroDev|Ofi|BarPx|RollPx)$", t));
+        Assert.All(tinted, t => Assert.Matches(@"PriceDisplacement|StrictDelta|EnrichedDelta|ReturnBps|Residual|\.(Strict|Enriched|MicroDev|Ofi|BarPx|RollPx)$|^(frMicro|avgMicro|davgMicro)$|^dr\.", t));
         Assert.DoesNotContain(tinted, t => Regex.IsMatch(t, "Oi|Basis|Volume|Efficiency|Duration|Urgency|Gross|Abs|DeltaChange", RegexOptions.IgnoreCase));
     }
 }
