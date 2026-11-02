@@ -975,7 +975,8 @@ public sealed class AdaptiveCompactGridTests
     {
         // The current incomplete bar (quantity, progress, start, staleness) lives only in the sticky live quote; the research panel keeps just the runtime recovery line.
         var factory = await SeedResearchAsync();
-        var html = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new());
+        var html = await LiveRenderAsync(factory);
+        Assert.Contains("data-grid=\"futures-compact\"", html);                                           // the live panel really rendered
         Assert.DoesNotContain("Current incomplete adaptive bar", html);
         Assert.DoesNotContain("adaptive-current-bar", html);
         Assert.DoesNotContain("adaptive-progress-fill", html);
