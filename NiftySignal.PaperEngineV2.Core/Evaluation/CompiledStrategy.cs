@@ -56,6 +56,7 @@ public sealed class CompiledStrategy
     static ConditionNode Build(ConditionSpec spec) => spec switch
     {
         GroupSpec g => new GroupNode(g.IsAnd, g.Items.Select(Build).ToArray()),
+        AtLeastSpec a => new AtLeastNode(a.Min, a.Items.Select(Build).ToArray()),
         ThresholdSpec t => new ThresholdNode(t.Metric.Handle, t.Window, t.Cmp, t.A, t.B),
         MetricPairSpec m => new MetricPairNode(m.MetricA.Handle, m.WindowA, m.Cmp, m.MetricB.Handle, m.WindowB),
         CrossSpec c => new CrossNode(c.Direction, c.Metric.Handle, c.Window, c.ConstantLevel ?? 0d, c.LevelMetric?.Handle ?? -1, c.LevelWindow),

@@ -19,7 +19,7 @@ public class FrameBuilderTests
     {
         var s = Summary(130);
         var f = Build(new MarketStateFrameBuilder(), 1, 130, s);
-        Assert.Equal(MetricRegistry.Count * SummaryWindows.Count, f.PresentMetricCount);       // 284 metrics x 5 windows, nothing unmapped
+        Assert.Equal(MetricRegistry.Count * SummaryWindows.Count, f.PresentMetricCount);       // 286 metrics x 5 windows, nothing unmapped
         Assert.All(MetricRegistry.Specs, spec => Assert.All(Enum.GetValues<SummaryWindowId>(), w => Assert.True(f.TryRead(spec.Handle, w, out _), $"{spec.Id} {w}")));
 
         // spot checks against the summary the frame was built from

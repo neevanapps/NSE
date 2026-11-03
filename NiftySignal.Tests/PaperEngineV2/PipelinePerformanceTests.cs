@@ -71,7 +71,7 @@ public class PipelinePerformanceTests(ITestOutputHelper output)
             var t = Stopwatch.GetTimestamp();
             var f = b.Build(Bar(1, 130), s.Basket, s.Futures, s.Grids, s.Vix, s.Quotes);
             times.Add(Us(t));
-            if (i == 0) Assert.Equal(1_420, f.PresentMetricCount);
+            if (i == 0) Assert.Equal(1_430, f.PresentMetricCount);
             var t2 = Stopwatch.GetTimestamp(); _ = f.Hash; canonical.Add(Us(t2));            // first use of the canonical payload + hash: the consumer-side cost
         }
 

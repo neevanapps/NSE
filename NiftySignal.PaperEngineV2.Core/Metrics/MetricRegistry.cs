@@ -29,7 +29,7 @@ public static class SummaryWindows
 public enum MetricUnit { Quantity, Percent, Price, IvPoints, DeltaRaw, VegaRaw, PerSecond, Count, VixPoints, Flag }
 
 /// <summary>What the value of a metric means relative to CE and PE. <see cref="Level"/> = the side's own value (or a futures value); <see cref="CeMinusPe"/> / <see cref="PeMinusCe"/> = the Market Summary direction conventions (OI is PE - CE).</summary>
-public enum MetricDirection { Level, CeMinusPe, PeMinusCe }
+public enum MetricDirection { Level, CeMinusPe, PeMinusCe, CeMinusPeInverted }
 
 /// <summary>Raw = the value in its own unit; Pct = the pooled ratio expressed in percent (Num / Den x 100) where the Market Summary defines one.</summary>
 public enum MetricKind { Raw, Pct }
@@ -130,6 +130,14 @@ public static class MetricRegistry
         Add("vix.change:raw", MetricUnit.VixPoints, MetricDirection.Level, MetricKind.Raw, false, "India VIX end - start over the window.", vixAvail);
         Add("vix.change:pct", MetricUnit.Percent, MetricDirection.Level, MetricKind.Pct, false, "India VIX change / start x 100.", vixAvail);
         Add("vix.fresh", MetricUnit.Flag, MetricDirection.Level, MetricKind.Raw, true, "1 when the VIX observation at the decision boundary is within the freshness limit, else 0.", "Never Unknown once the frame exists: a missing/stale VIX is 0.");
+
+        // ---- appended after the original registry: existing handles (and therefore existing frames / config hashes) never move ----
+        // The Dashboard's "MicroDev Dir (Inv)" convention (displayed = -raw) as an explicit, separate metric. The sign flip happens exactly once, in MarketStateFrameBuilder; the raw
+        // opt.total.microdev.dir metric is unchanged and no other metric is inverted.
+        const string invDesc = "Market Summary TOTAL grid MicroDev direction in the Dashboard's INVERTED convention (value = -raw CE-PE MicroDev; the ratio flips sign with it; zero stays zero). Derived once in the frame builder from opt.total.microdev.dir.";
+        const string invAvail = "Unknown exactly when opt.total.microdev.dir is Unknown.";
+        Add("opt.total.microdev_inv.dir:raw", MetricUnit.Price, MetricDirection.CeMinusPeInverted, MetricKind.Raw, false, invDesc, invAvail);
+        Add("opt.total.microdev_inv.dir:pct", MetricUnit.Percent, MetricDirection.CeMinusPeInverted, MetricKind.Pct, false, invDesc, invAvail);
     }
 
     /// <summary>Whether two metrics may be compared with each other: same unit and the same direction convention (a CE value is not comparable to a CE-PE difference, and an OI direction (PE-CE) is not comparable to a flow direction (CE-PE)).</summary>

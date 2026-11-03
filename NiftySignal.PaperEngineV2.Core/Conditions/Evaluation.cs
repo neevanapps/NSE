@@ -56,6 +56,33 @@ public sealed class GroupNode(bool isAnd, ConditionNode[] items) : ConditionNode
     }
 }
 
+/// <summary>
+/// "At least N of these leaf conditions" (node version atLeast/1). Strict Unknown policy: when any listed condition is Unknown the result is Unknown, so a count is never decided on partial evidence;
+/// otherwise True iff the number of True conditions is &gt;= <c>min</c>. Evaluates every item (no short-circuit, so Unknown is always seen) and allocates nothing.
+/// </summary>
+public sealed class AtLeastNode(int min, ConditionNode[] items) : ConditionNode
+{
+    public int Min { get; } = min;
+
+    public IReadOnlyList<ConditionNode> Items => items;
+
+    public override Tri Evaluate(in EvaluationContext context)
+    {
+        var trues = 0;
+        var unknown = false;
+        foreach (var item in items)
+        {
+            switch (item.Evaluate(context))
+            {
+                case Tri.True: trues++; break;
+                case Tri.Unknown: unknown = true; break;
+            }
+        }
+
+        return unknown ? Tri.Unknown : TriLogic.Of(trues >= Min);
+    }
+}
+
 static class Compare
 {
     public static Tri Apply(Comparison cmp, double x, double a, double b) => cmp switch

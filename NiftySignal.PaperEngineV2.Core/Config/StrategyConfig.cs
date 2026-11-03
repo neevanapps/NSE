@@ -18,6 +18,14 @@ public sealed record ThresholdSpec(MetricSpec Metric, SummaryWindowId Window, Co
 
 public sealed record MetricPairSpec(MetricSpec MetricA, SummaryWindowId WindowA, Comparison Cmp, MetricSpec MetricB, SummaryWindowId WindowB) : ConditionSpec;
 
+/// <summary>
+/// Count node "atLeast/1": true when at least <see cref="Min"/> of the bounded list of leaf conditions are True. <see cref="OnUnknown"/> is explicit; the only supported policy is
+/// <see cref="AtLeastUnknownPolicy.Unknown"/>: if ANY listed condition is Unknown the result is Unknown (never a partial count). Deterministic, no scripts.
+/// </summary>
+public sealed record AtLeastSpec(int Min, AtLeastUnknownPolicy OnUnknown, IReadOnlyList<ConditionSpec> Items) : ConditionSpec;
+
+public enum AtLeastUnknownPolicy { Unknown }
+
 public sealed record CrossSpec(CrossDirection Direction, MetricSpec Metric, SummaryWindowId Window, double? ConstantLevel, MetricSpec? LevelMetric, SummaryWindowId LevelWindow) : ConditionSpec;
 
 public enum OnOppositeEntrySignal { Exit }

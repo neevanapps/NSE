@@ -48,7 +48,7 @@ public class EvaluatorTests
     [Fact]
     public void Registry_IsDenseUniqueAndTyped()
     {
-        Assert.Equal(284, MetricRegistry.Count);                                                           // 16 futures + 4 grids x 66 + 4 VIX
+        Assert.Equal(286, MetricRegistry.Count);                                                           // 16 futures + 4 grids x 66 + 4 VIX + 2 appended inverted-MicroDev aliases
         Assert.Equal(Enumerable.Range(0, MetricRegistry.Count), MetricRegistry.Specs.Select(s => s.Handle));
         Assert.Equal(MetricRegistry.Count, MetricRegistry.Specs.Select(s => s.Id).Distinct(StringComparer.Ordinal).Count());
         Assert.All(MetricRegistry.Specs, s => { Assert.Equal(MetricRegistry.SourceModel, s.SourceModel); Assert.False(string.IsNullOrWhiteSpace(s.Description)); Assert.False(string.IsNullOrWhiteSpace(s.Availability)); });

@@ -38,6 +38,8 @@ public sealed class MarketStateFrameBuilder
     static readonly int FutCoveragePct = Handle("fut.coverage_pct", required: true), FutCoverageFull = Handle("fut.coverage_full", required: true);
     static readonly int[] GridCoveragePct = GridNames.Select(g => Handle($"opt.{g}.coverage_pct", required: true)).ToArray();
     static readonly int[] GridCoverageFull = GridNames.Select(g => Handle($"opt.{g}.coverage_full", required: true)).ToArray();
+    // the Dashboard's inverted MicroDev direction (opt.total only): the ONLY place a MicroDev sign is flipped for a strategy
+    static readonly int TotalMicroDevInvRaw = Handle("opt.total.microdev_inv.dir:raw", required: true), TotalMicroDevInvPct = Handle("opt.total.microdev_inv.dir:pct", required: true);
     static readonly int VixLevel = Handle("vix.level:raw", required: true), VixChange = Handle("vix.change:raw", required: true), VixChangePct = Handle("vix.change:pct", required: true), VixFresh = Handle("vix.fresh", required: true);
 
     static int Handle(string id, bool required = false) => MetricRegistry.TryGet(id, out var s) ? s.Handle : required ? throw new InvalidOperationException($"registry lacks {id}") : -1;
@@ -142,10 +144,20 @@ public sealed class MarketStateFrameBuilder
                 PutMetric(list, h[10][2][0], h[10][2][1], w, d.Activity);
             }
 
+            if (g == TotalGridIndex && r.Direction is { } inv)
+            {
+                Put(list, TotalMicroDevInvRaw, w, Invert(inv.MicroDev.Raw));         // same convention as the Dashboard's MicroDevDisplay: displayed = -raw, ratio flips with it, zero stays zero
+                Put(list, TotalMicroDevInvPct, w, Invert(inv.MicroDev.Ratio));
+            }
+
             if (r.Coverage.Expected > 0) Put(list, GridCoveragePct[g], w, r.Coverage.Included * 100d / r.Coverage.Expected);
             Put(list, GridCoverageFull[g], w, r.Coverage.Status == CoverageStatus.Full ? 1d : 0d);
         }
     }
+
+    const int TotalGridIndex = 3;
+
+    static double? Invert(double? v) => v is { } x && double.IsFinite(x) ? (x == 0d ? 0d : -x) : null;
 
     static void MapSide(List<MetricValue> list, int[][][] h, int side, SummaryWindowId w, SideSummary s)
     {

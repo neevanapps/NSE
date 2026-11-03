@@ -16,6 +16,7 @@ public static partial class StrategyConfigParser
     public const string Schema = "pev2-strategy/1";
     public const int MaxConditionDepth = 4;
     public const int MaxLeavesPerTree = 32;
+    public const int MaxAtLeastItems = 12;
     public const string RankRule = "PremiumProximityThenCentreDistanceThenStrikeThenToken";
 
     static readonly TimeOnly EarliestEntry = new(9, 30, 0);
@@ -328,8 +329,11 @@ public static partial class StrategyConfigParser
         if (element.ValueKind != JsonValueKind.Object) { errors.Add(new ConfigError("Type", path, "an object is required")); return null; }
         var hasOp = element.TryGetProperty("op", out _);
         var hasCross = element.TryGetProperty("cross", out _);
+        var hasAtLeast = element.TryGetProperty("atLeast", out _);
         if (hasOp && hasCross) { errors.Add(new ConfigError("Value", path, "a node is either a group (op) or a crossover (cross), not both")); return null; }
+        if (hasAtLeast && (hasOp || hasCross)) { errors.Add(new ConfigError("Value", path, "a count (atLeast) cannot be combined with a group (op) or a crossover (cross): a node is exactly one of them")); return null; }
         if (hasOp) return ReadGroup(element, path, depth, errors, ref leaves);
+        if (hasAtLeast) return ReadAtLeast(element, path, depth, errors, ref leaves);
         leaves++;
         if (leaves > MaxLeavesPerTree) { if (leaves == MaxLeavesPerTree + 1) errors.Add(new ConfigError("Limit", path, $"a condition tree has at most {MaxLeavesPerTree} leaf conditions")); return null; }
         return hasCross ? ReadCross(element, path, errors) : ReadCompare(element, path, errors);
@@ -354,6 +358,37 @@ public static partial class StrategyConfigParser
 
         if (list.Count == 0 && ok) { o.Error("Value", "items", "a group needs at least one condition"); ok = false; }
         return ok ? new GroupSpec(op == "AND", list) : null;
+    }
+
+    /// <summary>
+    /// <c>{ "atLeast": N, "onUnknown": "Unknown", "of": [ leaf, ... ] }</c> (node version atLeast/1): 2..<see cref="MaxAtLeastItems"/> LEAF conditions (thresholds, metric pairs, crossovers; no nested groups or counts, so
+    /// the semantics stay a plain count), 1 &lt;= N &lt;= number of items. <c>onUnknown</c> is mandatory and explicit. Every leaf counts toward <see cref="MaxLeavesPerTree"/>.
+    /// </summary>
+    static AtLeastSpec? ReadAtLeast(JsonElement element, string path, int depth, List<ConfigError> errors, ref int leaves)
+    {
+        var o = Obj.Open(element, path, errors, "atLeast", "onUnknown", "of");
+        if (o is null) return null;
+        if (depth > MaxConditionDepth) { errors.Add(new ConfigError("Limit", path, $"condition groups nest at most {MaxConditionDepth} levels")); return null; }
+        var min = o.Int("atLeast");
+        var policy = o.Str("onUnknown");
+        if (policy is not null && policy != "Unknown") o.Error("Value", "onUnknown", "only 'Unknown' is supported: any Unknown listed condition makes the count Unknown (never a partial count)");
+        if (!element.TryGetProperty("of", out var items) || items.ValueKind != JsonValueKind.Array) { o.Error("Type", "of", "an array of leaf conditions is required"); return null; }
+        var list = new List<ConditionSpec>();
+        var ok = policy == "Unknown";
+        var i = 0;
+        foreach (var item in items.EnumerateArray())
+        {
+            var itemPath = $"{path}/of/{i++}";
+            if (item.ValueKind == JsonValueKind.Object && (item.TryGetProperty("op", out _) || item.TryGetProperty("atLeast", out _))) { errors.Add(new ConfigError("Value", itemPath, "an atLeast list holds leaf conditions only (no nested group or count)")); ok = false; continue; }
+            leaves++;
+            if (leaves > MaxLeavesPerTree) { if (leaves == MaxLeavesPerTree + 1) errors.Add(new ConfigError("Limit", itemPath, $"a condition tree has at most {MaxLeavesPerTree} leaf conditions")); ok = false; continue; }
+            var child = item.ValueKind == JsonValueKind.Object && item.TryGetProperty("cross", out _) ? ReadCross(item, itemPath, errors) : ReadCompare(item, itemPath, errors);
+            if (child is null) ok = false; else list.Add(child);
+        }
+
+        if (ok && (list.Count < 2 || list.Count > MaxAtLeastItems)) { o.Error("Value", "of", $"2 to {MaxAtLeastItems} conditions are required"); ok = false; }
+        if (min is { } m && ok && (m < 1 || m > list.Count)) { o.Error("Value", "atLeast", "must be between 1 and the number of listed conditions"); ok = false; }
+        return ok && min is { } mm ? new AtLeastSpec(mm, AtLeastUnknownPolicy.Unknown, list) : null;
     }
 
     static readonly Dictionary<string, Comparison> Comparisons = new(StringComparer.Ordinal)
