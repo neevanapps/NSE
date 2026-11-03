@@ -127,6 +127,10 @@ builder.Services.AddSingleton<AdaptiveQuoteAsOfService>();
 builder.Services.AddSingleton<VixSummaryService>();
 builder.Services.AddSingleton<AdaptiveBarProgressService>();
 builder.Services.AddSingleton<AdaptiveResearchService>();
+// Read-only agent feed (GET /api/agent/snapshot on loopback + <AgentFeed:RootDirectory>/agent-feed/yyyy-MM-dd.jsonl). A projection of the same adaptive rows the grids render; no Host, trading or write path.
+builder.Services.Configure<AgentFeedOptions>(builder.Configuration.GetSection(AgentFeedOptions.SectionName));
+builder.Services.AddSingleton<AgentSnapshotService>();
+builder.Services.AddHostedService<AgentFeedWriter>();
 builder.Services.Configure<AdaptiveScreenshotOptions>(builder.Configuration.GetSection(AdaptiveScreenshotOptions.SectionName));
 builder.Services.Configure<TelegramOptions>(builder.Configuration.GetSection(TelegramOptions.SectionName));
 builder.Services.AddSingleton<IAdaptiveScreenshotRenderer, AdaptiveScreenshotRenderer>();
@@ -201,6 +205,9 @@ app.MapRazorComponents<App>()
 // ingestion into the dashboard. The hub is only reachable on the VM's own network anyway --
 // no public firewall rule exposes this port.
 app.MapHub<MarketDataHub>("/hubs/market-data");
+
+// Read-only agent feed: loopback callers only, deliberately outside the cookie login (see AgentFeedEndpoint).
+AgentFeedEndpoint.Map(app);
 
 // Static form POST rather than an interactive component: a Blazor circuit can't write an auth
 // cookie (response headers are already flushed by the time component code runs).

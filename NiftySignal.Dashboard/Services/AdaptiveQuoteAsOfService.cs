@@ -101,25 +101,73 @@ public sealed class AdaptiveQuoteAsOfService(
             putToken = options.FirstOrDefault(x => x.OptionType == OptionType.Put && (decimal)x.Strike == strike)?.Token;
         }
 
-        // The session's FROZEN spot identity (Slice 2B) wins: the capture never independently re-resolves a different spot instrument, and a frozen
-        // "unresolved" outcome stays unavailable. Sessions without a frozen identity (older sessions / table not migrated) fall back to the unique
-        // NIFTY Index in the instrument master; a non-unique spot instrument is ambiguous and is shown unavailable rather than guessed.
-        string? frozenToken = null; var hasFrozen = false;
-        try
-        {
-            var frozen = await observer.SessionSupplemental.AsNoTracking().Where(x => x.SessionId == id).OrderBy(x => x.Id)
-                .Select(x => new { x.SpotToken }).FirstOrDefaultAsync(ct);
-            if (frozen is not null) { hasFrozen = true; frozenToken = frozen.SpotToken; }
-        }
-        catch (Npgsql.PostgresException ex) when (ex.SqlState == Npgsql.PostgresErrorCodes.UndefinedTable) { }
-
-        var spotToken = hasFrozen ? frozenToken : spotTokens.Length == 1 ? spotTokens[0] : null;
+        var spotToken = await ResolveSpotTokenAsync(observer, id, spotTokens, ct);
         var spot = spotToken is null ? null : await QuoteAsync(source, spotToken, dayStartUtc, boundary, ct);
         var future = await QuoteAsync(source, session.FutureToken, dayStartUtc, boundary, ct);
         var vix = vixTokens.Length == 1 ? await QuoteAsync(source, vixTokens[0], dayStartUtc, boundary, ct) : null;
         var call = callToken is null ? null : await QuoteAsync(source, callToken, dayStartUtc, boundary, ct);
         var put = putToken is null ? null : await QuoteAsync(source, putToken, dayStartUtc, boundary, ct);
         return new PinnedQuoteSnapshot(boundary, null, spot, future, vix, centerStrike, centerStrike, call, put);
+    }
+
+    /// <summary>
+    /// The session's FROZEN spot identity (Slice 2B) wins: the capture never independently re-resolves a different spot instrument, and a frozen "unresolved" outcome stays unavailable. Sessions without a
+    /// frozen identity (older sessions / table not migrated) fall back to the unique NIFTY Index in the instrument master; a non-unique spot instrument is ambiguous and is shown unavailable rather than guessed.
+    /// </summary>
+    static async Task<string?> ResolveSpotTokenAsync(AdaptiveObserverDbContext observer, long sessionId, string[] masterSpotTokens, CancellationToken ct)
+    {
+        string? frozenToken = null; var hasFrozen = false;
+        try
+        {
+            var frozen = await observer.SessionSupplemental.AsNoTracking().Where(x => x.SessionId == sessionId).OrderBy(x => x.Id)
+                .Select(x => new { x.SpotToken }).FirstOrDefaultAsync(ct);
+            if (frozen is not null) { hasFrozen = true; frozenToken = frozen.SpotToken; }
+        }
+        catch (Npgsql.PostgresException ex) when (ex.SqlState == Npgsql.PostgresErrorCodes.UndefinedTable) { }
+
+        return hasFrozen ? frozenToken : masterSpotTokens.Length == 1 ? masterSpotTokens[0] : null;
+    }
+
+    /// <summary>The quotes in force at ONE completed bar's end boundary, for the agent feed: spot plus the CE / PE top of book of the bar's fixed strike. Null = nothing eligible at or before the boundary.</summary>
+    public sealed record BoundaryQuotes(PinnedQuote? Spot, PinnedQuote? Ce, PinnedQuote? Pe);
+
+    /// <summary>One bar to resolve: its end boundary and the exact CE / PE tokens of its fixed strike (either may be null).</summary>
+    public sealed record BoundaryRequest(int BarSeq, DateTimeOffset BoundaryUtc, string? CeToken, string? PeToken);
+
+    /// <summary>
+    /// Spot and fixed-strike CE / PE quotes at each requested completed-bar boundary. Same as-of rule, same frozen spot identity and same tick probes as the pinned Live Quote (<see cref="LoadAsync"/>); a tick available
+    /// after a bar's boundary is never visible to that bar. Read-only; a bar with nothing eligible simply has null quotes.
+    /// </summary>
+    public async Task<IReadOnlyDictionary<int, BoundaryQuotes>> LoadBoundaryQuotesAsync(AdaptiveSessionStateRow session, IReadOnlyList<BoundaryRequest> requests, CancellationToken ct = default)
+    {
+        var result = new Dictionary<int, BoundaryQuotes>();
+        if (requests.Count == 0) return result;
+        await using var observer = await observerFactory.CreateDbContextAsync(ct);
+        await using var source = await sourceFactory.CreateDbContextAsync(ct);
+        var dayStartUtc = new DateTimeOffset(session.TradeDate.ToDateTime(TimeOnly.MinValue), IstOffset).ToUniversalTime();
+        var spotTokens = await source.Instruments.AsNoTracking()
+            .Where(i => i.AsOfDate == session.TradeDate && i.Underlying == "NIFTY" && i.InstrumentType == InstrumentType.Index)
+            .Select(i => i.Token).Distinct().ToArrayAsync(ct);
+        var spotToken = await ResolveSpotTokenAsync(observer, session.Id, spotTokens, ct);
+        foreach (var r in requests)
+        {
+            var spot = spotToken is null ? null : await AvailableQuoteAsync(source, spotToken, dayStartUtc, r.BoundaryUtc, ct);
+            var ce = r.CeToken is null ? null : await AvailableQuoteAsync(source, r.CeToken, dayStartUtc, r.BoundaryUtc, ct);
+            var pe = r.PeToken is null ? null : await AvailableQuoteAsync(source, r.PeToken, dayStartUtc, r.BoundaryUtc, ct);
+            result[r.BarSeq] = new BoundaryQuotes(spot, ce, pe);
+        }
+
+        return result;
+    }
+
+    static async Task<PinnedQuote?> AvailableQuoteAsync(NiftySignalDbContext db, string token, DateTimeOffset dayStartUtc, DateTimeOffset boundary, CancellationToken ct)
+    {
+        var latest = await LatestAvailableAsync(db, token, dayStartUtc, boundary, ct);
+        if (latest is null) return null;
+        var depth = latest.Depth;
+        return new PinnedQuote(new QuickQuote(latest.LastPrice,
+            depth?.Bid1Price is > 0 ? depth.Bid1Price : null,
+            depth?.Ask1Price is > 0 ? depth.Ask1Price : null, null), AsOfTickSelector.AvailableAt(latest));
     }
 
     /// <summary>
