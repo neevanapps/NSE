@@ -163,7 +163,7 @@ public sealed class V2Runtime : IAsyncDisposable
     {
         var pipeline = await EnsurePipelineAsync(notice.Session, ct);
         MarketStateFrame? frame; string? problem = null;
-        try { (frame, problem) = await _frames.BuildAsync(notice, pipeline.Builder, ct); }
+        try { (frame, problem) = await _frames.BuildAsync(notice with { HeldTokens = pipeline.Engine.HeldTokens }, pipeline.Builder, ct); }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception ex) { frame = null; problem = $"{ex.GetType().Name}: {ex.Message}"; }
         if (frame is null)

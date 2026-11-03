@@ -13,7 +13,7 @@ public static class FrameSerializer
 {
     static string Instant(DateTimeOffset t) => t.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture);
 
-    internal static string Write(FrameIdentity id, BasketIdentity basket, double[] values, bool[] present, QuoteSnapshot[] quotes, QuoteIssue[] issues, VixAvailability vix)
+    internal static string Write(FrameIdentity id, BasketIdentity basket, double[] values, bool[] present, QuoteSnapshot[] quotes, QuoteIssue[] issues, VixAvailability vix, QuoteSnapshot[]? held = null)
     {
         using var ms = new MemoryStream();
         using (var w = new Utf8JsonWriter(ms))
@@ -68,6 +68,18 @@ public static class FrameSerializer
             }
 
             w.WriteEndArray();
+            if (held is { Length: > 0 })           // only schema pev2-frame/2: a frame without held quotes serialises exactly as before
+            {
+                w.WriteStartArray("heldQuotes");
+                foreach (var q in held)
+                {
+                    w.WriteStartObject(); w.WriteString("token", q.Token); w.WriteNumber("bid", q.Bid); w.WriteNumber("ask", q.Ask); w.WriteNumber("bidQty", q.BidQty); w.WriteNumber("askQty", q.AskQty);
+                    w.WriteString("availableAt", Instant(q.AvailableAt)); w.WriteNumber("tickId", q.SourceTickId); w.WriteEndObject();
+                }
+
+                w.WriteEndArray();
+            }
+
             w.WriteEndObject();
         }
 
@@ -101,7 +113,11 @@ public static class FrameSerializer
                 q.GetProperty("bidQty").GetInt64(), q.GetProperty("askQty").GetInt64(), T(q, "availableAt"), q.GetProperty("tickId").GetInt64())).ToList();
             var issues = r.GetProperty("quoteIssues").EnumerateArray().Select(i => new QuoteIssue(Str(i, "token"), Str(i, "reason"))).ToList();
             var metrics = r.GetProperty("metrics").EnumerateArray().Select(m => new MetricValue(m[0].GetInt32(), (SummaryWindowId)m[1].GetInt32(), m[2].GetDouble())).ToList();
-            return MarketStateFrame.Create(id, basket, metrics, quotes, issues, vix);
+            var held = r.TryGetProperty("heldQuotes", out var hq)
+                ? hq.EnumerateArray().Select(q => new QuoteSnapshot(Str(q, "token"), q.GetProperty("bid").GetDouble(), q.GetProperty("ask").GetDouble(),
+                    q.GetProperty("bidQty").GetInt64(), q.GetProperty("askQty").GetInt64(), T(q, "availableAt"), q.GetProperty("tickId").GetInt64())).ToList()
+                : [];
+            return MarketStateFrame.Create(id, basket, metrics, quotes, issues, vix, held);
         }
         catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException or FormatException or ArgumentException)
         {

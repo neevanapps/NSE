@@ -41,10 +41,19 @@ public sealed class PaperEngine : IFrameProcessor
 
     public long SinkFailures { get; private set; }
 
+    volatile IReadOnlySet<string> _held = new HashSet<string>(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Distinct tokens held by open positions of ALL strategies (deduplicated), published as an immutable snapshot after every processed frame (and therefore after a journal replay on restart). Safe to read from
+    /// another thread; empty when nothing is held. A frame built a moment before a fill simply lacks the new token's held quote: the exit then waits for a later frame, never for an inferred price.
+    /// </summary>
+    public IReadOnlySet<string> HeldTokens => _held;
+
     public ValueTask ProcessAsync(MarketStateFrame frame, MarketStateFrame? previous, FrameDisposition disposition, CancellationToken ct)
     {
         var batch = new List<PaperEvent>();
         foreach (var r in _runtimes) r.Process(frame, previous, disposition, batch);
+        _held = new HashSet<string>(_runtimes.SelectMany(r => r.HeldTokens()), StringComparer.Ordinal);
         foreach (var e in batch)
         {
             _events.Add(e);

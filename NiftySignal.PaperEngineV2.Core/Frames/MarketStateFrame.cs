@@ -15,6 +15,12 @@ public sealed record FrameIdentity(
 {
     public const string CurrentSchema = "pev2-frame/1";
 
+    /// <summary>
+    /// Frame schema that additionally carries <see cref="MarketStateFrame.HeldQuotes"/>: quotes of contracts held by open positions that are NOT in the signal-time basket. A frame without held quotes keeps
+    /// <see cref="CurrentSchema"/> and its exact payload and hash, so existing journals and hashes are unchanged; a Host that does not know /2 rejects such a frame (fail closed).
+    /// </summary>
+    public const string HeldQuotesSchema = "pev2-frame/2";
+
     /// <summary>The instant AND source tick from which this frame's data could be used. Ordered by (instant, tick id), the observer's own ordering key.</summary>
     public DecisionKey DecisionKey => new(BarEndAvailableAt, LastSourceTickId);
 
@@ -62,9 +68,9 @@ public sealed class MarketStateFrame : IMarketStateFrame
     readonly bool[] _present;
     readonly Lazy<(string Payload, string Hash)> _canonical;
 
-    MarketStateFrame(FrameIdentity identity, BasketIdentity basket, double[] values, bool[] present, IReadOnlyList<QuoteSnapshot> quotes, IReadOnlyList<QuoteIssue> issues, VixAvailability vix, Lazy<(string, string)> canonical)
+    MarketStateFrame(FrameIdentity identity, BasketIdentity basket, double[] values, bool[] present, IReadOnlyList<QuoteSnapshot> quotes, IReadOnlyList<QuoteIssue> issues, VixAvailability vix, IReadOnlyList<QuoteSnapshot> heldQuotes, Lazy<(string, string)> canonical)
     {
-        Identity = identity; Basket = basket; _values = values; _present = present; Quotes = quotes; QuoteIssues = issues; Vix = vix; _canonical = canonical;
+        Identity = identity; Basket = basket; _values = values; _present = present; Quotes = quotes; QuoteIssues = issues; Vix = vix; HeldQuotes = heldQuotes; _canonical = canonical;
     }
 
     public FrameIdentity Identity { get; }
@@ -74,6 +80,12 @@ public sealed class MarketStateFrame : IMarketStateFrame
     public IReadOnlyList<QuoteSnapshot> Quotes { get; }
 
     public IReadOnlyList<QuoteIssue> QuoteIssues { get; }
+
+    /// <summary>
+    /// Genuinely observed two-sided quotes (with their own availability instant and source tick) of contracts held by open V2 positions that are outside this bar's basket. They exist only so a held position can be
+    /// marked and exited after the dynamic ATM moved; they are never an input of any Market Summary metric or entry decision, never replace a missing basket quote and never stand in for another contract.
+    /// </summary>
+    public IReadOnlyList<QuoteSnapshot> HeldQuotes { get; }
 
     public VixAvailability Vix { get; }
 
@@ -111,10 +123,12 @@ public sealed class MarketStateFrame : IMarketStateFrame
 
     /// <summary>Creates and validates a frame. Inputs are copied; any look-ahead (a quote or VIX observation available after the bar's end), a foreign source model, an invalid metric value or an inconsistent identity throws <see cref="FrameValidationException"/>.</summary>
     public static MarketStateFrame Create(
-        FrameIdentity identity, BasketIdentity basket, IEnumerable<MetricValue> metrics, IEnumerable<QuoteSnapshot> quotes, IEnumerable<QuoteIssue> quoteIssues, VixAvailability vix)
+        FrameIdentity identity, BasketIdentity basket, IEnumerable<MetricValue> metrics, IEnumerable<QuoteSnapshot> quotes, IEnumerable<QuoteIssue> quoteIssues, VixAvailability vix, IEnumerable<QuoteSnapshot>? heldQuotes = null)
     {
         ArgumentNullException.ThrowIfNull(identity); ArgumentNullException.ThrowIfNull(basket); ArgumentNullException.ThrowIfNull(metrics); ArgumentNullException.ThrowIfNull(quotes); ArgumentNullException.ThrowIfNull(quoteIssues); ArgumentNullException.ThrowIfNull(vix);
-        if (identity.Schema != FrameIdentity.CurrentSchema) throw new FrameValidationException($"unsupported frame schema '{identity.Schema}'");
+        var heldCopy = (heldQuotes ?? []).Select(q => q with { }).OrderBy(q => q.Token, StringComparer.Ordinal).ToArray();
+        if (identity.Schema != FrameIdentity.CurrentSchema && identity.Schema != FrameIdentity.HeldQuotesSchema) throw new FrameValidationException($"unsupported frame schema '{identity.Schema}'");
+        if ((heldCopy.Length > 0) != (identity.Schema == FrameIdentity.HeldQuotesSchema)) throw new FrameValidationException($"schema '{identity.Schema}' and {heldCopy.Length} held quote(s) are inconsistent: held quotes require {FrameIdentity.HeldQuotesSchema} and only then");
         if (identity.SourceModel != MetricRegistry.SourceModel) throw new FrameValidationException($"source model '{identity.SourceModel}' is not '{MetricRegistry.SourceModel}': the fixed-13,650 clock is never mixed with another clock");
         if (identity.BarSeq < 1) throw new FrameValidationException("BarSeq must be >= 1");
         if (identity.SameInstantOrdinal < 0) throw new FrameValidationException("SameInstantOrdinal must be >= 0");
@@ -145,6 +159,14 @@ public sealed class MarketStateFrame : IMarketStateFrame
         }
 
         if (quoteCopy.Select(q => q.Token).Distinct(StringComparer.Ordinal).Count() != quoteCopy.Length) throw new FrameValidationException("two quotes for one token");
+        foreach (var q in heldCopy)
+        {
+            if (tokens.Contains(q.Token)) throw new FrameValidationException($"held quote token {q.Token} is a basket token: a basket contract is quoted once, in Quotes");
+            if (!double.IsFinite(q.Bid) || !double.IsFinite(q.Ask) || q.Bid <= 0d || q.Ask < q.Bid || q.BidQty < 0 || q.AskQty < 0) throw new FrameValidationException($"held quote of {q.Token} is not a valid two-sided quote");
+            if (q.AvailableAt > identity.BarEndAvailableAt) throw new FrameValidationException($"look-ahead: the held quote of {q.Token} became available at {q.AvailableAt:O}, after the bar end {identity.BarEndAvailableAt:O}");
+        }
+
+        if (heldCopy.Select(q => q.Token).Distinct(StringComparer.Ordinal).Count() != heldCopy.Length) throw new FrameValidationException("two held quotes for one token");
         if (vix.ObservedAt is { } obs && obs > identity.BarEndAvailableAt) throw new FrameValidationException($"look-ahead: the VIX observation is from {obs:O}, after the bar end {identity.BarEndAvailableAt:O}");
 
         var basketCopy = new BasketIdentity(basket.Expiry, basket.Centre, basket.Step, Array.AsReadOnly(basket.Slots.Select(s => s with { }).ToArray()), Array.AsReadOnly(basket.Problems.ToArray()));     // read-only wrappers: a caller cannot cast back to a mutable array
@@ -153,9 +175,9 @@ public sealed class MarketStateFrame : IMarketStateFrame
         var identityCopy = identity with { };
         var canonical = new Lazy<(string, string)>(() =>
         {
-            var payload = FrameSerializer.Write(identityCopy, basketCopy, values, present, quoteCopy, issues, vixCopy);
+            var payload = FrameSerializer.Write(identityCopy, basketCopy, values, present, quoteCopy, issues, vixCopy, heldCopy);
             return (payload, Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(payload))).ToLowerInvariant());
         }, LazyThreadSafetyMode.ExecutionAndPublication);
-        return new MarketStateFrame(identityCopy, basketCopy, values, present, Array.AsReadOnly(quoteCopy), Array.AsReadOnly(issues), vixCopy, canonical);
+        return new MarketStateFrame(identityCopy, basketCopy, values, present, Array.AsReadOnly(quoteCopy), Array.AsReadOnly(issues), vixCopy, Array.AsReadOnly(heldCopy), canonical);
     }
 }

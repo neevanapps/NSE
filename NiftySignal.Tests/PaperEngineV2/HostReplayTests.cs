@@ -364,6 +364,17 @@ public class HostReplayTests
                 report.AppendLine($"STRATEGY {g.Key}: signalsReachingEntryStage={pl.Count + rl.Count} (orders={pl.Count} suppressed={rl.Count}) fills={fl.Count} exits={xl.Count} winRate={(xl.Count == 0 ? "n/a" : (100.0 * xl.Count(x => x.NetPnl > 0) / xl.Count).ToString("0.0", CultureInfo.InvariantCulture) + "%")} gross={xl.Sum(x => x.GrossPnl):0.00} fees={fees:0.00} net={xl.Sum(x => x.NetPnl):0.00} avgMFE={(xl.Count == 0 ? 0m : xl.Average(x => x.Mfe)):0.00} avgMAE={(xl.Count == 0 ? 0m : xl.Average(x => x.Mae)):0.00} avgHoldMin={(hold.Count == 0 ? 0 : hold.Average()):0.0} unresolved={g.OfType<PositionUnresolved>().Count()} faults={g.OfType<StrategyFaulted>().Count()} exitReasons=[{string.Join(", ", xl.GroupBy(x => x.Reason).Select(q => $"{q.Key}={q.Count()}"))}] rejections=[{string.Join(", ", rl.GroupBy(r => r.Reason).Select(q => $"{q.Key}={q.Count()}"))}]");
             }
 
+            string Ist(DateTimeOffset at) => at.ToOffset(TimeSpan.FromHours(5.5)).ToString("HH:mm:ss.fff", CultureInfo.InvariantCulture);
+            foreach (var ev in events.Where(x => x is EntryFilled or ExitRequested or ExitFilled or PositionUnresolved).OrderBy(x => x.StrategyId, StringComparer.Ordinal).ThenBy(x => x.BarSeq))
+                report.AppendLine(ev switch
+                {
+                    EntryFilled f => $"TRADE {f.StrategyId} ENTRY bar={f.BarSeq} at={Ist(f.At)} token={f.Token} {f.Right} qty={f.Quantity} fill={f.FillPrice:0.00} fees={f.Fees:0.00} quoteAt={Ist(f.QuoteAvailableAt)} pos={f.PositionId}",
+                    ExitRequested r => $"TRADE {r.StrategyId} EXITSIGNAL bar={r.BarSeq} at={Ist(r.At)} reason={r.Reason} decisionAt={Ist(r.Decision.AvailableAt)} pos={r.PositionId}",
+                    ExitFilled x => $"TRADE {x.StrategyId} EXIT bar={x.BarSeq} at={Ist(x.At)} reason={x.Reason} fill={x.FillPrice:0.00} quoteAt={Ist(x.QuoteAvailableAt)} fees={x.Fees:0.00} gross={x.GrossPnl:0.00} net={x.NetPnl:0.00} mfe={x.Mfe:0.00} mae={x.Mae:0.00} pos={x.PositionId}",
+                    PositionUnresolved u => $"TRADE {u.StrategyId} UNRESOLVED bar={u.BarSeq} at={Ist(u.At)} detail={u.Detail} pos={u.PositionId}",
+                    _ => string.Empty,
+                });
+
             report.AppendLine($"alerts: outbox={outbox} sent={sent} expired={expired} fakeSenderTexts={telegram.Texts.Count}");
             report.AppendLine($"dashboard: strategies={view.Strategies.Count} trades={view.Trades.Count} rejections={view.Rejections.Count} failures={view.Failures.Count}");
             var lagP = new List<long>(); await using (var lc = pev2.CreateCommand("SELECT processing_lag_ms FROM pev2.pev2_dispositions ORDER BY 1")) await using (var lr = await lc.ExecuteReaderAsync()) while (await lr.ReadAsync()) lagP.Add(lr.GetInt64(0));

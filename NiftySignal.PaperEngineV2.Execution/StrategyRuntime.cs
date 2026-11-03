@@ -171,12 +171,23 @@ public sealed class StrategyRuntime
         return null;
     }
 
+    /// <summary>The quote of a HELD contract: its basket quote when it is still in the basket, otherwise the frame's held quote. Never another strike, never inferred; null = unobserved at this bar.</summary>
+    static QuoteSnapshot? HeldQuoteOf(MarketStateFrame frame, string token)
+    {
+        if (QuoteOf(frame, token) is { } q) return q;
+        foreach (var h in frame.HeldQuotes) if (string.Equals(h.Token, token, StringComparison.Ordinal)) return h;
+        return null;
+    }
+
+    /// <summary>Tokens of the contracts this strategy currently holds (Open or ExitPending): they must stay observable until the position is closed or Unresolved.</summary>
+    public IEnumerable<string> HeldTokens() => _positions.Where(p => p.State is PositionState.Open or PositionState.ExitPending).Select(p => p.Token);
+
     void MarkPositions(MarketStateFrame frame)
     {
         foreach (var p in _positions.Where(p => p.State is PositionState.Open or PositionState.ExitPending))
         {
             p.BarsHeld = frame.Identity.BarSeq - p.FillBarSeq;
-            var q = QuoteOf(frame, p.Token);
+            var q = HeldQuoteOf(frame, p.Token);
             if (q is null || !Fresh(q, frame, _config.Execution.MaxQuoteAgeMs)) { p.MarkGaps++; continue; }
             var mark = (decimal)q.Bid;
             var pnl = (mark - p.EntryPrice) * p.Quantity;
@@ -191,7 +202,7 @@ public sealed class StrategyRuntime
         var ex = _config.Execution;
         foreach (var p in _positions.Where(p => p.State == PositionState.ExitPending).ToArray())
         {
-            var q = QuoteOf(frame, p.Token);
+            var q = HeldQuoteOf(frame, p.Token);
             if (q is null || !Fresh(q, frame, ex.MaxQuoteAgeMs)) continue;
             if (q.AvailableAt <= p.ExitDecision!.Value.AvailableAt.AddMilliseconds(ex.LatencyMs)) continue;      // not strictly newer than the decision (+ latency)
             var price = Math.Max(0m, (decimal)q.Bid - (decimal)ex.ExitSlippage);
@@ -262,7 +273,7 @@ public sealed class StrategyRuntime
         var x = _config.Exits;
         if (!x.Any) return;
         if (x.MaxHoldBars is { } hold && p.BarsHeld >= hold) { RequestExit(p, ExitReason.MaxHold, frame, output); return; }
-        var q = QuoteOf(frame, p.Token);
+        var q = HeldQuoteOf(frame, p.Token);
         if (q is null || !Fresh(q, frame, _config.Execution.MaxQuoteAgeMs)) return;      // no usable mark: never assume a threshold price
         var mark = (decimal)q.Bid;
         if (x.StopLoss is { } sl && mark <= p.EntryPrice - Distance(sl, p.EntryPrice)) RequestExit(p, ExitReason.StopLoss, frame, output);

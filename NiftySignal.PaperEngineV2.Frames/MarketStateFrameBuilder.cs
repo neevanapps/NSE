@@ -48,7 +48,7 @@ public sealed class MarketStateFrameBuilder
         GridNames.Select(g => Families.Select(f => SideNames.Select(s => new[] { Handle($"opt.{g}.{f}.{s}:raw"), Handle($"opt.{g}.{f}.{s}:pct") }).ToArray()).ToArray()).ToArray();
 
     public MarketStateFrame Build(
-        BarInput bar, Basket basket, IReadOnlyList<FuturesWindowSummary> futures, IReadOnlyList<GridSummary> grids, IReadOnlyList<VixWindowSummary>? vix, IReadOnlyList<QuoteInput> quotes)
+        BarInput bar, Basket basket, IReadOnlyList<FuturesWindowSummary> futures, IReadOnlyList<GridSummary> grids, IReadOnlyList<VixWindowSummary>? vix, IReadOnlyList<QuoteInput> quotes, IReadOnlyList<QuoteInput>? heldQuotes = null)
     {
         ArgumentNullException.ThrowIfNull(bar); ArgumentNullException.ThrowIfNull(basket); ArgumentNullException.ThrowIfNull(futures); ArgumentNullException.ThrowIfNull(grids); ArgumentNullException.ThrowIfNull(quotes);
         if (bar.AdaptiveModelVersion != FixedClockModelVersion)
@@ -88,9 +88,19 @@ public sealed class MarketStateFrameBuilder
 
         if (quotes.Any(q => !slots.Any(s => s.Token == q.Token))) throw new FrameValidationException("a quote was supplied for a token outside the basket (no substitution)");
 
-        var identity = new FrameIdentity(FrameIdentity.CurrentSchema, MetricRegistry.SourceModel, bar.AdaptiveModelVersion, bar.AtmRuleVersion, bar.SessionId, bar.TradeDate, bar.BarSeq,
+        // held-contract quotes: observed quotes of contracts held by open positions OUTSIDE this basket (the caller passes only those); a missing or unusable one is simply absent (never inferred, never another strike)
+        var held = new List<QuoteSnapshot>();
+        foreach (var q in heldQuotes ?? [])
+        {
+            if (slots.Any(s => s.Token == q.Token)) throw new FrameValidationException($"held quote of {q.Token} supplied for a basket token: a basket contract is quoted once");
+            if (q.AvailableAt > bar.EndAvailableAt) throw new FrameValidationException($"look-ahead: the held quote of {q.Token} became available at {q.AvailableAt:O}, after the bar end {bar.EndAvailableAt:O}");
+            if (!double.IsFinite(q.Bid) || !double.IsFinite(q.Ask) || q.Bid <= 0d || q.Ask < q.Bid || q.BidQty < 0 || q.AskQty < 0) continue;
+            held.Add(new QuoteSnapshot(q.Token, q.Bid, q.Ask, q.BidQty, q.AskQty, q.AvailableAt, q.SourceTickId));
+        }
+
+        var identity = new FrameIdentity(held.Count > 0 ? FrameIdentity.HeldQuotesSchema : FrameIdentity.CurrentSchema, MetricRegistry.SourceModel, bar.AdaptiveModelVersion, bar.AtmRuleVersion, bar.SessionId, bar.TradeDate, bar.BarSeq,
             bar.StartAvailableAt, bar.EndAvailableAt, bar.LastSourceTickId, ordinal, bar.DurationSeconds, bar.Verified, bar.Verified ? null : bar.UnverifiedReason ?? "unverified");
-        var frame = MarketStateFrame.Create(identity, basketId, metrics, usable, issues, vixAvailability);
+        var frame = MarketStateFrame.Create(identity, basketId, metrics, usable, issues, vixAvailability, held);
         _session = bar.SessionId; _lastSeq = bar.BarSeq; _lastEnd = bar.EndAvailableAt; _lastOrdinal = ordinal;      // only after the frame validated
         return frame;
     }

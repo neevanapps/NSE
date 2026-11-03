@@ -10,7 +10,11 @@ public sealed record V2SessionInfo(
     long SessionId, DateOnly TradeDate, string ModelVersion, string? AtmRuleVersion, DateOnly Expiry, IReadOnlyList<ListedStrike> Strikes, IReadOnlyDictionary<string, int> LotSizes);
 
 /// <summary>One completed bar, captured on the observer thread: plain immutable values plus the basket's last top-of-book quotes at the bar's availability instant. No database, no engine.</summary>
-public sealed record V2BarNotice(V2SessionInfo Session, BarInput Bar, double? CenterStrike, IReadOnlyList<QuoteInput> Quotes);
+public sealed record V2BarNotice(V2SessionInfo Session, BarInput Bar, double? CenterStrike, IReadOnlyList<QuoteInput> Quotes)
+{
+    /// <summary>Tokens of contracts held by open V2 positions, set by the V2 task (never by the observer) from the engine's durable state; their quotes are carried into the frame as held quotes when they left the basket.</summary>
+    public IReadOnlySet<string>? HeldTokens { get; init; }
+}
 
 /// <summary>Everything the frame builder needs besides the bar and the quotes; assembled by the V2 task, never by the observer.</summary>
 public sealed record V2FrameInputs(Basket Basket, IReadOnlyList<FuturesWindowSummary> Futures, IReadOnlyList<GridSummary> Grids, IReadOnlyList<VixWindowSummary>? Vix);
@@ -47,6 +51,8 @@ public sealed class InputSourceFrameFactory(IV2FrameInputSource source) : IV2Fra
         if (inputs is null) return (null, problem ?? "frame inputs unavailable");
         var tokens = inputs.Basket.Contracts.Where(c => c.Token is not null).Select(c => c.Token!).ToHashSet(StringComparer.Ordinal);
         var quotes = notice.Quotes.Where(q => tokens.Contains(q.Token)).ToList();
-        return (builder.Build(notice.Bar, inputs.Basket, inputs.Futures, inputs.Grids, inputs.Vix, quotes), null);
+        // held contracts that left the signal-time basket keep being observed (their own genuine quotes, available at or before the bar end); a held contract still in the basket is quoted once, in Quotes
+        var held = notice.HeldTokens is { Count: > 0 } h ? notice.Quotes.Where(q => h.Contains(q.Token) && !tokens.Contains(q.Token)).ToList() : null;
+        return (builder.Build(notice.Bar, inputs.Basket, inputs.Futures, inputs.Grids, inputs.Vix, quotes, held), null);
     }
 }
