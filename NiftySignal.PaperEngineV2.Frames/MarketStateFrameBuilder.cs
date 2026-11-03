@@ -146,7 +146,7 @@ public sealed class MarketStateFrameBuilder
 
             if (g == TotalGridIndex && r.Direction is { } inv)
             {
-                Put(list, TotalMicroDevInvRaw, w, Invert(inv.MicroDev.Raw));         // same convention as the Dashboard's MicroDevDisplay: displayed = -raw, ratio flips with it, zero stays zero
+                Put(list, TotalMicroDevInvRaw, w, Invert(inv.MicroDev.Raw));         // same sign convention as the Dashboard's MicroDev (Inv) column: value = -raw, ratio flips with it, zero stays zero
                 Put(list, TotalMicroDevInvPct, w, Invert(inv.MicroDev.Ratio));
             }
 
