@@ -97,6 +97,9 @@ public class TotalStrategiesTests
             Assert.Equal(OnOppositeEntrySignal.Exit, c.OnOppositeEntrySignal);
             Assert.Equal(FillMode.AllOrNone, c.Execution.FillMode);
             Assert.Equal("npt1-frozen-fees-v1", c.FeeSchedule);
+            Assert.Equal(5, c.Risk.MaxDailyTrades); Assert.Equal(1_500d, c.Risk.MaxDailyLoss); Assert.Equal(LiquidationPolicy.None, c.Risk.Liquidation);        // owner directive: frozen paper limits
+            Assert.Equal(StrategyConfigParser.ExitMechanismOppositeSignalOrSessionEnd, c.ExitMechanism);       // explicit exit contract, no artificial predicate
+            Assert.Null(c.ExitConditions); Assert.False(c.Exits.Any);
         });
     }
 
@@ -457,6 +460,84 @@ public class TotalStrategiesTests
         ExecFixtures.Run(e, [Fr(5, Up, 0, quotes: [new("CE26000", 40, 41)])]);                // the only call quote has an ask outside 100-150
         Assert.Empty(e.Events.OfType<EntryOrderPlaced>());
         Assert.Contains(e.Events.OfType<EntryRejected>(), r => r.Reason == RejectionReason.NoQualifyingContract);
+    }
+
+    // ---- exit contract: OppositeSignalOrSessionEnd ----
+
+    static string Mutated(string id, Action<JsonObject> edit)
+    {
+        var o = JsonNode.Parse(Json(id))!.AsObject();
+        edit(o);
+        return o.ToJsonString();
+    }
+
+    [Theory]
+    [InlineData(A)] [InlineData(B)] [InlineData(C)]
+    public void ExitMechanism_IsBackwardCompatible_AndExclusiveWithAnExitPredicate(string id)
+    {
+        Assert.DoesNotContain("coverage_pct", Json(id), StringComparison.Ordinal);                          // the artificial never-true exit predicate is gone
+        var both = StrategyConfigParser.Parse(Mutated(id, o => o["exit"]!["conditions"] = JsonNode.Parse("""{ "op": "AND", "items": [ { "metric": "fut.coverage_pct", "window": "5", "cmp": ">", "value": 100 } ] }""")));
+        Assert.False(both.IsValid);
+        Assert.Contains(both.Errors, e => e.ToString()!.Contains("conditions", StringComparison.Ordinal));
+        var unknown = StrategyConfigParser.Parse(Mutated(id, o => o["exit"]!["mechanism"] = "Whatever"));
+        Assert.False(unknown.IsValid);
+        var none = StrategyConfigParser.Parse(Mutated(id, o => ((JsonObject)o["exit"]!).Remove("mechanism")));
+        Assert.False(none.IsValid);                                                                         // a strategy still needs SOME exit mechanism
+        // the original contract is untouched: an explicit predicate (no mechanism) parses exactly as before, with no mechanism recorded
+        var legacy = StrategyConfigParser.Parse(Mutated(id, o => o["exit"] = JsonNode.Parse("""{ "conditions": { "op": "AND", "items": [ { "metric": "opt.total.coverage_full", "window": "5", "cmp": "==", "value": 0 } ] }, "onOppositeEntrySignal": "Exit" }""")));
+        Assert.True(legacy.IsValid, string.Join("; ", legacy.Errors));
+        Assert.Null(legacy.Config!.ExitMechanism);
+        Assert.DoesNotContain("mechanism", legacy.Config.CanonicalJson, StringComparison.Ordinal);          // existing config hashes cannot move
+        Assert.Contains("mechanism", Config(id).CanonicalJson, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ThreeStrategies_OnlyExit_OnTheOppositeSignal_OrAtTheSessionEnd()
+    {
+        var ist = TimeSpan.FromHours(5.5);
+        var at1500 = new DateTimeOffset(Day.ToDateTime(new TimeOnly(15, 0, 0)), ist).ToUniversalTime();
+        var e = Engine(Ids);
+        ExecFixtures.Run(e, [Fr(4, Flat, 0), Fr(5, Up, 1), Fr(6, Up, 1), Fr(7, Flat, 0), Fr(8, Up, 1)]);       // neutral / repeated signals never exit
+        foreach (var id in Ids) { Assert.Single(Of<EntryFilled>(e, id)); Assert.Empty(Of<ExitRequested>(e, id)); }
+        ExecFixtures.Run(e, [Fr(50, Up, 1, end: at1500.AddMinutes(-1)), Fr(51, Up, 1, end: at1500), Fr(52, Up, 1, end: at1500.AddMinutes(1))]);
+        foreach (var id in Ids)
+        {
+            var req = Assert.Single(Of<ExitRequested>(e, id));
+            Assert.Equal(ExitReason.Terminal, req.Reason);
+            Assert.Single(Of<ExitFilled>(e, id));
+            Assert.Empty(Of<PositionUnresolved>(e, id));
+        }
+    }
+
+    [Fact]
+    public void MaxDailyTradesFive_BlocksTheSixthEntry_IndependentPerStrategy()
+    {
+        var edited = StrategyConfigParser.Parse(Mutated(B, o => o["risk"]!["maxDailyTrades"] = 1)).Config!;
+        var e = ExecFixtures.Engine([CompiledStrategy.Compile(edited), Compiled(C)]);
+        ExecFixtures.Run(e, [Fr(4, Flat, 0), Fr(5, Up, 0), Fr(6, Up, 0), Fr(7, Down, 0), Fr(8, Down, 0), Fr(9, Down, 0)]);
+        Assert.Single(Of<EntryFilled>(e, B));                                                              // one trade allowed, the reversal entry is refused
+        Assert.Contains(e.Events.OfType<EntryRejected>(), r => r.StrategyId == B && r.Reason == RejectionReason.RiskBreach && r.Detail.Contains("daily trades", StringComparison.Ordinal));
+        Assert.Equal(2, Of<EntryFilled>(e, C).Count);                                                      // C has its own counter (limit 5)
+    }
+
+    [Fact]
+    public void FrozenLimits_AreFiveTradesAndFifteenHundredLoss()
+    {
+        foreach (var id in Ids) { Assert.Equal(5, Config(id).Risk.MaxDailyTrades); Assert.Equal(1500d, Config(id).Risk.MaxDailyLoss); }
+    }
+
+    [Theory]
+    [InlineData(B)] [InlineData(C)]
+    public void VoteFiles_ReadExactlyTheSixMetrics_AtTheFiveBarWindow(string id)
+    {
+        var node = JsonNode.Parse(Json(id))!["entry"]!;
+        foreach (var side in new[] { "buyCall", "buyPut" })
+        {
+            var leaves = node[side]!["items"]!.AsArray().SelectMany(i => i!["of"] is JsonArray of ? of.Select(x => x!) : [i!]).ToList();
+            var metrics = leaves.Where(l => l["metric"]!.GetValue<string>() != "opt.total.coverage_full").Select(l => l["metric"]!.GetValue<string>()).ToArray();
+            Assert.Equal(SixIds.OrderBy(x => x, StringComparer.Ordinal), metrics.OrderBy(x => x, StringComparer.Ordinal));
+            Assert.All(leaves, l => Assert.Equal("5", l["window"]!.GetValue<string>()));
+        }
     }
 
     [Fact]

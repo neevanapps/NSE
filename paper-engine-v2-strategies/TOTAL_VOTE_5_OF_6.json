@@ -113,17 +113,7 @@
     }
   },
   "exit": {
-    "conditions": {
-      "op": "OR",
-      "items": [
-        {
-          "metric": "fut.coverage_pct",
-          "window": "5",
-          "cmp": ">",
-          "value": 100
-        }
-      ]
-    },
+    "mechanism": "OppositeSignalOrSessionEnd",
     "onOppositeEntrySignal": "Exit"
   },
   "filters": {
@@ -166,8 +156,8 @@
     "maxConcurrent": 1
   },
   "risk": {
-    "maxDailyLoss": 10000,
-    "maxDailyTrades": 30,
+    "maxDailyLoss": 1500,
+    "maxDailyTrades": 5,
     "onBreach": {
       "blockEntries": true,
       "liquidation": "None"

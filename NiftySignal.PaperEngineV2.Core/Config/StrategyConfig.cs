@@ -67,7 +67,7 @@ public sealed record StrategyConfig(
     StrategyIdentity Identity, bool Enabled, string SourceModel,
     GroupSpec? BuyCall, GroupSpec? BuyPut, GroupSpec? ExitConditions, OnOppositeEntrySignal OnOppositeEntrySignal,
     EntryFilters Filters, PremiumRange Premium, ExecutionPolicy Execution, int Lots, double VirtualCapital, int MaxConcurrent, RiskPolicy Risk,
-    OptionalExits Exits, string FeeSchedule, string CanonicalJson);
+    OptionalExits Exits, string FeeSchedule, string CanonicalJson, string? ExitMechanism = null);
 
 /// <summary>One problem found while validating a configuration document. <see cref="Path"/> is a JSON-pointer-like location.</summary>
 public sealed record ConfigError(string Code, string Path, string Message)

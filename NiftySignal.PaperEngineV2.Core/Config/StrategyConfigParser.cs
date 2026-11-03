@@ -17,6 +17,12 @@ public static partial class StrategyConfigParser
     public const int MaxConditionDepth = 4;
     public const int MaxLeavesPerTree = 32;
     public const int MaxAtLeastItems = 12;
+
+    /// <summary>
+    /// Optional explicit exit mechanism (<c>exit.mechanism</c>): the position leaves on the OPPOSITE entry signal or at the mandatory session end (15:00 terminal exit), with no discretionary exit predicate.
+    /// It replaces the need for an <c>exit.conditions</c> tree; both together are refused. Absent = the original contract (a conditions tree or an optional exit is required).
+    /// </summary>
+    public const string ExitMechanismOppositeSignalOrSessionEnd = "OppositeSignalOrSessionEnd";
     public const string RankRule = "PremiumProximityThenCentreDistanceThenStrikeThenToken";
 
     static readonly TimeOnly EarliestEntry = new(9, 30, 0);
@@ -157,10 +163,18 @@ public static partial class StrategyConfigParser
 
         // exit
         GroupSpec? exitConditions = null;
-        var exit = o.Child("exit", true, "conditions", "onOppositeEntrySignal");
+        string? exitMechanism = null;
+        var exit = o.Child("exit", true, "conditions", "onOppositeEntrySignal", "mechanism");
         if (exit is not null)
         {
             if (exit.Raw("conditions") is { } ec) exitConditions = ReadTree(ec, $"{exit.Path}/conditions", errors);
+            if (exit.Has("mechanism"))
+            {
+                exitMechanism = exit.Str("mechanism");
+                if (exitMechanism is not null && exitMechanism != ExitMechanismOppositeSignalOrSessionEnd) { exit.Error("Value", "mechanism", $"only '{ExitMechanismOppositeSignalOrSessionEnd}' is supported"); exitMechanism = null; }
+                if (exitMechanism is not null && exit.Has("conditions")) { exit.Error("Value", "conditions", $"'{ExitMechanismOppositeSignalOrSessionEnd}' means no discretionary exit predicate: remove exit.conditions"); exitMechanism = null; }
+            }
+
             var opp = exit.Str("onOppositeEntrySignal");
             if (opp is not null && opp != "Exit") exit.Error("Value", "onOppositeEntrySignal", "only 'Exit' is allowed: an opposite signal exits, there is no automatic reversal");
         }
@@ -281,13 +295,13 @@ public static partial class StrategyConfigParser
         var fee = o.Child("fees", true, "schedule")?.Str("schedule");
         if (fee is not null && (fee.Length is 0 or > 64)) errors.Add(new ConfigError("Value", "$/fees/schedule", "1-64 characters"));
 
-        if (exitConditions is null && !exits.Any && errors.Count == 0) errors.Add(new ConfigError("NoExitMechanism", "$/exit", "a strategy needs at least one exit mechanism: exit.conditions or one of stopLoss / target / trailing / maxHoldBars"));
+        if (exitConditions is null && exitMechanism is null && !exits.Any && errors.Count == 0) errors.Add(new ConfigError("NoExitMechanism", "$/exit", "a strategy needs at least one exit mechanism: exit.conditions, exit.mechanism 'OppositeSignalOrSessionEnd', or one of stopLoss / target / trailing / maxHoldBars"));
 
         if (errors.Count > 0 || id is null || version is not { } ver || enabled is not { } en || filters is null || premium is null || execution is null || lots is not { } lo || capital is not { } cap || maxConc is not { } mc || risk is null || fee is null)
             return null;
 
         return new StrategyConfig(new StrategyIdentity(id, ver, CanonicalJson.Sha256Hex(canonical)), en, MetricRegistry.SourceModel, buyCall, buyPut, exitConditions, OnOppositeEntrySignal.Exit,
-            filters, premium, execution, lo, cap, mc, risk, exits, fee, canonical);
+            filters, premium, execution, lo, cap, mc, risk, exits, fee, canonical, exitMechanism);
     }
 
     static TimeOnly? ReadTime(Obj o, string name)
