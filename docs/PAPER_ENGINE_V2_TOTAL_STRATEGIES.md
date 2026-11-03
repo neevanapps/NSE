@@ -22,7 +22,7 @@ Unchanged frozen V2 contract: entry/exit at the executable ask/bid of a later, s
 
 ## Values I had to choose (owner to confirm)
 
-Taken from existing configuration: capital 50,000, lot size 65 (from the instrument, via the runtime), 2 lots per trade, premium 100–150 (`Ruleset`); `maxDailyTrades` 30 (`Ruleset:Entry:MaxTradesPerDay`); `maxDailyLoss` 10,000 (= `MaxDailyLossPct` 20 % of 50,000); `maxSpread.fraction` 0.02 (`StrikeSelection:MaxSpreadPctOfMid` 2.0); `maxQuoteAgeMs` 2000 (NPT1 execution freshness, V2 design §4); `maxProcessingLagMs` 5000 (`PaperEngineV2:MaxProcessingLagSeconds`); fee schedule `npt1-frozen-fees-v1` (the Host's configured `CostScheduleVersion`).
+Taken from existing configuration: capital 50,000, lot size 65 (from the instrument, via the runtime), 2 lots per trade, premium 100–150 (`Ruleset`); **`maxDailyTrades` 5 and `maxDailyLoss` 1,500 (owner directive for the paper session; they replace the earlier 30 / 10,000)**; `maxSpread.fraction` 0.02 (`StrikeSelection:MaxSpreadPctOfMid` 2.0); `maxQuoteAgeMs` 2000 (NPT1 execution freshness, V2 design §4); `maxProcessingLagMs` 5000 (`PaperEngineV2:MaxProcessingLagSeconds`); fee schedule `npt1-frozen-fees-v1` (the Host's configured `CostScheduleVersion`).
 
 | Field | Value | Why / status |
 |---|---|---|
@@ -32,8 +32,14 @@ Taken from existing configuration: capital 50,000, lot size 65 (from the instrum
 | `entryOrderLifetimeMs` | 60000 | Must exceed latency; one bar. owner to confirm |
 | `position.maxConcurrent` | 1 | NPT1 holds one position per strategy; "3 concurrent" is the sum over the three strategies. owner to confirm |
 | `risk.onBreach.liquidation` | `None` | Breach blocks entries; open positions keep their exit rules. owner to confirm |
-| `exit.conditions` | `fut.coverage_pct (5) > 100` | The validator demands an explicit exit mechanism. This condition can never be true (coverage ≤ 100 %), so it adds no exit rule; the real exits are the opposite signal and the 15:00 terminal exit. A validator that accepts "opposite-signal exit" as the mechanism would let this be removed. owner to confirm |
+| `exit.mechanism` | `OppositeSignalOrSessionEnd` | Replaces the earlier never-true `fut.coverage_pct > 100` predicate. The validator demanded an explicit exit mechanism; a new, backward-compatible `exit.mechanism` states the real contract: leave on the OPPOSITE entry signal or at the 15:00 terminal exit, with no discretionary predicate. It is refused together with `exit.conditions`; configs without it parse and hash exactly as before (NPT1 unaffected). A Host build older than this commit rejects the key (`ConfigInvalid`). |
 | `requireFreshVix` | false | Not requested. |
+
+## Strategy A, 2026-09-07 replay: 1 entry, 0 exits (unresolved)
+
+Root cause (engine limitation, not a data gap): frames carry quotes only for the signal-time ATM+-2 basket (10 contracts, centred on each completed bar's own option band). The held PUT (token 42636, strike 23900) drifted out of that basket while the centre sat at 23750 (bars 100-160), so no frame carried a quote for it. The terminal exit was requested at 15:00:27 but could not be priced; at the 15:25 retry cut-off the position became `Unresolved`. The recorded ticks do contain two-sided quotes for the token after 15:00 (7,155 of 7,157 ticks between 15:00 and 15:40 IST; bid 121.30 / ask 121.65 at 15:00:27). No fill was fabricated. Accounting: realised net excludes the open position; entry fees are charged and cash stays reduced; there is no unrealised P&L representation. Every V2 strategy has this limitation (the exit path needs the held token inside the basket).
+
+Recommended fix (needs the owner's decision, changes the frame contract and so the frame schema/hash): carry the held positions' tokens in the frames. Until then a position whose contract leaves the basket and is still open at 15:00 can end `Unresolved`.
 
 ## Open owner decisions (recommended defaults are what the files contain)
 
