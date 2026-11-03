@@ -294,7 +294,10 @@ public class HostReplayTests
             var baseline = await ReplayAsync(staged, obsA, null, null, new ReplayTelegram(), false, new ReplayClock());
             // run B: V2 enabled with 30 strategies and alerts (fake Telegram sender)
             var telegram = new ReplayTelegram();
-            var dir = WriteStrategies(strategies);
+            // NSE_V2_REPLAY_STRATEGY_DIR replays the exact reviewed strategy files (e.g. deploy/paper-engine-v2-strategies) instead of the generated ones
+            var customDir = Env("NSE_V2_REPLAY_STRATEGY_DIR");
+            var dir = customDir.Length > 0 ? customDir : WriteStrategies(strategies);
+            if (customDir.Length > 0) strategies = Directory.GetFiles(dir, "*.json").Length;
             var clock = new ReplayClock();
             var withV2 = await ReplayAsync(staged, obsB, pevDb, dir, telegram, true, clock);
 
@@ -352,6 +355,15 @@ public class HostReplayTests
             report.AppendLine($"v2: frames={frames} dispositions={disp} entriesAllowedFrames={allowed} gaps={gaps} maxLagMs={maxLag}");
             report.AppendLine($"ledger: orders={placed.Count} fills={filled.Count} exits={exits.Count} rejected={rej.Count} totalNet={exits.Sum(e => e.NetPnl):0.00} totalFees={exits.Sum(e => e.Fees) + filled.Sum(f => f.Fees):0.00}");
             report.AppendLine($"mfe/mae recorded on {exits.Count} exits; rejection reasons: {string.Join(", ", rej.GroupBy(r => r.Reason).Select(g => $"{g.Key}={g.Count()}"))}");
+            foreach (var g in events.GroupBy(e => e.StrategyId, StringComparer.Ordinal).OrderBy(g => g.Key, StringComparer.Ordinal))
+            {
+                var pl = g.OfType<EntryOrderPlaced>().ToList(); var fl = g.OfType<EntryFilled>().ToList(); var xl = g.OfType<ExitFilled>().ToList(); var rl = g.OfType<EntryRejected>().ToList();
+                var fillById = fl.ToDictionary(f => f.PositionId, StringComparer.Ordinal);
+                var hold = xl.Where(x => fillById.ContainsKey(x.PositionId)).Select(x => (x.At - fillById[x.PositionId].At).TotalMinutes).ToList();
+                var fees = fl.Sum(f => f.Fees) + xl.Sum(x => x.Fees);
+                report.AppendLine($"STRATEGY {g.Key}: signalsReachingEntryStage={pl.Count + rl.Count} (orders={pl.Count} suppressed={rl.Count}) fills={fl.Count} exits={xl.Count} winRate={(xl.Count == 0 ? "n/a" : (100.0 * xl.Count(x => x.NetPnl > 0) / xl.Count).ToString("0.0", CultureInfo.InvariantCulture) + "%")} gross={xl.Sum(x => x.GrossPnl):0.00} fees={fees:0.00} net={xl.Sum(x => x.NetPnl):0.00} avgMFE={(xl.Count == 0 ? 0m : xl.Average(x => x.Mfe)):0.00} avgMAE={(xl.Count == 0 ? 0m : xl.Average(x => x.Mae)):0.00} avgHoldMin={(hold.Count == 0 ? 0 : hold.Average()):0.0} unresolved={g.OfType<PositionUnresolved>().Count()} faults={g.OfType<StrategyFaulted>().Count()} exitReasons=[{string.Join(", ", xl.GroupBy(x => x.Reason).Select(q => $"{q.Key}={q.Count()}"))}] rejections=[{string.Join(", ", rl.GroupBy(r => r.Reason).Select(q => $"{q.Key}={q.Count()}"))}]");
+            }
+
             report.AppendLine($"alerts: outbox={outbox} sent={sent} expired={expired} fakeSenderTexts={telegram.Texts.Count}");
             report.AppendLine($"dashboard: strategies={view.Strategies.Count} trades={view.Trades.Count} rejections={view.Rejections.Count} failures={view.Failures.Count}");
             var lagP = new List<long>(); await using (var lc = pev2.CreateCommand("SELECT processing_lag_ms FROM pev2.pev2_dispositions ORDER BY 1")) await using (var lr = await lc.ExecuteReaderAsync()) while (await lr.ReadAsync()) lagP.Add(lr.GetInt64(0));

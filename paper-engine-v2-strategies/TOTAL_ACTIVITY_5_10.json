@@ -1,0 +1,131 @@
+{
+  "schema": "pev2-strategy/1",
+  "strategyId": "TOTAL_ACTIVITY_5_10",
+  "version": 1,
+  "enabled": true,
+  "sourceModel": "fixed13650-summary-v1",
+  "entry": {
+    "buyCall": {
+      "op": "AND",
+      "items": [
+        {
+          "metric": "opt.total.coverage_full",
+          "window": "5",
+          "cmp": "==",
+          "value": 1
+        },
+        {
+          "metric": "opt.total.coverage_full",
+          "window": "10",
+          "cmp": "==",
+          "value": 1
+        },
+        {
+          "metric": "opt.total.activity.dir:raw",
+          "window": "5",
+          "cmp": ">",
+          "value": 0
+        },
+        {
+          "metric": "opt.total.activity.dir:raw",
+          "window": "10",
+          "cmp": ">",
+          "value": 0
+        }
+      ]
+    },
+    "buyPut": {
+      "op": "AND",
+      "items": [
+        {
+          "metric": "opt.total.coverage_full",
+          "window": "5",
+          "cmp": "==",
+          "value": 1
+        },
+        {
+          "metric": "opt.total.coverage_full",
+          "window": "10",
+          "cmp": "==",
+          "value": 1
+        },
+        {
+          "metric": "opt.total.activity.dir:raw",
+          "window": "5",
+          "cmp": "<",
+          "value": 0
+        },
+        {
+          "metric": "opt.total.activity.dir:raw",
+          "window": "10",
+          "cmp": "<",
+          "value": 0
+        }
+      ]
+    }
+  },
+  "exit": {
+    "conditions": {
+      "op": "OR",
+      "items": [
+        {
+          "metric": "fut.coverage_pct",
+          "window": "5",
+          "cmp": ">",
+          "value": 100
+        }
+      ]
+    },
+    "onOppositeEntrySignal": "Exit"
+  },
+  "filters": {
+    "entryFrom": "09:30:00",
+    "entryBefore": "15:00:00",
+    "requireFreshVix": false
+  },
+  "instrument": {
+    "basket": "SignalTimeAtmPm2",
+    "premium": {
+      "min": 100,
+      "max": 150
+    },
+    "rank": "PremiumProximityThenCentreDistanceThenStrikeThenToken"
+  },
+  "execution": {
+    "fillQuote": "AsOfEligibleBarEnd",
+    "entryPrice": "Ask",
+    "exitPrice": "Bid",
+    "slippage": {
+      "entry": 0.1,
+      "exit": 0.1
+    },
+    "latencyMs": 0,
+    "maxQuoteAgeMs": 2000,
+    "maxSpread": {
+      "fraction": 0.02
+    },
+    "entryOrderLifetimeMs": 60000,
+    "maxProcessingLagMs": 5000,
+    "fillMode": "AllOrNone"
+  },
+  "quantity": {
+    "lots": 2
+  },
+  "capital": {
+    "virtualCapital": 50000
+  },
+  "position": {
+    "maxConcurrent": 1
+  },
+  "risk": {
+    "maxDailyLoss": 10000,
+    "maxDailyTrades": 30,
+    "onBreach": {
+      "blockEntries": true,
+      "liquidation": "None"
+    }
+  },
+  "fees": {
+    "schedule": "npt1-frozen-fees-v1"
+  }
+}
