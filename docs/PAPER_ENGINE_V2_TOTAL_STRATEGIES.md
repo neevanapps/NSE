@@ -65,7 +65,7 @@ Realistic first session: **the next session after an after-hours Host deploy**. 
    ```powershell
    $dir = 'D:\NiftySignal\paper-engine-v2-strategies'     # your choice; NOT VERIFIED on the VM
    New-Item -ItemType Directory -Force $dir | Out-Null
-   Copy-Item .\deploy\paper-engine-v2-strategies\*.json $dir
+   Copy-Item .\paper-engine-v2-strategies\*.json $dir
    Get-ChildItem $dir | Select-Object Name, Length
    ```
 4. Merge (do not replace) these keys into the Host's VM `appsettings.Local.json`:
@@ -73,7 +73,7 @@ Realistic first session: **the next session after an after-hours Host deploy**. 
    "PaperEngineV2": {
      "Enabled": true,
      "ConnectionStringName": "TradingPaperLive",
-     "StrategyDirectory": "D:\NiftySignal\paper-engine-v2-strategies",
+     "StrategyDirectory": "D:\\NiftySignal\\paper-engine-v2-strategies",
      "CostScheduleVersion": "npt1-frozen-fees-v1",
      "Alerts": { "Opened": false, "Closed": false, "OrderRejected": false, "PartialFill": false, "ExecutionFailure": false }
    }
