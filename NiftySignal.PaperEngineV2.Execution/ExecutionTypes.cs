@@ -13,6 +13,7 @@ public enum RejectionReason
     UnavailableLiquidity,       // reserved: V2 v1 is all-or-none and never infers liquidity from Level-1 sizes
     DuplicateOrder, InfrastructureFailure,
     NoQualifyingContract, SpreadTooWide, OutsideEntryWindow, PositionLimit, EntriesBlocked, ConflictingSignals,
+    WarmupIncomplete,           // appended: fewer than filters.minCompletedBars verified bars of the session have been evaluated
 }
 
 public enum ExitReason { Discretionary, OppositeSignal, StopLoss, Target, Trailing, MaxHold, Terminal, RiskLiquidation }

@@ -26,6 +26,7 @@ public static partial class StrategyConfigParser
     public const string RankRule = "PremiumProximityThenCentreDistanceThenStrikeThenToken";
 
     static readonly TimeOnly EarliestEntry = new(9, 30, 0);
+    static readonly TimeOnly EarliestEarlyEntry = new(9, 20, 0);
     static readonly TimeOnly LatestEntryCutoff = new(15, 0, 0);
 
     [GeneratedRegex("^[A-Za-z][A-Za-z0-9_-]{0,31}$")]
@@ -181,16 +182,25 @@ public static partial class StrategyConfigParser
 
         // filters
         EntryFilters? filters = null;
-        var f = o.Child("filters", true, "entryFrom", "entryBefore", "requireFreshVix");
+        var f = o.Child("filters", true, "entryFrom", "entryBefore", "requireFreshVix", "minCompletedBars");
         if (f is not null)
         {
             var from = ReadTime(f, "entryFrom");
             var before = ReadTime(f, "entryBefore");
             var fresh = f.Has("requireFreshVix") ? f.Bool("requireFreshVix") : false;
-            if (from is { } a && a < EarliestEntry) f.Error("Value", "entryFrom", "entries begin at 09:30:00 IST at the earliest");
+            int? minBars = null;
+            if (f.Has("minCompletedBars"))
+            {
+                minBars = f.Int("minCompletedBars");
+                if (minBars is < 1 or > 1_000) { f.Error("Value", "minCompletedBars", "must be between 1 and 1000"); minBars = null; }
+            }
+
+            if (from is { } a && a < EarliestEarlyEntry) f.Error("Value", "entryFrom", "entries begin at 09:20:00 IST at the earliest (09:30:00 unless filters.minCompletedBars >= 10 is set)");
+            else if (from is { } a3 && a3 < EarliestEntry && (minBars is null || minBars < EntryFilters.MinWarmupBarsForEarlyEntry))
+                f.Error("Value", "entryFrom", $"an entry window opening before 09:30:00 IST requires filters.minCompletedBars >= {EntryFilters.MinWarmupBarsForEarlyEntry}");
             if (before is { } b && b > LatestEntryCutoff) f.Error("Value", "entryBefore", "entries cease at 15:00:00 IST at the latest");
             if (from is { } a2 && before is { } b2 && a2 >= b2) f.Error("Value", "entryBefore", "must be later than entryFrom");
-            if (from is { } fa && before is { } fb && fresh is { } ff) filters = new EntryFilters(fa, fb, ff);
+            if (from is { } fa && before is { } fb && fresh is { } ff) filters = new EntryFilters(fa, fb, ff, minBars);
         }
 
         // instrument

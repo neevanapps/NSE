@@ -48,6 +48,8 @@ public sealed class StrategyRuntime
     bool _riskBreached;
     int _lastBarSeq = -1;
     long _lastSession = -1;
+    long _warmupSession = -1;
+    int _verifiedBars;
 
     public StrategyRuntime(CompiledStrategy strategy, ExecutionOptions options)
     {
@@ -107,6 +109,8 @@ public sealed class StrategyRuntime
         var id = frame.Identity;
         var istTime = TimeOnly.FromTimeSpan((id.BarEndAvailableAt + IstOffset).TimeOfDay);
         if (_day != id.TradeDate) NewDay(frame, output);
+        if (_warmupSession != id.SessionId) { _warmupSession = id.SessionId; _verifiedBars = 0; }
+        if (id.Verified) _verifiedBars++;                // completed, persisted and verified bars of this session evaluated so far (this frame included); rebuilt identically by a journal replay
 
         MarkPositions(frame);
         FillPendingExits(frame, output);
@@ -305,6 +309,8 @@ public sealed class StrategyRuntime
         var ex = _config.Execution;
         if (!disposition.EntriesAllowed) { Reject(frame, output, right, null, RejectionReason.EntriesBlocked, $"entries blocked ({disposition.BlockReasons})"); return; }
         if (!_strategy.IsEntryTimeAllowed(istTime)) { Reject(frame, output, right, null, RejectionReason.OutsideEntryWindow, $"{istTime:HH\\:mm\\:ss} IST is outside the entry window"); return; }
+        if (_config.Filters.MinCompletedBars is { } minBars && (_verifiedBars < minBars || frame.Identity.BarSeq < minBars))
+        { Reject(frame, output, right, null, RejectionReason.WarmupIncomplete, $"{_verifiedBars} verified bar(s) evaluated (bar {frame.Identity.BarSeq}); {minBars} completed bars are required before an entry"); return; }
         if (_riskBreached) { Reject(frame, output, right, null, RejectionReason.RiskBreach, "daily loss limit breached"); return; }
         if (_fillsToday >= _config.Risk.MaxDailyTrades) { Reject(frame, output, right, null, RejectionReason.RiskBreach, "max daily trades reached"); return; }
         var open = _positions.Count(p => p.State is PositionState.Open or PositionState.ExitPending);

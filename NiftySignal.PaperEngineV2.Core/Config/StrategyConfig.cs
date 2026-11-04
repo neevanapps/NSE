@@ -41,7 +41,14 @@ public enum DistanceKind { Points, Percent }
 /// <summary>An optional bar-evaluated exit threshold (disabled when absent). Never assumed executable at the threshold price.</summary>
 public sealed record ThresholdExit(DistanceKind Kind, double Value);
 
-public sealed record EntryFilters(TimeOnly EntryFrom, TimeOnly EntryBefore, bool RequireFreshVix);
+/// <summary>
+/// The entry window. <see cref="MinCompletedBars"/> (optional; absent = the original contract) is the number of completed, persisted and VERIFIED bars of the session that must have been evaluated before any
+/// entry is allowed; a window that opens before 09:30:00 IST (down to 09:20:00) requires it to be at least <see cref="EntryFilters.MinWarmupBarsForEarlyEntry"/>.
+/// </summary>
+public sealed record EntryFilters(TimeOnly EntryFrom, TimeOnly EntryBefore, bool RequireFreshVix, int? MinCompletedBars = null)
+{
+    public const int MinWarmupBarsForEarlyEntry = 10;
+}
 
 public sealed record PremiumRange(double Min, double Max)
 {
