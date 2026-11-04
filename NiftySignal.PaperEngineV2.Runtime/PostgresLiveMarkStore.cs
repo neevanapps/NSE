@@ -23,7 +23,7 @@ public sealed class PostgresLiveMarkStore(NpgsqlDataSource db) : ILiveMarkStore
         {
             await using var batch = db.CreateBatch();
             foreach (var m in changed) batch.BatchCommands.Add(Upsert(m.StrategyId, m.PositionId, m.TradeDate.ToString("yyyy-MM-dd"), m.MarkSeq, m.Status.ToString(), LiveMarkJson.Serialize(m), heartbeat.At));
-            var day = changed.Count > 0 ? changed[0].TradeDate.ToString("yyyy-MM-dd") : DateOnly.FromDateTime(heartbeat.At.UtcDateTime.AddHours(5.5)).ToString("yyyy-MM-dd");
+            var day = DateOnly.FromDateTime(heartbeat.At.UtcDateTime.AddHours(5.5)).ToString("yyyy-MM-dd");   // the heartbeat belongs to the IST day of the publisher clock, whatever the rows are
             batch.BatchCommands.Add(Upsert("*", PublisherRow, day, heartbeat.Seq, "Fresh", System.Text.Json.JsonSerializer.Serialize(heartbeat), heartbeat.At));
             await batch.ExecuteNonQueryAsync(ct);
         }
