@@ -1,0 +1,50 @@
+@implements IDisposable
+@using NiftySignal.Dashboard.Services
+@inject IServiceProvider Services
+
+@* Loads the live marks about once a second on its OWN timer (independent of the 15 s ledger refresh) through the existing Blazor Server circuit. One bounded read of a tiny table; never touches the observer or the NPT1 ledger.
+   A read still in flight skips the tick (no pile-up); a failed read is shown as a message, not an exception. *@
+<PaperEngineV2LiveMarksSection View="_view" />
+
+@code {
+    static readonly TimeSpan Refresh = TimeSpan.FromSeconds(1);
+
+    V2LiveMarksView? _view;
+    PaperEngineV2DataService? _service;
+    Timer? _timer;
+    int _busy, _disposed;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _service = Services.GetService(typeof(PaperEngineV2DataService)) as PaperEngineV2DataService;
+        var now = DateTimeOffset.UtcNow;
+        if (_service is null)
+        {
+            _view = V2LiveMarksView.Unavailable(V2PublisherState.NotInstalled, "the V2 database is not configured for this dashboard", PaperEngineV2DataService.IstDate(now), now);
+            return;
+        }
+
+        await LoadAsync();
+        _timer = new Timer(_ => _ = InvokeAsync(LoadAsync), null, Refresh, Refresh);
+    }
+
+    async Task LoadAsync()
+    {
+        if (_service is null || Volatile.Read(ref _disposed) == 1 || Interlocked.Exchange(ref _busy, 1) == 1) return;
+        try
+        {
+            _view = await _service.LoadLiveMarksAsync(DateTimeOffset.UtcNow, CancellationToken.None);
+            if (Volatile.Read(ref _disposed) == 0) StateHasChanged();
+        }
+        finally
+        {
+            Volatile.Write(ref _busy, 0);
+        }
+    }
+
+    public void Dispose()
+    {
+        Volatile.Write(ref _disposed, 1);
+        _timer?.Dispose();
+    }
+}

@@ -47,7 +47,10 @@ public sealed class V2Runtime : IAsyncDisposable
     PostgresFrameJournal? _journal;
     IReadOnlyList<CompiledStrategy> _strategies = [];
     ExecutionOptions? _execution;
-    Task? _assembler, _alerts;
+    Task? _assembler, _alerts, _marks;
+    volatile LiveMarkBoard? _markBoard;
+    LiveMarkPublisher? _markPublisher;
+    PostgresLiveMarkStore? _markStore;
     SessionPipeline? _pipeline;
     long _accepted, _dropped, _built, _buildFailures, _restarts, _inputFailures;
     int _started;
@@ -105,6 +108,17 @@ public sealed class V2Runtime : IAsyncDisposable
             State = V2RuntimeState.Running; Detail = $"{set.Active.Count} strategies active, {set.DisabledValid.Count} disabled, {set.Rejected.Count} rejected";
             _assembler = Task.Run(() => AssembleLoopAsync(_cts.Token));
             if (_options.AnyAlertEnabled && _transport is not null) _alerts = Task.Run(() => AlertLoopAsync(_cts.Token));
+            if (_options.LiveMarksEnabled)
+            {
+                // Read-only indicative marks for the Dashboard. Optional: it needs the owner-run AddObservability script; without it V2 runs exactly as before and says so.
+                if (await ObservabilitySchema.HasAsync(_db, "pev2_live_marks", ct))
+                {
+                    _markStore = new PostgresLiveMarkStore(_db);
+                    _markPublisher = new LiveMarkPublisher(() => _pipeline?.Engine?.MarkPositions ?? [], () => _markBoard, _markStore, _clock, _options.LiveMarkInterval, _log);
+                    _marks = Task.Run(() => _markPublisher.RunAsync(_cts.Token));
+                }
+                else _log?.LogWarning("Paper Engine V2: pev2.pev2_live_marks is not installed; live marks are off (owner-run script: AddObservability).");
+            }
             _log?.LogInformation("Paper Engine V2 SHADOW started: {Detail}", Detail);
         }
         catch (Exception ex)
@@ -134,6 +148,19 @@ public sealed class V2Runtime : IAsyncDisposable
             return false;
         }
     }
+
+    /// <summary>The Host registers the session's mark board (all option-universe tokens). Marks are read-only and independent of the frame path.</summary>
+    public void SetMarkBoard(LiveMarkBoard? board) => _markBoard = board;
+
+    /// <summary>Observer thread: one O(1) step for the live-mark board. Never waits, never throws, never touches the frame path; a no-op while marks are off.</summary>
+    public void ObserveMarkTick(string token, in NiftySignal.AdaptiveObserver.CleanObserverTick tick)
+    {
+        try { _markBoard?.Observe(token, in tick); }
+        catch (Exception) { }
+    }
+
+    /// <summary>Live-mark diagnostics (null while marks are off or not installed).</summary>
+    public (long Ticks, long Failures, string? Disabled)? MarkStatus => _markPublisher is { } p ? (p.Ticks, p.Failures, _markStore?.DisabledReason) : null;
 
     public V2RuntimeSnapshot Snapshot()
     {
@@ -220,7 +247,7 @@ public sealed class V2Runtime : IAsyncDisposable
         if (_assembler is not null) await Task.WhenAny(_assembler, Task.Delay(TimeSpan.FromSeconds(10)));
         if (_pipeline is { } p) { p.Handoff.Complete(); await p.DrainAsync(TimeSpan.FromSeconds(10)); }
         await _cts.CancelAsync();
-        foreach (var t in new[] { _assembler, _alerts }) if (t is not null) await Task.WhenAny(t, Task.Delay(TimeSpan.FromSeconds(5)));
+        foreach (var t in new[] { _assembler, _alerts, _marks }) if (t is not null) await Task.WhenAny(t, Task.Delay(TimeSpan.FromSeconds(5)));
     }
 
     public async ValueTask DisposeAsync()

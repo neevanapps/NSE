@@ -37,6 +37,11 @@ public sealed record V2RuntimeOptions
 
     public AlertOptions Alerts { get; init; } = AlertOptions.AllOff;
 
+    /// <summary>Near-real-time indicative P&amp;L of open positions for the Dashboard. OFF unless the owner enables it (and has run the AddObservability script); turning it on or off never changes a fill, a decision or the ledger.</summary>
+    public bool LiveMarksEnabled { get; init; }
+
+    public TimeSpan LiveMarkInterval { get; init; } = TimeSpan.FromSeconds(1);
+
     public TimeSpan AlertPollInterval { get; init; } = TimeSpan.FromSeconds(2);
 
     /// <summary>Delay before a faulted consumer is rebuilt from the durable journal.</summary>

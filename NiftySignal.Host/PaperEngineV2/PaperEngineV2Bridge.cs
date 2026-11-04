@@ -26,6 +26,7 @@ public sealed class PaperEngineV2Bridge : IHostedService, IAsyncDisposable
     V2Runtime? _runtime;
     V2SessionInfo? _session;
     QuoteBook? _book;
+    LiveMarkBoard? _marks, _attachedBoard;
 
     public PaperEngineV2Bridge(IConfiguration configuration, IServiceScopeFactory scopes, ILogger<PaperEngineV2Bridge> log, ITelegramTextSender? telegram = null, TimeProvider? clock = null)
     {
@@ -53,6 +54,8 @@ public sealed class PaperEngineV2Bridge : IHostedService, IAsyncDisposable
             MaxProcessingLag = double.TryParse(s["MaxProcessingLagSeconds"], inv, out var lag) ? TimeSpan.FromSeconds(lag) : TimeSpan.Zero,
             FramesToClearGap = int.TryParse(s["FramesToClearGap"], out var clear) ? clear : 0,
             NoticeCapacity = int.TryParse(s["NoticeCapacity"], out var nc) ? nc : 256,
+            LiveMarksEnabled = bool.TryParse(s.GetSection("LiveMarks")["Enabled"], out var lm) && lm,
+            LiveMarkInterval = TimeSpan.FromMilliseconds(int.TryParse(s.GetSection("LiveMarks")["IntervalMs"], out var lmi) && lmi is >= 250 and <= 10_000 ? lmi : 1000),
             AlertPollInterval = TimeSpan.FromMilliseconds(int.TryParse(s["AlertPollIntervalMs"], out var ap) && ap > 0 ? ap : 2000),
             TerminalRetryUntil = TimeOnly.TryParse(s["TerminalRetryUntil"], out var t) ? t : default,
             CostScheduleVersion = s["CostScheduleVersion"],
@@ -103,6 +106,8 @@ public sealed class PaperEngineV2Bridge : IHostedService, IAsyncDisposable
                 .Select(g => new ListedStrike(g.Key, g.FirstOrDefault(o => o.OptionType == OptionType.Call)?.Token, g.FirstOrDefault(o => o.OptionType == OptionType.Put)?.Token)).ToList();
             _session = new V2SessionInfo(ctx.Session.Id, ctx.Session.TradeDate, ctx.Session.ModelVersion, ctx.Session.AtmRuleVersion, expiry, strikes, ctx.Options.ToDictionary(o => o.Token, o => o.LotSize, StringComparer.Ordinal));
             _book = new QuoteBook(ctx.Options.Select(o => o.Token));
+            _marks = new LiveMarkBoard(ctx.Options.Select(o => o.Token));
+            _runtime?.SetMarkBoard(_marks);
         }
         catch (Exception e)
         {
@@ -117,6 +122,8 @@ public sealed class PaperEngineV2Bridge : IHostedService, IAsyncDisposable
         try
         {
             foreach (var (token, tick) in group) book.Update(token, tick);
+            if (_marks is { } board && !ReferenceEquals(_attachedBoard, board)) { _runtime.SetMarkBoard(board); _attachedBoard = board; }
+            foreach (var (token, tick) in group) _runtime.ObserveMarkTick(token, tick);            // read-only live-mark board: O(1) per tick, contained, never on the frame path
             foreach (var (package, verified) in bars)
             {
                 var bar = package.FutureBar;

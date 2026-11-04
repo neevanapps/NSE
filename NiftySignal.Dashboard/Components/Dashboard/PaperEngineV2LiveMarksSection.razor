@@ -1,0 +1,71 @@
+@using System.Globalization
+@using NiftySignal.Dashboard.Services
+@using NiftySignal.PaperEngineV2.Execution
+
+@* V2 LIVE MARKS — pure presentation of V2LiveMarksView. Read-only. The unrealized figures are an INDICATIVE liquidation estimate from continuously observed quotes, never a fill; realized net comes from the ledger and is
+   shown separately. A price the Host cannot support renders as "unavailable", never zero. *@
+<section class="panel v2-shadow" data-testid="v2-live-marks">
+    <div class="panel-title">V2 LIVE P&amp;L <span class="badge badge-neutral">indicative · paper only</span>
+        <span class="text-faint">bid-marked unrealized P&amp;L of open V2 positions, refreshed about once a second · not a fill · the ledger is the only truth</span></div>
+    @if (View is null)
+    {
+        <div class="text-faint" data-testid="v2-marks-loading">Loading…</div>
+    }
+    else if (View.Publisher is V2PublisherState.NotInstalled or V2PublisherState.NoAccess or V2PublisherState.Unreachable or V2PublisherState.Waiting)
+    {
+        <div class="text-faint" data-testid="v2-marks-unavailable">@View.Message</div>
+    }
+    else
+    {
+        <div class="v2-health" data-testid="v2-marks-health">
+            <span>Publisher <b class="@(View.Publisher == V2PublisherState.Running ? "" : "v2-warn")" data-testid="v2-marks-publisher">@(View.Publisher == V2PublisherState.Running ? "running" : "SILENT")</b></span>
+            <span>Last update <b>@(View.LastBeatAt is { } b ? $"{(View.AsOf - b).TotalSeconds:0.0}s ago" : "—")</b></span>
+            @if (View.Message is { } msg) { <span class="v2-warn">@msg</span> }
+        </div>
+        @if (View.Rows.Count == 0)
+        {
+            <div class="text-faint" data-testid="v2-marks-none">No V2 position today.</div>
+        }
+        else
+        {
+            <div class="scroll-x"><table class="data-table" data-testid="v2-marks-table">
+                <thead><tr><th>Strategy</th><th>Ver</th><th>Side</th><th>Contract</th><th>Entry</th><th>Fill</th><th>Qty (lots)</th><th>LTP</th><th>Bid</th><th>Ask</th><th>Quote age</th>
+                    <th title="(bid - entry fill) x remaining quantity, before any exit charge">Gross (bid-marked)</th>
+                    <th title="(bid - exit slippage - entry fill) x quantity - entry charges incurred - estimated exit charges">Est. net if closed now</th>
+                    <th title="from the ledger: closed trades today">Realized net</th><th>Status</th></tr></thead>
+                <tbody>
+                @foreach (var r in View.Rows)
+                {
+                    var m = r.Mark;
+                    <tr data-strategy="@m.StrategyId" data-position="@m.PositionId" data-status="@r.Status">
+                        <td>@m.StrategyId</td><td>@m.Version</td><td>@(m.Right == OptionRight.Call ? "CE" : "PE")</td>
+                        <td title="@m.Token">@m.Expiry.ToString("dd-MMM", CultureInfo.InvariantCulture) @m.Strike.ToString("0") · @m.Token</td>
+                        <td>@((m.EntryAt + TimeSpan.FromHours(5.5)).ToString("HH:mm:ss", CultureInfo.InvariantCulture))</td>
+                        <td>@Px(m.EntryPrice)</td><td>@m.Quantity (@m.Lots)</td>
+                        <td data-testid="v2-mark-ltp">@Px(m.Ltp)</td><td data-testid="v2-mark-bid">@Px(m.Bid)</td><td data-testid="v2-mark-ask">@Px(m.Ask)</td>
+                        <td>@(r.QuoteAgeSeconds is { } a ? $"{a:0.0}s" : "—")</td>
+                        <td class="@PnlClass(m.GrossBidMarked)" data-testid="v2-mark-gross">@Money(m.GrossBidMarked)</td>
+                        <td class="@PnlClass(m.EstNetLiquidation)" data-testid="v2-mark-net">@Money(m.EstNetLiquidation)</td>
+                        <td class="@PnlClass(m.RealizedNetToday)" data-testid="v2-mark-realized">@Money(m.RealizedNetToday)</td>
+                        <td title="@r.StatusDetail"><span class="@StatusClass(r.Status)" data-testid="v2-mark-status">@r.Status</span></td>
+                    </tr>
+                }
+                </tbody>
+            </table></div>
+        }
+    }
+</section>
+
+@code {
+    [Parameter] public V2LiveMarksView? View { get; set; }
+
+    static string Px(double? v) => v is { } x && double.IsFinite(x) ? x.ToString("0.00", CultureInfo.InvariantCulture) : "unavailable";
+
+    static string Px(decimal? v) => v is { } x ? x.ToString("0.00", CultureInfo.InvariantCulture) : "unavailable";
+
+    static string Money(decimal? v) => v is { } x ? (x > 0 ? "+" : "") + x.ToString("N2", CultureInfo.InvariantCulture) : "unavailable";
+
+    static string PnlClass(decimal? v) => v is null ? "" : v > 0 ? "paper-pnl-up" : v < 0 ? "paper-pnl-down" : "";
+
+    static string StatusClass(MarkStatus s) => s switch { MarkStatus.Fresh => "badge badge-bull", MarkStatus.Closed => "badge badge-neutral", _ => "badge badge-warn" };
+}

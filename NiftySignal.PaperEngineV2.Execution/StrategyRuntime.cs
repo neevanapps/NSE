@@ -26,7 +26,7 @@ public sealed class StrategyRuntime
     sealed class Position
     {
         public required string Id; public required OptionRight Right; public required string Token; public required double Strike; public required DateOnly Expiry; public required int Quantity;
-        public required decimal EntryPrice; public required decimal EntryFees; public required int FillBarSeq;
+        public required decimal EntryPrice; public required decimal EntryFees; public required int FillBarSeq; public DateTimeOffset EntryAt;
         public PositionState State = PositionState.Open;
         public decimal Peak; public decimal Mfe; public decimal Mae; public int MarkGaps;
         public ExitReason? ExitReason; public DecisionKey? ExitDecision;
@@ -258,6 +258,16 @@ public sealed class StrategyRuntime
     }
 
     /// <summary>Tokens of the contracts this strategy currently holds (Open or ExitPending): they must stay observable until the position is closed or Unresolved.</summary>
+    /// <summary>An immutable copy of today's positions for the read-only mark publisher (no engine state escapes). The cost schedule is a pure function, so the captured delegate is safe on another thread.</summary>
+    public IReadOnlyList<MarkPosition> MarkSnapshot()
+    {
+        if (_day is not { } day || _costs is not { } costs) return [];
+        var slip = (decimal)_config.Execution.ExitSlippage;
+        return _positions.Select(p => new MarkPosition(
+            StrategyId, _config.Identity.Version, day, _lastSession, p.Id, p.Right, p.Token, p.Strike, p.Expiry, p.Quantity, _config.Lots, p.EntryPrice, p.EntryFees, p.EntryAt, p.State,
+            _config.Execution.MaxQuoteAgeMs, slip, value => costs.Compute(TradeSide.Sell, value).Total, _realizedToday, p.ExitPrice, p.Gross, p.Net)).ToArray();
+    }
+
     public IEnumerable<string> HeldTokens() => _positions.Where(p => p.State is PositionState.Open or PositionState.ExitPending).Select(p => p.Token);
 
     void MarkPositions(MarketStateFrame frame)
@@ -318,7 +328,7 @@ public sealed class StrategyRuntime
             var cost = (price * it.Quantity) + fees;
             if (cost > _cash) { Reject(frame, output, it.Right, it.Id, RejectionReason.InsufficientCapital, $"cost {cost:0.00} exceeds available capital {_cash:0.00}", cancelPending: true); return; }
             _cash -= cost; _fillsToday++;
-            var pos = new Position { Id = it.Id, Right = it.Right, Token = it.Token, Strike = it.Strike, Expiry = it.Expiry, Quantity = it.Quantity, EntryPrice = price, EntryFees = fees, FillBarSeq = frame.Identity.BarSeq, Peak = price };
+            var pos = new Position { Id = it.Id, Right = it.Right, Token = it.Token, Strike = it.Strike, Expiry = it.Expiry, Quantity = it.Quantity, EntryPrice = price, EntryFees = fees, FillBarSeq = frame.Identity.BarSeq, Peak = price, EntryAt = frame.Identity.BarEndAvailableAt };
             _positions.Add(pos);
             _pending = null;
             output.Add(new EntryFilled($"{it.Id}:filled", StrategyId, _config.Identity.Hash, frame.Identity.BarSeq, frame.Identity.BarEndAvailableAt, it.Id, pos.Id, it.Right, it.Token, it.Quantity, price, fees, q.AvailableAt, q.SourceTickId, q.AskQty));

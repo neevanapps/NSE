@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Npgsql;
 using NiftySignal.PaperEngineV2.Data;
+using NiftySignal.PaperEngineV2.Execution;
 
 namespace NiftySignal.Dashboard.Services;
 
@@ -108,6 +109,60 @@ public sealed class PaperEngineV2DataService : IDisposable
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             return V2OpportunityView.Unavailable(day, $"the opportunity log could not be read ({ex.GetType().Name})");
+        }
+    }
+
+    /// <summary>A publisher heartbeat older than this means the Host is not updating marks: every Fresh row is then shown Stale.</summary>
+    public static readonly TimeSpan PublisherSilence = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// The latest published live marks. One bounded read of a tiny table (at most 200 rows) - never a ledger scan - so it can run every second. Rows of another IST trade date are ignored (no cross-session stale marks).
+    /// A missing table, a missing SELECT grant or an unreachable database degrades to a plain message.
+    /// </summary>
+    public async Task<V2LiveMarksView> LoadLiveMarksAsync(DateTimeOffset now, CancellationToken ct)
+    {
+        var day = IstDate(now);
+        var today = day.ToString("yyyy-MM-dd");
+        try
+        {
+            var raw = new List<(string Strategy, string Position, string Day, string Payload, long Published)>();
+            await using (var c = _db.CreateCommand("SELECT strategy_id, position_id, trade_date, payload_json, published_utc_ticks FROM pev2.pev2_live_marks WHERE trade_date = $1 ORDER BY strategy_id, position_id LIMIT 200"))
+            {
+                c.Parameters.AddWithValue(today);
+                await using var r = await c.ExecuteReaderAsync(ct);
+                while (await r.ReadAsync(ct)) raw.Add((r.GetString(0), r.GetString(1), r.GetString(2), r.GetString(3), r.GetInt64(4)));
+            }
+
+            var beat = raw.FirstOrDefault(x => x.Position == "_publisher");
+            if (beat.Position is null) return V2LiveMarksView.Unavailable(V2PublisherState.Waiting, "the Host has not published any live mark today (live marks may be switched off, or the Host has not started)", day, now);
+            var beatAt = new DateTimeOffset(beat.Published, TimeSpan.Zero);
+            var silent = now - beatAt > PublisherSilence;
+            var rows = new List<V2LiveMarkRow>();
+            foreach (var x in raw.Where(x => x.Position != "_publisher"))
+            {
+                var m = LiveMarkJson.Deserialize(x.Payload);
+                if (m is null || m.TradeDate != day) continue;
+                var published = new DateTimeOffset(x.Published, TimeSpan.Zero);
+                var status = m.Status;
+                var detail = m.StatusDetail;
+                if (silent && status is MarkStatus.Fresh) { status = MarkStatus.Stale; detail = $"the Host's mark publisher has been silent for {(now - beatAt).TotalSeconds:0}s"; }
+                var age = m.QuoteAvailableAt is { } at ? Math.Max(0d, (now - at).TotalSeconds) : (double?)null;
+                rows.Add(new V2LiveMarkRow(m, status, detail, age, published));
+            }
+
+            return new V2LiveMarksView(silent ? V2PublisherState.Silent : V2PublisherState.Running, silent ? $"the Host's mark publisher has been silent for {(now - beatAt).TotalSeconds:0}s" : null, day, now, beatAt, rows);
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedTable || ex.SqlState == PostgresErrorCodes.InvalidSchemaName)
+        {
+            return V2LiveMarksView.Unavailable(V2PublisherState.NotInstalled, "live marks are not installed (the owner has not run the AddObservability script)", day, now);
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.InsufficientPrivilege)
+        {
+            return V2LiveMarksView.Unavailable(V2PublisherState.NoAccess, "the Dashboard's read-only role has no SELECT permission on the live marks", day, now);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return V2LiveMarksView.Unavailable(V2PublisherState.Unreachable, $"live marks could not be read ({ex.GetType().Name})", day, now);
         }
     }
 

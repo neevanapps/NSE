@@ -50,6 +50,10 @@ public sealed class PaperEngine : IFrameProcessor
     public long OpportunitySinkFailures { get; private set; }
 
     volatile IReadOnlySet<string> _held = new HashSet<string>(StringComparer.Ordinal);
+    volatile IReadOnlyList<MarkPosition> _marks = [];
+
+    /// <summary>Today's positions of all strategies as an immutable snapshot, replaced after every processed frame (and after a journal replay). For the read-only live-mark publisher only.</summary>
+    public IReadOnlyList<MarkPosition> MarkPositions => _marks;
 
     /// <summary>
     /// Distinct tokens held by open positions of ALL strategies (deduplicated), published as an immutable snapshot after every processed frame (and therefore after a journal replay on restart). Safe to read from
@@ -63,6 +67,8 @@ public sealed class PaperEngine : IFrameProcessor
         var opportunities = new List<OpportunityRecord>();
         foreach (var r in _runtimes) r.Process(frame, previous, disposition, batch, opportunities);
         _held = new HashSet<string>(_runtimes.SelectMany(r => r.HeldTokens()), StringComparer.Ordinal);
+        try { _marks = _runtimes.SelectMany(r => r.MarkSnapshot()).ToArray(); }
+        catch (Exception) { /* a snapshot problem only leaves the previous marks in place; it never reaches a decision */ }
         foreach (var e in batch)
         {
             _events.Add(e);
