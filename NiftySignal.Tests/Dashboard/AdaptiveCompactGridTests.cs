@@ -625,7 +625,7 @@ public sealed class AdaptiveCompactGridTests
         Assert.Contains("data-grid=\"options-context\" data-strike=\"25000\"", html);
         Assert.Equal(["Seq", "End IST", "CE Strict Δ", "PE Strict Δ", "Strict Dir", "CE Enriched Δ", "PE Enriched Δ", "Enriched Dir",
             "CE OI Δ", "PE OI Δ", "OI Dir (PE−CE)", "CE MicroDev (Inv)", "PE MicroDev (Inv)", "MicroDev Dir (Inv)", "CE OFI", "PE OFI", "OFI Dir"], HeadersOf(html, "options-core-direction"));
-        Assert.Equal(["Seq", "End IST", "CE Price Δ", "PE Price Δ", "Price Dir", "CE ΔIV", "PE ΔIV", "IV Dir", "CE ΔDelta", "PE ΔDelta", "Delta Dir", "CE ΔVega", "PE ΔVega", "Vega Dir", "CE Activity", "PE Activity", "Activity Dir"],
+        Assert.Equal(["Seq", "End IST", "CE Price Δ", "PE Price Δ", "Price Dir", "CE ΔIV", "PE ΔIV", "IV Dir (Inv)", "CE ΔDelta", "PE ΔDelta", "Delta Dir (Inv)", "CE ΔVega", "PE ΔVega", "Vega Dir (Inv)", "CE Activity", "PE Activity", "Activity Dir"],
             HeadersOf(html, "options-context"));
         // The plain price family moved from CORE DIRECTION to OPTION CONTEXT; the three Roll ΔPx columns were replaced by the Delta and Vega change columns, so no rolling family is left in the primary Options grids.
         Assert.DoesNotContain(HeadersOf(html, "options-core-direction"), h => h.Contains("Price") || h.Contains("Roll", StringComparison.OrdinalIgnoreCase) || h.Contains("ΔPx"));
@@ -645,7 +645,7 @@ public sealed class AdaptiveCompactGridTests
         Assert.Equal(bar12[2..], bar11[2..]);                                                             // both bars of the SAME strike
 
         var context = RowsOf(html, "options-context");
-        Assert.Equal(["12", "09:42:00", "5.00 (5.00)", "-4.00 (-4.00)", "9.00 (4.50)", "1.00 (5.00)", "-1.00 (-5.00)", "2.00 (10.00)", "—", "—", "—", "—", "—", "—", "30.0 (75.00)", "10.0 (25.00)", "20.0 (50.00)"], context.Single(r => r[0] == "12"));   // the seeded rows carry no Greeks: six unavailable cells, never zero
+        Assert.Equal(["12", "09:42:00", "5.00 (5.00)", "-4.00 (-4.00)", "9.00 (4.50)", "1.00 (5.00)", "-1.00 (-5.00)", "-2.00 (-10.00)", "—", "—", "—", "—", "—", "—", "30.0 (75.00)", "10.0 (25.00)", "20.0 (50.00)"], context.Single(r => r[0] == "12"));   // the seeded rows carry no Greeks: six unavailable cells, never zero
         Assert.Single(context, r => r[0] == "AVG");
 
         // Futures + residual AVG rows, and the legacy moving ATM±2 grid inside the collapsed Diagnostics section.
@@ -660,15 +660,17 @@ public sealed class AdaptiveCompactGridTests
         Assert.Equal("—", residualAvg[11]);
         Assert.Equal("+12.50", RatioFormatCompatible(residualAvg[2]));
 
-        // Sign-only tint (2026-11-02): CE and PE cells of the signed metrics carry their own sign, the Direction cell keeps its own; MicroDev is the INVERTED display value; Activity and unavailable cells stay neutral.
+        // Direction-only tint (2026-11-04): the CE and PE value cells carry NO sign background; only the Direction cell is tinted from its displayed sign (MicroDev, IV, Delta and Vega are the INVERTED display values); Activity and unavailable cells stay neutral.
         string RowMarkup(string grid, string seq) =>
             Regex.Matches(Regex.Match(html, "<table[^>]*data-grid=\"" + grid + "\".*?</table>", RegexOptions.Singleline).Value, "<tr[^>]*>.*?</tr>", RegexOptions.Singleline)
                 .Select(m => m.Value).Single(r => Regex.IsMatch(r, "sticky-col[^>]*>" + seq + "</td>"));
         var coreMarkup = RowMarkup("options-core-direction", "12");
-        Assert.Equal(["pos", "neg", "pos", "neg", "pos", "pos", "neg", "pos", "pos", "neg"], Regex.Matches(coreMarkup, "<td class=\"[^\"]*\" data-sign=\"([^\"]*)\"").Select(m => m.Groups[1].Value));
+        Assert.All(Regex.Matches(coreMarkup, "<td class=\"[^\"]*\" data-sign=\"([^\"]*)\"").Select(m => m.Groups[1].Value), s => Assert.Equal("none", s));      // CE / PE background colouring is gone
+        Assert.Equal(10, Regex.Matches(coreMarkup, "<td class=\"[^\"]*\" data-sign=\"([^\"]*)\"").Count);
         Assert.Equal(["pos", "pos", "pos", "neg", "pos"], Regex.Matches(coreMarkup, "data-direction-sign=\"([^\"]*)\"").Select(m => m.Groups[1].Value));      // Strict, Enriched, OI (PE − CE), MicroDev (inverted), OFI
         var contextMarkup = RowMarkup("options-context", "12");
-        Assert.Equal(["pos", "neg", "pos", "neg", "none", "none", "none", "none", "none", "none"], Regex.Matches(contextMarkup, "<td class=\"[^\"]*\" data-sign=\"([^\"]*)\"").Select(m => m.Groups[1].Value));
+        Assert.All(Regex.Matches(contextMarkup, "<td class=\"[^\"]*\" data-sign=\"([^\"]*)\"").Select(m => m.Groups[1].Value), s => Assert.Equal("none", s));
+        Assert.Equal(["pos", "neg", "none"], Regex.Matches(contextMarkup, "data-direction-sign=\"([^\"]*)\"").Select(m => m.Groups[1].Value).Take(3));      // Price Dir (+9.00), Roll Dir (-2.00: raw +2.00 shown inverted) keep a tint from the DISPLAYED sign; the unavailable IV Dir stays neutral
         Assert.DoesNotContain("adaptive-signed", Regex.Match(contextMarkup, "30\\.0 \\(75\\.00\\).*", RegexOptions.Singleline).Value);       // the CE / PE Activity cells are never tinted
         Assert.Contains("MicroDev is shown INVERTED", html);
         Assert.Equal(0, Regex.Matches(html, "-0\\.00").Count);                                                                                   // a zero never prints as a negative zero
@@ -707,14 +709,15 @@ public sealed class AdaptiveCompactGridTests
 
         // 12 (v3): Delta CE 0.02 on |start| 0.5 = 4 %, PE 0.015 on |-0.5| = 3 %, Direction (CE - PE) = 0.005 over the average |start| 0.5 = 1 %; Vega the same way on 3000.
         var bar12 = context.Single(r => r[0] == "12");
-        Assert.Equal(["0.0200 (4.00)", "0.0150 (3.00)", "0.0050 (1.00)", "40.00 (1.33)", "36.00 (1.20)", "4.00 (0.13)"], bar12[8..14]);
+        // IV / Delta / Vega Dir are displayed inverted; the CE and PE source values keep their stored sign
+        Assert.Equal(["0.0200 (4.00)", "0.0150 (3.00)", "-0.0050 (-1.00)", "40.00 (1.33)", "36.00 (1.20)", "-4.00 (-0.13)"], bar12[8..14]);
         // 11 (v2, no Greeks stored): six unavailable cells, never zero, and the IV / price columns of the same row are untouched.
         var bar11 = context.Single(r => r[0] == "11");
         Assert.All(bar11[8..14], c => Assert.Equal("—", c));
         Assert.Equal(bar12[2..8], bar11[2..8]);
         // AVG covers only the rows that carry Greeks (bar 11 is excluded from each Greek metric, not counted as zero).
         var avg = context.Single(r => r[0] == "AVG");
-        Assert.Equal(["0.0200 (4.00)", "0.0150 (3.00)", "0.0050 (1.00)"], avg[8..11]);
+        Assert.Equal(["0.0200 (4.00)", "0.0150 (3.00)", "-0.0050 (-1.00)"], avg[8..11]);
     }
 
     // ------------------------------------------------------------------ DAY AVG (whole session through the boundary) next to the visible-rows AVG

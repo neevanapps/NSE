@@ -318,11 +318,11 @@
                                 <tr>
                                     <td class="sticky-col">@r.BarSeq</td>
                                     <td>@FmtIst(r.EndAvailableAtUtc)</td>
-                                    @DirectionCells(d.Strict, 0)
-                                    @DirectionCells(d.Enriched, 0)
-                                    @DirectionCells(d.Oi, 0)
-                                    @DirectionCells(MicroDevDisplay.Invert(d.MicroDev), 2)
-                                    @DirectionCells(d.Ofi, 0)
+                                    @DirectionCells(d.Strict, 0, tint: false)
+                                    @DirectionCells(d.Enriched, 0, tint: false)
+                                    @DirectionCells(d.Oi, 0, tint: false)
+                                    @DirectionCells(MicroDevDisplay.Invert(d.MicroDev), 2, tint: false)
+                                    @DirectionCells(d.Ofi, 0, tint: false)
                                 </tr>
                             }
                             @if (coreRows.Count > 0)
@@ -330,11 +330,11 @@
                                 <tr class="adaptive-avg-row" data-testid="options-core-avg">
                                     <td class="sticky-col">AVG</td>
                                     <td>@coreRows.Count rows</td>
-                                    @DirectionCells(coreAvg.Strict, 0)
-                                    @DirectionCells(coreAvg.Enriched, 0)
-                                    @DirectionCells(coreAvg.Oi, 0)
-                                    @DirectionCells(MicroDevDisplay.Invert(coreAvg.MicroDev), 2)
-                                    @DirectionCells(coreAvg.Ofi, 0)
+                                    @DirectionCells(coreAvg.Strict, 0, tint: false)
+                                    @DirectionCells(coreAvg.Enriched, 0, tint: false)
+                                    @DirectionCells(coreAvg.Oi, 0, tint: false)
+                                    @DirectionCells(MicroDevDisplay.Invert(coreAvg.MicroDev), 2, tint: false)
+                                    @DirectionCells(coreAvg.Ofi, 0, tint: false)
                                 </tr>
                             }
                             @if (dayFixed is { } dc && _day is not null)
@@ -342,26 +342,26 @@
                                 <tr class="adaptive-avg-row adaptive-day-avg-row" data-testid="options-core-day-avg">
                                     <td class="sticky-col">DAY AVG</td>
                                     <td>@_day.BarCount bars</td>
-                                    @DirectionCells(dc.Core.Strict, 0)
-                                    @DirectionCells(dc.Core.Enriched, 0)
-                                    @DirectionCells(dc.Core.Oi, 0)
-                                    @DirectionCells(MicroDevDisplay.Invert(dc.Core.MicroDev), 2)
-                                    @DirectionCells(dc.Core.Ofi, 0)
+                                    @DirectionCells(dc.Core.Strict, 0, tint: false)
+                                    @DirectionCells(dc.Core.Enriched, 0, tint: false)
+                                    @DirectionCells(dc.Core.Oi, 0, tint: false)
+                                    @DirectionCells(MicroDevDisplay.Invert(dc.Core.MicroDev), 2, tint: false)
+                                    @DirectionCells(dc.Core.Ofi, 0, tint: false)
                                 </tr>
                             }
                             </tbody>
                         </table>
                     </div>
-                    <div class="adaptive-subtitle">OPTION CONTEXT <span class="text-faint">same strike · IV raw in IV points · ΔDelta / ΔVega = bar change (end − start) of the Black-Scholes Greek, raw (Vega per 1.00 vol; blank until option-strike-v3 rows exist) · Activity = traded quantity per second</span></div>
+                    <div class="adaptive-subtitle">OPTION CONTEXT <span class="text-faint">same strike · IV raw in IV points · ΔDelta / ΔVega = bar change (end − start) of the Black-Scholes Greek, raw (Vega per 1.00 vol; blank until option-strike-v3 rows exist) · Activity = traded quantity per second · @DirectionDisplay.Legend</span></div>
                     <div class="adaptive-table-wrap">
                         <table class="adaptive-table adaptive-table-compact" data-grid="options-context" data-strike="@_fixed.Strike.ToString("0")">
                             <thead>
                             <tr>
                                 <th>Seq</th><th>End IST</th>
                                 <th>CE Price Δ</th><th>PE Price Δ</th><th>Price Dir</th>
-                                <th>CE ΔIV</th><th>PE ΔIV</th><th>IV Dir</th>
-                                <th>CE ΔDelta</th><th>PE ΔDelta</th><th>Delta Dir</th>
-                                <th>CE ΔVega</th><th>PE ΔVega</th><th>Vega Dir</th>
+                                <th>CE ΔIV</th><th>PE ΔIV</th><th title="displayed inverted: displayed = −raw (CE − PE)">@DirectionDisplay.IvLabel</th>
+                                <th>CE ΔDelta</th><th>PE ΔDelta</th><th title="displayed inverted: displayed = −raw (CE − PE)">@DirectionDisplay.DeltaLabel</th>
+                                <th>CE ΔVega</th><th>PE ΔVega</th><th title="displayed inverted: displayed = −raw (CE − PE)">@DirectionDisplay.VegaLabel</th>
                                 <th>CE Activity</th><th>PE Activity</th><th>Activity Dir</th>
                             </tr>
                             </thead>
@@ -372,10 +372,10 @@
                                 <tr>
                                     <td class="sticky-col">@r.BarSeq</td>
                                     <td>@FmtIst(r.EndAvailableAtUtc)</td>
-                                    @DirectionCells(pr.Price, 2)
-                                    @DirectionCells(d.Iv, 2)
-                                    @DirectionCells(d.Delta, 4)
-                                    @DirectionCells(d.Vega, 2)
+                                    @DirectionCells(pr.Price, 2, tint: false)
+                                    @DirectionCells(DirectionDisplay.InvertDirectionOnly(d.Iv), 2, tint: false)
+                                    @DirectionCells(DirectionDisplay.InvertDirectionOnly(d.Delta), 4, tint: false)
+                                    @DirectionCells(DirectionDisplay.InvertDirectionOnly(d.Vega), 2, tint: false)
                                     @DirectionCells(d.Activity, 1, tint: false)
                                 </tr>
                             }
@@ -384,10 +384,10 @@
                                 <tr class="adaptive-avg-row" data-testid="options-context-avg">
                                     <td class="sticky-col">AVG</td>
                                     <td>@ctxRows.Count rows</td>
-                                    @DirectionCells(ctxAvg.Price, 2)
-                                    @DirectionCells(ctxAvg.Iv, 2)
-                                    @DirectionCells(ctxAvg.Delta, 4)
-                                    @DirectionCells(ctxAvg.Vega, 2)
+                                    @DirectionCells(ctxAvg.Price, 2, tint: false)
+                                    @DirectionCells(DirectionDisplay.InvertDirectionOnly(ctxAvg.Iv), 2, tint: false)
+                                    @DirectionCells(DirectionDisplay.InvertDirectionOnly(ctxAvg.Delta), 4, tint: false)
+                                    @DirectionCells(DirectionDisplay.InvertDirectionOnly(ctxAvg.Vega), 2, tint: false)
                                     @DirectionCells(ctxAvg.Activity, 1, tint: false)
                                 </tr>
                             }
@@ -396,10 +396,10 @@
                                 <tr class="adaptive-avg-row adaptive-day-avg-row" data-testid="options-context-day-avg">
                                     <td class="sticky-col">DAY AVG</td>
                                     <td>@_day.BarCount bars</td>
-                                    @DirectionCells(dx.Context.Price, 2)
-                                    @DirectionCells(dx.Context.Iv, 2)
-                                    @DirectionCells(dx.Context.Delta, 4)
-                                    @DirectionCells(dx.Context.Vega, 2)
+                                    @DirectionCells(dx.Context.Price, 2, tint: false)
+                                    @DirectionCells(DirectionDisplay.InvertDirectionOnly(dx.Context.Iv), 2, tint: false)
+                                    @DirectionCells(DirectionDisplay.InvertDirectionOnly(dx.Context.Delta), 4, tint: false)
+                                    @DirectionCells(DirectionDisplay.InvertDirectionOnly(dx.Context.Vega), 2, tint: false)
                                     @DirectionCells(dx.Context.Activity, 1, tint: false)
                                 </tr>
                             }

@@ -60,8 +60,9 @@ public class MarketSummarySectionRenderTests
         Assert.Equal(2, Regex.Matches(html, "<table").Count);
         foreach (var w in new[] { "5 Bars", "10 Bars", "50 Bars", "100 Bars", "Day" }) Assert.Contains($"data-window=\"{w}\"", html);
         Assert.Contains("10/10 – FULL", html);
-        Assert.Contains("Delta Dir ×100", html);
-        Assert.Contains("Vega Dir ×100", html);
+        Assert.Contains("IV Dir (Inv)", html);
+        Assert.Contains("Delta Dir (Inv)", html);
+        Assert.Contains("Vega Dir (Inv)", html);
     }
 
     [Fact]

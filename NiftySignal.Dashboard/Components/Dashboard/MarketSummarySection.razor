@@ -67,7 +67,7 @@
                         <th>Window</th><th>Coverage</th>
                         <th>Price Dir</th><th>Roll Dir</th><th>Strict Dir</th><th>Enriched Dir</th>
                         <th title="PE − CE">OI Dir</th><th title="displayed inverted: displayed = −raw (CE − PE)">MicroDev Dir (Inv)</th><th>OFI Dir</th>
-                        <th>IV Dir</th><th>Delta Dir ×100</th><th>Vega Dir ×100</th><th>Activity Dir</th>
+                        <th title="displayed inverted: displayed = −raw (CE − PE)">@DirectionDisplay.IvLabel</th><th title="displayed inverted: displayed = −raw (CE − PE); ×100 display scaling">@DirectionDisplay.DeltaLabel</th><th title="displayed inverted: displayed = −raw (CE − PE); ×100 display scaling">@DirectionDisplay.VegaLabel</th><th>Activity Dir</th>
                     </tr>
                     </thead>
                     <tbody>
@@ -90,9 +90,9 @@
                                 @Dir(d.Oi, 0)
                                 @Dir(MicroDevDisplay.Invert(d.MicroDev), 2)
                                 @Dir(d.Ofi, 0)
-                                @Dir(d.Iv, 2)
-                                @Dir(d.Delta, 2, scale100: true)
-                                @Dir(d.Vega, 2, scale100: true)
+                                @Dir(DirectionDisplay.Invert(d.Iv), 2)
+                                @Dir(DirectionDisplay.Invert(d.Delta), 2, scale100: true)
+                                @Dir(DirectionDisplay.Invert(d.Vega), 2, scale100: true)
                                 @Dir(d.Activity, 1)
                             }
                         </tr>
