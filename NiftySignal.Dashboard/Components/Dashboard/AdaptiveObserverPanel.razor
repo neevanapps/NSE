@@ -406,6 +406,37 @@
                             </tbody>
                         </table>
                     </div>
+                    @* Live Dashboard only: the Telegram screenshot keeps its fixed six-grid contract. *@
+                    @if (_avgPrice is { } ap && !CaptureMode)
+                    {
+                        <div class="adaptive-table-wrap" data-testid="option-price-averages">
+                            <div class="adaptive-subtitle">OPTION PRICE AVERAGES · exact contract above · Avg = mean of the completed-bar mid (PriceEnd) of the latest 5 / 10 completed bars ending at bar @ap.TargetBarSeq · no bridging, no zero-fill · display only (no entry filter)</div>
+                            <table class="adaptive-table adaptive-table-compact" data-grid="option-price-averages">
+                                <thead>
+                                    <tr><th>Side</th><th>Contract</th><th>LTP</th><th>Bid</th><th>Ask</th><th>Quote age</th><th>Avg5</th><th>Ask − Avg5</th><th>Ask − Avg5 %</th><th>Avg10</th><th>Ask − Avg10</th><th>Ask − Avg10 %</th></tr>
+                                </thead>
+                                <tbody>
+                                    @foreach (var s in new[] { ap.Ce, ap.Pe })
+                                    {
+                                        <tr data-side="@s.Side">
+                                            <td class="sticky-col">@s.Side</td>
+                                            <td>@(s.Symbol ?? "—")</td>
+                                            <td>@PxCell(s.Quote?.Ltp)</td>
+                                            <td>@PxCell(s.Quote?.Bid)</td>
+                                            <td>@PxCell(s.Quote?.Ask)</td>
+                                            <td title="@(s.Quote?.AvailableAtUtc is { } at ? "available " + at.ToOffset(TimeSpan.FromHours(5.5)).ToString("HH:mm:ss") + " IST" : "no quote")">@(s.Quote is null ? "—" : s.Quote.Fresh ? $"{s.Quote.AgeSeconds:0.0}s" : $"stale {s.Quote.AgeSeconds:0}s")</td>
+                                            <td title="@s.Avg5.WhyUnavailable">@PxCell(s.Avg5.Value)</td>
+                                            <td>@PxCell(s.AskMinus5, signed: true)</td>
+                                            <td>@PxCell(s.AskMinus5Pct, signed: true, pct: true)</td>
+                                            <td title="@s.Avg10.WhyUnavailable">@PxCell(s.Avg10.Value)</td>
+                                            <td>@PxCell(s.AskMinus10, signed: true)</td>
+                                            <td>@PxCell(s.AskMinus10Pct, signed: true, pct: true)</td>
+                                        </tr>
+                                    }
+                                </tbody>
+                            </table>
+                        </div>
+                    }
                 }
             }
         </GridSection>
@@ -811,6 +842,32 @@
     FixedStrikeCatalog? _catalog;
     FixedStrikeHistory? _fixed;
     ResearchModel? _research;
+    // Avg5 / Avg10 of the selected exact contract plus its quotes as of the displayed boundary (display only).
+    OptionPriceAveragesView? _avgPrice;
+
+    static string PxCell(double? v, bool signed = false, bool pct = false) =>
+        v is not { } x || !double.IsFinite(x) ? "—" : (signed && x > 0 ? "+" : "") + x.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture) + (pct ? "%" : "");
+
+    /// <summary>Builds the price-average view from the displayed (pinned) history of the selected contract. A failed quote read leaves the averages in place and the quotes unavailable; it never breaks the panel.</summary>
+    async Task RefreshAvgPriceAsync(CancellationToken ct)
+    {
+        _avgPrice = null;
+        var target = _snapshot?.Futures.FirstOrDefault()?.Bar;
+        if (_fixed is null || _snapshot is null || target is null) { return; }
+        PinnedQuote? ce = null, pe = null;
+        DateTimeOffset? boundary = CaptureMode ? target.EndAvailableAtUtc : DateTimeOffset.UtcNow;
+        try
+        {
+            if (Services.GetService(typeof(AdaptiveQuoteAsOfService)) is AdaptiveQuoteAsOfService asOf)
+            {
+                var q = await asOf.LoadBoundaryQuotesAsync(_snapshot.Session, [new AdaptiveQuoteAsOfService.BoundaryRequest(target.BarSeq, boundary!.Value, _fixed.Contract.CeToken, _fixed.Contract.PeToken)], ct);
+                if (q.TryGetValue(target.BarSeq, out var bq)) { ce = bq.Ce; pe = bq.Pe; }
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch { /* quotes unavailable: the averages still render */ }
+        _avgPrice = OptionPriceAverages.Build(_fixed, target.BarSeq, boundary, ce, pe);
+    }
     // DAY AVG inputs (all completed bars of the session through the current boundary); reloaded only when the completed bar or the selected strike changes, never on a quote tick.
     DayAverageData? _day;
     // Market Summary (five-row grids) for the displayed completed bar and the selected centre strike; reloaded only when the session, completed bar or strike changes.
@@ -971,6 +1028,7 @@
 
         var bars = _snapshot.Futures.Select(x => (x.Bar.BarSeq, x.Bar.EndAvailableAtUtc)).ToList();
         _fixed = await AdaptiveData.LoadFixedStrikeHistoryAsync(_snapshot.Session.Id, _catalog, strike, bars, ct, _snapshot.Session.RollingWindowBars);
+        await RefreshAvgPriceAsync(ct);
         await RefreshDayAsync(ct);
             await RefreshSummaryAsync(ct);
         await RefreshResearchAsync(ct);
