@@ -16,13 +16,13 @@ public sealed class PostgresLiveMarkStore(NpgsqlDataSource db) : ILiveMarkStore
 
     public string? DisabledReason => _disabled;
 
-    public async Task PublishAsync(IReadOnlyList<LiveMark> changed, MarkHeartbeat heartbeat, CancellationToken ct)
+    public async Task PublishAsync(IReadOnlyList<PositionMark> changed, MarkHeartbeat heartbeat, CancellationToken ct)
     {
         if (_disabled is not null) return;
         try
         {
             await using var batch = db.CreateBatch();
-            foreach (var m in changed) batch.BatchCommands.Add(Upsert(m.StrategyId, m.PositionId, m.TradeDate.ToString("yyyy-MM-dd"), m.MarkSeq, m.Status.ToString(), LiveMarkJson.Serialize(m), heartbeat.At));
+            foreach (var m in changed) batch.BatchCommands.Add(Upsert(m.StrategyId, m.PositionId, m.TradeDate.ToString("yyyy-MM-dd"), m.MarkSeq, m.Status.ToString(), PositionMarkJson.Serialize(m), heartbeat.At));
             var day = DateOnly.FromDateTime(heartbeat.At.UtcDateTime.AddHours(5.5)).ToString("yyyy-MM-dd");   // the heartbeat belongs to the IST day of the publisher clock, whatever the rows are
             batch.BatchCommands.Add(Upsert("*", PublisherRow, day, heartbeat.Seq, "Fresh", System.Text.Json.JsonSerializer.Serialize(heartbeat), heartbeat.At));
             await batch.ExecuteNonQueryAsync(ct);

@@ -22,16 +22,16 @@ public enum MarkStatus { Fresh, Stale, Missing, Invalid, Closed }
 /// (never zero). <see cref="EstNetLiquidation"/> = (max(0, bid - exit slippage) - entry fill) x remaining quantity - entry charges already incurred - estimated exit charges: every charge is counted once.
 /// It is an INDICATIVE liquidation estimate, not a fill; the ledger remains the only truth.
 /// </summary>
-public sealed record LiveMark(
+public sealed record PositionMark(
     string StrategyId, int Version, DateOnly TradeDate, long SessionId, string PositionId, OptionRight Right, string Token, double Strike, DateOnly Expiry, int Quantity, int Lots,
     decimal EntryPrice, DateTimeOffset EntryAt, MarkStatus Status, string StatusDetail, double? Bid, double? Ask, double? Ltp, DateTimeOffset? QuoteAvailableAt, long? QuoteTickId, double? QuoteAgeSeconds,
     decimal? GrossBidMarked, decimal? EstNetLiquidation, decimal EntryFeesIncurred, decimal? EstExitFees, decimal RealizedNetToday, decimal? ClosedNet, long MarkSeq, DateTimeOffset ComputedAt);
 
-public static class LiveMarkCalculator
+public static class PositionMarkCalculator
 {
-    public static LiveMark Compute(MarkPosition p, MarkQuote? q, DateTimeOffset now, long markSeq)
+    public static PositionMark Compute(MarkPosition p, MarkQuote? q, DateTimeOffset now, long markSeq)
     {
-        LiveMark Build(MarkStatus status, string detail, double? bid = null, double? ask = null, double? ltp = null, DateTimeOffset? at = null, long? tick = null, double? age = null,
+        PositionMark Build(MarkStatus status, string detail, double? bid = null, double? ask = null, double? ltp = null, DateTimeOffset? at = null, long? tick = null, double? age = null,
             decimal? gross = null, decimal? net = null, decimal? exitFees = null) =>
             new(p.StrategyId, p.Version, p.TradeDate, p.SessionId, p.PositionId, p.Right, p.Token, p.Strike, p.Expiry, p.Quantity, p.Lots, p.EntryPrice, p.EntryAt, status, detail, bid, ask, ltp, at, tick, age,
                 gross, net, p.EntryFees, exitFees, p.RealizedNetToday, p.ClosedNet, markSeq, now);
@@ -61,11 +61,11 @@ public static class LiveMarkCalculator
 }
 
 /// <summary>The one JSON shape shared by the Host publisher and the Dashboard reader.</summary>
-public static class LiveMarkJson
+public static class PositionMarkJson
 {
     public static readonly JsonSerializerOptions Options = new() { Converters = { new JsonStringEnumConverter() }, NumberHandling = JsonNumberHandling.AllowNamedFloatingPointLiterals };
 
-    public static string Serialize(LiveMark m) => JsonSerializer.Serialize(m, Options);
+    public static string Serialize(PositionMark m) => JsonSerializer.Serialize(m, Options);
 
-    public static LiveMark? Deserialize(string json) => JsonSerializer.Deserialize<LiveMark>(json, Options);
+    public static PositionMark? Deserialize(string json) => JsonSerializer.Deserialize<PositionMark>(json, Options);
 }

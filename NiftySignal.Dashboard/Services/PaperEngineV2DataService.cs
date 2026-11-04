@@ -140,7 +140,7 @@ public sealed class PaperEngineV2DataService : IDisposable
             var rows = new List<V2LiveMarkRow>();
             foreach (var x in raw.Where(x => x.Position != "_publisher"))
             {
-                var m = LiveMarkJson.Deserialize(x.Payload);
+                var m = PositionMarkJson.Deserialize(x.Payload);
                 if (m is null || m.TradeDate != day) continue;
                 var published = new DateTimeOffset(x.Published, TimeSpan.Zero);
                 var status = m.Status;

@@ -3,7 +3,7 @@ using NiftySignal.PaperEngineV2.Execution;
 namespace NiftySignal.Dashboard.Services;
 
 /// <summary>One displayed mark: the published mark plus the status this Dashboard assigns now (a Fresh row from a silent publisher is shown Stale; a row of another trade date is never shown).</summary>
-public sealed record V2LiveMarkRow(LiveMark Mark, MarkStatus Status, string StatusDetail, double? QuoteAgeSeconds, DateTimeOffset PublishedAt);
+public sealed record V2LiveMarkRow(PositionMark Mark, MarkStatus Status, string StatusDetail, double? QuoteAgeSeconds, DateTimeOffset PublishedAt);
 
 public enum V2PublisherState { Running, Silent, NotInstalled, NoAccess, Unreachable, Waiting }
 

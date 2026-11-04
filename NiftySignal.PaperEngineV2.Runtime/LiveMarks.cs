@@ -48,7 +48,7 @@ public sealed record MarkHeartbeat(long Seq, DateTimeOffset At, int Positions, l
 public interface ILiveMarkStore
 {
     /// <summary>Upserts the changed marks and the heartbeat in one round trip.</summary>
-    Task PublishAsync(IReadOnlyList<LiveMark> changed, MarkHeartbeat heartbeat, CancellationToken ct);
+    Task PublishAsync(IReadOnlyList<PositionMark> changed, MarkHeartbeat heartbeat, CancellationToken ct);
 }
 
 /// <summary>
@@ -84,12 +84,12 @@ public sealed class LiveMarkPublisher(Func<IReadOnlyList<MarkPosition>> position
             var now = clock.GetUtcNow();
             var seq = Interlocked.Increment(ref _seq);
             var snapshot = positions();
-            var changed = new List<LiveMark>();
+            var changed = new List<PositionMark>();
             var keys = new Dictionary<string, string>(StringComparer.Ordinal);
             foreach (var p in snapshot)
             {
                 if (_day != p.TradeDate) { _day = p.TradeDate; _lastKey.Clear(); }                           // a new trade date: nothing from yesterday is carried over
-                var mark = LiveMarkCalculator.Compute(p, boardOf()?.TryGet(p.Token), now, seq);
+                var mark = PositionMarkCalculator.Compute(p, boardOf()?.TryGet(p.Token), now, seq);
                 var key = $"{mark.Status}|{mark.QuoteTickId}|{mark.ClosedNet}|{mark.RealizedNetToday}";
                 if (_lastKey.TryGetValue(p.PositionId, out var prev) && prev == key && !Due(p.PositionId, now)) continue;
                 keys[p.PositionId] = key;                                                                   // remembered only once the store has accepted the batch, so a failed write is retried

@@ -8,7 +8,7 @@ sealed class MemoryMarkStore : ILiveMarkStore
 {
     readonly object _gate = new();
 
-    public Dictionary<string, LiveMark> Rows { get; } = new(StringComparer.Ordinal);
+    public Dictionary<string, PositionMark> Rows { get; } = new(StringComparer.Ordinal);
 
     public List<MarkHeartbeat> Beats { get; } = [];
 
@@ -16,7 +16,7 @@ sealed class MemoryMarkStore : ILiveMarkStore
 
     public Exception? FailWith { get; set; }
 
-    public Task PublishAsync(IReadOnlyList<LiveMark> changed, MarkHeartbeat hb, CancellationToken ct)
+    public Task PublishAsync(IReadOnlyList<PositionMark> changed, MarkHeartbeat hb, CancellationToken ct)
     {
         lock (_gate)
         {
@@ -47,7 +47,7 @@ public class LiveMarkTests
     [Fact]
     public void GrossIsBidMarked_AndNetLiquidationCountsEveryChargeOnce()
     {
-        var m = LiveMarkCalculator.Compute(Pos(), Q(bid: 130), T, 1);
+        var m = PositionMarkCalculator.Compute(Pos(), Q(bid: 130), T, 1);
         Assert.Equal(MarkStatus.Fresh, m.Status);
         Assert.Equal((130m - 127.50m) * 130, m.GrossBidMarked);                                   // (bid - entry fill) x remaining quantity = 325.00
         var exitPrice = 130m - 0.05m;                                                              // the engine's exit fill: bid - exit slippage
@@ -61,9 +61,9 @@ public class LiveMarkTests
     [Fact]
     public void ALosingMark_IsNegative_AndTheExitPriceNeverGoesBelowZero()
     {
-        var m = LiveMarkCalculator.Compute(Pos(), Q(bid: 100, ask: 101), T, 1);
+        var m = PositionMarkCalculator.Compute(Pos(), Q(bid: 100, ask: 101), T, 1);
         Assert.True(m.GrossBidMarked < 0 && m.EstNetLiquidation < m.GrossBidMarked);             // charges only ever make the net worse
-        var floor = LiveMarkCalculator.Compute(Pos(slip: 5m), Q(bid: 0.05, ask: 0.10), T, 1);
+        var floor = PositionMarkCalculator.Compute(Pos(slip: 5m), Q(bid: 0.05, ask: 0.10), T, 1);
         Assert.Equal(0m, floor.EstExitFees);                                                       // max(0, bid - slippage) = 0 -> no sale value, no fee
         Assert.Equal((0m - 127.50m) * 130 - 30m, floor.EstNetLiquidation);
     }
@@ -75,7 +75,7 @@ public class LiveMarkTests
         var e = new PaperEngine([ExecFixtures.Strat("S01")], ExecFixtures.Options());
         ExecFixtures.Run(e, [ExecFixtures.Fr(5, dir: 10), ExecFixtures.Fr(6, dir: 0, quotes: [new("CE26000", 125.5, 127)])]);
         var held = Assert.Single(e.MarkPositions, p => p.State == PositionState.Open);
-        var indicative = LiveMarkCalculator.Compute(held, new MarkQuote(held.Token, 130, 131, 130.5, T, 9), T, 1);
+        var indicative = PositionMarkCalculator.Compute(held, new MarkQuote(held.Token, 130, 131, 130.5, T, 9), T, 1);
         ExecFixtures.Run(e, [ExecFixtures.Fr(7, dir: 0, fut: -100, quotes: [new("CE26000", 130, 131)]), ExecFixtures.Fr(8, dir: 0, fut: -100, quotes: [new("CE26000", 130, 131)])]);
         var exit = Assert.Single(e.Events.OfType<ExitFilled>());
         Assert.Equal(exit.NetPnl, indicative.EstNetLiquidation);                                   // the estimate IS the ledger formula
@@ -90,7 +90,7 @@ public class LiveMarkTests
     [InlineData(2.5, MarkStatus.Stale)]
     public void FreshnessFollowsTheStrategysQuoteAgeLimit(double age, MarkStatus expected)
     {
-        var m = LiveMarkCalculator.Compute(Pos(), Q(ageSeconds: age), T, 1);
+        var m = PositionMarkCalculator.Compute(Pos(), Q(ageSeconds: age), T, 1);
         Assert.Equal(expected, m.Status);
         if (expected == MarkStatus.Stale) { Assert.Null(m.GrossBidMarked); Assert.Null(m.EstNetLiquidation); Assert.NotNull(m.Bid); }      // the last quote is shown, flagged; no P&L comes from it
         Assert.Equal(age, m.QuoteAgeSeconds!.Value, 6);
@@ -99,22 +99,22 @@ public class LiveMarkTests
     [Fact]
     public void MissingAndInvalidQuotes_AreExplicit_NeverZero()
     {
-        var missing = LiveMarkCalculator.Compute(Pos(), null, T, 1);
+        var missing = PositionMarkCalculator.Compute(Pos(), null, T, 1);
         Assert.Equal(MarkStatus.Missing, missing.Status); Assert.Null(missing.GrossBidMarked); Assert.Null(missing.Bid);
         foreach (var (bid, ask) in new[] { (0d, 131d), (130d, 0d), (131d, 130d), (double.NaN, 131d), (-1d, 2d) })
         {
-            var m = LiveMarkCalculator.Compute(Pos(), Q(bid: bid, ask: ask), T, 1);
+            var m = PositionMarkCalculator.Compute(Pos(), Q(bid: bid, ask: ask), T, 1);
             Assert.Equal(MarkStatus.Invalid, m.Status);
             Assert.Null(m.GrossBidMarked); Assert.Null(m.EstNetLiquidation); Assert.Null(m.Bid);
         }
 
-        Assert.Equal(MarkStatus.Invalid, LiveMarkCalculator.Compute(Pos(state: PositionState.Unresolved), Q(), T, 1).Status);
+        Assert.Equal(MarkStatus.Invalid, PositionMarkCalculator.Compute(Pos(state: PositionState.Unresolved), Q(), T, 1).Status);
     }
 
     [Fact]
     public void AClosedPosition_ShowsTheLedgerNet_AndNeverALiveEstimate()
     {
-        var m = LiveMarkCalculator.Compute(Pos(state: PositionState.Closed, realized: 1560m), Q(), T, 1);
+        var m = PositionMarkCalculator.Compute(Pos(state: PositionState.Closed, realized: 1560m), Q(), T, 1);
         Assert.Equal(MarkStatus.Closed, m.Status);
         Assert.Equal(1560m, m.ClosedNet); Assert.Equal(1560m, m.RealizedNetToday);
         Assert.Null(m.GrossBidMarked); Assert.Null(m.EstNetLiquidation);                           // realized and unrealized are separate
@@ -123,7 +123,7 @@ public class LiveMarkTests
     [Fact]
     public void AClockSkewedFutureQuote_HasZeroAge_NotNegative()
     {
-        var m = LiveMarkCalculator.Compute(Pos(), Q(ageSeconds: -3), T, 1);
+        var m = PositionMarkCalculator.Compute(Pos(), Q(ageSeconds: -3), T, 1);
         Assert.Equal(0d, m.QuoteAgeSeconds); Assert.Equal(MarkStatus.Fresh, m.Status);
     }
 

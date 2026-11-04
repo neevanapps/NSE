@@ -161,7 +161,7 @@ public class LiveMarkDashboardTests
     }
 
     static V2LiveMarkRow Row(MarkPosition p, MarkQuote? q, DateTimeOffset now) =>
-        new(LiveMarkCalculator.Compute(p, q, now, 1), LiveMarkCalculator.Compute(p, q, now, 1).Status, "", q is null ? null : (now - q.AvailableAt).TotalSeconds, now);
+        new(PositionMarkCalculator.Compute(p, q, now, 1), PositionMarkCalculator.Compute(p, q, now, 1).Status, "", q is null ? null : (now - q.AvailableAt).TotalSeconds, now);
 
     [Fact]
     public async Task TheSection_ShowsAllThreeStrategies_WithUnavailablePricesForMissingAndInvalidQuotes_AndNoControls()
