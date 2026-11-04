@@ -118,3 +118,5 @@ Merge into the existing `PaperEngineV2` section (do not duplicate it). Telegram 
 - All three strategies visible; Closed row shows the ledger net; a position with no observed quote shows Missing with every price "unavailable"; Fresh = green badge, Closed = neutral, Missing/Stale/Invalid = warning; profit/loss colours applied.
 - Not verified in the browser: the avg-price table and the neutral CE/PE grid backgrounds need Observer data that the scratch environment lacks; both are covered by unit/render tests (`OptionPriceAveragesTests`, the updated `DashboardSimplificationTests`/`AdaptiveCompactGridTests`), and the six-grid historical screenshot tests (pinned data) pass in the regression.
 - Not run: a Telegram message (none sent), the VM, production DB.
+
+FINAL_SHA: c636aa2 (feature/v2-observability; master base 23f4ac7)
