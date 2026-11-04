@@ -317,6 +317,200 @@ namespace NiftySignal.PaperEngineV2.Data.Migrations
                     b.ToTable("pev2_gaps", "pev2");
                 });
 
+            modelBuilder.Entity("NiftySignal.PaperEngineV2.Data.LiveMarkRow", b =>
+                {
+                    b.Property<string>("StrategyId")
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("strategy_id")
+                        .UseCollation("C");
+
+                    b.Property<string>("PositionId")
+                        .HasMaxLength(256)
+                        .HasColumnType("character varying(256)")
+                        .HasColumnName("position_id")
+                        .UseCollation("C");
+
+                    b.Property<long>("MarkSeq")
+                        .HasColumnType("bigint")
+                        .HasColumnName("mark_seq");
+
+                    b.Property<string>("PayloadJson")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("payload_json");
+
+                    b.Property<long>("PublishedUtcTicks")
+                        .HasColumnType("bigint")
+                        .HasColumnName("published_utc_ticks");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)")
+                        .HasColumnName("status")
+                        .UseCollation("C");
+
+                    b.Property<string>("TradeDate")
+                        .IsRequired()
+                        .HasMaxLength(10)
+                        .HasColumnType("character varying(10)")
+                        .HasColumnName("trade_date")
+                        .UseCollation("C");
+
+                    b.HasKey("StrategyId", "PositionId");
+
+                    b.ToTable("pev2_live_marks", "pev2");
+                });
+
+            modelBuilder.Entity("NiftySignal.PaperEngineV2.Data.OpportunityRow", b =>
+                {
+                    b.Property<string>("OpportunityId")
+                        .HasMaxLength(300)
+                        .HasColumnType("character varying(300)")
+                        .HasColumnName("opportunity_id")
+                        .UseCollation("C");
+
+                    b.Property<int>("BarSeq")
+                        .HasColumnType("integer")
+                        .HasColumnName("bar_seq");
+
+                    b.Property<int>("Category")
+                        .HasColumnType("integer")
+                        .HasColumnName("category");
+
+                    b.Property<string>("CategoryName")
+                        .IsRequired()
+                        .HasMaxLength(48)
+                        .HasColumnType("character varying(48)")
+                        .HasColumnName("category_name")
+                        .UseCollation("C");
+
+                    b.Property<string>("ConfigHash")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("config_hash")
+                        .UseCollation("C");
+
+                    b.Property<string>("Coverage")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)")
+                        .HasColumnName("coverage")
+                        .UseCollation("C");
+
+                    b.Property<long>("DecisionUtcTicks")
+                        .HasColumnType("bigint")
+                        .HasColumnName("decision_utc_ticks");
+
+                    b.Property<string>("Detail")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("detail");
+
+                    b.Property<string>("Direction")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)")
+                        .HasColumnName("direction")
+                        .UseCollation("C");
+
+                    b.Property<bool>("EntriesAllowed")
+                        .HasColumnType("boolean")
+                        .HasColumnName("entries_allowed");
+
+                    b.Property<string>("EventRef")
+                        .HasColumnType("text")
+                        .HasColumnName("event_ref");
+
+                    b.Property<string>("FrameRef")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("frame_ref")
+                        .UseCollation("C");
+
+                    b.Property<bool>("InPosition")
+                        .HasColumnType("boolean")
+                        .HasColumnName("in_position");
+
+                    b.Property<string>("IntentId")
+                        .HasColumnType("text")
+                        .HasColumnName("intent_id");
+
+                    b.Property<bool>("OrderAttempted")
+                        .HasColumnType("boolean")
+                        .HasColumnName("order_attempted");
+
+                    b.Property<bool>("OrderEligible")
+                        .HasColumnType("boolean")
+                        .HasColumnName("order_eligible");
+
+                    b.Property<string>("OrderResult")
+                        .IsRequired()
+                        .HasMaxLength(24)
+                        .HasColumnType("character varying(24)")
+                        .HasColumnName("order_result")
+                        .UseCollation("C");
+
+                    b.Property<string>("Reason")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("reason")
+                        .UseCollation("C");
+
+                    b.Property<long>("RecordedUtcTicks")
+                        .HasColumnType("bigint")
+                        .HasColumnName("recorded_utc_ticks");
+
+                    b.Property<int>("ResolvedBarSeq")
+                        .HasColumnType("integer")
+                        .HasColumnName("resolved_bar_seq");
+
+                    b.Property<long>("SessionId")
+                        .HasColumnType("bigint")
+                        .HasColumnName("session_id");
+
+                    b.Property<string>("Stage")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)")
+                        .HasColumnName("stage")
+                        .UseCollation("C");
+
+                    b.Property<string>("StrategyId")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)")
+                        .HasColumnName("strategy_id")
+                        .UseCollation("C");
+
+                    b.Property<string>("Token")
+                        .HasColumnType("text")
+                        .HasColumnName("token");
+
+                    b.Property<string>("TradeDate")
+                        .IsRequired()
+                        .HasMaxLength(10)
+                        .HasColumnType("character varying(10)")
+                        .HasColumnName("trade_date")
+                        .UseCollation("C");
+
+                    b.Property<int>("Version")
+                        .HasColumnType("integer")
+                        .HasColumnName("version");
+
+                    b.HasKey("OpportunityId");
+
+                    b.HasIndex("TradeDate", "Category");
+
+                    b.HasIndex("TradeDate", "StrategyId", "BarSeq");
+
+                    b.ToTable("pev2_opportunities", "pev2");
+                });
+
             modelBuilder.Entity("NiftySignal.PaperEngineV2.Data.SchemaVersionRow", b =>
                 {
                     b.Property<string>("Component")

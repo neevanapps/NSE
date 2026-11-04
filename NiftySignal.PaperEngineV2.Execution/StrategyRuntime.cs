@@ -82,15 +82,27 @@ public sealed class StrategyRuntime
         p.Gross, p.Net, p.ExitReason, p.Mfe, p.Mae, p.MarkGaps, p.BarsHeld)).ToArray();
 
     /// <summary>Processes one frame. Never throws: a malfunction faults this strategy only (stops entries, open positions become Unresolved).</summary>
-    public void Process(MarketStateFrame frame, MarketStateFrame? previous, FrameDisposition disposition, List<PaperEvent> output)
+    /// <summary>What the bar's signal evaluation saw, kept only so the opportunity log can describe it after the step (observation only; no decision reads it).</summary>
+    sealed record Obs(Tri BuyCall, Tri BuyPut, bool HoldingCall, bool HoldingPut, bool HadPending);
+
+    Obs? _obs;
+
+    public void Process(MarketStateFrame frame, MarketStateFrame? previous, FrameDisposition disposition, List<PaperEvent> output, List<OpportunityRecord>? opportunities = null)
     {
         if (Faulted) return;
         var id = frame.Identity;
         if (id.SessionId == _lastSession && id.BarSeq <= _lastBarSeq) return;           // idempotent per decision key
         try
         {
+            var start = output.Count;
+            _obs = null;
             Step(frame, previous, disposition, output);
             _lastBarSeq = id.BarSeq; _lastSession = id.SessionId;
+            if (opportunities is not null)
+            {
+                try { Classify(frame, disposition, output, start, opportunities); }
+                catch (Exception) { /* the opportunity log is observation only: a failure here never reaches the simulation */ }
+            }
         }
         catch (Exception ex)
         {
@@ -136,6 +148,9 @@ public sealed class StrategyRuntime
         var ctx = new EvaluationContext(frame, previous);
         var signals = _strategy.EvaluateEntry(ctx);
         var exitCondition = _strategy.EvaluateExit(ctx) == Tri.True;
+        _obs = new Obs(signals.BuyCall, signals.BuyPut,
+            _positions.Any(p => p.State is PositionState.Open or PositionState.ExitPending && p.Right == OptionRight.Call),
+            _positions.Any(p => p.State is PositionState.Open or PositionState.ExitPending && p.Right == OptionRight.Put), _pending is not null);
         var oppositeExit = false;
         foreach (var p in _positions.Where(p => p.State == PositionState.Open).ToArray())
         {
@@ -151,6 +166,65 @@ public sealed class StrategyRuntime
         if (signals.BuyCall == Tri.True && signals.BuyPut == Tri.True) { Reject(frame, output, null, null, RejectionReason.ConflictingSignals, "buyCall and buyPut are both true on the same bar"); return; }
         if (signals.BuyCall == Tri.True) TryEntry(OptionRight.Call, frame, disposition, istTime, output);
         else if (signals.BuyPut == Tri.True) TryEntry(OptionRight.Put, frame, disposition, istTime, output);
+    }
+
+    static int DecisionBarOf(string intentId)
+    {
+        var parts = intentId.Split(':');
+        return parts.Length >= 3 && int.TryParse(parts[^2], out var b) ? b : -1;
+    }
+
+    /// <summary>
+    /// Builds the opportunity rows of ONE frame from the events this strategy produced in it. Outcome rows (a placed order's fill / non-fill) are written whenever they resolve; the Decision row only for a verified bar.
+    /// Pure observation: it reads the already-produced events and the signal snapshot, and changes nothing.
+    /// </summary>
+    void Classify(MarketStateFrame frame, FrameDisposition disposition, List<PaperEvent> output, int start, List<OpportunityRecord> sink)
+    {
+        var id = frame.Identity;
+        var mine = output.Skip(start).Where(e => e.StrategyId == StrategyId).ToList();
+        var frameRef = $"{id.SessionId}:{id.BarSeq}";
+        var coverage = disposition.BlockReasons.ToString();
+        OpportunityRecord Make(OpportunityStage stage, int bar, string dir, OpportunityCategory cat, string reason, string detail, bool inPos, bool eligible, bool attempted, string result,
+            string? intent, string? token, string? evRef) =>
+            new(OpportunityRecord.IdOf(StrategyId, id.SessionId, bar, stage), StrategyId, _config.Identity.Version, _config.Identity.Hash, id.SessionId, id.TradeDate, bar, stage, id.BarSeq, id.BarEndAvailableAt,
+                dir, cat, reason, detail, inPos, eligible, attempted, result, intent, token, evRef, frameRef, disposition.EntriesAllowed, coverage);
+
+        // Outcomes of orders placed on an EARLIER bar, resolved now.
+        foreach (var e in mine)
+        {
+            if (e is EntryFilled f && DecisionBarOf(f.IntentId) is var fb and >= 0)
+                sink.Add(Make(OpportunityStage.Outcome, fb, f.Right == OptionRight.Call ? "CE" : "PE", OpportunityCategory.OrderFilled, "Filled", $"filled at {f.FillPrice:0.00} x{f.Quantity}", false, true, true, "Filled", f.IntentId, f.Token, f.EventId));
+            else if (e is EntryRejected { IntentId: { } iid } r && DecisionBarOf(iid) is var rb and >= 0)
+            {
+                var cat = OpportunityClassifier.OfOrderRejection(r.Reason);
+                sink.Add(Make(OpportunityStage.Outcome, rb, r.Right == OptionRight.Call ? "CE" : r.Right == OptionRight.Put ? "PE" : "Unknown", cat, r.Reason.ToString(), r.Detail, false, true, true, cat == OpportunityCategory.OrderAcceptedNotFilled ? "ExpiredUnfilled" : "Rejected", iid, null, r.EventId));
+            }
+        }
+
+        if (!id.Verified || _obs is not { } o) return;
+        var dir = OpportunityClassifier.Direction(o.BuyCall, o.BuyPut);
+        var right = o.BuyCall == Tri.True && o.BuyPut != Tri.True ? OptionRight.Call : o.BuyPut == Tri.True && o.BuyCall != Tri.True ? OptionRight.Put : (OptionRight?)null;
+        var holdingSame = right is OptionRight.Call ? o.HoldingCall : right is OptionRight.Put && o.HoldingPut;
+        var holding = o.HoldingCall || o.HoldingPut;
+        var exitOpposite = mine.OfType<ExitRequested>().FirstOrDefault(x => x.Reason == ExitReason.OppositeSignal);
+        var placed = mine.OfType<EntryOrderPlaced>().FirstOrDefault();
+        var rejected = mine.OfType<EntryRejected>().FirstOrDefault(x => x.IntentId is null);
+
+        OpportunityRecord decision;
+        if (exitOpposite is not null)
+            decision = Make(OpportunityStage.Decision, id.BarSeq, dir, OpportunityCategory.OppositeSignalExit, "OppositeSignal", "the opposite signal requested an exit of the held position (exit only, never a reversal)", holding, false, false, "None", null, null, exitOpposite.EventId);
+        else if (placed is not null)
+            decision = Make(OpportunityStage.Decision, id.BarSeq, dir, OpportunityCategory.ValidDirectionalSignal, "OrderPlaced", $"entry order placed for {placed.Token}", holding, true, true, "Placed", placed.IntentId, placed.Token, placed.EventId);
+        else if (rejected is not null)
+        {
+            var (cat, why) = OpportunityClassifier.OfDecisionRejection(rejected.Reason, holdingSame);
+            var attempted = cat == OpportunityCategory.OrderRejectedQuoteOrContract;
+            decision = Make(OpportunityStage.Decision, id.BarSeq, dir, cat, rejected.Reason.ToString(), $"{why}: {rejected.Detail}", holding, attempted, attempted, attempted ? "Rejected" : "None", null, null, rejected.EventId);
+        }
+        else
+            decision = Make(OpportunityStage.Decision, id.BarSeq, dir, OpportunityCategory.NoDirectionalSignal, dir == "Unknown" ? "MetricUnavailable" : "NoSignal",
+                dir == "Unknown" ? "a signal metric was unavailable on this bar" : "neither entry condition was true", holding, false, false, "None", null, null, null);
+        sink.Add(decision);
     }
 
     void NewDay(MarketStateFrame frame, List<PaperEvent> output)

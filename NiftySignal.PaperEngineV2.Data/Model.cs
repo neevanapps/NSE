@@ -137,6 +137,55 @@ public sealed class AlertOutboxRow
 }
 
 /// <summary>
+/// One append-only opportunity row (observation only; never read by the engine). The primary key is the deterministic opportunity id, so a restart that replays the journal inserts nothing twice.
+/// Added by the optional <c>AddObservability</c> migration: the schema version is NOT bumped, so a Host without these tables (or an older Host with them) keeps running unchanged.
+/// </summary>
+public sealed class OpportunityRow
+{
+    public string OpportunityId { get; set; } = string.Empty;
+    public string StrategyId { get; set; } = string.Empty;
+    public int Version { get; set; }
+    public string ConfigHash { get; set; } = string.Empty;
+    public long SessionId { get; set; }
+    public string TradeDate { get; set; } = string.Empty;
+    public int BarSeq { get; set; }
+    public string Stage { get; set; } = string.Empty;
+    public int ResolvedBarSeq { get; set; }
+    public long DecisionUtcTicks { get; set; }
+    public string Direction { get; set; } = string.Empty;
+    public int Category { get; set; }
+    public string CategoryName { get; set; } = string.Empty;
+    public string Reason { get; set; } = string.Empty;
+    public string Detail { get; set; } = string.Empty;
+    public bool InPosition { get; set; }
+    public bool OrderEligible { get; set; }
+    public bool OrderAttempted { get; set; }
+    public string OrderResult { get; set; } = string.Empty;
+    public string? IntentId { get; set; }
+    public string? Token { get; set; }
+    public string? EventRef { get; set; }
+    public string FrameRef { get; set; } = string.Empty;
+    public bool EntriesAllowed { get; set; }
+    public string Coverage { get; set; } = string.Empty;
+    public long RecordedUtcTicks { get; set; }
+}
+
+/// <summary>
+/// The latest indicative mark of one open (or just-closed) position, or the publisher's heartbeat (position_id '_publisher'). One row per position, upserted about once a second by the Host's read-only mark
+/// publisher; the Dashboard (another process) reads it. It is a SNAPSHOT, never a ledger: nothing here is ever used by a decision, a fill or a risk check.
+/// </summary>
+public sealed class LiveMarkRow
+{
+    public string StrategyId { get; set; } = string.Empty;
+    public string PositionId { get; set; } = string.Empty;
+    public string TradeDate { get; set; } = string.Empty;
+    public long MarkSeq { get; set; }
+    public string Status { get; set; } = string.Empty;
+    public string PayloadJson { get; set; } = string.Empty;
+    public long PublishedUtcTicks { get; set; }
+}
+
+/// <summary>
 /// The model of the <c>pev2</c> schema. Own schema and own migration history table, so it can share the trading database without touching any trading.* table. Instants are stored as UTC ticks (bigint, exact);
 /// payloads are text (authoritative, canonical). Nothing here connects, creates or migrates by itself.
 /// </summary>
@@ -157,6 +206,10 @@ public sealed class PaperEngineV2DbContext(DbContextOptions<PaperEngineV2DbConte
     public DbSet<ConfigRow> Configs => Set<ConfigRow>();
 
     public DbSet<AlertOutboxRow> AlertOutbox => Set<AlertOutboxRow>();
+
+    public DbSet<OpportunityRow> Opportunities => Set<OpportunityRow>();
+
+    public DbSet<LiveMarkRow> LiveMarks => Set<LiveMarkRow>();
 
     static PropertyBuilder<string> Text(PropertyBuilder<string> p, int max) => p.HasMaxLength(max).UseCollation("C");
 
@@ -234,6 +287,37 @@ public sealed class PaperEngineV2DbContext(DbContextOptions<PaperEngineV2DbConte
             b.Property(e => e.MessageText).HasColumnType("text");
             b.Property(e => e.LastError).HasColumnType("text");
             b.HasIndex(e => new { e.Status, e.NextAttemptUtcTicks });
+        });
+
+        modelBuilder.Entity<OpportunityRow>(b =>
+        {
+            b.ToTable("pev2_opportunities");
+            b.HasKey(e => e.OpportunityId);
+            Text(b.Property(e => e.OpportunityId), 300);
+            Text(b.Property(e => e.StrategyId), 64);
+            Text(b.Property(e => e.ConfigHash), 64);
+            Text(b.Property(e => e.TradeDate), 10);
+            Text(b.Property(e => e.Stage), 16);
+            Text(b.Property(e => e.Direction), 16);
+            Text(b.Property(e => e.CategoryName), 48);
+            Text(b.Property(e => e.Reason), 64);
+            Text(b.Property(e => e.OrderResult), 24);
+            Text(b.Property(e => e.FrameRef), 64);
+            Text(b.Property(e => e.Coverage), 128);
+            b.Property(e => e.Detail).HasColumnType("text");
+            b.HasIndex(e => new { e.TradeDate, e.StrategyId, e.BarSeq });
+            b.HasIndex(e => new { e.TradeDate, e.Category });
+        });
+
+        modelBuilder.Entity<LiveMarkRow>(b =>
+        {
+            b.ToTable("pev2_live_marks");
+            b.HasKey(e => new { e.StrategyId, e.PositionId });
+            Text(b.Property(e => e.StrategyId), 64);
+            Text(b.Property(e => e.PositionId), 256);
+            Text(b.Property(e => e.TradeDate), 10);
+            Text(b.Property(e => e.Status), 16);
+            b.Property(e => e.PayloadJson).HasColumnType("text");
         });
 
         // snake_case column names, derived mechanically so the idempotent script reads naturally

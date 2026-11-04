@@ -227,3 +227,79 @@ BEGIN
 END $EF$;
 COMMIT;
 
+START TRANSACTION;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM pev2.__pev2_migrations_history WHERE "MigrationId" = '20261104130137_AddObservability') THEN
+    CREATE TABLE pev2.pev2_live_marks (
+        strategy_id character varying(64) COLLATE "C" NOT NULL,
+        position_id character varying(256) COLLATE "C" NOT NULL,
+        trade_date character varying(10) COLLATE "C" NOT NULL,
+        mark_seq bigint NOT NULL,
+        status character varying(16) COLLATE "C" NOT NULL,
+        payload_json text NOT NULL,
+        published_utc_ticks bigint NOT NULL,
+        CONSTRAINT "PK_pev2_live_marks" PRIMARY KEY (strategy_id, position_id)
+    );
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM pev2.__pev2_migrations_history WHERE "MigrationId" = '20261104130137_AddObservability') THEN
+    CREATE TABLE pev2.pev2_opportunities (
+        opportunity_id character varying(300) COLLATE "C" NOT NULL,
+        strategy_id character varying(64) COLLATE "C" NOT NULL,
+        version integer NOT NULL,
+        config_hash character varying(64) COLLATE "C" NOT NULL,
+        session_id bigint NOT NULL,
+        trade_date character varying(10) COLLATE "C" NOT NULL,
+        bar_seq integer NOT NULL,
+        stage character varying(16) COLLATE "C" NOT NULL,
+        resolved_bar_seq integer NOT NULL,
+        decision_utc_ticks bigint NOT NULL,
+        direction character varying(16) COLLATE "C" NOT NULL,
+        category integer NOT NULL,
+        category_name character varying(48) COLLATE "C" NOT NULL,
+        reason character varying(64) COLLATE "C" NOT NULL,
+        detail text NOT NULL,
+        in_position boolean NOT NULL,
+        order_eligible boolean NOT NULL,
+        order_attempted boolean NOT NULL,
+        order_result character varying(24) COLLATE "C" NOT NULL,
+        intent_id text,
+        token text,
+        event_ref text,
+        frame_ref character varying(64) COLLATE "C" NOT NULL,
+        entries_allowed boolean NOT NULL,
+        coverage character varying(128) COLLATE "C" NOT NULL,
+        recorded_utc_ticks bigint NOT NULL,
+        CONSTRAINT "PK_pev2_opportunities" PRIMARY KEY (opportunity_id)
+    );
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM pev2.__pev2_migrations_history WHERE "MigrationId" = '20261104130137_AddObservability') THEN
+    CREATE INDEX "IX_pev2_opportunities_trade_date_category" ON pev2.pev2_opportunities (trade_date, category);
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM pev2.__pev2_migrations_history WHERE "MigrationId" = '20261104130137_AddObservability') THEN
+    CREATE INDEX "IX_pev2_opportunities_trade_date_strategy_id_bar_seq" ON pev2.pev2_opportunities (trade_date, strategy_id, bar_seq);
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM pev2.__pev2_migrations_history WHERE "MigrationId" = '20261104130137_AddObservability') THEN
+    INSERT INTO pev2.__pev2_migrations_history ("MigrationId", "ProductVersion")
+    VALUES ('20261104130137_AddObservability', '10.0.11');
+    END IF;
+END $EF$;
+COMMIT;
+

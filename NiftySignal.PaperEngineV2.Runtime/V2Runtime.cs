@@ -43,6 +43,7 @@ public sealed class V2Runtime : IAsyncDisposable
     NpgsqlDataSource? _db;
     PostgresEventStore? _store;
     AlertingEventSink? _alertSink;
+    PostgresOpportunityStore? _opportunityStore;
     PostgresFrameJournal? _journal;
     IReadOnlyList<CompiledStrategy> _strategies = [];
     ExecutionOptions? _execution;
@@ -95,6 +96,9 @@ public sealed class V2Runtime : IAsyncDisposable
             _store = new PostgresEventStore(_db);
             foreach (var cfg in set.Active.Select(a => a.Config).Concat(set.DisabledValid)) await _store.RecordConfigAsync(cfg, _clock.GetUtcNow(), ct);
             _journal = new PostgresFrameJournal(_db);
+            // The opportunity log is optional: it exists only after the owner runs the AddObservability script. Without it V2 runs exactly as before and says so.
+            if (await ObservabilitySchema.HasAsync(_db, "pev2_opportunities", ct)) _opportunityStore = new PostgresOpportunityStore(_db, _clock);
+            else _log?.LogWarning("Paper Engine V2: pev2.pev2_opportunities is not installed; the opportunity log is off (owner-run script: AddObservability).");
             _alertSink = _options.AnyAlertEnabled ? new AlertingEventSink(_store, _db, _options.Alerts, _clock, id => _strategies.FirstOrDefault(s => s.Config.Identity.StrategyId == id)?.Config.Identity.Version) : null;
             foreach (var (src, errs) in set.Rejected) _log?.LogWarning("V2 strategy file {Source} rejected: {Errors}", src, string.Join("; ", errs.Select(e => e.Message)));
 
@@ -251,7 +255,7 @@ public sealed class V2Runtime : IAsyncDisposable
         async Task BuildConsumerAsync(CancellationToken ct)
         {
             IPaperEventSink sink = (IPaperEventSink?)owner._alertSink ?? owner._store!;
-            Engine = new PaperEngine(owner._strategies, owner._execution!, sink);
+            Engine = new PaperEngine(owner._strategies, owner._execution!, sink, owner._opportunityStore);
             foreach (var f in Engine.ActivationFailures) owner._log?.LogWarning("V2 strategy {Strategy} did not activate: {Reason}", f.StrategyId, f.Detail);
             IFrameJournal journal = owner._hooks?.JournalDecorator?.Invoke(owner._journal!) ?? owner._journal!;
             IFrameProcessor processor = owner._hooks?.ProcessorDecorator?.Invoke(Engine) ?? Engine;

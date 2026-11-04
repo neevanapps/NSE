@@ -55,6 +55,62 @@ public sealed class PaperEngineV2DataService : IDisposable
         }
     }
 
+    /// <summary>
+    /// The compact opportunity view of one trade date: counts per strategy, rejection counts by reason and a bounded list of the newest rows. Read-only, three bounded statements. When the owner has not run the
+    /// AddObservability script (undefined table) or the read-only role lacks SELECT (insufficient privilege) the view says so; nothing throws.
+    /// </summary>
+    public async Task<V2OpportunityView> LoadOpportunitiesAsync(DateOnly day, CancellationToken ct)
+    {
+        var d = day.ToString("yyyy-MM-dd");
+        try
+        {
+            var strategies = new List<V2OpportunityCounts>();
+            await using (var c = _db.CreateCommand(@"SELECT strategy_id,
+                       count(*) FILTER (WHERE stage = 'Decision'),
+                       count(*) FILTER (WHERE stage = 'Decision' AND direction IN ('CE','PE')),
+                       count(*) FILTER (WHERE order_attempted AND stage = 'Decision'),
+                       count(*) FILTER (WHERE category = 9),
+                       count(*) FILTER (WHERE stage = 'Decision' AND category IN (3,5,6)),
+                       count(*) FILTER (WHERE category = 8)
+                FROM pev2.pev2_opportunities WHERE trade_date = $1 GROUP BY strategy_id ORDER BY strategy_id LIMIT 100"))
+            {
+                c.Parameters.AddWithValue(d);
+                await using var r = await c.ExecuteReaderAsync(ct);
+                while (await r.ReadAsync(ct)) strategies.Add(new V2OpportunityCounts(r.GetString(0), (int)r.GetInt64(1), (int)r.GetInt64(2), (int)r.GetInt64(3), (int)r.GetInt64(4), (int)r.GetInt64(5), (int)r.GetInt64(6)));
+            }
+
+            var rejections = new List<V2RejectionCount>();
+            await using (var c = _db.CreateCommand("SELECT category_name, reason, count(*) FROM pev2.pev2_opportunities WHERE trade_date = $1 AND category IN (3,5,6,7,8) GROUP BY category_name, reason ORDER BY count(*) DESC, category_name, reason LIMIT 50"))
+            {
+                c.Parameters.AddWithValue(d);
+                await using var r = await c.ExecuteReaderAsync(ct);
+                while (await r.ReadAsync(ct)) rejections.Add(new V2RejectionCount(r.GetString(0), r.GetString(1), (int)r.GetInt64(2)));
+            }
+
+            var recent = new List<V2OpportunityRecent>();
+            await using (var c = _db.CreateCommand("SELECT strategy_id, bar_seq, stage, direction, category_name, reason, detail, order_result, decision_utc_ticks FROM pev2.pev2_opportunities WHERE trade_date = $1 AND (direction IN ('CE','PE') OR stage = 'Outcome') ORDER BY decision_utc_ticks DESC, opportunity_id LIMIT 25"))
+            {
+                c.Parameters.AddWithValue(d);
+                await using var r = await c.ExecuteReaderAsync(ct);
+                while (await r.ReadAsync(ct)) recent.Add(new V2OpportunityRecent(r.GetString(0), r.GetInt32(1), r.GetString(2), r.GetString(3), r.GetString(4), r.GetString(5), r.GetString(6), r.GetString(7), new DateTimeOffset(r.GetInt64(8), TimeSpan.Zero)));
+            }
+
+            return new V2OpportunityView(true, null, day, strategies, rejections, recent);
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedTable || ex.SqlState == PostgresErrorCodes.InvalidSchemaName)
+        {
+            return V2OpportunityView.Unavailable(day, "the opportunity log is not installed (the owner has not run the AddObservability script)");
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.InsufficientPrivilege)
+        {
+            return V2OpportunityView.Unavailable(day, "the Dashboard's read-only role has no SELECT permission on the opportunity log");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return V2OpportunityView.Unavailable(day, $"the opportunity log could not be read ({ex.GetType().Name})");
+        }
+    }
+
     async Task<IReadOnlyList<V2ConfiguredStrategy>> ConfiguredAsync(CancellationToken ct)
     {
         var list = new List<V2ConfiguredStrategy>();

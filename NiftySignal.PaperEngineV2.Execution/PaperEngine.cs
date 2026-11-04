@@ -20,11 +20,14 @@ public sealed class PaperEngine : IFrameProcessor
     readonly List<ActivationFailure> _failures = [];
     readonly List<PaperEvent> _events = [];
     readonly IPaperEventSink? _sink;
+    readonly IOpportunitySink? _opportunitySink;
+    readonly List<OpportunityRecord> _opportunities = [];
     readonly Dictionary<string, CompiledStrategy> _compiled = new(StringComparer.Ordinal);
 
-    public PaperEngine(IEnumerable<CompiledStrategy> strategies, ExecutionOptions options, IPaperEventSink? sink = null)
+    public PaperEngine(IEnumerable<CompiledStrategy> strategies, ExecutionOptions options, IPaperEventSink? sink = null, IOpportunitySink? opportunitySink = null)
     {
         _sink = sink;
+        _opportunitySink = opportunitySink;
         foreach (var s in strategies.Where(s => s.Config.Enabled).OrderBy(s => s.Config.Identity.StrategyId, StringComparer.Ordinal))
         {
             if (StrategyRuntime.CheckActivation(s.Config, options) is { } failure) { _failures.Add(failure); continue; }
@@ -41,6 +44,11 @@ public sealed class PaperEngine : IFrameProcessor
 
     public long SinkFailures { get; private set; }
 
+    /// <summary>Every opportunity row produced so far (observation only; bounded by the number of verified bars of the run).</summary>
+    public IReadOnlyList<OpportunityRecord> Opportunities => _opportunities;
+
+    public long OpportunitySinkFailures { get; private set; }
+
     volatile IReadOnlySet<string> _held = new HashSet<string>(StringComparer.Ordinal);
 
     /// <summary>
@@ -52,7 +60,8 @@ public sealed class PaperEngine : IFrameProcessor
     public ValueTask ProcessAsync(MarketStateFrame frame, MarketStateFrame? previous, FrameDisposition disposition, CancellationToken ct)
     {
         var batch = new List<PaperEvent>();
-        foreach (var r in _runtimes) r.Process(frame, previous, disposition, batch);
+        var opportunities = new List<OpportunityRecord>();
+        foreach (var r in _runtimes) r.Process(frame, previous, disposition, batch, opportunities);
         _held = new HashSet<string>(_runtimes.SelectMany(r => r.HeldTokens()), StringComparer.Ordinal);
         foreach (var e in batch)
         {
@@ -60,6 +69,14 @@ public sealed class PaperEngine : IFrameProcessor
             if (_sink is null) continue;
             try { _sink.Append(e); }
             catch (Exception) { SinkFailures++; }
+        }
+
+        foreach (var o in opportunities)
+        {
+            _opportunities.Add(o);
+            if (_opportunitySink is null) continue;
+            try { _opportunitySink.Append(o); }
+            catch (Exception) { OpportunitySinkFailures++; }
         }
 
         return ValueTask.CompletedTask;
