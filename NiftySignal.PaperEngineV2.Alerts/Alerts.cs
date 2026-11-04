@@ -45,6 +45,9 @@ public sealed class TelegramAlertTransport(ITelegramTextSender sender) : IAlertT
     }
 }
 
+/// <summary>The entry facts an alert needs that the fill event itself does not carry (resolved from the durable ledger, so they survive a restart).</summary>
+public sealed record EntryContext(string PositionId, OptionRight Right, string Token, double Strike, DateOnly Expiry, decimal FillPrice, DateTimeOffset EntryAt, string SignalId);
+
 /// <summary>Maps a ledger event to its alert class and plain-text message. Every message is labelled V2 SHADOW (paper only); no credential, token or config value ever enters a message.</summary>
 public static class AlertFormatter
 {
@@ -65,13 +68,23 @@ public static class AlertFormatter
 
     static string Cut(string s) => s.Length <= 300 ? s : s[..300] + "…";
 
-    public static string Format(PaperEvent e)
+    public const string Banner = "V2 SHADOW \u2014 PAPER ONLY";
+
+    static string Hold(TimeSpan d) => d < TimeSpan.Zero ? "n/a" : d.TotalHours >= 1 ? $"{(int)d.TotalHours}h {d.Minutes}m {d.Seconds}s" : $"{d.Minutes}m {d.Seconds}s";
+
+    static string Contract(EntryContext c) => $"{c.Right.ToString().ToUpperInvariant()} {c.Token} | expiry {c.Expiry:dd-MMM-yyyy} | strike {c.Strike:0}";
+
+    /// <param name="version">The strategy's configured version (shown next to its id) when known.</param>
+    /// <param name="entry">The entry facts of the position (strike, expiry, signal id, entry time and price) when they could be resolved; the alert degrades to the ledger event's own fields when not.</param>
+    public static string Format(PaperEvent e, int? version = null, EntryContext? entry = null)
     {
-        var head = $"V2 SHADOW (paper only) | {e.StrategyId} | ";
+        var head = $"{Banner} | {e.StrategyId}{(version is { } v ? $" v{v}" : "")} | ";
         return head + e switch
         {
-            EntryFilled f => $"OPENED {f.Right.ToString().ToUpperInvariant()} {f.Token} x{f.Quantity} @ {f.FillPrice:0.00} (fees {f.Fees:0.00}) | bar {f.BarSeq} | {Time(f.At)}",
-            ExitFilled x => $"CLOSED {x.PositionId.Split(':').Last()} x{x.Quantity} @ {x.FillPrice:0.00} | reason {x.Reason} | gross {x.GrossPnl:0.00} | fees {x.Fees:0.00} (exit leg) | net {x.NetPnl:0.00} | bar {x.BarSeq} | {Time(x.At)}",
+            EntryFilled f when entry is not null => $"ENTRY {Contract(entry)} | fill {f.FillPrice:0.00} x{f.Quantity} (fees {f.Fees:0.00}) | signal {entry.SignalId} | bar {f.BarSeq} | {Time(f.At)}",
+            ExitFilled x when entry is not null => $"EXIT {Contract(entry)} x{x.Quantity} | entry {entry.FillPrice:0.00} @ {Time(entry.EntryAt)} | exit {x.FillPrice:0.00} @ {Time(x.At)} | reason {x.Reason} | gross {x.GrossPnl:0.00} | fees {x.GrossPnl - x.NetPnl:0.00} (entry+exit) | net {x.NetPnl:0.00} | held {Hold(x.At - entry.EntryAt)} | bar {x.BarSeq}",
+            EntryFilled f => $"ENTRY {f.Right.ToString().ToUpperInvariant()} {f.Token} | fill {f.FillPrice:0.00} x{f.Quantity} (fees {f.Fees:0.00}) | bar {f.BarSeq} | {Time(f.At)}",
+            ExitFilled x => $"EXIT {x.PositionId.Split(':').Last()} x{x.Quantity} @ {x.FillPrice:0.00} | reason {x.Reason} | gross {x.GrossPnl:0.00} | fees {x.GrossPnl - x.NetPnl:0.00} (entry+exit) | net {x.NetPnl:0.00} | bar {x.BarSeq} | {Time(x.At)}",
             EntryRejected r => $"ORDER REJECTED {r.Right?.ToString().ToUpperInvariant() ?? "-"} | {r.Reason} | {Cut(r.Detail)} | bar {r.BarSeq} | {Time(r.At)}",
             StrategyFaulted s => $"EXECUTION FAILURE: strategy stopped | {Cut(s.Message)} | bar {s.BarSeq} | {Time(s.At)}",
             PositionUnresolved u => $"EXECUTION FAILURE: position UNRESOLVED (no exit fill) | {Cut(u.Detail)} | bar {u.BarSeq} | {Time(u.At)}",
@@ -84,13 +97,15 @@ public static class AlertFormatter
 /// Turns ledger events into outbox rows (idempotent by alert id = event id + class, so replay after a restart enqueues nothing twice and repairs a crash between the ledger write and the enqueue) for the
 /// ENABLED classes only. Wraps the durable event store; the ledger write happens first, so a failure of the outbox never loses the ledger event. A failure is counted and rethrown to the engine's sink containment.
 /// </summary>
-public sealed class AlertingEventSink(IPaperEventSink inner, NpgsqlDataSource db, AlertOptions options, TimeProvider clock) : IPaperEventSink
+public sealed class AlertingEventSink(IPaperEventSink inner, NpgsqlDataSource db, AlertOptions options, TimeProvider clock, Func<string, int?>? versionOf = null) : IPaperEventSink
 {
     long _failures, _enqueued;
 
     public long Failures => Interlocked.Read(ref _failures);
 
     public long Enqueued => Interlocked.Read(ref _enqueued);
+
+    EntryContext? ResolveEntry(PaperEvent e) => EntryContextLookup.Resolve(db, e);
 
     public void Append(PaperEvent e)
     {
@@ -101,13 +116,46 @@ public sealed class AlertingEventSink(IPaperEventSink inner, NpgsqlDataSource db
             var now = clock.GetUtcNow().UtcTicks;
             using var cmd = db.CreateCommand($"INSERT INTO {V2Schema.SchemaName}.pev2_alert_outbox (alert_id, alert_class, strategy_id, event_id, message_text, status, attempts, created_utc_ticks, next_attempt_utc_ticks) VALUES ($1,$2,$3,$4,$5,0,0,$6,$6) ON CONFLICT (alert_id) DO NOTHING");
             cmd.Parameters.AddWithValue(AlertFormatter.AlertId(e, c)); cmd.Parameters.AddWithValue(c.ToString()); cmd.Parameters.AddWithValue(e.StrategyId); cmd.Parameters.AddWithValue(e.EventId);
-            cmd.Parameters.AddWithValue(AlertFormatter.Format(e)); cmd.Parameters.AddWithValue(e.At.UtcTicks);
+            cmd.Parameters.AddWithValue(AlertFormatter.Format(e, versionOf?.Invoke(e.StrategyId), ResolveEntry(e))); cmd.Parameters.AddWithValue(e.At.UtcTicks);
             if (cmd.ExecuteNonQuery() == 1) Interlocked.Increment(ref _enqueued);
         }
         catch (Exception)
         {
             Interlocked.Increment(ref _failures);
             throw;
+        }
+    }
+}
+
+public static class EntryContextLookup
+{
+    /// <summary>
+    /// The entry facts for an EntryFilled / ExitFilled from the durable ledger (this strategy's most recent order and fill events up to the event itself). Never throws: a missing row or a read failure returns
+    /// null and the alert falls back to the fields the event carries. A bounded read (the newest 40 order / fill events), never a table scan.
+    /// </summary>
+    public static EntryContext? Resolve(NpgsqlDataSource db, PaperEvent e)
+    {
+        if (e is not (EntryFilled or ExitFilled)) return null;
+        try
+        {
+            var events = new List<PaperEvent>();
+            using (var cmd = db.CreateCommand($"SELECT kind, payload_json FROM {V2Schema.SchemaName}.pev2_events WHERE strategy_id = $1 AND kind IN ('EntryOrderPlaced','EntryFilled') AND at_utc_ticks <= $2 ORDER BY at_utc_ticks DESC, event_id DESC LIMIT 40"))
+            {
+                cmd.Parameters.AddWithValue(e.StrategyId); cmd.Parameters.AddWithValue(e.At.UtcTicks);
+                using var r = cmd.ExecuteReader();
+                while (r.Read()) events.Add(EventSerializer.Deserialize(r.GetString(0), r.GetString(1)));
+            }
+
+            if (e is EntryFilled self && !events.Any(x => x.EventId == self.EventId)) events.Add(self);
+            var positionId = e is EntryFilled ef ? ef.PositionId : ((ExitFilled)e).PositionId;
+            var fill = events.OfType<EntryFilled>().FirstOrDefault(f => f.PositionId == positionId);
+            var placed = fill is null ? null : events.OfType<EntryOrderPlaced>().FirstOrDefault(p => p.IntentId == fill.IntentId);
+            if (fill is null || placed is null) return null;
+            return new EntryContext(positionId, fill.Right, fill.Token, placed.Strike, placed.Expiry, fill.FillPrice, fill.At, placed.IntentId);
+        }
+        catch (Exception)
+        {
+            return null;
         }
     }
 }

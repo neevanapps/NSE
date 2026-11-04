@@ -95,7 +95,7 @@ public sealed class V2Runtime : IAsyncDisposable
             _store = new PostgresEventStore(_db);
             foreach (var cfg in set.Active.Select(a => a.Config).Concat(set.DisabledValid)) await _store.RecordConfigAsync(cfg, _clock.GetUtcNow(), ct);
             _journal = new PostgresFrameJournal(_db);
-            _alertSink = _options.AnyAlertEnabled ? new AlertingEventSink(_store, _db, _options.Alerts, _clock) : null;
+            _alertSink = _options.AnyAlertEnabled ? new AlertingEventSink(_store, _db, _options.Alerts, _clock, id => _strategies.FirstOrDefault(s => s.Config.Identity.StrategyId == id)?.Config.Identity.Version) : null;
             foreach (var (src, errs) in set.Rejected) _log?.LogWarning("V2 strategy file {Source} rejected: {Errors}", src, string.Join("; ", errs.Select(e => e.Message)));
 
             State = V2RuntimeState.Running; Detail = $"{set.Active.Count} strategies active, {set.DisabledValid.Count} disabled, {set.Rejected.Count} rejected";

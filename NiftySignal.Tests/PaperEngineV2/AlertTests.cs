@@ -90,12 +90,12 @@ public class AlertTests
         foreach (var e in new[] { Opened, Closed, Rejected, Faulted, Unresolved })
         {
             var text = AlertFormatter.Format(e);
-            Assert.StartsWith("V2 SHADOW (paper only) | S01 | ", text, StringComparison.Ordinal);
+            Assert.StartsWith("V2 SHADOW — PAPER ONLY | S01 | ", text, StringComparison.Ordinal);
             Assert.Contains("IST", text, StringComparison.Ordinal);
             Assert.True(text.Length < 600);
         }
 
-        Assert.Contains("OPENED CALL CE26000 x650 @ 127.50", AlertFormatter.Format(Opened), StringComparison.Ordinal);
+        Assert.Contains("ENTRY CALL CE26000 | fill 127.50 x650", AlertFormatter.Format(Opened), StringComparison.Ordinal);
         Assert.Contains("net -4600.55", AlertFormatter.Format(Closed), StringComparison.Ordinal);
         Assert.Contains("SpreadTooWide", AlertFormatter.Format(Rejected), StringComparison.Ordinal);
         Assert.Contains("UNRESOLVED", AlertFormatter.Format(Unresolved), StringComparison.Ordinal);

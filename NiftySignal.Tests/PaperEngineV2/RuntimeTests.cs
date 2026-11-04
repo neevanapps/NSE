@@ -222,7 +222,7 @@ public class RuntimeTests
         Assert.Equal(0, await ScalarAsync(db, "SELECT count(*) FROM pev2.pev2_gaps"));
         Assert.Equal(2, await ScalarAsync(db, "SELECT count(*) FROM pev2.pev2_alert_outbox"));                                          // Opened + Closed
         await Until(() => transport.Sent.Count == 2, "both alerts delivered");
-        Assert.All(transport.Sent, t => Assert.StartsWith("V2 SHADOW (paper only) | S01", t, StringComparison.Ordinal));
+        Assert.All(transport.Sent, t => Assert.StartsWith("V2 SHADOW — PAPER ONLY | S01", t, StringComparison.Ordinal));
         await Until(() => ScalarAsync(db, "SELECT count(*) FROM pev2.pev2_alert_outbox WHERE status = 1").GetAwaiter().GetResult() == 2, "outbox rows Sent");
         var snap = rt.Snapshot();
         Assert.Equal((0L, 0L, 0L), (snap.NoticesDropped, snap.LedgerFailures, snap.LedgerConflicts));
