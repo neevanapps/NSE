@@ -106,3 +106,15 @@ Merge into the existing `PaperEngineV2` section (do not duplicate it). Telegram 
 - Marks need the new tables; without them the features are silently off (visible as "not installed").
 - Feed gaps show Stale/Missing, not zero. A Dashboard disconnect only stops the display.
 - Directive vs code: "show IV/Delta/Vega Direction inverted" is display-only; strategies still consume the original scores.
+
+## Results
+**Full Release solution regression** (`dotnet test NiftySignal.slnx -c Release`, scratch PostgreSQL 18 enabled for the trading, pev2 and migration tests): **Passed 2854, Failed 0, Skipped 1, Total 2855.** The one skip is `HostReplayTests.RecordedSession_FlowsThroughTheRealHostPath_...`, which by design needs `NSE_V2_REPLAY_SOURCE` (read-only local recorded session); it was run separately, below. A first full run had 1 failure: the Execution assembly vocabulary guard (no "Live" in type names) flagged my new `LiveMark*` types. The guard was NOT weakened; the Execution types were renamed `PositionMark`, `PositionMarkCalculator`, `PositionMarkJson`, and the rerun passed.
+
+**Recorded-session replay (Sep 7, real Host path, read-only source, NPT1 parity)**, run separately with `--no-build`: Passed 1/1 with the deployed version-1 strategy files (6 m 3 s) and Passed 1/1 with `next-0920` (version 2, 09:20). Both ran after the final code.
+
+**Browser validation** (built-in browser on a localhost Dashboard from this branch, scratch pev2 DB seeded with moving marks for the three strategies; test login created locally, nothing production touched):
+- 1920 px and 1440 px: no horizontal overflow (scrollWidth = clientWidth). 1024 px: the V2 panels fit (the table scrolls inside its own `scroll-x` container), but the page overflows horizontally by about 340 px because of the **pre-existing top status bar** (status items, kill-switch toggle, logout button), unchanged by this branch. Reported, not fixed (out of scope).
+- Live P&L changed between two samples 2.5 s apart (e.g. TOTAL_ACTIVITY_5_10 net +741.04 → +710.51) with the publisher "running, last update 0.4 s ago", independently of the 15 s ledger refresh.
+- All three strategies visible; Closed row shows the ledger net; a position with no observed quote shows Missing with every price "unavailable"; Fresh = green badge, Closed = neutral, Missing/Stale/Invalid = warning; profit/loss colours applied.
+- Not verified in the browser: the avg-price table and the neutral CE/PE grid backgrounds need Observer data that the scratch environment lacks; both are covered by unit/render tests (`OptionPriceAveragesTests`, the updated `DashboardSimplificationTests`/`AdaptiveCompactGridTests`), and the six-grid historical screenshot tests (pinned data) pass in the regression.
+- Not run: a Telegram message (none sent), the VM, production DB.
