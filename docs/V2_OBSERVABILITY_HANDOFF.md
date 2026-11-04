@@ -4,7 +4,7 @@ Branch `feature/v2-observability`, branched from master `23f4ac7`. Local commits
 
 ## 1. SHAs
 - Initial master: `23f4ac7`
-- Final feature SHA: see the last line of this file (`FINAL_SHA`, filled at handoff).
+- Release SHA: this document deliberately does not name its own final commit (a document cannot contain the hash of the commit that changes it). After the merge, obtain it on the master checkout with `git rev-parse HEAD` and use that full 40-character value for `-ExpectedCommitSha`.
 - Chain: f32e4a7 (early entry) → 742176c (IV/Delta/Vega + neutral CE/PE) → 99786bb (avg prices) → cea187d (Telegram) → 29e72f9 (opportunity log) → becf53a/9ac3c73 (live marks) → docs/validation.
 
 ## 2. Projects and files changed
@@ -119,4 +119,31 @@ Merge into the existing `PaperEngineV2` section (do not duplicate it). Telegram 
 - Not verified in the browser: the avg-price table and the neutral CE/PE grid backgrounds need Observer data that the scratch environment lacks; both are covered by unit/render tests (`OptionPriceAveragesTests`, the updated `DashboardSimplificationTests`/`AdaptiveCompactGridTests`), and the six-grid historical screenshot tests (pinned data) pass in the regression.
 - Not run: a Telegram message (none sent), the VM, production DB.
 
-FINAL_SHA: c636aa2 (feature/v2-observability; master base 23f4ac7)
+## Final checks (owner request, 2026-11-04)
+
+**1. Visual fixture with representative Observer data** (static render of `AdaptiveObserverPanel` live view + `MarketSummarySection` from the same in-memory Observer fixtures the test suite uses, with the real Dashboard CSS, opened in the built-in browser; the local DB has no adaptive tables, so a fixture was the only way to get Observer-shaped data):
+- Option price averages: CE25000 Avg5 108.30 / Avg10 107.40, PE25000 Avg5 90.00 / Avg10 87.00 — equal to hand-computed means of the stored `PriceEnd` of bars 8–12 / 3–12. Bid/Ask/Quote age show "—" because the fixture has no tick source (never zero).
+- OPTION CONTEXT inversion, asymmetric fixture (CE ΔIV 1, PE ΔIV 3; ΔDelta 0.02 / 0.05; ΔVega 0.4 / 0.9): raw CE−PE would be −2.00 / −0.03 / −0.50; displayed **IV Dir (Inv) +2.00, Delta Dir (Inv) +0.03, Vega Dir (Inv) +0.50**, Direction cells tinted green; headers carry "(Inv)".
+- TOTAL SUMMARY: headers "IV Dir (Inv)", "Delta Dir (Inv)", "Vega Dir (Inv)"; Delta/Vega Direction cells tinted by the inverted sign (IV is "—" in that fixture because it has no IV data).
+- CE/PE colouring: 0 of the CE-/PE-labelled cells in OPTION CONTEXT and CORE DIRECTION have a background colour; only Direction cells are tinted.
+- No calculation logic was changed. The temporary fixture generator was deleted and is not in the repo.
+
+**2. Migration review** (`20261104130137_AddObservability`, run only on a scratch PostgreSQL, never the VM):
+- Applying the master (23f4ac7) `pev2-schema.idempotent.sql` and then the new script: tables 8 → 10 (only `pev2_live_marks`, `pev2_opportunities`, plus 2 indexes and one history row); `pev2_schema_versions.schema_version` stays **2** (no bump), so an old Host (exact-version check) and the new Host both accept the schema; running the new script a second time succeeds with no change; a fresh install straight to the new script also yields 10 tables. The script contains no DROP/ALTER/TRUNCATE/DELETE; its only UPDATE is the pre-existing AddAlertOutbox version stamp.
+- **Operator note:** both the old and the new script file start with a UTF-8 BOM that makes `psql -f` fail on the first statement (the test harness reads it with `File.ReadAllText`, which strips it). Strip it first: `sed '1s/^\xEF\xBB\xBF//' pev2-schema.idempotent.sql > pev2-schema.nobom.sql` (Git Bash) or run it through your usual tool that strips the BOM.
+- Permissions: the Host role needs SELECT, INSERT, UPDATE on the two new tables; the Dashboard's read-only role needs SELECT on them (both roles already need USAGE on schema `pev2`). With the tables or grants missing, both processes degrade to "not installed / no access" and never affect fills.
+
+**3. Release SHA:** see section 1; use `git rev-parse HEAD` after the merge.
+
+**4. Strategy files:** the three `next-0920/*.json` differ from the deployed version-1 files ONLY in `version` 1→2, `entryFrom` 09:30:00→09:20:00 and the added `filters.minCompletedBars: 10` (verified by diff); all entry rules are identical. The version-1 files at `paper-engine-v2-strategies/*.json` are unchanged since master 23f4ac7 (empty `git diff`; git blob ids 92511a9a… TOTAL_ACTIVITY_5_10, feb9d164… TOTAL_VOTE_4_OF_6, 3ca547d1… TOTAL_VOTE_5_OF_6). The Host loads `*.json` from the strategy directory non-recursively, so the `next-0920/` subfolder is never loaded by itself; activation is an explicit copy (below).
+
+**5. Scope:** all seven requested features are in; no NPT1 code or table changed; no known release blocker.
+
+## Manual deployment procedure (Host + Dashboard) — operator runs this, outside market hours
+0. Prerequisites: master contains this branch; on the master checkout run `git rev-parse HEAD` → `<RELEASE_SHA>` (40 chars). Take a DB backup: `pg_dump -Fc -n pev2 -f pev2_before_observability.dump <db>`. Copy the current strategy directory aside (keeps the version-1 files).
+1. Migration (owner, additive): apply the BOM-stripped `pev2-schema.idempotent.sql` with the owner role; then grants for `nifty_trading_host` (SELECT, INSERT, UPDATE) and the Dashboard read-only role (SELECT) on `pev2.pev2_live_marks` and `pev2.pev2_opportunities`; verify with `SELECT to_regclass('pev2.pev2_live_marks'), to_regclass('pev2.pev2_opportunities');` and `SELECT schema_version FROM pev2.pev2_schema_versions;` (must still be 2).
+2. VM `appsettings.Local.json`: merge the `PaperEngineV2` additions from section 17 (Alerts Opened/Closed/ExecutionFailure true; `LiveMarks:Enabled` true). Telegram needs the already-configured `Telegram` section.
+3. Strategy files: in `C:\Naveen\NiftySignal.Host\paper-engine-v2-strategies` (verify against the service definition) replace the three version-1 `.json` files with the three from `next-0920\`. Do not leave both versions in the folder.
+4. Deploy: `.\deploy.ps1 -Target Vm -Service Dashboard -ExpectedCommitSha <RELEASE_SHA>` then `.\deploy.ps1 -Target Vm -Service Host -ExpectedCommitSha <RELEASE_SHA>`.
+5. Activation verification: Host log shows the three strategies loaded at version 2 and live marks enabled (no "not installed" message); Dashboard "V2 LIVE P&L" shows "Publisher running" with updates about once a second; "V2 OPPORTUNITIES" panel loads; the first simulated entry/exit produces a Telegram ENTRY/EXIT alert (banner `V2 SHADOW — PAPER ONLY`) and a row in `pev2.pev2_alert_outbox`; `SELECT count(*) FROM pev2.pev2_opportunities WHERE trade_date = '<today>'` grows after 09:20 IST.
+6. Rollback: set `LiveMarks:Enabled` false and the Alerts flags false in `appsettings.Local.json`; restore the saved version-1 strategy files; redeploy the previous release SHA for both services. The two new tables may stay (derived data only). Never delete or truncate the V2 journal/ledger tables.
