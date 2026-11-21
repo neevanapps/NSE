@@ -125,6 +125,7 @@ builder.Services.AddSingleton<LiveDataService>();
 builder.Services.AddSingleton<AdaptiveObserverDataService>();
 builder.Services.AddSingleton<AdaptiveQuoteAsOfService>();
 builder.Services.AddSingleton<VixSummaryService>();
+builder.Services.AddSingleton<PollingFailureLogger>();
 builder.Services.AddSingleton<AdaptiveBarProgressService>();
 builder.Services.AddSingleton<AdaptiveResearchService>();
 // Read-only agent feed (GET /api/agent/snapshot on loopback + <AgentFeed:RootDirectory>/agent-feed/yyyy-MM-dd.jsonl). A projection of the same adaptive rows the grids render; no Host, trading or write path.

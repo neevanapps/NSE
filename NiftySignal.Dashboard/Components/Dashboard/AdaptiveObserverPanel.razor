@@ -865,7 +865,11 @@
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-        catch { /* quotes unavailable: the averages still render */ }
+        catch (Exception ex)
+        {
+            // quotes unavailable: the averages still render, but the failure is logged with its session / bar / strike context (deduplicated per cooldown)
+            Services.GetService<PollingFailureLogger>()?.Report("OptionAverageQuoteRead", ex, $"session={_snapshot.Session.Id}, bar={target.BarSeq}, strike={_fixed.Contract.Strike:0}, CE={_fixed.Contract.CeToken}, PE={_fixed.Contract.PeToken}");
+        }
         _avgPrice = OptionPriceAverages.Build(_fixed, target.BarSeq, boundary, ce, pe);
     }
     // DAY AVG inputs (all completed bars of the session through the current boundary); reloaded only when the completed bar or the selected strike changes, never on a quote tick.
@@ -953,6 +957,7 @@
         }
         catch (Exception ex)
         {
+            Services.GetService<PollingFailureLogger>()?.Report("AdaptiveHeaderRefresh", ex, "header poll");
             _loadError = $"Adaptive header refresh failed: {ex.Message}";
             await InvokeAsync(StateHasChanged);
         }
@@ -981,6 +986,7 @@
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
             catch (Exception ex)
             {
+                Services.GetService<PollingFailureLogger>()?.Report("AdaptiveObserverReload", ex, "snapshot reload");
                 _loadError = $"Adaptive observer read failed: {ex.Message}";
             }
             finally { _reloadGate.Release(); }
@@ -1047,6 +1053,7 @@
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            Services.GetService<PollingFailureLogger>()?.Report("VixRead", ex, $"tradeDate={tradeDate:yyyy-MM-dd}, endBar={view.EndBarSeq}");
             return view with { VixUnavailableReason = $"VIX read failed ({ex.GetType().Name})" };
         }
     }
@@ -1074,6 +1081,7 @@
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            Services.GetService<PollingFailureLogger>()?.Report("MarketSummaryRead", ex, $"session={_snapshot.Session.Id}, endBar={through}, centre={strike}");
             _summary = MarketSummaryView.Unavailable(through, $"read failed ({ex.GetType().Name})");     // informational: never fails the other grids
             _summaryKey = null;
         }
@@ -1101,6 +1109,7 @@
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            Services.GetService<PollingFailureLogger>()?.Report("DayAverageRead", ex, $"session={_snapshot.Session.Id}, endBar={through}, strike={strike}");
             _day = null;                              // DAY AVG is informational: a failed read hides the row, never the grids
         }
     }
@@ -1119,6 +1128,7 @@
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            Services.GetService<PollingFailureLogger>()?.Report("ResearchHeaderRead", ex, $"session={_snapshot.Session.Id}");
             _research = null;              // the research header is informational: a failed read never takes the grids down
         }
     }
