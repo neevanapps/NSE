@@ -91,6 +91,7 @@ try
     builder.Services.AddScoped<IInstrumentMasterProvider>(sp => sp.GetRequiredService<FlatTradeInstrumentMasterProvider>());
     builder.Services.AddScoped<IDataGapRecorder, EfDataGapRecorder>();
     builder.Services.AddScoped<InstrumentUniverseResolver>();
+    builder.Services.Configure<MarketDataCollectionOptions>(builder.Configuration.GetSection(MarketDataCollectionOptions.SectionName));
 
     // Sensex/Bank Nifty raw-tick-collection resolver (write-only/archive, future backtesting
     // only) -- registered as its own concrete types, not bound to IInstrumentMasterProvider

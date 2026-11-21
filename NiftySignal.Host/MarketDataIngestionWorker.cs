@@ -29,6 +29,7 @@ public sealed class MarketDataIngestionWorker(
     DashboardPushClient dashboardPush,
     IValidatedOptions<ScoreWeights> scoreWeightsOptions,
     IOptionsMonitor<PricingOptions> pricingOptions,
+    IOptions<MarketDataCollectionOptions> collectionOptions,
     ILogger<MarketDataIngestionWorker> logger) : BackgroundService
 {
     static readonly TimeSpan IstOffset = TimeSpan.FromHours(5.5);
@@ -726,6 +727,9 @@ public sealed class MarketDataIngestionWorker(
         return await db.FlatTradeSessions.FindAsync([FlatTradeSession.SingletonId], ct);
     }
 
+    static bool IsSensexOrBankNifty(Instrument i) =>
+        i.Underlying is SensexBankNiftyInstrumentMasterProvider.SensexUnderlying or SensexBankNiftyInstrumentMasterProvider.BankNiftyUnderlying;
+
     /// <summary>
     /// Reuses today's instruments if the 08:45-equivalent job already ran (e.g. a service restart)
     /// instead of re-hitting FlatTrade's API -- now checked and resolved PER underlying-group
@@ -737,14 +741,25 @@ public sealed class MarketDataIngestionWorker(
     /// already exist, this method calls the resolver exactly as often as it did before (zero
     /// times), returns exactly the same NIFTY rows, in the same way.
     /// </summary>
-    async Task<IReadOnlyList<Instrument>> ResolveInstrumentsAsync(string sessionToken, DateOnly asOfDate, CancellationToken ct)
+    internal async Task<IReadOnlyList<Instrument>> ResolveInstrumentsAsync(string sessionToken, DateOnly asOfDate, CancellationToken ct)
     {
+        var collectOther = collectionOptions.Value.CollectSensexBankNifty;
         await using var scope = scopeFactory.CreateAsyncScope();
         var db = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
 
         var existing = await db.Instruments.Where(i => i.AsOfDate == asOfDate).ToListAsync(ct);
         var resolved = new List<Instrument>(existing);
         var wroteAnything = false;
+
+        // MarketData:CollectSensexBankNifty = false (the shipped default) PAUSES the SENSEX/BANKNIFTY collection: today's already-stored rows are kept in the
+        // database untouched but are NOT returned (so never subscribed), and no fresh resolution is attempted below. NIFTY rows are never filtered.
+        if (!collectOther)
+        {
+            var paused = resolved.RemoveAll(IsSensexOrBankNifty);
+            logger.LogInformation(
+                "SENSEX/BANKNIFTY collection is PAUSED (MarketData:CollectSensexBankNifty=false): {Count} already-stored instruments for {AsOfDate} are not subscribed, none will be resolved.",
+                paused, asOfDate);
+        }
 
         if (existing.Any(i => i.Underlying == LiveFeatureEngine.NiftyUnderlying))
         {
@@ -765,11 +780,15 @@ public sealed class MarketDataIngestionWorker(
         // best-effort and fully independent of NIFTY's own resolution above: a failure here must
         // never stop or delay NIFTY's own live (paper) trading from starting. See
         // docs/SENSEX_BANKNIFTY_TICK_COLLECTION.md for the full design/verification.
-        if (existing.Any(i => i.Underlying is SensexBankNiftyInstrumentMasterProvider.SensexUnderlying or SensexBankNiftyInstrumentMasterProvider.BankNiftyUnderlying))
+        if (!collectOther)
+        {
+            // paused: neither reuse nor fresh resolution
+        }
+        else if (existing.Any(IsSensexOrBankNifty))
         {
             logger.LogInformation(
                 "Reusing {Count} previously-resolved SENSEX/BANKNIFTY instruments for {AsOfDate}",
-                existing.Count(i => i.Underlying is SensexBankNiftyInstrumentMasterProvider.SensexUnderlying or SensexBankNiftyInstrumentMasterProvider.BankNiftyUnderlying),
+                existing.Count(IsSensexOrBankNifty),
                 asOfDate);
         }
         else
