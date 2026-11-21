@@ -8,8 +8,8 @@ namespace NiftySignal.Ingestion.FlatTrade;
 /// <summary>
 /// The daily 08:45 job (plan section 3.1): ATM +/- 15 strikes for the NEAREST weekly expiry only
 /// (2026-11 change: previously nearest + next weekly, +/- 10 strikes), plus the underlying spot index,
-/// current-month future, and India VIX -- ~62 option instruments + 3 underlying. The chain is centred on the
-/// previous close, so the usable headroom around the live ATM is smaller than 15 strikes (see the Market
+/// current-month future, and India VIX -- up to roughly 60-62 option instruments + 3 underlying. The chain is centred on the
+/// previous close (the exact contract count depends on the broker's count semantics and is logged, not assumed), so the usable headroom around the live ATM is smaller than 15 strikes (see the Market
 /// Summary Upper grid, which needs ATM+3). Built around a live-verified discovery (2026-09-04) that
 /// simplifies the plan's original design: FlatTrade's GetOptionChain endpoint resolves
 /// strikes around a reference price server-side, so this class doesn't need to compute
@@ -31,6 +31,64 @@ public sealed class InstrumentUniverseResolver(
     const string Underlying = "NIFTY";
     /// <summary>Strikes requested each side of the previous-close centre (2026-11: 10 -> 15). The ladder is NOT re-centred intraday, so headroom around the live ATM shrinks as spot drifts from the previous close.</summary>
     public const int StrikeCountEachSide = 15;
+
+    /// <summary>
+    /// Validates a GetOptionChain response against the instrument master instead of trusting it: only contracts of the requested (nearest) expiry are kept, a token or a
+    /// (strike, CE/PE) pair appears once, and coverage is checked for the expected ladder = the listed strikes within <see cref="StrikeCountEachSide"/> steps of the strike nearest
+    /// the reference price (ties: the lower strike). The broker's exact count semantics (strikes each side vs. total, whether the ATM strike is added) are NOT assumed:
+    /// incomplete coverage is LOGGED with the actual counts, never padded, never filled from another expiry, and the universe size is never asserted as a fixed number.
+    /// </summary>
+    internal IReadOnlyList<OptionChainEntry> ValidateChain(IReadOnlyList<OptionChainEntry> chain, IReadOnlyList<Instrument> master, DateOnly expiry, decimal midPrice, DateOnly asOfDate)
+    {
+        var masterByToken = master.Where(i => i.InstrumentType == InstrumentType.Option).GroupBy(i => i.Token).ToDictionary(g => g.Key, g => g.First());
+        var accepted = new List<OptionChainEntry>();
+        var seenTokens = new HashSet<string>(StringComparer.Ordinal);
+        var seenSlots = new HashSet<(decimal, OptionType)>();
+        int wrongExpiry = 0, duplicateToken = 0, duplicateSlot = 0, notInMaster = 0;
+        foreach (var c in chain)
+        {
+            if (masterByToken.TryGetValue(c.Token, out var m) && m.ExpiryDate != expiry)
+            {
+                wrongExpiry++;                                                    // a contract of another expiry is never accepted into the nearest-expiry universe
+                continue;
+            }
+
+            if (m is null) notInMaster++;
+            if (!seenTokens.Add(c.Token)) { duplicateToken++; continue; }
+            if (!seenSlots.Add((c.StrikePrice, c.OptionType))) { duplicateSlot++; continue; }
+            accepted.Add(c);
+        }
+
+        var ladder = master.Where(i => i.InstrumentType == InstrumentType.Option && i.ExpiryDate == expiry && i.StrikePrice is not null)
+            .Select(i => i.StrikePrice!.Value).Distinct().OrderBy(x => x).ToArray();
+        var expected = new List<decimal>();
+        if (ladder.Length > 0)
+        {
+            var centre = 0;
+            for (var i = 1; i < ladder.Length; i++)
+                if (Math.Abs(ladder[i] - midPrice) < Math.Abs(ladder[centre] - midPrice)) centre = i;                // strict <: a tie keeps the lower strike
+            for (var i = Math.Max(0, centre - StrikeCountEachSide); i <= Math.Min(ladder.Length - 1, centre + StrikeCountEachSide); i++) expected.Add(ladder[i]);
+        }
+
+        var have = accepted.GroupBy(a => a.StrikePrice).ToDictionary(g => g.Key, g => g.Select(a => a.OptionType).ToHashSet());
+        var missing = expected.SelectMany(k => new[] { OptionType.Call, OptionType.Put }
+            .Where(t => !(have.TryGetValue(k, out var types) && types.Contains(t))).Select(t => $"{k:0.##}{(t == OptionType.Call ? "CE" : "PE")}")).ToList();
+        var unpairedStrikes = have.Count(kv => !(kv.Value.Contains(OptionType.Call) && kv.Value.Contains(OptionType.Put)));
+
+        if (missing.Count > 0 || wrongExpiry + duplicateToken + duplicateSlot > 0 || unpairedStrikes > 0 || ladder.Length == 0)
+        {
+            logger.LogWarning(
+                "NIFTY option-chain coverage INCOMPLETE for expiry {Expiry} (as-of {AsOfDate}, reference {Mid}): received {Received}, accepted {Accepted} over {Strikes} strikes; expected ATM+/-{Each} = {ExpectedStrikes} strikes x CE/PE; missing {MissingCount} [{Missing}]; strikes without both sides {Unpaired}; rejected: wrong-expiry {Wrong}, duplicate-token {DupToken}, duplicate-strike-side {DupSlot}. The next expiry is NOT substituted.",
+                expiry, asOfDate, midPrice, chain.Count, accepted.Count, have.Count, StrikeCountEachSide, expected.Count, missing.Count, string.Join(',', missing.Take(12)) + (missing.Count > 12 ? ",..." : ""), unpairedStrikes, wrongExpiry, duplicateToken, duplicateSlot);
+        }
+        else
+        {
+            logger.LogInformation("NIFTY option chain complete for expiry {Expiry}: {Accepted} contracts over {Strikes} strikes (ATM+/-{Each}, CE and PE each).", expiry, accepted.Count, have.Count, StrikeCountEachSide);
+        }
+
+        if (notInMaster > 0) logger.LogWarning("{Count} option-chain contracts are not in the instrument master, so their expiry could not be cross-checked.", notInMaster);
+        return accepted;
+    }
 
     public async Task<IReadOnlyList<Instrument>> ResolveAsync(string sessionToken, DateOnly asOfDate, CancellationToken cancellationToken)
     {
@@ -109,7 +167,11 @@ public sealed class InstrumentUniverseResolver(
             var chain = await authClient.GetOptionChainAsync(
                 sessionToken, Exchange.Nfo, anchor.TradingSymbol, midPrice, StrikeCountEachSide, cancellationToken);
 
-            instruments.AddRange(chain.Select(c => new Instrument
+            var accepted = ValidateChain(chain, master, expiry, midPrice, asOfDate);
+            if (accepted.Count == 0)
+                throw new InvalidOperationException($"GetOptionChain returned no usable {Underlying} option contracts for expiry {expiry:yyyy-MM-dd} (received {chain.Count}); the universe cannot be built.");
+
+            instruments.AddRange(accepted.Select(c => new Instrument
             {
                 Token = c.Token,
                 Exchange = c.Exchange,

@@ -560,6 +560,29 @@ public sealed class MarketDataIngestionWorker(
     /// pushes -- there's no Dashboard-to-Host channel other than the database, matching
     /// how FlatTradeSession/KillSwitchState are already shared between the two processes.
     /// </summary>
+    /// <summary>
+    /// One poll of the pending-subscription queue. With MarketData:CollectSensexBankNifty=false the SENSEX/BANKNIFTY rows are NOT requested and NOT marked
+    /// Subscribed (they stay pending, so switching the collection back on picks them up); NIFTY on-demand requests are unaffected. Returns the rows requested.
+    /// </summary>
+    internal async Task<int> PollPendingSubscriptionsAsync(Action<NiftySignal.Domain.Enums.Exchange, string> requestSubscribe, DateOnly asOfDate, CancellationToken ct)
+    {
+        var collectOther = collectionOptions.Value.CollectSensexBankNifty;
+        await using var scope = scopeFactory.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
+        var pending = await db.Instruments.Where(i => i.AsOfDate == asOfDate && !i.Subscribed).ToListAsync(ct);
+        if (!collectOther) pending = pending.Where(i => !IsSensexOrBankNifty(i)).ToList();
+
+        foreach (var instrument in pending)
+        {
+            requestSubscribe(instrument.Exchange, instrument.Token);
+            instrument.Subscribed = true;
+            logger.LogInformation("Requested on-demand subscribe: {Symbol} ({Token})", instrument.TradingSymbol, instrument.Token);
+        }
+
+        if (pending.Count > 0) await db.SaveChangesAsync(ct);
+        return pending.Count;
+    }
+
     async Task RunPendingSubscriptionLoopAsync(FlatTradeTickSource tickSource, DateOnly asOfDate, CancellationToken stoppingToken)
     {
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
@@ -569,21 +592,7 @@ public sealed class MarketDataIngestionWorker(
             {
                 try
                 {
-                    await using var scope = scopeFactory.CreateAsyncScope();
-                    var db = scope.ServiceProvider.GetRequiredService<NiftySignalDbContext>();
-                    var pending = await db.Instruments.Where(i => i.AsOfDate == asOfDate && !i.Subscribed).ToListAsync(stoppingToken);
-
-                    foreach (var instrument in pending)
-                    {
-                        tickSource.RequestSubscribe(instrument.Exchange, instrument.Token);
-                        instrument.Subscribed = true;
-                        logger.LogInformation("Requested on-demand subscribe: {Symbol} ({Token})", instrument.TradingSymbol, instrument.Token);
-                    }
-
-                    if (pending.Count > 0)
-                    {
-                        await db.SaveChangesAsync(stoppingToken);
-                    }
+                    await PollPendingSubscriptionsAsync(tickSource.RequestSubscribe, asOfDate, stoppingToken);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {

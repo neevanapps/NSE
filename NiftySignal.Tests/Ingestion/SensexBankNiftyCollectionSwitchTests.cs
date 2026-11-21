@@ -7,6 +7,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using NiftySignal.Domain.Abstractions;
 using NiftySignal.Domain.Entities;
+using NiftySignal.Domain.Enums;
 using NiftySignal.Host;
 using NiftySignal.Ingestion.FlatTrade;
 using NiftySignal.Persistence;
@@ -140,5 +141,45 @@ public sealed class SensexBankNiftyCollectionSwitchTests
         var again = await h.Worker(collect: true).ResolveInstrumentsAsync("tok", Day, default);   // restart: reused from the database, no new resolution
         Assert.Equal(calls, h.Http.BfoRequests);
         Assert.Equal(fresh.Select(i => i.Token).OrderBy(x => x), again.Select(i => i.Token).OrderBy(x => x));
+    }
+
+    static async Task SeedUnsubscribedAsync(Harness h)
+    {
+        await using var db = h.NewDb();
+        foreach (var (token, under, exch) in new[] { ("N1", "NIFTY", Exchange.Nfo), ("S1", "SENSEX", Exchange.Bfo), ("B1", "BANKNIFTY", Exchange.Nfo) })
+        {
+            db.Instruments.Add(new Instrument { AsOfDate = Day, Exchange = exch, Token = token, TradingSymbol = token, Underlying = under, Subscribed = false, InstrumentType = InstrumentType.Future, LotSize = 1, ExpiryDate = Day.AddDays(3) });
+        }
+
+        await db.SaveChangesAsync();
+    }
+
+    [Fact]
+    public async Task SwitchOff_PendingPoll_AfterRestart_DoesNotRequestOrMarkSensexBankNifty_ButStillServesNiftyOnDemand()
+    {
+        var h = NewHarness();
+        await SeedUnsubscribedAsync(h);
+        var requested = new List<string>();
+        var worker = h.Worker(collect: false);                                      // a restart with the switch off, rows already stored unsubscribed
+        Assert.Equal(1, await worker.PollPendingSubscriptionsAsync((_, t) => requested.Add(t), Day, default));
+        Assert.Equal(["N1"], requested);
+
+        await using var db = h.NewDb();
+        var rows = await db.Instruments.ToListAsync();
+        Assert.True(rows.Single(r => r.Token == "N1").Subscribed);
+        Assert.False(rows.Single(r => r.Token == "S1").Subscribed);                 // stays pending, not silently marked subscribed
+        Assert.False(rows.Single(r => r.Token == "B1").Subscribed);
+        Assert.Equal(0, await worker.PollPendingSubscriptionsAsync((_, t) => requested.Add(t), Day, default));   // repeat poll: still nothing
+    }
+
+    [Fact]
+    public async Task ReEnable_PendingPoll_NowRequestsThePausedRows()
+    {
+        var h = NewHarness();
+        await SeedUnsubscribedAsync(h);
+        await h.Worker(collect: false).PollPendingSubscriptionsAsync((_, _) => { }, Day, default);
+        var requested = new List<string>();
+        Assert.Equal(2, await h.Worker(collect: true).PollPendingSubscriptionsAsync((_, t) => requested.Add(t), Day, default));
+        Assert.Equal(["B1", "S1"], requested.OrderBy(x => x).ToList());
     }
 }
