@@ -309,4 +309,27 @@ public class MarketSummaryTests
         var withHole = bars.Where(kv => kv.Key != 58).ToDictionary(kv => kv.Key, kv => kv.Value);
         Assert.Equal("4/5 – PARTIAL", FuturesSummaryCalculator.Compute(withHole, 60)[0].Coverage.Text);
     }
+
+    static FuturesBar FutBar(int seq, double dur, long vol) => new(seq, dur, 26_000, 26_000, vol, 0, 0, 0, 0, 0, null, null, null, null, null, null, null, null);
+
+    [Fact]
+    public void FuturesActivity_IncludesVolumeOfZeroDurationSplitBars()
+    {
+        // A3: 27,300 volume over 10 s of bar time (two bars carry the duration, one split bar carries volume with 0 s) = 2,730/s, not (volume of duration bars only)/10.
+        var bars = new Dictionary<int, FuturesBar> { [1] = FutBar(1, 4, 10_000), [2] = FutBar(2, 0, 7_300), [3] = FutBar(3, 6, 10_000) };
+        var row = FuturesSummaryCalculator.Compute(bars, 3)[0];  // 5-bar window is insufficient with 3 bars, use Day
+        var day = FuturesSummaryCalculator.Compute(bars, 3)[4];
+        Assert.Equal(27_300L, day.Volume);
+        Assert.Equal(2_730d, day.Activity!.Value, 9);
+        Assert.Null(row.Activity);                                // Insufficient window stays unavailable
+    }
+
+    [Fact]
+    public void FuturesActivity_ZeroTotalDuration_IsUnavailable()
+    {
+        var bars = new Dictionary<int, FuturesBar> { [1] = FutBar(1, 0, 500), [2] = FutBar(2, 0, 800) };
+        var day = FuturesSummaryCalculator.Compute(bars, 2)[4];
+        Assert.Equal(1_300L, day.Volume);
+        Assert.Null(day.Activity);
+    }
 }

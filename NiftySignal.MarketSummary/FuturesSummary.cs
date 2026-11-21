@@ -42,8 +42,9 @@ public static class FuturesSummaryCalculator
 
             var ov = present.Where(x => x.Ofi is not null && x.GrossOfi is not null).ToList();
             var ofi = ov.Count == 0 ? Metric.None : new Metric(ov.Sum(x => x.Ofi!.Value), ov.Sum(x => x.Ofi!.Value), ov.Sum(x => x.GrossOfi!.Value));
-            var dur = present.Where(x => x.DurationSeconds > 0d).ToList();
-            rows.Add(new(w, from, endBarSeq, cov, price, vol, strict, enriched, oi, micro, ofi, dur.Count == 0 ? null : dur.Sum(x => (double)x.Volume) / dur.Sum(x => x.DurationSeconds)));
+            // A3: split bars can carry volume with zero duration; volume of ALL present bars is divided by the summed duration (valid only when > 0).
+            var durSeconds = present.Sum(x => x.DurationSeconds);
+            rows.Add(new(w, from, endBarSeq, cov, price, vol, strict, enriched, oi, micro, ofi, durSeconds > 0d ? (double)vol / durSeconds : null));
         }
 
         return rows;
