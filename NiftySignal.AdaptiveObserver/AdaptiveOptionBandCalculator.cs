@@ -5,6 +5,52 @@ namespace NiftySignal.AdaptiveObserver;
 
 public static class AdaptiveOptionBandCalculator
 {
+    /// <summary>
+    /// The ATM strike alone, by the SAME rule <see cref="Select"/> uses, without requiring the ATM±2 band to fit the ladder. spot-atm-v1 needs only a valid spot and a listed strike (quotes are not involved);
+    /// the legacy rule needs the synthetic forward (>= 3 fresh quote pairs). Returns null when the rule cannot produce a centre.
+    /// </summary>
+    public static double? SelectCenter(
+        DateTimeOffset atUtc,
+        DateOnly expiry,
+        double futureReferencePrice,
+        IReadOnlyList<ObserverOptionInstrument> chain,
+        IReadOnlyDictionary<string, OptionQuoteSnapshot> latestQuotes,
+        double riskFreeRate,
+        AtmCenterRule centerRule,
+        double? spot,
+        double maxQuoteAgeSeconds = 5d)
+    {
+        var strikes = chain.Where(x => x.ExpiryDate == expiry).Select(x => x.Strike).Distinct().OrderBy(x => x).ToArray();
+        if (strikes.Length == 0)
+        {
+            return null;
+        }
+
+        if (centerRule == AtmCenterRule.SpotV1)
+        {
+            return spot is { } s && s > 0d && double.IsFinite(s) ? AtmCenterRules.NearestStrike(strikes, s) : null;
+        }
+
+        var byKey = chain.Where(x => x.ExpiryDate == expiry).ToDictionary(x => (x.Strike, x.OptionType));
+        var pairs = new List<(double Strike, double CallMid, double PutMid)>();
+        foreach (var strike in strikes.OrderBy(k => Math.Abs(k - futureReferencePrice)).ThenBy(k => k).Take(5))
+        {
+            if (byKey.TryGetValue((strike, OptionType.Call), out var call) && byKey.TryGetValue((strike, OptionType.Put), out var put)
+                && FreshMid(call.Token, atUtc, latestQuotes, maxQuoteAgeSeconds, out var cm) && FreshMid(put.Token, atUtc, latestQuotes, maxQuoteAgeSeconds, out var pm))
+            {
+                pairs.Add((strike, cm, pm));
+            }
+        }
+
+        if (pairs.Count < 3)
+        {
+            return null;
+        }
+
+        var synthetic = SyntheticForward.Compute(pairs, TimeToExpiry.YearsUntilExpiry(expiry, atUtc), riskFreeRate);
+        return synthetic is null ? null : strikes.OrderBy(k => Math.Abs(k - synthetic.Value)).ThenBy(k => k).First();
+    }
+
     public static OptionBandSelection? Select(
         DateTimeOffset atUtc,
         DateOnly expiry,

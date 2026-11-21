@@ -139,6 +139,37 @@ public sealed class AdaptiveScreenshotTests
         } finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
     }
 
+    sealed class CaptureLog : Microsoft.Extensions.Logging.ILogger<PollingFailureLogger>
+    {
+        public readonly List<(string Message, Exception? Ex)> Entries = [];
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter) => Entries.Add((formatter(state, exception), exception));
+    }
+
+    sealed class FailingRenderer : IAdaptiveScreenshotRenderer
+    {
+        public Task CaptureAsync(AdaptiveScreenshotJobRow job, string path, CancellationToken ct) => throw new InvalidOperationException("renderer exploded");
+    }
+
+    [Fact]
+    public async Task Processor_CaptureFailure_IsLoggedWithTheOriginalExceptionAndJobContext_AndStillQueuesARetry()
+    {
+        await using var db = Database();
+        var job = AdaptiveScreenshotSchedule.New(null, Day, 0, AdaptiveScreenshotKind.PreLiveTest, Cutoff, Cutoff);
+        db.Add(job); await db.SaveChangesAsync();
+        var root = Path.Combine(Path.GetTempPath(), "adaptive-screenshot-test-" + Guid.NewGuid());
+        try {
+            var log = new CaptureLog();
+            var processor = new AdaptiveScreenshotProcessor(new FailingRenderer(), new Sender(TelegramDocumentOutcome.Sent), Options.Create(new AdaptiveScreenshotOptions { OutputDirectory = root }), new Clock(), null, new PollingFailureLogger(log));
+            await processor.ProcessOneAsync(db, Cutoff, default);
+            Assert.Equal(AdaptiveScreenshotStatus.Pending, job.Status);                              // behaviour unchanged: safe retry queued
+            var entry = Assert.Single(log.Entries);
+            Assert.IsType<InvalidOperationException>(entry.Ex);                                      // the ORIGINAL exception, not just its type name
+            Assert.Contains($"job={job.Id}", entry.Message);
+        } finally { if (Directory.Exists(root)) Directory.Delete(root, true); }
+    }
+
     [Fact]
     public async Task Processor_Rejected_RetriesOriginalImageNotRecaptured()
     {

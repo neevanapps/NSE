@@ -76,7 +76,7 @@ public class DashboardSimplificationTests
         Assert.Equal(["summary-futures", "summary-total"], grids);
         Assert.True(html.IndexOf("FUTURES SUMMARY", StringComparison.Ordinal) < html.IndexOf("TOTAL SUMMARY", StringComparison.Ordinal));
         foreach (var gone in new[] { "ATM SUMMARY", "ITM SUMMARY", "OTM SUMMARY", "summary-total-core", "summary-total-context" }) Assert.DoesNotContain(gone, html);
-        Assert.Equal(1, Regex.Matches(html, "TOTAL SUMMARY").Count);      // no duplicated section
+        Assert.Equal(1, Regex.Matches(html, "TOTAL SUMMARY").Count);      // this view carries no shifted baskets: the single ATM grid, no duplicated section
     }
 
     [Fact]
@@ -355,7 +355,7 @@ public class DashboardSimplificationTests
     [Fact]
     public void Renderer_RequiresTheSixNamedGridsInOrder_AndRefusesTheRemovedOnes()
     {
-        string[] ok = ["summary-futures", "summary-total", "futures-compact", "options-core-direction", "options-context", "residual-compact"];
+        string[] ok = ["summary-futures", "summary-total-itm", "summary-total", "summary-total-otm", "futures-compact", "options-core-direction", "options-context", "residual-compact"];
         Assert.True(AdaptiveScreenshotRenderer.IsExpectedGridSequence(ok));
         Assert.True(AdaptiveScreenshotRenderer.IsExpectedGridSequence([.. ok, "unrelated-extra-grid"]));        // an unrelated table never breaks a capture
         Assert.False(AdaptiveScreenshotRenderer.IsExpectedGridSequence(ok.Take(5).ToArray()));                  // a missing grid
@@ -363,7 +363,7 @@ public class DashboardSimplificationTests
         Assert.False(AdaptiveScreenshotRenderer.IsExpectedGridSequence([ok[1], ok[0], .. ok.Skip(2)]));         // wrong order
         foreach (var gone in AdaptiveScreenshotRenderer.ForbiddenGrids)
             Assert.False(AdaptiveScreenshotRenderer.IsExpectedGridSequence([gone, .. ok]));
-        Assert.Equal(6, AdaptiveScreenshotRenderer.RequiredGrids.Count);
+        Assert.Equal(8, AdaptiveScreenshotRenderer.RequiredGrids.Count);
         var src = File.ReadAllText(Path.Combine(TradingModelTests.RepoRoot(), "NiftySignal.Dashboard", "Services", "AdaptiveScreenshotRenderer.cs"));
         Assert.Contains("Removed capture grid", src);
         Assert.Contains("not in the expected order", src);

@@ -8,6 +8,7 @@
 @using NiftySignal.Domain
 @inject IDbContextFactory<AdaptiveObserverDbContext> DbFactory
 @inject IOptions<AdaptiveScreenshotOptions> Options
+@inject IServiceProvider Services
 
 <PageTitle>Adaptive Telegram screenshots</PageTitle>
 <main style="padding:24px">
@@ -41,7 +42,7 @@
     async Task ReloadAsync()
     {
         try { await using var db = await DbFactory.CreateDbContextAsync(); _jobs = await db.ScreenshotJobs.AsNoTracking().OrderByDescending(x => x.Id).Take(50).ToListAsync(); }
-        catch (Exception ex) { _message = $"Status read failed ({ex.GetType().Name}); check migration and Dashboard logs."; }
+        catch (Exception ex) when (ex is not OperationCanceledException) { Services.GetService<PollingFailureLogger>()?.Report("ScreenshotStatusRead", ex, "jobs list"); _message = $"Status read failed ({ex.GetType().Name}); check migration and Dashboard logs."; }
     }
     async Task SendTestAsync()
     {
@@ -57,7 +58,7 @@
             _message = "Pre-live test queued. Refresh to check Sent and Telegram message ID; verify the PNG in Telegram.";
             await ReloadAsync();
         }
-        catch (Exception ex) { _message = $"Test queue failed ({ex.GetType().Name}); nothing acknowledged as sent."; }
+        catch (Exception ex) when (ex is not OperationCanceledException) { Services.GetService<PollingFailureLogger>()?.Report("ScreenshotTestQueue", ex, "pre-live test"); _message = $"Test queue failed ({ex.GetType().Name}); nothing acknowledged as sent."; }
         finally { _busy = false; }
     }
 }

@@ -242,7 +242,7 @@ public sealed class AdaptiveObserverEngine
             _currentBand = SelectBandContext(bar.EndAvailableAtUtc, bar.Close);
             // The supplemental needs the NEXT selection's synthetic underlying (the same instant as the bar end) for end-of-bar IV,
             // so it is attached after the core package and the next band context exist. It reads state; it changes none.
-            packages[^1] = packages[^1] with { OptionsSupplemental = BuildOptionsSupplemental(bar, finishedBand, optionBand, _currentBand) };
+            packages[^1] = packages[^1] with { OptionsSupplemental = BuildOptionsSupplemental(bar, finishedBand, optionBand, _currentBand), CloseAtm = ComputeCloseAtm(bar.EndAvailableAtUtc, bar.Close) };
             if (_projectStrikes)
             {
                 var strikeStart = _strikeStart;
@@ -328,6 +328,25 @@ public sealed class AdaptiveObserverEngine
         var putRolling = OptionBandRollingCalculator.BuildLatest(_putBandHistory, _bandDurations, _session.RollingWindowBars);
 
         return new OptionBandBarResult(ctx.Selection, ctx.BandRolled, call, put, callRolling, putRolling, null);
+    }
+
+    /// <summary>The causal ATM at a bar's close instant: the same rule, spot freshness and tie rule as the band selection made at that instant, but independent of whether the ATM±2 band fits the frozen ladder.</summary>
+    BarCloseAtm ComputeCloseAtm(DateTimeOffset at, double futurePrice)
+    {
+        double? spot = null;
+        if (_atmRule == AtmCenterRule.SpotV1)
+        {
+            spot = _basis.FreshSpotAt(at);
+            if (spot is null)
+            {
+                return new BarCloseAtm(null, null, AtmCenterRules.SpotUnavailableReason);
+            }
+        }
+
+        var strike = AdaptiveOptionBandCalculator.SelectCenter(at, _optionExpiry, futurePrice, _options, _latestOptionQuotes, _riskFreeRate, _atmRule, spot);
+        return strike is { } k
+            ? new BarCloseAtm(k, spot, null)
+            : new BarCloseAtm(null, spot, _atmRule == AtmCenterRule.SpotV1 ? "No listed strike for the session's weekly expiry." : "Insufficient fresh CE/PE quotes to derive the weekly synthetic ATM.");
     }
 
     BandContext SelectBandContext(DateTimeOffset at, double futurePrice)

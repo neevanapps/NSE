@@ -8,7 +8,7 @@ using Microsoft.Extensions.Options;
 namespace NiftySignal.Dashboard.Services;
 
 public sealed class AdaptiveScreenshotProcessor(IAdaptiveScreenshotRenderer renderer, ITelegramDocumentSender sender,
-    IOptions<AdaptiveScreenshotOptions> options, TimeProvider? clock = null, AdaptiveResearchService? research = null)
+    IOptions<AdaptiveScreenshotOptions> options, TimeProvider? clock = null, AdaptiveResearchService? research = null, PollingFailureLogger? failures = null)
 {
     /// <summary>
     /// Research caption: it describes the view that was actually captured (fixed-strike CORE DIRECTION / OPTION CONTEXT, completed rows only), never the legacy BOTH / NOTIONAL / ATM±2 selector.
@@ -24,7 +24,7 @@ public sealed class AdaptiveScreenshotProcessor(IAdaptiveScreenshotRenderer rend
 
         PinnedResearchView? view = null;
         try { view = await research.LoadPinnedAsync(job.SessionId.Value, job.TargetBarSeq, ct); }
-        catch (Exception ex) when (ex is not OperationCanceledException) { /* a caption never blocks delivery of an already captured image */ }
+        catch (Exception ex) when (ex is not OperationCanceledException) { failures?.Report("ScreenshotCaptionView", ex, $"job={job.Id}, session={job.SessionId}, bar={job.TargetBarSeq}"); /* a caption never blocks delivery of an already captured image */ }
         var caption = ResearchCaption.Build(job, view?.Model, sha);
         return caption.Length > 1000 ? caption[..1000] : caption;
     }
@@ -61,6 +61,7 @@ public sealed class AdaptiveScreenshotProcessor(IAdaptiveScreenshotRenderer rend
         }
         catch (Exception ex) when (job.Status == AdaptiveScreenshotStatus.Capturing)
         {
+            if (ex is not OperationCanceledException) failures?.Report("ScreenshotCapture", ex, $"job={job.Id}, session={job.SessionId}, bar={job.TargetBarSeq}");
             job.Status = AdaptiveScreenshotStatus.Pending;
             job.NextAttemptUtc = now.AddSeconds(60);
             // Our validation errors contain no credentials; preserve their actionable reason.

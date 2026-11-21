@@ -193,7 +193,8 @@ public sealed class AdaptiveResearchService(
     IDbContextFactory<AdaptiveObserverDbContext> dbFactory,
     AdaptiveObserverDataService data,
     PaperLiveDataService? paper = null,
-    AdaptiveQuoteAsOfService? quotes = null)
+    AdaptiveQuoteAsOfService? quotes = null,
+    PollingFailureLogger? failures = null)
 {
     public async Task<PinnedResearchView?> LoadPinnedAsync(long sessionId, int barSeq, CancellationToken ct = default)
     {
@@ -225,6 +226,7 @@ public sealed class AdaptiveResearchService(
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
+                failures?.Report("PinnedQuoteForResearch", ex, $"session={sessionId}, bar={barSeq}");
                 quoteUnavailable = true;
             }
         }
@@ -238,6 +240,7 @@ public sealed class AdaptiveResearchService(
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            failures?.Report("PinnedDayAverage", ex, $"session={sessionId}, endBar={snapshot.Runtime.LastCompletedBarSeq}, strike={selected}");
             day = null;                 // DAY AVG is informational: a failed read shows it as unavailable and never fails the capture
         }
 
@@ -279,6 +282,7 @@ public sealed class AdaptiveResearchService(
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            failures?.Report("PaperLedgerForResearch", ex, $"day={day:yyyy-MM-dd}");
             return null;
         }
     }

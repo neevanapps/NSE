@@ -24,6 +24,7 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
     public DbSet<AdaptiveCommentaryNotificationJobRow> CommentaryNotificationJobs => Set<AdaptiveCommentaryNotificationJobRow>();
     public DbSet<AdaptiveOptionsSupplementalRow> OptionsSupplemental => Set<AdaptiveOptionsSupplementalRow>();
     public DbSet<AdaptiveOptionStrikeBarRow> OptionStrikeBars => Set<AdaptiveOptionStrikeBarRow>();
+    public DbSet<AdaptiveBarCloseAtmRow> BarCloseAtm => Set<AdaptiveBarCloseAtmRow>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -132,6 +133,14 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
             e.ToTable("adaptive_futures_supplemental_bars");
             e.HasIndex(x => new { x.SessionId, x.BarSeq, x.MetricsVersion }).IsUnique();
             e.Property(x => x.MetricsVersion).HasMaxLength(64);
+            e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
+        });
+        modelBuilder.Entity<AdaptiveBarCloseAtmRow>(e =>
+        {
+            e.ToTable("adaptive_bar_close_atm");
+            e.HasIndex(x => new { x.SessionId, x.BarSeq, x.Version }).IsUnique();
+            e.Property(x => x.Version).HasMaxLength(32);
+            e.Property(x => x.UnavailableReason).HasMaxLength(256);
             e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
         });
         modelBuilder.Entity<AdaptiveBasisSupplementalRow>(e =>

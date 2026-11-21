@@ -101,7 +101,7 @@
         @* The current incomplete adaptive bar (quantity, progress, start, staleness) is presented once, in the sticky NIFTY LIVE QUOTE panel. Only the runtime recovery diagnostic stays here. *@
         <div class="adaptive-subtitle" data-testid="runtime-recovery">Runtime recovery: @RecoveryText</div>
         }
-        <MarketSummarySection View="_summary" ShowLowerUpper="!CaptureMode" />
+        <MarketSummarySection View="_summary" />
         <div class="adaptive-subtitle" data-testid="diagnostic-grids-banner">EXISTING DETAILED GRIDS – TEMPORARY DIAGNOSTICS</div>
         <GridSection Title="Futures — exact adaptive bars">
             @if (!ShowDiagnostic)
@@ -896,15 +896,21 @@
                 _fixed = view?.Fixed;
                 _research = view?.Model;
                 _day = view?.Day;
-                if (view?.Catalog is not null && (LatestCompletedCentre(view.Snapshot) ?? view.Model.SelectedStrike) is { } pinnedStrike && _snapshot is not null)
+                if (view?.Catalog is not null && _snapshot is not null)
                 {
-                    // Pinned capture: the ATM centre / expiry / tokens valid at the TARGET bar, bars through the target only.
-                    _summary = await WithVixAsync(await AdaptiveData.LoadMarketSummaryAsync(_snapshot.Session.Id, _snapshot.Futures.FirstOrDefault()?.Bar.BarSeq ?? 0, view.Catalog, pinnedStrike), _snapshot.Session.TradeDate, CancellationToken.None);
+                    // Pinned capture: the ATM at the CLOSE of the TARGET bar (never the manual selector, never a later bar), the frozen expiry / tokens, and bars through the target only.
+                    var target = _snapshot.Futures.FirstOrDefault()?.Bar.BarSeq ?? 0;
+                    var close = await AdaptiveData.LoadCloseAtmAsync(_snapshot.Session.Id, target);
+                    _summary = await WithVixAsync(await AdaptiveData.LoadMarketSummaryAsync(_snapshot.Session.Id, target, view.Catalog, close.Strike, default, close.Source, close.Reason), _snapshot.Session.TradeDate, CancellationToken.None);
                 }
                 if (CaptureSessionId is not null && _snapshot is null) throw new InvalidOperationException("Capture session is unavailable.");
                 _captureReady = true;
             }
-            catch (Exception ex) { _loadError = $"Pinned capture failed ({ex.GetType().Name})."; }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                Services.GetService<PollingFailureLogger>()?.Report("PinnedCapture", ex, $"captureSession={CaptureSessionId}, targetBar={CaptureBarSeq}");
+                _loadError = $"Pinned capture failed ({ex.GetType().Name}).";
+            }
             return;
         }
         AdaptiveData.Updated += OnAdaptiveUpdated;
@@ -1058,10 +1064,6 @@
         }
     }
 
-    /// <summary>ATM centre of the newest completed bar of the snapshot (bars are newest first); null when the bar has no centre.</summary>
-    static double? LatestCompletedCentre(AdaptiveObserverSnapshot snapshot) =>
-        snapshot.Options.FirstOrDefault() is { } latest ? (latest.Call?.CenterStrike ?? latest.Put?.CenterStrike) : null;
-
     async Task RefreshSummaryAsync(CancellationToken ct)
     {
         if (_snapshot is null)
@@ -1071,9 +1073,11 @@
         }
 
         var through = _snapshot.Futures.FirstOrDefault()?.Bar.BarSeq ?? 0;
-        // The three summary grids (Lower / ATM / Upper) are anchored on the ATM centre of the LATEST COMPLETED bar - never on the manual fixed-strike selector - and are rebuilt whenever that centre or the bar changes.
-        var strike = _catalog is not null ? LatestCompletedCentre(_snapshot) : null;
-        var key = $"{_snapshot.Session.Id}|{through}|{strike}";
+        // The three summary grids (ITM-shifted / ATM / OTM-shifted) are anchored on the ATM at the CLOSE of the LATEST COMPLETED bar (the causal close ATM, not the bar-start band centre) - never on the
+        // manual fixed-strike selector - and are rebuilt whenever that bar or its close ATM changes.
+        var close = _catalog is not null ? await AdaptiveData.LoadCloseAtmAsync(_snapshot.Session.Id, through, ct) : null;
+        var strike = close?.Strike;
+        var key = $"{_snapshot.Session.Id}|{through}|{strike}|{close?.Source}";
         if (_summary is not null && _summaryKey == key)
         {
             return;
@@ -1081,7 +1085,7 @@
 
         try
         {
-            _summary = await WithVixAsync(await AdaptiveData.LoadMarketSummaryAsync(_snapshot.Session.Id, through, _catalog, strike, ct), _snapshot.Session.TradeDate, ct);
+            _summary = await WithVixAsync(await AdaptiveData.LoadMarketSummaryAsync(_snapshot.Session.Id, through, _catalog, strike, ct, close?.Source, close?.Reason), _snapshot.Session.TradeDate, ct);
             _summaryKey = key;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -1157,7 +1161,11 @@
         {
             await _reloadGate.WaitAsync(_cts?.Token ?? CancellationToken.None);
             try { await LoadFixedAsync(_cts?.Token ?? CancellationToken.None); }
-            catch (Exception ex) when (ex is not OperationCanceledException) { _loadError = $"Fixed-strike read failed: {ex.Message}"; }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                Services.GetService<PollingFailureLogger>()?.Report("FixedStrikeReload", ex, $"session={_snapshot?.Session.Id}, strike={_sel.SelectedStrike}, autoFollow={_sel.AutoFollow}");
+                _loadError = $"Fixed-strike read failed: {ex.Message}";
+            }
             finally { _reloadGate.Release(); }
         }
         catch (OperationCanceledException) { return; }

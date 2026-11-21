@@ -202,7 +202,7 @@
         if (CaptureMode)
         {
             try { _pinned = await Services.GetRequiredService<AdaptiveQuoteAsOfService>().LoadAsync(CaptureSessionId, CaptureBarSeq); }
-            catch (Exception ex) { _pinned = PinnedQuoteSnapshot.Unavailable($"Pinned quote failed ({ex.GetType().Name})."); }
+            catch (Exception ex) when (ex is not OperationCanceledException) { Services.GetService<PollingFailureLogger>()?.Report("PinnedQuoteCapture", ex, $"captureSession={CaptureSessionId}, bar={CaptureBarSeq}"); _pinned = PinnedQuoteSnapshot.Unavailable($"Pinned quote failed ({ex.GetType().Name})."); }
             _captureReady = true;
             return;
         }

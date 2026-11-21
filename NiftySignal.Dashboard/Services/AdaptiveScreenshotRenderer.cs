@@ -20,11 +20,11 @@ public sealed class AdaptiveScreenshotRenderer(IOptions<AdaptiveScreenshotOption
 {
     public const string AuthenticationScheme = "AdaptiveCapture";
 
-    /// <summary>The stable identities of the primary research grids (data-grid attributes in AdaptiveObserverPanel), in the order they must appear: the Futures and TOTAL Market Summary grids, then the detailed
-    /// Futures grid, the two fixed-strike Options grids and the residual grid (five sections, six data tables, plus the residual table).</summary>
+    /// <summary>The stable identities of the primary research grids (data-grid attributes in AdaptiveObserverPanel), in the order they must appear: the Futures summary and the three TOTAL Market Summary grids (ITM-shifted, ATM, OTM-shifted), then the detailed
+    /// Futures grid, the two fixed-strike Options grids and the residual grid (five sections, eight data tables).</summary>
     public static readonly IReadOnlyList<RequiredCaptureGrid> RequiredGrids =
     [
-        new("summary-futures", false), new("summary-total", false),
+        new("summary-futures", false), new("summary-total-itm", false), new("summary-total", false), new("summary-total-otm", false),
         new("futures-compact", true), new("options-core-direction", true), new("options-context", true), new("residual-compact", false),
     ];
 

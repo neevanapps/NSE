@@ -428,6 +428,21 @@ public sealed class AdaptiveBasisSupplementalRow
     public required string Status { get; set; }
 }
 
+/// <summary>
+/// The causal ATM strike at a completed bar's CLOSE instant (close-atm-v1), one row per (session, bar, version). Strike null = unavailable at that close (UnavailableReason says why; nothing is substituted).
+/// Distinct from the bar's option-band CenterStrike, which is the ATM at the bar's START. Additive sidecar: insert-if-missing, verified on restart replay, never overwritten.
+/// </summary>
+public sealed class AdaptiveBarCloseAtmRow
+{
+    public long Id { get; set; }
+    public long SessionId { get; set; }
+    public int BarSeq { get; set; }
+    public required string Version { get; set; }
+    public double? AtmStrike { get; set; }
+    public double? Spot { get; set; }
+    public string? UnavailableReason { get; set; }
+}
+
 /// <summary>Sidecar projection of supplemental options observations per completed adaptive bar (08-Oct plan section 71; metrics contract options-supp-v2).</summary>
 public sealed class AdaptiveOptionsSupplementalRow
 {
@@ -551,6 +566,8 @@ public static class AdaptiveProjectionComponents
     public const string BasisSupplemental = "basis-supplemental";
     /// <summary>Per-strike option bars whose stored rows disagreed with the reconstructed values after a restart. One row per (session, version, bar); Detail lists the unverified tokens (see <see cref="UnverifiedStrikeBars"/>).</summary>
     public const string OptionStrikeBars = "option-strike-bars";
+    /// <summary>A stored close-ATM row that disagreed with the recomputed value after a restart: readers treat that bar's close ATM as unavailable.</summary>
+    public const string BarCloseAtm = "bar-close-atm";
 }
 
 /// <summary>

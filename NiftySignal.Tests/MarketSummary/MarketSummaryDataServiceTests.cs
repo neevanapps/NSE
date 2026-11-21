@@ -136,7 +136,7 @@ public class MarketSummaryDataServiceTests
     {
         var f = await SeedAsync(5);
         Assert.Equal("no frozen option universe for this session", (await Service(f).LoadMarketSummaryAsync(1, 5, null, 26_000)).UnavailableReason);
-        Assert.Equal("no centre strike selected", (await Service(f).LoadMarketSummaryAsync(1, 5, Catalog(), null)).UnavailableReason);
+        Assert.Equal("no close ATM for this bar", (await Service(f).LoadMarketSummaryAsync(1, 5, Catalog(), null)).UnavailableReason);
         Assert.Equal("no completed bar", (await Service(f).LoadMarketSummaryAsync(1, 0, Catalog(), 26_000)).UnavailableReason);
     }
 
@@ -198,5 +198,77 @@ public class MarketSummaryDataServiceTests
         Assert.NotEmpty(v.UpperBasket.Problems);
         Assert.All(v.Upper!.Rows.Take(3), r => Assert.NotEqual(CoverageStatus.Full, r.Coverage.Status));
         Assert.DoesNotContain(v.UpperBasket.Contracts, c => c.Token is { } t && (t.EndsWith("26300") || t.EndsWith("26350")));
+    }
+
+    // ------------------------------------------------------------------ the close ATM that anchors the three summaries
+
+    static async Task AddBandAsync(Factory f, int seq, double center, bool available = true)
+    {
+        await using var db = f.CreateDbContext();
+        db.OptionBandBars.Add(new() { SessionId = 1, BarSeq = seq, Side = OptionType.Call, CenterStrike = available ? center : 0, BandStrikes = "[]", BandAvailable = available, StartAvailableAtUtc = T0.AddMinutes(seq - 1), EndAvailableAtUtc = T0.AddMinutes(seq) });
+        await db.SaveChangesAsync();
+    }
+
+    [Fact]
+    public async Task CloseAtm_StoredRowWins_AndIsNeverTheBarStartBandCentre()
+    {
+        var f = await SeedAsync(120);
+        await AddBandAsync(f, 120, 26_000);                                           // the START-of-bar ATM of bar 120
+        await using (var db = f.CreateDbContext()) { db.BarCloseAtm.Add(new() { SessionId = 1, BarSeq = 120, Version = BarCloseAtm.Version, AtmStrike = 26_050, Spot = 26_049 }); await db.SaveChangesAsync(); }
+        var close = await Service(f).LoadCloseAtmAsync(1, 120);
+        Assert.Equal((26_050d, "stored"), (close.Strike, close.Source));
+        var v = await Service(f).LoadMarketSummaryAsync(1, 120, Catalog(), close.Strike, default, close.Source, close.Reason);
+        Assert.Equal(26_050d, v.CloseAtmStrike);
+        Assert.Equal(new[] { "CE25900", "CE25950", "CE26000", "CE26050", "CE26100" }, v.LowerBasket!.Contracts.Where(c => c.IsCall).Select(c => c.Token!).OrderBy(x => x));   // ITM-shifted = close ATM - 1 step
+        Assert.Equal(new[] { "CE25950", "CE26000", "CE26050", "CE26100", "CE26150" }, v.Basket!.Contracts.Where(c => c.IsCall).Select(c => c.Token!).OrderBy(x => x));
+        Assert.Equal(new[] { "CE26000", "CE26050", "CE26100", "CE26150", "CE26200" }, v.UpperBasket!.Contracts.Where(c => c.IsCall).Select(c => c.Token!).OrderBy(x => x));
+    }
+
+    [Fact]
+    public async Task CloseAtm_KnownAtmWithNoBand_IsStillKnown_AndAStoredUnavailableIsNeverBorrowedFromElsewhere()
+    {
+        var f = await SeedAsync(120);
+        await using (var db = f.CreateDbContext())
+        {
+            db.BarCloseAtm.Add(new() { SessionId = 1, BarSeq = 119, Version = BarCloseAtm.Version, AtmStrike = 25_750, Spot = 25_751 });    // ladder edge: ATM known, ATM±2 band null
+            db.BarCloseAtm.Add(new() { SessionId = 1, BarSeq = 120, Version = BarCloseAtm.Version, AtmStrike = null, UnavailableReason = "no fresh spot" });
+            await db.SaveChangesAsync();
+        }
+
+        await AddBandAsync(f, 120, 26_000);                                           // a band exists, but must NOT stand in for the unavailable close ATM of bar 119/120
+        Assert.Equal((25_750d, "stored"), (await Service(f).LoadCloseAtmAsync(1, 119) is var a ? (a.Strike, a.Source) : default));
+        var unavailable = await Service(f).LoadCloseAtmAsync(1, 120);
+        Assert.Equal((null, "stored-unavailable", "no fresh spot"), (unavailable.Strike, unavailable.Source, unavailable.Reason));
+        var v = await Service(f).LoadMarketSummaryAsync(1, 120, Catalog(), unavailable.Strike, default, unavailable.Source, unavailable.Reason);
+        Assert.Equal("no fresh spot", v.UnavailableReason);                            // the section says why instead of guessing a centre
+    }
+
+    [Fact]
+    public async Task CloseAtm_LegacyBarWithoutARow_IsTakenFromTheNextBarsBand_OrIsUnavailable()
+    {
+        var f = await SeedAsync(120);
+        await AddBandAsync(f, 100, 25_900);                                           // bar 99's close ATM = bar 100's start-band centre (same instant, same rule)
+        var viaNext = await Service(f).LoadCloseAtmAsync(1, 99);
+        Assert.Equal((25_900d, "next-bar-start"), (viaNext.Strike, viaNext.Source));
+        await AddBandAsync(f, 111, 0, available: false);                              // the next bar had no band: nothing to derive
+        var none = await Service(f).LoadCloseAtmAsync(1, 110);
+        Assert.Equal((null, "none"), (none.Strike, none.Source));
+        var latest = await Service(f).LoadCloseAtmAsync(1, 120);                      // the newest bar has no next bar yet and no row
+        Assert.Null(latest.Strike);
+    }
+
+    [Fact]
+    public async Task CloseAtm_AMarkedUnverifiedRow_IsWithheld()
+    {
+        var f = await SeedAsync(120);
+        await using (var db = f.CreateDbContext())
+        {
+            db.BarCloseAtm.Add(new() { SessionId = 1, BarSeq = 120, Version = BarCloseAtm.Version, AtmStrike = 26_000 });
+            db.ProjectionHealth.Add(new() { SessionId = 1, Component = AdaptiveProjectionComponents.BarCloseAtm, Version = BarCloseAtm.Version, BarSeq = 120, Detail = "x", DetectedAtUtc = T0 });
+            await db.SaveChangesAsync();
+        }
+
+        var close = await Service(f).LoadCloseAtmAsync(1, 120);
+        Assert.Equal((null, "unverified"), (close.Strike, close.Source));
     }
 }

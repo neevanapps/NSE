@@ -23,6 +23,11 @@
             }
         </div>
 
+        @if (View.CloseAtmStrike is { } closeAtm)
+        {
+            <div class="adaptive-subtitle" data-testid="summary-close-atm">ATM at bar close <span data-testid="summary-close-atm-strike">@closeAtm.ToString("0.##")</span> <span class="text-faint">@CloseAtmSourceText(View.CloseAtmSource)</span></div>
+        }
+
         @if (View.Unverified.Count > 0)
         {
             <div class="adaptive-alert" data-testid="market-summary-unverified" title="Stored per-strike rows disagreed with the values reconstructed after a restart; they are withheld, so the affected windows show reduced coverage.">UNVERIFIED per-strike data withheld (not shown as observations): @string.Join(", ", View.Unverified.Take(12))@(View.Unverified.Count > 12 ? $" … +{View.Unverified.Count - 12} more" : "")</div>
@@ -65,14 +70,15 @@
         @if (View.Grids.FirstOrDefault(x => x.Kind == GridKind.Total) is { } total)
         {
             <div class="total-grids" data-testid="summary-total-grids">
-                <div class="total-grid-cell">@TotalGrid(total, basket, "TOTAL SUMMARY", "summary-total", "summary-total-title")</div>
-                @if (ShowLowerUpper && View.Lower is { } lower && View.LowerBasket is { } lowerBasket)
+                @* exactly three top option summaries, always in this order: ITM-shifted (close ATM - 1 step), ATM, OTM-shifted (close ATM + 1 step); CE and PE share each basket's strikes *@
+                @if (View.Lower is { } itm && View.LowerBasket is { } itmBasket)
                 {
-                    <div class="total-grid-cell">@TotalGrid(lower, lowerBasket, "TOTAL SUMMARY - LOWER (ATM-1 step)", "summary-total-lower", "summary-total-lower-title")</div>
+                    <div class="total-grid-cell">@TotalGrid(itm, itmBasket, "TOTAL SUMMARY - ITM-SHIFTED (ATM-1 step)", "summary-total-itm", "summary-total-itm-title")</div>
                 }
-                @if (ShowLowerUpper && View.Upper is { } upper && View.UpperBasket is { } upperBasket)
+                <div class="total-grid-cell">@TotalGrid(total, basket, "TOTAL SUMMARY - ATM", "summary-total", "summary-total-title")</div>
+                @if (View.Upper is { } otm && View.UpperBasket is { } otmBasket)
                 {
-                    <div class="total-grid-cell">@TotalGrid(upper, upperBasket, "TOTAL SUMMARY - UPPER (ATM+1 step)", "summary-total-upper", "summary-total-upper-title")</div>
+                    <div class="total-grid-cell">@TotalGrid(otm, otmBasket, "TOTAL SUMMARY - OTM-SHIFTED (ATM+1 step)", "summary-total-otm", "summary-total-otm-title")</div>
                 }
             </div>
         }
@@ -81,9 +87,6 @@
 
 @code {
     [Parameter] public MarketSummaryView? View { get; set; }
-
-    /// <summary>Lower / Upper TOTAL grids beside the ATM one. Off for the Telegram capture, which keeps its six-grid layout (the ATM TOTAL only).</summary>
-    [Parameter] public bool ShowLowerUpper { get; set; } = true;
 
     RenderFragment TotalGrid(GridSummary grid, Basket basket, string title, string gridId, string testId) => @<text>
     <div class="adaptive-subtitle" data-testid="@testId">@title <span class="text-faint">@Describe(grid, basket)</span></div>
@@ -130,6 +133,13 @@
 
     </text>;
 
+
+    static string CloseAtmSourceText(string? source) => source switch
+    {
+        "stored" => "(recorded at the bar's close)",
+        "next-bar-start" => "(older bar: taken from the next bar's band, selected at this bar's close instant)",
+        _ => "",
+    };
 
     static string Sc(SummaryMetric m) => RatioFormat.SignedClass(m.Raw);
 

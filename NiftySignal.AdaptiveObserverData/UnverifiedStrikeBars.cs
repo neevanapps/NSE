@@ -13,20 +13,42 @@ public sealed class UnverifiedStrikeBars
 {
     public const string AllMarker = "*";
     const int MaxDetail = 512;
-    readonly Dictionary<int, HashSet<string>?> _byBar;
+    /// <summary>bar -> version -> tokens (null = every strike of the bar for that metrics version).</summary>
+    readonly Dictionary<int, Dictionary<string, HashSet<string>?>> _byBar;
 
-    UnverifiedStrikeBars(Dictionary<int, HashSet<string>?> byBar, bool tablePending) { _byBar = byBar; TablePending = tablePending; }
+    UnverifiedStrikeBars(Dictionary<int, Dictionary<string, HashSet<string>?>> byBar, bool tablePending) { _byBar = byBar; TablePending = tablePending; }
 
     public static UnverifiedStrikeBars None { get; } = new([], false);
 
-    /// <summary>The marker table could not be read (migration pending): the readers cannot vouch for verification and say so instead of failing.</summary>
+    /// <summary>The marker table could not be read: verification cannot be vouched for, so FAIL CLOSED - every per-strike row is reported unverified (withheld), never shown as a normal observation.</summary>
     public bool TablePending { get; }
 
-    public bool Any => _byBar.Count > 0;
+    public bool Any => TablePending || _byBar.Count > 0;
 
     public IReadOnlyCollection<int> Bars => _byBar.Keys;
 
-    public bool IsUnverified(int barSeq, string token) => _byBar.TryGetValue(barSeq, out var t) && (t is null || t.Contains(token));
+    /// <summary>Union of two token lists for a marker; null (whole bar) absorbs.</summary>
+    public static HashSet<string>? Union(HashSet<string>? a, IReadOnlyCollection<string>? b)
+    {
+        if (a is null || b is null || b.Count == 0) return null;
+        var u = new HashSet<string>(a, StringComparer.Ordinal);
+        u.UnionWith(b);
+        return u;
+    }
+
+    /// <summary>Version-aware: a marker for strike-metrics version V withholds only rows of version V (<paramref name="version"/> null = any version, conservative).</summary>
+    public bool IsUnverified(int barSeq, string token, string? version = null)
+    {
+        if (TablePending) return true;
+        if (!_byBar.TryGetValue(barSeq, out var byVersion)) return false;
+        foreach (var (v, tokens) in byVersion)
+        {
+            if (version is not null && !string.Equals(v, version, StringComparison.Ordinal)) continue;
+            if (tokens is null || tokens.Contains(token)) return true;
+        }
+
+        return false;
+    }
 
     public static string FormatDetail(IReadOnlyCollection<string> tokens, string difference)
     {
@@ -56,13 +78,14 @@ public sealed class UnverifiedStrikeBars
             var component = AdaptiveProjectionComponents.OptionStrikeBars;
             var rows = await db.ProjectionHealth.AsNoTracking()
                 .Where(x => x.SessionId == sessionId && x.Component == component && x.BarSeq <= throughBarSeq)
-                .Select(x => new { x.BarSeq, x.Detail }).ToListAsync(ct);
-            var map = new Dictionary<int, HashSet<string>?>();
+                .Select(x => new { x.BarSeq, x.Version, x.Detail }).ToListAsync(ct);
+            var map = new Dictionary<int, Dictionary<string, HashSet<string>?>>();
             foreach (var r in rows)
             {
                 var tokens = ParseTokens(r.Detail);
-                if (!map.TryGetValue(r.BarSeq, out var existing)) map[r.BarSeq] = tokens;
-                else if (existing is not null) { if (tokens is null) map[r.BarSeq] = null; else existing.UnionWith(tokens); }
+                if (!map.TryGetValue(r.BarSeq, out var byVersion)) map[r.BarSeq] = byVersion = new(StringComparer.Ordinal);
+                if (!byVersion.TryGetValue(r.Version, out var existing)) byVersion[r.Version] = tokens;
+                else if (existing is not null) { if (tokens is null) byVersion[r.Version] = null; else existing.UnionWith(tokens); }
             }
 
             return new(map, false);
@@ -73,5 +96,5 @@ public sealed class UnverifiedStrikeBars
         }
     }
 
-    public IEnumerable<AdaptiveOptionStrikeBarRow> Exclude(IEnumerable<AdaptiveOptionStrikeBarRow> rows) => Any ? rows.Where(r => !IsUnverified(r.BarSeq, r.Token)) : rows;
+    public IEnumerable<AdaptiveOptionStrikeBarRow> Exclude(IEnumerable<AdaptiveOptionStrikeBarRow> rows) => Any ? rows.Where(r => !IsUnverified(r.BarSeq, r.Token, r.MetricsVersion)) : rows;
 }

@@ -65,24 +65,33 @@ public class MarketSummarySectionRenderTests
     public async Task Render_LowerAtmUpper_ThreeLabelledTotalGrids_EachWithFiveRows_AndTheirOwnStrikes()
     {
         var html = await RenderAsync(ViewWithLowerUpper(120));
-        foreach (var g in new[] { "summary-total", "summary-total-lower", "summary-total-upper" }) Assert.Equal(5, BodyRows(html, g));
-        Assert.Contains("TOTAL SUMMARY - LOWER (ATM-1 step)", html);
-        Assert.Contains("TOTAL SUMMARY - UPPER (ATM+1 step)", html);
-        Assert.Equal(new[] { "summary-futures", "summary-total", "summary-total-lower", "summary-total-upper" }, Regex.Matches(html, "data-grid=\"([^\"]+)\"").Select(m => m.Groups[1].Value).ToArray());
-        var lower = Regex.Match(html, "data-testid=\"summary-total-lower-title\".*?</div>", RegexOptions.Singleline).Value;
+        foreach (var g in new[] { "summary-total", "summary-total-itm", "summary-total-otm" }) Assert.Equal(5, BodyRows(html, g));
+        Assert.Contains("TOTAL SUMMARY - ITM-SHIFTED (ATM-1 step)", html);
+        Assert.Contains("TOTAL SUMMARY - ATM", html);
+        Assert.Contains("TOTAL SUMMARY - OTM-SHIFTED (ATM+1 step)", html);
+        Assert.DoesNotContain("LOWER", html);
+        Assert.DoesNotContain("UPPER", html);
+        Assert.Equal(new[] { "summary-futures", "summary-total-itm", "summary-total", "summary-total-otm" }, Regex.Matches(html, "data-grid=\"([^\"]+)\"").Select(m => m.Groups[1].Value).ToArray());
+        var lower = Regex.Match(html, "data-testid=\"summary-total-itm-title\".*?</div>", RegexOptions.Singleline).Value;
         Assert.Contains("CE 25850", lower); Assert.Contains("PE 25850", lower); Assert.DoesNotContain("26100", lower);
-        var upper = Regex.Match(html, "data-testid=\"summary-total-upper-title\".*?</div>", RegexOptions.Singleline).Value;
+        var upper = Regex.Match(html, "data-testid=\"summary-total-otm-title\".*?</div>", RegexOptions.Singleline).Value;
         Assert.Contains("CE 26150", upper); Assert.Contains("PE 26150", upper); Assert.DoesNotContain("25900", upper);
     }
 
     [Fact]
-    public async Task Render_WithoutLowerUpper_OrInCaptureMode_KeepsTheSingleTotalGrid()
+    public async Task Render_ForAViewWithoutShiftedBaskets_ShowsOnlyTheAtmGrid_NeverAGuess()
     {
         Assert.Equal(["summary-futures", "summary-total"], Regex.Matches(await RenderAsync(View(120)), "data-grid=\"([^\"]+)\"").Select(m => m.Groups[1].Value).ToArray());
-        var services = new ServiceCollection().AddLogging().BuildServiceProvider();
-        await using var renderer = new HtmlRenderer(services, services.GetRequiredService<ILoggerFactory>());
-        var capture = await renderer.Dispatcher.InvokeAsync(async () => (await renderer.RenderComponentAsync<MarketSummarySection>(ParameterView.FromDictionary(new Dictionary<string, object?> { ["View"] = ViewWithLowerUpper(120), ["ShowLowerUpper"] = false }))).ToHtmlString());
-        Assert.Equal(["summary-futures", "summary-total"], Regex.Matches(capture, "data-grid=\"([^\"]+)\"").Select(m => m.Groups[1].Value).ToArray());
+    }
+
+    [Fact]
+    public async Task Render_ShowsTheCloseAtmAndItsSource()
+    {
+        var v = ViewWithLowerUpper(120) with { };
+        var html = await RenderAsync(new MarketSummaryView(v.EndBarSeq, v.Basket, v.Futures, v.Grids, null, v.Instants) { Lower = v.Lower, LowerBasket = v.LowerBasket, Upper = v.Upper, UpperBasket = v.UpperBasket, CloseAtmStrike = 26_000, CloseAtmSource = "stored" });
+        Assert.Contains("ATM at bar close", html);
+        Assert.Contains("26000", Regex.Match(html, "data-testid=\"summary-close-atm-strike\".*?</span>", RegexOptions.Singleline).Value);
+        Assert.Contains("recorded at the bar", html);
     }
 
     static int BodyRows(string html, string grid)

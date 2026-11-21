@@ -80,7 +80,7 @@ public static class FixedStrikeProjection
         var withheld = new HashSet<(int, OptionType)>();
         if (unverified is { Any: true })
         {
-            foreach (var kv in byBar.Where(kv => unverified.IsUnverified(kv.Key.BarSeq, kv.Value.Token)).ToList())
+            foreach (var kv in byBar.Where(kv => unverified.IsUnverified(kv.Key.BarSeq, kv.Value.Token, kv.Value.MetricsVersion)).ToList())
             {
                 byBar.Remove(kv.Key);
                 withheld.Add(kv.Key);

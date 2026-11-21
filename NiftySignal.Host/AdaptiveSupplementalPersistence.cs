@@ -226,9 +226,11 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
             Interlocked.Increment(ref _mismatches);
             logger.LogError("Adaptive per-strike projection mismatch (rows left untouched): session={SessionId}, bar={BarSeq}, {Difference}", sessionId, package.FutureBar.BarSeq, difference);
             // A4: durably mark the affected strikes of this bar UNVERIFIED (reuses the known-invalid ledger; no schema change). A count-only mismatch with no differing token marks the whole bar.
-            // Recording a marker is best-effort for this display sidecar: the returned outcome is unchanged.
-            await RecordInvalidAsync(db, sessionId, AdaptiveProjectionComponents.OptionStrikeBars, version, package.FutureBar.BarSeq, UnverifiedStrikeBars.FormatDetail(badTokens, difference), ct);
-            return SupplementalOutcome.Mismatch;
+            // FAIL CLOSED: Mismatch is reported only once the marker durably covers every affected token. If it cannot be written the outcome is Failed (integrity unknown), so the caller
+            // retries instead of treating the bar as handled; the original strike rows are never touched either way.
+            return await RecordUnverifiedStrikesAsync(db, sessionId, version, package.FutureBar.BarSeq, badTokens, difference, ct)
+                ? SupplementalOutcome.Mismatch
+                : SupplementalOutcome.Failed;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -256,6 +258,69 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
             return SupplementalOutcome.Failed;
         }
     }
+
+    /// <summary>
+    /// Close-ATM sidecar (close-atm-v1): inserts the bar's close ATM when missing, otherwise verifies the stored row against the recomputed one and leaves it untouched. A mismatch is durably marked
+    /// known-invalid (component bar-close-atm) so readers show that bar's close ATM as unavailable; if the marker cannot be written the outcome is Failed (integrity unknown, retried), never Mismatch.
+    /// </summary>
+    public async Task<SupplementalOutcome> PersistOrVerifyCloseAtmAsync(AdaptiveObserverDbContext db, long sessionId, AdaptiveCompletedBarPackage package, CancellationToken ct)
+    {
+        if (package.CloseAtm is not { } atm)
+        {
+            return SupplementalOutcome.Skipped;
+        }
+
+        var barSeq = package.FutureBar.BarSeq;
+        var expected = new AdaptiveBarCloseAtmRow
+        {
+            SessionId = sessionId, BarSeq = barSeq, Version = BarCloseAtm.Version, AtmStrike = atm.Strike, Spot = atm.Spot,
+            UnavailableReason = atm.UnavailableReason is { Length: > 256 } r ? r[..256] : atm.UnavailableReason,
+        };
+        try
+        {
+            var stored = await db.BarCloseAtm.AsNoTracking().SingleOrDefaultAsync(x => x.SessionId == sessionId && x.BarSeq == barSeq && x.Version == BarCloseAtm.Version, ct);
+            if (stored is null)
+            {
+                db.BarCloseAtm.Add(expected);
+                await db.SaveChangesAsync(ct);
+                return SupplementalOutcome.Inserted;
+            }
+
+            var same = stored.AtmStrike == expected.AtmStrike && NullableEqual(stored.Spot, expected.Spot) && string.Equals(stored.UnavailableReason, expected.UnavailableReason, StringComparison.Ordinal);
+            if (same)
+            {
+                return SupplementalOutcome.Verified;
+            }
+
+            Interlocked.Increment(ref _mismatches);
+            var difference = $"close ATM stored {stored.AtmStrike?.ToString() ?? "null"} vs recomputed {expected.AtmStrike?.ToString() ?? "null"}";
+            logger.LogError("Adaptive close-ATM mismatch (row left untouched): session={SessionId}, bar={BarSeq}, {Difference}", sessionId, barSeq, difference);
+            return await RecordInvalidAsync(db, sessionId, AdaptiveProjectionComponents.BarCloseAtm, BarCloseAtm.Version, barSeq, difference, ct)
+                ? SupplementalOutcome.Mismatch
+                : SupplementalOutcome.Failed;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                if (db.Entry(expected).State != EntityState.Detached) db.Entry(expected).State = EntityState.Detached;
+            }
+            catch (Exception)
+            {
+                // The context itself is unusable.
+            }
+
+            Interlocked.Increment(ref _failures);
+            logger.LogError(ex, "Adaptive close-ATM write failed (core observer unaffected): session={SessionId}, bar={BarSeq}", sessionId, barSeq);
+            return SupplementalOutcome.Failed;
+        }
+    }
+
+    static bool NullableEqual(double? a, double? b) => a is null || b is null ? a is null && b is null : Math.Abs(a.Value - b.Value) <= DoubleTolerance;
 
     public static AdaptiveOptionStrikeBarRow MapStrike(long sessionId, int barSeq, DateTimeOffset endUtc, OptionStrikeBarMetrics m) => new()
     {
@@ -384,6 +449,67 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
     }
 
     /// <summary>
+    /// A4 marker write for per-strike bars: inserts the bar's marker, or UNIONS the newly affected tokens into an existing one (a later mismatch with different tokens must not be lost;
+    /// a whole-bar marker absorbs everything). One SaveChanges = one atomic row change; a concurrent-writer conflict is retried. Returns true only when the durable marker covers every
+    /// token in <paramref name="badTokens"/> (an empty list = whole bar).
+    /// </summary>
+    internal async Task<bool> RecordUnverifiedStrikesAsync(AdaptiveObserverDbContext db, long sessionId, string version, int barSeq, IReadOnlyCollection<string> badTokens, string difference, CancellationToken ct)
+    {
+        const string component = AdaptiveProjectionComponents.OptionStrikeBars;
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            AdaptiveProjectionHealthRow? row = null;
+            var added = false;
+            try
+            {
+                row = await db.ProjectionHealth.SingleOrDefaultAsync(x => x.SessionId == sessionId && x.Component == component && x.Version == version && x.BarSeq == barSeq, ct);
+                if (row is null)
+                {
+                    row = new AdaptiveProjectionHealthRow { SessionId = sessionId, Component = component, Version = version, BarSeq = barSeq, Detail = UnverifiedStrikeBars.FormatDetail(badTokens, difference), DetectedAtUtc = DateTimeOffset.UtcNow };
+                    db.ProjectionHealth.Add(row);
+                    added = true;
+                }
+                else
+                {
+                    var existing = UnverifiedStrikeBars.ParseTokens(row.Detail);
+                    if (existing is null) return true;                                                   // already the whole bar
+                    var union = UnverifiedStrikeBars.Union(existing, badTokens);
+                    if (union is not null && union.SetEquals(existing)) return true;                      // nothing new
+                    row.Detail = UnverifiedStrikeBars.FormatDetail(union ?? [], difference);
+                    row.DetectedAtUtc = DateTimeOffset.UtcNow;
+                }
+
+                await db.SaveChangesAsync(ct);
+                return true;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                try
+                {
+                    if (row is not null && db.Entry(row).State != EntityState.Detached) db.Entry(row).State = EntityState.Detached;   // only the marker: the context is shared with core persistence
+                }
+                catch (Exception)
+                {
+                    // The context itself is unusable.
+                }
+
+                if (attempt == 2 || (!added && ex is not DbUpdateException))
+                {
+                    Interlocked.Increment(ref _failures);
+                    logger.LogError(ex, "Could not record UNVERIFIED strike marker: session={SessionId}, bar={BarSeq}, tokens={Tokens}", sessionId, barSeq, badTokens.Count == 0 ? "*" : string.Join(',', badTokens));
+                    return false;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// Durably marks a bar's sidecar as known-invalid (insert-if-missing; the sidecar row itself is never touched). A failure to write the
     /// marker is logged and swallowed: the core observer must never be affected by sidecar health bookkeeping.
     /// </summary>
@@ -436,8 +562,10 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
     /// </summary>
     public async Task<bool> PersistAndVerifyAsync(AdaptiveObserverDbContext db, AdaptiveSessionStateRow session, AdaptiveCompletedBarPackage package, CancellationToken ct)
     {
-        // The per-strike projection is a display sidecar: its outcome NEVER changes the verification result the paper path consumess.
-        await PersistOrVerifyStrikesAsync(db, session.Id, package, ct);
+        // The per-strike projection is a display sidecar: its outcome never changes the verification result the paper path consumes (a missing strike table must not halt paper trading).
+        // But a Failed outcome (write/verify failed, or a mismatch whose UNVERIFIED marker could not be written) is NOT dropped: the bar is queued here and retried on every later call
+        // (and on restart, when recovery replays every bar through this method), so a mismatched row is marked as soon as the marker can be written.
+        await RetryStrikesAsync(db, session.Id, package, ct);
         for (var attempt = 0; attempt < 2; attempt++)
         {
             var futures = await PersistOrVerifyFuturesAsync(db, session.Id, package, ct);
@@ -447,6 +575,52 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
         }
 
         return false;
+    }
+
+    readonly Dictionary<(long Session, int Bar), AdaptiveCompletedBarPackage> _strikeRetry = new();
+    const int MaxStrikeRetry = 200;
+
+    /// <summary>Number of bars whose per-strike integrity is still unestablished (queued for retry).</summary>
+    public int PendingStrikeRetryCount { get { lock (_strikeRetry) return _strikeRetry.Count; } }
+
+    /// <summary>Per-strike bars and the close ATM: both are display sidecars (their failure never gates the paper path) and both are retried through the same queue.</summary>
+    async Task<SupplementalOutcome> PersistOrVerifyDisplaySidecarsAsync(AdaptiveObserverDbContext db, long sessionId, AdaptiveCompletedBarPackage package, CancellationToken ct)
+    {
+        var strikes = await PersistOrVerifyStrikesAsync(db, sessionId, package, ct);
+        var closeAtm = await PersistOrVerifyCloseAtmAsync(db, sessionId, package, ct);
+        return strikes == SupplementalOutcome.Failed || closeAtm == SupplementalOutcome.Failed ? SupplementalOutcome.Failed : SupplementalOutcome.Verified;
+    }
+
+    async Task RetryStrikesAsync(AdaptiveObserverDbContext db, long sessionId, AdaptiveCompletedBarPackage package, CancellationToken ct)
+    {
+        var key = (sessionId, package.FutureBar.BarSeq);
+        AdaptiveCompletedBarPackage[] earlier;
+        // A bounded number of the oldest queued bars is retried per call, so a persistent failure (e.g. a table not migrated yet) cannot multiply into a retry storm every bar.
+        lock (_strikeRetry) earlier = _strikeRetry.Where(x => x.Key.Session == sessionId && x.Key.Bar != key.BarSeq).OrderBy(x => x.Key.Bar).Select(x => x.Value).Take(3).ToArray();
+        foreach (var e in earlier)
+        {
+            if (await PersistOrVerifyDisplaySidecarsAsync(db, sessionId, e, ct) != SupplementalOutcome.Failed)
+                lock (_strikeRetry) _strikeRetry.Remove((sessionId, e.FutureBar.BarSeq));
+        }
+
+        var outcome = await PersistOrVerifyDisplaySidecarsAsync(db, sessionId, package, ct);
+        lock (_strikeRetry)
+        {
+            if (outcome == SupplementalOutcome.Failed)
+            {
+                _strikeRetry[key] = package;
+                while (_strikeRetry.Count > MaxStrikeRetry)
+                {
+                    var oldest = _strikeRetry.Keys.OrderBy(k => k.Bar).First();
+                    _strikeRetry.Remove(oldest);
+                    logger.LogError("Per-strike retry queue overflow: dropped bar {BarSeq} of session {SessionId} (it will be re-verified by restart recovery)", oldest.Bar, oldest.Session);
+                }
+            }
+            else
+            {
+                _strikeRetry.Remove(key);
+            }
+        }
     }
 
     public static AdaptiveOptionsSupplementalRow MapOptions(long sessionId, int barSeq, OptionsSupplementalBar b, DateTimeOffset observationStartUtc) => new()

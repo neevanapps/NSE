@@ -825,7 +825,7 @@ public sealed class AdaptiveCompactGridTests
         Assert.Equal("11 bars", RowsOf(at11, "options-context").Single(r => r[0] == "DAY AVG")[1]);
         Assert.Equal("11 bars", RowsOf(at11, "residual-compact").Single(r => r[0] == "DAY AVG")[1]);
         Assert.Equal(4, System.Text.RegularExpressions.Regex.Matches(at11, "<table(?![^>]*data-grid=\"summary-)[ >]").Count);     // the four existing detailed grids are unchanged
-        Assert.Equal(2, System.Text.RegularExpressions.Regex.Matches(at11, "<table[^>]*data-grid=\"summary-").Count);                // plus the two Market Summary grids (Futures and the compact TOTAL)
+        Assert.Equal(4, System.Text.RegularExpressions.Regex.Matches(at11, "<table[^>]*data-grid=\"summary-").Count);                // plus the four Market Summary grids (Futures and the three compact TOTALs)
         Assert.Contains("data-testid=\"futures-avg\"", at11);
         Assert.Contains("data-testid=\"futures-day-avg\"", at11);
         Assert.Contains("data-testid=\"options-core-day-avg\"", at11);
@@ -920,6 +920,7 @@ public sealed class AdaptiveCompactGridTests
         var session = await db.Sessions.SingleAsync();
         session.OptionUniverseJson = OptionJson(); session.WeeklyOptionExpiry = Day.AddDays(6);
         foreach (var band in await db.OptionBandBars.Where(x => x.BarSeq == 12).ToListAsync()) band.CenterStrike = 25050;          // the center moves on bar 12
+        foreach (var seq in new[] { 11, 12 }) db.BarCloseAtm.Add(new() { SessionId = 1, BarSeq = seq, Version = NiftySignal.AdaptiveObserver.BarCloseAtm.Version, AtmStrike = 25050, Spot = 25049 });
         foreach (var seq in new[] { 11, 12 })
             foreach (var (side, token, strike) in new[] { (OptionType.Call, "CE25000", 25000d), (OptionType.Put, "PE25000", 25000d), (OptionType.Call, "CE25050", 25050d) })
                 db.OptionStrikeBars.Add(new()
@@ -940,6 +941,41 @@ public sealed class AdaptiveCompactGridTests
         db.CommentaryEvents.AddRange(Ev(10, TimeSpan.FromMinutes(10), 1), Ev(11, TimeSpan.FromMinutes(11), 2), Ev(11, TimeSpan.FromMinutes(11) + TimeSpan.FromSeconds(5), 3), Ev(12, TimeSpan.FromMinutes(12), 4));
         await db.SaveChangesAsync();
         return factory;
+    }
+
+    [Fact]
+    public async Task Capture_ThreeSummaries_AreAnchoredOnTheCloseAtmOfTheTargetBar_NotTheBarStartBandCentre_NorAnyLaterBar()
+    {
+        var factory = await SeedResearchAsync();                                        // bar 12: START band centre 25050, close ATM row 25050
+        await using (var db = factory.CreateDbContext())
+        {
+            var close = await db.BarCloseAtm.SingleAsync(x => x.BarSeq == 12);
+            close.AtmStrike = 25000;                                                    // the ATM at bar 12's CLOSE differs from its start-of-bar band centre
+            db.BarCloseAtm.Add(new() { SessionId = 1, BarSeq = 13, Version = NiftySignal.AdaptiveObserver.BarCloseAtm.Version, AtmStrike = 25100 });   // a LATER bar must never leak in
+            await db.SaveChangesAsync();
+        }
+
+        var html = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new() { ["CaptureMode"] = true, ["CaptureSessionId"] = 1L, ["CaptureBarSeq"] = 12 });
+        var shown = System.Text.RegularExpressions.Regex.Match(html, "data-testid=\"summary-close-atm-strike\"[^>]*>([^<]*)<");
+        Assert.True(shown.Success, "the close ATM line did not render; summary markers: " + string.Join("|", System.Text.RegularExpressions.Regex.Matches(html, "data-testid=\"(summary[^\"]*)\"").Select(m => m.Groups[1].Value)) + " / " + (html.Contains("Market Summary unavailable") ? "unavailable" : "?"));
+        Assert.Equal("25000", shown.Groups[1].Value);
+        foreach (var grid in new[] { "summary-total-itm", "summary-total", "summary-total-otm" })
+            Assert.Single(System.Text.RegularExpressions.Regex.Matches(html, "<table[^>]*data-grid=\"" + grid + "\""));
+    }
+
+    [Fact]
+    public async Task Capture_WithoutAnyCloseAtm_ShowsNoSummaryGrids_InsteadOfGuessingFromTheSelectorOrTheBandStart()
+    {
+        var factory = await SeedResearchAsync();
+        await using (var db = factory.CreateDbContext())
+        {
+            db.BarCloseAtm.RemoveRange(db.BarCloseAtm);
+            await db.SaveChangesAsync();
+        }
+
+        var html = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new() { ["CaptureMode"] = true, ["CaptureSessionId"] = 1L, ["CaptureBarSeq"] = 12 });
+        Assert.DoesNotContain("data-grid=\"summary-total\"", html);                    // bar 12 has no row and no bar 13 band: unavailable, never the selector's strike
+        Assert.DoesNotContain("data-grid=\"summary-total-itm\"", html);
     }
 
     [Fact]
@@ -996,11 +1032,11 @@ public sealed class AdaptiveCompactGridTests
         foreach (var testId in AdaptiveScreenshotRenderer.RequiredBlocks)
             Assert.Single(System.Text.RegularExpressions.Regex.Matches(html, "data-testid=\"" + testId + "\""));
         Assert.Equal(4, System.Text.RegularExpressions.Regex.Matches(html, "<table(?![^>]*data-grid=\"summary-)[ >]").Count);          // futures, core, context, residual: no diagnostic table slipped in
-        Assert.Equal(2, System.Text.RegularExpressions.Regex.Matches(html, "<table[^>]*data-grid=\"summary-").Count);                    // futures summary + the one compact TOTAL summary
+        Assert.Equal(4, System.Text.RegularExpressions.Regex.Matches(html, "<table[^>]*data-grid=\"summary-").Count);                    // futures summary + the three compact TOTAL summaries (ITM-shifted, ATM, OTM-shifted)
         Assert.Contains("NIFTY RESEARCH SNAPSHOT", html);
         // The five retained sections appear once each, in order; the removed ATM / ITM / OTM summaries and the old two-table TOTAL are absent; there is no commentary.
         var order = System.Text.RegularExpressions.Regex.Matches(html, "<table[^>]*data-grid=\"([^\"]+)\"").Select(m => m.Groups[1].Value).ToList();
-        Assert.Equal(["summary-futures", "summary-total", "futures-compact", "options-core-direction", "options-context", "residual-compact"], order);
+        Assert.Equal(["summary-futures", "summary-total-itm", "summary-total", "summary-total-otm", "futures-compact", "options-core-direction", "options-context", "residual-compact"], order);
         Assert.True(AdaptiveScreenshotRenderer.IsExpectedGridSequence(order));
         foreach (var gone in new[] { "ATM SUMMARY", "ITM SUMMARY", "OTM SUMMARY", "summary-atm", "summary-itm", "summary-otm", "summary-total-core", "summary-total-context" })
             Assert.DoesNotContain(gone, html);

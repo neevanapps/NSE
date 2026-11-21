@@ -620,4 +620,133 @@ public sealed class SpotAtmRuleTests
         Assert.Equal("spot-atm-v1", (await db.Sessions.SingleAsync(x => x.ModelVersion == AdaptiveFixedClockV1.ModelVersion)).AtmRuleVersion);
         Assert.Null((await db.Sessions.SingleAsync(x => x.ModelVersion == "adaptive-v1")).AtmRuleVersion);
     }
+
+    // ------------------------------------------------------------------ causal ATM at the bar CLOSE (close-atm-v1)
+
+    [Fact]
+    public void CloseAtm_IsTheAtmAtTheBarsClose_NotTheBarStartBandCentre_AndEqualsTheNextBarsBandCentre()
+    {
+        var engine = Engine(AtmCenterRule.SpotV1);
+        long id = 1;
+        Step(engine, ref id, T0, 1000, spot: 23020);
+        Step(engine, ref id, T0.AddSeconds(1.5), null, spot: 23030);
+        var bar1 = Assert.Single(Step(engine, ref id, T0.AddSeconds(2), 1100, spot: null));
+        var bar2 = Assert.Single(Step(engine, ref id, T0.AddSeconds(4), 1200, spot: null));
+
+        Assert.Equal(23000d, bar1.OptionBand.Selection!.CenterStrike);               // the band is the START-of-bar ATM ...
+        Assert.Equal(23050d, bar1.CloseAtm!.Strike);                                 // ... the close ATM is the one at the close (spot 23030 -> 23050)
+        Assert.Equal(23030d, bar1.CloseAtm.Spot);
+        Assert.Null(bar1.CloseAtm.UnavailableReason);
+        Assert.Equal(bar1.CloseAtm.Strike, bar2.OptionBand.Selection!.CenterStrike);  // the next bar's band is selected at this bar's close instant: the same causal value
+    }
+
+    [Theory]
+    [InlineData(23025d, 23000d)]      // an exact midpoint chooses the LOWER strike
+    [InlineData(23025.01d, 23050d)]
+    [InlineData(23049.99d, 23050d)]
+    public void CloseAtm_TieAndNearestRules_MatchTheBandRule(double spot, double expected)
+    {
+        var engine = Engine(AtmCenterRule.SpotV1);
+        long id = 1;
+        Step(engine, ref id, T0, 1000, spot: spot);
+        var bar = Assert.Single(Step(engine, ref id, T0.AddSeconds(2), 1100, spot: null));
+        Assert.Equal(expected, bar.CloseAtm!.Strike);
+    }
+
+    [Fact]
+    public void CloseAtm_AtTheFrozenLadderEdge_IsKnown_WhileTheOptionBandIsUnavailable()
+    {
+        var engine = Engine(AtmCenterRule.SpotV1);
+        long id = 1;
+        Step(engine, ref id, T0, 1000, spot: 23020);
+        Step(engine, ref id, T0.AddSeconds(1.5), null, spot: 22810);                  // the ladder starts at 22800: ATM 22800 has no ATM-2 below it
+        var bar1 = Assert.Single(Step(engine, ref id, T0.AddSeconds(2), 1100, spot: null));
+        var bar2 = Assert.Single(Step(engine, ref id, T0.AddSeconds(4), 1200, spot: null));
+
+        Assert.Equal(22800d, bar1.CloseAtm!.Strike);                                  // the ATM is KNOWN ...
+        Assert.Null(bar1.CloseAtm.UnavailableReason);
+        Assert.Null(bar2.OptionBand.Selection);                                       // ... although the ATM±2 band selected at that instant is not
+    }
+
+    [Theory]
+    [InlineData(5d, 23000d)]       // exactly 5 s old: fresh (inclusive)
+    [InlineData(5.01d, null)]      // older: stale, no ATM, NO fallback to any other price or earlier ATM
+    public void CloseAtm_UsesTheFiveSecondSpotFreshnessRule_AndNeverFallsBack(double ageSeconds, double? expected)
+    {
+        var engine = Engine(AtmCenterRule.SpotV1);
+        long id = 1;
+        Step(engine, ref id, T0, 1000, spot: 23020);                                  // this spot, 23020, is the only one ever seen
+        var bar = Assert.Single(Step(engine, ref id, T0.AddSeconds(ageSeconds), 1100, spot: null));
+        Assert.Equal(expected, bar.CloseAtm!.Strike);
+        if (expected is null)
+        {
+            Assert.Equal(AtmCenterRules.SpotUnavailableReason, bar.CloseAtm.UnavailableReason);
+            Assert.Null(bar.CloseAtm.Spot);
+        }
+    }
+
+    [Fact]
+    public void CloseAtm_WithoutAnySpotOrFrozenSpotToken_IsUnavailable()
+    {
+        foreach (var token in new string?[] { "SPOT", null })
+        {
+            var engine = Engine(AtmCenterRule.SpotV1, spotToken: token);
+            long id = 1;
+            Step(engine, ref id, T0, 1000, spot: null);
+            var bar = Assert.Single(Step(engine, ref id, T0.AddSeconds(2), 1100, spot: null));
+            Assert.Null(bar.CloseAtm!.Strike);
+            Assert.NotNull(bar.CloseAtm.UnavailableReason);
+        }
+    }
+
+    [Fact]
+    public void CloseAtm_LegacySession_IsTheSyntheticForwardCentreOfTheSameInstant_AndSpotIsIgnored()
+    {
+        var engine = Engine(AtmCenterRule.SyntheticForwardLegacy);
+        long id = 1;
+        Step(engine, ref id, T0, 1000, spot: 23400);
+        var bar1 = Assert.Single(Step(engine, ref id, T0.AddSeconds(2), 1100, spot: 23400));
+        var bar2 = Assert.Single(Step(engine, ref id, T0.AddSeconds(4), 1200, spot: 23400));
+        Assert.Equal(bar2.OptionBand.Selection!.CenterStrike, bar1.CloseAtm!.Strike);   // the forward (~23000) chose it, not the 23400 spot
+        Assert.Equal(23000d, bar1.CloseAtm.Strike);
+    }
+
+    [Fact]
+    public void CloseAtm_IsDeterministic_ARestartReplayGivesTheSameValues()
+    {
+        BarCloseAtm?[] Run()
+        {
+            var engine = Engine(AtmCenterRule.SpotV1);
+            long id = 1;
+            var list = new List<BarCloseAtm?>();
+            list.AddRange(Step(engine, ref id, T0, 1000, 23020).Select(p => p.CloseAtm));
+            list.AddRange(Step(engine, ref id, T0.AddSeconds(1.5), null, 23030).Select(p => p.CloseAtm));
+            list.AddRange(Step(engine, ref id, T0.AddSeconds(2), 1100, null).Select(p => p.CloseAtm));
+            list.AddRange(Step(engine, ref id, T0.AddSeconds(4), 1200, 23080).Select(p => p.CloseAtm));
+            return [.. list];
+        }
+
+        Assert.Equal(Run(), Run());
+    }
+
+    [Fact]
+    public async Task CloseAtmSidecar_InsertsOnce_VerifiesOnReplay_AndAMismatchIsMarkedNotOverwritten()
+    {
+        var package = OneBar();
+        Assert.NotNull(package.CloseAtm);
+        await using var db = Database();
+        var service = new AdaptiveSupplementalPersistence(NullLogger<AdaptiveSupplementalPersistence>.Instance);
+        Assert.Equal(SupplementalOutcome.Inserted, await service.PersistOrVerifyCloseAtmAsync(db, 1, package, default));
+        Assert.Equal(SupplementalOutcome.Verified, await service.PersistOrVerifyCloseAtmAsync(db, 1, package, default));
+        Assert.Equal(SupplementalOutcome.Skipped, await service.PersistOrVerifyCloseAtmAsync(db, 1, package with { CloseAtm = null }, default));
+
+        var row = await db.BarCloseAtm.SingleAsync();
+        Assert.Equal((BarCloseAtm.Version, package.CloseAtm!.Strike), (row.Version, row.AtmStrike));
+        row.AtmStrike += 50;
+        await db.SaveChangesAsync();
+        Assert.Equal(SupplementalOutcome.Mismatch, await service.PersistOrVerifyCloseAtmAsync(db, 1, package, default));
+        Assert.Equal(package.CloseAtm.Strike + 50, (await db.BarCloseAtm.AsNoTracking().SingleAsync()).AtmStrike);              // original row preserved
+        var marker = await db.ProjectionHealth.SingleAsync();
+        Assert.Equal((AdaptiveProjectionComponents.BarCloseAtm, BarCloseAtm.Version, package.FutureBar.BarSeq), (marker.Component, marker.Version, marker.BarSeq));
+    }
 }

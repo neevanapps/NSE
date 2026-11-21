@@ -493,8 +493,8 @@ public class ResearchDashboardTests
         // The original four detailed grids are unchanged and still required (in the same order, after the two Market Summary grids: Futures and the compact TOTAL; ATM / ITM / OTM were removed on 2026-11-02).
         var grids = AdaptiveScreenshotRenderer.RequiredGrids.Select(g => g.Grid).ToList();
         Assert.Equal(["futures-compact", "options-core-direction", "options-context", "residual-compact"], grids.TakeLast(4));
-        Assert.Equal(["summary-futures", "summary-total"], grids.Take(2));
-        Assert.Equal(6, grids.Count);
+        Assert.Equal(["summary-futures", "summary-total-itm", "summary-total", "summary-total-otm"], grids.Take(4));
+        Assert.Equal(8, grids.Count);
         Assert.Contains("summary-atm-core", AdaptiveScreenshotRenderer.ForbiddenGrids);
         Assert.DoesNotContain(AdaptiveScreenshotRenderer.ForbiddenGrids, grids.Contains);
         Assert.Equal(["research-header", "research-data-quality", "recent-events"], AdaptiveScreenshotRenderer.RequiredBlocks);

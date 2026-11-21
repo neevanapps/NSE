@@ -260,16 +260,42 @@ public sealed class AdaptiveObserverDataService(
         return FixedStrikeProjection.Assemble(catalog, contract, bars, stored, rollWindowBars, unverified);
     }
 
+    /// <summary>The ATM at a completed bar's CLOSE. <see cref="Source"/>: stored (the Host's close-atm-v1 row), next-bar-start (a bar recorded before that sidecar existed: the NEXT bar's band was selected at this bar's close instant, so its centre is the same causal value),
+    /// stored-unavailable / unverified / none (no strike; <see cref="Reason"/> says why). No later tick, prior ATM or manual selection is ever used.</summary>
+    public sealed record CloseAtmResult(double? Strike, string Source, string? Reason);
+
+    public async Task<CloseAtmResult> LoadCloseAtmAsync(long sessionId, int barSeq, CancellationToken ct = default)
+    {
+        if (barSeq < 1) return new(null, "none", "no completed bar");
+        await using var db = await dbFactory.CreateDbContextAsync(ct);
+        try
+        {
+            if (await db.ProjectionHealth.AsNoTracking().AnyAsync(x => x.SessionId == sessionId && x.Component == AdaptiveProjectionComponents.BarCloseAtm && x.Version == BarCloseAtm.Version && x.BarSeq == barSeq, ct))
+                return new(null, "unverified", "the stored close ATM of this bar disagreed with its recomputation after a restart, so it is withheld");
+            var row = await db.BarCloseAtm.AsNoTracking().SingleOrDefaultAsync(x => x.SessionId == sessionId && x.BarSeq == barSeq && x.Version == BarCloseAtm.Version, ct);
+            if (row is not null)
+                return row.AtmStrike is { } k ? new(k, "stored", null) : new(null, "stored-unavailable", row.UnavailableReason ?? "no ATM could be derived at this bar's close");
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedTable)
+        {
+            // close-atm-v1 not migrated yet: fall through to the causal derivation below
+        }
+
+        // A bar recorded before the close-ATM sidecar: the next bar's band is selected at THIS bar's close instant with the same rule, so its centre is the same causal value (a disclosed source, not a fallback to another ATM).
+        var next = await db.OptionBandBars.AsNoTracking().Where(x => x.SessionId == sessionId && x.BarSeq == barSeq + 1 && x.BandAvailable).Select(x => (double?)x.CenterStrike).FirstOrDefaultAsync(ct);
+        return next is { } c ? new(c, "next-bar-start", null) : new(null, "none", "close ATM is not recorded for this bar and no later bar exists to derive it from");
+    }
+
     /// <summary>
     /// The Market Summary grids for ONE session, pinned at completed bar <paramref name="endBarSeq"/> (no bar after it is read). The basket is the session's frozen weekly expiry resolved around
     /// <paramref name="centreStrike"/> - the authoritative ATM centre of the latest completed bar (the pinned target bar for a historical view), independent of the fixed-strike selector. The Lower (centre -1 listed step) and
     /// Upper (+1 step) TOTAL grids use the same centre. One scoped query reads the exact tokens of ATM-3..ATM+3; a missing table or missing rows yields coverage gaps, never another strike.
     /// </summary>
-    public async Task<MarketSummaryView> LoadMarketSummaryAsync(long sessionId, int endBarSeq, FixedStrikeCatalog? catalog, double? centreStrike, CancellationToken ct = default)
+    public async Task<MarketSummaryView> LoadMarketSummaryAsync(long sessionId, int endBarSeq, FixedStrikeCatalog? catalog, double? centreStrike, CancellationToken ct = default, string? closeAtmSource = null, string? centreUnavailableReason = null)
     {
         if (catalog is null || centreStrike is not { } centre || endBarSeq < 1)
         {
-            return MarketSummaryView.Unavailable(endBarSeq, catalog is null ? "no frozen option universe for this session" : centreStrike is null ? "no centre strike selected" : "no completed bar");
+            return MarketSummaryView.Unavailable(endBarSeq, catalog is null ? "no frozen option universe for this session" : centreStrike is null ? centreUnavailableReason ?? "no close ATM for this bar" : "no completed bar");
         }
 
         var listed = MarketSummaryMapper.Listed(catalog);
@@ -310,8 +336,8 @@ public sealed class AdaptiveObserverDataService(
 
         var futures = bars.ToDictionary(b => b.BarSeq, b => MarketSummaryMapper.FuturesBarOf(b, sup.GetValueOrDefault(b.BarSeq)));
         // A4: strike bars recovery found disagreeing with the reconstruction are withheld (a coverage gap, never a normal observation) and listed in the view.
-        var unverifiedNotes = stored.Where(r => unverified.IsUnverified(r.BarSeq, r.Token)).Select(r => $"{r.TradingSymbol ?? r.Token} bar {r.BarSeq}").Distinct().OrderBy(x => x, StringComparer.Ordinal).ToList();
-        if (unverified.TablePending) unverifiedNotes.Add("verification markers unavailable - migration pending");
+        var unverifiedNotes = stored.Where(r => !unverified.TablePending && unverified.IsUnverified(r.BarSeq, r.Token, r.MetricsVersion)).Select(r => $"{r.TradingSymbol ?? r.Token} bar {r.BarSeq}").Distinct().OrderBy(x => x, StringComparer.Ordinal).ToList();
+        if (unverified.TablePending) unverifiedNotes.Add("verification markers unreadable - ALL per-strike rows withheld");
         stored = unverified.Exclude(stored).ToList();
         var history = new NiftySignal.MarketSummary.ContractHistory(MarketSummaryMapper.ContractBars(stored, tokens, catalog.Expiry, endBarSeq), bars.ToDictionary(b => b.BarSeq, b => b.DurationSeconds));
         // The boundaries of each window (start of its first bar, end of the target bar) for the as-of VIX alignment; bars are completed bars through the target only.
@@ -328,6 +354,8 @@ public sealed class AdaptiveObserverDataService(
             NiftySignal.MarketSummary.OptionSummaryCalculator.ComputeAll(basket, history, endBarSeq), null, instants)
         {
             Unverified = unverifiedNotes,
+            CloseAtmStrike = centre,
+            CloseAtmSource = closeAtmSource,
             LowerBasket = lowerBasket,
             Lower = NiftySignal.MarketSummary.OptionSummaryCalculator.Compute(lowerBasket, NiftySignal.MarketSummary.GridKind.Total, history, endBarSeq),
             UpperBasket = upperBasket,
