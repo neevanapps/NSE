@@ -367,6 +367,40 @@ public sealed class AdaptiveMigrationPostgresTests
         Assert.Null(ratios.Delta.Direction.Raw);                                      // unavailable, not zero
     }
 
+    [PgMigrationFact]
+    public async Task A4_StrikeMismatch_IsMarkedUnverifiedOnPostgres_Idempotently_WithoutAnyNewMigration()
+    {
+        await using var temp = await HistoricalDatabaseAsync();
+        await temp.MigrateAsync();
+        var package = SpotAtmRuleTests.OneBar();
+        var service = new AdaptiveSupplementalPersistence(NullLogger<AdaptiveSupplementalPersistence>.Instance);
+        await using (var db = temp.Context()) Assert.Equal(SupplementalOutcome.Inserted, await service.PersistOrVerifyStrikesAsync(db, 1, package, default));
+        await using (var db = temp.Context())
+        {
+            var row = await db.OptionStrikeBars.SingleAsync(x => x.Token == "C23000" && x.BarSeq == package.FutureBar.BarSeq && x.MetricsVersion == "option-strike-v3");
+            row.StrictBuy += 7;
+            await db.SaveChangesAsync();
+        }
+
+        for (var i = 0; i < 2; i++)                                                  // a second restart must be idempotent against the real unique index
+        {
+            await using var db = temp.Context();
+            Assert.Equal(SupplementalOutcome.Mismatch, await service.PersistOrVerifyStrikesAsync(db, 1, package, default));
+        }
+
+        await using (var db = temp.Context())
+        {
+            var marker = await db.ProjectionHealth.SingleAsync(x => x.Component == AdaptiveProjectionComponents.OptionStrikeBars);
+            Assert.Equal(package.FutureBar.BarSeq, marker.BarSeq);
+            Assert.StartsWith("tokens=C23000;", marker.Detail);
+            var u = await UnverifiedStrikeBars.LoadAsync(db, 1, 100, default);
+            Assert.True(u.IsUnverified(package.FutureBar.BarSeq, "C23000"));
+            Assert.False(u.IsUnverified(package.FutureBar.BarSeq, "P23000"));
+            Assert.False(u.TablePending);
+            Assert.Empty(db.Database.GetPendingMigrations());                        // no migration was generated for A4
+        }
+    }
+
     sealed class TempFactory(TempAdaptiveDatabase temp) : IDbContextFactory<AdaptiveObserverDbContext>
     {
         public AdaptiveObserverDbContext CreateDbContext() => temp.Context();
