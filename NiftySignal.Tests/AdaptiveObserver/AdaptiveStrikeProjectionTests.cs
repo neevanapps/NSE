@@ -541,4 +541,60 @@ public sealed class AdaptiveStrikeProjectionTests
         var catalog = new NiftySignal.Dashboard.Services.FixedStrikeCatalog(bad.Expiry, [new NiftySignal.Dashboard.Services.FixedStrikeContract(bad.Strike, bad.Side == OptionType.Call ? bad.Token : null, "CE", bad.Side == OptionType.Put ? bad.Token : null, "PE")]);
         Assert.Equal(3, await ServedCellsAsync(name, catalog, bad));                              // verified strikes are served although close ATM cannot be persisted
     }
+
+    /// <summary>Columns the old comparison did not cover: derived metrics and contract identity.</summary>
+    public static IEnumerable<object[]> OmittedColumns() => new[] { "StrictDelta", "EnrichedDelta", "OiDelta", "IvChange", "QuoteAgeEndSeconds", "Expiry", "Strike", "Side", "TradingSymbol", "Token" }.Select(x => new object[] { x });
+
+    static void Corrupt(AdaptiveOptionStrikeBarRow r, string column)
+    {
+        switch (column)
+        {
+            case "StrictDelta": r.StrictDelta += 11; break;
+            case "EnrichedDelta": r.EnrichedDelta += 11; break;
+            case "OiDelta": r.OiDelta = (r.OiDelta ?? 0) + 11; break;
+            case "IvChange": r.IvChange = (r.IvChange ?? 0) + 0.5; break;
+            case "QuoteAgeEndSeconds": r.QuoteAgeEndSeconds = (r.QuoteAgeEndSeconds ?? 0) + 3; break;
+            case "Expiry": r.Expiry = r.Expiry.AddDays(7); break;
+            case "Strike": r.Strike += 50; break;
+            case "Side": r.Side = r.Side == OptionType.Call ? OptionType.Put : OptionType.Call; break;
+            case "TradingSymbol": r.TradingSymbol += "X"; break;
+            case "Token": r.Token += "X"; break;
+            default: throw new ArgumentException(column);
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(OmittedColumns))]
+    public async Task A4_ReplayDoesNotAttest_ARowCorruptedInAColumnTheOldComparisonIgnored(string column)
+    {
+        var name = Guid.NewGuid().ToString();
+        var (packages, bad, catalog) = await SeedWrongRowAsync(name);                              // seeds + attests, then corrupts StrictBuy of `bad`
+        await using (var host = Shared(name))
+        {
+            host.StrikeAttestations.RemoveRange(await host.StrikeAttestations.ToListAsync());     // pre-attestation rows: the replay is the only thing that can vouch for them
+            var row = await host.OptionStrikeBars.SingleAsync(x => x.Id == bad.Id);
+            row.StrictBuy -= 7;                                                                      // undo the seed corruption, then corrupt exactly one previously-uncompared column
+            Corrupt(row, column);
+            await host.SaveChangesAsync();
+        }
+
+        await using (var host = Shared(name))
+        {
+            var replay = new AdaptiveSupplementalPersistence(NullLogger<AdaptiveSupplementalPersistence>.Instance);
+            foreach (var p in Run(NewEngine(Session().Item1, true), Session().Item2).Take(3)) await replay.PersistAndVerifyAsync(host, SessionRow(), p, default);
+        }
+
+        await using var reader = Shared(name);
+        var attestations = await reader.StrikeAttestations.AsNoTracking().ToListAsync();
+        Assert.DoesNotContain(attestations, a => a.BarSeq == bad.BarSeq);                          // the corrupted bar was NOT attested as valid
+        Assert.Contains(attestations, a => a.BarSeq != bad.BarSeq);                                // healthy bars were
+        Assert.True((await reader.ProjectionHealth.AsNoTracking().ToListAsync()).Any(m => m.BarSeq == bad.BarSeq && m.Component == AdaptiveProjectionComponents.OptionStrikeBars));
+
+        var h = await DashboardReadAsync(name, catalog, bad.Strike);                               // Dashboard (fixed-strike history path)
+        Assert.Null(Cell(h!, bad, bad.BarSeq));
+
+        var unverified = await UnverifiedStrikeBars.LoadAsync(reader, 1, 100, default);             // V2 and the summary use exactly this Exclude on the rows they load
+        var stored = await reader.OptionStrikeBars.AsNoTracking().Where(x => x.Id == bad.Id).ToListAsync();
+        Assert.Empty(unverified.Exclude(stored));
+    }
 }

@@ -214,7 +214,7 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
             var badTokens = new List<string>();
             foreach (var row in expected)
             {
-                var d = byToken.TryGetValue(row.Token, out var stored) ? FirstDifference(stored, row) : $"token {row.Token} missing";
+                var d = byToken.TryGetValue(row.Token, out var stored) ? StrikeDifference(stored, row) : $"token {row.Token} missing";
                 if (d is not null)
                 {
                     badTokens.Add(row.Token);
@@ -375,21 +375,17 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
         VegaChange = m.VegaChange,
     };
 
-    static string? FirstDifference(AdaptiveOptionStrikeBarRow a, AdaptiveOptionStrikeBarRow b)
+    /// <summary>
+    /// Compares EVERY column of a stored per-strike row with the recomputed one (reflection, so a column added later is covered automatically) - the same column set
+    /// <see cref="StrikeAttestation.Digest"/> hashes - so a row can only be attested when nothing the digest covers disagrees. Doubles use the tolerance of the other sidecars.
+    /// The one deliberate exclusion is the bar-end instant (the database stores microseconds, the engine 100 ns ticks): it is compared with a 1 ms tolerance here, and is not part of the digest.
+    /// </summary>
+    static string? StrikeDifference(AdaptiveOptionStrikeBarRow stored, AdaptiveOptionStrikeBarRow expected)
     {
-        string? D(string name, double? x, double? y) => (x is null) != (y is null) || (x is { } xv && y is { } yv && Math.Abs(xv - yv) > DoubleTolerance) ? $"{a.Token}.{name} {x} vs {y}" : null;
-        string? L(string name, long? x, long? y) => x != y ? $"{a.Token}.{name} {x} vs {y}" : null;
-        return D(nameof(a.PriceStart), a.PriceStart, b.PriceStart) ?? D(nameof(a.PriceEnd), a.PriceEnd, b.PriceEnd) ?? D(nameof(a.PriceChange), a.PriceChange, b.PriceChange)
-            ?? L(nameof(a.TotalQuantity), a.TotalQuantity, b.TotalQuantity) ?? L(nameof(a.StrictBuy), a.StrictBuy, b.StrictBuy) ?? L(nameof(a.StrictSell), a.StrictSell, b.StrictSell)
-            ?? L(nameof(a.StrictUnknown), a.StrictUnknown, b.StrictUnknown) ?? L(nameof(a.EnrichedBuy), a.EnrichedBuy, b.EnrichedBuy) ?? L(nameof(a.EnrichedSell), a.EnrichedSell, b.EnrichedSell)
-            ?? L(nameof(a.EnrichedUnknown), a.EnrichedUnknown, b.EnrichedUnknown) ?? L(nameof(a.TradeUpdates), a.TradeUpdates, b.TradeUpdates)
-            ?? L(nameof(a.OiStart), a.OiStart, b.OiStart) ?? L(nameof(a.OiEnd), a.OiEnd, b.OiEnd)
-            ?? D(nameof(a.IvStart), a.IvStart, b.IvStart) ?? D(nameof(a.IvEnd), a.IvEnd, b.IvEnd) ?? D(nameof(a.ActivityPerSecond), a.ActivityPerSecond, b.ActivityPerSecond)
-            ?? D(nameof(a.TobTimeWeighted), a.TobTimeWeighted, b.TobTimeWeighted) ?? D(nameof(a.MicroDevTimeWeighted), a.MicroDevTimeWeighted, b.MicroDevTimeWeighted)
-            ?? D(nameof(a.TobUsableSeconds), a.TobUsableSeconds, b.TobUsableSeconds) ?? L(nameof(a.NetOfi), a.NetOfi, b.NetOfi) ?? L(nameof(a.GrossOfi), a.GrossOfi, b.GrossOfi)
-            ?? L(nameof(a.OfiTransitions), a.OfiTransitions, b.OfiTransitions)
-            ?? D(nameof(a.DeltaStart), a.DeltaStart, b.DeltaStart) ?? D(nameof(a.DeltaEnd), a.DeltaEnd, b.DeltaEnd) ?? D(nameof(a.DeltaChange), a.DeltaChange, b.DeltaChange)
-            ?? D(nameof(a.VegaStart), a.VegaStart, b.VegaStart) ?? D(nameof(a.VegaEnd), a.VegaEnd, b.VegaEnd) ?? D(nameof(a.VegaChange), a.VegaChange, b.VegaChange);
+        if ((stored.EndAvailableAtUtc - expected.EndAvailableAtUtc).Duration() > TimeSpan.FromMilliseconds(1))
+            return $"{expected.Token}.EndAvailableAtUtc persisted={stored.EndAvailableAtUtc:O}, recomputed={expected.EndAvailableAtUtc:O}";
+        var d = FirstDifference(stored, expected, nameof(AdaptiveOptionStrikeBarRow.EndAvailableAtUtc));
+        return d is null ? null : $"{expected.Token}.{d}";
     }
 
     /// <summary>Same insert-if-missing / verify-if-present contract for the options sidecar.</summary>
@@ -757,11 +753,11 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
         GrossOfi = m.GrossOfi,
     };
 
-    static string? FirstDifference<TRow>(TRow actual, TRow expected) where TRow : class
+    static string? FirstDifference<TRow>(TRow actual, TRow expected, params string[] skip) where TRow : class
     {
         foreach (var property in typeof(TRow).GetProperties())
         {
-            if (property.Name == "Id") continue;
+            if (property.Name == "Id" || skip.Contains(property.Name)) continue;
             var a = property.GetValue(actual);
             var e = property.GetValue(expected);
             if (a is double av && e is double ev && double.IsFinite(av) && double.IsFinite(ev) && Math.Abs(av - ev) <= DoubleTolerance) continue;
