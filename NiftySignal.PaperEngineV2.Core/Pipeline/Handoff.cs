@@ -74,6 +74,9 @@ public sealed class FrameHandoff
     readonly int _ledgerCapacity;
     long _offered, _accepted, _rejected, _buildFailures;
     int _signals;
+    readonly object _failGate = new();                 // guards the (rare) failure bookkeeping below; never taken on the Offer hot path
+    int _failedBarMax = -1;                            // highest bar sequence whose build failed since the signal was last acknowledged
+    bool _unattributedFailure;                         // a failure whose bar sequence is unknown: only a detected gap may acknowledge it
     int _firstDropped = -1, _lastDropped = -1;
     int _closed;
 
@@ -118,7 +121,7 @@ public sealed class FrameHandoff
     /// Builds the frame and offers it, all without ever throwing: a build failure is a producer-side signal (<see cref="IntegrityFlags.BuildFailure"/>), counted, and surfaces as a sequence gap. The builder delegate
     /// runs on the CALLER's thread (the observer's), so it must be the cheap pure construction only - no database, no strategy work.
     /// </summary>
-    public OfferResult OfferBuilt(Func<MarketStateFrame> build)
+    public OfferResult OfferBuilt(Func<MarketStateFrame> build, int? failedBarSeq = null)
     {
         MarketStateFrame frame;
         try
@@ -128,7 +131,12 @@ public sealed class FrameHandoff
         catch (Exception)
         {
             Interlocked.Increment(ref _buildFailures);
-            Interlocked.Or(ref _signals, (int)IntegrityFlags.BuildFailure);
+            lock (_failGate)
+            {
+                if (failedBarSeq is { } failed) _failedBarMax = Math.Max(_failedBarMax, failed); else _unattributedFailure = true;
+                Interlocked.Or(ref _signals, (int)IntegrityFlags.BuildFailure);
+            }
+
             return new OfferResult(OfferOutcome.BuildFailed, Interlocked.Read(ref _offered), Interlocked.Read(ref _rejected));
         }
 
@@ -136,7 +144,31 @@ public sealed class FrameHandoff
     }
 
     /// <summary>Returns and clears the producer-side signals (the consumer calls this once it has accounted for them through the sequence gap they caused).</summary>
-    public IntegrityFlags TakeSignals() => (IntegrityFlags)Interlocked.Exchange(ref _signals, 0);
+    public IntegrityFlags TakeSignals()
+    {
+        lock (_failGate)
+        {
+            _failedBarMax = -1; _unattributedFailure = false;
+            return (IntegrityFlags)Interlocked.Exchange(ref _signals, 0);
+        }
+    }
+
+    /// <summary>
+    /// Acknowledges a pending <see cref="IntegrityFlags.BuildFailure"/> ONLY when every failed bar is at or before <paramref name="acceptedBarSeq"/> and its failure is attributed to a bar: the consumer has then accepted a
+    /// frame that already covers the failed bar(s) (it started after them, or the failure was a duplicate notice of a bar that was built), so no sequence gap can ever surface for them and, without this, the flag would
+    /// stay raised for the whole session. A failure of a LATER bar, an unattributed failure, and any Overflow signal are left untouched (they are acknowledged by the gap they cause). Returns the flags acknowledged.
+    /// </summary>
+    public IntegrityFlags AcknowledgeBuildFailuresCoveredBy(int acceptedBarSeq)
+    {
+        lock (_failGate)
+        {
+            if ((Volatile.Read(ref _signals) & (int)IntegrityFlags.BuildFailure) == 0) return IntegrityFlags.None;
+            if (_unattributedFailure || _failedBarMax < 0 || _failedBarMax > acceptedBarSeq) return IntegrityFlags.None;
+            Interlocked.And(ref _signals, ~(int)IntegrityFlags.BuildFailure);
+            _failedBarMax = -1;
+            return IntegrityFlags.BuildFailure;
+        }
+    }
 
     public IntegrityFlags PeekSignals() => (IntegrityFlags)Volatile.Read(ref _signals);
 

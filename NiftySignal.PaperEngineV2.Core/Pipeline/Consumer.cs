@@ -168,6 +168,13 @@ public sealed class FrameConsumer
                 _run = 0; flags |= IntegrityFlags.SequenceGap;
             }
 
+            else
+            {
+                // A build failure of a bar at or before this accepted frame can never surface as a gap (the consumer started after it, or it was a duplicate notice of a built bar): acknowledge it here, block THIS frame
+                // with the reason, and let the normal run-length rule (FramesToClearGap) decide when entries resume. Failures of later bars and overflow stay pending until the gap they cause is seen.
+                flags |= _handoff?.AcknowledgeBuildFailuresCoveredBy(frame.Identity.BarSeq) ?? IntegrityFlags.None;
+            }
+
             flags |= _handoff?.PeekSignals() ?? IntegrityFlags.None;                   // still-unacknowledged overflow / build failure: entries blocked
             if (!frame.Identity.Verified) { flags |= IntegrityFlags.UnverifiedFrame; _run = 0; }
             else if (decision.Verdict == GuardVerdict.SessionStart) _run = frame.Identity.BarSeq == 1 ? _options.FramesToClearGap : 1;    // a clean start at bar 1 needs no warm-up; a mid-session start counts as a post-gap run
