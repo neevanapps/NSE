@@ -6,13 +6,15 @@ using NiftySignal.Domain.Enums;
 namespace NiftySignal.Ingestion.FlatTrade;
 
 /// <summary>
-/// The daily 08:45 job (plan section 3.1): ATM +/- 10 strikes for the nearest and next
-/// weekly expiry, plus the underlying spot index, current-month future, and India VIX --
-/// ~84 option instruments + 3 underlying. Built around a live-verified discovery (2026-09-04) that
+/// The daily 08:45 job (plan section 3.1): ATM +/- 15 strikes for the NEAREST weekly expiry only
+/// (2026-11 change: previously nearest + next weekly, +/- 10 strikes), plus the underlying spot index,
+/// current-month future, and India VIX -- ~62 option instruments + 3 underlying. The chain is centred on the
+/// previous close, so the usable headroom around the live ATM is smaller than 15 strikes (see the Market
+/// Summary Upper grid, which needs ATM+3). Built around a live-verified discovery (2026-09-04) that
 /// simplifies the plan's original design: FlatTrade's GetOptionChain endpoint resolves
 /// strikes around a reference price server-side, so this class doesn't need to compute
 /// ATM from the raw instrument master itself -- it only uses the master
-/// (<see cref="IInstrumentMasterProvider"/>) to discover which two expiries are nearest
+/// (<see cref="IInstrumentMasterProvider"/>) to discover the nearest expiry
 /// and to find the current-month future, then lets GetOptionChain do the strike selection.
 /// </summary>
 public sealed class InstrumentUniverseResolver(
@@ -27,25 +29,25 @@ public sealed class InstrumentUniverseResolver(
     public const string IndiaVixToken = "26017";
 
     const string Underlying = "NIFTY";
-    const int StrikeCountEachSide = 10;
+    /// <summary>Strikes requested each side of the previous-close centre (2026-11: 10 -> 15). The ladder is NOT re-centred intraday, so headroom around the live ATM shrinks as spot drifts from the previous close.</summary>
+    public const int StrikeCountEachSide = 15;
 
     public async Task<IReadOnlyList<Instrument>> ResolveAsync(string sessionToken, DateOnly asOfDate, CancellationToken cancellationToken)
     {
         var master = await masterProvider.GetInstrumentMasterAsync(asOfDate, cancellationToken);
 
-        var expiries = master
-            .Where(i => i.InstrumentType == InstrumentType.Option && i.ExpiryDate is not null)
+        // Only the nearest weekly expiry: the earliest listed option expiry on or after the as-of date (an already-expired
+        // row of a stale master is never picked). No next-week expiry is resolved or subscribed.
+        var nearestExpiry = master
+            .Where(i => i.InstrumentType == InstrumentType.Option && i.ExpiryDate is not null && i.ExpiryDate.Value >= asOfDate)
             .Select(i => i.ExpiryDate!.Value)
             .Distinct()
             .OrderBy(d => d)
-            .Take(2)
-            .ToList();
-
-        if (expiries.Count < 2)
-        {
-            throw new InvalidOperationException(
-                $"Expected at least 2 distinct {Underlying} option expiries in the instrument master, found {expiries.Count}.");
-        }
+            .Cast<DateOnly?>()
+            .FirstOrDefault()
+            ?? throw new InvalidOperationException(
+                $"No {Underlying} option expiry on or after {asOfDate:yyyy-MM-dd} in the instrument master.");
+        var expiries = new List<DateOnly> { nearestExpiry };
 
         var nearestFuture = master
             .Where(i => i.InstrumentType == InstrumentType.Future && i.ExpiryDate is not null)
@@ -57,8 +59,8 @@ public sealed class InstrumentUniverseResolver(
         var midPrice = spotQuote.PreviousClose ?? spotQuote.LastPrice;
 
         logger.LogInformation(
-            "Resolving instrument universe for {AsOfDate}: expiries {Nearest}/{Next}, mid price {MidPrice}",
-            asOfDate, expiries[0], expiries[1], midPrice);
+            "Resolving instrument universe for {AsOfDate}: nearest expiry {Nearest}, +/-{Strikes} strikes, mid price {MidPrice}",
+            asOfDate, nearestExpiry, StrikeCountEachSide, midPrice);
 
         var instruments = new List<Instrument>
         {
