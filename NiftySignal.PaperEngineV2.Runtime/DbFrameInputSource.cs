@@ -27,8 +27,10 @@ public sealed class DbFrameInputSource(Func<AdaptiveObserverDbContext> observerD
         List<AdaptiveFutureBarRow> bars;
         Dictionary<int, AdaptiveFuturesSupplementalRow> sup;
         List<AdaptiveOptionStrikeBarRow> stored = [];
+        var unverified = UnverifiedStrikeBars.None;
         await using (var db = observerDb())
         {
+            unverified = await UnverifiedStrikeBars.LoadAsync(db, session.SessionId, endBar, ct);
             bars = await db.FutureBars.AsNoTracking().Where(x => x.SessionId == session.SessionId && x.BarSeq <= endBar).OrderBy(x => x.BarSeq).ToListAsync(ct);
             var seqs = bars.Select(x => x.BarSeq).ToArray();
             if (!bars.Any(b => b.BarSeq == endBar)) return (null, $"bar {endBar} is not persisted yet");
@@ -48,6 +50,9 @@ public sealed class DbFrameInputSource(Func<AdaptiveObserverDbContext> observerD
             }
         }
 
+        // A4 (AWAITING OWNER CONFIRMATION - isolated commit, easy to drop): a strike bar that recovery durably marked UNVERIFIED is a MISSING observation. It is removed here, so the
+        // window coverage shrinks (never zero-filled) and the existing full-coverage requirement suppresses entries that depend on it.
+        stored = unverified.Exclude(stored).ToList();
         var futuresBars = bars.ToDictionary(b => b.BarSeq, b => FuturesBarOf(b, sup.GetValueOrDefault(b.BarSeq)));
         var history = new ContractHistory(ContractBars(stored, tokens, session.Expiry, endBar), bars.ToDictionary(b => b.BarSeq, b => b.DurationSeconds));
         var startOf = bars.ToDictionary(b => b.BarSeq, b => b.StartAvailableAtUtc);
