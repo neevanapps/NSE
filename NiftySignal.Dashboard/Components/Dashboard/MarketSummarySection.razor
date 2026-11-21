@@ -64,46 +64,16 @@
 
         @if (View.Grids.FirstOrDefault(x => x.Kind == GridKind.Total) is { } total)
         {
-            <div class="adaptive-subtitle" data-testid="summary-total-title">TOTAL SUMMARY <span class="text-faint">@Describe(total, basket)</span></div>
-            <div class="adaptive-table-wrap">
-                <table class="adaptive-table adaptive-table-compact" data-grid="summary-total">
-                    <thead>
-                    <tr>
-                        <th>Window</th><th>Coverage</th>
-                        <th>Price Dir</th><th>Roll Dir</th><th>Strict Dir</th><th>Enriched Dir</th>
-                        <th title="PE − CE">OI Dir</th><th title="displayed inverted: displayed = −raw (CE − PE)">MicroDev Dir (Inv)</th><th>OFI Dir</th>
-                        <th title="displayed inverted: displayed = −raw (CE − PE)">@DirectionDisplay.IvLabel</th><th title="displayed inverted: displayed = −raw (CE − PE); ×100 display scaling">@DirectionDisplay.DeltaLabel</th><th title="displayed inverted: displayed = −raw (CE − PE); ×100 display scaling">@DirectionDisplay.VegaLabel</th><th>Activity Dir</th>
-                    </tr>
-                    </thead>
-                    <tbody>
-                    @foreach (var r in total.Rows)
-                    {
-                        <tr data-window="@r.Window.Name">
-                            <td class="sticky-col">@r.Window.Name</td>
-                            <td title="@CoverageTitle(r.Coverage)" data-coverage="@r.Coverage.Status">@r.Coverage.Text@Deficits(r.Coverage, TotalFamilies)</td>
-                            @if (r.Direction is null)
-                            {
-                                @for (var i = 0; i < 11; i++) { <td>—</td> }
-                            }
-                            else
-                            {
-                                var d = r.Direction;
-                                @Dir(d.Price, 2)
-                                @Dir(d.Roll, 2)
-                                @Dir(d.Strict, 0)
-                                @Dir(d.Enriched, 0)
-                                @Dir(d.Oi, 0)
-                                @Dir(MicroDevDisplay.Invert(d.MicroDev), 2)
-                                @Dir(d.Ofi, 0)
-                                @Dir(DirectionDisplay.Invert(d.Iv), 2)
-                                @Dir(DirectionDisplay.Invert(d.Delta), 2, scale100: true)
-                                @Dir(DirectionDisplay.Invert(d.Vega), 2, scale100: true)
-                                @Dir(d.Activity, 1)
-                            }
-                        </tr>
-                    }
-                    </tbody>
-                </table>
+            <div class="total-grids" data-testid="summary-total-grids">
+                <div class="total-grid-cell">@TotalGrid(total, basket, "TOTAL SUMMARY", "summary-total", "summary-total-title")</div>
+                @if (ShowLowerUpper && View.Lower is { } lower && View.LowerBasket is { } lowerBasket)
+                {
+                    <div class="total-grid-cell">@TotalGrid(lower, lowerBasket, "TOTAL SUMMARY - LOWER (ATM-1 step)", "summary-total-lower", "summary-total-lower-title")</div>
+                }
+                @if (ShowLowerUpper && View.Upper is { } upper && View.UpperBasket is { } upperBasket)
+                {
+                    <div class="total-grid-cell">@TotalGrid(upper, upperBasket, "TOTAL SUMMARY - UPPER (ATM+1 step)", "summary-total-upper", "summary-total-upper-title")</div>
+                }
             </div>
         }
     }
@@ -111,6 +81,55 @@
 
 @code {
     [Parameter] public MarketSummaryView? View { get; set; }
+
+    /// <summary>Lower / Upper TOTAL grids beside the ATM one. Off for the Telegram capture, which keeps its six-grid layout (the ATM TOTAL only).</summary>
+    [Parameter] public bool ShowLowerUpper { get; set; } = true;
+
+    RenderFragment TotalGrid(GridSummary grid, Basket basket, string title, string gridId, string testId) => @<text>
+    <div class="adaptive-subtitle" data-testid="@testId">@title <span class="text-faint">@Describe(grid, basket)</span></div>
+    <div class="adaptive-table-wrap">
+        <table class="adaptive-table adaptive-table-compact" data-grid="@gridId">
+            <thead>
+            <tr>
+                <th>Window</th><th>Coverage</th>
+                <th>Price Dir</th><th>Roll Dir</th><th>Strict Dir</th><th>Enriched Dir</th>
+                <th title="PE − CE">OI Dir</th><th title="displayed inverted: displayed = −raw (CE − PE)">MicroDev Dir (Inv)</th><th>OFI Dir</th>
+                <th title="displayed inverted: displayed = −raw (CE − PE)">@DirectionDisplay.IvLabel</th><th title="displayed inverted: displayed = −raw (CE − PE); ×100 display scaling">@DirectionDisplay.DeltaLabel</th><th title="displayed inverted: displayed = −raw (CE − PE); ×100 display scaling">@DirectionDisplay.VegaLabel</th><th>Activity Dir</th>
+            </tr>
+            </thead>
+            <tbody>
+            @foreach (var r in grid.Rows)
+            {
+                <tr data-window="@r.Window.Name">
+                    <td class="sticky-col">@r.Window.Name</td>
+                    <td title="@CoverageTitle(r.Coverage)" data-coverage="@r.Coverage.Status">@r.Coverage.Text@Deficits(r.Coverage, TotalFamilies)</td>
+                    @if (r.Direction is null)
+                    {
+                        @for (var i = 0; i < 11; i++) { <td>—</td> }
+                    }
+                    else
+                    {
+                        var d = r.Direction;
+                        @Dir(d.Price, 2)
+                        @Dir(d.Roll, 2)
+                        @Dir(d.Strict, 0)
+                        @Dir(d.Enriched, 0)
+                        @Dir(d.Oi, 0)
+                        @Dir(MicroDevDisplay.Invert(d.MicroDev), 2)
+                        @Dir(d.Ofi, 0)
+                        @Dir(DirectionDisplay.Invert(d.Iv), 2)
+                        @Dir(DirectionDisplay.Invert(d.Delta), 2, scale100: true)
+                        @Dir(DirectionDisplay.Invert(d.Vega), 2, scale100: true)
+                        @Dir(d.Activity, 1)
+                    }
+                </tr>
+            }
+            </tbody>
+        </table>
+    </div>
+
+    </text>;
+
 
     static string Sc(SummaryMetric m) => RatioFormat.SignedClass(m.Raw);
 

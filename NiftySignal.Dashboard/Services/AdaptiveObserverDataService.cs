@@ -262,8 +262,8 @@ public sealed class AdaptiveObserverDataService(
 
     /// <summary>
     /// The Market Summary grids for ONE session, pinned at completed bar <paramref name="endBarSeq"/> (no bar after it is read). The basket is the session's frozen weekly expiry resolved around
-    /// <paramref name="centreStrike"/> - the strike the Dashboard has selected (Auto Follow = the authoritative centre of the latest completed bar; manual pin = the pinned strike; a historical capture =
-    /// the centre of the target bar). One scoped query reads the ten exact tokens; a missing table or missing rows yields coverage gaps, never another strike.
+    /// <paramref name="centreStrike"/> - the authoritative ATM centre of the latest completed bar (the pinned target bar for a historical view), independent of the fixed-strike selector. The Lower (centre -1 listed step) and
+    /// Upper (+1 step) TOTAL grids use the same centre. One scoped query reads the exact tokens of ATM-3..ATM+3; a missing table or missing rows yields coverage gaps, never another strike.
     /// </summary>
     public async Task<MarketSummaryView> LoadMarketSummaryAsync(long sessionId, int endBarSeq, FixedStrikeCatalog? catalog, double? centreStrike, CancellationToken ct = default)
     {
@@ -272,8 +272,13 @@ public sealed class AdaptiveObserverDataService(
             return MarketSummaryView.Unavailable(endBarSeq, catalog is null ? "no frozen option universe for this session" : centreStrike is null ? "no centre strike selected" : "no completed bar");
         }
 
-        var basket = NiftySignal.MarketSummary.BasketResolver.Resolve(catalog.Expiry, centre, MarketSummaryMapper.Listed(catalog));
-        var tokens = basket.Contracts.Where(c => c.Token is not null).Select(c => c.Token!).ToHashSet(StringComparer.Ordinal);
+        var listed = MarketSummaryMapper.Listed(catalog);
+        var basket = NiftySignal.MarketSummary.BasketResolver.Resolve(catalog.Expiry, centre, listed);
+        // Lower (ATM-1 step) and Upper (ATM+1 step) around the SAME centre: the history below is read once for the union of the three baskets (ATM-3..ATM+3).
+        var lowerBasket = NiftySignal.MarketSummary.BasketResolver.Resolve(catalog.Expiry, centre, listed, -1);
+        var upperBasket = NiftySignal.MarketSummary.BasketResolver.Resolve(catalog.Expiry, centre, listed, 1);
+        var allBaskets = new[] { basket, lowerBasket, upperBasket };
+        var tokens = allBaskets.SelectMany(b => b.Contracts).Where(c => c.Token is not null).Select(c => c.Token!).ToHashSet(StringComparer.Ordinal);
         List<AdaptiveFutureBarRow> bars;
         Dictionary<int, AdaptiveFuturesSupplementalRow> sup;
         List<AdaptiveOptionStrikeBarRow> stored = [];
@@ -288,7 +293,7 @@ public sealed class AdaptiveObserverDataService(
             if (tokens.Count > 0)
             {
                 // Scoped by the indexed (SessionId, Expiry, Strike, Side, BarSeq) key: the five strikes of the basket only, never the whole universe. The exact-token filter is applied by the mapper.
-                var strikeArray = basket.Contracts.Where(c => c.Strike is not null).Select(c => c.Strike!.Value).Distinct().ToArray();
+                var strikeArray = allBaskets.SelectMany(b => b.Contracts).Where(c => c.Strike is not null).Select(c => c.Strike!.Value).Distinct().ToArray();
                 var expiry = catalog.Expiry;
                 try
                 {
@@ -320,7 +325,14 @@ public sealed class AdaptiveObserverDataService(
                 endOf.TryGetValue(endBarSeq, out var e) ? e : null);
         }).ToList();
         return new MarketSummaryView(endBarSeq, basket, NiftySignal.MarketSummary.FuturesSummaryCalculator.Compute(futures, endBarSeq),
-            NiftySignal.MarketSummary.OptionSummaryCalculator.ComputeAll(basket, history, endBarSeq), null, instants) { Unverified = unverifiedNotes };
+            NiftySignal.MarketSummary.OptionSummaryCalculator.ComputeAll(basket, history, endBarSeq), null, instants)
+        {
+            Unverified = unverifiedNotes,
+            LowerBasket = lowerBasket,
+            Lower = NiftySignal.MarketSummary.OptionSummaryCalculator.Compute(lowerBasket, NiftySignal.MarketSummary.GridKind.Total, history, endBarSeq),
+            UpperBasket = upperBasket,
+            Upper = NiftySignal.MarketSummary.OptionSummaryCalculator.Compute(upperBasket, NiftySignal.MarketSummary.GridKind.Total, history, endBarSeq),
+        };
     }
 
     /// <summary>Bars (of the displayed range) whose sidecar carries a durable failed-verification marker. Tolerates a not-yet-migrated schema.</summary>

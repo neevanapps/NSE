@@ -40,6 +40,51 @@ public class MarketSummarySectionRenderTests
             OptionSummaryCalculator.ComputeAll(basket, new ContractHistory(all, durations), bars), null);
     }
 
+    internal static MarketSummaryView ViewWithLowerUpper(int bars)
+    {
+        var listed = Enumerable.Range(0, 11).Select(i => 25_750d + i * 50).Select(x => new ListedStrike(x, $"CE{x:0}", $"PE{x:0}")).ToList();
+        var basket = BasketResolver.Resolve(Expiry, 26_000, listed);
+        var lowerB = BasketResolver.Resolve(Expiry, 26_000, listed, -1);
+        var upperB = BasketResolver.Resolve(Expiry, 26_000, listed, 1);
+        var r = new Random(5);
+        var tokens = lowerB.Contracts.Concat(basket.Contracts).Concat(upperB.Contracts).Where(c => c.Token is not null).DistinctBy(c => c.Token).ToList();
+        var all = new List<ContractBar>();
+        for (var seq = 1; seq <= bars; seq++)
+            foreach (var c in tokens)
+                all.Add(new ContractBar(seq, c.Token!, c.IsCall, 100, 101 + r.Next(5), 500, 20, 100, 90, 10, 10, 1000, 1010, 12, 12.5, 0.42, 0.45, 5, 5.5, 0.1, 0.2, 10, 10, 50));
+        var history = new ContractHistory(all, Enumerable.Range(1, bars).ToDictionary(i => i, _ => 30d));
+        var fut = Enumerable.Range(1, bars).ToDictionary(i => i, i => new FuturesBar(i, 30, 26_000, 26_001, 13_650, 100, 100, 100, 10, 5, 1000, 1010, 0.1, 0.1, 20, 20, 5, 50));
+        return new MarketSummaryView(bars, basket, FuturesSummaryCalculator.Compute(fut, bars), OptionSummaryCalculator.ComputeAll(basket, history, bars), null)
+        {
+            LowerBasket = lowerB, Lower = OptionSummaryCalculator.Compute(lowerB, GridKind.Total, history, bars),
+            UpperBasket = upperB, Upper = OptionSummaryCalculator.Compute(upperB, GridKind.Total, history, bars),
+        };
+    }
+
+    [Fact]
+    public async Task Render_LowerAtmUpper_ThreeLabelledTotalGrids_EachWithFiveRows_AndTheirOwnStrikes()
+    {
+        var html = await RenderAsync(ViewWithLowerUpper(120));
+        foreach (var g in new[] { "summary-total", "summary-total-lower", "summary-total-upper" }) Assert.Equal(5, BodyRows(html, g));
+        Assert.Contains("TOTAL SUMMARY - LOWER (ATM-1 step)", html);
+        Assert.Contains("TOTAL SUMMARY - UPPER (ATM+1 step)", html);
+        Assert.Equal(new[] { "summary-futures", "summary-total", "summary-total-lower", "summary-total-upper" }, Regex.Matches(html, "data-grid=\"([^\"]+)\"").Select(m => m.Groups[1].Value).ToArray());
+        var lower = Regex.Match(html, "data-testid=\"summary-total-lower-title\".*?</div>", RegexOptions.Singleline).Value;
+        Assert.Contains("CE 25850", lower); Assert.Contains("PE 25850", lower); Assert.DoesNotContain("26100", lower);
+        var upper = Regex.Match(html, "data-testid=\"summary-total-upper-title\".*?</div>", RegexOptions.Singleline).Value;
+        Assert.Contains("CE 26150", upper); Assert.Contains("PE 26150", upper); Assert.DoesNotContain("25900", upper);
+    }
+
+    [Fact]
+    public async Task Render_WithoutLowerUpper_OrInCaptureMode_KeepsTheSingleTotalGrid()
+    {
+        Assert.Equal(["summary-futures", "summary-total"], Regex.Matches(await RenderAsync(View(120)), "data-grid=\"([^\"]+)\"").Select(m => m.Groups[1].Value).ToArray());
+        var services = new ServiceCollection().AddLogging().BuildServiceProvider();
+        await using var renderer = new HtmlRenderer(services, services.GetRequiredService<ILoggerFactory>());
+        var capture = await renderer.Dispatcher.InvokeAsync(async () => (await renderer.RenderComponentAsync<MarketSummarySection>(ParameterView.FromDictionary(new Dictionary<string, object?> { ["View"] = ViewWithLowerUpper(120), ["ShowLowerUpper"] = false }))).ToHtmlString());
+        Assert.Equal(["summary-futures", "summary-total"], Regex.Matches(capture, "data-grid=\"([^\"]+)\"").Select(m => m.Groups[1].Value).ToArray());
+    }
+
     static int BodyRows(string html, string grid)
     {
         var table = Regex.Match(html, "<table[^>]*data-grid=\"" + Regex.Escape(grid) + "\".*?</table>", RegexOptions.Singleline).Value;

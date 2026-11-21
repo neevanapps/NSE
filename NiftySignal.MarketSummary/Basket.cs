@@ -37,7 +37,14 @@ public static class BasketResolver
     /// Classification: CE is ITM below the centre, ATM at it, OTM above; PE is the mirror image (OTM below, ITM above). Always returns the ten slots; unresolved slots have a null token and a
     /// problem line. Δ is the gap to the next listed strike above the centre (the one below if there is none above).
     /// </summary>
-    public static Basket Resolve(DateOnly expiry, double center, IReadOnlyList<ListedStrike> listed)
+    public static Basket Resolve(DateOnly expiry, double center, IReadOnlyList<ListedStrike> listed) => Resolve(expiry, center, listed, 0);
+
+    /// <summary>
+    /// The same ten-slot basket shifted by <paramref name="shiftSteps"/> listed steps (Lower = -1, Upper = +1) from the latest completed bar's ATM <paramref name="center"/>: the slots are the strikes
+    /// center + (offset + shift) x step for offset -2..2, CE and PE using the SAME five strikes. The returned <see cref="Basket.Center"/> is the shifted centre; slot offsets stay -2..2 around it.
+    /// Step is the listed interval at the ATM centre. A slot that is not listed (ladder edge, gap) stays unresolved with a problem line - never another strike, expiry or token.
+    /// </summary>
+    public static Basket Resolve(DateOnly expiry, double center, IReadOnlyList<ListedStrike> listed, int shiftSteps)
     {
         var problems = new List<string>();
         var byStrike = new Dictionary<double, ListedStrike>();
@@ -55,7 +62,7 @@ public static class BasketResolver
         var contracts = new List<BasketContract>(10);
         for (var off = -Basket.HalfWidth; off <= Basket.HalfWidth; off++)
         {
-            double? strike = step is { } d and > 0d ? center + off * d : null;
+            double? strike = step is { } d and > 0d ? center + (off + shiftSteps) * d : null;
             ListedStrike? l = strike is { } s && byStrike.TryGetValue(s, out var found) ? found : null;
             if (l is null) problems.Add(strike is { } s2 ? $"strike {s2:0.##} (offset {off:+0;-0;0}) is not listed" : $"offset {off:+0;-0;0} cannot be resolved (no listed interval)");
             foreach (var isCall in new[] { true, false })
@@ -67,6 +74,7 @@ public static class BasketResolver
             }
         }
 
-        return new Basket(expiry, center, step, contracts, problems);
+        var shiftedCentre = step is { } sd and > 0d ? center + shiftSteps * sd : center;
+        return new Basket(expiry, shiftedCentre, step, contracts, problems);
     }
 }

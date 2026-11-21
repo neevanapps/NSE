@@ -139,4 +139,64 @@ public class MarketSummaryDataServiceTests
         Assert.Equal("no centre strike selected", (await Service(f).LoadMarketSummaryAsync(1, 5, Catalog(), null)).UnavailableReason);
         Assert.Equal("no completed bar", (await Service(f).LoadMarketSummaryAsync(1, 0, Catalog(), 26_000)).UnavailableReason);
     }
+
+    static string[] TokensOf(Basket? b) => b!.Contracts.Select(c => c.Token!).OrderBy(x => x).ToArray();
+
+    [Fact]
+    public async Task LowerAndUpper_UseTheSameCentre_FiveStrikesEachForCeAndPe_AndReuseTheTotalCalculation()
+    {
+        var f = await SeedAsync(120);
+        var v = await Service(f).LoadMarketSummaryAsync(1, 120, Catalog(), 26_000);
+        Assert.Equal(new[] { "CE25850", "CE25900", "CE25950", "CE26000", "CE26050", "PE25850", "PE25900", "PE25950", "PE26000", "PE26050" }, TokensOf(v.LowerBasket));
+        Assert.Equal(new[] { "CE25900", "CE25950", "CE26000", "CE26050", "CE26100", "PE25900", "PE25950", "PE26000", "PE26050", "PE26100" }, TokensOf(v.Basket));
+        Assert.Equal(new[] { "CE25950", "CE26000", "CE26050", "CE26100", "CE26150", "PE25950", "PE26000", "PE26050", "PE26100", "PE26150" }, TokensOf(v.UpperBasket));
+        Assert.All(new[] { v.Lower!, v.Upper!, v.Grids.Single(g => g.Kind == GridKind.Total) }, g =>
+        {
+            Assert.Equal(GridKind.Total, g.Kind);
+            Assert.Equal(new[] { "5 Bars", "10 Bars", "50 Bars", "100 Bars", "Day" }, g.Rows.Select(r => r.Window.Name));
+            Assert.All(g.Rows, r => Assert.Equal("10/10 – FULL", r.Coverage.Text));
+        });
+        // the Lower grid is exactly what the ordinary TOTAL calculation gives for the shifted basket
+        var viaMain = (await Service(f).LoadMarketSummaryAsync(1, 120, Catalog(), 25_950)).Grids.Single(g => g.Kind == GridKind.Total);
+        Assert.Equivalent(viaMain, v.Lower, strict: true);
+    }
+
+    [Fact]
+    public async Task WhenTheCentreMoves_LowerAndUpperFollow()
+    {
+        var f = await SeedAsync(120);
+        var a = await Service(f).LoadMarketSummaryAsync(1, 120, Catalog(), 26_000);
+        var b = await Service(f).LoadMarketSummaryAsync(1, 120, Catalog(), 26_050);
+        Assert.Equal(25_950d, a.LowerBasket!.Center); Assert.Equal(26_000d, b.LowerBasket!.Center);
+        Assert.Equal(26_050d, a.UpperBasket!.Center); Assert.Equal(26_100d, b.UpperBasket!.Center);
+        Assert.Contains("CE26200", TokensOf(b.UpperBasket)); Assert.DoesNotContain("CE26200", TokensOf(a.UpperBasket));
+    }
+
+    [Fact]
+    public async Task LowerUpper_OnAnOldBarWithoutOuterStrikeRows_AreUnavailableNotWrong_WhileAtmIsUnaffected()
+    {
+        var f = await SeedAsync(60);
+        await using (var db = f.CreateDbContext())
+        {
+            db.OptionStrikeBars.RemoveRange(db.OptionStrikeBars.Where(x => x.Strike == 25_850 || x.Strike == 26_150));   // ATM-3 / ATM+3 were never stored for this old session
+            await db.SaveChangesAsync();
+        }
+
+        var v = await Service(f).LoadMarketSummaryAsync(1, 60, Catalog(), 26_000);
+        Assert.All(v.Grids.Single(g => g.Kind == GridKind.Total).Rows.Take(3), r => Assert.Equal(CoverageStatus.Full, r.Coverage.Status));
+        foreach (var g in new[] { v.Lower!, v.Upper! })
+            Assert.All(g.Rows.Take(3), r => { Assert.NotEqual(CoverageStatus.Full, r.Coverage.Status); Assert.Equal(8, r.Coverage.Included == 0 ? 8 : r.Coverage.Included); });
+        Assert.DoesNotContain(v.Lower!.Rows, r => r.Coverage.Included > 8);
+    }
+
+    [Fact]
+    public async Task LowerUpper_AtTheLadderEdge_LeaveTheMissingSlotsUnresolved()
+    {
+        var f = await SeedAsync(60);
+        var v = await Service(f).LoadMarketSummaryAsync(1, 60, Catalog(), 26_200);     // ladder tops out at 26250: Upper wants 26150..26350
+        Assert.Equal(4, v.UpperBasket!.Contracts.Count(c => c.Token is null));
+        Assert.NotEmpty(v.UpperBasket.Problems);
+        Assert.All(v.Upper!.Rows.Take(3), r => Assert.NotEqual(CoverageStatus.Full, r.Coverage.Status));
+        Assert.DoesNotContain(v.UpperBasket.Contracts, c => c.Token is { } t && (t.EndsWith("26300") || t.EndsWith("26350")));
+    }
 }
