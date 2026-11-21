@@ -23,6 +23,11 @@
             }
         </div>
 
+        @if (View.Unverified.Count > 0)
+        {
+            <div class="adaptive-alert" data-testid="market-summary-unverified" title="Stored per-strike rows disagreed with the values reconstructed after a restart; they are withheld, so the affected windows show reduced coverage.">UNVERIFIED per-strike data withheld (not shown as observations): @string.Join(", ", View.Unverified.Take(12))@(View.Unverified.Count > 12 ? $" … +{View.Unverified.Count - 12} more" : "")</div>
+        }
+
         <div class="adaptive-subtitle" data-testid="summary-futures-title">FUTURES SUMMARY</div>
         <div class="adaptive-table-wrap">
             <table class="adaptive-table adaptive-table-compact" data-grid="summary-futures">

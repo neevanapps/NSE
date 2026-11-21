@@ -549,6 +549,8 @@ public static class AdaptiveProjectionComponents
     public const string OptionsSupplemental = "options-supplemental";
     public const string Commentary = "commentary";
     public const string BasisSupplemental = "basis-supplemental";
+    /// <summary>Per-strike option bars whose stored rows disagreed with the reconstructed values after a restart. One row per (session, version, bar); Detail lists the unverified tokens (see <see cref="UnverifiedStrikeBars"/>).</summary>
+    public const string OptionStrikeBars = "option-strike-bars";
 }
 
 /// <summary>

@@ -182,14 +182,16 @@ public sealed class AgentSnapshotService(
         }
         else
         {
-            if (contract.CeToken is not null && ceRow is null) issues.Add("fixed-strike CE row missing");
-            if (contract.PeToken is not null && peRow is null) issues.Add("fixed-strike PE row missing");
+            if (fixedRow?.CeUnverified == true) issues.Add("fixed-strike CE UNVERIFIED (stored row disagrees with reconstruction; withheld)");
+            else if (contract.CeToken is not null && ceRow is null) issues.Add("fixed-strike CE row missing");
+            if (fixedRow?.PeUnverified == true) issues.Add("fixed-strike PE UNVERIFIED (stored row disagrees with reconstruction; withheld)");
+            else if (contract.PeToken is not null && peRow is null) issues.Add("fixed-strike PE row missing");
         }
 
         var options = new AgentOptions(
             catalog?.Expiry.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture), selectedStrike, center,
-            Side(ceRow, contract?.CeToken, contract?.CeSymbol, quotes?.Ce, b.EndAvailableAtUtc),
-            Side(peRow, contract?.PeToken, contract?.PeSymbol, quotes?.Pe, b.EndAvailableAtUtc),
+            Side(ceRow, contract?.CeToken, contract?.CeSymbol, quotes?.Ce, b.EndAvailableAtUtc) with { Unverified = fixedRow?.CeUnverified == true },
+            Side(peRow, contract?.PeToken, contract?.PeSymbol, quotes?.Pe, b.EndAvailableAtUtc) with { Unverified = fixedRow?.PeUnverified == true },
             dir);
 
         // Residual (the Dashboard's default ATM +/- 2 band): before the 09:30 anchor exists an absent row is by design; after it, it is missing input.

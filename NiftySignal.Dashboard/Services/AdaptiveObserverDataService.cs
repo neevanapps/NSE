@@ -234,11 +234,13 @@ public sealed class AdaptiveObserverDataService(
             ? displayed
             : Enumerable.Range(Math.Max(1, displayed.Min() - (rollWindowBars - 1)), displayed.Max() - Math.Max(1, displayed.Min() - (rollWindowBars - 1)) + 1).ToArray();
         IReadOnlyList<AdaptiveOptionStrikeBarRow> stored = Array.Empty<AdaptiveOptionStrikeBarRow>();
+        var unverified = UnverifiedStrikeBars.None;
         if (seqs.Length > 0)
         {
             try
             {
                 await using var db = await dbFactory.CreateDbContextAsync(ct);
+                unverified = await UnverifiedStrikeBars.LoadAsync(db, sessionId, seqs.Max(), ct);
                 var version = OptionStrikeBarMetrics.MetricsVersion;
                 var previous = OptionStrikeBarMetrics.PreviousMetricsVersion;
                 var legacy = OptionStrikeBarMetrics.LegacyMetricsVersion;
@@ -255,7 +257,7 @@ public sealed class AdaptiveObserverDataService(
             }
         }
 
-        return FixedStrikeProjection.Assemble(catalog, contract, bars, stored, rollWindowBars);
+        return FixedStrikeProjection.Assemble(catalog, contract, bars, stored, rollWindowBars, unverified);
     }
 
     /// <summary>
@@ -275,8 +277,10 @@ public sealed class AdaptiveObserverDataService(
         List<AdaptiveFutureBarRow> bars;
         Dictionary<int, AdaptiveFuturesSupplementalRow> sup;
         List<AdaptiveOptionStrikeBarRow> stored = [];
+        var unverified = UnverifiedStrikeBars.None;
         await using (var db = await dbFactory.CreateDbContextAsync(ct))
         {
+            unverified = await UnverifiedStrikeBars.LoadAsync(db, sessionId, endBarSeq, ct);
             bars = await db.FutureBars.AsNoTracking().Where(x => x.SessionId == sessionId && x.BarSeq <= endBarSeq).OrderBy(x => x.BarSeq).ToListAsync(ct);
             var seqs = bars.Select(x => x.BarSeq).ToArray();
             var invalidFutures = await LoadInvalidBarsAsync(db, sessionId, AdaptiveProjectionComponents.FuturesSupplemental, FuturesMicrostructureBar.MetricsVersion, seqs, ct);
@@ -300,6 +304,10 @@ public sealed class AdaptiveObserverDataService(
         }
 
         var futures = bars.ToDictionary(b => b.BarSeq, b => MarketSummaryMapper.FuturesBarOf(b, sup.GetValueOrDefault(b.BarSeq)));
+        // A4: strike bars recovery found disagreeing with the reconstruction are withheld (a coverage gap, never a normal observation) and listed in the view.
+        var unverifiedNotes = stored.Where(r => unverified.IsUnverified(r.BarSeq, r.Token)).Select(r => $"{r.TradingSymbol ?? r.Token} bar {r.BarSeq}").Distinct().OrderBy(x => x, StringComparer.Ordinal).ToList();
+        if (unverified.TablePending) unverifiedNotes.Add("verification markers unavailable - migration pending");
+        stored = unverified.Exclude(stored).ToList();
         var history = new NiftySignal.MarketSummary.ContractHistory(MarketSummaryMapper.ContractBars(stored, tokens, catalog.Expiry, endBarSeq), bars.ToDictionary(b => b.BarSeq, b => b.DurationSeconds));
         // The boundaries of each window (start of its first bar, end of the target bar) for the as-of VIX alignment; bars are completed bars through the target only.
         var startOf = bars.ToDictionary(b => b.BarSeq, b => b.StartAvailableAtUtc);
@@ -312,7 +320,7 @@ public sealed class AdaptiveObserverDataService(
                 endOf.TryGetValue(endBarSeq, out var e) ? e : null);
         }).ToList();
         return new MarketSummaryView(endBarSeq, basket, NiftySignal.MarketSummary.FuturesSummaryCalculator.Compute(futures, endBarSeq),
-            NiftySignal.MarketSummary.OptionSummaryCalculator.ComputeAll(basket, history, endBarSeq), null, instants);
+            NiftySignal.MarketSummary.OptionSummaryCalculator.ComputeAll(basket, history, endBarSeq), null, instants) { Unverified = unverifiedNotes };
     }
 
     /// <summary>Bars (of the displayed range) whose sidecar carries a durable failed-verification marker. Tolerates a not-yet-migrated schema.</summary>

@@ -63,7 +63,8 @@ public sealed record AgentOptionSide(
     double? MicroDevRaw,
     long? Ofi,
     long? GrossOfi,
-    double? ActivityPerSec);
+    double? ActivityPerSec,
+    bool Unverified = false);   // additive in agent-v1: true = a stored row exists but recovery found it disagreeing with the reconstruction; withheld (values null, RowAvailable false, bar DataOk false)
 
 /// <summary>A displayed cell as the Dashboard builds it: the raw value and the ratio in percentage points (numerator / denominator x 100). Both null when unavailable.</summary>
 public sealed record AgentRatio(double? Raw, double? RatioPct);

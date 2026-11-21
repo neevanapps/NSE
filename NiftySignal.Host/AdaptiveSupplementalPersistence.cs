@@ -207,9 +207,15 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
 
             var byToken = existing.ToDictionary(x => x.Token, StringComparer.Ordinal);
             string? difference = existing.Count != expected.Count ? $"row count {existing.Count} vs {expected.Count}" : null;
+            var badTokens = new List<string>();
             foreach (var row in expected)
             {
-                difference ??= byToken.TryGetValue(row.Token, out var stored) ? FirstDifference(stored, row) : $"token {row.Token} missing";
+                var d = byToken.TryGetValue(row.Token, out var stored) ? FirstDifference(stored, row) : $"token {row.Token} missing";
+                if (d is not null)
+                {
+                    badTokens.Add(row.Token);
+                    difference ??= d;
+                }
             }
 
             if (difference is null)
@@ -219,6 +225,9 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
 
             Interlocked.Increment(ref _mismatches);
             logger.LogError("Adaptive per-strike projection mismatch (rows left untouched): session={SessionId}, bar={BarSeq}, {Difference}", sessionId, package.FutureBar.BarSeq, difference);
+            // A4: durably mark the affected strikes of this bar UNVERIFIED (reuses the known-invalid ledger; no schema change). A count-only mismatch with no differing token marks the whole bar.
+            // Recording a marker is best-effort for this display sidecar: the returned outcome is unchanged.
+            await RecordInvalidAsync(db, sessionId, AdaptiveProjectionComponents.OptionStrikeBars, version, package.FutureBar.BarSeq, UnverifiedStrikeBars.FormatDetail(badTokens, difference), ct);
             return SupplementalOutcome.Mismatch;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)

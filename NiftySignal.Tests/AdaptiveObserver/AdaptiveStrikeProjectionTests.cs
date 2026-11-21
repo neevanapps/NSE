@@ -180,4 +180,53 @@ public sealed class AdaptiveStrikeProjectionTests
         };
         Assert.True(await service.PersistAndVerifyAsync(db, session, packages[0], default));
     }
+
+    [Fact]
+    public async Task A4_AMismatch_IsDurablyMarkedUnverified_PerToken_AndReadersWithholdIt()
+    {
+        var (freeze, groups) = Session();
+        var packages = Run(NewEngine(freeze, true), groups);
+        await using var db = Database();
+        var service = new AdaptiveSupplementalPersistence(NullLogger<AdaptiveSupplementalPersistence>.Instance);
+        foreach (var p in packages.Take(3)) await service.PersistOrVerifyStrikesAsync(db, 1, p, default);
+        db.ChangeTracker.Clear();
+        var stored = await db.OptionStrikeBars.OrderBy(x => x.BarSeq).ThenBy(x => x.Token).FirstAsync();
+        stored.StrictBuy += 7;
+        await db.SaveChangesAsync();
+        db.ChangeTracker.Clear();
+        var replay = Run(NewEngine(freeze, true), groups);
+
+        Assert.Equal(SupplementalOutcome.Mismatch, await service.PersistOrVerifyStrikesAsync(db, 1, replay[stored.BarSeq - 1], default));
+        Assert.Equal(SupplementalOutcome.Mismatch, await service.PersistOrVerifyStrikesAsync(db, 1, replay[stored.BarSeq - 1], default));   // second restart: idempotent, still one marker
+        var marker = await db.ProjectionHealth.SingleAsync();
+        Assert.Equal(AdaptiveProjectionComponents.OptionStrikeBars, marker.Component);
+        Assert.Equal(OptionStrikeBarMetrics.MetricsVersion, marker.Version);
+        Assert.Equal(stored.BarSeq, marker.BarSeq);
+        Assert.StartsWith($"tokens={stored.Token};", marker.Detail);
+
+        var unverified = await UnverifiedStrikeBars.LoadAsync(db, 1, 100, default);
+        Assert.True(unverified.IsUnverified(stored.BarSeq, stored.Token));
+        Assert.False(unverified.IsUnverified(stored.BarSeq, "OTHER"));
+        Assert.False(unverified.IsUnverified(stored.BarSeq + 1, stored.Token));
+
+        // The fixed-strike reader withholds exactly that cell (null, flagged), never serves it, and the neighbours stay normal.
+        var all = await db.OptionStrikeBars.AsNoTracking().ToListAsync();
+        var catalog = new NiftySignal.Dashboard.Services.FixedStrikeCatalog(stored.Expiry, [new NiftySignal.Dashboard.Services.FixedStrikeContract(stored.Strike, stored.Side == OptionType.Call ? stored.Token : null, "CE", stored.Side == OptionType.Put ? stored.Token : null, "PE")]);
+        var seqs = all.Select(x => x.BarSeq).Distinct().OrderBy(x => x).Select(x => (x, DateTimeOffset.UtcNow)).ToList();
+        var h = NiftySignal.Dashboard.Services.FixedStrikeProjection.Assemble(catalog, catalog.Strikes[0], seqs, all, 0, unverified);
+        var row = h.Rows.Single(r => r.BarSeq == stored.BarSeq);
+        var cell = stored.Side == OptionType.Call ? row.Ce : row.Pe;
+        Assert.Null(cell);
+        Assert.True(stored.Side == OptionType.Call ? row.CeUnverified : row.PeUnverified);
+        Assert.DoesNotContain(h.Rows.Where(r => r.BarSeq != stored.BarSeq), r => r.CeUnverified || r.PeUnverified);
+    }
+
+    [Fact]
+    public void A4_MarkerDetail_RoundTrips_AndFallsBackToWholeBar()
+    {
+        Assert.Equal(new[] { "A1", "B2" }, UnverifiedStrikeBars.ParseTokens(UnverifiedStrikeBars.FormatDetail(["B2", "A1"], "x vs y"))!.OrderBy(x => x).ToArray());
+        Assert.Null(UnverifiedStrikeBars.ParseTokens(UnverifiedStrikeBars.FormatDetail([], "row count 3 vs 4")));      // count-only mismatch: every strike of the bar
+        Assert.Null(UnverifiedStrikeBars.ParseTokens("garbage"));                                                      // unreadable: conservative
+        Assert.True(UnverifiedStrikeBars.FormatDetail(Enumerable.Range(0, 200).Select(i => $"NFO{i:00000}").ToList(), "d").Length <= 512);
+    }
 }
