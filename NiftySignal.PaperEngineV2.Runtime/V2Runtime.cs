@@ -193,19 +193,51 @@ public sealed class V2Runtime : IAsyncDisposable
     async Task HandleNoticeAsync(V2BarNotice notice, CancellationToken ct)
     {
         var pipeline = await EnsurePipelineAsync(notice.Session, ct);
-        MarketStateFrame? frame; string? problem = null;
+        MarketStateFrame? frame; string? problem = null; Exception? thrown = null;
         try { (frame, problem) = await _frames.BuildAsync(notice with { HeldTokens = pipeline.Engine.HeldTokens }, pipeline.Builder, ct); }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-        catch (Exception ex) { frame = null; problem = $"{ex.GetType().Name}: {ex.Message}"; }
+        catch (Exception ex) { frame = null; problem = $"{ex.GetType().Name}: {ex.Message}"; thrown = ex; }
         if (frame is null)
         {
             Interlocked.Increment(ref _inputFailures);
-            pipeline.Handoff.OfferBuilt(() => throw new InvalidOperationException(problem ?? "frame unavailable"));       // registers a BuildFailure signal; the consumer sees a gap
+            ReportBuildFailure(notice, problem, thrown);
+            pipeline.Handoff.OfferBuilt(() => throw new InvalidOperationException(problem ?? "frame unavailable"), notice.Bar.BarSeq);       // registers a BuildFailure signal for this bar; the consumer sees a gap (or acknowledges it when it started after the bar)
             return;
         }
 
         Interlocked.Increment(ref _built);
         pipeline.Handoff.Offer(frame);
+    }
+
+    // ---- build-failure diagnostics (assembler task only; never the Observer thread) ----
+
+    readonly Dictionary<string, int> _failureCounts = new(StringComparer.Ordinal);
+    string? _lastInputProblem;
+    int _lastInputProblemBar;
+
+    /// <summary>The most recent reason a bar could not be turned into a frame (null if none yet), with its bar sequence. Diagnostics only.</summary>
+    public (string Reason, int BarSeq)? LastInputProblem => _lastInputProblem is { } r ? (r, _lastInputProblemBar) : null;
+
+    /// <summary>
+    /// Records WHY a bar produced no frame: session, trade date, bar, model version, centre strike, the reason and (for an unexpected exception) its type and stack. An expected "input unavailable" result is a Warning
+    /// without a stack; an exception is an Error with it. Rate limited per distinct reason (the first 3, then every 60th) so a persistent condition cannot flood the log. Never throws.
+    /// </summary>
+    void ReportBuildFailure(V2BarNotice notice, string? problem, Exception? thrown)
+    {
+        try
+        {
+            var reason = problem ?? "frame unavailable";
+            _lastInputProblem = reason; _lastInputProblemBar = notice.Bar.BarSeq;
+            var key = thrown is null ? reason : thrown.GetType().Name;
+            _failureCounts.TryGetValue(key, out var n); n++;
+            if (_failureCounts.Count > 64) _failureCounts.Clear();
+            _failureCounts[key] = n;
+            if (_log is null || (n > 3 && n % 60 != 0)) return;
+            const string template = "V2 frame unavailable (occurrence {Count} of this reason): session {Session} {TradeDate} bar {Bar} model {Model} centre {Centre} - {Reason}. Entries stay blocked until the contiguous-frame run is re-established.";
+            if (thrown is null) _log.LogWarning(template, n, notice.Session.SessionId, notice.Session.TradeDate, notice.Bar.BarSeq, notice.Session.ModelVersion, notice.CenterStrike?.ToString("0.##") ?? "none", reason);
+            else _log.LogError(thrown, template, n, notice.Session.SessionId, notice.Session.TradeDate, notice.Bar.BarSeq, notice.Session.ModelVersion, notice.CenterStrike?.ToString("0.##") ?? "none", reason);
+        }
+        catch (Exception) { }
     }
 
     async Task<SessionPipeline> EnsurePipelineAsync(V2SessionInfo session, CancellationToken ct)
