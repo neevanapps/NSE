@@ -129,6 +129,7 @@ public class MarketSummaryPerformanceTests(ITestOutputHelper output)
             }
 
             await db.SaveChangesAsync();
+            await db.AttestStrikesAsync();
         }
 
         var factory = new PgFactory(temp.ConnectionString);       // pooled, like the Dashboard

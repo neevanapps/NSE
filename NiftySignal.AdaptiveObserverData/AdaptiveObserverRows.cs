@@ -443,6 +443,22 @@ public sealed class AdaptiveBarCloseAtmRow
     public string? UnavailableReason { get; set; }
 }
 
+/// <summary>
+/// Durable POSITIVE verification of one bar's per-strike rows (A4). One row per (session, bar, metrics version); <see cref="Digests"/> lists every verified contract as <c>token=hash;...</c>
+/// (sorted), the hash being <see cref="StrikeAttestation.Digest"/> of the stored row. Written by the Host only together with the rows (atomic insert) or after a successful comparison of stored rows;
+/// readers serve a current-version strike row only when its token and digest appear here. See docs/A4_STRIKE_ATTESTATION.md.
+/// </summary>
+public sealed class AdaptiveStrikeAttestationRow
+{
+    public long Id { get; set; }
+    public long SessionId { get; set; }
+    public int BarSeq { get; set; }
+    public required string MetricsVersion { get; set; }
+    public int TokenCount { get; set; }
+    public required string Digests { get; set; }
+    public DateTimeOffset VerifiedAtUtc { get; set; }
+}
+
 /// <summary>Sidecar projection of supplemental options observations per completed adaptive bar (08-Oct plan section 71; metrics contract options-supp-v2).</summary>
 public sealed class AdaptiveOptionsSupplementalRow
 {

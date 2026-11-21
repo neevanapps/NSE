@@ -1,3 +1,4 @@
+using NiftySignal.Tests.AdaptiveObserver;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -69,6 +70,7 @@ public class MarketSummaryDataServiceTests
         }
 
         await db.SaveChangesAsync();
+        await db.AttestStrikesAsync();
         return f;
     }
 
@@ -84,6 +86,34 @@ public class MarketSummaryDataServiceTests
         Assert.Equal(new[] { "CE25950", "CE26000", "CE26050", "CE26100", "CE26150", "PE25950", "PE26000", "PE26050", "PE26100", "PE26150" }, b.Basket.Contracts.Select(c => c.Token!).OrderBy(x => x));
         foreach (var v in new[] { a, b })
             Assert.All(v.Grids.Single(g => g.Kind == GridKind.Total).Rows, r => Assert.Equal("10/10 – FULL", r.Coverage.Text));    // all five windows computed under the one basket
+    }
+
+    [Fact]
+    public async Task Summary_WithholdsStrikeRows_WithoutAnAttestation_OrChangedSinceIt()
+    {
+        var f = await SeedAsync(120);
+        var cat = Catalog();
+        var healthy = await Service(f).LoadMarketSummaryAsync(1, 120, cat, 26_000);
+        Assert.All(healthy.Grids.Single(g => g.Kind == GridKind.Total).Rows, r => Assert.Equal("10/10 – FULL", r.Coverage.Text));
+
+        await using (var db = f.CreateDbContext())                                  // one row edited after it was attested: no marker, no Host write
+        {
+            var row = await db.OptionStrikeBars.FirstAsync(x => x.BarSeq == 120 && x.Token == "CE26000");
+            row.StrictBuy += 1;
+            await db.SaveChangesAsync();
+        }
+
+        var changed = await Service(f).LoadMarketSummaryAsync(1, 120, cat, 26_000);
+        Assert.Contains(changed.Grids.Single(g => g.Kind == GridKind.Total).Rows, r => r.Coverage.Text != "10/10 – FULL");
+
+        await using (var db = f.CreateDbContext())                                  // attestations gone (pre-rollout rows): everything of the current version is withheld
+        {
+            db.StrikeAttestations.RemoveRange(await db.StrikeAttestations.ToListAsync());
+            await db.SaveChangesAsync();
+        }
+
+        var none = await Service(f).LoadMarketSummaryAsync(1, 120, cat, 26_000);
+        Assert.All(none.Grids.Single(g => g.Kind == GridKind.Total).Rows, r => Assert.NotEqual("10/10 – FULL", r.Coverage.Text));
     }
 
     [Fact]
@@ -270,5 +300,39 @@ public class MarketSummaryDataServiceTests
 
         var close = await Service(f).LoadCloseAtmAsync(1, 120);
         Assert.Equal((null, "unverified"), (close.Strike, close.Source));
+    }
+
+    [Fact]
+    public async Task CloseAtm_NextBandThatDidNotStartAtThisBarsClose_IsNeverBorrowed()
+    {
+        var f = await SeedAsync(120);
+        // bar 99 closed at T0+99min; bar 100's band was initialised 3 s LATER, from later data: it is not bar 99's close selection
+        await using (var db = f.CreateDbContext())
+        {
+            db.OptionBandBars.Add(new() { SessionId = 1, BarSeq = 100, Side = OptionType.Call, CenterStrike = 26_150, BandStrikes = "[]", BandAvailable = true, StartAvailableAtUtc = T0.AddMinutes(99).AddSeconds(3), EndAvailableAtUtc = T0.AddMinutes(100) });
+            await db.SaveChangesAsync();
+        }
+
+        var close = await Service(f).LoadCloseAtmAsync(1, 99);
+        Assert.Null(close.Strike);
+        Assert.Equal("none", close.Source);
+        Assert.Contains("close", close.Reason);
+    }
+
+    [Fact]
+    public async Task CloseAtm_AdjacentAndZeroDurationSplitBars_UseTheBandSelectedAtThatExactInstant()
+    {
+        var f = await SeedAsync(120);
+        await using (var db = f.CreateDbContext())
+        {
+            var split = await db.FutureBars.SingleAsync(x => x.BarSeq == 51);
+            split.StartAvailableAtUtc = T0.AddMinutes(50); split.EndAvailableAtUtc = T0.AddMinutes(50); split.DurationSeconds = 0;     // zero-duration split bar at the instant bar 50 closed
+            foreach (var (seq, centre) in new[] { (51, 26_000d), (52, 26_050d) })
+                db.OptionBandBars.Add(new() { SessionId = 1, BarSeq = seq, Side = OptionType.Call, CenterStrike = centre, BandStrikes = "[]", BandAvailable = true, StartAvailableAtUtc = T0.AddMinutes(50), EndAvailableAtUtc = T0.AddMinutes(50) });
+            await db.SaveChangesAsync();
+        }
+
+        Assert.Equal(26_000d, (await Service(f).LoadCloseAtmAsync(1, 50)).Strike);     // bar 51 started at bar 50's close instant
+        Assert.Equal(26_050d, (await Service(f).LoadCloseAtmAsync(1, 51)).Strike);     // the zero-duration bar's own close is the same instant, bar 52's band
     }
 }

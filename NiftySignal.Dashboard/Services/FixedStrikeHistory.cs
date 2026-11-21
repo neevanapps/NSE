@@ -78,9 +78,9 @@ public static class FixedStrikeProjection
             .ToDictionary(g => g.Key, g => g.OrderByDescending(r => VersionRank(r.MetricsVersion)).First());   // latest supported version wins (v3, then v2, then v1)
         // A4: a row durably marked UNVERIFIED is withheld from every cell and rolling window (unavailable, never a normal observation).
         var withheld = new HashSet<(int, OptionType)>();
-        if (unverified is { Any: true })
+        if (unverified is not null)
         {
-            foreach (var kv in byBar.Where(kv => unverified.IsUnverified(kv.Key.BarSeq, kv.Value.Token, kv.Value.MetricsVersion)).ToList())
+            foreach (var kv in byBar.Where(kv => unverified.IsUnverified(kv.Value)).ToList())
             {
                 byBar.Remove(kv.Key);
                 withheld.Add(kv.Key);

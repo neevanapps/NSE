@@ -1,3 +1,4 @@
+using NiftySignal.Tests.AdaptiveObserver;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.Components;
@@ -616,6 +617,7 @@ public sealed class AdaptiveCompactGridTests
                     });
                 }
             await db.SaveChangesAsync();
+            await db.AttestStrikesAsync();
         }
 
         var html = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new());
@@ -702,6 +704,7 @@ public sealed class AdaptiveCompactGridTests
                     });
                 }
             await db.SaveChangesAsync();
+            await db.AttestStrikesAsync();
         }
 
         var html = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new());
@@ -748,6 +751,7 @@ public sealed class AdaptiveCompactGridTests
         AddStrikeRow(db, 1, OptionType.Put, "PE25000", 25000, -200, 500);
         AddStrikeRow(db, 1, OptionType.Call, "CE25050", 25050, 987654, 1000);
         await db.SaveChangesAsync();
+        await db.AttestStrikesAsync();
         return factory;
     }
 
@@ -940,6 +944,7 @@ public sealed class AdaptiveCompactGridTests
         };
         db.CommentaryEvents.AddRange(Ev(10, TimeSpan.FromMinutes(10), 1), Ev(11, TimeSpan.FromMinutes(11), 2), Ev(11, TimeSpan.FromMinutes(11) + TimeSpan.FromSeconds(5), 3), Ev(12, TimeSpan.FromMinutes(12), 4));
         await db.SaveChangesAsync();
+        await db.AttestStrikesAsync();
         return factory;
     }
 

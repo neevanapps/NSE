@@ -113,6 +113,7 @@ public sealed class AdaptiveStateRecoveryService(
         var unverifiedSidecars = new SortedSet<int>();
         DateTimeOffset? lastAvailable = null;
         long? lastTickId = null;
+        var replayStart = System.Diagnostics.Stopwatch.GetTimestamp();
         foreach (var group in clean.GroupBy(x=>x.Tick.AvailableAt))
         {
             var items=group.Select(x=>(x.Token,x.Tick)).ToArray();
@@ -150,6 +151,10 @@ public sealed class AdaptiveStateRecoveryService(
                 }
             }
         }
+
+        if (supplemental is not null)
+            logger.LogInformation("Per-strike verification replay finished for session {SessionId}: bars replayed through verification in {ElapsedMs} ms; per-strike retries pending={StrikePending}, close-ATM retries pending={CloseAtmPending} (bars not yet attested stay withheld from readers).",
+                context.Session.Id, (long)System.Diagnostics.Stopwatch.GetElapsedTime(replayStart).TotalMilliseconds, supplemental.PendingStrikeRetryCount, supplemental.PendingCloseAtmRetryCount);
 
         var rebuiltLastSeq = engine.FutureBars.Where(x => x.IsComplete).Select(x => x.BarSeq).DefaultIfEmpty(0).Max();
         if (await observer.FutureBars.AsNoTracking().AnyAsync(x => x.SessionId == context.Session.Id && x.BarSeq > rebuiltLastSeq, ct))

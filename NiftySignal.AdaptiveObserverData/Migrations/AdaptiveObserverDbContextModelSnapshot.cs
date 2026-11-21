@@ -1789,6 +1789,43 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                     b.ToTable("adaptive_session_supplemental", (string)null);
                 });
 
+            modelBuilder.Entity("NiftySignal.AdaptiveObserverData.AdaptiveStrikeAttestationRow", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<int>("BarSeq")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("Digests")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("MetricsVersion")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<long>("SessionId")
+                        .HasColumnType("bigint");
+
+                    b.Property<int>("TokenCount")
+                        .HasColumnType("integer");
+
+                    b.Property<DateTimeOffset>("VerifiedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("SessionId", "BarSeq", "MetricsVersion")
+                        .IsUnique();
+
+                    b.ToTable("adaptive_strike_attestation", (string)null);
+                });
+
             modelBuilder.Entity("NiftySignal.AdaptiveObserverData.AdaptiveWeak2ObservationRow", b =>
                 {
                     b.Property<long>("Id")
@@ -2085,6 +2122,15 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                 });
 
             modelBuilder.Entity("NiftySignal.AdaptiveObserverData.AdaptiveSessionSupplementalRow", b =>
+                {
+                    b.HasOne("NiftySignal.AdaptiveObserverData.AdaptiveSessionStateRow", null)
+                        .WithMany()
+                        .HasForeignKey("SessionId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("NiftySignal.AdaptiveObserverData.AdaptiveStrikeAttestationRow", b =>
                 {
                     b.HasOne("NiftySignal.AdaptiveObserverData.AdaptiveSessionStateRow", null)
                         .WithMany()

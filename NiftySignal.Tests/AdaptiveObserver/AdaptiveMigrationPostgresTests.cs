@@ -25,6 +25,7 @@ public static class AdaptivePg
     public const string Latest = "20261028130033_AddSpotAtmRuleAndStrikeGreeks";
     /// <summary>The close-ATM sidecar table migration (adaptive_bar_close_atm); purely additive on top of <see cref="Latest"/>.</summary>
     public const string Newest = "20261121110612_AddBarCloseAtm";
+    public const string Attestation = "20261121125209_AddStrikeAttestation";
 
     public static string? Maintenance => Environment.GetEnvironmentVariable(Variable) is { Length: > 0 } text ? Guard(text) : null;
 
@@ -349,6 +350,13 @@ public sealed class AdaptiveMigrationPostgresTests
             Assert.NotNull(ce.DeltaChange);
         }
 
+        await using (var db = temp.Context())
+        {
+            var att = await db.StrikeAttestations.AsNoTracking().SingleAsync();                           // real PostgreSQL: the attestation was written with the rows and survives the replay
+            Assert.Equal(package.OptionStrikes!.Count, att.TokenCount);
+            Assert.All(await db.OptionStrikeBars.AsNoTracking().Where(x => x.MetricsVersion == "option-strike-v3" && x.BarSeq == package.FutureBar.BarSeq).ToListAsync(), r => Assert.Null((UnverifiedStrikeBars.LoadAsync(db, 1, 100, default).GetAwaiter().GetResult()).WithheldReason(r)));
+        }
+
         // The Dashboard's real fixed-strike query over MIXED data: bar 1 has v1+v2 history AND the engine's v3 rows (same tokens); bar 2 has v2 history only.
         var catalog = new FixedStrikeCatalog(new DateOnly(2026, 10, 12), [new FixedStrikeContract(23000, "C23000", "OPT", "P23000", "OPT")]);
         var data = new AdaptiveObserverDataService(new TempFactory(temp), NullLogger<AdaptiveObserverDataService>.Instance);
@@ -392,12 +400,14 @@ public sealed class AdaptiveMigrationPostgresTests
 
         await using (var db = temp.Context())
         {
+            Assert.Empty(await db.StrikeAttestations.AsNoTracking().ToListAsync());                      // the mismatch revoked the attestation in the same transaction as the marker
+
             var marker = await db.ProjectionHealth.SingleAsync(x => x.Component == AdaptiveProjectionComponents.OptionStrikeBars);
             Assert.Equal(package.FutureBar.BarSeq, marker.BarSeq);
             Assert.StartsWith("tokens=C23000;", marker.Detail);
             var u = await UnverifiedStrikeBars.LoadAsync(db, 1, 100, default);
-            Assert.True(u.IsUnverified(package.FutureBar.BarSeq, "C23000"));
-            Assert.False(u.IsUnverified(package.FutureBar.BarSeq, "P23000"));
+            Assert.True(u.IsMarked(package.FutureBar.BarSeq, "C23000"));
+            Assert.False(u.IsMarked(package.FutureBar.BarSeq, "P23000"));
             Assert.False(u.TablePending);
             Assert.Empty(db.Database.GetPendingMigrations());                        // no migration was generated for A4
         }
@@ -412,7 +422,7 @@ public sealed class AdaptiveMigrationPostgresTests
         await db.Database.ExecuteSqlRawAsync("DROP TABLE adaptive_projection_health");
         var u = await UnverifiedStrikeBars.LoadAsync(db, 1, 100, default);
         Assert.True(u.TablePending);
-        Assert.True(u.IsUnverified(5, "ANY", "option-strike-v3"));                 // not shown as normal: the markers cannot be read
+        Assert.True(u.IsMarked(5, "ANY", "option-strike-v3"));                 // not shown as normal: the markers cannot be read
     }
 
     sealed class TempFactory(TempAdaptiveDatabase temp) : IDbContextFactory<AdaptiveObserverDbContext>
@@ -454,6 +464,46 @@ public sealed class AdaptiveMigrationPostgresTests
         Assert.Equal(1, await temp.ScalarAsync($"SELECT count(*) FROM \"__EFMigrationsHistory\" WHERE \"MigrationId\" = '{AdaptivePg.Latest}'"));
     }
 
+    static string ScriptPath(string name)
+    {
+        for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir is not null; dir = dir.Parent)
+        {
+            var candidate = Path.Combine(dir.FullName, "NiftySignal.AdaptiveObserverData", "Sql", name);
+            if (File.Exists(candidate)) return candidate;
+        }
+
+        throw new FileNotFoundException(name + " not found above " + AppContext.BaseDirectory);
+    }
+
+    [PgMigrationFact]
+    public async Task StrikeAttestationTable_ScriptIsIdempotent_MatchesTheEfMigration_AndDownDropsOnlyThatTable()
+    {
+        await using var viaScript = await HistoricalDatabaseAsync();
+        await viaScript.MigrateAsync(AdaptivePg.Newest);
+        var sql = await File.ReadAllTextAsync(ScriptPath("adaptive-strike-attestation.idempotent.sql"));
+        await viaScript.ExecAsync(sql);
+        await viaScript.ExecAsync(sql);                                              // twice: idempotent
+        Assert.Equal(1, await viaScript.ScalarAsync($"SELECT count(*) FROM \"__EFMigrationsHistory\" WHERE \"MigrationId\" = '{AdaptivePg.Attestation}'"));
+
+        await using var viaEf = await HistoricalDatabaseAsync();
+        await viaEf.MigrateAsync();
+        const string columns = "SELECT table_name || '.' || column_name || ':' || data_type || ':' || coalesce(character_maximum_length::text, '') || ':' || is_nullable FROM information_schema.columns WHERE table_schema = 'public' ORDER BY 1";
+        Assert.Equal(await ColumnsAsync(viaEf, columns), await ColumnsAsync(viaScript, columns));
+
+        await using (var db = viaEf.Context())
+        {
+            db.StrikeAttestations.Add(new() { SessionId = 1, BarSeq = 1, MetricsVersion = "option-strike-v3", TokenCount = 1, Digests = "C1=abc", VerifiedAtUtc = DateTimeOffset.UtcNow });
+            await db.SaveChangesAsync();
+            db.StrikeAttestations.Add(new() { SessionId = 1, BarSeq = 1, MetricsVersion = "option-strike-v3", TokenCount = 1, Digests = "C1=def", VerifiedAtUtc = DateTimeOffset.UtcNow });
+            var duplicate = await Assert.ThrowsAsync<DbUpdateException>(() => db.SaveChangesAsync());
+            Assert.Equal("23505", ((PostgresException)duplicate.InnerException!).SqlState);
+        }
+
+        await viaEf.MigrateAsync(AdaptivePg.Newest);                                 // Down: only the attestation table goes; rows are untouched
+        Assert.Equal(0, await viaEf.ScalarAsync("SELECT count(*) FROM information_schema.tables WHERE table_name = 'adaptive_strike_attestation'"));
+        Assert.Equal(5, await viaEf.ScalarAsync("SELECT count(*) FROM adaptive_option_strike_bars"));
+    }
+
     static string CloseAtmScriptPath()
     {
         for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir is not null; dir = dir.Parent)
@@ -476,7 +526,7 @@ public sealed class AdaptiveMigrationPostgresTests
         Assert.Equal(1, await viaScript.ScalarAsync($"SELECT count(*) FROM \"__EFMigrationsHistory\" WHERE \"MigrationId\" = '{AdaptivePg.Newest}'"));
 
         await using var viaEf = await HistoricalDatabaseAsync();
-        await viaEf.MigrateAsync();
+        await viaEf.MigrateAsync(AdaptivePg.Newest);
         const string columns = "SELECT table_name || '.' || column_name || ':' || data_type || ':' || coalesce(character_maximum_length::text, '') || ':' || is_nullable FROM information_schema.columns WHERE table_schema = 'public' ORDER BY 1";
         Assert.Equal(await ColumnsAsync(viaEf, columns), await ColumnsAsync(viaScript, columns));
         Assert.Equal(1, await viaEf.ScalarAsync("SELECT count(*) FROM pg_indexes WHERE tablename = 'adaptive_bar_close_atm' AND indexdef LIKE 'CREATE UNIQUE INDEX%' AND indexdef LIKE '%(\"SessionId\", \"BarSeq\", \"Version\")%'"));

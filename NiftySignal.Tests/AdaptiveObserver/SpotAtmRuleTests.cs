@@ -749,4 +749,18 @@ public sealed class SpotAtmRuleTests
         var marker = await db.ProjectionHealth.SingleAsync();
         Assert.Equal((AdaptiveProjectionComponents.BarCloseAtm, BarCloseAtm.Version, package.FutureBar.BarSeq), (marker.Component, marker.Version, marker.BarSeq));
     }
+
+    [Fact]
+    public void CloseAtm_StaleSpotAtTheClose_ThenAFreshDifferentSpotBeforeTheNextBarStarts_NeverMakesTheNextBandTheClosesAtm()
+    {
+        var engine = Engine(AtmCenterRule.SpotV1);
+        long id = 1;
+        Step(engine, ref id, T0, 1000, spot: 23020);
+        var bar1 = Assert.Single(Step(engine, ref id, T0.AddSeconds(6), 1100, spot: null));          // the only spot is 6 s old at the close: stale
+        Assert.Null(bar1.CloseAtm!.Strike);
+        Assert.Empty(Step(engine, ref id, T0.AddSeconds(7), null, spot: 23130));                       // a fresh spot with a DIFFERENT ATM arrives before the next bar closes
+        var bar2 = Assert.Single(Step(engine, ref id, T0.AddSeconds(9), 1200, spot: null));
+        Assert.Null(bar2.OptionBand.Selection);                                                        // the band context chosen at bar 1's close stays unavailable: it is never re-chosen from later data
+        Assert.Equal(23150d, bar2.CloseAtm!.Strike);                                                   // bar 2's own close ATM uses the spot in force at ITS close
+    }
 }

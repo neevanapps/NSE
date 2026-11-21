@@ -282,8 +282,15 @@ public sealed class AdaptiveObserverDataService(
         }
 
         // A bar recorded before the close-ATM sidecar: the next bar's band is selected at THIS bar's close instant with the same rule, so its centre is the same causal value (a disclosed source, not a fallback to another ATM).
-        var next = await db.OptionBandBars.AsNoTracking().Where(x => x.SessionId == sessionId && x.BarSeq == barSeq + 1 && x.BandAvailable).Select(x => (double?)x.CenterStrike).FirstOrDefaultAsync(ct);
-        return next is { } c ? new(c, "next-bar-start", null) : new(null, "none", "close ATM is not recorded for this bar and no later bar exists to derive it from");
+        // It is accepted ONLY when the persisted timestamps prove it: bar N+1's band is selected at bar N's close instant, so N+1's recorded start must equal N's recorded end exactly (this includes zero-duration split bars).
+        // A band that started later was initialised from later data and is never N's close ATM; neither is one whose selection was unavailable (BandAvailable false).
+        var closeInstant = await db.FutureBars.AsNoTracking().Where(x => x.SessionId == sessionId && x.BarSeq == barSeq).Select(x => (DateTimeOffset?)x.EndAvailableAtUtc).FirstOrDefaultAsync(ct);
+        double? next = null;
+        if (closeInstant is { } end)
+            next = await db.OptionBandBars.AsNoTracking()
+                .Where(x => x.SessionId == sessionId && x.BarSeq == barSeq + 1 && x.BandAvailable && x.StartAvailableAtUtc == end)
+                .Select(x => (double?)x.CenterStrike).FirstOrDefaultAsync(ct);
+        return next is { } c ? new(c, "next-bar-start", null) : new(null, "none", "close ATM is not recorded for this bar, and no persisted band proves the selection at its close instant");
     }
 
     /// <summary>
@@ -336,8 +343,16 @@ public sealed class AdaptiveObserverDataService(
 
         var futures = bars.ToDictionary(b => b.BarSeq, b => MarketSummaryMapper.FuturesBarOf(b, sup.GetValueOrDefault(b.BarSeq)));
         // A4: strike bars recovery found disagreeing with the reconstruction are withheld (a coverage gap, never a normal observation) and listed in the view.
-        var unverifiedNotes = stored.Where(r => !unverified.TablePending && unverified.IsUnverified(r.BarSeq, r.Token, r.MetricsVersion)).Select(r => $"{r.TradingSymbol ?? r.Token} bar {r.BarSeq}").Distinct().OrderBy(x => x, StringComparer.Ordinal).ToList();
-        if (unverified.TablePending) unverifiedNotes.Add("verification markers unreadable - ALL per-strike rows withheld");
+        var unverifiedNotes = new List<string>();
+        if (unverified.TablePending) unverifiedNotes.Add("verification tables unreadable - ALL per-strike rows withheld");
+        else
+        {
+            var withheld = stored.Select(r => (Row: r, Reason: unverified.WithheldReason(r))).Where(x => x.Reason is not null).ToList();
+            unverifiedNotes.AddRange(withheld.Where(x => x.Reason != "no verification attestation").Select(x => $"{x.Row.TradingSymbol ?? x.Row.Token} bar {x.Row.BarSeq} ({x.Reason})").Distinct().OrderBy(x => x, StringComparer.Ordinal));
+            var unattested = withheld.Count(x => x.Reason == "no verification attestation");
+            if (unattested > 0) unverifiedNotes.Add($"{unattested} per-strike rows withheld: no verification attestation yet (Host restart replay pending, or a historical session that was never re-verified)");
+        }
+
         stored = unverified.Exclude(stored).ToList();
         var history = new NiftySignal.MarketSummary.ContractHistory(MarketSummaryMapper.ContractBars(stored, tokens, catalog.Expiry, endBarSeq), bars.ToDictionary(b => b.BarSeq, b => b.DurationSeconds));
         // The boundaries of each window (start of its first bar, end of the target bar) for the as-of VIX alignment; bars are completed bars through the target only.

@@ -192,6 +192,7 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
         }
 
         var expected = strikes.Select(x => MapStrike(sessionId, package.FutureBar.BarSeq, package.FutureBar.EndAvailableAtUtc, x)).ToList();
+        AdaptiveStrikeAttestationRow? attestation = null;
         try
         {
             var version = OptionStrikeBarMetrics.MetricsVersion;
@@ -200,7 +201,10 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
                 .ToListAsync(ct);
             if (existing.Count == 0)
             {
+                // Rows and their attestation commit together (one SaveChanges = one transaction): never rows without proof that they were written from the verified package, never proof without rows.
                 db.OptionStrikeBars.AddRange(expected);
+                attestation = NewAttestation(sessionId, package.FutureBar.BarSeq, version, expected);
+                db.StrikeAttestations.Add(attestation);
                 await db.SaveChangesAsync(ct);
                 return SupplementalOutcome.Inserted;
             }
@@ -220,7 +224,8 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
 
             if (difference is null)
             {
-                return SupplementalOutcome.Verified;
+                // Verified against the recomputation: record (or refresh) the POSITIVE attestation of exactly these stored rows. If it cannot be written the rows simply stay unattested (= withheld by every reader) and the bar is retried.
+                return await EnsureAttestationAsync(db, sessionId, version, package.FutureBar.BarSeq, existing, ct) ? SupplementalOutcome.Verified : SupplementalOutcome.Failed;
             }
 
             Interlocked.Increment(ref _mismatches);
@@ -247,6 +252,8 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
                         db.Entry(row).State = EntityState.Detached;
                     }
                 }
+
+                if (attestation is not null && db.Entry(attestation).State != EntityState.Detached) db.Entry(attestation).State = EntityState.Detached;
             }
             catch (Exception)
             {
@@ -448,6 +455,51 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
         }
     }
 
+    static AdaptiveStrikeAttestationRow NewAttestation(long sessionId, int barSeq, string version, IReadOnlyCollection<AdaptiveOptionStrikeBarRow> rows) => new()
+    {
+        SessionId = sessionId, BarSeq = barSeq, MetricsVersion = version, TokenCount = rows.Count, Digests = StrikeAttestation.Format(rows), VerifiedAtUtc = DateTimeOffset.UtcNow,
+    };
+
+    /// <summary>Upserts the attestation of the bar's stored (already compared) rows; true when a matching attestation is durable afterwards.</summary>
+    async Task<bool> EnsureAttestationAsync(AdaptiveObserverDbContext db, long sessionId, string version, int barSeq, IReadOnlyCollection<AdaptiveOptionStrikeBarRow> stored, CancellationToken ct)
+    {
+        AdaptiveStrikeAttestationRow? row = null;
+        var added = false;
+        try
+        {
+            var digests = StrikeAttestation.Format(stored);
+            row = await db.StrikeAttestations.SingleOrDefaultAsync(x => x.SessionId == sessionId && x.BarSeq == barSeq && x.MetricsVersion == version, ct);
+            if (row is null)
+            {
+                row = NewAttestation(sessionId, barSeq, version, stored.ToList());
+                db.StrikeAttestations.Add(row);
+                added = true;
+            }
+            else if (row.Digests == digests && row.TokenCount == stored.Count)
+            {
+                return true;
+            }
+            else
+            {
+                row.Digests = digests; row.TokenCount = stored.Count; row.VerifiedAtUtc = DateTimeOffset.UtcNow;
+            }
+
+            await db.SaveChangesAsync(ct);
+            return true;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Increment(ref _failures);
+            logger.LogError(ex, "Could not record the per-strike verification attestation (rows stay withheld until it is written): session={SessionId}, bar={BarSeq}", sessionId, barSeq);
+            try { if (row is not null && db.Entry(row).State != EntityState.Detached) db.Entry(row).State = added ? EntityState.Detached : EntityState.Unchanged; } catch (Exception) { /* context unusable */ }
+            return false;
+        }
+    }
+
     /// <summary>
     /// A4 marker write for per-strike bars: inserts the bar's marker, or UNIONS the newly affected tokens into an existing one (a later mismatch with different tokens must not be lost;
     /// a whole-bar marker absorbs everything). One SaveChanges = one atomic row change; a concurrent-writer conflict is retried. Returns true only when the durable marker covers every
@@ -459,6 +511,7 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
         for (var attempt = 0; attempt < 3; attempt++)
         {
             AdaptiveProjectionHealthRow? row = null;
+            AdaptiveStrikeAttestationRow? attestationRow = null;
             var added = false;
             try
             {
@@ -479,6 +532,9 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
                     row.DetectedAtUtc = DateTimeOffset.UtcNow;
                 }
 
+                // The marker and the revocation of the bar's attestation are ONE SaveChanges: both or neither.
+                attestationRow = await db.StrikeAttestations.SingleOrDefaultAsync(x => x.SessionId == sessionId && x.BarSeq == barSeq && x.MetricsVersion == version, ct);
+                if (attestationRow is not null) db.StrikeAttestations.Remove(attestationRow);
                 await db.SaveChangesAsync(ct);
                 return true;
             }
@@ -490,7 +546,8 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
             {
                 try
                 {
-                    if (row is not null && db.Entry(row).State != EntityState.Detached) db.Entry(row).State = EntityState.Detached;   // only the marker: the context is shared with core persistence
+                    if (attestationRow is not null && db.Entry(attestationRow).State != EntityState.Detached) db.Entry(attestationRow).State = EntityState.Unchanged;
+                    if (row is not null && db.Entry(row).State != EntityState.Detached) db.Entry(row).State = added ? EntityState.Detached : EntityState.Unchanged;   // only the marker: the context is shared with core persistence
                 }
                 catch (Exception)
                 {
@@ -562,10 +619,11 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
     /// </summary>
     public async Task<bool> PersistAndVerifyAsync(AdaptiveObserverDbContext db, AdaptiveSessionStateRow session, AdaptiveCompletedBarPackage package, CancellationToken ct)
     {
-        // The per-strike projection is a display sidecar: its outcome never changes the verification result the paper path consumes (a missing strike table must not halt paper trading).
-        // But a Failed outcome (write/verify failed, or a mismatch whose UNVERIFIED marker could not be written) is NOT dropped: the bar is queued here and retried on every later call
-        // (and on restart, when recovery replays every bar through this method), so a mismatched row is marked as soon as the marker can be written.
-        await RetryStrikesAsync(db, session.Id, package, ct);
+        // The per-strike projection and the close ATM are display sidecars: their outcome never changes the verification result the paper path consumes (a missing table must not halt paper trading).
+        // A Failed outcome is NOT dropped: the bar is queued (separately per sidecar) and retried on every later call, and on restart recovery replays every bar through this method.
+        // A strike row without a durable attestation is withheld by every reader, so a failed or abandoned strike retry never needs a fence: absence of proof already means unverified.
+        await RetryAsync(db, session.Id, package, _strikeRetry, StrikeRetryCapacity, PersistOrVerifyStrikesAsync, "per-strike", ct);
+        await RetryAsync(db, session.Id, package, _closeAtmRetry, CloseAtmRetryCapacity, PersistOrVerifyCloseAtmAsync, "close-ATM", ct);
         for (var attempt = 0; attempt < 2; attempt++)
         {
             var futures = await PersistOrVerifyFuturesAsync(db, session.Id, package, ct);
@@ -578,47 +636,45 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
     }
 
     readonly Dictionary<(long Session, int Bar), AdaptiveCompletedBarPackage> _strikeRetry = new();
-    const int MaxStrikeRetry = 200;
+    readonly Dictionary<(long Session, int Bar), AdaptiveCompletedBarPackage> _closeAtmRetry = new();
+    internal int StrikeRetryCapacity { get; set; } = 200;
+    internal int CloseAtmRetryCapacity { get; set; } = 200;
 
-    /// <summary>Number of bars whose per-strike integrity is still unestablished (queued for retry).</summary>
+    /// <summary>Number of bars whose per-strike verification/attestation is still queued for retry.</summary>
     public int PendingStrikeRetryCount { get { lock (_strikeRetry) return _strikeRetry.Count; } }
 
-    /// <summary>Per-strike bars and the close ATM: both are display sidecars (their failure never gates the paper path) and both are retried through the same queue.</summary>
-    async Task<SupplementalOutcome> PersistOrVerifyDisplaySidecarsAsync(AdaptiveObserverDbContext db, long sessionId, AdaptiveCompletedBarPackage package, CancellationToken ct)
-    {
-        var strikes = await PersistOrVerifyStrikesAsync(db, sessionId, package, ct);
-        var closeAtm = await PersistOrVerifyCloseAtmAsync(db, sessionId, package, ct);
-        return strikes == SupplementalOutcome.Failed || closeAtm == SupplementalOutcome.Failed ? SupplementalOutcome.Failed : SupplementalOutcome.Verified;
-    }
+    /// <summary>Number of bars whose close ATM is still queued for retry (independent of the strike queue).</summary>
+    public int PendingCloseAtmRetryCount { get { lock (_closeAtmRetry) return _closeAtmRetry.Count; } }
 
-    async Task RetryStrikesAsync(AdaptiveObserverDbContext db, long sessionId, AdaptiveCompletedBarPackage package, CancellationToken ct)
+    async Task RetryAsync(AdaptiveObserverDbContext db, long sessionId, AdaptiveCompletedBarPackage package, Dictionary<(long Session, int Bar), AdaptiveCompletedBarPackage> queue, int capacity,
+        Func<AdaptiveObserverDbContext, long, AdaptiveCompletedBarPackage, CancellationToken, Task<SupplementalOutcome>> persist, string what, CancellationToken ct)
     {
         var key = (sessionId, package.FutureBar.BarSeq);
         AdaptiveCompletedBarPackage[] earlier;
         // A bounded number of the oldest queued bars is retried per call, so a persistent failure (e.g. a table not migrated yet) cannot multiply into a retry storm every bar.
-        lock (_strikeRetry) earlier = _strikeRetry.Where(x => x.Key.Session == sessionId && x.Key.Bar != key.BarSeq).OrderBy(x => x.Key.Bar).Select(x => x.Value).Take(3).ToArray();
+        lock (queue) earlier = queue.Where(x => x.Key.Session == sessionId && x.Key.Bar != key.BarSeq).OrderBy(x => x.Key.Bar).Select(x => x.Value).Take(3).ToArray();
         foreach (var e in earlier)
         {
-            if (await PersistOrVerifyDisplaySidecarsAsync(db, sessionId, e, ct) != SupplementalOutcome.Failed)
-                lock (_strikeRetry) _strikeRetry.Remove((sessionId, e.FutureBar.BarSeq));
+            if (await persist(db, sessionId, e, ct) != SupplementalOutcome.Failed)
+                lock (queue) queue.Remove((sessionId, e.FutureBar.BarSeq));
         }
 
-        var outcome = await PersistOrVerifyDisplaySidecarsAsync(db, sessionId, package, ct);
-        lock (_strikeRetry)
+        var outcome = await persist(db, sessionId, package, ct);
+        lock (queue)
         {
             if (outcome == SupplementalOutcome.Failed)
             {
-                _strikeRetry[key] = package;
-                while (_strikeRetry.Count > MaxStrikeRetry)
+                queue[key] = package;
+                while (queue.Count > capacity)
                 {
-                    var oldest = _strikeRetry.Keys.OrderBy(k => k.Bar).First();
-                    _strikeRetry.Remove(oldest);
-                    logger.LogError("Per-strike retry queue overflow: dropped bar {BarSeq} of session {SessionId} (it will be re-verified by restart recovery)", oldest.Bar, oldest.Session);
+                    var oldest = queue.Keys.OrderBy(k => k.Bar).First();
+                    queue.Remove(oldest);
+                    logger.LogError("Retry queue overflow ({What}): dropped bar {BarSeq} of session {SessionId}; it stays withheld/unavailable until restart recovery re-verifies it", what, oldest.Bar, oldest.Session);
                 }
             }
             else
             {
-                _strikeRetry.Remove(key);
+                queue.Remove(key);
             }
         }
     }

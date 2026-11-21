@@ -1,3 +1,4 @@
+using NiftySignal.Tests.AdaptiveObserver;
 using System.Net;
 using System.Text.Json;
 using Microsoft.AspNetCore.Authentication.Cookies;
@@ -161,6 +162,7 @@ public sealed class AgentFeedTests : IDisposable
             }
 
             await db.SaveChangesAsync();
+            await db.AttestStrikesAsync();
         }
 
         await using (var s = source.CreateDbContext())

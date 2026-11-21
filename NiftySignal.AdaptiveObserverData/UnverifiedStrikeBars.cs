@@ -1,3 +1,4 @@
+using NiftySignal.AdaptiveObserver;
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
 
@@ -16,14 +17,17 @@ public sealed class UnverifiedStrikeBars
     /// <summary>bar -> version -> tokens (null = every strike of the bar for that metrics version).</summary>
     readonly Dictionary<int, Dictionary<string, HashSet<string>?>> _byBar;
 
-    UnverifiedStrikeBars(Dictionary<int, Dictionary<string, HashSet<string>?>> byBar, bool tablePending) { _byBar = byBar; TablePending = tablePending; }
+    /// <summary>bar -> raw attested digest list (current metrics version only); parsed per bar on first use, because a read only ever looks at the bars it serves.</summary>
+    readonly Dictionary<int, string> _attestedRaw;
+    readonly Dictionary<int, Dictionary<string, string>> _attested = [];
 
-    public static UnverifiedStrikeBars None { get; } = new([], false);
+    UnverifiedStrikeBars(Dictionary<int, Dictionary<string, HashSet<string>?>> byBar, Dictionary<int, string> attestedRaw, bool tablePending) { _byBar = byBar; _attestedRaw = attestedRaw; TablePending = tablePending; }
 
-    /// <summary>The marker table could not be read: verification cannot be vouched for, so FAIL CLOSED - every per-strike row is reported unverified (withheld), never shown as a normal observation.</summary>
+    /// <summary>Nothing attested, nothing marked: FAIL CLOSED (a current-version row is unverified). Only a placeholder before a real load.</summary>
+    public static UnverifiedStrikeBars None { get; } = new([], [], false);
+
+    /// <summary>The marker or attestation table could not be read: verification cannot be vouched for, so FAIL CLOSED - every current-version per-strike row is reported unverified.</summary>
     public bool TablePending { get; }
-
-    public bool Any => TablePending || _byBar.Count > 0;
 
     public IReadOnlyCollection<int> Bars => _byBar.Keys;
 
@@ -36,8 +40,8 @@ public sealed class UnverifiedStrikeBars
         return u;
     }
 
-    /// <summary>Version-aware: a marker for strike-metrics version V withholds only rows of version V (<paramref name="version"/> null = any version, conservative).</summary>
-    public bool IsUnverified(int barSeq, string token, string? version = null)
+    /// <summary>Marker-only, version-aware: a marker for strike-metrics version V withholds only rows of version V (<paramref name="version"/> null = any version, conservative).</summary>
+    public bool IsMarked(int barSeq, string token, string? version = null)
     {
         if (TablePending) return true;
         if (!_byBar.TryGetValue(barSeq, out var byVersion)) return false;
@@ -49,6 +53,20 @@ public sealed class UnverifiedStrikeBars
 
         return false;
     }
+
+    /// <summary>Why a row is withheld, or null when it may be served: marked UNVERIFIED, no attestation covering its token, or its values changed since it was attested. Legacy versions have no attestation (marker-only).</summary>
+    public string? WithheldReason(AdaptiveOptionStrikeBarRow row)
+    {
+        if (TablePending) return "verification tables unreadable";
+        if (IsMarked(row.BarSeq, row.Token, row.MetricsVersion)) return "marked unverified";
+        if (!string.Equals(row.MetricsVersion, OptionStrikeBarMetrics.MetricsVersion, StringComparison.Ordinal)) return null;
+        if (!_attestedRaw.TryGetValue(row.BarSeq, out var raw)) return "no verification attestation";
+        if (!_attested.TryGetValue(row.BarSeq, out var tokens)) _attested[row.BarSeq] = tokens = StrikeAttestation.Parse(raw);
+        if (!tokens.TryGetValue(row.Token, out var digest)) return "no verification attestation";
+        return string.Equals(digest, StrikeAttestation.Digest(row), StringComparison.Ordinal) ? null : "changed since it was attested";
+    }
+
+    public bool IsUnverified(AdaptiveOptionStrikeBarRow row) => WithheldReason(row) is not null;
 
     public static string FormatDetail(IReadOnlyCollection<string> tokens, string difference)
     {
@@ -70,7 +88,7 @@ public sealed class UnverifiedStrikeBars
         return list.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToHashSet(StringComparer.Ordinal);
     }
 
-    /// <summary>Markers of a session for bars up to <paramref name="throughBarSeq"/>. A missing table yields <see cref="TablePending"/>.</summary>
+    /// <summary>Markers and attestations of a session for bars up to <paramref name="throughBarSeq"/>. A missing table yields <see cref="TablePending"/>.</summary>
     public static async Task<UnverifiedStrikeBars> LoadAsync(AdaptiveObserverDbContext db, long sessionId, int throughBarSeq, CancellationToken ct)
     {
         try
@@ -88,13 +106,18 @@ public sealed class UnverifiedStrikeBars
                 else if (existing is not null) { if (tokens is null) byVersion[r.Version] = null; else existing.UnionWith(tokens); }
             }
 
-            return new(map, false);
+            var version = OptionStrikeBarMetrics.MetricsVersion;
+            var att = await db.StrikeAttestations.AsNoTracking()
+                .Where(x => x.SessionId == sessionId && x.MetricsVersion == version && x.BarSeq <= throughBarSeq)
+                .Select(x => new { x.BarSeq, x.Digests }).ToListAsync(ct);
+            var attested = att.ToDictionary(x => x.BarSeq, x => x.Digests);
+            return new(map, attested, false);
         }
         catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedTable)
         {
-            return new([], true);
+            return new([], [], true);
         }
     }
 
-    public IEnumerable<AdaptiveOptionStrikeBarRow> Exclude(IEnumerable<AdaptiveOptionStrikeBarRow> rows) => Any ? rows.Where(r => !IsUnverified(r.BarSeq, r.Token, r.MetricsVersion)) : rows;
+    public IEnumerable<AdaptiveOptionStrikeBarRow> Exclude(IEnumerable<AdaptiveOptionStrikeBarRow> rows) => rows.Where(r => !IsUnverified(r));
 }

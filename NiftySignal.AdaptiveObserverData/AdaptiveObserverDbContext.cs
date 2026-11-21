@@ -25,6 +25,7 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
     public DbSet<AdaptiveOptionsSupplementalRow> OptionsSupplemental => Set<AdaptiveOptionsSupplementalRow>();
     public DbSet<AdaptiveOptionStrikeBarRow> OptionStrikeBars => Set<AdaptiveOptionStrikeBarRow>();
     public DbSet<AdaptiveBarCloseAtmRow> BarCloseAtm => Set<AdaptiveBarCloseAtmRow>();
+    public DbSet<AdaptiveStrikeAttestationRow> StrikeAttestations => Set<AdaptiveStrikeAttestationRow>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -141,6 +142,13 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
             e.HasIndex(x => new { x.SessionId, x.BarSeq, x.Version }).IsUnique();
             e.Property(x => x.Version).HasMaxLength(32);
             e.Property(x => x.UnavailableReason).HasMaxLength(256);
+            e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
+        });
+        modelBuilder.Entity<AdaptiveStrikeAttestationRow>(e =>
+        {
+            e.ToTable("adaptive_strike_attestation");
+            e.HasIndex(x => new { x.SessionId, x.BarSeq, x.MetricsVersion }).IsUnique();
+            e.Property(x => x.MetricsVersion).HasMaxLength(64);
             e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
         });
         modelBuilder.Entity<AdaptiveBasisSupplementalRow>(e =>

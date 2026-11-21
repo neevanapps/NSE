@@ -30,7 +30,15 @@ public sealed class UnverifiedStrikeFrameTests
         return inputs!.Grids.Single(g => g.Kind == GridKind.Total);
     }
 
-    static async Task Seed(string db, bool markUnverified)
+    /// <summary>What the Host's replay/insert writes: one attestation per bar over the stored rows.</summary>
+    static async Task AttestAsync(AdaptiveObserverDbContext o)
+    {
+        await o.SaveChangesAsync();
+        foreach (var g in (await o.OptionStrikeBars.AsNoTracking().ToListAsync()).GroupBy(x => x.BarSeq))
+            o.StrikeAttestations.Add(new AdaptiveStrikeAttestationRow { SessionId = 1, BarSeq = g.Key, MetricsVersion = OptionStrikeBarMetrics.MetricsVersion, TokenCount = g.Count(), Digests = StrikeAttestation.Format(g), VerifiedAtUtc = DateTimeOffset.UtcNow });
+    }
+
+    static async Task Seed(string db, bool markUnverified, bool attest = true)
     {
         await using var o = Observer(db);
         for (var seq = 1; seq <= 5; seq++)
@@ -43,6 +51,7 @@ public sealed class UnverifiedStrikeFrameTests
             }
         }
 
+        if (attest) await AttestAsync(o);
         if (markUnverified)
         {
             o.ProjectionHealth.Add(new AdaptiveProjectionHealthRow
@@ -67,5 +76,34 @@ public sealed class UnverifiedStrikeFrameTests
         Assert.NotEqual(CoverageStatus.Full, marked.Coverage.Status);              // CE26000 bar 4 is missing: the full-coverage requirement is not met
         Assert.Contains("CE26000", marked.Coverage.MissingTokens);
         Assert.True(marked.Coverage.Included < marked.Coverage.Expected || marked.Coverage.MissingTokens.Count > 0);
+    }
+
+    [Fact]
+    public async Task UnattestedStrikeRows_AreSuppressedForV2_UntilTheHostReplayAttestsThem_ThenCoverageIsFullAgain()
+    {
+        await Seed("unattested", false, attest: false);                              // e.g. rows from before the attestation rollout, or a Host restart that has not replayed yet
+        var before = (await TotalAsync("unattested")).Rows.Single(r => r.Window.Name == "5 Bars");
+        Assert.NotEqual(CoverageStatus.Full, before.Coverage.Status);
+        Assert.Equal(0, before.Coverage.Included);                                    // withheld, never zero-filled
+
+        await using (var o = Observer("unattested")) { await AttestAsync(o); await o.SaveChangesAsync(); }   // replay verified and attested every bar
+        var after = (await TotalAsync("unattested")).Rows.Single(r => r.Window.Name == "5 Bars");
+        Assert.Equal(CoverageStatus.Full, after.Coverage.Status);                     // a healthy restart resumes with full coverage
+    }
+
+    [Fact]
+    public async Task ARowChangedAfterAttestation_IsSuppressedForV2()
+    {
+        await Seed("changed", false);
+        await using (var o = Observer("changed"))
+        {
+            var row = await o.OptionStrikeBars.FirstAsync(x => x.BarSeq == 4 && x.Token == "CE26000");
+            row.StrictBuy += 3;
+            await o.SaveChangesAsync();
+        }
+
+        var row5 = (await TotalAsync("changed")).Rows.Single(r => r.Window.Name == "5 Bars");
+        Assert.NotEqual(CoverageStatus.Full, row5.Coverage.Status);
+        Assert.Contains("CE26000", row5.Coverage.MissingTokens);
     }
 }
