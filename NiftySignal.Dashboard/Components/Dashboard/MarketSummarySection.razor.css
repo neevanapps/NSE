@@ -94,15 +94,14 @@
     background: rgba(248, 81, 73, .16);
 }
 
-/* Lower / ATM / Upper TOTAL grids: side by side while each keeps a readable width, wrapping below otherwise (each table still scrolls inside its own wrapper). */
+/* Lower / ATM / Upper TOTAL grids: always stacked one per row (ITM-shifted, ATM, OTM-shifted) at full width (each table still scrolls inside its own wrapper). */
 .total-grids {
     display: flex;
-    flex-wrap: wrap;
+    flex-direction: column;
     gap: 12px;
-    align-items: flex-start;
 }
 
 .total-grid-cell {
-    flex: 1 1 800px;
+    width: 100%;
     min-width: 0;
 }
