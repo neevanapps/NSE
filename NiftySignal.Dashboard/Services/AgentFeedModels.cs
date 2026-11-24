@@ -123,7 +123,13 @@ public sealed record AgentBar(
     AgentFutures Futures,
     AgentOptions Options,
     AgentResidual Residual,
-    AgentMarket Market);
+    AgentMarket Market,
+    AgentTop5? Top5 = null);
+
+/// <summary>Top-5 depth (additive; null when neither the futures nor the attested option depth rows exist). RAW values (MicroDev5Proxy is NOT inverted here: inversion is a Dashboard display convention); every sign is a hypothesis.</summary>
+public sealed record AgentTop5(
+    AgentRatio FuturesOfi5, AgentRatio FuturesMicroDev5Proxy, int? Ofi5DirectTransitions, int? Ofi5BridgedTransitions, double? DepthUsableSeconds,
+    AgentSideRatios FixedStrikeOfi5, AgentSideRatios FixedStrikeMicroDev5Proxy);
 
 public sealed record AgentSnapshotResponse(AgentMeta Meta, IReadOnlyList<AgentBar> Bars);
 

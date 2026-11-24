@@ -64,7 +64,7 @@ public class DashboardSimplificationTests
     }
 
     static readonly string[] TotalHeaders =
-        ["Window", "Coverage", "Price Dir", "Roll Dir", "Strict Dir", "Enriched Dir", "OI Dir", "MicroDev Dir (Inv)", "OFI Dir", "IV Dir (Inv)", "Delta Dir", "Vega Dir (Inv)", "Activity Dir"];
+        ["Window", "Coverage", "Price Dir", "Roll Dir", "Strict Dir", "Enriched Dir", "OI Dir", "MicroDev Dir (Inv)", "OFI Dir", "IV Dir (Inv)", "Delta Dir", "Vega Dir (Inv)", "Activity Dir", "Depth L5 Dir"];
 
     // ---- 1 / 2 / 4: retained sections, order, the exact TOTAL columns and rows ----
 
@@ -86,7 +86,7 @@ public class DashboardSimplificationTests
         Assert.Equal(TotalHeaders, Headers(html, "summary-total"));
         var rows = Regex.Matches(Table(html, "summary-total"), "<tr data-window=\"([^\"]+)\"").Select(m => m.Groups[1].Value).ToList();
         Assert.Equal(["5 Bars", "10 Bars", "50 Bars", "100 Bars", "Day"], rows);
-        foreach (var w in rows) Assert.Equal(13, Cells(html, "summary-total", w).Count);
+        foreach (var w in rows) Assert.Equal(14, Cells(html, "summary-total", w).Count);
     }
 
     // ---- 3: the TOTAL cells are the calculator's Direction values, scaled for display only ----

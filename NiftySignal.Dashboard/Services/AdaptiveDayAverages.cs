@@ -116,8 +116,11 @@ public sealed record DayAverageData(
     IReadOnlyDictionary<int, AdaptiveBasisSupplementalRow> Basis,
     FixedStrikeHistory? Fixed,
     IReadOnlyList<AdaptiveOptionResidualBarRow> Residuals,
-    IReadOnlyList<AdaptiveResidualAnchorComponentRow> Anchors)
+    IReadOnlyList<AdaptiveResidualAnchorComponentRow> Anchors,
+    IReadOnlyDictionary<int, AdaptiveFuturesDepth5Row>? FuturesDepth5 = null)
 {
+    public Depth5AvgRow Depth5Average() => Depth5Averages.Compute(Futures, s => FuturesDepth5?.GetValueOrDefault(s));
+
     public string Key => $"{SessionId}|{ThroughBarSeq}|{Strike}";
 
     public FuturesAvgRow FuturesAverage() => FuturesAverages.Compute(Futures, s => FuturesSupplemental.GetValueOrDefault(s), s => Basis.GetValueOrDefault(s));

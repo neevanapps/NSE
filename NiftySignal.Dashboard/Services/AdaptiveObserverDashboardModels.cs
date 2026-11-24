@@ -30,7 +30,9 @@ public sealed record AdaptiveObserverSnapshot(
     IReadOnlySet<int>? InvalidOptionsSupplementalBars = null,
     // Basis sidecar (current MetricsVersion) keyed by BarSeq, with known-invalid bars withheld.
     IReadOnlyDictionary<int, AdaptiveBasisSupplementalRow>? BasisSupplemental = null,
-    IReadOnlySet<int>? InvalidBasisSupplementalBars = null)
+    IReadOnlySet<int>? InvalidBasisSupplementalBars = null,
+    // Futures Top-5 sidecar (futures-depth5-v1) keyed by BarSeq; bars with a verification marker are withheld. Empty when the Host flag is off or the table is missing.
+    IReadOnlyDictionary<int, AdaptiveFuturesDepth5Row>? FuturesDepth5 = null)
 {
     public int InvalidSupplementalBarCount => (InvalidFuturesSupplementalBars?.Count ?? 0) + (InvalidOptionsSupplementalBars?.Count ?? 0) + (InvalidBasisSupplementalBars?.Count ?? 0);
 

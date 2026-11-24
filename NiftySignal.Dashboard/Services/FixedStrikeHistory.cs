@@ -43,7 +43,8 @@ public sealed record FixedStrikeCatalog(DateOnly Expiry, IReadOnlyList<FixedStri
 
 /// <summary>One displayed completed bar of the fixed strike. A side without a stored row stays null: it is shown as unavailable and NEVER replaced by another strike. <c>*Unverified</c> = a stored row exists but recovery found it disagreeing with the reconstructed values (A4): it is withheld (null), not served.</summary>
 public sealed record FixedStrikeRow(int BarSeq, DateTimeOffset EndAvailableAtUtc, AdaptiveOptionStrikeBarRow? Ce, AdaptiveOptionStrikeBarRow? Pe,
-    RollPrice? CeRoll = null, RollPrice? PeRoll = null, bool CeUnverified = false, bool PeUnverified = false);
+    RollPrice? CeRoll = null, RollPrice? PeRoll = null, bool CeUnverified = false, bool PeUnverified = false,
+    AdaptiveOptionsDepth5Row? CeDepth = null, AdaptiveOptionsDepth5Row? PeDepth = null);
 
 /// <summary>
 /// Rolling price change of ONE exact contract over the last N completed bars: PriceEnd of the current bar minus PriceStart of the first bar of the window. Built only from that contract's own persisted
@@ -66,8 +67,13 @@ public static class FixedStrikeProjection
         IReadOnlyList<(int BarSeq, DateTimeOffset EndAvailableAtUtc)> bars,
         IEnumerable<AdaptiveOptionStrikeBarRow> stored,
         int rollWindowBars = 0,
-        UnverifiedStrikeBars? unverified = null)
+        UnverifiedStrikeBars? unverified = null,
+        IEnumerable<AdaptiveOptionsDepth5Row>? depth = null)
     {
+        // Attested option depth rows (the caller loads them through VerifiedOptionsDepth5): exactly this strike's CE / PE token, keyed by bar.
+        var depthByBar = (depth ?? []).Where(d => d.Expiry == catalog.Expiry && d.Strike == contract.Strike
+                && ((d.Side == OptionType.Call && contract.CeToken is not null && d.Token == contract.CeToken) || (d.Side == OptionType.Put && contract.PeToken is not null && d.Token == contract.PeToken)))
+            .GroupBy(d => (d.BarSeq, d.Side)).ToDictionary(g => g.Key, g => g.First());
         // Identity filter: a stored row counts only when it is exactly this expiry, this strike AND this side's token.
         var byBar = stored
             .Where(r => r.Expiry == catalog.Expiry && r.Strike == contract.Strike
@@ -116,7 +122,9 @@ public static class FixedStrikeProjection
                 Roll(b.BarSeq, OptionType.Call),
                 Roll(b.BarSeq, OptionType.Put),
                 withheld.Contains((b.BarSeq, OptionType.Call)),
-                withheld.Contains((b.BarSeq, OptionType.Put))))
+                withheld.Contains((b.BarSeq, OptionType.Put)),
+                depthByBar.GetValueOrDefault((b.BarSeq, OptionType.Call)),
+                depthByBar.GetValueOrDefault((b.BarSeq, OptionType.Put))))
             .ToList();
         return new FixedStrikeHistory(catalog.Expiry, contract.Strike, contract, rows);
     }

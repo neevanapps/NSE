@@ -429,6 +429,94 @@ public sealed class AdaptiveBasisSupplementalRow
 }
 
 /// <summary>
+/// Sidecar projection of Futures Top-5 depth per completed adaptive bar (futures-depth5-v1): OFI5 with D10 conditional bridging, MicroDev5Proxy, Tob5, notional depth imbalance, and the full time accounting.
+/// Additive table: insert-if-missing, verified on restart replay, never overwritten; no existing table or digest is touched.
+/// </summary>
+public sealed class AdaptiveFuturesDepth5Row
+{
+    public long Id { get; set; }
+    public long SessionId { get; set; }
+    public int BarSeq { get; set; }
+    public required string MetricsVersion { get; set; }
+    public double BarSeconds { get; set; }
+    public long? Ofi5 { get; set; }
+    public long? GrossOfi5 { get; set; }
+    public int Ofi5Transitions { get; set; }
+    public int Ofi5DirectTransitions { get; set; }
+    public int Ofi5BridgedTransitions { get; set; }
+    public long? Ofi5BridgedNet { get; set; }
+    public double Ofi5BridgedGapSeconds { get; set; }
+    public int Ofi5BaselineResets { get; set; }
+    public double? Tob5TimeWeighted { get; set; }
+    public double? MicroDev5TimeWeighted { get; set; }
+    public double? DepthImb5TimeWeighted { get; set; }
+    public double? BidNotionalTimeWeighted { get; set; }
+    public double? AskNotionalTimeWeighted { get; set; }
+    public double Depth5UsableSeconds { get; set; }
+    public double Depth5StaleSeconds { get; set; }
+    public double Depth5InvalidSeconds { get; set; }
+    public double Depth5SupersededSeconds { get; set; }
+    public double Depth5NoDepthSeconds { get; set; }
+    public double Depth5UnobservedSeconds { get; set; }
+    public int SnapshotEvents { get; set; }
+    public int SupersededMarkers { get; set; }
+    public int InvalidSnapshots { get; set; }
+}
+
+/// <summary>
+/// Per-contract Top-5 depth of one completed adaptive bar (options-depth5-v1, S5): one row per (session, bar, token, metrics version) for every contract of the frozen option universe.
+/// Separate from adaptive_option_strike_bars (option-strike-v3 and its attestation are untouched). Insert-if-missing, verified on restart replay, never overwritten; a row is served to consumers only
+/// when its bar has a durable <see cref="AdaptiveOptionsDepth5AttestationRow"/> covering its token and digest.
+/// </summary>
+public sealed class AdaptiveOptionsDepth5Row
+{
+    public long Id { get; set; }
+    public long SessionId { get; set; }
+    public int BarSeq { get; set; }
+    public required string Token { get; set; }
+    public required string MetricsVersion { get; set; }
+    public required string TradingSymbol { get; set; }
+    public DateOnly Expiry { get; set; }
+    public double Strike { get; set; }
+    public OptionType Side { get; set; }
+    public double BarSeconds { get; set; }
+    public long? Ofi5 { get; set; }
+    public long? GrossOfi5 { get; set; }
+    public int Ofi5Transitions { get; set; }
+    public int Ofi5DirectTransitions { get; set; }
+    public int Ofi5BridgedTransitions { get; set; }
+    public long? Ofi5BridgedNet { get; set; }
+    public double Ofi5BridgedGapSeconds { get; set; }
+    public int Ofi5BaselineResets { get; set; }
+    public double? Tob5TimeWeighted { get; set; }
+    public double? MicroDev5TimeWeighted { get; set; }
+    public double? DepthImb5TimeWeighted { get; set; }
+    public double? BidNotionalTimeWeighted { get; set; }
+    public double? AskNotionalTimeWeighted { get; set; }
+    public double Depth5UsableSeconds { get; set; }
+    public double Depth5StaleSeconds { get; set; }
+    public double Depth5InvalidSeconds { get; set; }
+    public double Depth5SupersededSeconds { get; set; }
+    public double Depth5NoDepthSeconds { get; set; }
+    public double Depth5UnobservedSeconds { get; set; }
+    public int SnapshotEvents { get; set; }
+    public int SupersededMarkers { get; set; }
+    public int InvalidSnapshots { get; set; }
+}
+
+/// <summary>Durable POSITIVE verification of one bar's options depth rows (own table; the per-strike attestation is untouched). <see cref="Digests"/> lists every verified contract as <c>token=hash;...</c> (sorted).</summary>
+public sealed class AdaptiveOptionsDepth5AttestationRow
+{
+    public long Id { get; set; }
+    public long SessionId { get; set; }
+    public int BarSeq { get; set; }
+    public required string MetricsVersion { get; set; }
+    public int TokenCount { get; set; }
+    public required string Digests { get; set; }
+    public DateTimeOffset VerifiedAtUtc { get; set; }
+}
+
+/// <summary>
 /// The causal ATM strike at a completed bar's CLOSE instant (close-atm-v1), one row per (session, bar, version). Strike null = unavailable at that close (UnavailableReason says why; nothing is substituted).
 /// Distinct from the bar's option-band CenterStrike, which is the ATM at the bar's START. Additive sidecar: insert-if-missing, verified on restart replay, never overwritten.
 /// </summary>
@@ -584,6 +672,10 @@ public static class AdaptiveProjectionComponents
     public const string OptionStrikeBars = "option-strike-bars";
     /// <summary>A stored close-ATM row that disagreed with the recomputed value after a restart: readers treat that bar's close ATM as unavailable.</summary>
     public const string BarCloseAtm = "bar-close-atm";
+    /// <summary>A stored Futures Top-5 depth row (futures-depth5-v1) that disagreed with the recomputed value after a restart: readers treat that bar's depth values as unavailable.</summary>
+    public const string FuturesDepth5 = "futures-depth5";
+    /// <summary>Whole-bar UNVERIFIED marker of the per-contract options Top-5 rows (S5); the bar's attestation is revoked in the same transaction.</summary>
+    public const string OptionsDepth5 = "options-depth5";
 }
 
 /// <summary>

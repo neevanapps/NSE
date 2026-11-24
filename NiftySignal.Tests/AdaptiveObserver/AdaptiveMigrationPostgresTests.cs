@@ -486,7 +486,7 @@ public sealed class AdaptiveMigrationPostgresTests
         Assert.Equal(1, await viaScript.ScalarAsync($"SELECT count(*) FROM \"__EFMigrationsHistory\" WHERE \"MigrationId\" = '{AdaptivePg.Attestation}'"));
 
         await using var viaEf = await HistoricalDatabaseAsync();
-        await viaEf.MigrateAsync();
+        await viaEf.MigrateAsync(AdaptivePg.Attestation);                            // this script is the attestation migration only; the Futures depth5 table has its own script and test below
         const string columns = "SELECT table_name || '.' || column_name || ':' || data_type || ':' || coalesce(character_maximum_length::text, '') || ':' || is_nullable FROM information_schema.columns WHERE table_schema = 'public' ORDER BY 1";
         Assert.Equal(await ColumnsAsync(viaEf, columns), await ColumnsAsync(viaScript, columns));
 
@@ -543,6 +543,179 @@ public sealed class AdaptiveMigrationPostgresTests
         await viaEf.MigrateAsync(AdaptivePg.Latest);                                 // Down: only the new table goes
         Assert.Equal(0, await viaEf.ScalarAsync("SELECT count(*) FROM information_schema.tables WHERE table_name = 'adaptive_bar_close_atm'"));
         Assert.Equal(5, await viaEf.ScalarAsync("SELECT count(*) FROM adaptive_option_strike_bars"));
+    }
+
+    static string Depth5ScriptPath()
+    {
+        for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir is not null; dir = dir.Parent)
+        {
+            var candidate = Path.Combine(dir.FullName, "NiftySignal.AdaptiveObserverData", "Sql", "adaptive-futures-depth5.idempotent.sql");
+            if (File.Exists(candidate)) return candidate;
+        }
+
+        throw new FileNotFoundException("adaptive-futures-depth5.idempotent.sql not found above " + AppContext.BaseDirectory);
+    }
+
+    const string Depth5Migration = "20261124060445_AddFuturesDepth5Sidecar";
+    const string OptionsDepth5Migration = "20261124064802_AddOptionsDepth5Sidecar";
+    const string ColumnsSql = "SELECT table_name || '.' || column_name || ':' || data_type || ':' || coalesce(character_maximum_length::text, '') || ':' || is_nullable FROM information_schema.columns WHERE table_schema = 'public' ORDER BY 1";
+
+    [PgMigrationFact]
+    public async Task FuturesDepth5Table_ScriptIsIdempotent_MatchesTheEfMigration_AndIsPurelyAdditive()
+    {
+        await using var viaScript = await HistoricalDatabaseAsync();
+        await viaScript.MigrateAsync(AdaptivePg.Attestation);
+        var before = await ColumnsAsync(viaScript, ColumnsSql);
+        var sql = await File.ReadAllTextAsync(Depth5ScriptPath());
+        await viaScript.ExecAsync(sql);
+        await viaScript.ExecAsync(sql);                                              // twice: idempotent
+        Assert.Equal(1, await viaScript.ScalarAsync($"SELECT count(*) FROM \"__EFMigrationsHistory\" WHERE \"MigrationId\" = '{Depth5Migration}'"));
+
+        await using var viaEf = await HistoricalDatabaseAsync();
+        await viaEf.MigrateAsync(Depth5Migration);                                   // this script is the futures depth5 migration only; the options depth5 tables have their own script and test below
+        var after = await ColumnsAsync(viaEf, ColumnsSql);
+        Assert.Equal(after, await ColumnsAsync(viaScript, ColumnsSql));
+
+        // additive only: every column that existed before still exists unchanged; the only new ones belong to the new table
+        var added = after.Split('\n').Except(before.Split('\n')).ToList();
+        Assert.NotEmpty(added);
+        Assert.All(added, c => Assert.StartsWith("adaptive_futures_depth5_bars.", c));
+        Assert.Empty(before.Split('\n').Except(after.Split('\n')));
+        Assert.Equal(1, await viaEf.ScalarAsync("SELECT count(*) FROM pg_indexes WHERE tablename = 'adaptive_futures_depth5_bars' AND indexdef LIKE 'CREATE UNIQUE INDEX%' AND indexdef LIKE '%(\"SessionId\", \"BarSeq\", \"MetricsVersion\")%'"));
+
+        await viaEf.MigrateAsync(AdaptivePg.Attestation);                            // Down: only the new table goes
+        Assert.Equal(0, await viaEf.ScalarAsync("SELECT count(*) FROM information_schema.tables WHERE table_name = 'adaptive_futures_depth5_bars'"));
+        Assert.Equal(before, await ColumnsAsync(viaEf, ColumnsSql));
+        Assert.Equal(5, await viaEf.ScalarAsync("SELECT count(*) FROM adaptive_option_strike_bars"));
+    }
+
+    [PgMigrationFact]
+    public async Task FuturesDepth5Sidecar_InsertsVerifiesAndMarksAMismatch_OnPostgres_WithoutOverwriting()
+    {
+        await using var temp = await HistoricalDatabaseAsync();
+        await temp.MigrateAsync();
+        var bars = FuturesDepth5Tests.SamplePackages();
+        var svc = new AdaptiveSupplementalPersistence(NullLogger<AdaptiveSupplementalPersistence>.Instance);
+        await using var db = temp.Context();
+        var sessionId = await db.Sessions.Select(s => s.Id).FirstAsync();
+
+        Assert.Equal(SupplementalOutcome.Inserted, await svc.PersistOrVerifyFuturesDepth5Async(db, sessionId, bars[0], default));
+        Assert.Equal(SupplementalOutcome.Verified, await svc.PersistOrVerifyFuturesDepth5Async(db, sessionId, bars[0], default));
+        Assert.Equal(SupplementalOutcome.Inserted, await svc.PersistOrVerifyFuturesDepth5Async(db, sessionId, bars[1], default));
+        Assert.Equal(2, await temp.ScalarAsync("SELECT count(*) FROM adaptive_futures_depth5_bars"));
+
+        var seq = bars[0].FutureBar.BarSeq;
+        var storedGap = await temp.ScalarAsync($"SELECT round(\"Ofi5BridgedGapSeconds\")::bigint FROM adaptive_futures_depth5_bars WHERE \"BarSeq\" = {seq}");
+        var tampered = bars[0] with { Depth5 = bars[0].Depth5! with { Ofi5BridgedGapSeconds = bars[0].Depth5!.Ofi5BridgedGapSeconds + 1 } };
+        Assert.Equal(SupplementalOutcome.Mismatch, await svc.PersistOrVerifyFuturesDepth5Async(db, sessionId, tampered, default));
+        Assert.Equal(storedGap, await temp.ScalarAsync($"SELECT round(\"Ofi5BridgedGapSeconds\")::bigint FROM adaptive_futures_depth5_bars WHERE \"BarSeq\" = {seq}"));
+        Assert.Equal(1, await temp.ScalarAsync($"SELECT count(*) FROM adaptive_projection_health WHERE \"Component\" = '{AdaptiveProjectionComponents.FuturesDepth5}'"));
+    }
+
+    static string OptionsDepth5ScriptPath()
+    {
+        for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir is not null; dir = dir.Parent)
+        {
+            var candidate = Path.Combine(dir.FullName, "NiftySignal.AdaptiveObserverData", "Sql", "adaptive-options-depth5.idempotent.sql");
+            if (File.Exists(candidate)) return candidate;
+        }
+
+        throw new FileNotFoundException("adaptive-options-depth5.idempotent.sql not found above " + AppContext.BaseDirectory);
+    }
+
+    [PgMigrationFact]
+    public async Task OptionsDepth5Tables_ScriptIsIdempotent_MatchesTheEfMigration_IsPurelyAdditive_AndDownDropsOnlyThem()
+    {
+        await using var viaScript = await HistoricalDatabaseAsync();
+        await viaScript.MigrateAsync(Depth5Migration);
+        var before = await ColumnsAsync(viaScript, ColumnsSql);
+        var sql = await File.ReadAllTextAsync(OptionsDepth5ScriptPath());
+        await viaScript.ExecAsync(sql);
+        await viaScript.ExecAsync(sql);                                              // twice: idempotent
+        Assert.Equal(1, await viaScript.ScalarAsync($"SELECT count(*) FROM \"__EFMigrationsHistory\" WHERE \"MigrationId\" = '{OptionsDepth5Migration}'"));
+
+        await using var viaEf = await HistoricalDatabaseAsync();
+        await viaEf.MigrateAsync();
+        var after = await ColumnsAsync(viaEf, ColumnsSql);
+        Assert.Equal(after, await ColumnsAsync(viaScript, ColumnsSql));
+
+        var added = after.Split('\n').Except(before.Split('\n')).ToList();
+        Assert.NotEmpty(added);
+        Assert.All(added, c => Assert.True(c.StartsWith("adaptive_options_depth5_bars.", StringComparison.Ordinal) || c.StartsWith("adaptive_options_depth5_attestation.", StringComparison.Ordinal), c));
+        Assert.Empty(before.Split('\n').Except(after.Split('\n')));                // nothing existing changed
+        Assert.Equal(1, await viaEf.ScalarAsync("SELECT count(*) FROM pg_indexes WHERE tablename = 'adaptive_options_depth5_bars' AND indexdef LIKE 'CREATE UNIQUE INDEX%' AND indexdef LIKE '%(\"SessionId\", \"BarSeq\", \"Token\", \"MetricsVersion\")%'"));
+        Assert.Equal(1, await viaEf.ScalarAsync("SELECT count(*) FROM pg_indexes WHERE tablename = 'adaptive_options_depth5_attestation' AND indexdef LIKE 'CREATE UNIQUE INDEX%' AND indexdef LIKE '%(\"SessionId\", \"BarSeq\", \"MetricsVersion\")%'"));
+
+        await viaEf.MigrateAsync(Depth5Migration);                                   // Down: only the two new tables go
+        Assert.Equal(0, await viaEf.ScalarAsync("SELECT count(*) FROM information_schema.tables WHERE table_name IN ('adaptive_options_depth5_bars','adaptive_options_depth5_attestation')"));
+        Assert.Equal(1, await viaEf.ScalarAsync("SELECT count(*) FROM information_schema.tables WHERE table_name = 'adaptive_futures_depth5_bars'"));
+        Assert.Equal(before, await ColumnsAsync(viaEf, ColumnsSql));
+        Assert.Equal(5, await viaEf.ScalarAsync("SELECT count(*) FROM adaptive_option_strike_bars"));
+    }
+
+    [PgMigrationFact]
+    public async Task OptionsDepth5Sidecar_OnPostgres_InsertsVerifiesAttestsAndWithholds_WithoutTouchingStrikeV3()
+    {
+        await using var temp = await HistoricalDatabaseAsync();
+        await temp.MigrateAsync();
+        var bars = OptionsDepth5Tests.SamplePackages();
+        var svc = new AdaptiveSupplementalPersistence(NullLogger<AdaptiveSupplementalPersistence>.Instance);
+        await using var db = temp.Context();
+        var sessionId = await db.Sessions.Select(s => s.Id).FirstAsync();
+        var strikeBefore = await temp.ScalarAsync("SELECT count(*) FROM adaptive_option_strike_bars");
+        var strikeAttBefore = await temp.ScalarAsync("SELECT count(*) FROM adaptive_strike_attestation");
+
+        Assert.Equal(SupplementalOutcome.Inserted, await svc.PersistOrVerifyOptionsDepth5Async(db, sessionId, bars[0], default));
+        Assert.Equal(SupplementalOutcome.Verified, await svc.PersistOrVerifyOptionsDepth5Async(db, sessionId, bars[0], default));
+        Assert.Equal(SupplementalOutcome.Inserted, await svc.PersistOrVerifyOptionsDepth5Async(db, sessionId, bars[1], default));
+        Assert.Equal(80, await temp.ScalarAsync("SELECT count(*) FROM adaptive_options_depth5_bars"));
+        Assert.Equal(2, await temp.ScalarAsync("SELECT count(*) FROM adaptive_options_depth5_attestation"));
+        Assert.Equal(80, (await VerifiedOptionsDepth5.LoadServedRowsAsync(db, sessionId, 0, 100000, default)).Count);       // values round-trip through real PostgreSQL to the same digests
+
+        // a duplicate row for the same (session, bar, token, version) is rejected by the unique index
+        var dupe = AdaptiveSupplementalPersistence.MapOptionsDepth5(sessionId, bars[0].FutureBar.BarSeq, bars[0].OptionsDepth5![0]);
+        await using (var other = temp.Context())
+        {
+            other.OptionsDepth5.Add(dupe);
+            var ex = await Assert.ThrowsAsync<DbUpdateException>(() => other.SaveChangesAsync());
+            Assert.Equal("23505", ((PostgresException)ex.InnerException!).SqlState);
+        }
+
+        var seq = bars[0].FutureBar.BarSeq;
+        var storedGap = await temp.ScalarAsync($"SELECT round(\"Ofi5BridgedGapSeconds\" * 1000)::bigint FROM adaptive_options_depth5_bars WHERE \"BarSeq\" = {seq} AND \"Token\" = 'C7'");
+        var tampered = bars[0] with { OptionsDepth5 = bars[0].OptionsDepth5!.Select(x => x.Token == "C7" ? x with { Depth = x.Depth with { Ofi5BridgedGapSeconds = x.Depth.Ofi5BridgedGapSeconds + 1 } } : x).ToList() };
+        Assert.Equal(SupplementalOutcome.Mismatch, await svc.PersistOrVerifyOptionsDepth5Async(db, sessionId, tampered, default));
+        Assert.Equal(storedGap, await temp.ScalarAsync($"SELECT round(\"Ofi5BridgedGapSeconds\" * 1000)::bigint FROM adaptive_options_depth5_bars WHERE \"BarSeq\" = {seq} AND \"Token\" = 'C7'"));
+        Assert.Equal(1, await temp.ScalarAsync("SELECT count(*) FROM adaptive_options_depth5_attestation"));                  // the mismatching bar's attestation was revoked with the marker
+        Assert.Equal(1, await temp.ScalarAsync($"SELECT count(*) FROM adaptive_projection_health WHERE \"Component\" = '{AdaptiveProjectionComponents.OptionsDepth5}'"));
+        Assert.Equal(40, (await VerifiedOptionsDepth5.LoadServedRowsAsync(db, sessionId, 0, 100000, default)).Count);
+
+        Assert.Equal(strikeBefore, await temp.ScalarAsync("SELECT count(*) FROM adaptive_option_strike_bars"));               // option-strike-v3 and its attestation untouched
+        Assert.Equal(strikeAttBefore, await temp.ScalarAsync("SELECT count(*) FROM adaptive_strike_attestation"));
+    }
+
+    [PgMigrationFact]
+    public async Task OldHost_RollbackCompatibility_AnUnknownLaterMigrationInTheHistoryIsHarmless_AndTheOldTablesStayReadable()
+    {
+        await using var temp = await HistoricalDatabaseAsync();
+        await temp.MigrateAsync();                                                   // the NEW Host has applied the depth5 migration
+        // The previous Host's startup is an untargeted MigrateAsync() over its own (shorter) migration list; EF ignores applied ids it does not know. The table is purely additive, so the old
+        // model's queries keep working against the migrated schema (an old model has no mapping to the new table at all).
+        Assert.Equal(1, await temp.ScalarAsync($"SELECT count(*) FROM \"__EFMigrationsHistory\" WHERE \"MigrationId\" = '{Depth5Migration}'"));
+        await using var old = temp.Context();
+        Assert.Equal(1, await temp.ScalarAsync("SELECT count(*) FROM information_schema.tables WHERE table_name = 'adaptive_futures_depth5_bars'"));
+
+        // old queries (every pre-existing sidecar) still work against the migrated schema
+        Assert.Equal(1, await temp.ScalarAsync("SELECT count(*) FROM adaptive_sessions"));
+        Assert.Equal(5, await temp.ScalarAsync("SELECT count(*) FROM adaptive_option_strike_bars"));
+        Assert.True(await old.Sessions.AnyAsync());
+        Assert.True(await old.OptionStrikeBars.AnyAsync());
+
+        // an id this build has never heard of (a FUTURE migration) in the history is also harmless
+        await temp.ExecAsync("INSERT INTO \"__EFMigrationsHistory\" (\"MigrationId\", \"ProductVersion\") VALUES ('99999999999999_FutureMigration', '10.0.0')");
+        await using var again = temp.Context();
+        await again.GetService<IMigrator>().MigrateAsync();
+        Assert.Equal(1, await temp.ScalarAsync("SELECT count(*) FROM \"__EFMigrationsHistory\" WHERE \"MigrationId\" = '99999999999999_FutureMigration'"));
     }
 
     static async Task<string> ColumnsAsync(TempAdaptiveDatabase temp, string sql)

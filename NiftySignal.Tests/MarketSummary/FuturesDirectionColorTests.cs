@@ -169,7 +169,7 @@ public class FuturesDirectionColorTests
         var src = File.ReadAllText(Path.Combine(NiftySignal.Tests.Trading.Data.TradingModelTests.RepoRoot(), "NiftySignal.Dashboard", "Components", "Dashboard", "AdaptiveObserverPanel.razor"));
         var tinted = Regex.Matches(src, @"class=""@Sc\(([^)]*)\)""").Select(m => m.Groups[1].Value).ToList();
         Assert.NotEmpty(tinted);
-        Assert.All(tinted, t => Assert.Matches(@"PriceDisplacement|StrictDelta|EnrichedDelta|ReturnBps|Residual|\.(Strict|Enriched|MicroDev|Ofi|BarPx|RollPx)$|^(frMicro|avgMicro|davgMicro)$|^dr\.", t));
+        Assert.All(tinted, t => Assert.Matches(@"PriceDisplacement|StrictDelta|EnrichedDelta|ReturnBps|Residual|\.(Strict|Enriched|MicroDev|Ofi|BarPx|RollPx)$|^(frMicro|avgMicro|davgMicro|o5|m5|a5m|da5m|a5\.Ofi5|da5\.Ofi5)$|^dr\.", t));
         Assert.DoesNotContain(tinted, t => Regex.IsMatch(t, "Oi|Basis|Volume|Efficiency|Duration|Urgency|Gross|Abs|DeltaChange", RegexOptions.IgnoreCase));
     }
 }

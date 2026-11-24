@@ -134,7 +134,7 @@ public sealed class AgentSnapshotService(
                 session, f, centerBySeq.GetValueOrDefault(seq), selectedBySeq[seq], catalog, contract,
                 day.FuturesSupplemental.GetValueOrDefault(seq), day.Basis.GetValueOrDefault(seq), fixedBySeq.GetValueOrDefault(seq),
                 boundary.GetValueOrDefault(seq), vixWindows is not null && i < vixWindows.Count ? vixWindows[i] : null,
-                residualRows.GetValueOrDefault(seq), derived.GetValueOrDefault(seq)));
+                residualRows.GetValueOrDefault(seq), derived.GetValueOrDefault(seq), day.FuturesDepth5?.GetValueOrDefault(seq)));
         }
 
         return result;
@@ -144,7 +144,7 @@ public sealed class AgentSnapshotService(
     public static AgentBar Map(
         AdaptiveSessionStateRow session, AdaptiveFuturesGridRow futures, double? center, double? selectedStrike, FixedStrikeCatalog? catalog, FixedStrikeContract? contract,
         AdaptiveFuturesSupplementalRow? sup, AdaptiveBasisSupplementalRow? basis, FixedStrikeRow? fixedRow,
-        AdaptiveQuoteAsOfService.BoundaryQuotes? quotes, VixWindowSummary? vix, AdaptiveOptionResidualBarRow? residual, ResidualDerivedPoint? residualDerived)
+        AdaptiveQuoteAsOfService.BoundaryQuotes? quotes, VixWindowSummary? vix, AdaptiveOptionResidualBarRow? residual, ResidualDerivedPoint? residualDerived, AdaptiveFuturesDepth5Row? depth = null)
     {
         var b = futures.Bar;
         var r = futures.Rolling;
@@ -229,7 +229,15 @@ public sealed class AgentSnapshotService(
 
         var market = new AgentMarket(spot, F(spotAge), F(vixEnd?.Value), F(vix?.Change), F(vixEnd?.AgeSeconds));
 
-        return new AgentBar(b.BarSeq, At(b.StartAvailableAtUtc), At(b.EndAvailableAtUtc), true, F(b.DurationSeconds), issues.Count == 0, issues, agentFutures, options, agentResidual, market);
+        AgentTop5? top5 = null;
+        if (depth is not null || fixedRow?.CeDepth is not null || fixedRow?.PeDepth is not null)
+        {
+            top5 = new AgentTop5(
+                Ratio(Depth5Ratios.Ofi5(depth)), Ratio(Depth5Ratios.MicroDev5(depth)), depth?.Ofi5DirectTransitions, depth?.Ofi5BridgedTransitions, F(depth?.Depth5UsableSeconds),
+                Ratios(Depth5Ratios.OptionOfi5(fixedRow?.CeDepth, fixedRow?.PeDepth)), Ratios(Depth5Ratios.OptionMicroDev5(fixedRow?.CeDepth, fixedRow?.PeDepth)));
+        }
+
+        return new AgentBar(b.BarSeq, At(b.StartAvailableAtUtc), At(b.EndAvailableAtUtc), true, F(b.DurationSeconds), issues.Count == 0, issues, agentFutures, options, agentResidual, market, top5);
     }
 
     static AgentOptionSide Side(AdaptiveOptionStrikeBarRow? row, string? token, string? symbol, PinnedQuote? quote, DateTimeOffset boundary) => new(

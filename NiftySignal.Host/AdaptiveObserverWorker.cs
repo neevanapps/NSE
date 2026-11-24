@@ -22,7 +22,8 @@ public sealed class AdaptiveObserverWorker(
     DashboardPushClient dashboardPush,
     ILogger<AdaptiveObserverWorker> logger,
     PaperLive.PaperLiveBridge? paperLive = null,
-    PaperEngineV2.PaperEngineV2Bridge? paperEngineV2 = null) : BackgroundService
+    PaperEngineV2.PaperEngineV2Bridge? paperEngineV2 = null,
+    FuturesDepth5Gateway? depth5 = null) : BackgroundService
 {
     static readonly TimeSpan IstOffset = TimeSpan.FromHours(5.5);
     static readonly TimeOnly MarketOpen = new(9, 15);
@@ -57,6 +58,15 @@ public sealed class AdaptiveObserverWorker(
         /// <summary>Recovery hands back raw-Id-ordered pending rows; sort once, then only after new ticks are appended.</summary>
         public bool PendingNeedsSort { get; set; } = recovered.Pending.Count > 1;
         public DateTimeOffset? LastRuntimeFlushUtc { get; set; }
+        /// <summary>Futures Top-5 depth feed (null when the flag is off). Shares the recovery feed's cursor and pending events.</summary>
+        public FuturesDepth5Feed? Depth5Feed { get; } = recovered.Depth5Feed;
+        /// <summary>False once a depth read failed in this live session: later bars then carry NO depth sidecar (never a partial one) until the next recovery replays and backfills them.</summary>
+        public bool Depth5Healthy { get; set; } = true;
+        /// <summary>Options Top-5 depth feed (null when the S5 flag is off) and the frozen option universe's tokens it covers.</summary>
+        public FuturesDepth5Feed? OptionsDepth5Feed { get; } = recovered.OptionsDepth5Feed;
+        public IReadOnlyList<string> OptionDepthTokens { get; } = recovered.OptionDepthTokens ?? [];
+        /// <summary>False once an options depth read failed in this live session: later bars carry NO options depth rows until the next recovery replays and backfills them (the futures sidecar and the core are unaffected).</summary>
+        public bool OptionsDepth5Healthy { get; set; } = true;
         /// <summary>Fixed-clock sessions store their 09:30 residual anchor once, when the engine freezes it (see AdaptiveObserverPersistence.PersistResidualAnchorOnceAsync).</summary>
         public bool AnchorStored { get; set; } = !AdaptiveFixedClockV1.IsFixedClock(context.Session.ModelVersion) || context.ResidualAnchor is not null || recovered.Engine.SelfAnchorAttempted;
         /// <summary>Completed bars whose sidecar integrity is unknown (a write/verify failed). The paper path never receives a verified bar at or past the first of them (see <see cref="PaperVerifiedCapBeforeBar"/>).</summary>
@@ -254,6 +264,39 @@ public sealed class AdaptiveObserverWorker(
             }
         }
 
+        if (live.Depth5Feed is { } depthFeed && depth5 is not null && live.Depth5Healthy)
+        {
+            // A depth failure must never disturb the core observer: depth is simply withheld for the rest of this live session (see LiveState.Depth5Healthy).
+            try
+            {
+                using (AdaptiveLiveTelemetry.Source.StartActivity("poll.depth5"))
+                    await depth5.PollAsync(source, depthFeed, live.Context.Definition.FutureToken, live.Context.Session.TradeDate,
+                        live.Context.Session.ObservationStartUtc ?? live.Context.Session.OpeningWindowStartUtc, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                live.Depth5Healthy = false;
+                logger.LogError(ex, "Futures depth5 read failed; depth sidecar withheld for the rest of this session until the next recovery (core observer unaffected).");
+            }
+        }
+
+        if (live.OptionsDepth5Feed is { } optionsFeed && depth5 is not null && live.OptionsDepth5Healthy)
+        {
+            try
+            {
+                using (AdaptiveLiveTelemetry.Source.StartActivity("poll.options-depth5"))
+                    await depth5.PollOptionsAsync(source, optionsFeed, live.OptionDepthTokens, live.Context.Session.TradeDate,
+                        live.Context.Session.ObservationStartUtc ?? live.Context.Session.OpeningWindowStartUtc, ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                live.OptionsDepth5Healthy = false;
+                logger.LogError(ex, "Options depth5 read failed; the options depth sidecar is withheld for the rest of this session until the next recovery (core observer and futures depth unaffected).");
+            }
+        }
+
         // Once sorted, removing a prefix preserves order, so an unchanged buffer is never re-sorted.
         if (appended > 0) live.PendingNeedsSort = true;
         if (live.PendingNeedsSort)
@@ -280,8 +323,17 @@ public sealed class AdaptiveObserverWorker(
             while(groupEnd<live.Pending.Count && live.Pending[groupEnd].Tick.AvailableAt==groupTime)groupEnd++;
             var group=live.Pending.GetRange(processed,groupEnd-processed).Select(x=>(x.Token,x.Tick)).ToArray();
             IReadOnlyList<AdaptiveCompletedBarPackage> packages;
+            // Every depth event up to and including this boundary is delivered before the group (identical to recovery); with the flag off the feed is null and nothing happens.
+            if (live.Depth5Feed is { } feed && live.Depth5Healthy)
+                foreach (var depthEvent in feed.DrainThrough(groupTime)) live.Engine.ObserveDepth(depthEvent);
+            if (live.OptionsDepth5Feed is { } optFeed && live.OptionsDepth5Healthy)
+                foreach (var depthEvent in optFeed.DrainThrough(groupTime)) live.Engine.ObserveDepth(depthEvent);
             using (AdaptiveLiveTelemetry.Source.StartActivity("poll.engine"))
                 packages = live.Engine.ProcessAvailabilityGroup(group);
+            if (live.OptionsDepth5Feed is not null && !live.OptionsDepth5Healthy)
+                packages = packages.Select(p => p.OptionsDepth5 is null ? p : p with { OptionsDepth5 = null }).ToList();
+            if (live.Depth5Feed is not null && !live.Depth5Healthy)
+                packages = packages.Select(p => p.Depth5 is null ? p : p with { Depth5 = null }).ToList();
             live.LastProcessedAvailableAt = groupTime;
             live.LastProcessedTickId = group.Max(x=>x.Tick.Id);
             if (!live.AnchorStored && live.Engine.SelfAnchorAttempted)

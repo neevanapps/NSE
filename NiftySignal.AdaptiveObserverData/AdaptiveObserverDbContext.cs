@@ -26,6 +26,9 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
     public DbSet<AdaptiveOptionStrikeBarRow> OptionStrikeBars => Set<AdaptiveOptionStrikeBarRow>();
     public DbSet<AdaptiveBarCloseAtmRow> BarCloseAtm => Set<AdaptiveBarCloseAtmRow>();
     public DbSet<AdaptiveStrikeAttestationRow> StrikeAttestations => Set<AdaptiveStrikeAttestationRow>();
+    public DbSet<AdaptiveFuturesDepth5Row> FuturesDepth5 => Set<AdaptiveFuturesDepth5Row>();
+    public DbSet<AdaptiveOptionsDepth5Row> OptionsDepth5 => Set<AdaptiveOptionsDepth5Row>();
+    public DbSet<AdaptiveOptionsDepth5AttestationRow> OptionsDepth5Attestations => Set<AdaptiveOptionsDepth5AttestationRow>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -157,6 +160,29 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
             e.HasIndex(x => new { x.SessionId, x.BarSeq, x.MetricsVersion }).IsUnique();
             e.Property(x => x.MetricsVersion).HasMaxLength(64);
             e.Property(x => x.Status).HasMaxLength(16);
+            e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
+        });
+        modelBuilder.Entity<AdaptiveFuturesDepth5Row>(e =>
+        {
+            e.ToTable("adaptive_futures_depth5_bars");
+            e.HasIndex(x => new { x.SessionId, x.BarSeq, x.MetricsVersion }).IsUnique();
+            e.Property(x => x.MetricsVersion).HasMaxLength(64);
+            e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
+        });
+        modelBuilder.Entity<AdaptiveOptionsDepth5Row>(e =>
+        {
+            e.ToTable("adaptive_options_depth5_bars");
+            e.HasIndex(x => new { x.SessionId, x.BarSeq, x.Token, x.MetricsVersion }).IsUnique();
+            e.Property(x => x.Token).HasMaxLength(32);
+            e.Property(x => x.MetricsVersion).HasMaxLength(64);
+            e.Property(x => x.TradingSymbol).HasMaxLength(64);
+            e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
+        });
+        modelBuilder.Entity<AdaptiveOptionsDepth5AttestationRow>(e =>
+        {
+            e.ToTable("adaptive_options_depth5_attestation");
+            e.HasIndex(x => new { x.SessionId, x.BarSeq, x.MetricsVersion }).IsUnique();
+            e.Property(x => x.MetricsVersion).HasMaxLength(64);
             e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
         });
         modelBuilder.Entity<AdaptiveSessionSupplementalRow>(e =>

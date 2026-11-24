@@ -14,7 +14,10 @@ public sealed record AdaptiveRecoveryResult(
     int ReconciledBars,
     IReadOnlyList<string> Tokens,
     IReadOnlyList<ObserverTokenTick> Pending,
-    IReadOnlyCollection<int> UnverifiedSidecarBars);
+    IReadOnlyCollection<int> UnverifiedSidecarBars,
+    FuturesDepth5Feed? Depth5Feed = null,
+    FuturesDepth5Feed? OptionsDepth5Feed = null,
+    IReadOnlyList<string>? OptionDepthTokens = null);
 
 public sealed class AdaptiveStateRecoveryService(
     AdaptiveSourceTickReader tickReader,
@@ -22,7 +25,8 @@ public sealed class AdaptiveStateRecoveryService(
     AdaptiveWeak2ObservationService observations,
     ILogger<AdaptiveStateRecoveryService> logger,
     AdaptiveSupplementalPersistence? supplemental = null,
-    AdaptiveSessionSupplementalService? sessionSupplemental = null)
+    AdaptiveSessionSupplementalService? sessionSupplemental = null,
+    FuturesDepth5Gateway? depth5 = null)
 {
     public async Task<AdaptiveRecoveryResult> RecoverAsync(
         NiftySignalDbContext source,
@@ -94,6 +98,21 @@ public sealed class AdaptiveStateRecoveryService(
             return byTime != 0 ? byTime : a.Tick.Id.CompareTo(b.Tick.Id);
         });
 
+        // Futures Top-5 depth (flag-gated, default OFF): the same feed code as live polling, derived from the same stored rows of the future token.
+        FuturesDepth5Feed? depthFeed = null;
+        if (depth5 is { Enabled: true })
+        {
+            using (AdaptiveLiveTelemetry.Source.StartActivity("recovery.depth5"))
+                depthFeed = await depth5.RecoverFeedAsync(source, context.Session.TradeDate, context.Definition.FutureToken,
+                    context.Session.ObservationStartUtc ?? marketOpenUtc, ct);
+        }
+
+        // Options Top-5 depth (S5; flag-gated, default OFF): bounded-memory lazy source over the frozen option universe's tokens only.
+        OptionsDepth5Source? optionsSource = null;
+        var optionTokens = context.Options.Select(x => x.Token).Distinct(StringComparer.Ordinal).ToArray();
+        if (depth5 is { OptionsEnabled: true } && optionTokens.Length > 0)
+            optionsSource = depth5.CreateOptionsSource(source, context.Session.TradeDate, optionTokens, context.Session.ObservationStartUtc ?? marketOpenUtc);
+
         var engine = new AdaptiveObserverEngine(
             context.Definition,
             context.WeeklyOptionExpiry,
@@ -105,7 +124,9 @@ public sealed class AdaptiveStateRecoveryService(
             spotToken,
             projectStrikes: true,
             selfAnchorCutoffUtc: AdaptiveFixedClockV1.IsFixedClock(context.Session.ModelVersion) ? context.Session.OpeningWindowEndUtc : null,
-            atmRule: atmRule);
+            atmRule: atmRule,
+            trackFuturesDepth5: depthFeed is not null,
+            trackOptionsDepth5: optionsSource is not null);
         var anchorStored = !AdaptiveFixedClockV1.IsFixedClock(context.Session.ModelVersion) || context.ResidualAnchor is not null;
 
         var reconciled = 0;
@@ -118,6 +139,13 @@ public sealed class AdaptiveStateRecoveryService(
         {
             var items=group.Select(x=>(x.Token,x.Tick)).ToArray();
             IReadOnlyList<AdaptiveCompletedBarPackage> packages;
+            // Every depth event up to and including this boundary is delivered before the group, exactly as live polling does.
+            if (depthFeed is not null) foreach (var depthEvent in depthFeed.DrainThrough(group.Key)) engine.ObserveDepth(depthEvent);
+            if (optionsSource is not null)
+            {
+                await optionsSource.AdvanceToAsync(group.Key, ct);
+                foreach (var depthEvent in optionsSource.Feed.DrainThrough(group.Key)) engine.ObserveDepth(depthEvent);
+            }
             using (AdaptiveLiveTelemetry.Source.StartActivity("recovery.engine"))
                 packages = engine.ProcessAvailabilityGroup(items);
             lastAvailable = group.Key;
@@ -155,6 +183,9 @@ public sealed class AdaptiveStateRecoveryService(
         if (supplemental is not null)
             logger.LogInformation("Per-strike verification replay finished for session {SessionId}: bars replayed through verification in {ElapsedMs} ms; per-strike retries pending={StrikePending}, close-ATM retries pending={CloseAtmPending} (bars not yet attested stay withheld from readers).",
                 context.Session.Id, (long)System.Diagnostics.Stopwatch.GetElapsedTime(replayStart).TotalMilliseconds, supplemental.PendingStrikeRetryCount, supplemental.PendingCloseAtmRetryCount);
+
+        // The options feed's cursor must equal the last stored option row (rows after the stable cutoff stay pending for live polling, exactly like the Level-1 pending rows).
+        if (optionsSource is not null) await optionsSource.FinishAsync(ct);
 
         var rebuiltLastSeq = engine.FutureBars.Where(x => x.IsComplete).Select(x => x.BarSeq).DefaultIfEmpty(0).Max();
         if (await observer.FutureBars.AsNoTracking().AnyAsync(x => x.SessionId == context.Session.Id && x.BarSeq > rebuiltLastSeq, ct))
@@ -194,6 +225,9 @@ public sealed class AdaptiveStateRecoveryService(
             reconciled,
             tokens,
             pending,
-            unverifiedSidecars);
+            unverifiedSidecars,
+            depthFeed,
+            optionsSource?.Feed,
+            optionsSource is null ? null : optionTokens);
     }
 }

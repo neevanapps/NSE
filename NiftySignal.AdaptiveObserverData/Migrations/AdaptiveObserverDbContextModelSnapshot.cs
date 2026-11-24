@@ -482,6 +482,102 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                     b.ToTable("adaptive_future_bars", (string)null);
                 });
 
+            modelBuilder.Entity("NiftySignal.AdaptiveObserverData.AdaptiveFuturesDepth5Row", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<double?>("AskNotionalTimeWeighted")
+                        .HasColumnType("double precision");
+
+                    b.Property<double>("BarSeconds")
+                        .HasColumnType("double precision");
+
+                    b.Property<int>("BarSeq")
+                        .HasColumnType("integer");
+
+                    b.Property<double?>("BidNotionalTimeWeighted")
+                        .HasColumnType("double precision");
+
+                    b.Property<double>("Depth5InvalidSeconds")
+                        .HasColumnType("double precision");
+
+                    b.Property<double>("Depth5NoDepthSeconds")
+                        .HasColumnType("double precision");
+
+                    b.Property<double>("Depth5StaleSeconds")
+                        .HasColumnType("double precision");
+
+                    b.Property<double>("Depth5SupersededSeconds")
+                        .HasColumnType("double precision");
+
+                    b.Property<double>("Depth5UnobservedSeconds")
+                        .HasColumnType("double precision");
+
+                    b.Property<double>("Depth5UsableSeconds")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("DepthImb5TimeWeighted")
+                        .HasColumnType("double precision");
+
+                    b.Property<long?>("GrossOfi5")
+                        .HasColumnType("bigint");
+
+                    b.Property<int>("InvalidSnapshots")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("MetricsVersion")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<double?>("MicroDev5TimeWeighted")
+                        .HasColumnType("double precision");
+
+                    b.Property<long?>("Ofi5")
+                        .HasColumnType("bigint");
+
+                    b.Property<int>("Ofi5BaselineResets")
+                        .HasColumnType("integer");
+
+                    b.Property<double>("Ofi5BridgedGapSeconds")
+                        .HasColumnType("double precision");
+
+                    b.Property<long?>("Ofi5BridgedNet")
+                        .HasColumnType("bigint");
+
+                    b.Property<int>("Ofi5BridgedTransitions")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("Ofi5DirectTransitions")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("Ofi5Transitions")
+                        .HasColumnType("integer");
+
+                    b.Property<long>("SessionId")
+                        .HasColumnType("bigint");
+
+                    b.Property<int>("SnapshotEvents")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("SupersededMarkers")
+                        .HasColumnType("integer");
+
+                    b.Property<double?>("Tob5TimeWeighted")
+                        .HasColumnType("double precision");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("SessionId", "BarSeq", "MetricsVersion")
+                        .IsUnique();
+
+                    b.ToTable("adaptive_futures_depth5_bars", (string)null);
+                });
+
             modelBuilder.Entity("NiftySignal.AdaptiveObserverData.AdaptiveFuturesSupplementalRow", b =>
                 {
                     b.Property<long>("Id")
@@ -1097,6 +1193,158 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                     b.HasIndex("SessionId", "Expiry", "Strike", "Side", "BarSeq");
 
                     b.ToTable("adaptive_option_strike_bars", (string)null);
+                });
+
+            modelBuilder.Entity("NiftySignal.AdaptiveObserverData.AdaptiveOptionsDepth5AttestationRow", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<int>("BarSeq")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("Digests")
+                        .IsRequired()
+                        .HasColumnType("text");
+
+                    b.Property<string>("MetricsVersion")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<long>("SessionId")
+                        .HasColumnType("bigint");
+
+                    b.Property<int>("TokenCount")
+                        .HasColumnType("integer");
+
+                    b.Property<DateTimeOffset>("VerifiedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("SessionId", "BarSeq", "MetricsVersion")
+                        .IsUnique();
+
+                    b.ToTable("adaptive_options_depth5_attestation", (string)null);
+                });
+
+            modelBuilder.Entity("NiftySignal.AdaptiveObserverData.AdaptiveOptionsDepth5Row", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<double?>("AskNotionalTimeWeighted")
+                        .HasColumnType("double precision");
+
+                    b.Property<double>("BarSeconds")
+                        .HasColumnType("double precision");
+
+                    b.Property<int>("BarSeq")
+                        .HasColumnType("integer");
+
+                    b.Property<double?>("BidNotionalTimeWeighted")
+                        .HasColumnType("double precision");
+
+                    b.Property<double>("Depth5InvalidSeconds")
+                        .HasColumnType("double precision");
+
+                    b.Property<double>("Depth5NoDepthSeconds")
+                        .HasColumnType("double precision");
+
+                    b.Property<double>("Depth5StaleSeconds")
+                        .HasColumnType("double precision");
+
+                    b.Property<double>("Depth5SupersededSeconds")
+                        .HasColumnType("double precision");
+
+                    b.Property<double>("Depth5UnobservedSeconds")
+                        .HasColumnType("double precision");
+
+                    b.Property<double>("Depth5UsableSeconds")
+                        .HasColumnType("double precision");
+
+                    b.Property<double?>("DepthImb5TimeWeighted")
+                        .HasColumnType("double precision");
+
+                    b.Property<DateOnly>("Expiry")
+                        .HasColumnType("date");
+
+                    b.Property<long?>("GrossOfi5")
+                        .HasColumnType("bigint");
+
+                    b.Property<int>("InvalidSnapshots")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("MetricsVersion")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<double?>("MicroDev5TimeWeighted")
+                        .HasColumnType("double precision");
+
+                    b.Property<long?>("Ofi5")
+                        .HasColumnType("bigint");
+
+                    b.Property<int>("Ofi5BaselineResets")
+                        .HasColumnType("integer");
+
+                    b.Property<double>("Ofi5BridgedGapSeconds")
+                        .HasColumnType("double precision");
+
+                    b.Property<long?>("Ofi5BridgedNet")
+                        .HasColumnType("bigint");
+
+                    b.Property<int>("Ofi5BridgedTransitions")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("Ofi5DirectTransitions")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("Ofi5Transitions")
+                        .HasColumnType("integer");
+
+                    b.Property<long>("SessionId")
+                        .HasColumnType("bigint");
+
+                    b.Property<int>("Side")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("SnapshotEvents")
+                        .HasColumnType("integer");
+
+                    b.Property<double>("Strike")
+                        .HasColumnType("double precision");
+
+                    b.Property<int>("SupersededMarkers")
+                        .HasColumnType("integer");
+
+                    b.Property<double?>("Tob5TimeWeighted")
+                        .HasColumnType("double precision");
+
+                    b.Property<string>("Token")
+                        .IsRequired()
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<string>("TradingSymbol")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("SessionId", "BarSeq", "Token", "MetricsVersion")
+                        .IsUnique();
+
+                    b.ToTable("adaptive_options_depth5_bars", (string)null);
                 });
 
             modelBuilder.Entity("NiftySignal.AdaptiveObserverData.AdaptiveOptionsSupplementalRow", b =>
@@ -2032,6 +2280,15 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                         .IsRequired();
                 });
 
+            modelBuilder.Entity("NiftySignal.AdaptiveObserverData.AdaptiveFuturesDepth5Row", b =>
+                {
+                    b.HasOne("NiftySignal.AdaptiveObserverData.AdaptiveSessionStateRow", null)
+                        .WithMany()
+                        .HasForeignKey("SessionId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+                });
+
             modelBuilder.Entity("NiftySignal.AdaptiveObserverData.AdaptiveFuturesSupplementalRow", b =>
                 {
                     b.HasOne("NiftySignal.AdaptiveObserverData.AdaptiveSessionStateRow", null)
@@ -2069,6 +2326,24 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                 });
 
             modelBuilder.Entity("NiftySignal.AdaptiveObserverData.AdaptiveOptionStrikeBarRow", b =>
+                {
+                    b.HasOne("NiftySignal.AdaptiveObserverData.AdaptiveSessionStateRow", null)
+                        .WithMany()
+                        .HasForeignKey("SessionId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("NiftySignal.AdaptiveObserverData.AdaptiveOptionsDepth5AttestationRow", b =>
+                {
+                    b.HasOne("NiftySignal.AdaptiveObserverData.AdaptiveSessionStateRow", null)
+                        .WithMany()
+                        .HasForeignKey("SessionId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("NiftySignal.AdaptiveObserverData.AdaptiveOptionsDepth5Row", b =>
                 {
                     b.HasOne("NiftySignal.AdaptiveObserverData.AdaptiveSessionStateRow", null)
                         .WithMany()

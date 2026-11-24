@@ -28,6 +28,11 @@
             <div class="adaptive-subtitle" data-testid="summary-close-atm">ATM at bar close <span data-testid="summary-close-atm-strike">@closeAtm.ToString("0.##")</span> <span class="text-faint">@CloseAtmSourceText(View.CloseAtmSource)</span></div>
         }
 
+        @if (View.DepthNote is { } depthNote)
+        {
+            <div class="adaptive-note" data-testid="market-summary-depth-note">@depthNote</div>
+        }
+
         @if (View.Unverified.Count > 0)
         {
             <div class="adaptive-alert" data-testid="market-summary-unverified" title="Stored per-strike rows disagreed with the values reconstructed after a restart; they are withheld, so the affected windows show reduced coverage.">UNVERIFIED per-strike data withheld (not shown as observations): @string.Join(", ", View.Unverified.Take(12))@(View.Unverified.Count > 12 ? $" … +{View.Unverified.Count - 12} more" : "")</div>
@@ -41,6 +46,7 @@
                     <th>Window</th><th>Coverage</th><th>Price Δ</th><th>Volume</th>
                     <th title="raw Strict delta (Strict delta / volume, %)">Strict Δ</th><th title="raw Enriched delta (/ classified volume, %)">Enriched Δ</th>
                     <th title="usable-seconds weighted MicroDev (TOB x 100), displayed inverted: displayed = −raw">@MicroDevDisplay.Label</th><th title="net OFI (net / gross, %)">OFI</th><th>OI Δ</th><th>Activity /s</th>
+                    <th title="Top-5 Notional Depth Imbalance L5 = (Σbid − Σask) / (Σbid + Σask) of the window's bars, time-weighted by usable seconds (shown as fraction (ratio %)). Unavailable when the Top-5 sidecar is off or no bar had usable depth. Sign is a hypothesis.">Depth Imb L5</th>
                     <th title="India VIX level at the window end (latest valid observation at or before the boundary, within the freshness limit)">VIX</th><th title="VIX change over the window (end − start)">VIX Δ</th><th title="VIX change / start VIX × 100">VIX Δ%</th><th title="age of the end observation at the boundary">VIX age</th>
                 </tr>
                 </thead>
@@ -60,6 +66,7 @@
                             <td class="@Sc(r.Price)" data-sign="@RatioFormat.SignName(r.Price.Raw)">@Cell(r.Price, 2)</td><td>@r.Volume.ToString("N0")</td><td class="@Sc(r.Strict)" data-sign="@RatioFormat.SignName(r.Strict.Raw)">@Cell(r.Strict)</td><td class="@Sc(r.Enriched)" data-sign="@RatioFormat.SignName(r.Enriched.Raw)">@Cell(r.Enriched)</td><td class="@Sc(micro)" data-sign="@RatioFormat.SignName(micro.Raw)">@Cell(micro, 2)</td><td class="@Sc(r.Ofi)" data-sign="@RatioFormat.SignName(r.Ofi.Raw)">@Cell(r.Ofi)</td><td>@Cell(r.Oi)</td>
                             <td>@RatioFormat.Plain(r.Activity, 1)</td>
                         }
+                        @DepthCell(View.FuturesDepth?.FirstOrDefault(x => x.Window.Name == r.Window.Name))
                         @VixCells(View, r.Window.Name)
                     </tr>
                 }
@@ -73,12 +80,12 @@
                 @* exactly three top option summaries, always in this order: ITM-shifted (close ATM - 1 step), ATM, OTM-shifted (close ATM + 1 step); CE and PE share each basket's strikes *@
                 @if (View.Lower is { } itm && View.LowerBasket is { } itmBasket)
                 {
-                    <div class="total-grid-cell">@TotalGrid(itm, itmBasket, "TOTAL SUMMARY - ITM-SHIFTED (ATM-1 step)", "summary-total-itm", "summary-total-itm-title")</div>
+                    <div class="total-grid-cell">@TotalGrid(itm, itmBasket, "TOTAL SUMMARY - ITM-SHIFTED (ATM-1 step)", "summary-total-itm", "summary-total-itm-title", View.LowerDepth)</div>
                 }
-                <div class="total-grid-cell">@TotalGrid(total, basket, "TOTAL SUMMARY - ATM", "summary-total", "summary-total-title")</div>
+                <div class="total-grid-cell">@TotalGrid(total, basket, "TOTAL SUMMARY - ATM", "summary-total", "summary-total-title", View.TotalDepth)</div>
                 @if (View.Upper is { } otm && View.UpperBasket is { } otmBasket)
                 {
-                    <div class="total-grid-cell">@TotalGrid(otm, otmBasket, "TOTAL SUMMARY - OTM-SHIFTED (ATM+1 step)", "summary-total-otm", "summary-total-otm-title")</div>
+                    <div class="total-grid-cell">@TotalGrid(otm, otmBasket, "TOTAL SUMMARY - OTM-SHIFTED (ATM+1 step)", "summary-total-otm", "summary-total-otm-title", View.UpperDepth)</div>
                 }
             </div>
         }
@@ -88,7 +95,7 @@
 @code {
     [Parameter] public MarketSummaryView? View { get; set; }
 
-    RenderFragment TotalGrid(GridSummary grid, Basket basket, string title, string gridId, string testId) => @<text>
+    RenderFragment TotalGrid(GridSummary grid, Basket basket, string title, string gridId, string testId, IReadOnlyList<DepthDirectionWindow>? depth) => @<text>
     <div class="adaptive-subtitle" data-testid="@testId">@title <span class="text-faint">@Describe(grid, basket)</span></div>
     <div class="adaptive-table-wrap">
         <table class="adaptive-table adaptive-table-compact" data-grid="@gridId">
@@ -98,6 +105,7 @@
                 <th>Price Dir</th><th>Roll Dir</th><th>Strict Dir</th><th>Enriched Dir</th>
                 <th title="PE − CE">OI Dir</th><th title="displayed inverted: displayed = −raw (CE − PE)">MicroDev Dir (Inv)</th><th>OFI Dir</th>
                 <th title="displayed inverted: displayed = −raw (CE − PE)">@DirectionDisplay.IvLabel</th><th title="CE − PE (raw); ×100 display scaling">@DirectionDisplay.DeltaLabel</th><th title="displayed inverted: displayed = −raw (CE − PE); ×100 display scaling">@DirectionDisplay.VegaLabel</th><th>Activity Dir</th>
+                <th title="Notional Depth L5 Direction = CE ratio − PE ratio. CE and PE are each normalized by their OWN pooled bid+ask notional (time-weighted by usable seconds) over contracts that have usable attested depth in EVERY bar of the window; the count is shown. Sign is a hypothesis.">Depth L5 Dir</th>
             </tr>
             </thead>
             <tbody>
@@ -125,6 +133,7 @@
                         @Dir(DirectionDisplay.Invert(d.Vega), 2, scale100: true)
                         @Dir(d.Activity, 1)
                     }
+                    @DepthDirCell(depth?.FirstOrDefault(x => x.Window.Name == r.Window.Name))
                 </tr>
             }
             </tbody>
@@ -133,6 +142,50 @@
 
     </text>;
 
+
+    /// <summary>Futures Depth Imbalance L5 cell: fraction (ratio %); "—" with the reason when unavailable.</summary>
+    static RenderFragment DepthCell(FuturesDepthWindow? w) => builder =>
+    {
+        builder.OpenElement(0, "td");
+        builder.AddAttribute(1, "data-col", "depth-imb-l5");
+        if (w is null || w.Imbalance.Raw is null)
+        {
+            builder.AddAttribute(2, "title", "unavailable: no usable Top-5 depth in this window (sidecar off, not recorded, or withheld)");
+            builder.AddContent(3, "—");
+        }
+        else
+        {
+            var cls = RatioFormat.SignedClass(w.Imbalance.Raw);
+            if (cls.Length > 0) builder.AddAttribute(2, "class", cls);
+            builder.AddAttribute(4, "data-sign", RatioFormat.SignName(w.Imbalance.Raw));
+            builder.AddAttribute(5, "title", $"bars with usable depth {w.Text}");
+            builder.AddContent(6, RatioFormat.Cell(new RatioPart(w.Imbalance.Raw, w.Imbalance.Num, w.Imbalance.Den), 3) + (w.Status == CoverageStatus.Partial ? " · " + w.Text : ""));
+        }
+
+        builder.CloseElement();
+    };
+
+    /// <summary>Total-grid Depth L5 Direction cell: Direction (CE − PE ratio) with the CE / PE contract counts; unavailable unless BOTH sides have at least one included contract.</summary>
+    static RenderFragment DepthDirCell(DepthDirectionWindow? w) => builder =>
+    {
+        builder.OpenElement(0, "td");
+        builder.AddAttribute(1, "data-col", "depth-l5-dir");
+        if (w is null || w.Direction.Raw is null)
+        {
+            builder.AddAttribute(2, "title", w is null ? "unavailable" : $"unavailable: needs usable attested depth for the whole window on both sides (CE {w.CeContracts}, PE {w.PeContracts} contracts)");
+            builder.AddContent(3, "—");
+        }
+        else
+        {
+            var cls = RatioFormat.SignedClass(w.Direction.Raw);
+            if (cls.Length > 0) builder.AddAttribute(2, "class", cls);
+            builder.AddAttribute(4, "data-sign", RatioFormat.SignName(w.Direction.Raw));
+            builder.AddAttribute(5, "title", $"CE {RatioFormat.Cell(new RatioPart(w.Ce.Raw, w.Ce.Num, w.Ce.Den), 3)} ({w.CeContracts} contracts) − PE {RatioFormat.Cell(new RatioPart(w.Pe.Raw, w.Pe.Num, w.Pe.Den), 3)} ({w.PeContracts} contracts)");
+            builder.AddContent(6, RatioFormat.Cell(new RatioPart(w.Direction.Raw, w.Direction.Num, w.Direction.Den), 3) + $" · {w.Included}/{w.Expected}");
+        }
+
+        builder.CloseElement();
+    };
 
     static string CloseAtmSourceText(string? source) => source switch
     {

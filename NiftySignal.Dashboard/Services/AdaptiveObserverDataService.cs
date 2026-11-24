@@ -165,7 +165,8 @@ public sealed class AdaptiveObserverDataService(
             optionsSupplemental,
             seqs.Length == 0 ? [] : await db.OptionResidualBars.AsNoTracking()
                 .Where(x => x.SessionId == session.Id && x.BarSeq == seqs.Min() - 1).ToListAsync(ct),
-            invalidFutures, invalidOptions, basisSupplemental, invalidBasis);
+            invalidFutures, invalidOptions, basisSupplemental, invalidBasis,
+            await LoadFuturesDepth5Async(db, session.Id, seqs, ct));
     }
 
     /// <summary>
@@ -185,6 +186,7 @@ public sealed class AdaptiveObserverDataService(
         Dictionary<int, AdaptiveFuturesSupplementalRow> sup;
         Dictionary<int, AdaptiveBasisSupplementalRow> basis;
         List<AdaptiveOptionResidualBarRow> residuals;
+        IReadOnlyDictionary<int, AdaptiveFuturesDepth5Row> futuresDepth;
         await using (var db = await dbFactory.CreateDbContextAsync(ct))
         {
             bars = await db.FutureBars.AsNoTracking()
@@ -204,6 +206,7 @@ public sealed class AdaptiveObserverDataService(
             residuals = await db.OptionResidualBars.AsNoTracking()
                 .Where(x => x.SessionId == sessionId && x.BarSeq <= throughBarSeq)
                 .ToListAsync(ct);
+            futuresDepth = await LoadFuturesDepth5Async(db, sessionId, seqs, ct);
         }
 
         FixedStrikeHistory? fixedHistory = null;
@@ -212,7 +215,7 @@ public sealed class AdaptiveObserverDataService(
             fixedHistory = await LoadFixedStrikeHistoryAsync(sessionId, catalog, k, bars.Select(b => (b.BarSeq, b.EndAvailableAtUtc)).ToList(), ct, rollWindowBars);
         }
 
-        return new DayAverageData(sessionId, throughBarSeq, bars.Count, strike, futures, sup, basis, fixedHistory, residuals, anchors);
+        return new DayAverageData(sessionId, throughBarSeq, bars.Count, strike, futures, sup, basis, fixedHistory, residuals, anchors, futuresDepth);
     }
 
     /// <summary>
@@ -234,6 +237,7 @@ public sealed class AdaptiveObserverDataService(
             ? displayed
             : Enumerable.Range(Math.Max(1, displayed.Min() - (rollWindowBars - 1)), displayed.Max() - Math.Max(1, displayed.Min() - (rollWindowBars - 1)) + 1).ToArray();
         IReadOnlyList<AdaptiveOptionStrikeBarRow> stored = Array.Empty<AdaptiveOptionStrikeBarRow>();
+        IReadOnlyList<AdaptiveOptionsDepth5Row> depth = Array.Empty<AdaptiveOptionsDepth5Row>();
         var unverified = UnverifiedStrikeBars.None;
         if (seqs.Length > 0)
         {
@@ -255,9 +259,17 @@ public sealed class AdaptiveObserverDataService(
             {
                 // not migrated yet: every cell is unavailable
             }
+
+            // Top-5 option depth of exactly this strike's CE / PE token, only through the attestation (no attestation, a marker, changed values or a missing table: unavailable). Independent of the strike rows above.
+            var depthTokens = new[] { contract.CeToken, contract.PeToken }.Where(t => t is not null).Select(t => t!).ToArray();
+            if (depthTokens.Length > 0)
+            {
+                await using var depthDb = await dbFactory.CreateDbContextAsync(ct);
+                depth = await LoadOptionDepth5Async(depthDb, sessionId, displayed.Min(), displayed.Max(), depthTokens, ct);
+            }
         }
 
-        return FixedStrikeProjection.Assemble(catalog, contract, bars, stored, rollWindowBars, unverified);
+        return FixedStrikeProjection.Assemble(catalog, contract, bars, stored, rollWindowBars, unverified, depth);
     }
 
     /// <summary>The ATM at a completed bar's CLOSE. <see cref="Source"/>: stored (the Host's close-atm-v1 row), next-bar-start (a bar recorded before that sidecar existed: the NEXT bar's band was selected at this bar's close instant, so its centre is the same causal value),
@@ -341,7 +353,25 @@ public sealed class AdaptiveObserverDataService(
             }
         }
 
+        // Top-5 depth (flag-gated sidecars; absent rows are unavailable, never zero). Option rows only through the attestation, for exactly the three baskets' tokens.
+        IReadOnlyDictionary<int, AdaptiveFuturesDepth5Row> futuresDepth;
+        IReadOnlyList<AdaptiveOptionsDepth5Row> optionDepth = [];
+        string? depthNote = null;
+        await using (var depthDb = await dbFactory.CreateDbContextAsync(ct))
+        {
+            futuresDepth = await LoadFuturesDepth5Async(depthDb, sessionId, bars.Select(x => x.BarSeq).ToArray(), ct);
+            if (tokens.Count > 0)
+            {
+                var verified = await VerifiedOptionsDepth5.LoadAsync(depthDb, sessionId, endBarSeq, ct);
+                if (verified.TablePending) depthNote = "option depth unavailable: verification tables unreadable";
+                optionDepth = await LoadOptionDepth5Async(depthDb, sessionId, 1, endBarSeq, tokens, ct);
+                if (!verified.TablePending && optionDepth.Count == 0) depthNote = "option depth unavailable: no attested options-depth5 rows (flag off, or restart verification pending)";
+            }
+        }
+
         var futures = bars.ToDictionary(b => b.BarSeq, b => MarketSummaryMapper.FuturesBarOf(b, sup.GetValueOrDefault(b.BarSeq)));
+        var depthHistory = new NiftySignal.MarketSummary.DepthHistory(optionDepth.Select(r => (r.Token, Depth5Ratios.ToDepthBar(r))));
+        var futuresDepthBars = futuresDepth.Values.Select(Depth5Ratios.ToDepthBar).Where(x => x is not null).ToDictionary(x => x!.BarSeq, x => x!);
         // A4: strike bars recovery found disagreeing with the reconstruction are withheld (a coverage gap, never a normal observation) and listed in the view.
         var unverifiedNotes = new List<string>();
         if (unverified.TablePending) unverifiedNotes.Add("verification tables unreadable - ALL per-strike rows withheld");
@@ -369,6 +399,11 @@ public sealed class AdaptiveObserverDataService(
             NiftySignal.MarketSummary.OptionSummaryCalculator.ComputeAll(basket, history, endBarSeq), null, instants)
         {
             Unverified = unverifiedNotes,
+            FuturesDepth = NiftySignal.MarketSummary.DepthSummaryCalculator.Futures(futuresDepthBars, endBarSeq),
+            TotalDepth = NiftySignal.MarketSummary.DepthSummaryCalculator.Direction(basket, NiftySignal.MarketSummary.GridKind.Total, depthHistory, endBarSeq),
+            LowerDepth = NiftySignal.MarketSummary.DepthSummaryCalculator.Direction(lowerBasket, NiftySignal.MarketSummary.GridKind.Total, depthHistory, endBarSeq),
+            UpperDepth = NiftySignal.MarketSummary.DepthSummaryCalculator.Direction(upperBasket, NiftySignal.MarketSummary.GridKind.Total, depthHistory, endBarSeq),
+            DepthNote = depthNote,
             CloseAtmStrike = centre,
             CloseAtmSource = closeAtmSource,
             LowerBasket = lowerBasket,
@@ -394,6 +429,37 @@ public sealed class AdaptiveObserverDataService(
         {
             return new HashSet<int>();
         }
+    }
+
+    /// <summary>
+    /// Futures Top-5 sidecar (futures-depth5-v1) of the given bars: the futures trust model (insert-if-missing, verified on restart, a mismatch writes a per-bar marker), so a marked bar is withheld. A missing relation
+    /// (Dashboard started before the Host migrated) or a flag-off Host simply has no rows: every value is then unavailable, never zero.
+    /// </summary>
+    static async Task<IReadOnlyDictionary<int, AdaptiveFuturesDepth5Row>> LoadFuturesDepth5Async(
+        AdaptiveObserverDbContext db, long sessionId, int[] seqs, CancellationToken ct)
+    {
+        if (seqs.Length == 0) return new Dictionary<int, AdaptiveFuturesDepth5Row>();
+        try
+        {
+            var version = FuturesDepth5Bar.MetricsVersion;
+            var invalid = await LoadInvalidBarsAsync(db, sessionId, AdaptiveProjectionComponents.FuturesDepth5, version, seqs, ct);
+            var rows = await db.FuturesDepth5.AsNoTracking()
+                .Where(x => x.SessionId == sessionId && x.MetricsVersion == version && seqs.Contains(x.BarSeq))
+                .ToListAsync(ct);
+            return rows.Where(x => !invalid.Contains(x.BarSeq)).GroupBy(x => x.BarSeq).ToDictionary(g => g.Key, g => g.First());
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedTable)
+        {
+            return new Dictionary<int, AdaptiveFuturesDepth5Row>();
+        }
+    }
+
+    /// <summary>Attested option depth rows (options-depth5-v1) of the given tokens over a bar range. Fails closed: no attestation, a marker, changed values or an unreadable table all yield NO row (unavailable).</summary>
+    static async Task<IReadOnlyList<AdaptiveOptionsDepth5Row>> LoadOptionDepth5Async(
+        AdaptiveObserverDbContext db, long sessionId, int fromBar, int throughBar, IReadOnlyCollection<string> tokens, CancellationToken ct)
+    {
+        if (throughBar < 1 || tokens.Count == 0) return [];
+        return await VerifiedOptionsDepth5.LoadServedRowsAsync(db, sessionId, Math.Max(1, fromBar), throughBar, ct, tokens);
     }
 
     /// <summary>Basis sidecar read (approved 5-second freshness already applied to the stored values); same missing-relation tolerance.</summary>

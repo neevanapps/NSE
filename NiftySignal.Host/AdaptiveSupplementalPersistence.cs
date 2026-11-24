@@ -162,6 +162,102 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
         }
     }
 
+    /// <summary>
+    /// Futures Top-5 depth sidecar (futures-depth5-v1): same insert-if-missing / verify-if-present contract, separate additive table, own known-invalid component. Its outcome is a display-sidecar outcome:
+    /// it never changes the verification result the paper path consumes (see <see cref="PersistAndVerifyAsync"/>).
+    /// </summary>
+    public async Task<SupplementalOutcome> PersistOrVerifyFuturesDepth5Async(
+        AdaptiveObserverDbContext db,
+        long sessionId,
+        AdaptiveCompletedBarPackage package,
+        CancellationToken ct)
+    {
+        if (package.Depth5 is not { } depth)
+        {
+            return SupplementalOutcome.Skipped;
+        }
+
+        var expected = MapFuturesDepth5(sessionId, package.FutureBar.BarSeq, depth);
+        try
+        {
+            var existing = await db.FuturesDepth5.AsNoTracking()
+                .SingleOrDefaultAsync(x => x.SessionId == sessionId && x.BarSeq == expected.BarSeq
+                    && x.MetricsVersion == expected.MetricsVersion, ct);
+            if (existing is null)
+            {
+                db.FuturesDepth5.Add(expected);
+                await db.SaveChangesAsync(ct);
+                return SupplementalOutcome.Inserted;
+            }
+
+            var difference = FirstDifference(existing, expected);
+            if (difference is null)
+            {
+                return SupplementalOutcome.Verified;
+            }
+
+            Interlocked.Increment(ref _mismatches);
+            logger.LogError(
+                "Adaptive futures depth5 metrics mismatch (row left untouched): session={SessionId}, bar={BarSeq}, version={Version}, {Difference}",
+                sessionId, expected.BarSeq, expected.MetricsVersion, difference);
+            return await RecordInvalidAsync(db, sessionId, AdaptiveProjectionComponents.FuturesDepth5, expected.MetricsVersion, expected.BarSeq, difference, ct)
+                ? SupplementalOutcome.Mismatch : SupplementalOutcome.Failed;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                if (db.Entry(expected).State != EntityState.Detached)
+                {
+                    db.Entry(expected).State = EntityState.Detached;
+                }
+            }
+            catch (Exception)
+            {
+                // The context itself is unusable; nothing more to protect.
+            }
+
+            Interlocked.Increment(ref _failures);
+            logger.LogError(ex, "Adaptive futures depth5 write failed (core observer unaffected): session={SessionId}, bar={BarSeq}",
+                sessionId, expected.BarSeq);
+            return SupplementalOutcome.Failed;
+        }
+    }
+
+    public static AdaptiveFuturesDepth5Row MapFuturesDepth5(long sessionId, int barSeq, FuturesDepth5Bar d) => new()
+    {
+        SessionId = sessionId,
+        BarSeq = barSeq,
+        MetricsVersion = FuturesDepth5Bar.MetricsVersion,
+        BarSeconds = d.BarSeconds,
+        Ofi5 = d.Ofi5,
+        GrossOfi5 = d.GrossOfi5,
+        Ofi5Transitions = d.Ofi5Transitions,
+        Ofi5DirectTransitions = d.Ofi5DirectTransitions,
+        Ofi5BridgedTransitions = d.Ofi5BridgedTransitions,
+        Ofi5BridgedNet = d.Ofi5BridgedNet,
+        Ofi5BridgedGapSeconds = d.Ofi5BridgedGapSeconds,
+        Ofi5BaselineResets = d.Ofi5BaselineResets,
+        Tob5TimeWeighted = d.Tob5TimeWeighted,
+        MicroDev5TimeWeighted = d.MicroDev5TimeWeighted,
+        DepthImb5TimeWeighted = d.DepthImb5TimeWeighted,
+        BidNotionalTimeWeighted = d.BidNotionalTimeWeighted,
+        AskNotionalTimeWeighted = d.AskNotionalTimeWeighted,
+        Depth5UsableSeconds = d.Depth5UsableSeconds,
+        Depth5StaleSeconds = d.Depth5StaleSeconds,
+        Depth5InvalidSeconds = d.Depth5InvalidSeconds,
+        Depth5SupersededSeconds = d.Depth5SupersededSeconds,
+        Depth5NoDepthSeconds = d.Depth5NoDepthSeconds,
+        Depth5UnobservedSeconds = d.Depth5UnobservedSeconds,
+        SnapshotEvents = d.SnapshotEvents,
+        SupersededMarkers = d.SupersededMarkers,
+        InvalidSnapshots = d.InvalidSnapshots,
+    };
+
     public static AdaptiveBasisSupplementalRow MapBasis(long sessionId, int barSeq, FuturesBasisBar b) => new()
     {
         SessionId = sessionId,
@@ -451,6 +547,165 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
         }
     }
 
+    public static AdaptiveOptionsDepth5Row MapOptionsDepth5(long sessionId, int barSeq, OptionDepth5Bar o)
+    {
+        var d = o.Depth;
+        return new()
+        {
+            SessionId = sessionId, BarSeq = barSeq, Token = o.Token, MetricsVersion = OptionDepth5Bar.MetricsVersion, TradingSymbol = o.TradingSymbol.Length > 64 ? o.TradingSymbol[..64] : o.TradingSymbol,
+            Expiry = o.Expiry, Strike = o.Strike, Side = o.Side,
+            BarSeconds = d.BarSeconds, Ofi5 = d.Ofi5, GrossOfi5 = d.GrossOfi5, Ofi5Transitions = d.Ofi5Transitions, Ofi5DirectTransitions = d.Ofi5DirectTransitions,
+            Ofi5BridgedTransitions = d.Ofi5BridgedTransitions, Ofi5BridgedNet = d.Ofi5BridgedNet, Ofi5BridgedGapSeconds = d.Ofi5BridgedGapSeconds, Ofi5BaselineResets = d.Ofi5BaselineResets,
+            Tob5TimeWeighted = d.Tob5TimeWeighted, MicroDev5TimeWeighted = d.MicroDev5TimeWeighted, DepthImb5TimeWeighted = d.DepthImb5TimeWeighted,
+            BidNotionalTimeWeighted = d.BidNotionalTimeWeighted, AskNotionalTimeWeighted = d.AskNotionalTimeWeighted,
+            Depth5UsableSeconds = d.Depth5UsableSeconds, Depth5StaleSeconds = d.Depth5StaleSeconds, Depth5InvalidSeconds = d.Depth5InvalidSeconds, Depth5SupersededSeconds = d.Depth5SupersededSeconds,
+            Depth5NoDepthSeconds = d.Depth5NoDepthSeconds, Depth5UnobservedSeconds = d.Depth5UnobservedSeconds,
+            SnapshotEvents = d.SnapshotEvents, SupersededMarkers = d.SupersededMarkers, InvalidSnapshots = d.InvalidSnapshots,
+        };
+    }
+
+    /// <summary>
+    /// Per-contract options Top-5 sidecar (options-depth5-v1, S5): inserts the bar's rows together with their own attestation (one SaveChanges) when none exist, otherwise verifies the stored rows column by column
+    /// against the recomputed ones and (re)writes the attestation of exactly the verified stored rows. A mismatch never overwrites a row: the bar is marked UNVERIFIED and its attestation revoked in one SaveChanges, so every
+    /// reader withholds it. Entirely separate from option-strike-v3 and its attestation; failures are logged and counted and never reach the core observer or the paper verification result.
+    /// </summary>
+    public async Task<SupplementalOutcome> PersistOrVerifyOptionsDepth5Async(AdaptiveObserverDbContext db, long sessionId, AdaptiveCompletedBarPackage package, CancellationToken ct)
+    {
+        if (package.OptionsDepth5 is not { Count: > 0 } contracts) return SupplementalOutcome.Skipped;
+
+        var barSeq = package.FutureBar.BarSeq;
+        var version = OptionDepth5Bar.MetricsVersion;
+        var expected = contracts.Select(x => MapOptionsDepth5(sessionId, barSeq, x)).ToList();
+        AdaptiveOptionsDepth5AttestationRow? attestation = null;
+        try
+        {
+            var existing = await db.OptionsDepth5.AsNoTracking().Where(x => x.SessionId == sessionId && x.BarSeq == barSeq && x.MetricsVersion == version).ToListAsync(ct);
+            if (existing.Count == 0)
+            {
+                db.OptionsDepth5.AddRange(expected);
+                attestation = NewOptionsDepth5Attestation(sessionId, barSeq, version, expected);
+                db.OptionsDepth5Attestations.Add(attestation);
+                await db.SaveChangesAsync(ct);
+                return SupplementalOutcome.Inserted;
+            }
+
+            var byToken = existing.ToDictionary(x => x.Token, StringComparer.Ordinal);
+            string? difference = existing.Count != expected.Count ? $"row count {existing.Count} vs {expected.Count}" : null;
+            foreach (var row in expected)
+            {
+                var d = byToken.TryGetValue(row.Token, out var stored) ? FirstDifference(stored, row) : "missing";
+                if (d is not null) difference ??= $"{row.Token}.{d}";
+            }
+
+            if (difference is null)
+                return await EnsureOptionsDepth5AttestationAsync(db, sessionId, version, barSeq, existing, ct) ? SupplementalOutcome.Verified : SupplementalOutcome.Failed;
+
+            Interlocked.Increment(ref _mismatches);
+            logger.LogError("Adaptive options depth5 mismatch (rows left untouched): session={SessionId}, bar={BarSeq}, {Difference}", sessionId, barSeq, difference);
+            return await RecordUnverifiedOptionsDepth5Async(db, sessionId, version, barSeq, difference, ct) ? SupplementalOutcome.Mismatch : SupplementalOutcome.Failed;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                foreach (var row in expected) if (db.Entry(row).State != EntityState.Detached) db.Entry(row).State = EntityState.Detached;
+                if (attestation is not null && db.Entry(attestation).State != EntityState.Detached) db.Entry(attestation).State = EntityState.Detached;
+            }
+            catch (Exception)
+            {
+                // The context itself is unusable; nothing more to protect.
+            }
+
+            Interlocked.Increment(ref _failures);
+            logger.LogError(ex, "Adaptive options depth5 write failed (core observer unaffected): session={SessionId}, bar={BarSeq}", sessionId, barSeq);
+            return SupplementalOutcome.Failed;
+        }
+    }
+
+    static AdaptiveOptionsDepth5AttestationRow NewOptionsDepth5Attestation(long sessionId, int barSeq, string version, IReadOnlyCollection<AdaptiveOptionsDepth5Row> rows) => new()
+    {
+        SessionId = sessionId, BarSeq = barSeq, MetricsVersion = version, TokenCount = rows.Count, Digests = OptionsDepth5Attestation.Format(rows), VerifiedAtUtc = DateTimeOffset.UtcNow,
+    };
+
+    async Task<bool> EnsureOptionsDepth5AttestationAsync(AdaptiveObserverDbContext db, long sessionId, string version, int barSeq, IReadOnlyCollection<AdaptiveOptionsDepth5Row> stored, CancellationToken ct)
+    {
+        AdaptiveOptionsDepth5AttestationRow? row = null;
+        var added = false;
+        try
+        {
+            var digests = OptionsDepth5Attestation.Format(stored);
+            row = await db.OptionsDepth5Attestations.SingleOrDefaultAsync(x => x.SessionId == sessionId && x.BarSeq == barSeq && x.MetricsVersion == version, ct);
+            if (row is null)
+            {
+                row = NewOptionsDepth5Attestation(sessionId, barSeq, version, stored.ToList());
+                db.OptionsDepth5Attestations.Add(row);
+                added = true;
+            }
+            else if (row.Digests == digests && row.TokenCount == stored.Count) return true;
+            else { row.Digests = digests; row.TokenCount = stored.Count; row.VerifiedAtUtc = DateTimeOffset.UtcNow; }
+
+            await db.SaveChangesAsync(ct);
+            return true;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Increment(ref _failures);
+            logger.LogError(ex, "Could not record the options depth5 attestation (rows stay withheld until it is written): session={SessionId}, bar={BarSeq}", sessionId, barSeq);
+            try { if (row is not null && db.Entry(row).State != EntityState.Detached) db.Entry(row).State = added ? EntityState.Detached : EntityState.Unchanged; } catch (Exception) { /* context unusable */ }
+            return false;
+        }
+    }
+
+    /// <summary>Whole-bar UNVERIFIED marker (insert-if-missing) and attestation revocation in ONE SaveChanges. True only when the marker is durable.</summary>
+    async Task<bool> RecordUnverifiedOptionsDepth5Async(AdaptiveObserverDbContext db, long sessionId, string version, int barSeq, string difference, CancellationToken ct)
+    {
+        const string component = AdaptiveProjectionComponents.OptionsDepth5;
+        AdaptiveProjectionHealthRow? marker = null;
+        AdaptiveOptionsDepth5AttestationRow? attestationRow = null;
+        try
+        {
+            var haveMarker = await db.ProjectionHealth.AsNoTracking().AnyAsync(x => x.SessionId == sessionId && x.Component == component && x.Version == version && x.BarSeq == barSeq, ct);
+            if (!haveMarker)
+            {
+                marker = new AdaptiveProjectionHealthRow { SessionId = sessionId, Component = component, Version = version, BarSeq = barSeq, Detail = difference.Length > 512 ? difference[..512] : difference, DetectedAtUtc = DateTimeOffset.UtcNow };
+                db.ProjectionHealth.Add(marker);
+            }
+
+            attestationRow = await db.OptionsDepth5Attestations.SingleOrDefaultAsync(x => x.SessionId == sessionId && x.BarSeq == barSeq && x.MetricsVersion == version, ct);
+            if (attestationRow is not null) db.OptionsDepth5Attestations.Remove(attestationRow);
+            await db.SaveChangesAsync(ct);
+            return true;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Increment(ref _failures);
+            logger.LogError(ex, "Could not record the options depth5 UNVERIFIED marker: session={SessionId}, bar={BarSeq}", sessionId, barSeq);
+            try
+            {
+                if (marker is not null && db.Entry(marker).State != EntityState.Detached) db.Entry(marker).State = EntityState.Detached;
+                if (attestationRow is not null && db.Entry(attestationRow).State != EntityState.Detached) db.Entry(attestationRow).State = EntityState.Unchanged;
+            }
+            catch (Exception)
+            {
+                // The context itself is unusable.
+            }
+
+            return false;
+        }
+    }
+
     static AdaptiveStrikeAttestationRow NewAttestation(long sessionId, int barSeq, string version, IReadOnlyCollection<AdaptiveOptionStrikeBarRow> rows) => new()
     {
         SessionId = sessionId, BarSeq = barSeq, MetricsVersion = version, TokenCount = rows.Count, Digests = StrikeAttestation.Format(rows), VerifiedAtUtc = DateTimeOffset.UtcNow,
@@ -620,6 +875,12 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
         // A strike row without a durable attestation is withheld by every reader, so a failed or abandoned strike retry never needs a fence: absence of proof already means unverified.
         await RetryAsync(db, session.Id, package, _strikeRetry, StrikeRetryCapacity, PersistOrVerifyStrikesAsync, "per-strike", ct);
         await RetryAsync(db, session.Id, package, _closeAtmRetry, CloseAtmRetryCapacity, PersistOrVerifyCloseAtmAsync, "close-ATM", ct);
+        // Futures Top-5 depth (flag-gated; Skipped when the package carries none). Same display-sidecar status: never part of the paper verification result.
+        if (package.Depth5 is not null || PendingDepth5RetryCount > 0)
+            await RetryAsync(db, session.Id, package, _depth5Retry, CloseAtmRetryCapacity, PersistOrVerifyFuturesDepth5Async, "futures-depth5", ct);
+        // Options Top-5 depth (S5; flag-gated): own queue, own attestation; never part of the paper verification result.
+        if (package.OptionsDepth5 is not null || PendingOptionsDepth5RetryCount > 0)
+            await RetryAsync(db, session.Id, package, _optionsDepth5Retry, StrikeRetryCapacity, PersistOrVerifyOptionsDepth5Async, "options-depth5", ct);
         for (var attempt = 0; attempt < 2; attempt++)
         {
             var futures = await PersistOrVerifyFuturesAsync(db, session.Id, package, ct);
@@ -633,6 +894,14 @@ public sealed class AdaptiveSupplementalPersistence(ILogger<AdaptiveSupplemental
 
     readonly Dictionary<(long Session, int Bar), AdaptiveCompletedBarPackage> _strikeRetry = new();
     readonly Dictionary<(long Session, int Bar), AdaptiveCompletedBarPackage> _closeAtmRetry = new();
+    readonly Dictionary<(long Session, int Bar), AdaptiveCompletedBarPackage> _depth5Retry = new();
+    readonly Dictionary<(long Session, int Bar), AdaptiveCompletedBarPackage> _optionsDepth5Retry = new();
+
+    /// <summary>Number of bars whose options depth5 rows/attestation are still queued for retry (independent of every other queue).</summary>
+    public int PendingOptionsDepth5RetryCount { get { lock (_optionsDepth5Retry) return _optionsDepth5Retry.Count; } }
+
+    /// <summary>Number of bars whose Futures depth5 row is still queued for retry (independent of every other queue).</summary>
+    public int PendingDepth5RetryCount { get { lock (_depth5Retry) return _depth5Retry.Count; } }
     internal int StrikeRetryCapacity { get; set; } = 200;
     internal int CloseAtmRetryCapacity { get; set; } = 200;
 

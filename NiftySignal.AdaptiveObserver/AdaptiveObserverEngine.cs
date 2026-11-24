@@ -15,6 +15,7 @@ public sealed class AdaptiveObserverEngine
     readonly DateTimeOffset _signalStartUtc;
     readonly IReadOnlyList<ObserverOptionInstrument> _options;
     readonly HashSet<string> _optionTokens;
+    readonly OptionsDepth5Tracker? _optionDepth;
     OptionResidualAnchor? _residualAnchor;
     // Fixed-clock sessions start their bars at 09:15 and cannot know the 09:30 residual anchor at construction. The engine then freezes it ITSELF, causally, from the
     // option quotes and the last futures tick it has already processed at <= the cutoff (live and replay run the same code on the same ordered ticks, so the anchor is identical).
@@ -35,6 +36,8 @@ public sealed class AdaptiveObserverEngine
     readonly Dictionary<ResidualVariant, double> _previousResidual = [];
     // Supplemental Level-1 book observation. Separate state: it never influences bar construction or any core output.
     readonly FuturesMicrostructureTracker _microstructure = new();
+    // Futures Top-5 depth observation (S4, null when disabled). Fed only through ObserveDepth, which bypasses EnsureOrder/_lastAvailableAt/_lastId and every core structure: it cannot change any core output or the core cursors.
+    readonly FuturesDepth5Tracker? _futureDepth;
     // Level-1 book of every universe option, observed only to summarize the bar's center CE/PE (MicroDev/OFI). Never read by core logic.
     readonly Dictionary<string, FuturesMicrostructureTracker> _optionBooks = new(StringComparer.Ordinal);
     // Spot enters only the basis tracker. It bypasses EnsureOrder/_lastAvailableAt/_lastId and the exact-volume bar builder, so adding
@@ -70,8 +73,12 @@ public sealed class AdaptiveObserverEngine
         string? spotToken = null,
         bool projectStrikes = false,
         DateTimeOffset? selfAnchorCutoffUtc = null,
-        AtmCenterRule atmRule = AtmCenterRule.SyntheticForwardLegacy)
+        AtmCenterRule atmRule = AtmCenterRule.SyntheticForwardLegacy,
+        bool trackFuturesDepth5 = false,
+        bool trackOptionsDepth5 = false)
     {
+        _futureDepth = trackFuturesDepth5 ? new FuturesDepth5Tracker() : null;
+        _optionDepth = trackOptionsDepth5 && options.Count > 0 ? new OptionsDepth5Tracker(options) : null;
         _atmRule = atmRule;
         _selfAnchorCutoffUtc = residualAnchor is null ? selfAnchorCutoffUtc : null;
         _projectStrikes = projectStrikes;
@@ -100,6 +107,31 @@ public sealed class AdaptiveObserverEngine
 
     /// <summary>Spot ticks ignored because an equal-or-later spot tick had already been seen (always 0 on ordered replay).</summary>
     public int LateSpotTicks => _basis.LateSpotTicks;
+
+    /// <summary>True when this engine summarizes Futures Top-5 depth per completed bar.</summary>
+    public bool TracksFuturesDepth5 => _futureDepth is not null;
+
+    /// <summary>Depth events dropped because they were older than one already delivered (diagnostic; 0 on ordered replay).</summary>
+    public int LateDepthEvents => _futureDepth?.LateEvents ?? 0;
+
+    /// <summary>
+    /// Delivers one Futures Top-5 depth event. Contract for the caller (live and recovery use the same <see cref="FuturesDepth5Feed"/>): every event with AvailableAt at or before an availability group's instant is delivered,
+    /// in (AvailableAt, Id) order, BEFORE that group is processed, so a bar closing at the group's instant sees every event up to and including it. Never moves the core cursors; a no-op when depth tracking is disabled.
+    /// </summary>
+    public void ObserveDepth(Depth5Observation observation)
+    {
+        if (string.Equals(observation.Token, _session.FutureToken, StringComparison.Ordinal)) _futureDepth?.Observe(observation);
+        else _optionDepth?.Observe(observation);
+    }
+
+    /// <summary>True when this engine summarizes per-contract Top-5 depth of the frozen option universe.</summary>
+    public bool TracksOptionsDepth5 => _optionDepth is not null;
+
+    /// <summary>Option depth events dropped as late, summed over tokens (diagnostic; 0 on ordered replay).</summary>
+    public int LateOptionDepthEvents => _optionDepth?.LateEvents ?? 0;
+
+    /// <summary>Option depth events retained in memory across all tokens (bounded: pruned at every completed bar).</summary>
+    public int RetainedOptionDepthEvents => _optionDepth?.RetainedEvents ?? 0;
 
     public IReadOnlyList<AdaptiveCompletedBarPackage> Process(string token, CleanObserverTick tick)
     {
@@ -233,6 +265,8 @@ public sealed class AdaptiveObserverEngine
                 _microstructure.Complete(bar.StartAvailableAtUtc, bar.EndAvailableAtUtc))
             {
                 Basis = _spotToken is null ? null : _basis.Complete(bar.StartAvailableAtUtc, bar.EndAvailableAtUtc),
+                Depth5 = _futureDepth?.Complete(bar.StartAvailableAtUtc, bar.EndAvailableAtUtc),
+                OptionsDepth5 = _optionDepth?.Complete(bar.StartAvailableAtUtc, bar.EndAvailableAtUtc),
             });
 
             // A crossing futures update can close multiple exact bars at the same timestamp.

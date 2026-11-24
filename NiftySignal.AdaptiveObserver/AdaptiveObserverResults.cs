@@ -37,7 +37,11 @@ public sealed record AdaptiveCompletedBarPackage(
     // Per-strike observational projection of the frozen weekly option universe (sidecar-persisted; null unless the engine was created with projectStrikes). Never part of the parity-protected core rows.
     IReadOnlyList<OptionStrikeBarMetrics>? OptionStrikes = null,
     // The causal ATM at THIS bar's CLOSE (not the band's start-of-bar centre). Sidecar-persisted; never part of the parity-protected core rows. Null only when the producer did not compute it.
-    BarCloseAtm? CloseAtm = null);
+    BarCloseAtm? CloseAtm = null,
+    // Futures Top-5 depth observation (futures-depth5-v1, sidecar-persisted; null unless the engine was created with trackFuturesDepth5). Never part of the parity-protected core rows.
+    FuturesDepth5Bar? Depth5 = null,
+    // Per-contract Top-5 depth of the frozen option universe (options-depth5-v1, sidecar-persisted; null unless the engine was created with trackOptionsDepth5). Never part of the parity-protected core rows.
+    IReadOnlyList<OptionDepth5Bar>? OptionsDepth5 = null);
 
 /// <summary>
 /// The ATM strike in force at a completed bar's CLOSE instant, by the session's own ATM rule (spot-atm-v1: nearest strike of the frozen weekly ladder to the spot at most 5 s old, ties choose the lower strike; the legacy

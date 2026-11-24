@@ -192,6 +192,10 @@ try
     builder.Services.AddSingleton<NiftySignal.Host.PaperEngineV2.PaperEngineV2Bridge>();
     builder.Services.AddHostedService(sp => sp.GetRequiredService<NiftySignal.Host.PaperEngineV2.PaperEngineV2Bridge>());
     builder.Services.AddSingleton<AdaptiveSourceTickReader>();
+    // Futures Top-5 microstructure sidecar (S4). Adaptive:Top5Microstructure:Enabled defaults to FALSE; disabled, the gateway is inert (no depth read, no state, no sidecar row).
+    builder.Services.Configure<Top5MicrostructureOptions>(builder.Configuration.GetSection(Top5MicrostructureOptions.SectionName));
+    builder.Services.AddSingleton<AdaptiveDepthTickReader>();
+    builder.Services.AddSingleton<FuturesDepth5Gateway>();
     builder.Services.AddSingleton<AdaptiveHistoricalBootstrapService>();
     // New adaptive sessions use the fixed 13,650-contract clock (config Adaptive:Clock:Mode = OpeningVolumeV1 restores the legacy estimator for NEW sessions). Existing sessions keep their frozen model.
     builder.Services.AddSingleton(sp => new AdaptiveSessionCoordinator(

@@ -22,6 +22,11 @@ namespace NiftySignal.Tests.MarketSummary;
 /// Measurements (not benchmarks of the VM): in-memory aggregation, database loading against a disposable local PostgreSQL 18 database holding a full-session-sized sidecar (80 strikes x CE/PE x 220 bars =
 /// 35,200 rows), and Razor rendering of the five-row grids. The numbers are written to the test output and to <c>market-summary-perf.txt</c> in the temp directory; the assertions are deliberately loose guards.
 /// </summary>
+/// <summary>Timing guards must not compete with the other ~3000 tests for CPU and the database: this collection runs ALONE (xunit runs a DisableParallelization collection after all parallel ones finish). The thresholds are unchanged.</summary>
+[CollectionDefinition("TimingGuards", DisableParallelization = true)]
+public sealed class TimingGuardsCollection;
+
+[Collection("TimingGuards")]
 public class MarketSummaryPerformanceTests(ITestOutputHelper output)
 {
     static readonly DateOnly Day = new(2026, 10, 7);

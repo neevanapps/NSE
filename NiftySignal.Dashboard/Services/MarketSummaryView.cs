@@ -24,5 +24,17 @@ public sealed record MarketSummaryView(
     /// <summary>A4: per-strike bars withheld because recovery found them disagreeing with the reconstruction ("symbol bar N"), or a pending-migration note. Rendered as a visible UNVERIFIED marker.</summary>
     public IReadOnlyList<string> Unverified { get; init; } = [];
 
+    /// <summary>Top-5 depth (flag-gated sidecars): Futures Notional Depth Imbalance L5 per window, and the Notional Depth L5 Direction of the three Total Options grids (main, Lower, Upper). Null when no depth data was loaded at all.</summary>
+    public IReadOnlyList<FuturesDepthWindow>? FuturesDepth { get; init; }
+
+    public IReadOnlyList<DepthDirectionWindow>? TotalDepth { get; init; }
+
+    public IReadOnlyList<DepthDirectionWindow>? LowerDepth { get; init; }
+
+    public IReadOnlyList<DepthDirectionWindow>? UpperDepth { get; init; }
+
+    /// <summary>Why option depth is unavailable / partial (no attestation yet, table pending, marker): shown next to the Depth columns.</summary>
+    public string? DepthNote { get; init; }
+
     public static MarketSummaryView Unavailable(int endBarSeq, string reason) => new(endBarSeq, null, [], [], reason);
 }

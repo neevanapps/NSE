@@ -114,7 +114,9 @@
                         <th>Bar ΔPx</th><th>Roll ΔPx</th>
                         <th title="raw Strict delta (Strict delta / volume, %)">Strict Δ</th><th title="raw Enriched delta (Enriched delta / classified volume, %)">Enriched Δ</th>
                         <th title="time-weighted MicroDev (time-weighted TOB x 100), displayed inverted: displayed = −raw">@MicroDevDisplay.Label</th><th title="net OFI (net OFI / gross OFI, %)">OFI</th>
+                        <th title="Top-5 price-aligned OFI (net / gross, %). Unavailable when the Top-5 sidecar is off or the bar has no valid transition. Sign is a hypothesis.">OFI5</th><th title="Top-5 MicroDev5Proxy = HS1 × Tob5, time-weighted, displayed inverted like MicroDev: displayed = −raw. Sign is a hypothesis.">@Depth5Label</th>
                         <th>Roll OI Δ</th><th>ΔBasis</th><th>Roll Efficiency</th>
+                        <th title="existing 10-bar rolling metric: does the rolling price move agree in sign with the rolling Strict / Enriched delta? (S = Strict, E = Enriched)">Price–Flow Agree</th><th title="existing 10-bar rolling metric: share of the rolling window carried by fallback-classified trades">Fallback Share %</th>
                         <th>Evolution</th><th>State</th>
                     </tr>
                     </thead>
@@ -135,9 +137,14 @@
                             @{ var frMicro = MicroDevDisplay.Invert(fr.MicroDev); }
                             <td class="@Sc(frMicro)" data-sign="@RatioFormat.SignName(frMicro)">@RatioFormat.Cell(frMicro, 2)</td>
                             <td class="@Sc(fr.Ofi)" data-sign="@RatioFormat.SignName(fr.Ofi)">@RatioFormat.Cell(fr.Ofi)</td>
+                            @{ var d5 = _snapshot.FuturesDepth5?.GetValueOrDefault(x.Bar.BarSeq); var o5 = Depth5Ratios.Ofi5(d5); var m5 = MicroDevDisplay.Invert(Depth5Ratios.MicroDev5(d5)); }
+                            <td class="@Sc(o5)" data-sign="@RatioFormat.SignName(o5)" data-col="ofi5" title="@Ofi5Title(d5)">@RatioFormat.Cell(o5)</td>
+                            <td class="@Sc(m5)" data-sign="@RatioFormat.SignName(m5)" data-col="microdev5">@RatioFormat.Cell(m5, 2)</td>
                             <td>@FmtSigned(r?.OiChange)</td>
                             <td>@FmtSigned(Basis(x.Bar.BarSeq)?.DeltaBasis, 2)</td>
                             <td>@Fmt(r?.Efficiency, 3)</td>
+                            <td data-col="price-flow-agree">@AgreeText(r)</td>
+                            <td data-col="fallback-share">@(r is null ? "—" : (r.FallbackShare * 100d).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture))</td>
                             <td>@(r?.StrictDominanceEvolution ?? "—")</td>
                             <td><span class="state-badge">@((r?.State).ToString() ?? "—")</span></td>
                         </tr>
@@ -157,9 +164,14 @@
                             @{ var avgMicro = MicroDevDisplay.Invert(avg.MicroDev); }
                             <td class="@Sc(avgMicro)" data-sign="@RatioFormat.SignName(avgMicro)">@RatioFormat.Cell(avgMicro, 2)</td>
                             <td class="@Sc(avg.Ofi)" data-sign="@RatioFormat.SignName(avg.Ofi)">@RatioFormat.Cell(avg.Ofi)</td>
+                            @{ var a5 = Depth5Averages.Compute(_snapshot.Futures, s => _snapshot.FuturesDepth5?.GetValueOrDefault(s)); var a5m = MicroDevDisplay.Invert(a5.MicroDev5); }
+                            <td class="@Sc(a5.Ofi5)" data-sign="@RatioFormat.SignName(a5.Ofi5)">@RatioFormat.Cell(a5.Ofi5)</td>
+                            <td class="@Sc(a5m)" data-sign="@RatioFormat.SignName(a5m)">@RatioFormat.Cell(a5m, 2)</td>
                             <td>@RatioFormat.Plain(avg.RollOi, 1)</td>
                             <td>@RatioFormat.Plain(avg.Basis, 2)</td>
                             <td>@RatioFormat.Plain(avg.Efficiency, 3)</td>
+                            <td>@AgreeAvgText(a5)</td>
+                            <td>@RatioFormat.Plain(a5.FallbackSharePct, 1)</td>
                             <td>—</td><td>—</td>
                         </tr>
                     }
@@ -178,9 +190,14 @@
                             @{ var davgMicro = MicroDevDisplay.Invert(davg.MicroDev); }
                             <td class="@Sc(davgMicro)" data-sign="@RatioFormat.SignName(davgMicro)">@RatioFormat.Cell(davgMicro, 2)</td>
                             <td class="@Sc(davg.Ofi)" data-sign="@RatioFormat.SignName(davg.Ofi)">@RatioFormat.Cell(davg.Ofi)</td>
+                            @{ var da5 = dayF.Depth5Average(); var da5m = MicroDevDisplay.Invert(da5.MicroDev5); }
+                            <td class="@Sc(da5.Ofi5)" data-sign="@RatioFormat.SignName(da5.Ofi5)">@RatioFormat.Cell(da5.Ofi5)</td>
+                            <td class="@Sc(da5m)" data-sign="@RatioFormat.SignName(da5m)">@RatioFormat.Cell(da5m, 2)</td>
                             <td>@RatioFormat.Plain(davg.RollOi, 1)</td>
                             <td>@RatioFormat.Plain(davg.Basis, 2)</td>
                             <td>@RatioFormat.Plain(davg.Efficiency, 3)</td>
+                            <td>@AgreeAvgText(da5)</td>
+                            <td>@RatioFormat.Plain(da5.FallbackSharePct, 1)</td>
                             <td>—</td><td>—</td>
                         </tr>
                     }
@@ -310,6 +327,8 @@
                                 <th>CE OI Δ</th><th>PE OI Δ</th><th>OI Dir (PE−CE)</th>
                                 <th>CE MicroDev (Inv)</th><th>PE MicroDev (Inv)</th><th>MicroDev Dir (Inv)</th>
                                 <th>CE OFI</th><th>PE OFI</th><th>OFI Dir</th>
+                                <th title="Top-5 price-aligned OFI, attested rows only; sign is a hypothesis">CE OFI5</th><th>PE OFI5</th><th title="CE − PE over the combined gross OFI5">OFI5 Dir</th>
+                                <th title="Top-5 MicroDev5Proxy, displayed inverted: displayed = −raw; sign is a hypothesis">CE MicroDev5Proxy (Inv)</th><th>PE MicroDev5Proxy (Inv)</th><th>MicroDev5 Dir (Inv)</th>
                             </tr>
                             </thead>
                             <tbody>
@@ -323,6 +342,8 @@
                                     @DirectionCells(d.Oi, 0, tint: false)
                                     @DirectionCells(MicroDevDisplay.Invert(d.MicroDev), 2, tint: false)
                                     @DirectionCells(d.Ofi, 0, tint: false)
+                                    @DirectionCells(Depth5Ratios.OptionOfi5(r.CeDepth, r.PeDepth), 0, tint: false)
+                                    @DirectionCells(MicroDevDisplay.Invert(Depth5Ratios.OptionMicroDev5(r.CeDepth, r.PeDepth)), 2, tint: false)
                                 </tr>
                             }
                             @if (coreRows.Count > 0)
@@ -335,6 +356,8 @@
                                     @DirectionCells(coreAvg.Oi, 0, tint: false)
                                     @DirectionCells(MicroDevDisplay.Invert(coreAvg.MicroDev), 2, tint: false)
                                     @DirectionCells(coreAvg.Ofi, 0, tint: false)
+                                    @DirectionCells(OptionDirectionRatios.Average(_fixed.Rows.Select(r => Depth5Ratios.OptionOfi5(r.CeDepth, r.PeDepth))), 0, tint: false)
+                                    @DirectionCells(MicroDevDisplay.Invert(OptionDirectionRatios.Average(_fixed.Rows.Select(r => Depth5Ratios.OptionMicroDev5(r.CeDepth, r.PeDepth)))), 2, tint: false)
                                 </tr>
                             }
                             @if (dayFixed is { } dc && _day is not null)
@@ -347,6 +370,8 @@
                                     @DirectionCells(dc.Core.Oi, 0, tint: false)
                                     @DirectionCells(MicroDevDisplay.Invert(dc.Core.MicroDev), 2, tint: false)
                                     @DirectionCells(dc.Core.Ofi, 0, tint: false)
+                                    @DirectionCells(OptionDirectionRatios.Average(_day.Fixed!.Rows.Select(r => Depth5Ratios.OptionOfi5(r.CeDepth, r.PeDepth))), 0, tint: false)
+                                    @DirectionCells(MicroDevDisplay.Invert(OptionDirectionRatios.Average(_day.Fixed!.Rows.Select(r => Depth5Ratios.OptionMicroDev5(r.CeDepth, r.PeDepth)))), 2, tint: false)
                                 </tr>
                             }
                             </tbody>
@@ -1304,6 +1329,24 @@
         var decimalPart = decimals > 0 ? "." + new string('0', decimals) : string.Empty;
         return x.Value.ToString($"+0{decimalPart};-0{decimalPart};0{decimalPart}");
     }
+    static string Depth5Label => "MicroDev5Proxy (Inv)";
+
+    /// <summary>Direct vs bridged OFI5 evidence of a bar: a bridged transition crossed an L1Superseded marker (both endpoints valid, at most 5 s apart).</summary>
+    static string Ofi5Title(AdaptiveFuturesDepth5Row? d) => d is null
+        ? "Top-5 sidecar unavailable for this bar (flag off, not yet recorded, or withheld after a failed verification)"
+        : $"OFI5 evidence: {Depth5Ratios.EvidenceText(d.Ofi5DirectTransitions, d.Ofi5BridgedTransitions)}; baseline resets {d.Ofi5BaselineResets}; usable depth {d.Depth5UsableSeconds:0.0}s of {d.BarSeconds:0.0}s";
+
+    /// <summary>Price–Flow Agreement of the existing 10-bar rolling window: S = Strict, E = Enriched; ✓ agree, ✗ disagree, — undefined.</summary>
+    static string AgreeText(AdaptiveRollingStateRow? r)
+    {
+        static string One(string n, bool? v) => v is { } b ? $"{n}{(b ? "✓" : "✗")}" : $"{n}—";
+        return r is null ? "—" : One("S", r.PriceStrictDeltaAgree) + " " + One("E", r.PriceEnrichedDeltaAgree);
+    }
+
+    static string AgreeAvgText(Depth5AvgRow a) =>
+        a.AgreeStrictPct is null && a.AgreeEnrichedPct is null ? "—"
+            : $"S {(a.AgreeStrictPct is { } s ? s.ToString("0", System.Globalization.CultureInfo.InvariantCulture) + "%" : "—")} E {(a.AgreeEnrichedPct is { } e ? e.ToString("0", System.Globalization.CultureInfo.InvariantCulture) + "%" : "—")}";
+
     static string Sc(double? v) => RatioFormat.SignedClass(v);
     static string Sc(long? v) => RatioFormat.SignedClass(v);
     static string Sc(long v) => RatioFormat.SignedClass(v);
