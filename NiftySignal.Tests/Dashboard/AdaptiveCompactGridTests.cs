@@ -627,7 +627,7 @@ public sealed class AdaptiveCompactGridTests
         Assert.Contains("data-grid=\"options-context\" data-strike=\"25000\"", html);
         Assert.Equal(["Seq", "End IST", "CE Strict Δ", "PE Strict Δ", "Strict Dir", "CE Enriched Δ", "PE Enriched Δ", "Enriched Dir",
             "CE OI Δ", "PE OI Δ", "OI Dir (PE−CE)", "CE MicroDev (Inv)", "PE MicroDev (Inv)", "MicroDev Dir (Inv)", "CE OFI", "PE OFI", "OFI Dir"], HeadersOf(html, "options-core-direction"));
-        Assert.Equal(["Seq", "End IST", "CE Price Δ", "PE Price Δ", "Price Dir", "CE ΔIV", "PE ΔIV", "IV Dir (Inv)", "CE ΔDelta", "PE ΔDelta", "Delta Dir (Inv)", "CE ΔVega", "PE ΔVega", "Vega Dir (Inv)", "CE Activity", "PE Activity", "Activity Dir"],
+        Assert.Equal(["Seq", "End IST", "CE Price Δ", "PE Price Δ", "Price Dir", "CE ΔIV", "PE ΔIV", "IV Dir (Inv)", "CE ΔDelta", "PE ΔDelta", "Delta Dir", "CE ΔVega", "PE ΔVega", "Vega Dir (Inv)", "CE Activity", "PE Activity", "Activity Dir"],
             HeadersOf(html, "options-context"));
         // The plain price family moved from CORE DIRECTION to OPTION CONTEXT; the three Roll ΔPx columns were replaced by the Delta and Vega change columns, so no rolling family is left in the primary Options grids.
         Assert.DoesNotContain(HeadersOf(html, "options-core-direction"), h => h.Contains("Price") || h.Contains("Roll", StringComparison.OrdinalIgnoreCase) || h.Contains("ΔPx"));
@@ -712,15 +712,116 @@ public sealed class AdaptiveCompactGridTests
 
         // 12 (v3): Delta CE 0.02 on |start| 0.5 = 4 %, PE 0.015 on |-0.5| = 3 %, Direction (CE - PE) = 0.005 over the average |start| 0.5 = 1 %; Vega the same way on 3000.
         var bar12 = context.Single(r => r[0] == "12");
-        // IV / Delta / Vega Dir are displayed inverted; the CE and PE source values keep their stored sign
-        Assert.Equal(["0.0200 (4.00)", "0.0150 (3.00)", "-0.0050 (-1.00)", "40.00 (1.33)", "36.00 (1.20)", "-4.00 (-0.13)"], bar12[8..14]);
+        // IV / Vega Dir are displayed inverted, Delta Dir is raw CE − PE; the CE and PE source values keep their stored sign
+        Assert.Equal(["0.0200 (4.00)", "0.0150 (3.00)", "0.0050 (1.00)", "40.00 (1.33)", "36.00 (1.20)", "-4.00 (-0.13)"], bar12[8..14]);
         // 11 (v2, no Greeks stored): six unavailable cells, never zero, and the IV / price columns of the same row are untouched.
         var bar11 = context.Single(r => r[0] == "11");
         Assert.All(bar11[8..14], c => Assert.Equal("—", c));
         Assert.Equal(bar12[2..8], bar11[2..8]);
         // AVG covers only the rows that carry Greeks (bar 11 is excluded from each Greek metric, not counted as zero).
         var avg = context.Single(r => r[0] == "AVG");
-        Assert.Equal(["0.0200 (4.00)", "0.0150 (3.00)", "-0.0050 (-1.00)"], avg[8..11]);
+        Assert.Equal(["0.0200 (4.00)", "0.0150 (3.00)", "0.0050 (1.00)"], avg[8..11]);
+    }
+
+    // ------------------------------------------------------------------ Greek Delta Direction in OPTION CONTEXT: raw CE - PE (not inverted); IV / Vega / MicroDev stay inverted
+
+    /// <summary>Seeds strike 25000 bars. <paramref name="greeks"/> maps a bar to (CE ΔDelta, PE ΔDelta); null = a v2 row with no Greeks stored (unavailable). IV change CE 1 / PE 3, Vega change CE 40 / PE 36, MicroDev CE +0.3 / PE -0.1 on every bar.</summary>
+    static async Task<ObserverFactory> SeedDeltaScenarioAsync(Func<int, (double Ce, double Pe)?> greeks, int[] bars)
+    {
+        var factory = await SeedGridAsync();
+        await using var db = factory.CreateDbContext();
+        var session = await db.Sessions.SingleAsync();
+        session.OptionUniverseJson = OptionJson(); session.WeeklyOptionExpiry = Day.AddDays(6);
+        session.TradeDate = DateOnly.FromDateTime(DateTimeOffset.UtcNow.ToOffset(Ist).DateTime);
+        foreach (var seq in bars)
+            foreach (var (side, token) in new[] { (OptionType.Call, "CE25000"), (OptionType.Put, "PE25000") })
+            {
+                var ce = side == OptionType.Call;
+                var g = greeks(seq);
+                var v3 = g is not null;
+                var change = g is null ? (double?)null : ce ? g.Value.Ce : g.Value.Pe;
+                db.OptionStrikeBars.Add(new()
+                {
+                    SessionId = 1, BarSeq = seq, MetricsVersion = v3 ? OptionStrikeBarMetrics.MetricsVersion : OptionStrikeBarMetrics.PreviousMetricsVersion,
+                    EndAvailableAtUtc = Open930.AddMinutes(seq), Expiry = Day.AddDays(6), Strike = 25000, Side = side, Token = token, TradingSymbol = token,
+                    PriceStart = 100, PriceEnd = 105, PriceChange = 5, TotalQuantity = 1000, IvStart = 20, IvChange = ce ? 1 : 3, ActivityPerSecond = 10,
+                    TobTimeWeighted = ce ? 0.6 : -0.2, MicroDevTimeWeighted = ce ? 0.3 : -0.1, TobUsableSeconds = 40,
+                    // CE delta level +0.5, PE delta level -0.5 (a put delta is negative): the change is end - start, stored raw
+                    DeltaStart = v3 ? (ce ? 0.5 : -0.5) : null, DeltaEnd = v3 ? (ce ? 0.5 : -0.5) + change : null, DeltaChange = change,
+                    VegaStart = v3 ? 3000 : null, VegaEnd = v3 ? (ce ? 3040 : 3036) : null, VegaChange = v3 ? (ce ? 40 : 36) : null,
+                });
+            }
+        await db.SaveChangesAsync();
+        await db.AttestStrikesAsync();
+        return factory;
+    }
+
+    static (string Text, string Dir)[] ContextCells(string html, string seq)
+    {
+        var table = Regex.Match(html, "<table[^>]*data-grid=\"options-context\".*?</table>", RegexOptions.Singleline).Value;
+        var row = Regex.Matches(table, "<tr[ >].*?</tr>", RegexOptions.Singleline).Select(m => m.Value).Single(r => Regex.IsMatch(r, "sticky-col[^>]*>" + Regex.Escape(seq) + "</td>"));
+        return Regex.Matches(row, "<td([^>]*)>(.*?)</td>", RegexOptions.Singleline)
+            .Select(c => (System.Net.WebUtility.HtmlDecode(Regex.Replace(c.Groups[2].Value, "<[^>]+>", "").Trim()), Regex.Match(c.Groups[1].Value, "data-direction-sign=\"([^\"]*)\"").Groups[1].Value)).ToArray();
+    }
+
+    // Context columns: 8 CE ΔDelta, 9 PE ΔDelta, 10 Delta Dir; IV Dir is 7, Vega Dir is 13. Direction % = (CE - PE) / average |start| (0.5) x 100.
+    [Theory]
+    [InlineData(0.01, 0.03, "0.0100 (2.00)", "0.0300 (6.00)", "-0.0200 (-4.00)", "neg")]   // raw CE - PE = -0.02 stays negative
+    [InlineData(0.02, 0.02, "0.0200 (4.00)", "0.0200 (4.00)", "0.0000 (0.00)", "zero")]     // zero stays zero: never "-0.0000" / "-0.00"
+    public async Task OptionContext_BarRowAvgAndDayAvg_ShowRawDeltaDirection_NegativeAndZero(double ceChange, double peChange, string ceCell, string peCell, string dir, string sign)
+    {
+        // bar 1 (outside the 10 visible rows, inside the session) carries the same values, so DAY AVG over bars 1, 11, 12 equals the bar value
+        var factory = await SeedDeltaScenarioAsync(_ => (ceChange, peChange), [1, 11, 12]);
+        var html = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new());
+        foreach (var key in new[] { "12", "AVG", "DAY AVG" })
+        {
+            var c = ContextCells(html, key);
+            Assert.Equal(ceCell, c[8].Text); Assert.Equal(peCell, c[9].Text);                    // CE / PE Delta source values unchanged
+            Assert.Equal(dir, c[10].Text); Assert.Equal(sign, c[10].Dir);                         // raw CE - PE, tint from that sign
+            if (sign == "zero") Assert.DoesNotContain("-", c[10].Text);                             // no negative-zero artifact
+            // IV (CE 1, PE 3: raw -2.00) displayed inverted +2.00 (pos); Vega (CE 40, PE 36: raw +4.00) displayed inverted -4.00 (neg)
+            Assert.StartsWith("2.00", c[7].Text); Assert.Equal("pos", c[7].Dir);
+            Assert.StartsWith("-4.00", c[13].Text); Assert.Equal("neg", c[13].Dir);
+        }
+
+        // MicroDev (CORE DIRECTION): CE +0.3, PE -0.1 -> raw +0.40, displayed inverted -0.40 (neg)
+        var coreTable = Regex.Match(html, "<table[^>]*data-grid=\"options-core-direction\".*?</table>", RegexOptions.Singleline).Value;
+        var coreRow = Regex.Matches(coreTable, "<tr[ >].*?</tr>", RegexOptions.Singleline).Select(m => m.Value).Single(r => Regex.IsMatch(r, "sticky-col[^>]*>12</td>"));
+        var micro = Regex.Matches(coreRow, "<td([^>]*)>(.*?)</td>", RegexOptions.Singleline)[13];
+        Assert.StartsWith("-0.40", System.Net.WebUtility.HtmlDecode(Regex.Replace(micro.Groups[2].Value, "<[^>]+>", "").Trim()));
+        Assert.Contains("data-direction-sign=\"neg\"", micro.Groups[1].Value);
+    }
+
+    [Fact]
+    public async Task OptionContext_MissingGreeks_DeltaDirectionIsUnavailable_NeverZero_AndAvgSkipsThoseBars()
+    {
+        // bar 12 has no Greeks (v2 row); bars 10 and 11 are negative; bar 1 (DAY AVG only) is positive.
+        var factory = await SeedDeltaScenarioAsync(seq => seq switch { 12 => null, 1 => (0.07, 0.01), _ => (0.01, 0.03) }, [1, 10, 11, 12]);
+        var html = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new());
+
+        var missing = ContextCells(html, "12");
+        Assert.All(new[] { 8, 9, 10, 11, 12, 13 }.Select(i => missing[i]), c => Assert.Equal("—", c.Text));   // unavailable, never "0"
+        Assert.All(new[] { 10, 13 }.Select(i => missing[i]), c => Assert.Equal("none", c.Dir));            // Direction cells are never tinted when unavailable
+        Assert.Equal("-0.0200 (-4.00)", ContextCells(html, "11")[10].Text);
+        Assert.Equal("neg", ContextCells(html, "11")[10].Dir);
+        Assert.Equal("-0.0200 (-4.00)", ContextCells(html, "AVG")[10].Text);              // bars 10 and 11 only: bar 12 is excluded, not averaged in as zero
+        Assert.Equal("neg", ContextCells(html, "AVG")[10].Dir);
+        // DAY AVG over bars 1, 10, 11: raw mean (+0.06 - 0.02 - 0.02) / 3 = +0.0067, /0.5 = +1.33 %: positive although the visible AVG is negative
+        var day = ContextCells(html, "DAY AVG");
+        Assert.Equal("0.0067 (1.33)", day[10].Text); Assert.Equal("pos", day[10].Dir);
+    }
+
+    [Fact]
+    public async Task OptionContext_NoGreeksAnywhere_DayAvgDeltaDirectionIsUnavailable()
+    {
+        var factory = await SeedDeltaScenarioAsync(_ => null, [1, 11, 12]);
+        var html = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new());
+        foreach (var key in new[] { "12", "AVG", "DAY AVG" })
+        {
+            var c = ContextCells(html, key);
+            Assert.All(new[] { 8, 9, 10 }.Select(i => c[i]), x => Assert.Equal("—", x.Text)); Assert.Equal("none", c[10].Dir);
+            Assert.StartsWith("2.00", c[7].Text);                                           // IV Dir (inverted) is still available
+        }
     }
 
     // ------------------------------------------------------------------ DAY AVG (whole session through the boundary) next to the visible-rows AVG

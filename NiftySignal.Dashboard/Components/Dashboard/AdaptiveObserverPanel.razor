@@ -360,7 +360,7 @@
                                 <th>Seq</th><th>End IST</th>
                                 <th>CE Price Δ</th><th>PE Price Δ</th><th>Price Dir</th>
                                 <th>CE ΔIV</th><th>PE ΔIV</th><th title="displayed inverted: displayed = −raw (CE − PE)">@DirectionDisplay.IvLabel</th>
-                                <th>CE ΔDelta</th><th>PE ΔDelta</th><th title="displayed inverted: displayed = −raw (CE − PE)">@DirectionDisplay.DeltaLabel</th>
+                                <th>CE ΔDelta</th><th>PE ΔDelta</th><th title="CE − PE (raw)">@DirectionDisplay.DeltaLabel</th>
                                 <th>CE ΔVega</th><th>PE ΔVega</th><th title="displayed inverted: displayed = −raw (CE − PE)">@DirectionDisplay.VegaLabel</th>
                                 <th>CE Activity</th><th>PE Activity</th><th>Activity Dir</th>
                             </tr>
@@ -374,7 +374,7 @@
                                     <td>@FmtIst(r.EndAvailableAtUtc)</td>
                                     @DirectionCells(pr.Price, 2, tint: false)
                                     @DirectionCells(DirectionDisplay.InvertDirectionOnly(d.Iv), 2, tint: false)
-                                    @DirectionCells(DirectionDisplay.InvertDirectionOnly(d.Delta), 4, tint: false)
+                                    @DirectionCells(d.Delta, 4, tint: false)
                                     @DirectionCells(DirectionDisplay.InvertDirectionOnly(d.Vega), 2, tint: false)
                                     @DirectionCells(d.Activity, 1, tint: false)
                                 </tr>
@@ -386,7 +386,7 @@
                                     <td>@ctxRows.Count rows</td>
                                     @DirectionCells(ctxAvg.Price, 2, tint: false)
                                     @DirectionCells(DirectionDisplay.InvertDirectionOnly(ctxAvg.Iv), 2, tint: false)
-                                    @DirectionCells(DirectionDisplay.InvertDirectionOnly(ctxAvg.Delta), 4, tint: false)
+                                    @DirectionCells(ctxAvg.Delta, 4, tint: false)
                                     @DirectionCells(DirectionDisplay.InvertDirectionOnly(ctxAvg.Vega), 2, tint: false)
                                     @DirectionCells(ctxAvg.Activity, 1, tint: false)
                                 </tr>
@@ -398,7 +398,7 @@
                                     <td>@_day.BarCount bars</td>
                                     @DirectionCells(dx.Context.Price, 2, tint: false)
                                     @DirectionCells(DirectionDisplay.InvertDirectionOnly(dx.Context.Iv), 2, tint: false)
-                                    @DirectionCells(DirectionDisplay.InvertDirectionOnly(dx.Context.Delta), 4, tint: false)
+                                    @DirectionCells(dx.Context.Delta, 4, tint: false)
                                     @DirectionCells(DirectionDisplay.InvertDirectionOnly(dx.Context.Vega), 2, tint: false)
                                     @DirectionCells(dx.Context.Activity, 1, tint: false)
                                 </tr>

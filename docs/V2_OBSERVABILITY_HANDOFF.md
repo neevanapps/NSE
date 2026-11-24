@@ -38,6 +38,8 @@ The Host feeds each clean option tick into `LiveMarkBoard` (O(1), Observer threa
 Dashboard live view only (not in the six-grid Telegram screenshot): table `option-price-averages` with Avg5 / Avg10 of CE and PE `PriceEnd` over the last 5/10 completed bars, plus the current bid/ask (fresh ≤ 10 s). An average is shown only when ALL N consecutive bars have a finite positive price; otherwise "unavailable". Display only: no signal, filter or strategy reads it. Example: CE bars 118,120,121,119,122 → Avg5 = 120.00.
 
 ## 8. IV / Delta / Vega rendering
+> **Update 2026-11-24:** the Greek Delta Direction is no longer inverted (shown raw CE − PE, label "Delta Dir"); IV and Vega stay inverted. The text below is the historical 2026-11-04 description.
+
 `DirectionDisplay` flips the sign of the displayed Direction for IV, Delta and Vega in TOTAL SUMMARY and OPTION CONTEXT, with an "(Inv)" label; the underlying scores and strategy inputs are unchanged. CE/PE background tint is removed in both fixed-strike grids (`tint: false`); the Direction-only tint stays. Eight existing tests were updated deliberately for the label/sign change; a guard test asserts `DirectionDisplay` is used only in the Dashboard.
 
 ## 9. Opportunity log
@@ -105,7 +107,7 @@ Merge into the existing `PaperEngineV2` section (do not duplicate it). Telegram 
 - Average-price quotes are as of page load, not per second; marks are an estimate, never a fill.
 - Marks need the new tables; without them the features are silently off (visible as "not installed").
 - Feed gaps show Stale/Missing, not zero. A Dashboard disconnect only stops the display.
-- Directive vs code: "show IV/Delta/Vega Direction inverted" is display-only; strategies still consume the original scores.
+- Directive vs code: "show IV/Delta/Vega Direction inverted" (historical: Delta was returned to raw on 2026-11-24) is display-only; strategies still consume the original scores.
 
 ## Results
 **Full Release solution regression** (`dotnet test NiftySignal.slnx -c Release`, scratch PostgreSQL 18 enabled for the trading, pev2 and migration tests): **Passed 2854, Failed 0, Skipped 1, Total 2855.** The one skip is `HostReplayTests.RecordedSession_FlowsThroughTheRealHostPath_...`, which by design needs `NSE_V2_REPLAY_SOURCE` (read-only local recorded session); it was run separately, below. A first full run had 1 failure: the Execution assembly vocabulary guard (no "Live" in type names) flagged my new `LiveMark*` types. The guard was NOT weakened; the Execution types were renamed `PositionMark`, `PositionMarkCalculator`, `PositionMarkJson`, and the rerun passed.
@@ -123,8 +125,8 @@ Merge into the existing `PaperEngineV2` section (do not duplicate it). Telegram 
 
 **1. Visual fixture with representative Observer data** (static render of `AdaptiveObserverPanel` live view + `MarketSummarySection` from the same in-memory Observer fixtures the test suite uses, with the real Dashboard CSS, opened in the built-in browser; the local DB has no adaptive tables, so a fixture was the only way to get Observer-shaped data):
 - Option price averages: CE25000 Avg5 108.30 / Avg10 107.40, PE25000 Avg5 90.00 / Avg10 87.00 — equal to hand-computed means of the stored `PriceEnd` of bars 8–12 / 3–12. Bid/Ask/Quote age show "—" because the fixture has no tick source (never zero).
-- OPTION CONTEXT inversion, asymmetric fixture (CE ΔIV 1, PE ΔIV 3; ΔDelta 0.02 / 0.05; ΔVega 0.4 / 0.9): raw CE−PE would be −2.00 / −0.03 / −0.50; displayed **IV Dir (Inv) +2.00, Delta Dir (Inv) +0.03, Vega Dir (Inv) +0.50**, Direction cells tinted green; headers carry "(Inv)".
-- TOTAL SUMMARY: headers "IV Dir (Inv)", "Delta Dir (Inv)", "Vega Dir (Inv)"; Delta/Vega Direction cells tinted by the inverted sign (IV is "—" in that fixture because it has no IV data).
+- [historical 2026-11-04; Delta no longer inverted since 2026-11-24] OPTION CONTEXT inversion, asymmetric fixture (CE ΔIV 1, PE ΔIV 3; ΔDelta 0.02 / 0.05; ΔVega 0.4 / 0.9): raw CE−PE would be −2.00 / −0.03 / −0.50; displayed **IV Dir (Inv) +2.00, Delta Dir (Inv) +0.03, Vega Dir (Inv) +0.50**, Direction cells tinted green; headers carry "(Inv)".
+- [historical; Delta header is now "Delta Dir", untinted-by-inversion] TOTAL SUMMARY: headers "IV Dir (Inv)", "Delta Dir (Inv)", "Vega Dir (Inv)"; Delta/Vega Direction cells tinted by the inverted sign (IV is "—" in that fixture because it has no IV data).
 - CE/PE colouring: 0 of the CE-/PE-labelled cells in OPTION CONTEXT and CORE DIRECTION have a background colour; only Direction cells are tinted.
 - No calculation logic was changed. The temporary fixture generator was deleted and is not in the repo.
 

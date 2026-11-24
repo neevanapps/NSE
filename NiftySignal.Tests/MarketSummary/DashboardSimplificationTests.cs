@@ -64,7 +64,7 @@ public class DashboardSimplificationTests
     }
 
     static readonly string[] TotalHeaders =
-        ["Window", "Coverage", "Price Dir", "Roll Dir", "Strict Dir", "Enriched Dir", "OI Dir", "MicroDev Dir (Inv)", "OFI Dir", "IV Dir (Inv)", "Delta Dir (Inv)", "Vega Dir (Inv)", "Activity Dir"];
+        ["Window", "Coverage", "Price Dir", "Roll Dir", "Strict Dir", "Enriched Dir", "OI Dir", "MicroDev Dir (Inv)", "OFI Dir", "IV Dir (Inv)", "Delta Dir", "Vega Dir (Inv)", "Activity Dir"];
 
     // ---- 1 / 2 / 4: retained sections, order, the exact TOTAL columns and rows ----
 
@@ -107,10 +107,10 @@ public class DashboardSimplificationTests
                 Assert.StartsWith(r.Coverage.Status == CoverageStatus.Full ? "10/10 – FULL" : "9/10 – PARTIAL (levels 10/10)", cells[1].Text);
             Assert.Equal(RatioFormat.Cell(new RatioPart(d.Price.Raw, d.Price.Num, d.Price.Den), 2), cells[2].Text);
             Assert.Equal(RatioFormat.Cell(new RatioPart(d.Oi.Raw, d.Oi.Num, d.Oi.Den), 0), cells[6].Text);                                  // OI keeps the PE − CE convention of the contract
-            // IV / Delta / Vega Dir are displayed INVERTED (numerator and raw negated together, denominator untouched, zero stays zero); Delta and Vega are scaled ×100 exactly once
+            // IV / Vega Dir are displayed INVERTED, Delta Dir is RAW (numerator and raw negated together, denominator untouched, zero stays zero); Delta and Vega are scaled ×100 exactly once
             static double? Neg(double? x) => x is { } v && double.IsFinite(v) ? (v == 0d ? 0d : -v) : x;
             Assert.Equal(RatioFormat.Cell(new RatioPart(Neg(d.Iv.Raw), Neg(d.Iv.Num), d.Iv.Den), 2), cells[9].Text);
-            Assert.Equal(RatioFormat.Cell(new RatioPart(DisplayScale.Times100(Neg(d.Delta.Raw)), Neg(d.Delta.Num), d.Delta.Den), 2), cells[10].Text);   // ×100 once
+            Assert.Equal(RatioFormat.Cell(new RatioPart(DisplayScale.Times100(d.Delta.Raw), d.Delta.Num, d.Delta.Den), 2), cells[10].Text);   // ×100 once
             Assert.Equal(RatioFormat.Cell(new RatioPart(DisplayScale.Times100(Neg(d.Vega.Raw)), Neg(d.Vega.Num), d.Vega.Den), 2), cells[11].Text);
         }
 
@@ -181,9 +181,9 @@ public class DashboardSimplificationTests
     public async Task TotalSummary_DeltaAndVegaAreScaledOnce_NotTwice()
     {
         var html = await RenderAsync(View(30, 1));
-        // CE delta change +0.03, PE +0.01 -> raw Direction 0.02 -> displayed inverted -2.00 (and not -200.00 / +2.00); vega CE +0.5 - PE +0.2 = 0.3 -> displayed -30.00
+        // CE delta change +0.03, PE +0.01 -> raw Direction 0.02 -> displayed raw +2.00 (not inverted, and not 200.00 / 0.02); vega CE +0.5 - PE +0.2 = 0.3 -> displayed -30.00
         var c = Cells(html, "summary-total", "5 Bars");
-        Assert.StartsWith("-2.00 (", c[10].Text);
+        Assert.StartsWith("2.00 (", c[10].Text);
         Assert.StartsWith("-30.00 (", c[11].Text);
     }
 
@@ -227,7 +227,8 @@ public class DashboardSimplificationTests
         var shown = DirectionDisplay.InvertDirectionOnly(side);
         Assert.Equal(side.Ce, shown.Ce); Assert.Equal(side.Pe, shown.Pe);                           // the CE and PE source values are NEVER inverted
         Assert.Equal(-0.4, shown.Direction.Raw); Assert.Equal(-8d, shown.Direction.Num); Assert.Equal(40d, shown.Direction.Den);
-        Assert.Equal(["IV Dir (Inv)", "Delta Dir (Inv)", "Vega Dir (Inv)"], [DirectionDisplay.IvLabel, DirectionDisplay.DeltaLabel, DirectionDisplay.VegaLabel]);
+        Assert.Equal(["IV Dir (Inv)", "Delta Dir", "Vega Dir (Inv)"], [DirectionDisplay.IvLabel, DirectionDisplay.DeltaLabel, DirectionDisplay.VegaLabel]);
+        Assert.Contains("IV / Vega", DirectionDisplay.Legend); Assert.DoesNotContain("IV / Delta", DirectionDisplay.Legend);
     }
 
     [Fact]
@@ -248,9 +249,9 @@ public class DashboardSimplificationTests
     public async Task TotalSummary_AllElevenDirectionColumns_AreTintedBySign(int mode)
     {
         var html = await RenderAsync(View(120, mode));
-        // CE-strong (mode 1): Price, Roll, Strict, Enriched, OFI, Activity are CE − PE > 0; OI = PE − CE < 0; MicroDev, IV, Delta and Vega are displayed inverted (< 0), coloured from the DISPLAYED sign
-        var positive = mode > 0 ? new[] { 2, 3, 4, 5, 8, 12 } : new[] { 6, 7, 9, 10, 11 };
-        var negative = mode > 0 ? new[] { 6, 7, 9, 10, 11 } : new[] { 2, 3, 4, 5, 8, 12 };
+        // CE-strong (mode 1): Price, Roll, Strict, Enriched, OFI, Activity are CE − PE > 0; OI = PE − CE < 0; MicroDev, IV and Vega are displayed inverted (< 0), coloured from the DISPLAYED sign; Delta is raw (> 0)
+        var positive = mode > 0 ? new[] { 2, 3, 4, 5, 8, 10, 12 } : new[] { 6, 7, 9, 11 };
+        var negative = mode > 0 ? new[] { 6, 7, 9, 11 } : new[] { 2, 3, 4, 5, 8, 10, 12 };
         foreach (var w in new[] { "5 Bars", "10 Bars", "50 Bars", "100 Bars", "Day" })
         {
             var cells = Cells(html, "summary-total", w);
