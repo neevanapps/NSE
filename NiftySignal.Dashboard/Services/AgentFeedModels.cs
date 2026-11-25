@@ -126,10 +126,11 @@ public sealed record AgentBar(
     AgentMarket Market,
     AgentTop5? Top5 = null);
 
-/// <summary>Top-5 depth (additive; null when neither the futures nor the attested option depth rows exist). RAW values (MicroDev5Proxy is NOT inverted here: inversion is a Dashboard display convention); every sign is a hypothesis.</summary>
+/// <summary>Top-5 depth (additive; null when neither the futures nor the attested option depth rows exist). RAW values (MicroDev5Proxy is NOT inverted here: inversion is a Dashboard display convention); every sign is a hypothesis. Depth values are EVENT-BASED (depth5-v2): ValidDepthEvents = distinct coherent snapshots accumulated in the bar (no elapsed-time weights).</summary>
 public sealed record AgentTop5(
-    AgentRatio FuturesOfi5, AgentRatio FuturesMicroDev5Proxy, int? Ofi5DirectTransitions, int? Ofi5BridgedTransitions, double? DepthUsableSeconds,
-    AgentSideRatios FixedStrikeOfi5, AgentSideRatios FixedStrikeMicroDev5Proxy);
+    AgentRatio FuturesOfi5, AgentRatio FuturesMicroDev5Proxy, int? Ofi5DirectTransitions, int? Ofi5BridgedTransitions, int? ValidDepthEvents,
+    AgentSideRatios FixedStrikeOfi5, AgentSideRatios FixedStrikeMicroDev5Proxy,
+    string? DepthMetricsVersion = null);
 
 public sealed record AgentSnapshotResponse(AgentMeta Meta, IReadOnlyList<AgentBar> Bars);
 

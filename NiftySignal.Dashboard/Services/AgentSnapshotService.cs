@@ -233,8 +233,8 @@ public sealed class AgentSnapshotService(
         if (depth is not null || fixedRow?.CeDepth is not null || fixedRow?.PeDepth is not null)
         {
             top5 = new AgentTop5(
-                Ratio(Depth5Ratios.Ofi5(depth)), Ratio(Depth5Ratios.MicroDev5(depth)), depth?.Ofi5DirectTransitions, depth?.Ofi5BridgedTransitions, F(depth?.Depth5UsableSeconds),
-                Ratios(Depth5Ratios.OptionOfi5(fixedRow?.CeDepth, fixedRow?.PeDepth)), Ratios(Depth5Ratios.OptionMicroDev5(fixedRow?.CeDepth, fixedRow?.PeDepth)));
+                Ratio(Depth5Ratios.Ofi5(depth)), Ratio(Depth5Ratios.MicroDev5(depth)), depth?.Ofi5DirectTransitions, depth?.Ofi5BridgedTransitions, depth?.ValidDepthEvents,
+                Ratios(Depth5Ratios.OptionOfi5(fixedRow?.CeDepth, fixedRow?.PeDepth)), Ratios(Depth5Ratios.OptionMicroDev5(fixedRow?.CeDepth, fixedRow?.PeDepth)), NiftySignal.AdaptiveObserver.FuturesDepth5Bar.MetricsVersion);
         }
 
         return new AgentBar(b.BarSeq, At(b.StartAvailableAtUtc), At(b.EndAvailableAtUtc), true, F(b.DurationSeconds), issues.Count == 0, issues, agentFutures, options, agentResidual, market, top5);

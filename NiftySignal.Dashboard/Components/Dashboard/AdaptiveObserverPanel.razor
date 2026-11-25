@@ -114,7 +114,7 @@
                         <th>Bar ΔPx</th><th>Roll ΔPx</th>
                         <th title="raw Strict delta (Strict delta / volume, %)">Strict Δ</th><th title="raw Enriched delta (Enriched delta / classified volume, %)">Enriched Δ</th>
                         <th title="time-weighted MicroDev (time-weighted TOB x 100), displayed inverted: displayed = −raw">@MicroDevDisplay.Label</th><th title="net OFI (net OFI / gross OFI, %)">OFI</th>
-                        <th title="Top-5 price-aligned OFI (net / gross, %). Unavailable when the Top-5 sidecar is off or the bar has no valid transition. Sign is a hypothesis.">OFI5</th><th title="Top-5 MicroDev5Proxy = HS1 × Tob5, time-weighted, displayed inverted like MicroDev: displayed = −raw. Sign is a hypothesis.">@Depth5Label</th>
+                        <th title="Top-5 price-aligned OFI (net / gross, %). Unavailable when the Top-5 sidecar is off or the bar has no valid transition. Sign is a hypothesis.">OFI5</th><th title="Top-5 MicroDev5Proxy (EVENT-BASED) = mean over the bar's eligible depth snapshots of HalfSpread × TOB5, displayed inverted like MicroDev: displayed = −raw. Sign is a hypothesis.">@Depth5Label</th>
                         <th>Roll OI Δ</th><th>ΔBasis</th><th>Roll Efficiency</th>
                         <th title="existing 10-bar rolling metric: does the rolling price move agree in sign with the rolling Strict / Enriched delta? (S = Strict, E = Enriched)">Price–Flow Agree</th><th title="existing 10-bar rolling metric: share of the rolling window carried by fallback-classified trades">Fallback Share %</th>
                         <th>Evolution</th><th>State</th>
@@ -325,10 +325,10 @@
                                 <th>CE Strict Δ</th><th>PE Strict Δ</th><th>Strict Dir</th>
                                 <th>CE Enriched Δ</th><th>PE Enriched Δ</th><th>Enriched Dir</th>
                                 <th>CE OI Δ</th><th>PE OI Δ</th><th>OI Dir (PE−CE)</th>
-                                <th>CE MicroDev (Inv)</th><th>PE MicroDev (Inv)</th><th>MicroDev Dir (Inv)</th>
+                                <th>CE MicroDev (Inv)</th><th>PE MicroDev (Inv)</th><th title="raw CE − PE of the raw MicroDev values (NOT inverted; the CE / PE columns are shown inverted)">MicroDev Dir</th>
                                 <th>CE OFI</th><th>PE OFI</th><th>OFI Dir</th>
                                 <th title="Top-5 price-aligned OFI, attested rows only; sign is a hypothesis">CE OFI5</th><th>PE OFI5</th><th title="CE − PE over the combined gross OFI5">OFI5 Dir</th>
-                                <th title="Top-5 MicroDev5Proxy, displayed inverted: displayed = −raw; sign is a hypothesis">CE MicroDev5Proxy (Inv)</th><th>PE MicroDev5Proxy (Inv)</th><th>MicroDev5 Dir (Inv)</th>
+                                <th title="Top-5 MicroDev5Proxy, displayed inverted: displayed = −raw; sign is a hypothesis">CE MicroDev5Proxy (Inv)</th><th>PE MicroDev5Proxy (Inv)</th><th title="raw CE − PE of the raw MicroDev5Proxy (NOT inverted; the CE / PE columns are shown inverted)">MicroDev5 Dir</th>
                             </tr>
                             </thead>
                             <tbody>
@@ -340,10 +340,10 @@
                                     @DirectionCells(d.Strict, 0, tint: false)
                                     @DirectionCells(d.Enriched, 0, tint: false)
                                     @DirectionCells(d.Oi, 0, tint: false)
-                                    @DirectionCells(MicroDevDisplay.Invert(d.MicroDev), 2, tint: false)
+                                    @DirectionCells(MicroDevDisplay.InvertSides(d.MicroDev), 2, tint: false)
                                     @DirectionCells(d.Ofi, 0, tint: false)
                                     @DirectionCells(Depth5Ratios.OptionOfi5(r.CeDepth, r.PeDepth), 0, tint: false)
-                                    @DirectionCells(MicroDevDisplay.Invert(Depth5Ratios.OptionMicroDev5(r.CeDepth, r.PeDepth)), 2, tint: false)
+                                    @DirectionCells(MicroDevDisplay.InvertSides(Depth5Ratios.OptionMicroDev5(r.CeDepth, r.PeDepth)), 2, tint: false)
                                 </tr>
                             }
                             @if (coreRows.Count > 0)
@@ -354,10 +354,10 @@
                                     @DirectionCells(coreAvg.Strict, 0, tint: false)
                                     @DirectionCells(coreAvg.Enriched, 0, tint: false)
                                     @DirectionCells(coreAvg.Oi, 0, tint: false)
-                                    @DirectionCells(MicroDevDisplay.Invert(coreAvg.MicroDev), 2, tint: false)
+                                    @DirectionCells(MicroDevDisplay.InvertSides(coreAvg.MicroDev), 2, tint: false)
                                     @DirectionCells(coreAvg.Ofi, 0, tint: false)
                                     @DirectionCells(OptionDirectionRatios.Average(_fixed.Rows.Select(r => Depth5Ratios.OptionOfi5(r.CeDepth, r.PeDepth))), 0, tint: false)
-                                    @DirectionCells(MicroDevDisplay.Invert(OptionDirectionRatios.Average(_fixed.Rows.Select(r => Depth5Ratios.OptionMicroDev5(r.CeDepth, r.PeDepth)))), 2, tint: false)
+                                    @DirectionCells(MicroDevDisplay.InvertSides(OptionDirectionRatios.Average(_fixed.Rows.Select(r => Depth5Ratios.OptionMicroDev5(r.CeDepth, r.PeDepth)))), 2, tint: false)
                                 </tr>
                             }
                             @if (dayFixed is { } dc && _day is not null)
@@ -368,10 +368,10 @@
                                     @DirectionCells(dc.Core.Strict, 0, tint: false)
                                     @DirectionCells(dc.Core.Enriched, 0, tint: false)
                                     @DirectionCells(dc.Core.Oi, 0, tint: false)
-                                    @DirectionCells(MicroDevDisplay.Invert(dc.Core.MicroDev), 2, tint: false)
+                                    @DirectionCells(MicroDevDisplay.InvertSides(dc.Core.MicroDev), 2, tint: false)
                                     @DirectionCells(dc.Core.Ofi, 0, tint: false)
                                     @DirectionCells(OptionDirectionRatios.Average(_day.Fixed!.Rows.Select(r => Depth5Ratios.OptionOfi5(r.CeDepth, r.PeDepth))), 0, tint: false)
-                                    @DirectionCells(MicroDevDisplay.Invert(OptionDirectionRatios.Average(_day.Fixed!.Rows.Select(r => Depth5Ratios.OptionMicroDev5(r.CeDepth, r.PeDepth)))), 2, tint: false)
+                                    @DirectionCells(MicroDevDisplay.InvertSides(OptionDirectionRatios.Average(_day.Fixed!.Rows.Select(r => Depth5Ratios.OptionMicroDev5(r.CeDepth, r.PeDepth)))), 2, tint: false)
                                 </tr>
                             }
                             </tbody>
@@ -1334,7 +1334,7 @@
     /// <summary>Direct vs bridged OFI5 evidence of a bar: a bridged transition crossed an L1Superseded marker (both endpoints valid, at most 5 s apart).</summary>
     static string Ofi5Title(AdaptiveFuturesDepth5Row? d) => d is null
         ? "Top-5 sidecar unavailable for this bar (flag off, not yet recorded, or withheld after a failed verification)"
-        : $"OFI5 evidence: {Depth5Ratios.EvidenceText(d.Ofi5DirectTransitions, d.Ofi5BridgedTransitions)}; baseline resets {d.Ofi5BaselineResets}; usable depth {d.Depth5UsableSeconds:0.0}s of {d.BarSeconds:0.0}s";
+        : $"OFI5 evidence: {Depth5Ratios.EvidenceText(d.Ofi5DirectTransitions, d.Ofi5BridgedTransitions)}; baseline resets {d.Ofi5BaselineResets}; eligible depth events {d.ValidDepthEvents?.ToString() ?? "—"} (repeats ignored {d.RepeatSnapshotsIgnored?.ToString() ?? "—"}, L1-superseded {d.SupersededMarkers}, invalid {d.InvalidSnapshots}, no-depth {d.NoDepthEvents?.ToString() ?? "—"}, feed gaps {d.FeedGapEvents?.ToString() ?? "—"})";
 
     /// <summary>Price–Flow Agreement of the existing 10-bar rolling window: S = Strict, E = Enriched; ✓ agree, ✗ disagree, — undefined.</summary>
     static string AgreeText(AdaptiveRollingStateRow? r)

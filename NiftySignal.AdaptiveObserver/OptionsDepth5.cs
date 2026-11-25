@@ -14,8 +14,11 @@ public sealed record OptionDepth5Bar(
     OptionType Side,
     FuturesDepth5Bar Depth)
 {
-    /// <summary>options-depth5-v1: per-token application of the futures-depth5-v1 rules to every contract of the frozen session universe. A different rule is a new version.</summary>
-    public const string MetricsVersion = "options-depth5-v1";
+    /// <summary>options-depth5-v2 (EVENT-BASED): per-token application of the futures-depth5-v2 rules to every contract of the frozen session universe. A different rule is a new version.</summary>
+    public const string MetricsVersion = "options-depth5-v2";
+
+    /// <summary>The v1 (time-weighted) version string: historical rows are never rewritten, relabelled or served as v2.</summary>
+    public const string LegacyTimeWeightedVersion = "options-depth5-v1";
 }
 
 /// <summary>

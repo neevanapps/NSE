@@ -461,6 +461,16 @@ public sealed class AdaptiveFuturesDepth5Row
     public int SnapshotEvents { get; set; }
     public int SupersededMarkers { get; set; }
     public int InvalidSnapshots { get; set; }
+    // ---- *-depth5-v2 EVENT-BASED accumulators (additive, nullable: v1 rows never carry them; v2 rows leave the legacy *TimeWeighted columns null). Sums are NULL, never 0, when the bar had no eligible event. ----
+    public double? BidNotionalEventSum { get; set; }
+    public double? AskNotionalEventSum { get; set; }
+    public int? ValidDepthEvents { get; set; }
+    public double? MicroDev5EventSum { get; set; }
+    public double? Tob5EventSum { get; set; }
+    public int? ValidMicroDev5Events { get; set; }
+    public int? RepeatSnapshotsIgnored { get; set; }
+    public int? NoDepthEvents { get; set; }
+    public int? FeedGapEvents { get; set; }
 }
 
 /// <summary>
@@ -502,6 +512,16 @@ public sealed class AdaptiveOptionsDepth5Row
     public int SnapshotEvents { get; set; }
     public int SupersededMarkers { get; set; }
     public int InvalidSnapshots { get; set; }
+    // ---- *-depth5-v2 EVENT-BASED accumulators (additive, nullable: v1 rows never carry them; v2 rows leave the legacy *TimeWeighted columns null). Sums are NULL, never 0, when the bar had no eligible event. ----
+    public double? BidNotionalEventSum { get; set; }
+    public double? AskNotionalEventSum { get; set; }
+    public int? ValidDepthEvents { get; set; }
+    public double? MicroDev5EventSum { get; set; }
+    public double? Tob5EventSum { get; set; }
+    public int? ValidMicroDev5Events { get; set; }
+    public int? RepeatSnapshotsIgnored { get; set; }
+    public int? NoDepthEvents { get; set; }
+    public int? FeedGapEvents { get; set; }
 }
 
 /// <summary>Durable POSITIVE verification of one bar's options depth rows (own table; the per-strike attestation is untouched). <see cref="Digests"/> lists every verified contract as <c>token=hash;...</c> (sorted).</summary>

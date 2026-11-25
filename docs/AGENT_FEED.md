@@ -48,3 +48,10 @@ On every completed bar the Dashboard appends one line — exactly one bar object
 ```
 
 A relative `RootDirectory` resolves against the Dashboard install folder. Writer guarantees: only bars ≤ `LastCompletedBarSeq`; idempotent on `barSeq` per file (existing barSeq values are read under an exclusive write lock, so restarts, reconnects and a second process never duplicate; first line wins); a restart back-fills missing bars at the end without touching existing lines; a torn last line is left behind a newline and its bar rewritten; the newest bar waits `SettleSeconds` so the Host's sidecar rows are in place. Set `JsonlEnabled=false` to turn the writer off (the API stays).
+
+
+## `top5` block compatibility (2026-11-25)
+* The optional `top5` object (flag-gated Top-5 depth; absent / null while the Host flags are OFF, which is the shipped default, so it has never carried data in production) was introduced at commit `bd0b08f`; it was not part of the documented `agent-v1` payload.
+* Depth values are now EVENT-BASED (`futures-depth5-v2` / `options-depth5-v2`). `top5.depthMetricsVersion` states which version produced the values; a consumer must not compare values across versions.
+* `top5.depthUsableSeconds` (seconds, v1 time-weighted) was REMOVED and replaced by `top5.validDepthEvents` (count of distinct coherent snapshots accumulated in the bar). The field was renamed rather than reused so that no existing name changes meaning or unit. `futuresMicroDev5Proxy` is now SumMicroDev5 / events (price units, raw, not inverted); its `ratio` is mean TOB5 x 100.
+* Decision: the schema string stays `agent-v1` (the block is additive, nullable, undocumented before this change and empty in production). Consumers of `depthUsableSeconds` (none found in this repository) would need to switch to `validDepthEvents`; if an external consumer is known to parse it, bump `meta.schema` to `agent-v2` instead (approval needed).

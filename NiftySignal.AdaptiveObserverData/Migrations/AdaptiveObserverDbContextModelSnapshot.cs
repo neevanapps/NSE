@@ -490,6 +490,9 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
 
                     NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
 
+                    b.Property<double?>("AskNotionalEventSum")
+                        .HasColumnType("double precision");
+
                     b.Property<double?>("AskNotionalTimeWeighted")
                         .HasColumnType("double precision");
 
@@ -498,6 +501,9 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
 
                     b.Property<int>("BarSeq")
                         .HasColumnType("integer");
+
+                    b.Property<double?>("BidNotionalEventSum")
+                        .HasColumnType("double precision");
 
                     b.Property<double?>("BidNotionalTimeWeighted")
                         .HasColumnType("double precision");
@@ -523,6 +529,9 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                     b.Property<double?>("DepthImb5TimeWeighted")
                         .HasColumnType("double precision");
 
+                    b.Property<int?>("FeedGapEvents")
+                        .HasColumnType("integer");
+
                     b.Property<long?>("GrossOfi5")
                         .HasColumnType("bigint");
 
@@ -534,8 +543,14 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                         .HasMaxLength(64)
                         .HasColumnType("character varying(64)");
 
+                    b.Property<double?>("MicroDev5EventSum")
+                        .HasColumnType("double precision");
+
                     b.Property<double?>("MicroDev5TimeWeighted")
                         .HasColumnType("double precision");
+
+                    b.Property<int?>("NoDepthEvents")
+                        .HasColumnType("integer");
 
                     b.Property<long?>("Ofi5")
                         .HasColumnType("bigint");
@@ -558,6 +573,9 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                     b.Property<int>("Ofi5Transitions")
                         .HasColumnType("integer");
 
+                    b.Property<int?>("RepeatSnapshotsIgnored")
+                        .HasColumnType("integer");
+
                     b.Property<long>("SessionId")
                         .HasColumnType("bigint");
 
@@ -567,8 +585,17 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                     b.Property<int>("SupersededMarkers")
                         .HasColumnType("integer");
 
+                    b.Property<double?>("Tob5EventSum")
+                        .HasColumnType("double precision");
+
                     b.Property<double?>("Tob5TimeWeighted")
                         .HasColumnType("double precision");
+
+                    b.Property<int?>("ValidDepthEvents")
+                        .HasColumnType("integer");
+
+                    b.Property<int?>("ValidMicroDev5Events")
+                        .HasColumnType("integer");
 
                     b.HasKey("Id");
 
@@ -1240,6 +1267,9 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
 
                     NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
 
+                    b.Property<double?>("AskNotionalEventSum")
+                        .HasColumnType("double precision");
+
                     b.Property<double?>("AskNotionalTimeWeighted")
                         .HasColumnType("double precision");
 
@@ -1248,6 +1278,9 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
 
                     b.Property<int>("BarSeq")
                         .HasColumnType("integer");
+
+                    b.Property<double?>("BidNotionalEventSum")
+                        .HasColumnType("double precision");
 
                     b.Property<double?>("BidNotionalTimeWeighted")
                         .HasColumnType("double precision");
@@ -1276,6 +1309,9 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                     b.Property<DateOnly>("Expiry")
                         .HasColumnType("date");
 
+                    b.Property<int?>("FeedGapEvents")
+                        .HasColumnType("integer");
+
                     b.Property<long?>("GrossOfi5")
                         .HasColumnType("bigint");
 
@@ -1287,8 +1323,14 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                         .HasMaxLength(64)
                         .HasColumnType("character varying(64)");
 
+                    b.Property<double?>("MicroDev5EventSum")
+                        .HasColumnType("double precision");
+
                     b.Property<double?>("MicroDev5TimeWeighted")
                         .HasColumnType("double precision");
+
+                    b.Property<int?>("NoDepthEvents")
+                        .HasColumnType("integer");
 
                     b.Property<long?>("Ofi5")
                         .HasColumnType("bigint");
@@ -1311,6 +1353,9 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                     b.Property<int>("Ofi5Transitions")
                         .HasColumnType("integer");
 
+                    b.Property<int?>("RepeatSnapshotsIgnored")
+                        .HasColumnType("integer");
+
                     b.Property<long>("SessionId")
                         .HasColumnType("bigint");
 
@@ -1326,6 +1371,9 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                     b.Property<int>("SupersededMarkers")
                         .HasColumnType("integer");
 
+                    b.Property<double?>("Tob5EventSum")
+                        .HasColumnType("double precision");
+
                     b.Property<double?>("Tob5TimeWeighted")
                         .HasColumnType("double precision");
 
@@ -1338,6 +1386,12 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                         .IsRequired()
                         .HasMaxLength(64)
                         .HasColumnType("character varying(64)");
+
+                    b.Property<int?>("ValidDepthEvents")
+                        .HasColumnType("integer");
+
+                    b.Property<int?>("ValidMicroDev5Events")
+                        .HasColumnType("integer");
 
                     b.HasKey("Id");
 

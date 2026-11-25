@@ -64,7 +64,7 @@ public class DashboardSimplificationTests
     }
 
     static readonly string[] TotalHeaders =
-        ["Window", "Coverage", "Price Dir", "Roll Dir", "Strict Dir", "Enriched Dir", "OI Dir", "MicroDev Dir (Inv)", "OFI Dir", "IV Dir (Inv)", "Delta Dir", "Vega Dir (Inv)", "Activity Dir", "Depth L5 Dir"];
+        ["Window", "Coverage", "Price Dir", "Roll Dir", "Strict Dir", "Enriched Dir", "OI Dir", "MicroDev Dir", "OFI Dir", "IV Dir (Inv)", "Delta Dir", "Vega Dir (Inv)", "Activity Dir", "Depth L5 Dir", "OFI5 Dir", "MicroDev5 Dir"];
 
     // ---- 1 / 2 / 4: retained sections, order, the exact TOTAL columns and rows ----
 
@@ -80,13 +80,13 @@ public class DashboardSimplificationTests
     }
 
     [Fact]
-    public async Task TotalSummary_HasExactlyTheThirteenColumns_AndFiveWindowRows()
+    public async Task TotalSummary_HasTheExpectedSixteenColumns_AndFiveWindowRows()
     {
         var html = await RenderAsync(View(120, 1));
         Assert.Equal(TotalHeaders, Headers(html, "summary-total"));
         var rows = Regex.Matches(Table(html, "summary-total"), "<tr data-window=\"([^\"]+)\"").Select(m => m.Groups[1].Value).ToList();
         Assert.Equal(["5 Bars", "10 Bars", "50 Bars", "100 Bars", "Day"], rows);
-        foreach (var w in rows) Assert.Equal(14, Cells(html, "summary-total", w).Count);
+        foreach (var w in rows) Assert.Equal(16, Cells(html, "summary-total", w).Count);
     }
 
     // ---- 3: the TOTAL cells are the calculator's Direction values, scaled for display only ----
@@ -143,18 +143,18 @@ public class DashboardSimplificationTests
     }
 
     [Theory]
-    [InlineData(1, "adaptive-signed val-neg", "neg")]
-    [InlineData(-1, "adaptive-signed val-pos", "pos")]
+    [InlineData(1, "adaptive-signed val-pos", "pos")]
+    [InlineData(-1, "adaptive-signed val-neg", "neg")]
     [InlineData(0, "", "zero")]
-    public async Task TotalSummary_MicroDevDir_IsShownInverted_ExactlyOnce(int mode, string cssClass, string sign)
+    public async Task TotalSummary_MicroDevDir_IsRawCeMinusPe_NeverInverted(int mode, string cssClass, string sign)
     {
         var view = View(120, mode);
         var html = await RenderAsync(view);
         var raw = view.Grids.Single(g => g.Kind == GridKind.Total).Rows[0].Direction!.MicroDev;     // the untouched calculator value (CE − PE of the time-weighted MicroDev)
         var cell = Cells(html, "summary-total", "5 Bars")[7];
         Assert.Equal(cssClass, cell.Class); Assert.Equal(sign, cell.Sign);
-        Assert.StartsWith(RatioFormat.Cell(new RatioPart(MicroDevDisplay.Invert(raw.Raw), MicroDevDisplay.Invert(raw.Num), raw.Den), 2), cell.Text);   // once; a second inversion would restore the raw sign
-        if (mode != 0) Assert.NotEqual(RatioFormat.Cell(new RatioPart(raw.Raw, raw.Num, raw.Den), 2), cell.Text);
+        Assert.StartsWith(RatioFormat.Cell(new RatioPart(raw.Raw, raw.Num, raw.Den), 2), cell.Text);   // owner correction 2026-11-25: the direction is the RAW CE − PE, no inversion
+        if (mode != 0) Assert.NotEqual(RatioFormat.Cell(new RatioPart(MicroDevDisplay.Invert(raw.Raw), MicroDevDisplay.Invert(raw.Num), raw.Den), 2), cell.Text);
     }
 
     [Fact]
@@ -249,9 +249,9 @@ public class DashboardSimplificationTests
     public async Task TotalSummary_AllElevenDirectionColumns_AreTintedBySign(int mode)
     {
         var html = await RenderAsync(View(120, mode));
-        // CE-strong (mode 1): Price, Roll, Strict, Enriched, OFI, Activity are CE − PE > 0; OI = PE − CE < 0; MicroDev, IV and Vega are displayed inverted (< 0), coloured from the DISPLAYED sign; Delta is raw (> 0)
-        var positive = mode > 0 ? new[] { 2, 3, 4, 5, 8, 10, 12 } : new[] { 6, 7, 9, 11 };
-        var negative = mode > 0 ? new[] { 6, 7, 9, 11 } : new[] { 2, 3, 4, 5, 8, 10, 12 };
+        // CE-strong (mode 1): Price, Roll, Strict, Enriched, OFI, Activity are CE − PE > 0; OI = PE − CE < 0; IV and Vega are displayed inverted (< 0); MicroDev Dir is RAW (> 0), coloured from the DISPLAYED sign; Delta is raw (> 0)
+        var positive = mode > 0 ? new[] { 2, 3, 4, 5, 7, 8, 10, 12 } : new[] { 6, 9, 11 };
+        var negative = mode > 0 ? new[] { 6, 9, 11 } : new[] { 2, 3, 4, 5, 7, 8, 10, 12 };
         foreach (var w in new[] { "5 Bars", "10 Bars", "50 Bars", "100 Bars", "Day" })
         {
             var cells = Cells(html, "summary-total", w);

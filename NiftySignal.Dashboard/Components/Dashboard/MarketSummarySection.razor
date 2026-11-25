@@ -46,7 +46,8 @@
                     <th>Window</th><th>Coverage</th><th>Price Δ</th><th>Volume</th>
                     <th title="raw Strict delta (Strict delta / volume, %)">Strict Δ</th><th title="raw Enriched delta (/ classified volume, %)">Enriched Δ</th>
                     <th title="usable-seconds weighted MicroDev (TOB x 100), displayed inverted: displayed = −raw">@MicroDevDisplay.Label</th><th title="net OFI (net / gross, %)">OFI</th><th>OI Δ</th><th>Activity /s</th>
-                    <th title="Top-5 Notional Depth Imbalance L5 = (Σbid − Σask) / (Σbid + Σask) of the window's bars, time-weighted by usable seconds (shown as fraction (ratio %)). Unavailable when the Top-5 sidecar is off or no bar had usable depth. Sign is a hypothesis.">Depth Imb L5</th>
+                    <th title="Top-5 Notional Depth Imbalance L5 (EVENT-BASED) = (ΣBid − ΣAsk) / (ΣBid + ΣAsk) of the window's accumulated notionals: every distinct coherent five-level snapshot counts once, no time weighting (shown as fraction (ratio %)). Unavailable when the Top-5 sidecar is off or no bar had an eligible depth event. Sign is a hypothesis.">Depth Imb L5</th>
+                    <th title="Top-5 OFI5 = ΣNet / ΣGross of the window (price-aligned transitions, D10 conditional bridging); raw (ratio %). Sign is a hypothesis.">OFI5</th><th title="Top-5 MicroDev5Proxy (EVENT-BASED) = ΣMicroDev5 / ΣEvents; ratio = mean TOB5 × 100; displayed inverted like the Level-1 MicroDev: displayed = −raw. Sign is a hypothesis.">MicroDev5 (Inv)</th>
                     <th title="India VIX level at the window end (latest valid observation at or before the boundary, within the freshness limit)">VIX</th><th title="VIX change over the window (end − start)">VIX Δ</th><th title="VIX change / start VIX × 100">VIX Δ%</th><th title="age of the end observation at the boundary">VIX age</th>
                 </tr>
                 </thead>
@@ -67,6 +68,7 @@
                             <td>@RatioFormat.Plain(r.Activity, 1)</td>
                         }
                         @DepthCell(View.FuturesDepth?.FirstOrDefault(x => x.Window.Name == r.Window.Name))
+                        @Top5FuturesCells(View.FuturesDepth?.FirstOrDefault(x => x.Window.Name == r.Window.Name))
                         @VixCells(View, r.Window.Name)
                     </tr>
                 }
@@ -103,9 +105,11 @@
             <tr>
                 <th>Window</th><th>Coverage</th>
                 <th>Price Dir</th><th>Roll Dir</th><th>Strict Dir</th><th>Enriched Dir</th>
-                <th title="PE − CE">OI Dir</th><th title="displayed inverted: displayed = −raw (CE − PE)">MicroDev Dir (Inv)</th><th>OFI Dir</th>
+                <th title="PE − CE">OI Dir</th><th title="raw CE − PE of the raw MicroDev values (NOT inverted; owner correction 2026-11-25)">MicroDev Dir</th><th>OFI Dir</th>
                 <th title="displayed inverted: displayed = −raw (CE − PE)">@DirectionDisplay.IvLabel</th><th title="CE − PE (raw); ×100 display scaling">@DirectionDisplay.DeltaLabel</th><th title="displayed inverted: displayed = −raw (CE − PE); ×100 display scaling">@DirectionDisplay.VegaLabel</th><th>Activity Dir</th>
-                <th title="Notional Depth L5 Direction = CE ratio − PE ratio. CE and PE are each normalized by their OWN pooled bid+ask notional (time-weighted by usable seconds) over contracts that have usable attested depth in EVERY bar of the window; the count is shown. Sign is a hypothesis.">Depth L5 Dir</th>
+                <th title="Notional Depth L5 Direction (EVENT-BASED) = CE ratio − PE ratio. CE and PE are each normalized by their OWN pooled event notionals ΣBid + ΣAsk (every distinct coherent snapshot counts once, no time weighting) over contracts whose every bar of the window has an attested row with at least one eligible event; the count and event total are shown. Sign is a hypothesis.">Depth L5 Dir</th>
+                <th title="OFI5 Dir = (ΣCE net − ΣPE net) / (ΣCE gross + ΣPE gross) over contracts with an attested depth row in every bar (combined-denominator rule, as OFI Dir). Sign is a hypothesis.">OFI5 Dir</th>
+                <th title="MicroDev5 Dir = CE raw − PE raw of the EVENT-BASED MicroDev5Proxy (ΣMicroDev5 / ΣEvents per side), NOT inverted; ratio = (CE mean TOB5 − PE mean TOB5) / 2 × 100. Sign is a hypothesis.">MicroDev5 Dir</th>
             </tr>
             </thead>
             <tbody>
@@ -126,7 +130,7 @@
                         @Dir(d.Strict, 0)
                         @Dir(d.Enriched, 0)
                         @Dir(d.Oi, 0)
-                        @Dir(MicroDevDisplay.Invert(d.MicroDev), 2)
+                        @Dir(d.MicroDev, 2)
                         @Dir(d.Ofi, 0)
                         @Dir(DirectionDisplay.Invert(d.Iv), 2)
                         @Dir(d.Delta, 2, scale100: true)
@@ -134,6 +138,7 @@
                         @Dir(d.Activity, 1)
                     }
                     @DepthDirCell(depth?.FirstOrDefault(x => x.Window.Name == r.Window.Name))
+                    @Top5DirCells(depth?.FirstOrDefault(x => x.Window.Name == r.Window.Name))
                 </tr>
             }
             </tbody>
@@ -172,7 +177,7 @@
         builder.AddAttribute(1, "data-col", "depth-l5-dir");
         if (w is null || w.Direction.Raw is null)
         {
-            builder.AddAttribute(2, "title", w is null ? "unavailable" : $"unavailable: needs usable attested depth for the whole window on both sides (CE {w.CeContracts}, PE {w.PeContracts} contracts)");
+            builder.AddAttribute(2, "title", w is null ? "unavailable" : $"unavailable: needs, on BOTH sides, contracts whose every bar of the window has an attested row with an eligible depth event (CE {w.CeContracts}, PE {w.PeContracts} contracts; excluded - {w.DepthWhy ?? DepthExclusions.None})");
             builder.AddContent(3, "—");
         }
         else
@@ -185,6 +190,55 @@
         }
 
         builder.CloseElement();
+    };
+
+    /// <summary>Futures OFI5 and MicroDev5 cells of one window (MicroDev5 displayed inverted exactly once, like the Level-1 MicroDev).</summary>
+    static RenderFragment Top5FuturesCells(FuturesDepthWindow? w) => builder =>
+    {
+        void Td(int seq, string col, RatioPart part, int decimals, string title)
+        {
+            builder.OpenElement(seq, "td");
+            builder.AddAttribute(seq + 1, "data-col", col);
+            var cls = RatioFormat.SignedClass(part.Raw);
+            if (cls.Length > 0) builder.AddAttribute(seq + 2, "class", cls);
+            builder.AddAttribute(seq + 3, "data-sign", RatioFormat.SignName(part.Raw));
+            builder.AddAttribute(seq + 4, "title", title);
+            builder.AddContent(seq + 5, RatioFormat.Cell(part, decimals));
+            builder.CloseElement();
+        }
+
+        var ofi = w?.Ofi5 ?? default;
+        var micro = MicroDevDisplay.Invert(w?.MicroDev5 ?? default);
+        Td(0, "ofi5", new RatioPart(ofi.Raw, ofi.Num, ofi.Den), 0, ofi.Raw is null ? "unavailable: no bar of the window had a valid Top-5 transition" : "ΣNet / ΣGross OFI5 of the window");
+        Td(10, "microdev5", new RatioPart(micro.Raw, micro.Num, micro.Den), 2, micro.Raw is null ? "unavailable: no bar of the window had an eligible depth event" : $"event-based MicroDev5Proxy, {w!.MicroDev5Events} eligible events; displayed = −raw");
+    };
+
+    /// <summary>OFI5 Dir and MicroDev5 Dir (RAW, not inverted) cells of a Total grid window, each with its own eligible-contract count.</summary>
+    static RenderFragment Top5DirCells(DepthDirectionWindow? w) => builder =>
+    {
+        void Td(int seq, string col, SummaryMetric m, int decimals, string text, string unavailable)
+        {
+            builder.OpenElement(seq, "td");
+            builder.AddAttribute(seq + 1, "data-col", col);
+            if (m.Raw is null)
+            {
+                builder.AddAttribute(seq + 2, "title", unavailable);
+                builder.AddContent(seq + 5, "—");
+            }
+            else
+            {
+                var cls = RatioFormat.SignedClass(m.Raw);
+                if (cls.Length > 0) builder.AddAttribute(seq + 2, "class", cls);
+                builder.AddAttribute(seq + 3, "data-sign", RatioFormat.SignName(m.Raw));
+                builder.AddAttribute(seq + 4, "title", $"contracts {text}");
+                builder.AddContent(seq + 5, RatioFormat.Cell(new RatioPart(m.Raw, m.Num, m.Den), decimals) + $" · {text}");
+            }
+
+            builder.CloseElement();
+        }
+
+        Td(0, "ofi5-dir", w?.Ofi5Dir ?? default, 0, w?.Ofi5Text ?? "—", "unavailable: needs contracts with an attested depth row in every bar on BOTH sides");
+        Td(10, "microdev5-dir", w?.MicroDev5Dir ?? default, 2, w?.MicroDev5Text ?? "—", "unavailable: needs contracts whose every bar has an eligible MicroDev5 event on BOTH sides");
     };
 
     static string CloseAtmSourceText(string? source) => source switch

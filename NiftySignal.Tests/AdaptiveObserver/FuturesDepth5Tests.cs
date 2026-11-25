@@ -44,6 +44,221 @@ public sealed class FuturesDepth5Tests
 
     static long E(Depth5Book p, Depth5Book n) => Depth5Metrics.Ofi5Contribution(p, n)!.Value;
 
+    // ------------------------------------------------------------------ futures-depth5-v2: EVENT-BASED accumulation (no elapsed-time weight anywhere)
+
+    static (double Bid, double Ask) Notionals(Depth5Book b) => (Depth5Metrics.BidNotional(b)!.Value, Depth5Metrics.AskNotional(b)!.Value);
+
+    [Fact]
+    public void V2_VersionsAreNew_AndV1StaysRecognisedButNeverTheCurrentVersion()
+    {
+        Assert.Equal("futures-depth5-v2", FuturesDepth5Bar.MetricsVersion);
+        Assert.Equal("options-depth5-v2", OptionDepth5Bar.MetricsVersion);
+        Assert.Equal("futures-depth5-v1", FuturesDepth5Bar.LegacyTimeWeightedVersion);
+        Assert.Equal("options-depth5-v1", OptionDepth5Bar.LegacyTimeWeightedVersion);
+    }
+
+    [Fact]
+    public void V2_EveryDistinctCoherentSnapshotContributesOnce_ShortAndLongLivedWeighEqually()
+    {
+        // A lives 0.1 s, B lives 9 s, C 0.0 s until the bar end: three snapshots, three equal contributions.
+        var bar = Run(-1, 10, Snap(1, 0, A), Snap(2, 0.1, B), Snap(3, 9.1, C));
+        Assert.Equal(3, bar.ValidDepthEvents);
+        var (ab, aa) = Notionals(A); var (bb, ba) = Notionals(B); var (cb, ca) = Notionals(C);
+        Assert.Equal(ab + bb + cb, bar.BidNotionalEventSum!.Value, 9);
+        Assert.Equal(aa + ba + ca, bar.AskNotionalEventSum!.Value, 9);
+        Assert.Equal(3, bar.ValidMicroDev5Events);
+        var micro = new[] { A, B, C }.Select(x => Depth5Metrics.MicroDev5Proxy(x)!.Value).Sum();
+        Assert.Equal(micro, bar.MicroDev5EventSum!.Value, 12);
+        var tob = new[] { A, B, C }.Select(x => (double)(Depth5Metrics.TotalBidQuantity(x)!.Value - Depth5Metrics.TotalAskQuantity(x)!.Value) / (Depth5Metrics.TotalBidQuantity(x)!.Value + Depth5Metrics.TotalAskQuantity(x)!.Value)).Sum();
+        Assert.Equal(tob, bar.Tob5EventSum!.Value, 12);
+    }
+
+    [Fact]
+    public void V2_ResultDoesNotDependOnSnapshotSpacing_OnlyOnTheSnapshots()
+    {
+        var tight = Run(-1, 10, Snap(1, 0, A), Snap(2, 0.01, B), Snap(3, 0.02, C));
+        var wide = Run(-1, 100, Snap(1, 0, A), Snap(2, 40, B), Snap(3, 80, C));
+        Assert.Equal(tight.BidNotionalEventSum, wide.BidNotionalEventSum);
+        Assert.Equal(tight.AskNotionalEventSum, wide.AskNotionalEventSum);
+        Assert.Equal(tight.MicroDev5EventSum, wide.MicroDev5EventSum);
+        Assert.Equal((3, 3), (wide.ValidDepthEvents, wide.ValidMicroDev5Events));          // 40 s apart: freshness expired in between, yet every event still counts once
+    }
+
+    [Fact]
+    public void V2_RepeatedIdenticalSnapshots_AreNotExtraObservations_AndAreCounted()
+    {
+        var bar = Run(-1, 10, Snap(1, 0, A), Snap(2, 1, A), Snap(3, 2, A), Snap(4, 3, B));
+        Assert.Equal(2, bar.ValidDepthEvents);
+        Assert.Equal(2, bar.RepeatSnapshotsIgnored);
+    }
+
+    [Fact]
+    public void V2_LevelOneOnlyChange_IsNeverAnArtificialBook_AndInvalidOrCrossedBooksAreExcluded()
+    {
+        var bar = Run(-1, 20, Snap(1, 0, A), Mark(2, 1), Mark(3, 2), Snap(4, 3, Crossed), Snap(5, 4, B));
+        Assert.Equal(2, bar.ValidDepthEvents);                                              // A and B only: the markers add nothing, the crossed book is excluded
+        Assert.Equal((2, 1), (bar.SupersededMarkers, bar.InvalidSnapshots));
+        Assert.Equal(0, bar.FeedGapEvents);
+    }
+
+    [Fact]
+    public void V2_ABarWithoutEligibleEvents_IsUnavailable_NeverAZero()
+    {
+        var bar = Run(-1, 10, Snap(1, 0, Crossed), NoDepth(2, 2), Gap(3, 3));
+        Assert.Equal((0, 0), (bar.ValidDepthEvents, bar.ValidMicroDev5Events));
+        Assert.Null(bar.BidNotionalEventSum); Assert.Null(bar.AskNotionalEventSum);
+        Assert.Null(bar.MicroDev5EventSum); Assert.Null(bar.Tob5EventSum);
+        Assert.Equal((1, 1), (bar.NoDepthEvents, bar.FeedGapEvents));
+        var empty = Run(-1, 10);
+        Assert.Null(empty.BidNotionalEventSum);
+        Assert.Equal(0, empty.ValidDepthEvents);
+    }
+
+    [Fact]
+    public void V2_EventsAreAttributedToTheirOwnBar_AndABoundaryEventBelongsToTheBarItEnds()
+    {
+        var t = new FuturesDepth5Tracker();
+        t.Observe(Snap(1, 0, A)); t.Observe(Snap(2, 10, B)); t.Observe(Snap(3, 15, C));       // bar 1 = (-1, 10], bar 2 = (10, 20]
+        var one = t.Complete(T0.AddSeconds(-1), T0.AddSeconds(10));
+        var two = t.Complete(T0.AddSeconds(10), T0.AddSeconds(20));
+        Assert.Equal((2, 1), (one.ValidDepthEvents, two.ValidDepthEvents));
+        Assert.Equal(Notionals(C).Bid, two.BidNotionalEventSum!.Value, 9);
+    }
+
+    [Fact]
+    public void V2_LiveStyleIncrementalFeedingEqualsOneShotReplay_BitForBit()
+    {
+        var events = new[] { Snap(1, 0, A), Snap(2, 2, B), Mark(3, 3), Snap(4, 4, C), Snap(5, 12, A), Snap(6, 13, B) };
+        var replay = new FuturesDepth5Tracker();
+        foreach (var e in events) replay.Observe(e);
+        var r1 = replay.Complete(T0.AddSeconds(-1), T0.AddSeconds(10));
+        var r2 = replay.Complete(T0.AddSeconds(10), T0.AddSeconds(20));
+
+        var live = new FuturesDepth5Tracker();
+        foreach (var e in events.Take(4)) live.Observe(e);
+        var l1 = live.Complete(T0.AddSeconds(-1), T0.AddSeconds(10));
+        foreach (var e in events.Skip(4)) live.Observe(e);
+        var l2 = live.Complete(T0.AddSeconds(10), T0.AddSeconds(20));
+        Assert.Equal(r1, l1);
+        Assert.Equal(r2, l2);
+    }
+
+    [Fact]
+    public void V2_LongSession_RetentionStaysBounded_AndEventSumsStayExactPerBar()
+    {
+        var t = new FuturesDepth5Tracker();
+        var books = new[] { A, B, C };
+        long id = 0;
+        var max = 0;
+        for (var bar = 0; bar < 300; bar++)
+        {
+            var start = bar * 60d;
+            for (var i = 0; i < 400; i++) t.Observe(Snap(++id, start + 0.1 + i * 0.1, books[(bar * 400 + i) % 3]));     // 400 distinct-by-rotation snapshots per bar
+            var done = t.Complete(T0.AddSeconds(start), T0.AddSeconds(start + 60));
+            Assert.True(done.ValidDepthEvents is > 0 and <= 400);
+            max = Math.Max(max, t.RetainedEvents);
+        }
+
+        Assert.True(max <= 2, $"retained {max} events after Complete; bounded by one bar's reference state, not by the session length");
+    }
+
+    [Fact]
+    public void V2_Options_EachContractAccumulatesOnlyItsOwnEvents_AndAnUnobservedContractIsUnavailable()
+    {
+        var expiry = new DateOnly(2026, 10, 13);
+        var universe = new[]
+        {
+            new ObserverOptionInstrument("CE1", "NIFTY CE1", OptionType.Call, 26000, expiry, 65),
+            new ObserverOptionInstrument("PE1", "NIFTY PE1", OptionType.Put, 26000, expiry, 65),
+            new ObserverOptionInstrument("CE2", "NIFTY CE2", OptionType.Call, 26050, expiry, 65),
+        };
+        var t = new OptionsDepth5Tracker(universe);
+        t.Observe(Snap(1, 0, A) with { Token = "CE1" }); t.Observe(Snap(2, 1, B) with { Token = "CE1" });
+        t.Observe(Snap(3, 2, C) with { Token = "PE1" });
+        t.Observe(Snap(4, 3, A) with { Token = "NOT-IN-UNIVERSE" });
+        var rows = t.Complete(T0.AddSeconds(-1), T0.AddSeconds(10)).ToDictionary(x => x.Token);
+        Assert.Equal(2, rows["CE1"].Depth.ValidDepthEvents);
+        Assert.Equal(1, rows["PE1"].Depth.ValidDepthEvents);
+        Assert.Equal(Notionals(C).Bid, rows["PE1"].Depth.BidNotionalEventSum!.Value, 9);
+        Assert.Equal(0, rows["CE2"].Depth.ValidDepthEvents);
+        Assert.Null(rows["CE2"].Depth.BidNotionalEventSum);                                 // never observed: unavailable, not zero
+        Assert.Equal(1, t.UnknownTokenEvents);
+    }
+
+    // ------------------------------------------------------------------ v2 deduplication semantics: exclude repeats, never suppress a recurring book state
+
+    [Fact]
+    public void Dedup_AAA_IsOneObservation()
+    {
+        var bar = Run(-1, 20, Snap(1, 0, A), Snap(2, 1, A), Snap(3, 2, A));
+        Assert.Equal(1, bar.ValidDepthEvents);
+        Assert.Equal(2, bar.RepeatSnapshotsIgnored);
+    }
+
+    [Fact]
+    public void Dedup_ABA_IsThreeObservations_ARecurringBookStateIsNotSuppressed()
+    {
+        var bar = Run(-1, 20, Snap(1, 0, A), Snap(2, 1, B), Snap(3, 2, A));
+        Assert.Equal(3, bar.ValidDepthEvents);
+        Assert.Equal(0, bar.RepeatSnapshotsIgnored);
+        var (ab, _) = Notionals(A); var (bb, _) = Notionals(B);
+        Assert.Equal(2 * ab + bb, bar.BidNotionalEventSum!.Value, 9);                       // A counted twice because it genuinely recurred
+    }
+
+    [Fact]
+    public void Dedup_ABBA_IsThreeObservations()
+    {
+        var bar = Run(-1, 20, Snap(1, 0, A), Snap(2, 1, B), Snap(3, 2, B), Snap(4, 3, A));
+        Assert.Equal(3, bar.ValidDepthEvents);
+        Assert.Equal(1, bar.RepeatSnapshotsIgnored);
+    }
+
+    [Fact]
+    public void Dedup_AnUnchangedSnapshotAcrossAVolumeBarBoundary_IsNotANewEvent_AndABRecurrenceIs()
+    {
+        var t = new FuturesDepth5Tracker();
+        t.Observe(Snap(1, 5, A));
+        var one = t.Complete(T0.AddSeconds(0), T0.AddSeconds(10));
+        t.Observe(Snap(2, 12, A));                                                        // identical to the book held when bar 1 closed: per-bar reset must not make it new
+        var two = t.Complete(T0.AddSeconds(10), T0.AddSeconds(20));
+        t.Observe(Snap(3, 25, B)); t.Observe(Snap(4, 26, A));                           // a genuine change and a genuine recurrence
+        var three = t.Complete(T0.AddSeconds(20), T0.AddSeconds(30));
+        Assert.Equal((1, 0, 2), (one.ValidDepthEvents, two.ValidDepthEvents, three.ValidDepthEvents));
+        Assert.Equal((0, 1, 0), (one.RepeatSnapshotsIgnored, two.RepeatSnapshotsIgnored, three.RepeatSnapshotsIgnored));
+        Assert.Null(two.BidNotionalEventSum);                                              // a bar whose only row was a repeat is unavailable, not zero
+    }
+
+    [Fact]
+    public void Dedup_AfterL1Superseded_AFreshDepthRefreshCountsOnce_AndMarkersAddNothing()
+    {
+        var changed = Run(-1, 20, Snap(1, 0, A), Mark(2, 1), Mark(3, 2), Snap(4, 3, B));
+        Assert.Equal(2, changed.ValidDepthEvents);
+        // an identical full book after a superseding marker is a fresh depth message that restores coherence (the normalizer only emits it when L2-L5 changed after the touchline move): one observation
+        var same = Run(-1, 20, Snap(1, 0, A), Mark(2, 1), Snap(3, 3, A));
+        Assert.Equal(2, same.ValidDepthEvents);
+        Assert.Equal(0, same.RepeatSnapshotsIgnored);
+        var neverRefreshed = Run(-1, 20, Snap(1, 0, A), Mark(2, 1), Mark(3, 2));
+        Assert.Equal(1, neverRefreshed.ValidDepthEvents);                                  // no coherent refresh: nothing artificial is added
+    }
+
+    [Fact]
+    public void Dedup_SiblingSplitBars_CannotMultiplyOneEvent()
+    {
+        // one source event completes bar 1 and its zero-duration sibling bars (start == end == the event instant) at once
+        var t = new FuturesDepth5Tracker();
+        t.Observe(Snap(1, 3, A));
+        t.Observe(Snap(2, 10, B));
+        var first = t.Complete(T0.AddSeconds(0), T0.AddSeconds(10));                      // (0, 10] contains both events
+        var sibling1 = t.Complete(T0.AddSeconds(10), T0.AddSeconds(10));
+        var sibling2 = t.Complete(T0.AddSeconds(10), T0.AddSeconds(10));
+        Assert.Equal(2, first.ValidDepthEvents);
+        Assert.Equal((0, 0), (sibling1.ValidDepthEvents, sibling2.ValidDepthEvents));
+        Assert.Null(sibling1.BidNotionalEventSum);
+        t.Observe(Snap(3, 14, C));
+        var next = t.Complete(T0.AddSeconds(10), T0.AddSeconds(20));
+        Assert.Equal(1, next.ValidDepthEvents);                                            // total events across all bars = 3 = events delivered
+    }
+
     // ------------------------------------------------------------------ D10 bridging (tests 1-6)
 
     [Fact]
@@ -391,6 +606,11 @@ public sealed class FuturesDepth5Tests
 
         // the non-zero bars together carry the whole transition: nothing is duplicated into the zero-duration ones
         Assert.Equal(1, bars.Sum(b => b.Depth5!.Ofi5Transitions));
+
+        // v2 event conservation: a genuine depth snapshot is accumulated exactly once across ALL sibling bars (the zero-duration ones carry none). The snapshot at exactly the first bar's START instant
+        // (T0) is that bar's reference state under the (start, end] convention shared with the Level-1 tracker, so it is not an in-bar event; the T0+1 snapshot is counted once.
+        Assert.All(zero, z => { Assert.Equal(0, z.Depth5!.ValidDepthEvents); Assert.Null(z.Depth5.BidNotionalEventSum); });
+        Assert.Equal(1, bars.Sum(b => b.Depth5!.ValidDepthEvents));
     }
 
     // ------------------------------------------------------------------ persistence (in-memory) and flag-off behaviour (tests 11, 13)

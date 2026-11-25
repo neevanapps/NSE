@@ -626,7 +626,7 @@ public sealed class AdaptiveCompactGridTests
         Assert.Contains("data-grid=\"options-core-direction\" data-strike=\"25000\"", html);
         Assert.Contains("data-grid=\"options-context\" data-strike=\"25000\"", html);
         Assert.Equal(["Seq", "End IST", "CE Strict Δ", "PE Strict Δ", "Strict Dir", "CE Enriched Δ", "PE Enriched Δ", "Enriched Dir",
-            "CE OI Δ", "PE OI Δ", "OI Dir (PE−CE)", "CE MicroDev (Inv)", "PE MicroDev (Inv)", "MicroDev Dir (Inv)", "CE OFI", "PE OFI", "OFI Dir", "CE OFI5", "PE OFI5", "OFI5 Dir", "CE MicroDev5Proxy (Inv)", "PE MicroDev5Proxy (Inv)", "MicroDev5 Dir (Inv)"], HeadersOf(html, "options-core-direction"));
+            "CE OI Δ", "PE OI Δ", "OI Dir (PE−CE)", "CE MicroDev (Inv)", "PE MicroDev (Inv)", "MicroDev Dir", "CE OFI", "PE OFI", "OFI Dir", "CE OFI5", "PE OFI5", "OFI5 Dir", "CE MicroDev5Proxy (Inv)", "PE MicroDev5Proxy (Inv)", "MicroDev5 Dir"], HeadersOf(html, "options-core-direction"));
         Assert.Equal(["Seq", "End IST", "CE Price Δ", "PE Price Δ", "Price Dir", "CE ΔIV", "PE ΔIV", "IV Dir (Inv)", "CE ΔDelta", "PE ΔDelta", "Delta Dir", "CE ΔVega", "PE ΔVega", "Vega Dir (Inv)", "CE Activity", "PE Activity", "Activity Dir"],
             HeadersOf(html, "options-context"));
         // The plain price family moved from CORE DIRECTION to OPTION CONTEXT; the three Roll ΔPx columns were replaced by the Delta and Vega change columns, so no rolling family is left in the primary Options grids.
@@ -639,7 +639,7 @@ public sealed class AdaptiveCompactGridTests
         var core = RowsOf(html, "options-core-direction");
         var bar12 = core.Single(r => r[0] == "12");
         Assert.Equal(["12", "09:42:00", "300 (30.00)", "-200 (-40.00)", "500 (33.33)", "50 (25.00)", "-50 (-25.00)", "100 (25.00)",
-            "1000 (10.00)", "3000 (30.00)", "2000 (10.00)", "-0.30 (-60.00)", "0.10 (20.00)", "-0.40 (-40.00)", "300 (30.00)", "-100 (-20.00)", "400 (26.67)", "—", "—", "—", "—", "—", "—"], bar12);
+            "1000 (10.00)", "3000 (30.00)", "2000 (10.00)", "-0.30 (-60.00)", "0.10 (20.00)", "0.40 (40.00)", "300 (30.00)", "-100 (-20.00)", "400 (26.67)", "—", "—", "—", "—", "—", "—"], bar12);
         var avg = core.Single(r => r[0] == "AVG");
         Assert.Equal("10 rows", avg[1]);                                                            // all visible rows; bars without a stored row are simply excluded from each metric
         Assert.Equal("500 (33.33)", avg[4]);                                                               // aggregate numerator / denominator, identical rows here
@@ -669,7 +669,7 @@ public sealed class AdaptiveCompactGridTests
         var coreMarkup = RowMarkup("options-core-direction", "12");
         Assert.All(Regex.Matches(coreMarkup, "<td class=\"[^\"]*\" data-sign=\"([^\"]*)\"").Select(m => m.Groups[1].Value), s => Assert.Equal("none", s));      // CE / PE background colouring is gone
         Assert.Equal(14, Regex.Matches(coreMarkup, "<td class=\"[^\"]*\" data-sign=\"([^\"]*)\"").Count);
-        Assert.Equal(["pos", "pos", "pos", "neg", "pos", "none", "none"], Regex.Matches(coreMarkup, "data-direction-sign=\"([^\"]*)\"").Select(m => m.Groups[1].Value));      // Strict, Enriched, OI (PE − CE), MicroDev (inverted), OFI, then OFI5 / MicroDev5 (unavailable in this fixture: neutral)
+        Assert.Equal(["pos", "pos", "pos", "pos", "pos", "none", "none"], Regex.Matches(coreMarkup, "data-direction-sign=\"([^\"]*)\"").Select(m => m.Groups[1].Value));      // Strict, Enriched, OI (PE − CE), MicroDev (RAW, not inverted), OFI, then OFI5 / MicroDev5 (unavailable in this fixture: neutral)
         var contextMarkup = RowMarkup("options-context", "12");
         Assert.All(Regex.Matches(contextMarkup, "<td class=\"[^\"]*\" data-sign=\"([^\"]*)\"").Select(m => m.Groups[1].Value), s => Assert.Equal("none", s));
         Assert.Equal(["pos", "neg", "none"], Regex.Matches(contextMarkup, "data-direction-sign=\"([^\"]*)\"").Select(m => m.Groups[1].Value).Take(3));      // Price Dir (+9.00), Roll Dir (-2.00: raw +2.00 shown inverted) keep a tint from the DISPLAYED sign; the unavailable IV Dir stays neutral
@@ -784,12 +784,12 @@ public sealed class AdaptiveCompactGridTests
             Assert.StartsWith("-4.00", c[13].Text); Assert.Equal("neg", c[13].Dir);
         }
 
-        // MicroDev (CORE DIRECTION): CE +0.3, PE -0.1 -> raw +0.40, displayed inverted -0.40 (neg)
+        // MicroDev (CORE DIRECTION): CE +0.3, PE -0.1 -> raw +0.40; the DIRECTION is raw (pos); the CE / PE cells stay inverted
         var coreTable = Regex.Match(html, "<table[^>]*data-grid=\"options-core-direction\".*?</table>", RegexOptions.Singleline).Value;
         var coreRow = Regex.Matches(coreTable, "<tr[ >].*?</tr>", RegexOptions.Singleline).Select(m => m.Value).Single(r => Regex.IsMatch(r, "sticky-col[^>]*>12</td>"));
         var micro = Regex.Matches(coreRow, "<td([^>]*)>(.*?)</td>", RegexOptions.Singleline)[13];
-        Assert.StartsWith("-0.40", System.Net.WebUtility.HtmlDecode(Regex.Replace(micro.Groups[2].Value, "<[^>]+>", "").Trim()));
-        Assert.Contains("data-direction-sign=\"neg\"", micro.Groups[1].Value);
+        Assert.StartsWith("0.40", System.Net.WebUtility.HtmlDecode(Regex.Replace(micro.Groups[2].Value, "<[^>]+>", "").Trim()));
+        Assert.Contains("data-direction-sign=\"pos\"", micro.Groups[1].Value);
     }
 
     [Fact]

@@ -612,6 +612,77 @@ public sealed class AdaptiveMigrationPostgresTests
         Assert.Equal(1, await temp.ScalarAsync($"SELECT count(*) FROM adaptive_projection_health WHERE \"Component\" = '{AdaptiveProjectionComponents.FuturesDepth5}'"));
     }
 
+    const string EventBasedMigration = "20261125074852_AddDepth5EventBasedColumns";
+
+    static string EventBasedScriptPath()
+    {
+        for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir is not null; dir = dir.Parent)
+        {
+            var candidate = Path.Combine(dir.FullName, "NiftySignal.AdaptiveObserverData", "Sql", "adaptive-depth5-event-based.idempotent.sql");
+            if (File.Exists(candidate)) return candidate;
+        }
+
+        throw new FileNotFoundException("adaptive-depth5-event-based.idempotent.sql not found above " + AppContext.BaseDirectory);
+    }
+
+    [PgMigrationFact]
+    public async Task Depth5EventBasedColumns_ScriptIsIdempotent_MatchesTheEfMigration_IsPurelyAdditive_AndKeepsV1Rows()
+    {
+        await using var viaScript = await HistoricalDatabaseAsync();
+        await viaScript.MigrateAsync(OptionsDepth5Migration);
+        var sessionId = await viaScript.ScalarAsync("SELECT \"Id\" FROM adaptive_sessions ORDER BY \"Id\" LIMIT 1");
+        // historical v1 (time-weighted) rows written BEFORE the additive migration
+        await viaScript.InsertFilledAsync("adaptive_futures_depth5_bars", new Dictionary<string, object> { ["SessionId"] = sessionId, ["BarSeq"] = 1, ["MetricsVersion"] = "futures-depth5-v1", ["Tob5TimeWeighted"] = 0.5d });
+        await viaScript.InsertFilledAsync("adaptive_options_depth5_bars", new Dictionary<string, object> { ["SessionId"] = sessionId, ["BarSeq"] = 1, ["Token"] = "T1", ["MetricsVersion"] = "options-depth5-v1", ["Tob5TimeWeighted"] = 0.25d });
+        var before = await ColumnsAsync(viaScript, ColumnsSql);
+        var sql = await File.ReadAllTextAsync(EventBasedScriptPath());
+        await viaScript.ExecAsync(sql);
+        await viaScript.ExecAsync(sql);                                              // twice: idempotent
+        Assert.Equal(1, await viaScript.ScalarAsync($"SELECT count(*) FROM \"__EFMigrationsHistory\" WHERE \"MigrationId\" = '{EventBasedMigration}'"));
+
+        await using var viaEf = await HistoricalDatabaseAsync();
+        await viaEf.MigrateAsync(EventBasedMigration);
+        Assert.Equal(await ColumnsAsync(viaEf, ColumnsSql), await ColumnsAsync(viaScript, ColumnsSql));
+
+        var after = await ColumnsAsync(viaScript, ColumnsSql);
+        var added = after.Split('\n').Except(before.Split('\n')).ToList();
+        Assert.Equal(18, added.Count);                                               // 9 nullable columns on each of the two depth5 tables, nothing else
+        Assert.All(added, c => { Assert.True(c.StartsWith("adaptive_futures_depth5_bars.", StringComparison.Ordinal) || c.StartsWith("adaptive_options_depth5_bars.", StringComparison.Ordinal)); Assert.EndsWith(":YES", c); });
+        Assert.Empty(before.Split('\n').Except(after.Split('\n')));
+
+        // the v1 rows are intact and the new columns are NULL on them (never defaulted to a value that could pass as an event count)
+        Assert.Equal(1, await viaScript.ScalarAsync("SELECT count(*) FROM adaptive_futures_depth5_bars WHERE \"MetricsVersion\" = 'futures-depth5-v1' AND \"Tob5TimeWeighted\" = 0.5 AND \"ValidDepthEvents\" IS NULL AND \"BidNotionalEventSum\" IS NULL"));
+        Assert.Equal(1, await viaScript.ScalarAsync("SELECT count(*) FROM adaptive_options_depth5_bars WHERE \"MetricsVersion\" = 'options-depth5-v1' AND \"Tob5TimeWeighted\" = 0.25 AND \"ValidDepthEvents\" IS NULL"));
+
+        await viaEf.MigrateAsync(OptionsDepth5Migration);                            // Down: only the new columns go
+        Assert.Equal(before, await ColumnsAsync(viaEf, ColumnsSql));
+    }
+
+    [PgMigrationFact]
+    public async Task DepthV2Sidecar_CoexistsWithV1Rows_NeverOverwritesOrReinterpretsThem_AndRestartVerifiesWithoutDuplicates()
+    {
+        await using var temp = await HistoricalDatabaseAsync();
+        await temp.MigrateAsync();
+        var bars = FuturesDepth5Tests.SamplePackages();
+        var svc = new AdaptiveSupplementalPersistence(NullLogger<AdaptiveSupplementalPersistence>.Instance);
+        await using var db = temp.Context();
+        var sessionId = await db.Sessions.Select(s => s.Id).FirstAsync();
+        var seq = bars[0].FutureBar.BarSeq;
+        await temp.InsertFilledAsync("adaptive_futures_depth5_bars", new Dictionary<string, object> { ["SessionId"] = sessionId, ["BarSeq"] = seq, ["MetricsVersion"] = "futures-depth5-v1", ["Tob5TimeWeighted"] = 0.5d });
+
+        Assert.Equal(SupplementalOutcome.Inserted, await svc.PersistOrVerifyFuturesDepth5Async(db, sessionId, bars[0], default));      // v2 lives beside the v1 row of the same bar
+        Assert.Equal(SupplementalOutcome.Verified, await svc.PersistOrVerifyFuturesDepth5Async(db, sessionId, bars[0], default));      // restart: verified, no duplicate
+        Assert.Equal(2, await temp.ScalarAsync($"SELECT count(*) FROM adaptive_futures_depth5_bars WHERE \"BarSeq\" = {seq}"));
+        Assert.Equal(1, await temp.ScalarAsync($"SELECT count(*) FROM adaptive_futures_depth5_bars WHERE \"BarSeq\" = {seq} AND \"MetricsVersion\" = '{FuturesDepth5Bar.MetricsVersion}'"));
+        Assert.Equal(1, await temp.ScalarAsync($"SELECT count(*) FROM adaptive_futures_depth5_bars WHERE \"BarSeq\" = {seq} AND \"MetricsVersion\" = 'futures-depth5-v1' AND \"Tob5TimeWeighted\" = 0.5 AND \"ValidDepthEvents\" IS NULL"));   // v1 untouched
+        Assert.Equal(1, await temp.ScalarAsync($"SELECT count(*) FROM adaptive_futures_depth5_bars WHERE \"BarSeq\" = {seq} AND \"MetricsVersion\" = '{FuturesDepth5Bar.MetricsVersion}' AND \"Tob5TimeWeighted\" IS NULL AND \"MicroDev5TimeWeighted\" IS NULL AND \"BidNotionalTimeWeighted\" IS NULL AND \"ValidDepthEvents\" IS NOT NULL"));   // v2 never writes the legacy columns
+
+        // a tampered recomputation is a mismatch: the v2 row is left untouched and the bar's marker is written
+        var tampered = bars[0] with { Depth5 = bars[0].Depth5! with { ValidDepthEvents = bars[0].Depth5!.ValidDepthEvents + 1 } };
+        Assert.Equal(SupplementalOutcome.Mismatch, await svc.PersistOrVerifyFuturesDepth5Async(db, sessionId, tampered, default));
+        Assert.Equal(bars[0].Depth5!.ValidDepthEvents, await temp.ScalarAsync($"SELECT \"ValidDepthEvents\" FROM adaptive_futures_depth5_bars WHERE \"BarSeq\" = {seq} AND \"MetricsVersion\" = '{FuturesDepth5Bar.MetricsVersion}'"));
+    }
+
     static string OptionsDepth5ScriptPath()
     {
         for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir is not null; dir = dir.Parent)
@@ -635,7 +706,7 @@ public sealed class AdaptiveMigrationPostgresTests
         Assert.Equal(1, await viaScript.ScalarAsync($"SELECT count(*) FROM \"__EFMigrationsHistory\" WHERE \"MigrationId\" = '{OptionsDepth5Migration}'"));
 
         await using var viaEf = await HistoricalDatabaseAsync();
-        await viaEf.MigrateAsync();
+        await viaEf.MigrateAsync(OptionsDepth5Migration);       // this script is the options depth5 migration only; the event-based columns have their own script and test
         var after = await ColumnsAsync(viaEf, ColumnsSql);
         Assert.Equal(after, await ColumnsAsync(viaScript, ColumnsSql));
 

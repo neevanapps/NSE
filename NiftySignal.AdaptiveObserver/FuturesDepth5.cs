@@ -30,13 +30,29 @@ public sealed record FuturesDepth5Bar(
     double Depth5UnobservedSeconds,
     int SnapshotEvents,
     int SupersededMarkers,
-    int InvalidSnapshots)
+    int InvalidSnapshots,
+    // ---- futures-depth5-v2 EVENT-BASED accumulators (no elapsed time anywhere): every distinct, coherent, valid five-level snapshot delivered inside the bar contributes exactly once. ----
+    // Sums are null (never 0) when the bar has no eligible event.
+    double? BidNotionalEventSum = null,
+    double? AskNotionalEventSum = null,
+    int ValidDepthEvents = 0,
+    double? MicroDev5EventSum = null,
+    double? Tob5EventSum = null,
+    int ValidMicroDev5Events = 0,
+    int RepeatSnapshotsIgnored = 0,
+    int NoDepthEvents = 0,
+    int FeedGapEvents = 0)
 {
     /// <summary>
-    /// futures-depth5-v1: OFI5 price-aligned, MicroDev5Proxy = HS1 x Tob5, notional DepthN5, hard 5 s freshness, D10 conditional bridging across L1Superseded markers
-    /// (both endpoints valid, endpoints at most 5 s apart; invalid/no-depth/feed-gap/stale break the baseline; identical snapshots are not transitions). A different rule is a new version.
+    /// futures-depth5-v2 (EVENT-BASED): per-bar SumBidNotional / SumAskNotional / ValidDepthEvents and SumMicroDev5 / SumTob5 / ValidMicroDev5Events over the bar's distinct coherent snapshots, plus OFI5 (price-aligned,
+    /// D10 conditional bridging across L1Superseded markers; both endpoints valid, at most 5 s apart; invalid/no-depth/feed-gap/stale break the baseline; identical snapshots are not transitions).
+    /// The time-weighted members of this record (…TimeWeighted, Depth5*Seconds) are v1 legacy / diagnostics only: they are NOT persisted into v2 rows (those columns stay null) and never used as weights.
+    /// futures-depth5-v1 rows (time-weighted) are never rewritten or reinterpreted. A different rule is a new version.
     /// </summary>
-    public const string MetricsVersion = "futures-depth5-v1";
+    public const string MetricsVersion = "futures-depth5-v2";
+
+    /// <summary>The v1 version string, kept only so readers can recognise (and never serve) historical time-weighted rows.</summary>
+    public const string LegacyTimeWeightedVersion = "futures-depth5-v1";
 }
 
 /// <summary>
@@ -58,6 +74,7 @@ public sealed class FuturesDepth5Tracker
     readonly List<Entry> _events = [];
     readonly List<Transition> _transitions = [];
     readonly List<DateTimeOffset> _resets = [];
+    readonly List<DateTimeOffset> _repeatAts = [];      // repeats ignored, attributed to their bar at Complete (pruned there; bounded by one bar)
 
     // Incremental OFI state (a pure function of the delivered events).
     Depth5Book? _baseBook;
@@ -89,6 +106,7 @@ public sealed class FuturesDepth5Tracker
         {
             _last = (o.AvailableAt, o.Id);
             RepeatsIgnored++;
+            _repeatAts.Add(o.AvailableAt);
             return;
         }
 
@@ -228,13 +246,31 @@ public sealed class FuturesDepth5Tracker
 
         Account(current, cursor, end);
 
-        int snapshots = 0, markers = 0, invalidSnapshots = 0;
+        int snapshots = 0, markers = 0, invalidSnapshots = 0, noDepthEvents = 0, feedGaps = 0;
+        // v2 event accumulators: fixed event order (the delivery order), so live and replay sums are bit-for-bit identical. No weight of any kind.
+        double bidEv = 0d, askEv = 0d, microEv = 0d, tobEv = 0d;
+        int depthEvents = 0, microEvents = 0;
         for (var i = firstInside; i < lastInside; i++)
         {
-            var e = _events[i].Event;
-            if (e.Kind == Depth5EventKind.Snapshot) { snapshots++; if (!_events[i].Usable) invalidSnapshots++; }
+            var en = _events[i];
+            var e = en.Event;
+            if (e.Kind == Depth5EventKind.Snapshot)
+            {
+                snapshots++;
+                if (!en.Usable) invalidSnapshots++;
+                else
+                {
+                    if (en.BidNotional is { } bn && en.AskNotional is { } an && double.IsFinite(bn) && double.IsFinite(an) && bn + an > 0d) { bidEv += bn; askEv += an; depthEvents++; }
+                    if (en.MicroDev5 is { } md && en.Tob5 is { } tb && double.IsFinite(md) && double.IsFinite(tb)) { microEv += md; tobEv += tb; microEvents++; }
+                }
+            }
             else if (e.Kind == Depth5EventKind.L1Superseded) markers++;
+            else if (e.Kind == Depth5EventKind.NoDepth) noDepthEvents++;
+            else if (e.Kind == Depth5EventKind.FeedGap) feedGaps++;
         }
+
+        var repeats = 0;
+        foreach (var r in _repeatAts) if (r > start && r <= end) repeats++;
 
         long net = 0, gross = 0, bridgedNet = 0;
         int transitions = 0, bridgedCount = 0;
@@ -255,6 +291,7 @@ public sealed class FuturesDepth5Tracker
         if (lastInside > 1) _events.RemoveRange(0, lastInside - 1);
         _transitions.RemoveAll(t => t.At <= end);
         _resets.RemoveAll(r => r <= end);
+        _repeatAts.RemoveAll(r => r <= end);
 
         return new FuturesDepth5Bar(
             (end - start).TotalSeconds,
@@ -272,7 +309,10 @@ public sealed class FuturesDepth5Tracker
             bidSec > 0d ? bidSum / bidSec : null,
             askSec > 0d ? askSum / askSec : null,
             usable, stale, invalid, superseded, noDepth, unobserved,
-            snapshots, markers, invalidSnapshots);
+            snapshots, markers, invalidSnapshots,
+            depthEvents > 0 ? bidEv : null, depthEvents > 0 ? askEv : null, depthEvents,
+            microEvents > 0 ? microEv : null, microEvents > 0 ? tobEv : null, microEvents,
+            repeats, noDepthEvents, feedGaps);
     }
 
     int UpperBound(DateTimeOffset instant)

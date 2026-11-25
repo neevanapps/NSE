@@ -81,11 +81,18 @@ public sealed class OptionsDepth5HostBenchmark
         long g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
         var pauseBefore = GC.GetTotalPauseDuration();
 
+        var peakManaged = 0L; var sampling = true;
+        var sampler = Task.Run(async () => { while (Volatile.Read(ref sampling)) { peakManaged = Math.Max(peakManaged, GC.GetTotalMemory(false)); await Task.Delay(50); } });
         var (first, firstSeconds) = await Recover("insert");
         var retained = GC.GetTotalMemory(true) - baseHeap;
         var peakAfterFirst = Process.GetCurrentProcess().PeakWorkingSet64;
         var (second, secondSeconds) = await Recover("verify");                // restart: every bar is replayed through the verify-if-present path
 
+        Volatile.Write(ref sampling, false); await sampler;
+        var allTokens = universe.Select(x => x.Token).ToArray();
+        var rawFut = await source.Ticks.AsNoTracking().CountAsync(t => t.Token == fut && t.ExchangeTimestamp >= open && t.ExchangeTimestamp <= through);
+        var rawOpt = await source.Ticks.AsNoTracking().CountAsync(t => allTokens.Contains(t.Token) && t.ExchangeTimestamp >= open && t.ExchangeTimestamp <= through);
+        if (outPath is not null) await File.AppendAllTextAsync(outPath, $"opt_mode={mode} raw_ticks_future={rawFut} raw_ticks_options={rawOpt} peak_managed_mb={peakManaged / 1048576d:F0}{Environment.NewLine}");
         var process = Process.GetCurrentProcess();
         var bars = first.Engine.FutureBars.Count(b => b.IsComplete);
         var sameCore = System.Text.Json.JsonSerializer.Serialize(first.Engine.FutureBars) == System.Text.Json.JsonSerializer.Serialize(second.Engine.FutureBars);
