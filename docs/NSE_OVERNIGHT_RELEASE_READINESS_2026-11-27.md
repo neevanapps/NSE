@@ -1,19 +1,20 @@
 # Release readiness, paper session of Monday 30 November 2026
 
-**Status (27 November, after 13:00): tree `45008e3...` has a passing full test suite, both real-data recovery certifications MET (section 13.6) and four packages built and validated locally (section 11). The owner approved the commit on 27 November (this report is part of it); local `master` is merged; nothing is pushed or deployed. The 300-second recovery finding is closed by the owner.**
+**Status (27 November, 13:56): a deployment-script defect was found after the push: the pre-start checks could not read the commented Dashboard settings under Windows PowerShell 5.1 (section 14). It is fixed in two files under `tools/`; the owner-run 5.1 validation PASSED (56 of 56 safety tests, packaging test). The owner approved the commit and push on 27 November (this wording is part of that commit). New source tree `4e4d398...`. Application code is the certified tree `45008e3...`, unchanged.**
 
-**Recommendation: local validation complete; GO to proceed to owner approval, commit and merge for paper trading on Monday 30 November.** Deployment still depends on the VM preflight in the owner checklist. VM performance (recovery time, freshness false-block rate) is unmeasured. Real money: NO-GO. Paper only.
+**Recommendation: local validation complete. Deploy only from a clean `master` equal to `origin/master` whose tree without `docs` is `4e4d398...`.** Deployment depends on the VM preflight in the owner checklist. VM performance (recovery time, freshness false-block rate) is unmeasured. Real money: NO-GO. Paper only.
 
-Nothing has been pushed or deployed. The VM was not contacted. No broker session was started and no order was placed.
+The section 14 fix is committed on `master` on top of `0520591ffacb4305bc2daff38b0c7524e8ca126b` (the commit that contains this line; its SHA is the one to record in checklist A3). Nothing is deployed. The VM was not contacted. No broker session was started and no order was placed.
 
 ## 1. Source identity
 
 | Item | Value |
 |---|---|
 | Working directory | `D:\Projects\NSE-release-20261124` |
-| Branch | `feature/production-reliability-strategy-enhancement` |
-| HEAD / baseline | `78d9b8bd84d0b9bb38dd91a80ae89f0dad8fd5fe` (all release work uncommitted) |
-| **Candidate source tree (without `docs`)** | `45008e381918ec091c37b1b9c861ea9a1fa03630` (section 13) |
+| Branch | `master` |
+| Baseline / current HEAD | `78d9b8bd84d0b9bb38dd91a80ae89f0dad8fd5fe` / `0520591ffacb4305bc2daff38b0c7524e8ca126b` before the section 14 commit |
+| **Source tree to deploy (without `docs`)** | `4e4d39876aca868c64c1f2f71f7c13a9b84089c5` (section 14) |
+| Certified application tree | `45008e381918ec091c37b1b9c861ea9a1fa03630` (section 13; commit `17ce4c79...`) |
 | Previous tree | `aa906ab302ce7e770d03c1c4002aa40e5a15808e`: sections 3-7 and 12 were measured on it; section 13 states what still applies |
 | Superseded tree | `25e7f964...` (before the publication fix; its packages and certification are invalid) |
 
@@ -562,3 +563,40 @@ Inputs and all parity table hashes are identical to the `aa906ab...` certificati
    - `git diff --check` reports one finding type: a blank line at the end of three `adaptive-*.idempotent.sql` files. Not changed, because it would change the certified tree.
 2. Owner VM preflight, backups and deployment (checklist), preferably 28 or 29 November.
 3. First session: watch the freshness blocks (checklist E7) and the first recovery duration (D3a).
+
+## 14. Deployment-script defect: commented settings under Windows PowerShell 5.1
+
+### 14.1 Defect
+
+The owner's desktop compatibility check returned FAILED on 27 November. `tools/DeploymentSafety.ps1` read `appsettings*.json` with `Get-Content -Raw | ConvertFrom-Json` in its two target-side script blocks (paper ownership, Observer settings). The shipped `NiftySignal.Dashboard\appsettings.json` has `//` comments (also `appsettings.Development.json`); the applications accept them, Windows PowerShell 5.1 does not. Effect: the ownership check reports "Dashboard settings: ... cannot be read as JSON" and `deploy.ps1` does not start `NiftySignalExecution`, whatever the switches say. It fails closed; no unsafe start was possible from this. Earlier deployment validation used comment-free test files and missed it.
+
+Exact exception (Windows PowerShell 5.1.26100.9818, 27 November): `System.ArgumentException`, id `System.ArgumentException,Microsoft.PowerShell.Commands.ConvertFromJsonCommand`, message `Invalid object passed in, ':' or '}' expected. (337): {...}` for `appsettings.json` and `(155)` for `appsettings.Development.json`. The message repeats the file content, so the scripts still do not print it. The Host, Observer and execution service settings files parsed.
+
+### 14.2 Fix
+
+- `ConvertFrom-SettingsJson`: reads the text character by character, removes `//` and `/* */` comments outside strings, keeps strings (URLs, connection strings, escapes) unchanged, then calls `ConvertFrom-Json`. No regular expression, no PowerShell 7 dependency.
+- Its source is placed inside both script blocks, which run on the target without the local functions.
+- Unchanged: which switches are read, `appsettings.Local.json` override order, defaults for missing keys, every ownership and Observer verdict, and the message that does not repeat file content.
+- Stricter: an empty or comment-only settings file, an unterminated comment or string, or content that is not one object now blocks. Before, an empty file counted as "setting absent". Other syntax (including trailing commas) is judged by the 5.1 parser as before; a rejection blocks.
+- Tests added in `tools/Test-DeploymentSafety.ps1`: comments, URLs, escaped strings, malformed input, all shipped settings files including the real Dashboard file, missing files and keys, unsafe execution settings behind comments, no content echo, script blocks run in an empty runspace.
+
+### 14.3 Other scripts
+
+`deploy.ps1`, `vm-deploy.ps1`, `DeploymentPackaging.ps1` and the service installation scripts parse no JSON. `scripts/sync-vm-data-incremental.ps1` (lines 170 and 223, data sync, not deployment) reads `appsettings.Local.json` the old way and would fail under 5.1 if such a file had comments: **not changed**, follow-up. `docs/overnight` scripts parse generated reports only.
+
+### 14.4 Validation
+
+Owner-run, Windows PowerShell 5.1.26100.9818 Desktop, 27 November 13:56, local only: `docs/overnight/Run-DeploymentCompatibility.ps1` on tree `4e4d39876aca868c64c1f2f71f7c13a9b84089c5` (checked at start and end). `Test-DeploymentSafety.ps1`: **56 passed, 0 failed** (47 earlier and 9 new, including the real Dashboard file and the script-parse checks). `TestDeploymentPackaging.ps1`: **passed**. Logs: `D:\perf-scratch\out\deploy-ps51\20261127-135614\`. Not exercised: a remote session to the VM and the VM's own settings files.
+
+### 14.5 Identity and earlier evidence
+
+Tree `4e4d39876aca868c64c1f2f71f7c13a9b84089c5` against `45008e381918ec091c37b1b9c861ea9a1fa03630` (without `docs`): `tools/DeploymentSafety.ps1` and `tools/Test-DeploymentSafety.ps1` only. No Observer, Host, Execution, Dashboard or strategy source, setting, project or migration changed. The identity changes again if review changes either file, and the commit SHA stamped into deployed binaries will be that of the new commit.
+
+| Evidence | Still applies? |
+|---|---|
+| Full test suite on `45008e381918ec091c37b1b9c861ea9a1fa03630` (13.2) | Yes: no file that it builds or reads changed |
+| Recovery certifications MET (13.6) | Yes; not repeated. Their script is pinned to the old tree |
+| Parity, benchmarks, recovery comparison (13.3) | As stated in 13.3, unchanged |
+| Four packages and hashes (11) | Yes as local build validation: same application source; build commit field is the old tree. Deployment rebuilds from the committed HEAD |
+| Deployment safety tests, packaging test, script parse checks | **No: repeated on `4e4d398...`, passed (14.4)** |
+| Expected tree in checklist A1 | Replaced |

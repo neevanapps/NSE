@@ -307,6 +307,116 @@ Test-Case 'the Observer is stopped before a Host change, started only when it is
     Assert-True ($script:calls.Count -eq 0) ($script:calls -join ',')
 }
 
+# ---- settings files with comments (Windows PowerShell 5.1) ----
+$commented = @'
+// leading comment with a "quoted" word and an unmatched /*
+{
+  /* block comment
+     // nested line marker, "quote" and { brace } */
+  "Url": "http://localhost:5210//path", // trailing comment
+  "Connection": "Host=db;Password=a//b/*c*/d",
+  "Escaped": "say \"// not a comment\" /* nor this */",
+  "Folder": "C:\\data\\", // the string above ends with an escaped backslash
+  "Glob": "logs/*.log",
+  "Number": 5 /* after a value */,
+  "Section": { /* inside */ "Enabled": true }
+}
+/* closing comment */
+'@
+Test-Case 'comments are removed and URLs, connection strings and escaped strings are kept exactly' {
+    $j = ConvertFrom-SettingsJson -Text $commented
+    Assert-True ($j.Url -ceq 'http://localhost:5210//path') $j.Url
+    Assert-True ($j.Connection -ceq 'Host=db;Password=a//b/*c*/d')
+    Assert-True ($j.Escaped -ceq 'say "// not a comment" /* nor this */') $j.Escaped
+    Assert-True ($j.Folder -ceq 'C:\data\') $j.Folder
+    Assert-True ($j.Glob -ceq 'logs/*.log' -and $j.Number -eq 5 -and $j.Section.Enabled -eq $true)
+    $crlf = ConvertFrom-SettingsJson -Text ($commented -replace "`r?`n", "`r`n")
+    Assert-True ($crlf.Url -ceq $j.Url -and $crlf.Section.Enabled -eq $true)
+}
+Test-Case 'malformed, empty and non-object settings are rejected' {
+    $bad = @($null, '', '   ', '// only a comment', '/* only */', '{ "a": 1', '"a": 1 }', '[ 1 ]', '{ "a": "open }', '{ "a": 1 } /* never closed', '{ "a": tru }', '{ "a": 1/* x */2 }', '{ "a": 1 } { "b": 2 }', '{ "a" 1 }')
+    foreach ($text in $bad) {
+        $rejected = $false
+        try { ConvertFrom-SettingsJson -Text $text | Out-Null } catch { $rejected = $true }
+        Assert-True $rejected "accepted: $text"
+    }
+}
+Test-Case 'every shipped settings file is read, with its values intact' {
+    $files = @(Get-ChildItem (Join-Path $PSScriptRoot '..') -Directory -Filter 'NiftySignal.*' | ForEach-Object { Get-ChildItem $_.FullName -File -Filter 'appsettings*.json' } | Where-Object { $_.Name -notlike '*.Local.json' })
+    Assert-True ($files.Count -ge 6) "found $($files.Count)"
+    foreach ($f in $files) { ConvertFrom-SettingsJson -Text (Get-Content -LiteralPath $f.FullName -Raw) | Out-Null }
+    $d = ConvertFrom-SettingsJson -Text (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\NiftySignal.Dashboard\appsettings.json') -Raw)
+    Assert-True ($d.AdaptiveScreenshots.BaseUrl -ceq 'http://localhost:5210' -and $d.Urls -ceq 'http://localhost:5210' -and $d.ExecutionHealth.Required -eq $false -and $d.DashboardAuth.Username -ceq 'admin')
+}
+function Copy-Shipped([string] $name, [string] $project, [string] $local) {
+    New-Settings $name (Get-Content -LiteralPath (Join-Path $PSScriptRoot "..\$project\appsettings.json") -Raw) $local
+}
+$realHost = Copy-Shipped 'realhost' 'NiftySignal.Host' '{ "PaperEngineV2": { "Enabled": false } }'
+$realExec = Copy-Shipped 'realexec' 'NiftySignal.ExecutionService' '{ "Execution": { "Enabled": true } }'
+$realDash = Copy-Shipped 'realdash' 'NiftySignal.Dashboard' '{ "ExecutionHealth": { "Required": true } }'
+$realDashNotRequired = Copy-Shipped 'realdashoff' 'NiftySignal.Dashboard' $null
+Test-Case 'the shipped Dashboard file: execution may start only when the local file requires it' {
+    $o = & $PaperOwnershipScript $realHost $realExec $realDash
+    Assert-True (@($o.Errors).Count -eq 0) ($o.Errors -join ' ')
+    Assert-True (@(Get-PaperOwnershipProblems -Ownership $o).Count -eq 0)
+    $found = @(Get-PaperOwnershipProblems -Ownership (& $PaperOwnershipScript $realHost $realExec $realDashNotRequired))
+    Assert-True ($found.Count -eq 1 -and $found[0] -like '*ExecutionHealth:Required*') ($found -join ' ')
+}
+Test-Case 'commented local settings: an unsafe execution configuration is still blocked' {
+    $twoWriters = New-Settings 'c-hoston' '{ "PaperEngineV2": { "Enabled": false } }' "{ // `"PaperEngineV2`": { `"Enabled`": false },`n `"PaperEngineV2`": { `"Enabled`": true } /* in-Host writer on */ }"
+    $found = @(Get-PaperOwnershipProblems -Ownership (& $PaperOwnershipScript $twoWriters $realExec $realDash))
+    Assert-True ($found.Count -eq 1 -and $found[0] -like '*two paper writers*') ($found -join ' ')
+    $commentedOut = New-Settings 'c-dash' '{ "ExecutionHealth": { "Required": false } }' "{`n // `"ExecutionHealth`": { `"Required`": true }`n }"
+    $found = @(Get-PaperOwnershipProblems -Ownership (& $PaperOwnershipScript $realHost $realExec $commentedOut))
+    Assert-True ($found.Count -eq 1 -and $found[0] -like '*ExecutionHealth:Required*') ($found -join ' ')
+}
+Test-Case 'missing settings files, missing or non-boolean switches block or keep the application default' {
+    $noFile = Join-Path $WorkRoot 'settings\nofile'; New-Item -ItemType Directory -Force $noFile | Out-Null
+    foreach ($dirs in @(@($noFile, $realExec, $realDash), @($realHost, $noFile, $realDash), @($realHost, $realExec, $noFile), @($realHost, $realExec, $null))) {
+        Assert-True (@(Get-PaperOwnershipProblems -Ownership (& $PaperOwnershipScript @dirs)).Count -ge 1) ($dirs -join '|')
+    }
+    $noKeys = New-Settings 'nokeys' '{ }' $null
+    $o = & $PaperOwnershipScript $noKeys $noKeys $noKeys
+    Assert-True ($o.HostPaperEngineEnabled -eq $false -and $o.ExecutionEnabled -eq $false -and $o.DashboardExecutionRequired -eq $false -and @($o.Errors).Count -eq 0)
+    Assert-True (@(Get-PaperOwnershipProblems -Ownership (& $PaperOwnershipScript $realHost $realExec $noKeys)).Count -eq 1)
+    $text = New-Settings 'nonbool' '{ "PaperEngineV2": { "Enabled": "no" } }' $null
+    Assert-True (@(Get-PaperOwnershipProblems -Ownership (& $PaperOwnershipScript $text $realExec $realDash) | Where-Object { $_ -like '*not true or false*' }).Count -eq 1)
+}
+Test-Case 'a malformed file in any of the three folders blocks the start and is not echoed' {
+    foreach ($local in @('{ "secret-marker": ', '{ "a": "secret-marker }', '{ } /* secret-marker', '// secret-marker')) {
+        $name = "bad$([Guid]::NewGuid().ToString('N'))"
+        $dir = New-Settings $name '{ }' $local
+        foreach ($dirs in @(@($dir, $realExec, $realDash), @($realHost, $dir, $realDash), @($realHost, $realExec, $dir))) {
+            $found = @(Get-PaperOwnershipProblems -Ownership (& $PaperOwnershipScript @dirs))
+            Assert-True (@($found | Where-Object { $_ -like '*cannot be read as JSON*' }).Count -eq 1) "$local : $($found -join ' ')"
+            Assert-True (($found -join ' ') -notlike '*secret-marker*')
+        }
+    }
+}
+Test-Case 'the Observer checks read commented files and refuse a commented-out connection string or a malformed file' {
+    $hostC = New-Settings 'c-newhost' ("// shipped`n" + '{ "Adaptive": { "Observer": { "Process": "Separate" } } /* mode */ }') $null
+    $ok = New-Settings 'c-observer' '{ }' '{ "ConnectionStrings": { "NiftySignalDb": "Host=a//b" } } // local'
+    Assert-True (@(Get-ObserverStartProblems -Settings (& $ObserverSettingsScript $hostC $ok)).Count -eq 0)
+    $off = New-Settings 'c-observeroff' '{ }' "{`n // `"ConnectionStrings`": { `"NiftySignalDb`": `"x`" }`n }"
+    Assert-True ((@(Get-ObserverStartProblems -Settings (& $ObserverSettingsScript $hostC $off)) -join ' ') -like '*no ConnectionStrings*')
+    $bad = New-Settings 'c-observerbad' '{ }' '{ "secret-marker": '
+    $s = & $ObserverSettingsScript $hostC $bad
+    Assert-True (@(Get-ObserverStartProblems -Settings $s).Count -ge 1 -and @(Get-ObserverInstallProblems -Settings $s -ObserverInstalled $true -HostSelected $true).Count -ge 1)
+    Assert-True (($s.Errors -join ' ') -notlike '*secret-marker*')
+}
+Test-Case 'the settings scripts are self-contained, as Invoke-Command sends them to the target' {
+    foreach ($case in @(@($PaperOwnershipScript, @($realHost, $realExec, $realDash)), @($ObserverSettingsScript, @($realHost, $realExec)))) {
+        $isolated = [PowerShell]::Create()      # a new runspace: none of the functions defined here exist in it
+        try {
+            $isolated.AddScript($case[0].ToString()) | Out-Null
+            foreach ($argument in $case[1]) { $isolated.AddArgument($argument) | Out-Null }
+            $result = @($isolated.Invoke())
+            Assert-True ($result.Count -eq 1 -and @($result[0].Errors | Where-Object { $_ }).Count -eq 0) (($result[0].Errors) -join ' ')
+        }
+        finally { $isolated.Dispose() }
+    }
+}
+
 Test-Case 'the scripts read no variable they never assign' {
     $known = @('_', 'args', 'true', 'false', 'null', 'matches', 'PSScriptRoot', 'LASTEXITCODE', 'ErrorActionPreference', 'PSItem', 'input', 'PSCmdlet', 'Error', 'Host')
     $assigned = @{}

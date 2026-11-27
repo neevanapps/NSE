@@ -148,14 +148,68 @@ function Get-DeploymentServiceCatalog {
     $all | Where-Object { $Service -eq 'Both' -or $_.Key -eq $Service }
 }
 
+# ---- settings files ----
+# The applications read appsettings*.json with // and /* */ comments; ConvertFrom-Json in Windows PowerShell 5.1 rejects them.
+function ConvertFrom-SettingsJson {
+    <#
+      Parses one settings file: comments are removed by reading the text character by character, so that // and /* inside a string (URLs, connection
+      strings, escaped quotes) are kept. Everything else is left to ConvertFrom-Json. Throws on an unterminated string or comment, on an empty file and
+      on anything that is not one JSON object. Callers must not repeat the exception text: it can quote file content.
+    #>
+    param([AllowNull()][AllowEmptyString()][string] $Text)
+    $length = $Text.Length
+    $clean = New-Object System.Text.StringBuilder
+    $inString = $false
+    $i = 0
+    while ($i -lt $length) {
+        $c = [string] $Text[$i]
+        $next = if ($i + 1 -lt $length) { [string] $Text[$i + 1] } else { '' }
+        if ($inString) {
+            [void] $clean.Append($c)
+            if ($c -ceq '\') { [void] $clean.Append($next); $i += 2; continue }
+            if ($c -ceq '"') { $inString = $false }
+            $i++
+        }
+        elseif ($c -ceq '/' -and $next -ceq '/') {
+            while ($i -lt $length -and $Text[$i] -ne [char] 10 -and $Text[$i] -ne [char] 13) { $i++ }
+            [void] $clean.Append(' ')
+        }
+        elseif ($c -ceq '/' -and $next -ceq '*') {
+            $end = $Text.IndexOf('*/', $i + 2, [StringComparison]::Ordinal)
+            if ($end -lt 0) { throw 'unterminated comment' }
+            [void] $clean.Append(' ')      # a comment separates tokens; it never joins them
+            $i = $end + 2
+        }
+        else {
+            if ($c -ceq '"') { $inString = $true }
+            [void] $clean.Append($c)
+            $i++
+        }
+    }
+    if ($inString) { throw 'unterminated string' }
+    $json = $clean.ToString().Trim()
+    if (-not ($json.StartsWith('{') -and $json.EndsWith('}'))) { throw 'not one JSON object' }
+    ConvertFrom-Json -InputObject $json -ErrorAction Stop
+}
+
+function New-SettingsScript {
+    <# A script block that runs on the target machine sees none of this file's functions: the reader's source is placed inside it. #>
+    param([Parameter(Mandatory = $true)][scriptblock] $Template)
+    $marker = '# <settings-reader>'
+    $text = $Template.ToString()
+    if (-not $text.Contains($marker)) { throw 'settings script without a reader marker' }
+    [scriptblock]::Create($text.Replace($marker, "function ConvertFrom-SettingsJson {`n$(${function:ConvertFrom-SettingsJson})`n}"))
+}
+
 # Runs on the target machine. Reads ONLY the switches that decide who writes paper state; no other setting (and no secret) leaves the machine.
 # appsettings.Local.json overrides appsettings.json, as in the applications. Environment-variable overrides are not visible here.
-$PaperOwnershipScript = {
+$PaperOwnershipScript = New-SettingsScript {
     param(
         [string] $HostDir,
         [string] $ExecutionDir,
         [string] $DashboardDir
     )
+    # <settings-reader>
     $problems = @()
     function Read-Switch([string] $dir, [string] $section, [string] $key) {
         if (-not $dir) { return $null }
@@ -166,7 +220,7 @@ $PaperOwnershipScript = {
                 if ($name -eq 'appsettings.json') { throw "'$path' is missing" }
                 continue
             }
-            try { $json = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json }
+            try { $json = ConvertFrom-SettingsJson -Text (Get-Content -LiteralPath $path -Raw) }
             catch { throw "'$path' cannot be read as JSON" }      # the parser's own message can quote file content, so it is not repeated
             $found = $null
             if ($json.PSObject.Properties[$section]) { $found = $json.$section.PSObject.Properties[$key] }
@@ -201,18 +255,19 @@ function Get-PaperOwnershipProblems {
 
 # Runs on the target machine. Reads the settings that decide which process writes the observer database, and whether the Observer is configured like
 # the Host it replaces. Only the process mode, yes/no facts and the NAMES of differing settings leave the machine.
-$ObserverSettingsScript = {
+$ObserverSettingsScript = New-SettingsScript {
     param(
         [string] $HostDir,
         [string] $ObserverDir
     )
+    # <settings-reader>
     $problems = @()
     function Read-Setting([string] $dir, [string[]] $path, [string[]] $files) {
         $value = $null
         foreach ($name in $files) {
             $file = Join-Path $dir $name
             if (-not (Test-Path -LiteralPath $file)) { continue }
-            try { $json = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json }
+            try { $json = ConvertFrom-SettingsJson -Text (Get-Content -LiteralPath $file -Raw) }
             catch { throw "'$file' cannot be read as JSON" }
             $node = $json
             foreach ($part in $path) {

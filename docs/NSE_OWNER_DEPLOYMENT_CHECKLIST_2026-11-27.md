@@ -11,23 +11,23 @@ Conventions: `<...>` is a value only you know. Passwords are typed at the prompt
 | # | Step | Changes state | Approval |
 |---|---|---|---|
 | A1 | Confirm the reviewed source | no | no |
-| A2 | Real-data certification | scratch only | no |
+| A2 | Deployment-script validation (PowerShell 5.1) | temporary files only | no |
 | A3 | Commit, merge to `master`, record SHA | yes (git) | **yes** |
 | A4 | Stop the desktop Host if running | yes | yes |
 
-**A1.** Expected: `45008e381918ec091c37b1b9c861ea9a1fa03630` (source tree without `docs`, with the Observer freshness entry gate). A different value means the source changed after packaging and the verification: stop.
+**A1.** Expected: `4e4d39876aca868c64c1f2f71f7c13a9b84089c5` (source tree without `docs`). It is the certified application tree `45008e3...` plus the deployment-script fix in two files under `tools/` (readiness report, section 14). A different value: stop.
 
 ```powershell
 $env:GIT_INDEX_FILE="$env:TEMP\nse-fingerprint.index"; git read-tree HEAD; git add -A; git rm -r -q --cached docs; git write-tree; Remove-Item Env:GIT_INDEX_FILE
 ```
 
-**A2.** Done 27 November 13:03, both MET; repeat only if the A1 tree differs. Both real-data recovery certifications (restart 14:30 and 09:45) on this tree; about 45 minutes. Expected: `CERTIFICATION-COMPLETED`. Failure: do not package or deploy. Parity, full/restart benchmarks and the recovery comparison were run on tree `aa906ab...` and are not repeated: the Observer, Host and recovery code is unchanged (readiness report, section 13).
+**A2.** The validation below passed on 27 November 13:56 (56 of 56 and the packaging test); repeat if the A1 tree differs. Certifications done 27 November 13:03 on tree `45008e3...`, both MET; not repeated for the `tools/`-only fix (readiness report 14.5). Their script refuses the new tree. Instead run the deployment-script validation under Windows PowerShell 5.1 (local only, about a minute). Expected last lines: `VERDICT: PASS` with the A1 tree. Failure: do not deploy.
 
 ```powershell
-& "D:\Projects\NSE-release-20261124\docs\overnight\Run-FreshnessCertification.ps1"
+powershell -NoProfile -File D:\Projects\NSE-release-20261124\docs\overnight\Run-DeploymentCompatibility.ps1
 ```
 
-**A3.** Done locally on 27 November: `master` was fast-forwarded to `17ce4c79ab819ef4466ed90a8de59c338e040fcb` (with its parent `78d9b8bd`), followed by a documentation and benchmark-tooling commit. **Not pushed**; pushing needs your approval. Before deploying, expected: `git status --porcelain` prints nothing on `master`, and A1 prints the expected tree. Record the SHA. Failure: the deploy scripts refuse a dirty or non-master checkout.
+**A3.** `master` with the certified release (`17ce4c79...`) and its documentation commit (`0520591...`) was pushed on 27 November. The deployment-script fix (`Fix Windows PowerShell 5.1 deployment configuration parsing and safety validation`) follows it, approved for commit and push on 27 November. Before deploying, expected: `git rev-parse HEAD origin/master` prints the same SHA twice, `git status --porcelain` prints nothing on `master`, and A1 prints the expected tree. Record the SHA. Failure: the deploy scripts refuse a dirty or non-master checkout.
 
 ```powershell
 git rev-parse HEAD
