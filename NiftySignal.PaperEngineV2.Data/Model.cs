@@ -63,6 +63,38 @@ public sealed class DispositionRow
     public long JournalSeq { get; set; }
 }
 
+/// <summary>The single execution writer's fencing epoch, heartbeat and read-only standing (one row, component "execution").</summary>
+public sealed class ExecutionStateRow
+{
+    public string Component { get; set; } = string.Empty;
+
+    public long Epoch { get; set; }
+
+    public string Owner { get; set; } = string.Empty;
+
+    public long HeartbeatUtcTicks { get; set; }
+
+    public string TradeDate { get; set; } = string.Empty;
+
+    public string Status { get; set; } = string.Empty;
+
+    public string SnapshotJson { get; set; } = string.Empty;
+}
+
+/// <summary>One state-changing execution input, in the order it was applied. Replaying a day's rows into a fresh engine reproduces its ledger.</summary>
+public sealed class ExecutionJournalRow
+{
+    public long Id { get; set; }
+
+    public string TradeDate { get; set; } = string.Empty;
+
+    public long Epoch { get; set; }
+
+    public long AtUtcTicks { get; set; }
+
+    public string PayloadJson { get; set; } = string.Empty;
+}
+
 public sealed class GapRow
 {
     public long Id { get; set; }
@@ -211,6 +243,10 @@ public sealed class PaperEngineV2DbContext(DbContextOptions<PaperEngineV2DbConte
 
     public DbSet<LiveMarkRow> LiveMarks => Set<LiveMarkRow>();
 
+    public DbSet<ExecutionStateRow> ExecutionState => Set<ExecutionStateRow>();
+
+    public DbSet<ExecutionJournalRow> ExecutionJournal => Set<ExecutionJournalRow>();
+
     static PropertyBuilder<string> Text(PropertyBuilder<string> p, int max) => p.HasMaxLength(max).UseCollation("C");
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
@@ -318,6 +354,27 @@ public sealed class PaperEngineV2DbContext(DbContextOptions<PaperEngineV2DbConte
             Text(b.Property(e => e.TradeDate), 10);
             Text(b.Property(e => e.Status), 16);
             b.Property(e => e.PayloadJson).HasColumnType("text");
+        });
+
+        modelBuilder.Entity<ExecutionStateRow>(b =>
+        {
+            b.ToTable("pev2_execution_state");
+            b.HasKey(e => e.Component);
+            Text(b.Property(e => e.Component), 32);
+            Text(b.Property(e => e.Owner), 128);
+            Text(b.Property(e => e.TradeDate), 10);
+            Text(b.Property(e => e.Status), 24);
+            b.Property(e => e.SnapshotJson).HasColumnType("text");
+        });
+
+        modelBuilder.Entity<ExecutionJournalRow>(b =>
+        {
+            b.ToTable("pev2_execution_journal");
+            b.HasKey(e => e.Id);
+            b.Property(e => e.Id).ValueGeneratedOnAdd().UseIdentityAlwaysColumn();
+            Text(b.Property(e => e.TradeDate), 10);
+            b.Property(e => e.PayloadJson).HasColumnType("text");
+            b.HasIndex(e => new { e.TradeDate, e.Id });
         });
 
         // snake_case column names, derived mechanically so the idempotent script reads naturally

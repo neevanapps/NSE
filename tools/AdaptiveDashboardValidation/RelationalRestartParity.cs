@@ -42,7 +42,7 @@ static class RelationalRestartParity
         var reader=new AdaptiveSourceTickReader();
         var input=await reader.ReadCleanSessionAsync(source,day,chain.Select(x=>x.Token).Append(row.FutureToken).ToArray(),at.AddMinutes(2),default);
         var groups=input.GroupBy(x=>x.Tick.AvailableAt).Select(x=>x.Select(t=>(t.Token,t.Tick)).ToArray()).ToArray();
-        AdaptiveObserverEngine NewEngine()=>new(context.Definition,expiry,.065,.2,at,chain,null);
+        AdaptiveObserverEngine NewEngine()=>new(context.Definition,expiry,.065,.2,at,chain,null,projectStrikes:true);     // configured as the recovery service configures it
         var baseline=NewEngine();var expected=new List<AdaptiveCompletedBarPackage>();
         foreach(var group in groups)expected.AddRange(baseline.ProcessAvailabilityGroup(group));
         var trigger=expected.FirstOrDefault(x=>x.IsActionableWeak2) ?? throw new Exception("PostgreSQL restart fixture did not produce Weak2.");
@@ -62,7 +62,7 @@ static class RelationalRestartParity
         {
             foreach(var package in engine.ProcessAvailabilityGroup(group))
             {
-                if(golden[package.FutureBar.BarSeq]!=JsonSerializer.Serialize(package))throw new Exception("PostgreSQL restart changed an emitted package.");
+                if(golden[package.FutureBar.BarSeq]!=JsonSerializer.Serialize(package)){ var a=golden[package.FutureBar.BarSeq];var n=JsonSerializer.Serialize(package);var i=0;while(i<Math.Min(a.Length,n.Length)&&a[i]==n[i])i++;var start0=Math.Max(0,i-250);throw new Exception($"PostgreSQL restart changed an emitted package (bar {package.FutureBar.BarSeq}, after {restarts} restarts). Uninterrupted: ...{a[start0..Math.Min(a.Length,i+150)]} | Restarted: ...{n[start0..Math.Min(n.Length,i+150)]}"); }
                 await persistence.PersistOrVerifyAsync(db,row,package,group[0].Tick.AvailableAt,default);
                 await supplemental.PersistOrVerifyFuturesAsync(db,row.Id,package,default);
                 await supplemental.PersistOrVerifyOptionsAsync(db,row,package,default);

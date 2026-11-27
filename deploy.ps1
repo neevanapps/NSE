@@ -1,12 +1,20 @@
 <#
 .SYNOPSIS
-    Publishes NiftySignal.Host / NiftySignal.Dashboard to the VM (or locally) and restarts
-    the Windows Services around the copy.
+    Publishes NiftySignal.Host / .Observer / .ExecutionService / .Dashboard to the VM
+    (or locally) and restarts the Windows Services around the copy.
 
 .DESCRIPTION
     Replaces the manual "dotnet publish, stop the service by hand, copy, start it again"
     cycle. Everything a deploy has to get right is enforced here rather than remembered:
 
+      - The paper execution service (NiftySignalExecution), where installed, is stopped before any
+        other service and started only after every selected service deployed, and never while the
+        Host is also configured to write paper state. A failed deployment leaves it stopped.
+        This script never registers a service: see tools\Install-ExecutionService.ps1.
+      - A Host that does not run the observer itself needs NiftySignalObserver registered (see
+        tools\Install-ObserverService.ps1), checked before anything stops. The Observer is stopped
+        before the Host changes and started after every selected service deployed, only when exactly
+        one process is configured to write the observer database. A failed deployment leaves it stopped.
       - Tests must pass first (skip with -SkipTests only when you know why).
       - appsettings.Local.json is stripped from the staged output before it ever leaves this
         machine. That file holds the database connection string, the FlatTrade credentials
@@ -25,7 +33,8 @@
 
 .EXAMPLE
     .\deploy.ps1
-    Runs tests, publishes both services, deploys to the VM over Tailscale.
+    Runs tests, publishes the services, deploys to the VM over Tailscale. NiftySignalExecution is
+    included only where that service is installed.
 
 .EXAMPLE
     .\deploy.ps1 -Service Host -SkipTests
@@ -40,7 +49,8 @@ param(
     [ValidateSet('Vm', 'Local')]
     [string] $Target = 'Vm',
 
-    [ValidateSet('Host', 'Dashboard', 'Both')]
+    # 'Both' (the default) = Host and Dashboard, plus the Observer and the execution service where they are installed.
+    [ValidateSet('Host', 'Dashboard', 'Observer', 'Execution', 'Both')]
     [string] $Service = 'Both',
 
     # Tailscale address. The public static IP (8.234.96.76) also works, but Tailscale keeps
@@ -57,11 +67,23 @@ param(
 
     # Bypasses the "desktop services are still running" guard. Only correct when you have
     # deliberately decided both machines should be up (they normally must not be).
-    [switch] $Force
+    [switch] $Force,
+
+    # Emergency override of the market-hours guard (weekdays 09:00-15:45 IST). Never enough on its own: the script also
+    # requires a typed confirmation that open-position risk was assessed.
+    [switch] $AllowMarketHours,
+
+    # Minutes needed for startup, validation and rollback; a deployment that would reach into the guard window is refused.
+    [ValidateRange(0, 600)]
+    [int] $ReserveMinutes = 30
 )
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = $PSScriptRoot
+. (Join-Path $repoRoot 'tools\DeploymentSafety.ps1')
+$guard = @{ AllowMarketHours = [bool] $AllowMarketHours; ReserveMinutes = $ReserveMinutes }
+# Fail early; checked again immediately before every service stop below.
+Assert-DeploymentWindow -Operation 'deployment start' @guard
 
 # Assembly metadata must identify the source actually published, including untracked source files.
 $sourceStatus = & git -C $repoRoot status --porcelain --untracked-files=normal
@@ -78,13 +100,7 @@ if ($ExpectedCommitSha -and $sourceBranch -ne 'master') {
     throw 'Expected-SHA release deployment requires the master branch. Nothing deployed.'
 }
 
-$services = @()
-if ($Service -eq 'Both' -or $Service -eq 'Host') {
-    $services += [pscustomobject]@{ Name = 'NiftySignalHost'; Project = 'NiftySignal.Host' }
-}
-if ($Service -eq 'Both' -or $Service -eq 'Dashboard') {
-    $services += [pscustomobject]@{ Name = 'NiftySignalDashboard'; Project = 'NiftySignal.Dashboard' }
-}
+$services = @(Get-DeploymentServiceCatalog -Service $Service)
 
 function Write-Step($message) {
     if ($script:stepClock) {
@@ -173,8 +189,104 @@ Remove-Item -LiteralPath $sourceArchive -Force
 Remove-Item -LiteralPath $publishSourceRoot -Recurse -Force
 
 # --- Deploy ----------------------------------------------------------------------------
+# Runs on the target (local or remote): install folder, start mode and state of one registered service, or nothing.
+$serviceInfo = {
+    param($name)
+    $info = Get-CimInstance Win32_Service -Filter "Name='$name'"
+    if (-not $info) { return $null }
+    [pscustomobject]@{ Dir = (Split-Path ($info.PathName.Trim('"')) -Parent); StartMode = $info.StartMode; Running = ((Get-Service $name).Status.ToString() -ne 'Stopped') }
+}
+$stopService = {
+    param($name)
+    Stop-Service -Name $name -Force -ErrorAction SilentlyContinue
+    (Get-Service $name).WaitForStatus('Stopped', '00:00:30')
+}
+
+# Stops the paper execution service (if installed) before anything else changes, so no paper writer runs against a half-deployed
+# system and a rollback never runs beside it. It is started again only by Start-ExecutionAfterDeployment.
+function Stop-ExecutionBeforeDeployment([hashtable] $on) {
+    $info = Invoke-Command @on -ScriptBlock $serviceInfo -ArgumentList 'NiftySignalExecution'
+    if ($info -and $info.Running) {
+        Write-Step 'Stopping NiftySignalExecution (restarted after all services are deployed)'
+        Assert-DeploymentWindow -Operation 'stop NiftySignalExecution' @guard
+        Invoke-Command @on -ScriptBlock $stopService -ArgumentList 'NiftySignalExecution'
+    }
+    $info
+}
+
+function Start-ExecutionAfterDeployment([hashtable] $on, $before) {
+    if (-not $before) { return }
+    # Restore what ran before; a first deployment of the service starts it too (it idles while Execution:Enabled=false).
+    $selected = @($services | Where-Object { $_.Key -eq 'Execution' }).Count -gt 0
+    if (-not $before.Running -and -not $selected) { return }
+    if ($before.StartMode -eq 'Disabled') { Write-Host '    NiftySignalExecution is disabled: left stopped.' -ForegroundColor Yellow; return }
+    Write-Step 'Starting NiftySignalExecution'
+    $hostInfo = Invoke-Command @on -ScriptBlock $serviceInfo -ArgumentList 'NiftySignalHost'
+    $dashInfo = Invoke-Command @on -ScriptBlock $serviceInfo -ArgumentList 'NiftySignalDashboard'
+    $ownership = Invoke-Command @on -ScriptBlock $PaperOwnershipScript -ArgumentList $hostInfo.Dir, $before.Dir, $dashInfo.Dir
+    $problems = @(Get-PaperOwnershipProblems -Ownership $ownership)
+    if ($problems.Count -gt 0) { throw "NiftySignalExecution was NOT started and stays stopped. $($problems -join ' ')" }
+    $state = Invoke-Command @on -ArgumentList 'NiftySignalExecution' -ScriptBlock {
+        param($name)
+        Start-Service -Name $name
+        (Get-Service $name).WaitForStatus('Running', '00:00:30')
+        (Get-Service $name).Status.ToString()
+    }
+    Write-Host "    NiftySignalExecution is $state (Execution:Enabled=$($ownership.ExecutionEnabled))" -ForegroundColor Green
+}
+
+# Checked before anything stops: deploying a Host must never leave the system without an observer.
+function Assert-ObserverInstalled([hashtable] $on) {
+    $hostInfo = Invoke-Command @on -ScriptBlock $serviceInfo -ArgumentList 'NiftySignalHost'
+    $observer = Invoke-Command @on -ScriptBlock $serviceInfo -ArgumentList 'NiftySignalObserver'
+    $settings = Invoke-Command @on -ScriptBlock $ObserverSettingsScript -ArgumentList $hostInfo.Dir, $observer.Dir
+    $hostSelected = @($services | Where-Object { $_.Key -eq 'Host' }).Count -gt 0
+    $problems = @(Get-ObserverInstallProblems -Settings $settings -ObserverInstalled ([bool] $observer) -HostSelected $hostSelected)
+    if ($problems.Count -gt 0) { throw "Nothing deployed. $($problems -join ' ')" }
+}
+
+# The Observer is stopped before a Host or Observer change, so an older Host build can never run beside it. A Dashboard or execution deployment leaves it running.
+function Stop-ObserverBeforeDeployment([hashtable] $on) {
+    if (@($services | Where-Object { $_.Key -eq 'Host' -or $_.Key -eq 'Observer' }).Count -eq 0) { return $null }
+    $info = Invoke-Command @on -ScriptBlock $serviceInfo -ArgumentList 'NiftySignalObserver'
+    if ($info -and $info.Running) {
+        Write-Step 'Stopping NiftySignalObserver (restarted after all services are deployed)'
+        Assert-DeploymentWindow -Operation 'stop NiftySignalObserver' @guard
+        Invoke-Command @on -ScriptBlock $stopService -ArgumentList 'NiftySignalObserver'
+    }
+    $info
+}
+
+function Start-ObserverAfterDeployment([hashtable] $on, $before) {
+    if (-not $before) { return }
+    if ($before.StartMode -eq 'Disabled') { Write-Host '    NiftySignalObserver is disabled: left stopped.' -ForegroundColor Yellow; return }
+    $hostInfo = Invoke-Command @on -ScriptBlock $serviceInfo -ArgumentList 'NiftySignalHost'
+    $settings = Invoke-Command @on -ScriptBlock $ObserverSettingsScript -ArgumentList $hostInfo.Dir, $before.Dir
+    if ($settings.HostBuildSeparatesObserver -and $settings.HostMode -eq 'InHost') {
+        Write-Host '    The Host runs the observer (InHost): NiftySignalObserver is left stopped. Disable that service.' -ForegroundColor Yellow
+        return
+    }
+    $problems = @(Get-ObserverStartProblems -Settings $settings)
+    if ($problems.Count -gt 0) { throw "NiftySignalObserver was NOT started and stays stopped: no observer is running. $($problems -join ' ')" }
+    Write-Step 'Starting NiftySignalObserver'
+    $state = Invoke-Command @on -ArgumentList 'NiftySignalObserver' -ScriptBlock {
+        param($name)
+        Start-Service -Name $name
+        (Get-Service $name).WaitForStatus('Running', '00:00:30')
+        (Get-Service $name).Status.ToString()
+    }
+    Write-Host "    NiftySignalObserver is $state" -ForegroundColor Green
+}
+
 if ($Target -eq 'Local') {
+    Assert-ObserverInstalled @{}
+    $executionBefore = Stop-ExecutionBeforeDeployment @{}
+    $observerBefore = Stop-ObserverBeforeDeployment @{}
     foreach ($svc in $services) {
+        if ($svc.Optional -and -not (Get-CimInstance Win32_Service -Filter "Name='$($svc.Name)'")) {
+            Write-Host "    $($svc.Name) is not installed: skipped." -ForegroundColor Yellow
+            continue
+        }
         $staging = Join-Path $stagingRoot $svc.Project
         $installed = (Get-CimInstance Win32_Service -Filter "Name='$($svc.Name)'").PathName
         if (-not $installed) {
@@ -184,6 +296,7 @@ if ($Target -eq 'Local') {
         $targetDir = Split-Path ($installed.Trim('"')) -Parent
 
         Write-Step "$($svc.Name) -> $targetDir"
+        Assert-DeploymentWindow -Operation "stop $($svc.Name)" @guard
         Stop-Service -Name $svc.Name -Force -ErrorAction SilentlyContinue
         (Get-Service $svc.Name).WaitForStatus('Stopped', '00:00:30')
 
@@ -192,10 +305,13 @@ if ($Target -eq 'Local') {
             & dotnet (Join-Path $targetDir 'NiftySignal.Dashboard.dll') --install-screenshot-browser
             if ($LASTEXITCODE -ne 0) { throw 'Screenshot Chromium installation failed; Dashboard remains stopped.' }
         }
+        if ($svc.Key -eq 'Execution' -or $svc.Key -eq 'Observer') { continue }   # started last, after the ownership checks
         Start-Service -Name $svc.Name
         (Get-Service $svc.Name).WaitForStatus('Running', '00:00:30')
         Write-Host "    $($svc.Name) is Running" -ForegroundColor Green
     }
+    Start-ObserverAfterDeployment @{} $observerBefore
+    Start-ExecutionAfterDeployment @{} $executionBefore
 }
 else {
     . (Join-Path $repoRoot 'tools\DeploymentPackaging.ps1')
@@ -220,6 +336,18 @@ else {
     }
 
     try {
+        $remote = @{ Session = $session }
+        # Every required service must be registered before anything is stopped.
+        foreach ($svc in $services) {
+            if (-not $svc.Optional -and -not (Invoke-Command @remote -ScriptBlock $serviceInfo -ArgumentList $svc.Name)) {
+                Write-Host "Service $($svc.Name) is not installed on $VmAddress. Nothing deployed." -ForegroundColor Red
+                exit 1
+            }
+        }
+        Assert-ObserverInstalled $remote
+        $executionBefore = Stop-ExecutionBeforeDeployment $remote
+        $observerBefore = Stop-ObserverBeforeDeployment $remote
+
         foreach ($svc in $services) {
             $staging = Join-Path $stagingRoot $svc.Project
 
@@ -232,6 +360,7 @@ else {
             }
 
             if (-not $targetDir) {
+                if ($svc.Optional) { Write-Host "    $($svc.Name) is not installed on $VmAddress`: skipped." -ForegroundColor Yellow; continue }
                 Write-Host "Service $($svc.Name) is not installed on $VmAddress." -ForegroundColor Red
                 exit 1
             }
@@ -310,6 +439,9 @@ else {
                 } finally { Remove-Item -LiteralPath $localPackage -Force -ErrorAction SilentlyContinue }
             }
 
+            # The build, the tests and the transfer take minutes: the guard is evaluated again here, at the disruptive step.
+            # A refusal leaves this service running; services already deployed in this run stay deployed (see the output above).
+            Assert-DeploymentWindow -Operation "stop $($svc.Name)" @guard
             Invoke-Command -Session $session -ArgumentList $svc.Name -ScriptBlock {
                 param($name)
                 Stop-Service -Name $name -Force -ErrorAction SilentlyContinue
@@ -329,6 +461,8 @@ else {
                 Write-Host "    files copied"
             }
 
+            if ($svc.Key -eq 'Execution' -or $svc.Key -eq 'Observer') { continue }   # started last, after the ownership checks
+
             $state = Invoke-Command -Session $session -ArgumentList $svc.Name, $targetDir -ScriptBlock {
                 param($name, $dir)
                 if ($name -eq 'NiftySignalDashboard') {
@@ -341,6 +475,8 @@ else {
             }
             Write-Host "    $($svc.Name) is $state" -ForegroundColor Green
         }
+        Start-ObserverAfterDeployment $remote $observerBefore
+        Start-ExecutionAfterDeployment $remote $executionBefore
     }
     finally {
         Remove-PSSession $session

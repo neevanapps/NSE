@@ -48,45 +48,47 @@ public static class V2SchemaCheck
 /// The durable <see cref="IFrameJournal"/> over PostgreSQL. Appends are idempotent per key (INSERT ... ON CONFLICT DO NOTHING, then a comparison with the stored row decides DuplicateSame / ConflictDifferent;
 /// a stored row is never overwritten) and every append is one auto-committed statement, so a returned append is on disk. <see cref="IsDurable"/> is true only because this implementation really commits.
 /// </summary>
-public sealed class PostgresFrameJournal(NpgsqlDataSource db) : IFrameJournal
+public sealed class PostgresFrameJournal(NpgsqlDataSource db, ExecutionOwnership? writer = null) : IFrameJournal
 {
     const string S = V2Schema.SchemaName;
 
     public bool IsDurable => true;
 
-    public async ValueTask<AppendOutcome> AppendFrameAsync(FrameRecord r, CancellationToken ct)
+    public async ValueTask<AppendOutcome> AppendFrameAsync(FrameRecord r, CancellationToken ct) => await Pev2Write.RunAsync(db, writer, async (connection, tx) =>
     {
-        await using var ins = db.CreateCommand($"INSERT INTO {S}.pev2_frames (session_id, bar_seq, frame_hash, payload_json, bar_end_utc_ticks, last_source_tick_id, verified) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (session_id, bar_seq) DO NOTHING");
+        await using var ins = new NpgsqlCommand($"INSERT INTO {S}.pev2_frames (session_id, bar_seq, frame_hash, payload_json, bar_end_utc_ticks, last_source_tick_id, verified) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (session_id, bar_seq) DO NOTHING", connection, tx);
         ins.Parameters.AddWithValue(r.SessionId); ins.Parameters.AddWithValue(r.BarSeq); ins.Parameters.AddWithValue(r.FrameHash); ins.Parameters.AddWithValue(r.PayloadJson);
         ins.Parameters.AddWithValue(r.BarEndAvailableAt.UtcTicks); ins.Parameters.AddWithValue(r.LastSourceTickId); ins.Parameters.AddWithValue(r.Verified);
         if (await ins.ExecuteNonQueryAsync(ct) == 1) return AppendOutcome.Appended;
-        await using var sel = db.CreateCommand($"SELECT frame_hash FROM {S}.pev2_frames WHERE session_id = $1 AND bar_seq = $2");
+        await using var sel = new NpgsqlCommand($"SELECT frame_hash FROM {S}.pev2_frames WHERE session_id = $1 AND bar_seq = $2", connection, tx);
         sel.Parameters.AddWithValue(r.SessionId); sel.Parameters.AddWithValue(r.BarSeq);
         var stored = (string?)await sel.ExecuteScalarAsync(ct);
         return string.Equals(stored, r.FrameHash, StringComparison.Ordinal) ? AppendOutcome.DuplicateSame : AppendOutcome.ConflictDifferent;
-    }
+    }, ct);
 
-    public async ValueTask<AppendOutcome> AppendDispositionAsync(DispositionRecord r, CancellationToken ct)
+    public async ValueTask<AppendOutcome> AppendDispositionAsync(DispositionRecord r, CancellationToken ct) => await Pev2Write.RunAsync(db, writer, async (connection, tx) =>
     {
-        await using var ins = db.CreateCommand($"INSERT INTO {S}.pev2_dispositions (session_id, bar_seq, entries_allowed, block_reasons, processing_lag_ms, run_length, previous_frame_usable, processed_without_journal) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (session_id, bar_seq) DO NOTHING");
+        await using var ins = new NpgsqlCommand($"INSERT INTO {S}.pev2_dispositions (session_id, bar_seq, entries_allowed, block_reasons, processing_lag_ms, run_length, previous_frame_usable, processed_without_journal) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (session_id, bar_seq) DO NOTHING", connection, tx);
         ins.Parameters.AddWithValue(r.SessionId); ins.Parameters.AddWithValue(r.BarSeq); ins.Parameters.AddWithValue(r.EntriesAllowed); ins.Parameters.AddWithValue((int)r.BlockReasons);
         ins.Parameters.AddWithValue(r.ProcessingLagMs); ins.Parameters.AddWithValue(r.RunLength); ins.Parameters.AddWithValue(r.PreviousFrameUsable); ins.Parameters.AddWithValue(r.ProcessedWithoutJournal);
         if (await ins.ExecuteNonQueryAsync(ct) == 1) return AppendOutcome.Appended;
-        await using var sel = db.CreateCommand($"SELECT entries_allowed, block_reasons, processing_lag_ms, run_length, previous_frame_usable, processed_without_journal FROM {S}.pev2_dispositions WHERE session_id = $1 AND bar_seq = $2");
+        await using var sel = new NpgsqlCommand($"SELECT entries_allowed, block_reasons, processing_lag_ms, run_length, previous_frame_usable, processed_without_journal FROM {S}.pev2_dispositions WHERE session_id = $1 AND bar_seq = $2", connection, tx);
         sel.Parameters.AddWithValue(r.SessionId); sel.Parameters.AddWithValue(r.BarSeq);
         await using var rd = await sel.ExecuteReaderAsync(ct);
         if (!await rd.ReadAsync(ct)) return AppendOutcome.ConflictDifferent;
         var same = rd.GetBoolean(0) == r.EntriesAllowed && rd.GetInt32(1) == (int)r.BlockReasons && rd.GetInt32(2) == r.ProcessingLagMs && rd.GetInt32(3) == r.RunLength && rd.GetBoolean(4) == r.PreviousFrameUsable && rd.GetBoolean(5) == r.ProcessedWithoutJournal;
         return same ? AppendOutcome.DuplicateSame : AppendOutcome.ConflictDifferent;
-    }
+    }, ct);
 
-    public async ValueTask AppendGapAsync(GapRecord r, CancellationToken ct)
+    public async ValueTask AppendGapAsync(GapRecord r, CancellationToken ct) => await Pev2Write.RunAsync(db, writer, async (connection, tx) =>
     {
-        await using var ins = db.CreateCommand($"INSERT INTO {S}.pev2_gaps (session_id, from_bar_seq, to_bar_seq, cause, producer_signals) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (session_id, from_bar_seq, to_bar_seq) DO NOTHING");
+        await using var ins = new NpgsqlCommand($"INSERT INTO {S}.pev2_gaps (session_id, from_bar_seq, to_bar_seq, cause, producer_signals) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (session_id, from_bar_seq, to_bar_seq) DO NOTHING", connection, tx);
         ins.Parameters.AddWithValue(r.SessionId); ins.Parameters.AddWithValue(r.FromBarSeq); ins.Parameters.AddWithValue(r.ToBarSeq); ins.Parameters.AddWithValue((int)r.Cause); ins.Parameters.AddWithValue((int)r.ProducerSignals);
-        await ins.ExecuteNonQueryAsync(ct);
-    }
+        return await ins.ExecuteNonQueryAsync(ct);
+    }, ct);
 
+    // PENDING (audit finding F81): the in-Host engine still reads the whole session journal into memory on a rebuild. The standalone execution service pages its journal; the in-Host engine is the
+    // fallback writer only and was not changed.
     public async ValueTask<JournalSession> ReadSessionAsync(long sessionId, CancellationToken ct)
     {
         var frames = new List<FrameRecord>(); var disp = new List<DispositionRecord>(); var gaps = new List<GapRecord>();
@@ -122,7 +124,8 @@ public static class EventSerializer
 
     static readonly Dictionary<string, Type> Types = new[]
     {
-        typeof(EntryRejected), typeof(EntryOrderPlaced), typeof(EntryFilled), typeof(ExitRequested), typeof(ExitFilled), typeof(PositionUnresolved), typeof(RiskBreached), typeof(StrategyFaulted),
+        typeof(EntryRejected), typeof(EntryOrderPlaced), typeof(EntryFilled), typeof(ExitRequested), typeof(ExitFilled), typeof(PositionUnresolved), typeof(RiskBreached), typeof(StrategyFaulted), typeof(EntryIntentCreated), typeof(EntryIntentCancelled), typeof(Avg5EntryEvidence),
+        typeof(PartialTargetAssigned), typeof(PartialExitRequested), typeof(PartialExitFilled), typeof(LiquidationFailed),
     }.ToDictionary(t => t.Name, t => t, StringComparer.Ordinal);       // each record's Kind equals its type name (asserted by a test)
 
     public static string Serialize(PaperEvent e) => JsonSerializer.Serialize(e, e.GetType(), Options);
@@ -139,7 +142,7 @@ public static class EventSerializer
 /// that DIFFERS from the regenerated one is counted in <see cref="Conflicts"/> and never overwritten). A failure is counted in <see cref="Failures"/> - the engine contains it and the ledger is then NOT complete until
 /// a reconcile; <see cref="IsComplete"/> says so honestly.
 /// </summary>
-public sealed class PostgresEventStore(NpgsqlDataSource db) : IPaperEventSink
+public sealed class PostgresEventStore(NpgsqlDataSource db, ExecutionOwnership? writer = null) : IPaperEventSink
 {
     const string S = V2Schema.SchemaName;
     long _failures, _conflicts, _written;
@@ -157,13 +160,18 @@ public sealed class PostgresEventStore(NpgsqlDataSource db) : IPaperEventSink
         try
         {
             var payload = EventSerializer.Serialize(e);
-            using var ins = db.CreateCommand($"INSERT INTO {S}.pev2_events (event_id, strategy_id, config_hash, kind, bar_seq, at_utc_ticks, payload_json) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (event_id) DO NOTHING");
-            ins.Parameters.AddWithValue(e.EventId); ins.Parameters.AddWithValue(e.StrategyId); ins.Parameters.AddWithValue(e.ConfigHash); ins.Parameters.AddWithValue(e.Kind);
-            ins.Parameters.AddWithValue(e.BarSeq); ins.Parameters.AddWithValue(e.At.UtcTicks); ins.Parameters.AddWithValue(payload);
-            if (ins.ExecuteNonQuery() == 1) { Interlocked.Increment(ref _written); return; }
-            using var sel = db.CreateCommand($"SELECT payload_json FROM {S}.pev2_events WHERE event_id = $1");
-            sel.Parameters.AddWithValue(e.EventId);
-            if (!string.Equals((string?)sel.ExecuteScalar(), payload, StringComparison.Ordinal)) Interlocked.Increment(ref _conflicts);
+            var (inserted, differs) = Pev2Write.Run(db, writer, (connection, tx) =>
+            {
+                using var ins = new NpgsqlCommand($"INSERT INTO {S}.pev2_events (event_id, strategy_id, config_hash, kind, bar_seq, at_utc_ticks, payload_json) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (event_id) DO NOTHING", connection, tx);
+                ins.Parameters.AddWithValue(e.EventId); ins.Parameters.AddWithValue(e.StrategyId); ins.Parameters.AddWithValue(e.ConfigHash); ins.Parameters.AddWithValue(e.Kind);
+                ins.Parameters.AddWithValue(e.BarSeq); ins.Parameters.AddWithValue(e.At.UtcTicks); ins.Parameters.AddWithValue(payload);
+                if (ins.ExecuteNonQuery() == 1) return (true, false);
+                using var sel = new NpgsqlCommand($"SELECT payload_json FROM {S}.pev2_events WHERE event_id = $1", connection, tx);
+                sel.Parameters.AddWithValue(e.EventId);
+                return (false, !string.Equals((string?)sel.ExecuteScalar(), payload, StringComparison.Ordinal));
+            });
+            if (inserted) Interlocked.Increment(ref _written);
+            if (differs) Interlocked.Increment(ref _conflicts);
         }
         catch (Exception)
         {
@@ -187,12 +195,12 @@ public sealed class PostgresEventStore(NpgsqlDataSource db) : IPaperEventSink
     }
 
     /// <summary>Records the exact canonical strategy configuration a ledger event's config hash refers to (idempotent).</summary>
-    public async Task RecordConfigAsync(StrategyConfig config, DateTimeOffset now, CancellationToken ct)
+    public async Task RecordConfigAsync(StrategyConfig config, DateTimeOffset now, CancellationToken ct) => await Pev2Write.RunAsync(db, writer, async (connection, tx) =>
     {
-        await using var c = db.CreateCommand($"INSERT INTO {S}.pev2_strategy_configs (config_hash, strategy_id, version, canonical_json, recorded_utc_ticks) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (config_hash) DO NOTHING");
+        await using var c = new NpgsqlCommand($"INSERT INTO {S}.pev2_strategy_configs (config_hash, strategy_id, version, canonical_json, recorded_utc_ticks) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (config_hash) DO NOTHING", connection, tx);
         c.Parameters.AddWithValue(config.Identity.Hash); c.Parameters.AddWithValue(config.Identity.StrategyId); c.Parameters.AddWithValue(config.Identity.Version); c.Parameters.AddWithValue(config.CanonicalJson); c.Parameters.AddWithValue(now.UtcTicks);
-        await c.ExecuteNonQueryAsync(ct);
-    }
+        return await c.ExecuteNonQueryAsync(ct);
+    }, ct);
 }
 
 public sealed record ReconcileReport(int Regenerated, int MissingInStore, int ExtraInStore, int Different)

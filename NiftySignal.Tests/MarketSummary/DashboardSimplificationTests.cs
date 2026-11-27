@@ -354,17 +354,17 @@ public class DashboardSimplificationTests
     // ---- 15: the screenshot renderer's grid contract ----
 
     [Fact]
-    public void Renderer_RequiresTheSixNamedGridsInOrder_AndRefusesTheRemovedOnes()
+    public void Renderer_RequiresTheFiveNamedGridsInOrder_AndRefusesTheRemovedOnes()
     {
-        string[] ok = ["summary-futures", "summary-total-itm", "summary-total", "summary-total-otm", "futures-compact", "options-core-direction", "options-context", "residual-compact"];
+        string[] ok = ["summary-futures", "summary-total-itm", "summary-total", "summary-total-otm", "residual-compact"];
         Assert.True(AdaptiveScreenshotRenderer.IsExpectedGridSequence(ok));
         Assert.True(AdaptiveScreenshotRenderer.IsExpectedGridSequence([.. ok, "unrelated-extra-grid"]));        // an unrelated table never breaks a capture
-        Assert.False(AdaptiveScreenshotRenderer.IsExpectedGridSequence(ok.Take(5).ToArray()));                  // a missing grid
+        Assert.False(AdaptiveScreenshotRenderer.IsExpectedGridSequence(ok.Take(4).ToArray()));                  // a missing grid
         Assert.False(AdaptiveScreenshotRenderer.IsExpectedGridSequence([.. ok, "residual-compact"]));           // a duplicated section
         Assert.False(AdaptiveScreenshotRenderer.IsExpectedGridSequence([ok[1], ok[0], .. ok.Skip(2)]));         // wrong order
         foreach (var gone in AdaptiveScreenshotRenderer.ForbiddenGrids)
             Assert.False(AdaptiveScreenshotRenderer.IsExpectedGridSequence([gone, .. ok]));
-        Assert.Equal(8, AdaptiveScreenshotRenderer.RequiredGrids.Count);
+        Assert.Equal(5, AdaptiveScreenshotRenderer.RequiredGrids.Count);
         var src = File.ReadAllText(Path.Combine(TradingModelTests.RepoRoot(), "NiftySignal.Dashboard", "Services", "AdaptiveScreenshotRenderer.cs"));
         Assert.Contains("Removed capture grid", src);
         Assert.Contains("not in the expected order", src);

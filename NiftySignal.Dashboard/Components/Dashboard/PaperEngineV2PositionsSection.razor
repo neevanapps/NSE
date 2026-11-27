@@ -1,0 +1,98 @@
+@using System.Globalization
+@using NiftySignal.Dashboard.Services
+@using NiftySignal.PaperEngineV2.Execution
+
+@* PAPER TRADING — exactly two grids, one row per enabled strategy each. Pure presentation of PaperPositionsView; read-only. A figure that is not supported by current data renders as "unavailable", never zero. *@
+<section class="panel v2-shadow" data-testid="paper-trading">
+    <div class="panel-title">PAPER TRADING <span class="badge badge-neutral">paper only · no real orders</span></div>
+    @if (View is null)
+    {
+        <div class="text-faint" data-testid="paper-loading">Loading…</div>
+    }
+    else
+    {
+        @if (View.Notice is { } notice)
+        {
+            <div class="v2-warn" role="alert" data-testid="paper-notice">@notice</div>
+        }
+        @if (View.Heartbeat is { } beat)
+        {
+            <div class="v2-health" data-testid="paper-health">
+                <span>Execution <b class="@(View.Stale || View.Status != "Running" ? "v2-warn" : "")" data-testid="paper-status">@(View.Stale ? "NOT CURRENT" : View.Status)</b></span>
+                <span>Last report <b>@($"{Math.Max(0d, (View.AsOf - beat).TotalSeconds):0}s ago")</b></span>
+                @if (View.EntryBlock is { } block) { <span class="v2-warn" data-testid="paper-entry-block">Entries blocked: @block</span> }
+                @if (View.Flatten is { } flatten) { <span class="v2-warn" data-testid="paper-flatten">Protective flatten: @flatten</span> }
+            </div>
+        }
+        @foreach (var condition in View.Conditions)
+        {
+            <div class="v2-warn" data-testid="paper-condition">@condition</div>
+        }
+
+        <div class="panel-subtitle">Current positions</div>
+        <div class="scroll-x"><table class="data-table" data-testid="paper-current">
+            <thead><tr><th>Strategy</th><th>Status</th><th>Contract</th><th>Entry (IST)</th><th>Fill</th><th>Qty</th><th>Remaining</th><th title="live executable bid">Bid</th><th>Quote</th>
+                <th title="(bid - exit slippage - entry fill) x remaining - entry charges of the remaining quantity - estimated exit charges">Unrealized net</th>
+                <th title="net of the confirmed partial exit of this still-open position">Realized partial</th><th title="realized partial + unrealized">Position total</th><th>Partial target</th></tr></thead>
+            <tbody>
+            @foreach (var r in View.Current)
+            {
+                var p = r.Position;
+                <tr data-strategy="@r.StrategyId">
+                    <td>@r.StrategyId</td>
+                    <td class="@(r.Critical ? "v2-warn" : "")" data-testid="paper-row-status">@r.Status</td>
+                    <td title="@(p?.Token ?? r.Pending?.OrderToken ?? r.Pending?.ReferenceToken)">@Contract(r)</td>
+                    <td>@(p?.EntryAt is { } at ? Ist(at) : "—")</td>
+                    <td>@(p is null ? "—" : Px(p.EntryPrice))</td>
+                    <td>@(p is null ? "—" : p.Quantity.ToString(CultureInfo.InvariantCulture))</td>
+                    <td data-testid="paper-remaining">@(p is null ? "—" : p.RemainingQuantity.ToString(CultureInfo.InvariantCulture))</td>
+                    <td data-testid="paper-bid">@(p is null ? "—" : r.Bid is { } b ? Px(b) : "unavailable")</td>
+                    <td title="@r.QuoteDetail" data-testid="paper-quote">
+                        @if (r.Quote is { } q)
+                        {
+                            <span class="@(q == MarkStatus.Fresh ? "badge badge-bull" : "badge badge-warn")">@q.ToString().ToUpperInvariant()</span>
+                            @if (r.QuoteAgeSeconds is { } a) { <span> @($"{a:0.0}s")</span> }
+                        }
+                        else { <span>—</span> }
+                    </td>
+                    <td class="@PnlClass(r.Unrealized)" data-testid="paper-unrealized">@(p is null ? "—" : Money(r.Unrealized))</td>
+                    <td class="@PnlClass(r.RealizedPartial)" data-testid="paper-partial">@(p is null ? "—" : Money(r.RealizedPartial))</td>
+                    <td class="@PnlClass(r.Total)" data-testid="paper-total">@(p is null ? "—" : Money(r.Total))</td>
+                    <td data-testid="paper-target">@(p is null ? "—" : $"{(p.PartialTargetPrice is { } t ? Px(t) : "none")} · {p.PartialStatus}")</td>
+                </tr>
+            }
+            </tbody>
+        </table></div>
+
+        <div class="panel-subtitle">Today's fully closed positions</div>
+        <div class="scroll-x"><table class="data-table" data-testid="paper-closed">
+            <thead><tr><th>Strategy</th><th>Closed</th><th>Wins</th><th>Losses</th><th>Gross</th><th>Charges</th><th title="each closed position includes its earlier partial exit">Net</th><th>Last exit</th></tr></thead>
+            <tbody>
+            @foreach (var c in View.Closed)
+            {
+                <tr data-strategy="@c.StrategyId">
+                    <td>@c.StrategyId</td><td data-testid="paper-closed-count">@c.Closed</td><td>@c.Wins</td><td>@c.Losses</td>
+                    <td class="@PnlClass(c.Gross)">@Money(c.Gross)</td><td>@c.Charges.ToString("N2", CultureInfo.InvariantCulture)</td>
+                    <td class="@PnlClass(c.Net)" data-testid="paper-closed-net">@Money(c.Net)</td><td>@(c.LastExit ?? "—")</td>
+                </tr>
+            }
+            </tbody>
+        </table></div>
+    }
+</section>
+
+@code {
+    [Parameter] public PaperPositionsView? View { get; set; }
+
+    static string Contract(CurrentPositionRow r) => r.Position is { } p
+        ? $"{p.Expiry.ToString("dd-MMM", CultureInfo.InvariantCulture)} {p.Strike.ToString("0", CultureInfo.InvariantCulture)} {(p.Right == OptionRight.Call ? "CE" : "PE")}"
+        : r.Pending is { } w ? $"{(w.Right == OptionRight.Call ? "CE" : "PE")} since {Ist(w.SignalAt)}" : "—";
+
+    static string Ist(DateTimeOffset t) => t.ToOffset(TimeSpan.FromHours(5.5)).ToString("HH:mm:ss", CultureInfo.InvariantCulture);
+
+    static string Px(decimal v) => v.ToString("0.00", CultureInfo.InvariantCulture);
+
+    static string Money(decimal? v) => v is { } x ? (x > 0 ? "+" : "") + x.ToString("N2", CultureInfo.InvariantCulture) : "unavailable";
+
+    static string PnlClass(decimal? v) => v is null ? "" : v > 0 ? "paper-pnl-up" : v < 0 ? "paper-pnl-down" : "";
+}

@@ -1,0 +1,21 @@
+@implements IDisposable
+@using NiftySignal.Dashboard.Services
+@using NiftySignal.Domain
+@inject ObserverHealthMonitor Monitor
+
+@if (Monitor.Current.IsCritical)
+{
+    <div class="observer-alert" role="alert" data-observer-condition="@Monitor.Current.Condition">
+        <strong>OBSERVER CRITICAL — @Monitor.Current.Condition</strong>
+        <span>@Monitor.Current.Message</span>
+        <span class="mono">checked @Monitor.Current.EvaluatedAtUtc.ToIst().ToString("HH:mm:ss") IST</span>
+    </div>
+}
+
+@code {
+    protected override void OnInitialized() => Monitor.Changed += OnChanged;
+
+    void OnChanged() => _ = InvokeAsync(StateHasChanged);
+
+    public void Dispose() => Monitor.Changed -= OnChanged;
+}

@@ -1,0 +1,52 @@
+@implements IDisposable
+@using Microsoft.Extensions.Options
+@using NiftySignal.Dashboard.Services
+@inject IServiceProvider Services
+
+@* Refreshes about once a second on its OWN timer, independent of completed futures bars: two bounded reads (the execution state row and today's marks). A read still in flight skips the tick. *@
+<PaperEngineV2PositionsSection View="_view" />
+
+@code {
+    static readonly TimeSpan Refresh = TimeSpan.FromSeconds(1);
+
+    PaperPositionsView? _view;
+    PaperEngineV2DataService? _service;
+    TimeSpan _staleAfter = TimeSpan.FromSeconds(30);
+    Timer? _timer;
+    int _busy, _disposed;
+
+    protected override async Task OnInitializedAsync()
+    {
+        _service = Services.GetService(typeof(PaperEngineV2DataService)) as PaperEngineV2DataService;
+        if (Services.GetService(typeof(IOptions<ExecutionHealthOptions>)) is IOptions<ExecutionHealthOptions> health)
+            _staleAfter = TimeSpan.FromSeconds(health.Value.StaleHeartbeatSeconds);
+        if (_service is null)
+        {
+            _view = PaperPositionsView.Unavailable(DateTimeOffset.UtcNow, "the paper ledger database is not configured for this dashboard");
+            return;
+        }
+
+        await LoadAsync();
+        _timer = new Timer(_ => _ = InvokeAsync(LoadAsync), null, Refresh, Refresh);
+    }
+
+    async Task LoadAsync()
+    {
+        if (_service is null || Volatile.Read(ref _disposed) == 1 || Interlocked.Exchange(ref _busy, 1) == 1) return;
+        try
+        {
+            _view = await _service.LoadPaperPositionsAsync(DateTimeOffset.UtcNow, _staleAfter, CancellationToken.None);
+            if (Volatile.Read(ref _disposed) == 0) StateHasChanged();
+        }
+        finally
+        {
+            Volatile.Write(ref _busy, 0);
+        }
+    }
+
+    public void Dispose()
+    {
+        Volatile.Write(ref _disposed, 1);
+        _timer?.Dispose();
+    }
+}

@@ -199,6 +199,23 @@ public sealed class FuturesBasisTracker
             status);
     }
 
+    /// <summary>
+    /// Releases the basis states and spot observations no later bar or spot lookup can read: everything older than the one in force at <paramref name="instant"/>. Callers pass a completed bar's end; later bars and lookups are at or after it.
+    /// </summary>
+    public void ReleaseBefore(DateTimeOffset instant)
+    {
+        var keepFrom = UpperBound(instant) - 1;
+        if (keepFrom > 0) _states.RemoveRange(0, keepFrom);
+        int lo = 0, hi = _spotHistory.Count;
+        while (lo < hi)
+        {
+            var mid = lo + (hi - lo) / 2;
+            if (_spotHistory[mid].At <= instant) lo = mid + 1; else hi = mid;
+        }
+
+        if (lo > 1) _spotHistory.RemoveRange(0, lo - 1);
+    }
+
     int UpperBound(DateTimeOffset instant)
     {
         int lo = 0, hi = _states.Count;

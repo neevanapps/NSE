@@ -9,10 +9,13 @@
   <Project Path="NiftySignal.Dashboard/NiftySignal.Dashboard.csproj" />
   <Project Path="NiftySignal.Domain/NiftySignal.Domain.csproj" />
   <Project Path="NiftySignal.Execution/NiftySignal.Execution.csproj" />
+  <Project Path="NiftySignal.ExecutionService/NiftySignal.ExecutionService.csproj" />
   <Project Path="NiftySignal.Features/NiftySignal.Features.csproj" />
   <Project Path="NiftySignal.Host/NiftySignal.Host.csproj" />
   <Project Path="NiftySignal.Ingestion/NiftySignal.Ingestion.csproj" />
   <Project Path="NiftySignal.Notifications/NiftySignal.Notifications.csproj" />
+  <Project Path="NiftySignal.Observer/NiftySignal.Observer.csproj" />
+  <Project Path="NiftySignal.ObserverRuntime/NiftySignal.ObserverRuntime.csproj" />
   <Project Path="NiftySignal.MarketSummary/NiftySignal.MarketSummary.csproj" />
   <Project Path="NiftySignal.PaperEngineV2.Core/NiftySignal.PaperEngineV2.Core.csproj" />
   <Project Path="NiftySignal.PaperEngineV2.Execution/NiftySignal.PaperEngineV2.Execution.csproj" />

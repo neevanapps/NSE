@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+  <!-- The NiftySignalObserver Windows service: market state, volume bars, metrics, recovery, checkpoints and publication. It reads the ticks the Host stores and writes the observer database. It references no
+       broker or ingestion project (asserted by a test): no FlatTrade session of its own, and its failure does not touch ingestion or the execution service. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="NiftySignal.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" />
+    <PackageReference Include="Serilog.Extensions.Hosting" />
+    <PackageReference Include="Serilog.Sinks.Console" />
+    <PackageReference Include="Serilog.Sinks.File" />
+    <PackageReference Include="Serilog.Settings.Configuration" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NiftySignal.ObserverRuntime\NiftySignal.ObserverRuntime.csproj" />
+  </ItemGroup>
+
+</Project>

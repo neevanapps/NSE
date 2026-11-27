@@ -66,6 +66,15 @@ public sealed class FrameSequenceGuard
         }
     }
 
+    /// <summary>The same restoration from the guard's own memory: the hash of every accepted bar of <paramref name="last"/>'s session, and the newest frame.</summary>
+    public void Restore(MarketStateFrame last, IReadOnlyDictionary<int, string> hashes)
+    {
+        _hashes.Clear();
+        foreach (var (bar, hash) in hashes) _hashes[bar] = hash;
+        _sessionId = last.Identity.SessionId;
+        _last = last;
+    }
+
     GuardDecision Accept(MarketStateFrame frame, GuardVerdict verdict, IntegrityFlags flags, int? from, int? to, bool previousUsable)
     {
         if (_hashes.Count >= MaxTrackedFrames) throw new InvalidOperationException("frame tracking bound exceeded");
@@ -124,6 +133,18 @@ public sealed class FrameConsumer
         _previousUsable = replay.LastFrame?.Identity.Verified ?? false;
         _run = 0;
         _processed += replay.FramesReplayed;
+    }
+
+    /// <summary>
+    /// <see cref="RecoverFromJournalAsync"/> for a caller that has already replayed the session itself, page by page, without keeping its frames: same guard, previous-frame link and clean-run length.
+    /// </summary>
+    public void Resume(MarketStateFrame last, IReadOnlyDictionary<int, string> hashes)
+    {
+        _guard.Restore(last, hashes);
+        _previous = last;
+        _previousUsable = last.Identity.Verified;
+        _run = 0;
+        _processed += hashes.Count;
     }
 
     public async Task<ConsumerExit> RunAsync(CancellationToken ct)

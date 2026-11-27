@@ -226,6 +226,89 @@ namespace NiftySignal.PaperEngineV2.Data.Migrations
                     b.ToTable("pev2_events", "pev2");
                 });
 
+            modelBuilder.Entity("NiftySignal.PaperEngineV2.Data.ExecutionJournalRow", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint")
+                        .HasColumnName("id");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityAlwaysColumn(b.Property<long>("Id"));
+
+                    b.Property<long>("AtUtcTicks")
+                        .HasColumnType("bigint")
+                        .HasColumnName("at_utc_ticks");
+
+                    b.Property<long>("Epoch")
+                        .HasColumnType("bigint")
+                        .HasColumnName("epoch");
+
+                    b.Property<string>("PayloadJson")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("payload_json");
+
+                    b.Property<string>("TradeDate")
+                        .IsRequired()
+                        .HasMaxLength(10)
+                        .HasColumnType("character varying(10)")
+                        .HasColumnName("trade_date")
+                        .UseCollation("C");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("TradeDate", "Id");
+
+                    b.ToTable("pev2_execution_journal", "pev2");
+                });
+
+            modelBuilder.Entity("NiftySignal.PaperEngineV2.Data.ExecutionStateRow", b =>
+                {
+                    b.Property<string>("Component")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)")
+                        .HasColumnName("component")
+                        .UseCollation("C");
+
+                    b.Property<long>("Epoch")
+                        .HasColumnType("bigint")
+                        .HasColumnName("epoch");
+
+                    b.Property<long>("HeartbeatUtcTicks")
+                        .HasColumnType("bigint")
+                        .HasColumnName("heartbeat_utc_ticks");
+
+                    b.Property<string>("Owner")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)")
+                        .HasColumnName("owner")
+                        .UseCollation("C");
+
+                    b.Property<string>("SnapshotJson")
+                        .IsRequired()
+                        .HasColumnType("text")
+                        .HasColumnName("snapshot_json");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(24)
+                        .HasColumnType("character varying(24)")
+                        .HasColumnName("status")
+                        .UseCollation("C");
+
+                    b.Property<string>("TradeDate")
+                        .IsRequired()
+                        .HasMaxLength(10)
+                        .HasColumnType("character varying(10)")
+                        .HasColumnName("trade_date")
+                        .UseCollation("C");
+
+                    b.HasKey("Component");
+
+                    b.ToTable("pev2_execution_state", "pev2");
+                });
+
             modelBuilder.Entity("NiftySignal.PaperEngineV2.Data.FrameRow", b =>
                 {
                     b.Property<long>("SessionId")

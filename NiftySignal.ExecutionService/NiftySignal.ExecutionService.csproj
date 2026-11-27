@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk.Worker">
+
+  <!-- The NiftySignalExecution Windows service (docs/NSE_EXECUTION_SERVICE_ARCHITECTURE.md): the single writer of paper position and execution state. Paper only: it references no broker, ingestion or
+       FlatTrade project (asserted by a test); it reads the ticks the Host stores and the bars the Observer publishes. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="NiftySignal.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" />
+    <PackageReference Include="Serilog.Extensions.Hosting" />
+    <PackageReference Include="Serilog.Sinks.Console" />
+    <PackageReference Include="Serilog.Sinks.File" />
+    <PackageReference Include="Serilog.Settings.Configuration" />
+    <PackageReference Include="Microsoft.Extensions.Http" />
+  </ItemGroup>
+
+  <!-- The reviewed strategy files ship with the service: Execution:StrategyDirectory is resolved against the exe's folder. -->
+  <ItemGroup>
+    <None Include="..\paper-engine-v2-strategies\execution-service\*.json" Link="paper-engine-v2-strategies\execution-service\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NiftySignal.PaperEngineV2.Runtime\NiftySignal.PaperEngineV2.Runtime.csproj" />
+    <ProjectReference Include="..\NiftySignal.Notifications\NiftySignal.Notifications.csproj" />
+  </ItemGroup>
+
+</Project>

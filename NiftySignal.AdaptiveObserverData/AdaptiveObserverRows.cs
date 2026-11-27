@@ -335,6 +335,8 @@ public enum AdaptiveRuntimeStatus
     Live = 2,
     Degraded = 3,
     Closed = 4,
+    /// <summary>The last recovery attempt failed or timed out; <see cref="AdaptiveObserverRuntimeRow.LastError"/> says why. Another attempt follows.</summary>
+    RecoveryFailed = 5,
 }
 
 public sealed class AdaptiveObserverRuntimeRow
@@ -352,6 +354,16 @@ public sealed class AdaptiveObserverRuntimeRow
     public DateTimeOffset? LastRecoveryCompletedUtc { get; set; }
     public int LastRecoveryReconciledBars { get; set; }
     public string? LastError { get; set; }
+
+    // Progress of the current (or last) recovery attempt, written only from inside the recovery loop. No total is estimated: the one known size is the number of bars already persisted when it started.
+    public string? RecoveryPhase { get; set; }
+    public DateTimeOffset? LastRecoveryProgressUtc { get; set; }
+    public long RecoveryTicksProcessed { get; set; }
+    public int RecoveryBarsReplayed { get; set; }
+    public int? RecoveryPersistedBarsAtStart { get; set; }
+    public DateTimeOffset? RecoveryReplayedThroughUtc { get; set; }
+    /// <summary>Consecutive failed recovery attempts; zero after a successful one.</summary>
+    public int RecoveryFailureCount { get; set; }
 }
 
 /// <summary>
@@ -792,4 +804,17 @@ public sealed class AdaptiveOptionStrikeBarRow
     public double? VegaStart { get; set; }
     public double? VegaEnd { get; set; }
     public double? VegaChange { get; set; }
+}
+
+/// <summary>
+/// The durable Observer-to-execution handoff: one row per completed bar, written after the bar and its sidecars are persisted and their verification verdict is known. Insert-if-missing and immutable.
+/// The execution service reads it in bar order; the Observer never waits for the service.
+/// </summary>
+public sealed class AdaptiveBarPublicationRow
+{
+    public long SessionId { get; set; }
+    public int BarSeq { get; set; }
+    public bool Verified { get; set; }
+    public string? UnverifiedReason { get; set; }
+    public DateTimeOffset PublishedAtUtc { get; set; }
 }

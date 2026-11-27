@@ -12,32 +12,26 @@ public interface IAdaptiveScreenshotRenderer
     Task CaptureAsync(AdaptiveScreenshotJobRow job, string path, CancellationToken ct);
 }
 
-/// <summary>One primary grid every research capture must contain. <see cref="StartsAtTarget"/>: its first body row is the target completed bar (the residual grid is legitimately empty before the 09:30 anchor).</summary>
-public sealed record RequiredCaptureGrid(string Grid, bool StartsAtTarget);
-
 public sealed class AdaptiveScreenshotRenderer(IOptions<AdaptiveScreenshotOptions> settings,
     IOptionsMonitor<CookieAuthenticationOptions> cookieOptions, IOptions<DashboardAuthOptions> auth) : IAdaptiveScreenshotRenderer
 {
     public const string AuthenticationScheme = "AdaptiveCapture";
 
-    /// <summary>The stable identities of the primary research grids (data-grid attributes in AdaptiveObserverPanel), in the order they must appear: the Futures summary and the three TOTAL Market Summary grids (ITM-shifted, ATM, OTM-shifted), then the detailed
-    /// Futures grid, the two fixed-strike Options grids and the residual grid (five sections, eight data tables).</summary>
-    public static readonly IReadOnlyList<RequiredCaptureGrid> RequiredGrids =
-    [
-        new("summary-futures", false), new("summary-total-itm", false), new("summary-total", false), new("summary-total-otm", false),
-        new("futures-compact", true), new("options-core-direction", true), new("options-context", true), new("residual-compact", false),
-    ];
+    /// <summary>The stable identities of the primary research grids (data-grid attributes in AdaptiveObserverPanel), in the order they must appear: the Futures summary, the three TOTAL Market Summary grids (ITM-shifted, ATM, OTM-shifted) and the
+    /// residual grid. Option Price Averages is not captured: it quotes the live market, not the pinned bar.</summary>
+    public static readonly IReadOnlyList<string> RequiredGrids = ["summary-futures", "summary-total-itm", "summary-total", "summary-total-otm", "residual-compact"];
 
-    /// <summary>Grids that must NOT be in a capture: the ATM / ITM / OTM summaries were removed from the presentation (2026-11-02).</summary>
+    /// <summary>Grids that must NOT be in a capture: presentation grids that were removed (the ATM / ITM / OTM summaries, and the three bar-wise grids).</summary>
     public static readonly IReadOnlyList<string> ForbiddenGrids =
-        ["summary-atm-core", "summary-atm-context", "summary-itm-core", "summary-itm-context", "summary-otm-core", "summary-otm-context", "summary-total-core", "summary-total-context"];
+        ["summary-atm-core", "summary-atm-context", "summary-itm-core", "summary-itm-context", "summary-otm-core", "summary-otm-context", "summary-total-core", "summary-total-context",
+         "futures-compact", "options-core-direction", "options-context"];
 
     /// <summary>True when every required grid occurs exactly once in <paramref name="documentOrder"/> and in the required relative order, and no forbidden grid occurs.</summary>
     public static bool IsExpectedGridSequence(IReadOnlyList<string> documentOrder)
     {
         if (ForbiddenGrids.Any(documentOrder.Contains)) return false;
-        var seen = documentOrder.Where(g => RequiredGrids.Any(r => r.Grid == g)).ToList();
-        return seen.SequenceEqual(RequiredGrids.Select(r => r.Grid));
+        var seen = documentOrder.Where(RequiredGrids.Contains).ToList();
+        return seen.SequenceEqual(RequiredGrids);
     }
 
     /// <summary>Other blocks a research capture must contain (data-testid): the identity header, its data-quality line and the recent-events strip.</summary>
@@ -83,8 +77,8 @@ public sealed class AdaptiveScreenshotRenderer(IOptions<AdaptiveScreenshotOption
             // Required PRIMARY content is verified by stable identities, not by counting tables (Diagnostics and any future table must not break a capture).
             // A capture that is missing any of them is refused rather than sent partially.
             foreach (var required in RequiredGrids)
-                if (await page.Locator($".adaptive-table[data-grid='{required.Grid}']").CountAsync() != 1)
-                    throw new InvalidOperationException($"Required capture grid '{required.Grid}' did not render; image not uploaded.");
+                if (await page.Locator($".adaptive-table[data-grid='{required}']").CountAsync() != 1)
+                    throw new InvalidOperationException($"Required capture grid '{required}' did not render; image not uploaded.");
             foreach (var forbidden in ForbiddenGrids)
                 if (await page.Locator($".adaptive-table[data-grid='{forbidden}']").CountAsync() != 0)
                     throw new InvalidOperationException($"Removed capture grid '{forbidden}' rendered; image not uploaded.");
@@ -94,9 +88,9 @@ public sealed class AdaptiveScreenshotRenderer(IOptions<AdaptiveScreenshotOption
             foreach (var testId in RequiredBlocks)
                 if (await page.Locator($"[data-testid='{testId}']").CountAsync() < 1)
                     throw new InvalidOperationException($"Required capture block '{testId}' did not render; image not uploaded.");
+            // the picture is of the job's completed bar, never of an earlier or later one
             if (job.TargetBarSeq > 0)
-                foreach (var required in RequiredGrids.Where(x => x.StartsAtTarget))
-                    await Microsoft.Playwright.Assertions.Expect(page.Locator($".adaptive-table[data-grid='{required.Grid}'] tbody tr td:first-child").First).ToHaveTextAsync(job.TargetBarSeq.ToString());
+                await Microsoft.Playwright.Assertions.Expect(page.Locator("[data-testid='market-summary-basket']")).ToHaveAttributeAsync("data-end-bar", job.TargetBarSeq.ToString());
         }
         // Wide tables scroll in the human UI. Expand capture to expose every column, not just the viewport.
         const string PrimaryTables = ".adaptive-capture .adaptive-table";

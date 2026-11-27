@@ -139,7 +139,7 @@ public static partial class StrategyConfigParser
 
     static StrategyConfig? ReadRoot(JsonElement root, string canonical, List<ConfigError> errors)
     {
-        var o = Obj.Open(root, "$", errors, "schema", "strategyId", "version", "enabled", "sourceModel", "entry", "exit", "filters", "instrument", "execution", "quantity", "capital", "position", "risk", "exits", "fees");
+        var o = Obj.Open(root, "$", errors, "schema", "strategyId", "version", "enabled", "sourceModel", "entry", "exit", "filters", "instrument", "execution", "quantity", "capital", "position", "risk", "exits", "fees", "entryTiming", "partialProfit");
         if (o is null) return null;
 
         var schema = o.Str("schema");
@@ -165,6 +165,7 @@ public static partial class StrategyConfigParser
         // exit
         GroupSpec? exitConditions = null;
         string? exitMechanism = null;
+        var onOpposite = OnOppositeEntrySignal.Exit;
         var exit = o.Child("exit", true, "conditions", "onOppositeEntrySignal", "mechanism");
         if (exit is not null)
         {
@@ -177,7 +178,8 @@ public static partial class StrategyConfigParser
             }
 
             var opp = exit.Str("onOppositeEntrySignal");
-            if (opp is not null && opp != "Exit") exit.Error("Value", "onOppositeEntrySignal", "only 'Exit' is allowed: an opposite signal exits, there is no automatic reversal");
+            if (opp == "ExitThenEnterOpposite") onOpposite = OnOppositeEntrySignal.ExitThenEnterOpposite;
+            else if (opp is not null && opp != "Exit") exit.Error("Value", "onOppositeEntrySignal", "must be 'Exit' or 'ExitThenEnterOpposite': an opposite signal always exits first");
         }
 
         // filters
@@ -302,6 +304,16 @@ public static partial class StrategyConfigParser
             }
         }
 
+        var timing = EntryTiming.Immediate;
+        if (o.Has("entryTiming"))
+        {
+            var t = o.Str("entryTiming");
+            if (t == "Avg5Pullback") timing = EntryTiming.Avg5Pullback;
+            else if (t is not null && t != "Immediate") o.Error("Value", "entryTiming", "must be 'Immediate' or 'Avg5Pullback'");
+        }
+
+        var partial = o.Has("partialProfit") ? ReadPartialProfit(o, errors) : null;
+
         var fee = o.Child("fees", true, "schedule")?.Str("schedule");
         if (fee is not null && (fee.Length is 0 or > 64)) errors.Add(new ConfigError("Value", "$/fees/schedule", "1-64 characters"));
 
@@ -310,8 +322,54 @@ public static partial class StrategyConfigParser
         if (errors.Count > 0 || id is null || version is not { } ver || enabled is not { } en || filters is null || premium is null || execution is null || lots is not { } lo || capital is not { } cap || maxConc is not { } mc || risk is null || fee is null)
             return null;
 
-        return new StrategyConfig(new StrategyIdentity(id, ver, CanonicalJson.Sha256Hex(canonical)), en, MetricRegistry.SourceModel, buyCall, buyPut, exitConditions, OnOppositeEntrySignal.Exit,
-            filters, premium, execution, lo, cap, mc, risk, exits, fee, canonical, exitMechanism);
+        return new StrategyConfig(new StrategyIdentity(id, ver, CanonicalJson.Sha256Hex(canonical)), en, MetricRegistry.SourceModel, buyCall, buyPut, exitConditions, onOpposite,
+            filters, premium, execution, lo, cap, mc, risk, exits, fee, canonical, exitMechanism, timing, partial);
+    }
+
+    /// <summary><c>partialProfit</c>. A disabled section yields no policy. Overlapping DTE values, empty buckets and out-of-range numbers are refused: no unapproved target is ever assigned.</summary>
+    static PartialProfitPolicy? ReadPartialProfit(Obj root, List<ConfigError> errors)
+    {
+        var o = root.Child("partialProfit", false, "enabled", "exitQuantityPercent", "vixThreshold", "maxVixAgeSeconds", "freezeAtEntry", "missingVixPolicy", "targets");
+        if (o is null) return null;
+        var before = errors.Count;
+        var enabled = o.Bool("enabled");
+        var percent = o.Num("exitQuantityPercent");
+        if (percent is <= 0d or >= 100d) o.Error("Value", "exitQuantityPercent", "must be greater than 0 and less than 100 (a remainder is always kept)");
+        var threshold = o.Num("vixThreshold");
+        if (threshold is <= 0d) o.Error("Value", "vixThreshold", "must be > 0");
+        var age = o.Int("maxVixAgeSeconds");
+        if (age is < 1 or > 3600) o.Error("Value", "maxVixAgeSeconds", "must be between 1 and 3600");
+        if (o.Bool("freezeAtEntry") is false) o.Error("Value", "freezeAtEntry", "must be true: the target is always frozen at entry");
+        var missing = o.Str("missingVixPolicy");
+        if (missing is not null && missing != "DisablePartialTargetForPosition") o.Error("Value", "missingVixPolicy", "only 'DisablePartialTargetForPosition' is supported");
+
+        var buckets = new List<PartialTargetBucket>();
+        var seen = new HashSet<int>();
+        if (o.Raw("targets") is not { ValueKind: JsonValueKind.Array } arr || arr.GetArrayLength() == 0) o.Error("Required", "targets", "a non-empty array is required");
+        else
+        {
+            var i = 0;
+            foreach (var item in arr.EnumerateArray())
+            {
+                var t = Obj.Open(item, $"{o.Path}/targets/{i++}", errors, "dte", "belowVixPercent", "atOrAboveVixPercent");
+                if (t is null) continue;
+                var low = t.Num("belowVixPercent"); var high = t.Num("atOrAboveVixPercent");
+                if (low is <= 0d or > 1000d) t.Error("Value", "belowVixPercent", "must be in (0, 1000]");
+                if (high is <= 0d or > 1000d) t.Error("Value", "atOrAboveVixPercent", "must be in (0, 1000]");
+                var days = new List<int>();
+                if (t.Raw("dte") is not { ValueKind: JsonValueKind.Array } d || d.GetArrayLength() == 0) t.Error("Required", "dte", "a non-empty array of calendar days to expiry is required");
+                else
+                    foreach (var v in d.EnumerateArray())
+                    {
+                        if (v.ValueKind != JsonValueKind.Number || !v.TryGetInt32(out var n) || n is < 0 or > 365) { t.Error("Value", "dte", "each DTE is an integer in [0, 365]"); continue; }
+                        if (!seen.Add(n)) t.Error("Value", "dte", $"DTE {n} is listed more than once");
+                        days.Add(n);
+                    }
+                if (low is { } l && high is { } h) buckets.Add(new PartialTargetBucket(days, l, h));
+            }
+        }
+
+        return errors.Count == before && enabled is true && percent is { } p && threshold is { } th && age is { } a ? new PartialProfitPolicy(p, th, a, buckets) : null;
     }
 
     static TimeOnly? ReadTime(Obj o, string name)

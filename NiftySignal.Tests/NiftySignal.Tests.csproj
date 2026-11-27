@@ -25,6 +25,7 @@
     <ProjectReference Include="..\NiftySignal.Ingestion\NiftySignal.Ingestion.csproj" />
     <ProjectReference Include="..\NiftySignal.Persistence\NiftySignal.Persistence.csproj" />
     <ProjectReference Include="..\NiftySignal.Notifications\NiftySignal.Notifications.csproj" />
+    <ProjectReference Include="..\NiftySignal.ExecutionService\NiftySignal.ExecutionService.csproj" />
     <ProjectReference Include="..\NiftySignal.Execution\NiftySignal.Execution.csproj" />
     <ProjectReference Include="..\NiftySignal.Trading.Core\NiftySignal.Trading.Core.csproj" />
     <ProjectReference Include="..\NiftySignal.Trading.Signals\NiftySignal.Trading.Signals.csproj" />
@@ -37,6 +38,7 @@
     <ProjectReference Include="..\NiftySignal.BacktestData\NiftySignal.BacktestData.csproj" />
     <ProjectReference Include="..\NiftySignal.MetricTrials\NiftySignal.MetricTrials.csproj" />
     <ProjectReference Include="..\NiftySignal.Host\NiftySignal.Host.csproj" />
+    <ProjectReference Include="..\NiftySignal.ObserverRuntime\NiftySignal.ObserverRuntime.csproj" />
     <ProjectReference Include="..\NiftySignal.Dashboard\NiftySignal.Dashboard.csproj" />
     <ProjectReference Include="..\NiftySignal.Npt1M1\NiftySignal.Npt1M1.csproj" />
     <ProjectReference Include="..\NiftySignal.MarketSummary\NiftySignal.MarketSummary.csproj" />

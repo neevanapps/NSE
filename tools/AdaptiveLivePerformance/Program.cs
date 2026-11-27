@@ -14,7 +14,13 @@
 //   ADAPTIVE_PERF_LIVE_DAYS    comma list yyyy-MM-dd for live simulation + warm recovery ("auto" picks max-rate / median / lightest)
 //   ADAPTIVE_PERF_COLD_DAYS    comma list for cold-recovery-only sessions (default none)
 //   ADAPTIVE_PERF_STRESS       "1" (default) to run the 2x-peak sustained stress on the busiest session, "0" to skip
+//   ADAPTIVE_PERF_CHECKPOINTS  "1" saves and restores Observer checkpoints (default "0": every recovery is a full replay)
 //   ADAPTIVE_PERF_STAGES       comma list of: inputs,live,recovery,dashboard,plans,stress,digest (default all)
+//                              "certify" instead runs only the checkpoint recovery certification with futures and options Top-5 (CheckpointCertification.cs):
+//                              ADAPTIVE_PERF_CERTIFY_DAY (required), ADAPTIVE_PERF_CERTIFY_RESTART_IST (14:30:00), ADAPTIVE_PERF_CERTIFY_END_IST (15:35:30),
+//                              ADAPTIVE_PERF_CERTIFY_DOWNTIME_SECONDS (60), ADAPTIVE_PERF_CERTIFY_POLL_MS (1000), ADAPTIVE_PERF_CERTIFY_LIMIT_SECONDS (300),
+//                              ADAPTIVE_PERF_CHECKPOINT_INTERVAL_SECONDS (60), ADAPTIVE_PERF_CERTIFY_COMPARE_FULL_REPLAY (1).
+//                              The other stages stage Level-1 depth only and do not certify Top-5 recovery.
 using System.Diagnostics;
 using System.Reflection;
 using System.Security.Cryptography;
@@ -61,6 +67,9 @@ if (string.Equals(sourceBuilder.Host, adminBuilder.Host, StringComparison.Ordina
     Console.Error.WriteLine("Refusing to run: ADAPTIVE_PERF_ADMIN must be a different PostgreSQL host:port than the read-only source.");
     return 2;
 }
+
+// The checkpoint-plus-Top-5 recovery certification is its own flow (CheckpointCertification.cs) and runs alone.
+if (stages.Contains("certify")) return await CheckpointCertification.RunAsync(sourceBuilder, adminBuilder, outDir, label);
 
 string DbCs(string database) => new NpgsqlConnectionStringBuilder(adminBuilder.ConnectionString) { Database = database }.ConnectionString;
 
@@ -257,7 +266,7 @@ AdaptiveObserverWorker NewWorker(string observerDb)
 {
     // The worker resolves its contexts from scopes; give it a provider whose observer context points at the requested database.
     var s = new ServiceCollection();
-    s.AddLogging(b => b.SetMinimumLevel(LogLevel.Error).AddSimpleConsole());
+    s.AddLogging(b => b.SetMinimumLevel(LogLevel.Error).AddFilter(typeof(AdaptiveStateRecoveryService).FullName, LogLevel.Information).AddSimpleConsole());     // shows whether a recovery continued from a checkpoint
     s.AddDbContext<NiftySignalDbContext>(o => o.UseNpgsql(DbCs(SourceDb)).AddInterceptors(new CountingInterceptor(sourceCounter)));
     s.AddDbContext<AdaptiveObserverDbContext>(o => o.UseNpgsql(DbCs(observerDb)).AddInterceptors(new CountingInterceptor(observerCounter)));
     s.AddOptions<PricingOptions>();
@@ -267,6 +276,7 @@ AdaptiveObserverWorker NewWorker(string observerDb)
     s.AddSingleton<AdaptiveWeak2ObservationService>();
     s.AddSingleton<AdaptiveStateRecoveryService>(); s.AddSingleton<AdaptiveEndedSessionRecoveryService>(); s.AddSingleton<DashboardPushClient>();
     if (Env("ADAPTIVE_PERF_BASIS", "1") != "0") s.AddSingleton<AdaptiveSessionSupplementalService>();
+    if (Env("ADAPTIVE_PERF_CHECKPOINTS", "0") == "1") s.AddSingleton<AdaptiveCheckpointStore>();     // recovery then restores from the newest checkpoint where one exists
     s.AddSingleton<AdaptiveObserverWorker>();
     return s.BuildServiceProvider().GetRequiredService<AdaptiveObserverWorker>();
 }
@@ -477,7 +487,7 @@ async Task<SimResult> SimulateAsync(DayData d, Staged staged, string observerDb,
 (AdaptiveObserverWorker Worker, ServiceProvider Provider) NewWorkerWithProvider(string observerDb)
 {
     var s = new ServiceCollection();
-    s.AddLogging(b => b.SetMinimumLevel(LogLevel.Error).AddSimpleConsole());
+    s.AddLogging(b => b.SetMinimumLevel(LogLevel.Error).AddFilter(typeof(AdaptiveStateRecoveryService).FullName, LogLevel.Information).AddSimpleConsole());     // shows whether a recovery continued from a checkpoint
     s.AddDbContext<NiftySignalDbContext>(o => o.UseNpgsql(DbCs(SourceDb)).AddInterceptors(new CountingInterceptor(sourceCounter)));
     s.AddDbContext<AdaptiveObserverDbContext>(o => o.UseNpgsql(DbCs(observerDb)).AddInterceptors(new CountingInterceptor(observerCounter)));
     s.AddOptions<PricingOptions>();
@@ -487,6 +497,7 @@ async Task<SimResult> SimulateAsync(DayData d, Staged staged, string observerDb,
     s.AddSingleton<AdaptiveWeak2ObservationService>();
     s.AddSingleton<AdaptiveStateRecoveryService>(); s.AddSingleton<AdaptiveEndedSessionRecoveryService>(); s.AddSingleton<DashboardPushClient>();
     if (Env("ADAPTIVE_PERF_BASIS", "1") != "0") s.AddSingleton<AdaptiveSessionSupplementalService>();
+    if (Env("ADAPTIVE_PERF_CHECKPOINTS", "0") == "1") s.AddSingleton<AdaptiveCheckpointStore>();     // recovery then restores from the newest checkpoint where one exists
     s.AddSingleton<AdaptiveObserverWorker>();
     var provider = s.BuildServiceProvider();
     return (provider.GetRequiredService<AdaptiveObserverWorker>(), provider);

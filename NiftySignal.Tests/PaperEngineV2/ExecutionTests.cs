@@ -373,13 +373,18 @@ public class ExecutionTests
     // ---- terminal handling ----
 
     [Fact]
-    public void Terminal_ExitsAt1500_RetriesUntilCutoff_ThenReportsUnresolved()
+    public void NoTimeExitAt1500_LiquidationAt1508_DeadlineFailureAt1510_ThenUnresolved()
     {
         var e = ExecFixtures.Engine([ExecFixtures.Strat()]);
         ExecFixtures.Run(e, [ExecFixtures.Fr(5, dir: 10), ExecFixtures.Fr(6, quotes: [new("CE26000", 126.5, 127)])]);
-        ExecFixtures.Run(e, [ExecFixtures.Fr(330, quotes: [])]);                           // 15:00:00 IST
+        ExecFixtures.Run(e, [ExecFixtures.Fr(330, quotes: [])]);                           // 15:00:00 IST: entries cease, the position stays open
+        Assert.Empty(ExecFixtures.Of<ExitRequested>(e));
+        ExecFixtures.Run(e, [ExecFixtures.Fr(338, quotes: [])]);                           // 15:08:00 IST: mandatory liquidation starts
         Assert.Equal(ExitReason.Terminal, Assert.Single(ExecFixtures.Of<ExitRequested>(e)).Reason);
-        ExecFixtures.Run(e, [ExecFixtures.Fr(340, quotes: [new("CE26000", 100, 101, AgeMs: 5000)])]);      // only a stale quote
+        Assert.Empty(ExecFixtures.Of<LiquidationFailed>(e));
+        ExecFixtures.Run(e, [ExecFixtures.Fr(340, quotes: [new("CE26000", 100, 101, AgeMs: 5000)])]);      // 15:10, only a stale quote: reported, never closed
+        Assert.Equal(650, Assert.Single(ExecFixtures.Of<LiquidationFailed>(e)).RemainingQuantity);
+        Assert.Equal(PositionState.ExitPending, e.Runtimes.Single().Positions().Single().State);
         Assert.Empty(ExecFixtures.Of<PositionUnresolved>(e));
         ExecFixtures.Run(e, [ExecFixtures.Fr(366, quotes: [])]);                           // 15:36 IST > the 15:35 cut-off
         Assert.Single(ExecFixtures.Of<PositionUnresolved>(e));
@@ -391,12 +396,12 @@ public class ExecutionTests
     public void Terminal_ExitFills_WhenAQuoteArrivesBeforeTheCutoff()
     {
         var e = ExecFixtures.Engine([ExecFixtures.Strat()]);
-        ExecFixtures.Run(e, [ExecFixtures.Fr(5, dir: 10), ExecFixtures.Fr(6, quotes: [new("CE26000", 126.5, 127)]), ExecFixtures.Fr(330, quotes: []), ExecFixtures.Fr(331, quotes: [new("CE26000", 120, 121)])]);
+        ExecFixtures.Run(e, [ExecFixtures.Fr(5, dir: 10), ExecFixtures.Fr(6, quotes: [new("CE26000", 126.5, 127)]), ExecFixtures.Fr(338, quotes: []), ExecFixtures.Fr(339, quotes: [new("CE26000", 120, 121)])]);
         Assert.Equal(ExitReason.Terminal, Assert.Single(ExecFixtures.Of<ExitFilled>(e)).Reason);
     }
 
     [Fact]
-    public void PendingEntry_IsCancelledAtTheTerminalTime_NeverFilledAfter1500()
+    public void PendingEntry_IsCancelledAtTheEntryCutoff_NeverFilledAfter1500()
     {
         var e = ExecFixtures.Engine([ExecFixtures.Strat(edit: o => o["execution"]!["entryOrderLifetimeMs"] = 600_000)]);
         ExecFixtures.Run(e, [ExecFixtures.Fr(329, dir: 10, quotes: Calls), ExecFixtures.Fr(330, quotes: [new("CE26000", 125.5, 127)])]);

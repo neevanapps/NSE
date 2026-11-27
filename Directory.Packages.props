@@ -13,7 +13,7 @@
     <!-- Host -> Dashboard live push (Dashboard's own SignalR hub is already part of the
          ASP.NET Core shared framework since it's an Sdk.Web project; Host is Sdk.Worker
          and needs the client package explicitly to connect to that hub). -->
-    <PackageVersion Include="Microsoft.AspNetCore.SignalR.Client" Version="10.0.0" />
+    <PackageVersion Include="Microsoft.AspNetCore.SignalR.Client" Version="10.0.13" />
 
     <!-- Logging -->
     <PackageVersion Include="Serilog.Extensions.Hosting" Version="10.0.0" />

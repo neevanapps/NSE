@@ -69,7 +69,7 @@ public class IsolationReleaseBlockerTests
             if (name.StartsWith("NiftySignal.PaperEngineV2", StringComparison.Ordinal) || name == "NiftySignal.Tests") continue;
             var text = File.ReadAllText(proj);
             if (name is "NiftySignal.Dashboard") continue;                       // Phase 7: a READ-ONLY reference to the Data project, guarded by HomeV2Tests
-            if (name is "NiftySignal.Host")
+            if (name is "NiftySignal.Host" or "NiftySignal.ExecutionService")      // decision A1: the execution service is the V2 writer; like the Host it names the Runtime project only
             {
                 // The owner-authorised Host integration references the Runtime project and nothing else of V2.
                 var refs = Regex.Matches(text, @"NiftySignal\.PaperEngineV2\.[A-Za-z]+").Select(m => m.Value).Distinct().ToArray();

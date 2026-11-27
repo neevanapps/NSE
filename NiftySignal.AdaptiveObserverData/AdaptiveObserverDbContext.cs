@@ -29,6 +29,8 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
     public DbSet<AdaptiveFuturesDepth5Row> FuturesDepth5 => Set<AdaptiveFuturesDepth5Row>();
     public DbSet<AdaptiveOptionsDepth5Row> OptionsDepth5 => Set<AdaptiveOptionsDepth5Row>();
     public DbSet<AdaptiveOptionsDepth5AttestationRow> OptionsDepth5Attestations => Set<AdaptiveOptionsDepth5AttestationRow>();
+    public DbSet<AdaptiveBarPublicationRow> BarPublications => Set<AdaptiveBarPublicationRow>();
+    public DbSet<AdaptiveCheckpointRow> Checkpoints => Set<AdaptiveCheckpointRow>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -114,6 +116,7 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
             e.ToTable("adaptive_observer_runtime");
             e.HasIndex(x => x.SessionId).IsUnique();
             e.Property(x => x.LastError).HasMaxLength(2048);
+            e.Property(x => x.RecoveryPhase).HasMaxLength(32);
         });
 
         modelBuilder.Entity<AdaptiveFutureBarRow>().HasOne<AdaptiveSessionStateRow>().WithMany()
@@ -193,6 +196,21 @@ public sealed class AdaptiveObserverDbContext(DbContextOptions<AdaptiveObserverD
             e.Property(x => x.SpotToken).HasMaxLength(32);
             e.Property(x => x.SpotSymbol).HasMaxLength(64);
             e.Property(x => x.ResolutionProvenance).HasMaxLength(256);
+            e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
+        });
+        modelBuilder.Entity<AdaptiveBarPublicationRow>(e =>
+        {
+            e.ToTable("adaptive_bar_publications");
+            e.HasKey(x => new { x.SessionId, x.BarSeq });
+            e.Property(x => x.UnverifiedReason).HasMaxLength(128);
+            e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
+        });
+        modelBuilder.Entity<AdaptiveCheckpointRow>(e =>
+        {
+            e.ToTable("adaptive_checkpoints");
+            e.HasIndex(x => new { x.SessionId, x.Id });
+            e.Property(x => x.Identity).HasMaxLength(64);
+            e.Property(x => x.PayloadSha256).HasMaxLength(64);
             e.HasOne<AdaptiveSessionStateRow>().WithMany().HasForeignKey(x => x.SessionId).OnDelete(DeleteBehavior.Restrict);
         });
         modelBuilder.Entity<AdaptiveProjectionHealthRow>(e =>

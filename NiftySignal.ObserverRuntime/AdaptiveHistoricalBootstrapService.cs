@@ -396,6 +396,7 @@ public sealed class AdaptiveHistoricalBootstrapService(
 
         await observer.SaveChangesAsync(ct);
         await tx.CommitAsync(ct);
+        observer.ChangeTracker.Clear();   // one day's rows are released before the next day is rebuilt
 
         logger.LogInformation(
             "Adaptive historical bootstrap seeded {TradeDate}: ticks={Ticks}, base={Base}, bars={Bars}, rolling={Rolling}, strong={Strong}",

@@ -15,7 +15,7 @@
     else
     {
         var basket = View.Basket!;
-        <div class="adaptive-note" data-testid="market-summary-basket">
+        <div class="adaptive-note" data-testid="market-summary-basket" data-end-bar="@View.EndBarSeq">
             Basket (fixed for all windows): expiry @basket.Expiry.ToString("dd-MMM-yyyy") · centre @basket.Center.ToString("0") · step @(basket.Step?.ToString("0.##") ?? "—") · through completed bar @View.EndBarSeq.
             @if (basket.Problems.Count > 0)
             {

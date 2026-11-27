@@ -8,7 +8,7 @@ namespace NiftySignal.PaperEngineV2.Runtime;
 /// Upserts live marks into <c>pev2.pev2_live_marks</c> (one NpgsqlBatch per sample, so one round trip per second). A missing table or a missing INSERT/UPDATE permission disables the store after the FIRST failure
 /// (reported through <see cref="DisabledReason"/>, never thrown again), so a missing owner-run script costs one failed statement, not one per second. Other failures are thrown to the publisher, which contains them.
 /// </summary>
-public sealed class PostgresLiveMarkStore(NpgsqlDataSource db) : ILiveMarkStore
+public sealed class PostgresLiveMarkStore(NpgsqlDataSource db, Func<ExecutionOwnership?>? writer = null) : ILiveMarkStore
 {
     const string S = V2Schema.SchemaName;
     public const string PublisherRow = "_publisher";
@@ -21,11 +21,16 @@ public sealed class PostgresLiveMarkStore(NpgsqlDataSource db) : ILiveMarkStore
         if (_disabled is not null) return;
         try
         {
-            await using var batch = db.CreateBatch();
-            foreach (var m in changed) batch.BatchCommands.Add(Upsert(m.StrategyId, m.PositionId, m.TradeDate.ToString("yyyy-MM-dd"), m.MarkSeq, m.Status.ToString(), PositionMarkJson.Serialize(m), heartbeat.At));
-            var day = DateOnly.FromDateTime(heartbeat.At.UtcDateTime.AddHours(5.5)).ToString("yyyy-MM-dd");   // the heartbeat belongs to the IST day of the publisher clock, whatever the rows are
-            batch.BatchCommands.Add(Upsert("*", PublisherRow, day, heartbeat.Seq, "Fresh", System.Text.Json.JsonSerializer.Serialize(heartbeat), heartbeat.At));
-            await batch.ExecuteNonQueryAsync(ct);
+            // the store of a writing runtime publishes only through the current ownership
+            var owner = writer is null ? null : writer() ?? throw new OwnershipLostException("this runtime does not hold the paper ledger");
+            await Pev2Write.RunAsync(db, owner, async (connection, tx) =>
+            {
+                await using var batch = new NpgsqlBatch(connection, tx);
+                foreach (var m in changed) batch.BatchCommands.Add(Upsert(m.StrategyId, m.PositionId, m.TradeDate.ToString("yyyy-MM-dd"), m.MarkSeq, m.Status.ToString(), PositionMarkJson.Serialize(m), heartbeat.At));
+                var day = DateOnly.FromDateTime(heartbeat.At.UtcDateTime.AddHours(5.5)).ToString("yyyy-MM-dd");   // the heartbeat belongs to the IST day of the publisher clock, whatever the rows are
+                batch.BatchCommands.Add(Upsert("*", PublisherRow, day, heartbeat.Seq, "Fresh", System.Text.Json.JsonSerializer.Serialize(heartbeat), heartbeat.At));
+                return await batch.ExecuteNonQueryAsync(ct);
+            }, ct);
         }
         catch (PostgresException ex) when (ex.SqlState is PostgresErrorCodes.UndefinedTable or PostgresErrorCodes.InvalidSchemaName or PostgresErrorCodes.InsufficientPrivilege)
         {

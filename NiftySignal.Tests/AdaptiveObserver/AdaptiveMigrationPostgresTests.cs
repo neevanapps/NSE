@@ -72,9 +72,10 @@ public sealed class TempAdaptiveDatabase : IAsyncDisposable
         ConnectionString = connectionString;
     }
 
-    public static async Task<TempAdaptiveDatabase> CreateAsync()
+    /// <param name="prefix">Classes outside the migration tests use their own, so that class's leftover check never counts a database another class is still using.</param>
+    public static async Task<TempAdaptiveDatabase> CreateAsync(string prefix = "niftysignal_adaptive_mig_test_")
     {
-        var name = "niftysignal_adaptive_mig_test_" + Guid.NewGuid().ToString("N")[..12];
+        var name = prefix + Guid.NewGuid().ToString("N")[..12];
         await using (var admin = new NpgsqlConnection(AdaptivePg.Maintenance))
         {
             await admin.OpenAsync();
@@ -176,6 +177,8 @@ public sealed class TempAdaptiveDatabase : IAsyncDisposable
     }
 }
 
+// One collection for everything that creates disposable databases on the server, so the leftover check never sees another class's database.
+[Collection("adaptive-postgres")]
 public sealed class AdaptiveMigrationPostgresTests
 {
     static readonly string[] NewStrikeColumns = ["DeltaStart", "DeltaEnd", "DeltaChange", "VegaStart", "VegaEnd", "VegaChange"];

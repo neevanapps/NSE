@@ -381,6 +381,78 @@ public class RuntimeTests
     }
 
     [PostgresFact]
+    public async Task LostWriterLock_TakenByAnotherWriter_ClosesTheRuntime_AndNothingMoreIsWritten()
+    {
+        var db = await InstalledAsync();
+        var clock = new ManualClock(FrameFixtures.T0);
+        await using var rt = new V2Runtime(Options(StrategyDir("S01"), clear: 2), new FrameMapFactory(s => ExecFixtures.Fr(s)), null, clock);
+        await rt.StartAsync(default);
+        await Pump(rt, clock, [1, 2, 3]);
+        var before = await ScalarAsync(db, "SELECT count(*) FROM pev2.pev2_frames");
+        // the runtime's lock connection drops and another writer takes the ledger
+        await using (var kill = db.CreateCommand("SELECT count(pg_terminate_backend(pid)) FROM pg_locks WHERE locktype = 'advisory' AND pid <> pg_backend_pid() AND database = (SELECT oid FROM pg_database WHERE datname = current_database())")) await kill.ExecuteNonQueryAsync();
+        ExecutionOwnership? other = null;
+        await Until(() => (other ??= ExecutionOwnership.TryAcquireAsync(db, default).GetAwaiter().GetResult()) is not null, "the other writer takes the lock", 40);
+        await using var held = other;
+        clock.Now = FrameFixtures.End(4).AddMilliseconds(100);
+        Assert.True(rt.TryEnqueue(Notice(4)));
+        await Until(() => rt.State == V2RuntimeState.ConfigInvalid, "the runtime closes", 40);
+        Assert.Contains("another execution writer took", rt.Detail);
+        Assert.False(rt.TryEnqueue(Notice(5)));
+        await Task.Delay(500);
+        Assert.Equal(before, await ScalarAsync(db, "SELECT count(*) FROM pev2.pev2_frames"));
+    }
+
+    /// <summary>
+    /// The in-Host race: bar 5's entry signal has been evaluated and its first ledger event is about to be appended when another writer takes the ledger; bars 6-8 are already queued. Neither the decision nor
+    /// anything produced by the queued frames may reach the ledger.
+    /// </summary>
+    [PostgresFact]
+    public async Task OwnershipMovingBetweenEvaluationAndPersistence_QueuedFramesCannotChangeTheLedger()
+    {
+        var db = await InstalledAsync();
+        var clock = new ManualClock(FrameFixtures.T0);
+        var decided = new ManualResetEventSlim();
+        var go = new ManualResetEventSlim();
+        var armed = false;
+        var hooks = new V2RuntimeTestHooks(SinkDecorator: inner => new GateSink(inner, () =>
+        {
+            if (!armed) return;
+            armed = false;
+            decided.Set();
+            go.Wait(TimeSpan.FromSeconds(60));
+        }));
+        await using var rt = new V2Runtime(Options(StrategyDir("S01"), clear: 2, lagSeconds: 3600), new FrameMapFactory(s => ExecFixtures.Fr(s, s >= 5 ? 10 : 0)), null, clock, hooks: hooks);
+        await rt.StartAsync(default);
+        await Pump(rt, clock, [1, 2, 3, 4]);
+
+        armed = true;
+        for (var seq = 5; seq <= 8; seq++) { clock.Now = FrameFixtures.End(seq).AddMilliseconds(100); Assert.True(rt.TryEnqueue(Notice(seq))); }
+        Assert.True(decided.Wait(TimeSpan.FromSeconds(30)), "no ledger event was produced");
+        await Until(() => rt.Snapshot().FramesBuilt >= 8, "the later frames are queued");
+        // the check made before each bar has passed for every queued bar: only the persistence boundary is left
+        await using var other = await LedgerTransfer.KillOwnerAndTakeAsync(db);
+        var before = await LedgerTransfer.LedgerAsync(db);
+        go.Set();
+
+        await Until(() => rt.Snapshot().LedgerFailures + rt.Snapshot().AlertFailures >= 1, "the append is refused", 40);
+        await Until(() => rt.Snapshot().Handoff is { QueueDepth: 0 }, "the queue is worked off", 40);
+        await Settle(rt);
+        Assert.Equal(before, await LedgerTransfer.LedgerAsync(db));
+
+        clock.Now = FrameFixtures.End(9).AddMilliseconds(100);
+        Assert.True(rt.TryEnqueue(Notice(9)));
+        await Until(() => rt.State == V2RuntimeState.ConfigInvalid, "the runtime closes", 40);
+        await Task.Delay(500);
+        Assert.Equal(before, await LedgerTransfer.LedgerAsync(db));
+    }
+
+    sealed class GateSink(IPaperEventSink inner, Action beforeAppend) : IPaperEventSink
+    {
+        public void Append(PaperEvent e) { beforeAppend(); inner.Append(e); }
+    }
+
+    [PostgresFact]
     public async Task RealConnectionLoss_AllBackendsTerminatedMidSession_RecoversWithoutDuplicates()
     {
         var db = await InstalledAsync();

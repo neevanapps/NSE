@@ -11,8 +11,8 @@ public interface IPaperEventSink
 }
 
 /// <summary>
-/// The paper execution engine: a frame processor that runs every ENABLED, activatable strategy in ascending id order over the shared immutable frames. Strategies are isolated (own state, fault containment); the
-/// engine has no broker, order-submission or network dependency. Idempotent per decision key.
+/// The paper execution engine: runs every ENABLED, activatable strategy in ascending id order over the shared immutable inputs (completed bars, quote updates, timer ticks). Strategies are isolated (own state, fault
+/// containment); the engine has no broker, order-submission or network dependency. Idempotent per decision key.
 /// </summary>
 public sealed class PaperEngine : IFrameProcessor
 {
@@ -52,20 +52,28 @@ public sealed class PaperEngine : IFrameProcessor
     volatile IReadOnlySet<string> _held = new HashSet<string>(StringComparer.Ordinal);
     volatile IReadOnlyList<MarkPosition> _marks = [];
 
-    /// <summary>Today's positions of all strategies as an immutable snapshot, replaced after every processed frame (and after a journal replay). For the read-only live-mark publisher only.</summary>
+    /// <summary>Today's positions of all strategies as an immutable snapshot, replaced after every processed input (and therefore after a journal replay). For the read-only live-mark publisher only.</summary>
     public IReadOnlyList<MarkPosition> MarkPositions => _marks;
 
     /// <summary>
-    /// Distinct tokens held by open positions of ALL strategies (deduplicated), published as an immutable snapshot after every processed frame (and therefore after a journal replay on restart). Safe to read from
-    /// another thread; empty when nothing is held. A frame built a moment before a fill simply lacks the new token's held quote: the exit then waits for a later frame, never for an inferred price.
+    /// Distinct tokens held by open positions of ALL strategies (deduplicated), published as an immutable snapshot after every processed input (and therefore after a journal replay on restart). Safe to read from
+    /// another thread; empty when nothing is held.
     /// </summary>
     public IReadOnlySet<string> HeldTokens => _held;
 
     public ValueTask ProcessAsync(MarketStateFrame frame, MarketStateFrame? previous, FrameDisposition disposition, CancellationToken ct)
     {
+        Step(ExecutionInput.FromFrame(frame, previous, disposition));
+        return ValueTask.CompletedTask;
+    }
+
+    /// <summary>Runs one input through every strategy. <c>Changed</c> says whether any strategy state moved (the input must then be journaled); the events are those this input produced.</summary>
+    public (bool Changed, IReadOnlyList<PaperEvent> Events) Step(ExecutionInput input)
+    {
         var batch = new List<PaperEvent>();
         var opportunities = new List<OpportunityRecord>();
-        foreach (var r in _runtimes) r.Process(frame, previous, disposition, batch, opportunities);
+        var changed = false;
+        foreach (var r in _runtimes) changed |= r.Step(input, batch, opportunities);
         _held = new HashSet<string>(_runtimes.SelectMany(r => r.HeldTokens()), StringComparer.Ordinal);
         try { _marks = _runtimes.SelectMany(r => r.MarkSnapshot()).ToArray(); }
         catch (Exception) { /* a snapshot problem only leaves the previous marks in place; it never reaches a decision */ }
@@ -85,6 +93,11 @@ public sealed class PaperEngine : IFrameProcessor
             catch (Exception) { OpportunitySinkFailures++; }
         }
 
-        return ValueTask.CompletedTask;
+        return (changed, batch);
     }
+
+    /// <summary>Contracts whose quotes the next step may need, across all strategies.</summary>
+    public IReadOnlySet<string> WatchedTokens() => new HashSet<string>(_runtimes.SelectMany(r => r.WatchedTokens()), StringComparer.Ordinal);
+
+    public IReadOnlyList<StrategyStatus> Statuses() => _runtimes.Select(r => r.Status()).ToArray();
 }

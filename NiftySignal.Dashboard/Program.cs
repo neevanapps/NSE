@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Antiforgery;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Options;
 using NiftySignal.Dashboard.Components;
 using NiftySignal.Dashboard.Hubs;
@@ -151,6 +152,34 @@ builder.Services.AddSingleton<ITelegramDocumentSender>(sp =>
 });
 builder.Services.AddSingleton<AdaptiveScreenshotProcessor>();
 builder.Services.AddHostedService<AdaptiveScreenshotWorker>();
+
+// Critical Observer alerts. The watcher lives here, outside the Host process it watches.
+builder.Services.Configure<ObserverHealthOptions>(builder.Configuration.GetSection(ObserverHealthOptions.SectionName));
+builder.Services.TryAddSingleton(TimeProvider.System);
+builder.Services.AddSingleton(sp => new ObserverHealthMonitor(
+    sp.GetRequiredService<AdaptiveObserverDataService>(),
+    // No HTTP logging handler: request URLs contain the bot token.
+    new TelegramTextSender(new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false, PooledConnectionLifetime = TimeSpan.FromMinutes(5) }) { Timeout = TimeSpan.FromSeconds(15) },
+        sp.GetRequiredService<IOptions<TelegramOptions>>()),
+    sp.GetRequiredService<IOptions<ObserverHealthOptions>>(),
+    sp.GetRequiredService<TimeProvider>(),
+    sp.GetRequiredService<ILogger<ObserverHealthMonitor>>()));
+builder.Services.AddHostedService(sp => sp.GetRequiredService<ObserverHealthMonitor>());
+
+// The paper execution service is watched from here too: a dead or hung service cannot report itself.
+builder.Services.Configure<ExecutionHealthOptions>(builder.Configuration.GetSection(ExecutionHealthOptions.SectionName));
+builder.Services.AddSingleton(sp =>
+{
+    var ledger = sp.GetService<PaperEngineV2DataService>();
+    return new ExecutionHealthMonitor(
+        ledger is null ? null : ledger.ReadExecutionStateAsync,
+        new TelegramTextSender(new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false, PooledConnectionLifetime = TimeSpan.FromMinutes(5) }) { Timeout = TimeSpan.FromSeconds(15) },
+            sp.GetRequiredService<IOptions<TelegramOptions>>()),
+        sp.GetRequiredService<IOptions<ExecutionHealthOptions>>(),
+        sp.GetRequiredService<TimeProvider>(),
+        sp.GetRequiredService<ILogger<ExecutionHealthMonitor>>());
+});
+builder.Services.AddHostedService(sp => sp.GetRequiredService<ExecutionHealthMonitor>());
 
 // Single-user cookie auth (2026-09-05) -- see DashboardAuthOptions for why this is deliberately
 // minimal. Sliding expiration so a phone left on the dashboard doesn't get logged out mid-session.

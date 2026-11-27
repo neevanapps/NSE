@@ -59,6 +59,29 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                     b.ToTable("adaptive_bar_close_atm", (string)null);
                 });
 
+            modelBuilder.Entity("NiftySignal.AdaptiveObserverData.AdaptiveBarPublicationRow", b =>
+                {
+                    b.Property<long>("SessionId")
+                        .HasColumnType("bigint");
+
+                    b.Property<int>("BarSeq")
+                        .HasColumnType("integer");
+
+                    b.Property<DateTimeOffset>("PublishedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<string>("UnverifiedReason")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<bool>("Verified")
+                        .HasColumnType("boolean");
+
+                    b.HasKey("SessionId", "BarSeq");
+
+                    b.ToTable("adaptive_bar_publications", (string)null);
+                });
+
             modelBuilder.Entity("NiftySignal.AdaptiveObserverData.AdaptiveBasisSupplementalRow", b =>
                 {
                     b.Property<long>("Id")
@@ -119,6 +142,50 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                         .IsUnique();
 
                     b.ToTable("adaptive_basis_supplemental_bars", (string)null);
+                });
+
+            modelBuilder.Entity("NiftySignal.AdaptiveObserverData.AdaptiveCheckpointRow", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("bigint");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<long>("Id"));
+
+                    b.Property<DateTimeOffset>("CreatedAtUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<int>("FormatVersion")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("Identity")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<int>("LastBarSeq")
+                        .HasColumnType("integer");
+
+                    b.Property<byte[]>("Payload")
+                        .IsRequired()
+                        .HasColumnType("bytea");
+
+                    b.Property<string>("PayloadSha256")
+                        .IsRequired()
+                        .HasMaxLength(64)
+                        .HasColumnType("character varying(64)");
+
+                    b.Property<DateTimeOffset?>("ProcessedThroughUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<long>("SessionId")
+                        .HasColumnType("bigint");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("SessionId", "Id");
+
+                    b.ToTable("adaptive_checkpoints", (string)null);
                 });
 
             modelBuilder.Entity("NiftySignal.AdaptiveObserverData.AdaptiveCommentaryEventRow", b =>
@@ -722,11 +789,33 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                     b.Property<DateTimeOffset?>("LastRecoveryCompletedUtc")
                         .HasColumnType("timestamp with time zone");
 
+                    b.Property<DateTimeOffset?>("LastRecoveryProgressUtc")
+                        .HasColumnType("timestamp with time zone");
+
                     b.Property<int>("LastRecoveryReconciledBars")
                         .HasColumnType("integer");
 
                     b.Property<DateTimeOffset?>("LastRecoveryStartedUtc")
                         .HasColumnType("timestamp with time zone");
+
+                    b.Property<int>("RecoveryBarsReplayed")
+                        .HasColumnType("integer");
+
+                    b.Property<int>("RecoveryFailureCount")
+                        .HasColumnType("integer");
+
+                    b.Property<int?>("RecoveryPersistedBarsAtStart")
+                        .HasColumnType("integer");
+
+                    b.Property<string>("RecoveryPhase")
+                        .HasMaxLength(32)
+                        .HasColumnType("character varying(32)");
+
+                    b.Property<DateTimeOffset?>("RecoveryReplayedThroughUtc")
+                        .HasColumnType("timestamp with time zone");
+
+                    b.Property<long>("RecoveryTicksProcessed")
+                        .HasColumnType("bigint");
 
                     b.Property<int>("RuntimeStatus")
                         .HasColumnType("integer");
@@ -2289,7 +2378,25 @@ namespace NiftySignal.AdaptiveObserverData.Migrations
                         .IsRequired();
                 });
 
+            modelBuilder.Entity("NiftySignal.AdaptiveObserverData.AdaptiveBarPublicationRow", b =>
+                {
+                    b.HasOne("NiftySignal.AdaptiveObserverData.AdaptiveSessionStateRow", null)
+                        .WithMany()
+                        .HasForeignKey("SessionId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+                });
+
             modelBuilder.Entity("NiftySignal.AdaptiveObserverData.AdaptiveBasisSupplementalRow", b =>
+                {
+                    b.HasOne("NiftySignal.AdaptiveObserverData.AdaptiveSessionStateRow", null)
+                        .WithMany()
+                        .HasForeignKey("SessionId")
+                        .OnDelete(DeleteBehavior.Restrict)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("NiftySignal.AdaptiveObserverData.AdaptiveCheckpointRow", b =>
                 {
                     b.HasOne("NiftySignal.AdaptiveObserverData.AdaptiveSessionStateRow", null)
                         .WithMany()

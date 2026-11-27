@@ -303,3 +303,51 @@ BEGIN
 END $EF$;
 COMMIT;
 
+START TRANSACTION;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM pev2.__pev2_migrations_history WHERE "MigrationId" = '20261126053557_AddExecutionService') THEN
+    CREATE TABLE pev2.pev2_execution_journal (
+        id bigint GENERATED ALWAYS AS IDENTITY,
+        trade_date character varying(10) COLLATE "C" NOT NULL,
+        epoch bigint NOT NULL,
+        at_utc_ticks bigint NOT NULL,
+        payload_json text NOT NULL,
+        CONSTRAINT "PK_pev2_execution_journal" PRIMARY KEY (id)
+    );
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM pev2.__pev2_migrations_history WHERE "MigrationId" = '20261126053557_AddExecutionService') THEN
+    CREATE TABLE pev2.pev2_execution_state (
+        component character varying(32) COLLATE "C" NOT NULL,
+        epoch bigint NOT NULL,
+        owner character varying(128) COLLATE "C" NOT NULL,
+        heartbeat_utc_ticks bigint NOT NULL,
+        trade_date character varying(10) COLLATE "C" NOT NULL,
+        status character varying(24) COLLATE "C" NOT NULL,
+        snapshot_json text NOT NULL,
+        CONSTRAINT "PK_pev2_execution_state" PRIMARY KEY (component)
+    );
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM pev2.__pev2_migrations_history WHERE "MigrationId" = '20261126053557_AddExecutionService') THEN
+    CREATE INDEX "IX_pev2_execution_journal_trade_date_id" ON pev2.pev2_execution_journal (trade_date, id);
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM pev2.__pev2_migrations_history WHERE "MigrationId" = '20261126053557_AddExecutionService') THEN
+    INSERT INTO pev2.__pev2_migrations_history ("MigrationId", "ProductVersion")
+    VALUES ('20261126053557_AddExecutionService', '10.0.11');
+    END IF;
+END $EF$;
+COMMIT;
+

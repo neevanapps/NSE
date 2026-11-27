@@ -291,6 +291,11 @@ public sealed class AdaptiveObserverEngine
                 };
                 CaptureStrikeStart();
             }
+
+            // Level-1 book and basis histories older than this bar's end can no longer be read, so a session does not retain every quote of the day.
+            _microstructure.ReleaseBefore(bar.EndAvailableAtUtc);
+            _basis.ReleaseBefore(bar.EndAvailableAtUtc);
+            foreach (var book in _optionBooks.Values) book.ReleaseBefore(bar.EndAvailableAtUtc);
         }
 
         return packages;

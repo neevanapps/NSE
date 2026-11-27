@@ -42,19 +42,12 @@ public static class OptionPriceAverages
     public static AveragePrice Average(IEnumerable<FixedStrikeRow> rows, bool call, int targetBarSeq, int window)
     {
         var bySeq = rows.Where(r => r.BarSeq <= targetBarSeq && r.BarSeq > targetBarSeq - window).GroupBy(r => r.BarSeq).ToDictionary(g => g.Key, g => g.First());
-        double sum = 0d;
-        var n = 0;
-        for (var seq = targetBarSeq - window + 1; seq <= targetBarSeq; seq++)
-        {
-            if (seq < 1) { return new AveragePrice(window, null, n, $"only {targetBarSeq} completed bar(s) exist (need {window})"); }
-            if (!bySeq.TryGetValue(seq, out var row)) { return new AveragePrice(window, null, n, $"bar {seq} is not displayed"); }
-            var p = (call ? row.Ce : row.Pe)?.PriceEnd;
-            if (p is not { } v || !double.IsFinite(v) || v <= 0d) { return new AveragePrice(window, null, n, $"bar {seq} has no valid price for this contract"); }
-            sum += v;
-            n++;
-        }
-
-        return new AveragePrice(window, sum / n, n, null);
+        var (value, n, bar, invalid) = NiftySignal.MarketSummary.CompletedBarAverage.Compute(
+            seq => bySeq.TryGetValue(seq, out var row) ? (true, (call ? row.Ce : row.Pe)?.PriceEnd) : (false, null), targetBarSeq, window);
+        var why = value is not null ? null
+            : bar is not { } b ? $"only {targetBarSeq} completed bar(s) exist (need {window})"
+            : invalid ? $"bar {b} has no valid price for this contract" : $"bar {b} is not displayed";
+        return new AveragePrice(window, value, n, why);
     }
 
     public static OptionQuoteView? Quote(PinnedQuote? q, DateTimeOffset boundaryUtc)

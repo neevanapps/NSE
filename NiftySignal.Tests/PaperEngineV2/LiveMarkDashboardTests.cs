@@ -50,6 +50,25 @@ public class LiveMarkDashboardTests
         return (new LiveMarkPublisher(() => positions, () => board, store, clock, TimeSpan.FromSeconds(1)), board, clock, store);
     }
 
+    /// <summary>The query behind tools\Measure-LivePnlLatency.ps1, run against rows the real publisher wrote.</summary>
+    [PostgresFact]
+    public async Task TheLatencySamplingQuery_ReportsQuoteToPublished_ForFreshMarksOnly()
+    {
+        var db = await FreshAsync();
+        var (pub, board, _, _) = Rig(db, Pos("P1", Day));
+        board.Observe("CE26000", Tick(7, Noon.AddSeconds(-0.4)));
+        await pub.TickAsync(default);
+
+        await using var command = db.CreateCommand(File.ReadAllText(Path.Combine(TradingModelTests.RepoRoot(), "tools", "live-pnl-latency.sql")));
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Equal("P1", reader.GetString(1));
+        Assert.Equal("7", reader.GetString(2));
+        Assert.Equal(400m, reader.GetDecimal(3));
+        Assert.True(reader.GetDecimal(4) != 0m);
+        Assert.False(await reader.ReadAsync());          // the publisher's heartbeat row is not a mark
+    }
+
     [PostgresFact]
     public async Task APublishedMark_IsReadByTheDashboardService_WithItsQuoteAndPnl()
     {

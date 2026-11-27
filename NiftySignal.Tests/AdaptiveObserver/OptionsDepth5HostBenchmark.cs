@@ -43,7 +43,7 @@ public sealed class OptionsDepth5HostBenchmark
         var universe = picked.Where(i => strikes.Contains((double)i.StrikePrice!.Value))
             .Select(i => new ObserverOptionInstrument(i.Token, i.TradingSymbol, i.OptionType, (double)i.StrikePrice!.Value, weekly, i.LotSize == 0 ? 75 : i.LotSize)).OrderBy(x => x.Token, StringComparer.Ordinal).ToList();
 
-        await using var temp = await TempAdaptiveDatabase.CreateAsync();
+        await using var temp = await TempAdaptiveDatabase.CreateAsync("niftysignal_adaptive_obs_test_");
         await temp.MigrateAsync();
         var at = open.AddMinutes(30);
         var session = new AdaptiveSessionStateRow

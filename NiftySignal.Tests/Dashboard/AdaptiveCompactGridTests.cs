@@ -470,6 +470,24 @@ public sealed class AdaptiveCompactGridTests
         return await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new());
     }
 
+    /// <summary>The figures of the removed bar-wise grids (decision A8), read from the services that still produce them: the visible rows, the fixed-strike history and the day data, all bounded to <paramref name="through"/>.</summary>
+    static async Task<(AdaptiveObserverSnapshot Snapshot, FixedStrikeHistory Fixed, DayAverageData Day)> DataAsync(ObserverFactory factory, int through = 12, double strike = 25000)
+    {
+        var data = GridServices(factory).BuildServiceProvider().GetRequiredService<AdaptiveObserverDataService>();
+        var snapshot = (await data.LoadSnapshotAsync(10, default, 1L, through))!;
+        var catalog = FixedStrikeCatalog.FromSession(snapshot.Session);
+        var bars = snapshot.Futures.Select(x => (x.Bar.BarSeq, x.Bar.EndAvailableAtUtc)).ToList();
+        var history = catalog is null ? null : await data.LoadFixedStrikeHistoryAsync(snapshot.Session.Id, catalog, strike, bars, default, snapshot.Session.RollingWindowBars);
+        var day = await data.LoadDayAverageDataAsync(snapshot.Session.Id, through, catalog, catalog is null ? null : strike, snapshot.Session.RollingWindowBars, snapshot.ResidualAnchors, default);
+        return (snapshot, history!, day!);
+    }
+
+    static string[] Cells(SideDirection d, int decimals) => [RatioFormat.Cell(d.Ce, decimals), RatioFormat.Cell(d.Pe, decimals), RatioFormat.Cell(d.Direction, decimals)];
+
+    static OptionContextRow ContextOf(FixedStrikeHistory history, int bar) => history.Rows.Where(r => r.BarSeq == bar).Select(r => OptionDirectionRatios.Context(r.Ce, r.Pe)).Single();
+
+    static readonly string[] RemovedGrids = ["futures-compact", "options-core-direction", "options-context"];
+
     static string[] Headers(string html, int tableIndex)
     {
         var table = Regex.Matches(html, "<table.*?</table>", RegexOptions.Singleline)[tableIndex].Value;
@@ -492,14 +510,13 @@ public sealed class AdaptiveCompactGridTests
         var factory = await SeedGridAsync();
         var html = await LiveRenderAsync(factory);
 
-        Assert.Equal(3, Regex.Matches(html, "<table[ >]").Count);
-        Assert.Equal(["Seq", "End IST", "Dur s", "Urgency", "Bar ΔPx", "Roll ΔPx", "Strict Δ", "Enriched Δ",
-            "MicroDev (Inv)", "OFI", "OFI5", "MicroDev5Proxy (Inv)", "Roll OI Δ", "ΔBasis", "Roll Efficiency", "Price–Flow Agree", "Fallback Share %", "Evolution", "State"], Headers(html, 0));
+        Assert.Equal(2, Regex.Matches(html, "<table[ >]").Count);
+        foreach (var removed in RemovedGrids) Assert.DoesNotContain(removed, html);
         Assert.Equal(["Seq", "End IST", "Center", "Roll?", "CE ΔPx", "PE ΔPx", "CE Roll ΔPx", "PE Roll ΔPx", "CE Strict Δ", "PE Strict Δ",
             "CE Enriched Δ", "PE Enriched Δ", "CE Roll Strict", "PE Roll Strict", "CE OI Δ", "PE OI Δ", "CE Position", "PE Position",
-            "CE ΔIV", "PE ΔIV", "IV Skew", "Vol PCR", "Roll Vol PCR"], Headers(html, 1));
+            "CE ΔIV", "PE ΔIV", "IV Skew", "Vol PCR", "Roll Vol PCR"], Headers(html, 0));
         Assert.Equal(["Seq", "End IST", "Future Δ09:30", "CE Res %", "CE Res Δ%", "PE Res %", "PE Res Δ%", "Directional Res %",
-            "Adjacent Directional Res Δ", "Straddle Res %", "Direction", "Relation", "Quote Age"], Headers(html, 2));
+            "Adjacent Directional Res Δ", "Straddle Res %", "Direction", "Relation", "Quote Age"], Headers(html, 1));
 
         // No columns from later slices, no legacy bridged delta and no diagnostic wide-table headers in the default compact grids.
         foreach (var absent in new[] { "Basis_TW", "Day Vol PCR", "Legacy Bridged", "Strict ratio" })
@@ -507,19 +524,16 @@ public sealed class AdaptiveCompactGridTests
     }
 
     [Fact]
-    public async Task CompactFuturesGrid_ShowsDerivedUrgencyAndRollingFields_ZeroDurationBarIsADash()
+    public async Task RemovedFuturesGrid_ItsDataStillLoads_UrgencyOfAZeroDurationBarIsUnavailable()
     {
-        var factory = await SeedGridAsync();
-        var html = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new()
-        { ["CaptureMode"] = true, ["CaptureSessionId"] = 1L, ["CaptureBarSeq"] = 12 });
-
-        var rows = FirstRows(html, 0, 2);
-        // Bar 12: zero duration => Urgency unavailable; rolling values from the persisted rolling row.
-        // MicroDev / OFI come from the versioned sidecar row for that bar.
-        Assert.Equal(["12", "09:42:00", "0.0", "—", "+1.50", "-7.25", "123 (12.30)", "-456 (—)", "-0.12 (—)", "-400 (—)", "—", "—", "+4242", "+1.75", "0.500", "S— E—", "0.0", "Weakening", "Weak2"], rows[0]);
-        // Bar 11: 1000 / 50s = 20.0 volume per second; it has no sidecar row, so MicroDev / OFI are unavailable (not zero).
-        Assert.Equal("20.0", rows[1][3]);
-        Assert.Equal(["—", "—"], rows[1][8..10]);
+        var (snapshot, _, _) = await DataAsync(await SeedGridAsync());
+        var newest = snapshot.Futures[0];
+        Assert.Equal(12, newest.Bar.BarSeq);
+        Assert.Null(AdaptiveGridProjection.Urgency(newest.Bar.Volume, newest.Bar.DurationSeconds));               // zero duration: unavailable, not infinity or zero
+        Assert.Equal(4242, newest.Rolling!.OiChange);
+        Assert.Equal(20d, AdaptiveGridProjection.Urgency(snapshot.Futures[1].Bar.Volume, snapshot.Futures[1].Bar.DurationSeconds));
+        Assert.Equal(-400, snapshot.FuturesSupplemental![12].Ofi);
+        Assert.False(snapshot.FuturesSupplemental.ContainsKey(11));                                             // another metrics contract: never consumed
     }
 
     [Fact]
@@ -528,12 +542,12 @@ public sealed class AdaptiveCompactGridTests
         var factory = await SeedGridAsync();
         var html = await LiveRenderAsync(factory);
 
-        var rows = FirstRows(html, 1, 2);
+        var rows = FirstRows(html, 0, 2);
         // Bar 12 has a sidecar row: center OI Δ, positions, ΔIV, skew (end of bar) and PCRs; bar 10 has none, so those cells are unavailable (never zero).
         Assert.Equal(["12", "09:42:00", "25000", "—", "+2.50", "-3.50", "+10.50", "-20.50", "+321", "-654", "+111", "-222", "+5555", "-6666",
             "+100", "-100", "CallLongBuild", "PutShortCover", "+3.00", "+2.75", "+1.25", "0.80", "1.10"], rows[0]);
         Assert.Equal(["11", "09:41:00", "Unavailable: fixture option quotes missing"], rows[1]);
-        Assert.Equal(["—", "—", "—", "—", "—", "—", "—", "—", "—"], FirstRows(html, 1, 3)[2][14..23]);
+        Assert.Equal(["—", "—", "—", "—", "—", "—", "—", "—", "—"], FirstRows(html, 0, 3)[2][14..23]);
     }
 
     [Fact]
@@ -550,10 +564,10 @@ public sealed class AdaptiveCompactGridTests
         var html = await LiveRenderAsync(factory);
 
         Assert.Contains("failed replay verification and are withheld", html);
-        var futures = FirstRows(html, 0, 1)[0];
-        Assert.Equal(["—", "—"], futures[8..10]);                          // MicroDev / OFI withheld, never shown as stored values or zero
-        Assert.Equal("+4242", futures[12]);                                  // core rolling values for the same bar are untouched
-        var options = FirstRows(html, 1, 1)[0];
+        var (snapshot, _, _) = await DataAsync(factory);
+        Assert.False(snapshot.FuturesSupplemental?.ContainsKey(12) ?? false);                                    // MicroDev / OFI withheld, never served as stored values or zero
+        Assert.Equal(4242, snapshot.Futures[0].Rolling!.OiChange);                                              // core rolling values for the same bar are untouched
+        var options = FirstRows(html, 0, 1)[0];
         Assert.Equal(["—", "—", "—", "—", "—", "—", "—", "—", "—"], options[14..23]);   // options sidecar columns withheld
         Assert.Equal("+321", options[8]);                                   // core band values for the same bar are untouched
         Assert.DoesNotContain("-400", html);
@@ -565,7 +579,7 @@ public sealed class AdaptiveCompactGridTests
         var factory = await SeedGridAsync();
         var html = await LiveRenderAsync(factory);
 
-        var rows = FirstRows(html, 2, 4);
+        var rows = FirstRows(html, 1, 4);
         // Bar 12: the previous bar (11) is unavailable, so every adjacent delta is unavailable even though bar 10 was valid (no bridging).
         // The straddle value uses the frozen 09:30 baselines (5 CE + 5 PE anchors at 20 each = 200): 100 * (2 + 3) / 200.
         Assert.Equal(["12", "09:42:00", "+12.50", "+1.25%", "—", "-2.50%", "—", "+3.75%", "—", "+2.50%", "UP", "ALIGN", "0.75"], rows[0]);
@@ -588,14 +602,14 @@ public sealed class AdaptiveCompactGridTests
         var html = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new());
 
         Assert.Contains("Diagnostic view", html);
-        Assert.Equal(3, Regex.Matches(html, "<table[ >]").Count);
-        Assert.Equal(19, Headers(html, 0).Length);
+        Assert.Equal(2, Regex.Matches(html, "<table[ >]").Count);
+        Assert.Equal(23, Headers(html, 0).Length);
         Assert.DoesNotContain("Strict ratio", html);                   // diagnostic wide tables are not rendered by default
         Assert.DoesNotContain("Legacy Bridged", html);
     }
 
     [Fact]
-    public async Task LiveFixedStrikeView_RendersCoreDirectionAndOptionContext_WithAvgRows_AndKeepsLegacyAtmGridUnderDiagnostics()
+    public async Task LiveFixedStrikeView_RemovedGridsAreAbsent_TheirFiguresStillLoad_AndTheLegacyAtmGridStaysUnderDiagnostics()
     {
         var factory = await SeedGridAsync();
         await using (var db = factory.CreateDbContext())
@@ -623,59 +637,34 @@ public sealed class AdaptiveCompactGridTests
         var html = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new());
 
         Assert.Contains("OPTIONS — FIXED STRIKE HISTORY", html);
-        Assert.Contains("data-grid=\"options-core-direction\" data-strike=\"25000\"", html);
-        Assert.Contains("data-grid=\"options-context\" data-strike=\"25000\"", html);
-        Assert.Equal(["Seq", "End IST", "CE Strict Δ", "PE Strict Δ", "Strict Dir", "CE Enriched Δ", "PE Enriched Δ", "Enriched Dir",
-            "CE OI Δ", "PE OI Δ", "OI Dir (PE−CE)", "CE MicroDev (Inv)", "PE MicroDev (Inv)", "MicroDev Dir", "CE OFI", "PE OFI", "OFI Dir", "CE OFI5", "PE OFI5", "OFI5 Dir", "CE MicroDev5Proxy (Inv)", "PE MicroDev5Proxy (Inv)", "MicroDev5 Dir"], HeadersOf(html, "options-core-direction"));
-        Assert.Equal(["Seq", "End IST", "CE Price Δ", "PE Price Δ", "Price Dir", "CE ΔIV", "PE ΔIV", "IV Dir (Inv)", "CE ΔDelta", "PE ΔDelta", "Delta Dir", "CE ΔVega", "PE ΔVega", "Vega Dir (Inv)", "CE Activity", "PE Activity", "Activity Dir"],
-            HeadersOf(html, "options-context"));
-        // The plain price family moved from CORE DIRECTION to OPTION CONTEXT; the three Roll ΔPx columns were replaced by the Delta and Vega change columns, so no rolling family is left in the primary Options grids.
-        Assert.DoesNotContain(HeadersOf(html, "options-core-direction"), h => h.Contains("Price") || h.Contains("Roll", StringComparison.OrdinalIgnoreCase) || h.Contains("ΔPx"));
-        Assert.DoesNotContain(HeadersOf(html, "options-context"), h => h.Contains("Roll", StringComparison.OrdinalIgnoreCase));
-        Assert.DoesNotContain(HeadersOf(html, "options-context"), h => h.Contains("Roll Strict") || h.Contains("Roll OI") || h.Contains("Roll Enriched") || h.Contains("Roll Vol") || h.Contains("Efficiency"));
-        Assert.All(new[] { "Strict", "Enriched", "OI", "MicroDev", "OFI" }, f => Assert.Contains(HeadersOf(html, "options-core-direction"), h => h.Contains(f)));
-        Assert.All(new[] { "ΔIV", "ΔDelta", "ΔVega", "Activity" }, f => Assert.Contains(HeadersOf(html, "options-context"), h => h.Contains(f)));
+        foreach (var removed in RemovedGrids) Assert.DoesNotContain(removed, html);
+        Assert.Contains("data-testid=\"fixed-strike-identity\"", html);
 
-        var core = RowsOf(html, "options-core-direction");
-        var bar12 = core.Single(r => r[0] == "12");
-        Assert.Equal(["12", "09:42:00", "300 (30.00)", "-200 (-40.00)", "500 (33.33)", "50 (25.00)", "-50 (-25.00)", "100 (25.00)",
-            "1000 (10.00)", "3000 (30.00)", "2000 (10.00)", "-0.30 (-60.00)", "0.10 (20.00)", "0.40 (40.00)", "300 (30.00)", "-100 (-20.00)", "400 (26.67)", "—", "—", "—", "—", "—", "—"], bar12);
-        var avg = core.Single(r => r[0] == "AVG");
-        Assert.Equal("10 rows", avg[1]);                                                            // all visible rows; bars without a stored row are simply excluded from each metric
-        Assert.Equal("500 (33.33)", avg[4]);                                                               // aggregate numerator / denominator, identical rows here
-        var bar11 = core.Single(r => r[0] == "11");
-        Assert.Equal(bar12[2..], bar11[2..]);                                                             // both bars of the SAME strike
-
-        var context = RowsOf(html, "options-context");
-        Assert.Equal(["12", "09:42:00", "5.00 (5.00)", "-4.00 (-4.00)", "9.00 (4.50)", "1.00 (5.00)", "-1.00 (-5.00)", "-2.00 (-10.00)", "—", "—", "—", "—", "—", "—", "30.0 (75.00)", "10.0 (25.00)", "20.0 (50.00)"], context.Single(r => r[0] == "12"));   // the seeded rows carry no Greeks: six unavailable cells, never zero
-        Assert.Single(context, r => r[0] == "AVG");
+        var (_, history, _) = await DataAsync(factory);
+        var bar12 = history.Rows.Where(r => r.BarSeq == 12).Select(OptionDirectionRatios.Core).Single();
+        Assert.Equal(["300 (30.00)", "-200 (-40.00)", "500 (33.33)"], Cells(bar12.Strict, 0));
+        Assert.Equal(["50 (25.00)", "-50 (-25.00)", "100 (25.00)"], Cells(bar12.Enriched, 0));
+        Assert.Equal(["1000 (10.00)", "3000 (30.00)", "2000 (10.00)"], Cells(bar12.Oi, 0));                     // OI direction is PE - CE
+        Assert.Equal(["300 (30.00)", "-100 (-20.00)", "400 (26.67)"], Cells(bar12.Ofi, 0));
+        Assert.Equal(["0.30 (60.00)", "-0.10 (-20.00)", "0.40 (40.00)"], Cells(bar12.MicroDev, 2));                       // raw signs; the removed grid inverted CE / PE for display only
+        Assert.Equal(["5.00 (5.00)", "-4.00 (-4.00)", "9.00 (4.50)"], Cells(bar12.Price, 2));
+        Assert.Equal(["1.00 (5.00)", "-1.00 (-5.00)", "2.00 (10.00)"], Cells(ContextOf(history, 12).Iv, 2));              // raw CE - PE; display inversion belongs to the grids that show it
+        var bar11Core = history.Rows.Where(r => r.BarSeq == 11).Select(OptionDirectionRatios.Core).Single();
+        Assert.Equal(Cells(bar12.Strict, 0).Concat(Cells(bar12.Oi, 0)), Cells(bar11Core.Strict, 0).Concat(Cells(bar11Core.Oi, 0)));     // both bars of the SAME strike
+        Assert.Equal("500 (33.33)", RatioFormat.Cell(OptionAverages.Of(history).Core.Strict.Direction, 0));       // aggregate numerator / denominator over the visible rows
+        var context = ContextOf(history, 12);
+        Assert.Equal(["30.0 (75.00)", "10.0 (25.00)", "20.0 (50.00)"], Cells(context.Activity, 1));
+        Assert.Equal(["—", "—", "—"], Cells(context.Delta, 4));                                                  // the seeded rows carry no Greeks: unavailable, never zero
 
         // Futures + residual AVG rows, and the legacy moving ATM±2 grid inside the collapsed Diagnostics section.
-        Assert.Contains("data-testid=\"futures-avg\"", html);
         Assert.Contains("data-testid=\"residual-avg\"", html);
-        Assert.DoesNotContain("Roll Strict", Regex.Match(html, "data-grid=\"futures-compact\".*?</table>", RegexOptions.Singleline).Value);
         var diagnostics = Regex.Match(html, "<details class=\"adaptive-diagnostics.*?</details>", RegexOptions.Singleline).Value;
         Assert.Contains("data-grid=\"options-compact\"", diagnostics);
-        Assert.DoesNotContain("options-core-direction", diagnostics);
         var residualAvg = RowsOf(html, "residual-compact").Single(r => r[0] == "AVG");
         Assert.Equal("—", residualAvg[10]);                                                               // categorical columns are not averaged
         Assert.Equal("—", residualAvg[11]);
         Assert.Equal("+12.50", RatioFormatCompatible(residualAvg[2]));
 
-        // Direction-only tint (2026-11-04): the CE and PE value cells carry NO sign background; only the Direction cell is tinted from its displayed sign (MicroDev, IV, Delta and Vega are the INVERTED display values); Activity and unavailable cells stay neutral.
-        string RowMarkup(string grid, string seq) =>
-            Regex.Matches(Regex.Match(html, "<table[^>]*data-grid=\"" + grid + "\".*?</table>", RegexOptions.Singleline).Value, "<tr[^>]*>.*?</tr>", RegexOptions.Singleline)
-                .Select(m => m.Value).Single(r => Regex.IsMatch(r, "sticky-col[^>]*>" + seq + "</td>"));
-        var coreMarkup = RowMarkup("options-core-direction", "12");
-        Assert.All(Regex.Matches(coreMarkup, "<td class=\"[^\"]*\" data-sign=\"([^\"]*)\"").Select(m => m.Groups[1].Value), s => Assert.Equal("none", s));      // CE / PE background colouring is gone
-        Assert.Equal(14, Regex.Matches(coreMarkup, "<td class=\"[^\"]*\" data-sign=\"([^\"]*)\"").Count);
-        Assert.Equal(["pos", "pos", "pos", "pos", "pos", "none", "none"], Regex.Matches(coreMarkup, "data-direction-sign=\"([^\"]*)\"").Select(m => m.Groups[1].Value));      // Strict, Enriched, OI (PE − CE), MicroDev (RAW, not inverted), OFI, then OFI5 / MicroDev5 (unavailable in this fixture: neutral)
-        var contextMarkup = RowMarkup("options-context", "12");
-        Assert.All(Regex.Matches(contextMarkup, "<td class=\"[^\"]*\" data-sign=\"([^\"]*)\"").Select(m => m.Groups[1].Value), s => Assert.Equal("none", s));
-        Assert.Equal(["pos", "neg", "none"], Regex.Matches(contextMarkup, "data-direction-sign=\"([^\"]*)\"").Select(m => m.Groups[1].Value).Take(3));      // Price Dir (+9.00), Roll Dir (-2.00: raw +2.00 shown inverted) keep a tint from the DISPLAYED sign; the unavailable IV Dir stays neutral
-        Assert.DoesNotContain("adaptive-signed", Regex.Match(contextMarkup, "30\\.0 \\(75\\.00\\).*", RegexOptions.Singleline).Value);       // the CE / PE Activity cells are never tinted
-        Assert.Contains("MicroDev is shown INVERTED", html);
-        Assert.Equal(0, Regex.Matches(html, "-0\\.00").Count);                                                                                   // a zero never prints as a negative zero
     }
 
 
@@ -707,20 +696,17 @@ public sealed class AdaptiveCompactGridTests
             await db.AttestStrikesAsync();
         }
 
-        var html = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new());
-        var context = RowsOf(html, "options-context");
-
+        var (_, history, _) = await DataAsync(factory);
         // 12 (v3): Delta CE 0.02 on |start| 0.5 = 4 %, PE 0.015 on |-0.5| = 3 %, Direction (CE - PE) = 0.005 over the average |start| 0.5 = 1 %; Vega the same way on 3000.
-        var bar12 = context.Single(r => r[0] == "12");
-        // IV / Vega Dir are displayed inverted, Delta Dir is raw CE − PE; the CE and PE source values keep their stored sign
-        Assert.Equal(["0.0200 (4.00)", "0.0150 (3.00)", "0.0050 (1.00)", "40.00 (1.33)", "36.00 (1.20)", "-4.00 (-0.13)"], bar12[8..14]);
-        // 11 (v2, no Greeks stored): six unavailable cells, never zero, and the IV / price columns of the same row are untouched.
-        var bar11 = context.Single(r => r[0] == "11");
-        Assert.All(bar11[8..14], c => Assert.Equal("—", c));
-        Assert.Equal(bar12[2..8], bar11[2..8]);
+        var bar12 = ContextOf(history, 12);
+        Assert.Equal(["0.0200 (4.00)", "0.0150 (3.00)", "0.0050 (1.00)"], Cells(bar12.Delta, 4));
+        Assert.Equal(["40.00 (1.33)", "36.00 (1.20)", "4.00 (0.13)"], Cells(bar12.Vega, 2));
+        // 11 (v2, no Greeks stored): unavailable, never zero, and the IV / price figures of the same row are untouched.
+        var bar11 = ContextOf(history, 11);
+        Assert.All(Cells(bar11.Delta, 4).Concat(Cells(bar11.Vega, 2)), x => Assert.Equal("—", x));
+        Assert.Equal(Cells(bar12.Iv, 2), Cells(bar11.Iv, 2));
         // AVG covers only the rows that carry Greeks (bar 11 is excluded from each Greek metric, not counted as zero).
-        var avg = context.Single(r => r[0] == "AVG");
-        Assert.Equal(["0.0200 (4.00)", "0.0150 (3.00)", "0.0050 (1.00)"], avg[8..11]);
+        Assert.Equal(["0.0200 (4.00)", "0.0150 (3.00)", "0.0050 (1.00)"], Cells(OptionAverages.Of(history).Context.Delta, 4));
     }
 
     // ------------------------------------------------------------------ Greek Delta Direction in OPTION CONTEXT: raw CE - PE (not inverted); IV / Vega / MicroDev stay inverted
@@ -756,15 +742,18 @@ public sealed class AdaptiveCompactGridTests
         return factory;
     }
 
-    static (string Text, string Dir)[] ContextCells(string html, string seq)
+    /// <summary>The Delta figures of bar 12, the visible-rows AVG and the DAY AVG.</summary>
+    static async Task<Dictionary<string, SideDirection>> DeltasAsync(ObserverFactory factory)
     {
-        var table = Regex.Match(html, "<table[^>]*data-grid=\"options-context\".*?</table>", RegexOptions.Singleline).Value;
-        var row = Regex.Matches(table, "<tr[ >].*?</tr>", RegexOptions.Singleline).Select(m => m.Value).Single(r => Regex.IsMatch(r, "sticky-col[^>]*>" + Regex.Escape(seq) + "</td>"));
-        return Regex.Matches(row, "<td([^>]*)>(.*?)</td>", RegexOptions.Singleline)
-            .Select(c => (System.Net.WebUtility.HtmlDecode(Regex.Replace(c.Groups[2].Value, "<[^>]+>", "").Trim()), Regex.Match(c.Groups[1].Value, "data-direction-sign=\"([^\"]*)\"").Groups[1].Value)).ToArray();
+        var (_, history, day) = await DataAsync(factory);
+        return new()
+        {
+            ["12"] = ContextOf(history, 12).Delta, ["11"] = ContextOf(history, 11).Delta,
+            ["AVG"] = OptionAverages.Of(history).Context.Delta, ["DAY AVG"] = OptionAverages.Of(day.Fixed!).Context.Delta,
+        };
     }
 
-    // Context columns: 8 CE ΔDelta, 9 PE ΔDelta, 10 Delta Dir; IV Dir is 7, Vega Dir is 13. Direction % = (CE - PE) / average |start| (0.5) x 100.
+    // Direction % = (CE - PE) / average |start| (0.5) x 100.
     [Theory]
     [InlineData(0.01, 0.03, "0.0100 (2.00)", "0.0300 (6.00)", "-0.0200 (-4.00)", "neg")]   // raw CE - PE = -0.02 stays negative
     [InlineData(0.02, 0.02, "0.0200 (4.00)", "0.0200 (4.00)", "0.0000 (0.00)", "zero")]     // zero stays zero: never "-0.0000" / "-0.00"
@@ -772,24 +761,12 @@ public sealed class AdaptiveCompactGridTests
     {
         // bar 1 (outside the 10 visible rows, inside the session) carries the same values, so DAY AVG over bars 1, 11, 12 equals the bar value
         var factory = await SeedDeltaScenarioAsync(_ => (ceChange, peChange), [1, 11, 12]);
-        var html = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new());
+        var deltas = await DeltasAsync(factory);
         foreach (var key in new[] { "12", "AVG", "DAY AVG" })
         {
-            var c = ContextCells(html, key);
-            Assert.Equal(ceCell, c[8].Text); Assert.Equal(peCell, c[9].Text);                    // CE / PE Delta source values unchanged
-            Assert.Equal(dir, c[10].Text); Assert.Equal(sign, c[10].Dir);                         // raw CE - PE, tint from that sign
-            if (sign == "zero") Assert.DoesNotContain("-", c[10].Text);                             // no negative-zero artifact
-            // IV (CE 1, PE 3: raw -2.00) displayed inverted +2.00 (pos); Vega (CE 40, PE 36: raw +4.00) displayed inverted -4.00 (neg)
-            Assert.StartsWith("2.00", c[7].Text); Assert.Equal("pos", c[7].Dir);
-            Assert.StartsWith("-4.00", c[13].Text); Assert.Equal("neg", c[13].Dir);
+            Assert.Equal([ceCell, peCell, dir], Cells(deltas[key], 4));                                           // raw CE - PE, no negative-zero artifact
+            Assert.Equal(sign, RatioFormat.SignName(deltas[key].Direction));
         }
-
-        // MicroDev (CORE DIRECTION): CE +0.3, PE -0.1 -> raw +0.40; the DIRECTION is raw (pos); the CE / PE cells stay inverted
-        var coreTable = Regex.Match(html, "<table[^>]*data-grid=\"options-core-direction\".*?</table>", RegexOptions.Singleline).Value;
-        var coreRow = Regex.Matches(coreTable, "<tr[ >].*?</tr>", RegexOptions.Singleline).Select(m => m.Value).Single(r => Regex.IsMatch(r, "sticky-col[^>]*>12</td>"));
-        var micro = Regex.Matches(coreRow, "<td([^>]*)>(.*?)</td>", RegexOptions.Singleline)[13];
-        Assert.StartsWith("0.40", System.Net.WebUtility.HtmlDecode(Regex.Replace(micro.Groups[2].Value, "<[^>]+>", "").Trim()));
-        Assert.Contains("data-direction-sign=\"pos\"", micro.Groups[1].Value);
     }
 
     [Fact]
@@ -797,31 +774,21 @@ public sealed class AdaptiveCompactGridTests
     {
         // bar 12 has no Greeks (v2 row); bars 10 and 11 are negative; bar 1 (DAY AVG only) is positive.
         var factory = await SeedDeltaScenarioAsync(seq => seq switch { 12 => null, 1 => (0.07, 0.01), _ => (0.01, 0.03) }, [1, 10, 11, 12]);
-        var html = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new());
+        var deltas = await DeltasAsync(factory);
 
-        var missing = ContextCells(html, "12");
-        Assert.All(new[] { 8, 9, 10, 11, 12, 13 }.Select(i => missing[i]), c => Assert.Equal("—", c.Text));   // unavailable, never "0"
-        Assert.All(new[] { 10, 13 }.Select(i => missing[i]), c => Assert.Equal("none", c.Dir));            // Direction cells are never tinted when unavailable
-        Assert.Equal("-0.0200 (-4.00)", ContextCells(html, "11")[10].Text);
-        Assert.Equal("neg", ContextCells(html, "11")[10].Dir);
-        Assert.Equal("-0.0200 (-4.00)", ContextCells(html, "AVG")[10].Text);              // bars 10 and 11 only: bar 12 is excluded, not averaged in as zero
-        Assert.Equal("neg", ContextCells(html, "AVG")[10].Dir);
+        Assert.All(Cells(deltas["12"], 4), x => Assert.Equal("—", x));                                           // unavailable, never "0"
+        Assert.Equal("-0.0200 (-4.00)", RatioFormat.Cell(deltas["11"].Direction, 4));
+        Assert.Equal("-0.0200 (-4.00)", RatioFormat.Cell(deltas["AVG"].Direction, 4));                            // bars 10 and 11 only: bar 12 is excluded, not averaged in as zero
         // DAY AVG over bars 1, 10, 11: raw mean (+0.06 - 0.02 - 0.02) / 3 = +0.0067, /0.5 = +1.33 %: positive although the visible AVG is negative
-        var day = ContextCells(html, "DAY AVG");
-        Assert.Equal("0.0067 (1.33)", day[10].Text); Assert.Equal("pos", day[10].Dir);
+        Assert.Equal("0.0067 (1.33)", RatioFormat.Cell(deltas["DAY AVG"].Direction, 4));
     }
 
     [Fact]
     public async Task OptionContext_NoGreeksAnywhere_DayAvgDeltaDirectionIsUnavailable()
     {
         var factory = await SeedDeltaScenarioAsync(_ => null, [1, 11, 12]);
-        var html = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new());
-        foreach (var key in new[] { "12", "AVG", "DAY AVG" })
-        {
-            var c = ContextCells(html, key);
-            Assert.All(new[] { 8, 9, 10 }.Select(i => c[i]), x => Assert.Equal("—", x.Text)); Assert.Equal("none", c[10].Dir);
-            Assert.StartsWith("2.00", c[7].Text);                                           // IV Dir (inverted) is still available
-        }
+        var deltas = await DeltasAsync(factory);
+        foreach (var key in new[] { "12", "AVG", "DAY AVG" }) Assert.All(Cells(deltas[key], 4), x => Assert.Equal("—", x));
     }
 
     // ------------------------------------------------------------------ DAY AVG (whole session through the boundary) next to the visible-rows AVG
@@ -833,6 +800,40 @@ public sealed class AdaptiveCompactGridTests
             Side = side, Token = token, TradingSymbol = token, PriceStart = priceStart, PriceEnd = priceStart + priceChange, PriceChange = priceChange, TotalQuantity = qty, StrictDelta = strictDelta,
             EnrichedBuy = 100, EnrichedSell = 100, EnrichedUnknown = 0, EnrichedDelta = 10, OiStart = 10000, OiDelta = 100, IvStart = 20, IvChange = 1, ActivityPerSecond = 10,
         });
+
+    [Fact]
+    public async Task OptionPriceAverages_OnTheLivePage_TheQuoteAgesAndANewQuoteAppears_WithoutANewBar()
+    {
+        var factory = await SeedDeltaScenarioAsync(_ => (1, 1), [11, 12]);
+        var source = new SourceFactory();
+        await AddTicksAsync(source, Px("CE25000", 100, DateTimeOffset.UtcNow.AddSeconds(-8), depth: true));
+        var services = GridServices(factory);
+        services.AddSingleton(new AdaptiveQuoteAsOfService(source, factory));
+        await using var provider = services.BuildServiceProvider();
+        await using var renderer = new HtmlRenderer(provider, provider.GetRequiredService<ILoggerFactory>());
+        var panel = await renderer.Dispatcher.InvokeAsync(async () => await renderer.RenderComponentAsync<AdaptiveObserverPanel>());
+        async Task<(string Ltp, string Age)> CallRowAsync()
+        {
+            var html = await renderer.Dispatcher.InvokeAsync(panel.ToHtmlString);
+            var table = html[html.IndexOf("data-grid=\"option-price-averages\"", StringComparison.Ordinal)..];
+            var row = table[table.IndexOf("data-side=\"CE\"", StringComparison.Ordinal)..];
+            var cells = Regex.Matches(row[..row.IndexOf("</tr>", StringComparison.Ordinal)], "<td[^>]*>(.*?)</td>", RegexOptions.Singleline).Select(m => m.Groups[1].Value.Trim()).ToArray();
+            return (cells[2], cells[5]);
+        }
+        async Task<(string Ltp, string Age)> UntilAsync(Func<(string Ltp, string Age), bool> done)
+        {
+            var until = DateTime.UtcNow.AddSeconds(15);
+            var row = await CallRowAsync();
+            while (!done(row) && DateTime.UtcNow < until) { await Task.Delay(200); row = await CallRowAsync(); }
+            Assert.True(done(row), $"LTP {row.Ltp}, age {row.Age}");
+            return row;
+        }
+
+        Assert.Equal("100.00", (await CallRowAsync()).Ltp);
+        await UntilAsync(r => r.Age.StartsWith("stale", StringComparison.Ordinal));          // 8 s old at load: it passes the 10 s limit with no new bar
+        await AddTicksAsync(source, Px("CE25000", 111, DateTimeOffset.UtcNow, depth: true));
+        await UntilAsync(r => r.Ltp == "111.00" && !r.Age.StartsWith("stale", StringComparison.Ordinal));
+    }
 
     static async Task<ObserverFactory> SeedDayAvgAsync()
     {
@@ -862,30 +863,14 @@ public sealed class AdaptiveCompactGridTests
         var factory = await SeedDayAvgAsync();
         var html = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new());
 
-        var core = RowsOf(html, "options-core-direction");
-        var avg = core.Single(r => r[0] == "AVG");
-        var day = core.Single(r => r[0] == "DAY AVG");
-        Assert.Equal("10 rows", avg[1]);
-        Assert.Equal("12 bars", day[1]);                                                      // every completed bar of this session through the latest completed one
-        Assert.Equal(core.Length - 2, core.Count(r => int.TryParse(r[0], out _)));            // normal rows, then AVG, then DAY AVG
-        Assert.Equal("AVG", core[^2][0]);
-        Assert.Equal("DAY AVG", core[^1][0]);
+        var (_, history, day) = await DataAsync(factory);
+        Assert.Equal(12, day.BarCount);                                                         // every completed bar of this session through the latest completed one
         // AVG: bars 11 and 12 only -> 600 / 2000 = 30.00 (raw mean 300). DAY AVG: bars 1, 11, 12 of the SAME strike -> SUM(delta) / SUM(qty) = 1600 / 6000 = 26.67 (NOT the mean of the percentages 28.33), raw mean 533.
-        Assert.Equal("300 (30.00)", avg[2]);
-        Assert.Equal("533 (26.67)", day[2]);
-        // The 25050 contract of bar 1 (huge delta) never reached the 25000 aggregate.
+        Assert.Equal("300 (30.00)", RatioFormat.Cell(OptionAverages.Of(history).Core.Strict.Ce, 0));
+        Assert.Equal("533 (26.67)", RatioFormat.Cell(OptionAverages.Of(day.Fixed!).Core.Strict.Ce, 0));
+        Assert.DoesNotContain(day.Fixed!.Rows, r => r.Ce?.Token == "CE25050");                  // another strike never reaches the 25000 aggregate
         Assert.DoesNotContain("987654", html);
-
-        var ctx = RowsOf(html, "options-context");
-        Assert.Equal("12 bars", ctx.Single(r => r[0] == "DAY AVG")[1]);
-        Assert.Equal("10 rows", ctx.Single(r => r[0] == "AVG")[1]);
-        Assert.Equal("AVG", ctx[^2][0]);
-        Assert.Equal("DAY AVG", ctx[^1][0]);
-
-        var fut = RowsOf(html, "futures-compact");
-        Assert.Equal("10 rows", fut.Single(r => r[0] == "AVG")[1]);
-        Assert.Equal("12 bars", fut.Single(r => r[0] == "DAY AVG")[1]);
-        Assert.Equal("123 (12.30)", fut.Single(r => r[0] == "DAY AVG")[6]);                   // SUM(delta) / SUM(volume) over all 12 bars
+        Assert.Equal("123 (12.30)", RatioFormat.Cell(day.FuturesAverage().Strict));              // SUM(delta) / SUM(volume) over all 12 bars
 
         var res = RowsOf(html, "residual-compact");
         Assert.Equal("12 bars", res.Single(r => r[0] == "DAY AVG")[1]);
@@ -896,14 +881,11 @@ public sealed class AdaptiveCompactGridTests
     public async Task Live_ContextDayAvg_AggregatesPriceFromTheSameExactStrike_AndLeavesGreeksUnavailable()
     {
         var factory = await SeedDayAvgAsync();
-        var html = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new());
-
-        var ctx = RowsOf(html, "options-context");
-        var day = ctx.Single(r => r[0] == "DAY AVG");
+        var (_, _, day) = await DataAsync(factory);
+        var context = OptionAverages.Of(day.Fixed!).Context;
         // Price (CE): bars 1, 11, 12 each +5 on a start of 100 -> SUM(change) / SUM(start) = 15 / 300 = 5.00 %.
-        Assert.Equal("5.00 (5.00)", day[2]);
-        Assert.Equal(17, day.Length);
-        Assert.All(day[8..14], c => Assert.Equal("—", c));                                   // Delta and Vega change: the seeded rows have none, so unavailable, never zero
+        Assert.Equal("5.00 (5.00)", RatioFormat.Cell(context.Price.Ce, 2));
+        Assert.All(Cells(context.Delta, 4).Concat(Cells(context.Vega, 2)), x => Assert.Equal("—", x));     // the seeded rows have none, so unavailable, never zero
     }
 
     [Fact]
@@ -920,21 +902,18 @@ public sealed class AdaptiveCompactGridTests
         var at11 = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new() { ["CaptureMode"] = true, ["CaptureSessionId"] = 1L, ["CaptureBarSeq"] = 11 });
         var at12 = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new() { ["CaptureMode"] = true, ["CaptureSessionId"] = 1L, ["CaptureBarSeq"] = 12 });
 
-        var day11 = RowsOf(at11, "futures-compact").Single(r => r[0] == "DAY AVG");
-        Assert.Equal("11 bars", day11[1]);
-        Assert.Equal("123 (12.30)", day11[6]);                                              // bars 1..11 only
-        var day12 = RowsOf(at12, "futures-compact").Single(r => r[0] == "DAY AVG");
-        Assert.Equal("12 bars", day12[1]);
-        Assert.NotEqual(day11[6], day12[6]);                                                // bar 12 appears only in the capture that targets it
-        Assert.Equal("11 bars", RowsOf(at11, "options-core-direction").Single(r => r[0] == "DAY AVG")[1]);
-        Assert.Equal("11 bars", RowsOf(at11, "options-context").Single(r => r[0] == "DAY AVG")[1]);
+        var (_, history11, day11) = await DataAsync(factory, 11);
+        var (_, _, day12) = await DataAsync(factory, 12);
+        Assert.Equal(11, day11.BarCount);
+        Assert.Equal("123 (12.30)", RatioFormat.Cell(day11.FuturesAverage().Strict));              // bars 1..11 only
+        Assert.Equal(12, day12.BarCount);
+        Assert.NotEqual(RatioFormat.Cell(day11.FuturesAverage().Strict), RatioFormat.Cell(day12.FuturesAverage().Strict));      // bar 12 appears only in what targets it
+        Assert.DoesNotContain(history11.Rows, r => r.BarSeq > 11);
+        Assert.DoesNotContain(day11.Fixed!.Rows, r => r.BarSeq > 11);
         Assert.Equal("11 bars", RowsOf(at11, "residual-compact").Single(r => r[0] == "DAY AVG")[1]);
-        Assert.Equal(4, System.Text.RegularExpressions.Regex.Matches(at11, "<table(?![^>]*data-grid=\"summary-)[ >]").Count);     // the four existing detailed grids are unchanged
+        Assert.Equal("12 bars", RowsOf(at12, "residual-compact").Single(r => r[0] == "DAY AVG")[1]);
+        Assert.Single(System.Text.RegularExpressions.Regex.Matches(at11, "<table(?![^>]*data-grid=\"summary-)[ >]"));      // the residual grid is the only detailed grid
         Assert.Equal(4, System.Text.RegularExpressions.Regex.Matches(at11, "<table[^>]*data-grid=\"summary-").Count);                // plus the four Market Summary grids (Futures and the three compact TOTALs)
-        Assert.Contains("data-testid=\"futures-avg\"", at11);
-        Assert.Contains("data-testid=\"futures-day-avg\"", at11);
-        Assert.Contains("data-testid=\"options-core-day-avg\"", at11);
-        Assert.Contains("data-testid=\"options-context-day-avg\"", at11);
         Assert.Contains("data-testid=\"residual-day-avg\"", at11);
         Assert.DoesNotContain("options-compact", at11);
     }
@@ -1010,7 +989,7 @@ public sealed class AdaptiveCompactGridTests
         Assert.Contains("data-testid=\"research-data-quality\"", html);
         Assert.Contains("NIFTY RESEARCH SNAPSHOT", html);
         Assert.Contains("Clock: Adaptive v1 (opening-volume estimate)", html);
-        Assert.Contains("data-grid=\"futures-compact\"", html);
+        foreach (var removed in RemovedGrids) Assert.DoesNotContain(removed, html);
         Assert.Contains("data-grid=\"residual-compact\"", html);
         Assert.DoesNotContain("options-compact", html);                // the moving ATM±2 diagnostics are excluded from captures
         Assert.DoesNotContain("Diagnostic view", html);
@@ -1070,6 +1049,83 @@ public sealed class AdaptiveCompactGridTests
     }
 
     [Fact]
+    public async Task Capture_LatestCompletedBar_RendersAllRequiredGridsFromItsStoredCloseAtm_WithoutAnyLaterRow()
+    {
+        var factory = await SeedResearchAsync();
+        await using (var db = factory.CreateDbContext())
+        {
+            Assert.False(await db.FutureBars.AnyAsync(x => x.BarSeq > 12));              // bar 12 is the newest completed bar: nothing later exists to borrow from
+            Assert.False(await db.OptionBandBars.AnyAsync(x => x.BarSeq > 12));
+            Assert.False(await db.BarCloseAtm.AnyAsync(x => x.BarSeq > 12));
+        }
+
+        var html = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new() { ["CaptureMode"] = true, ["CaptureSessionId"] = 1L, ["CaptureBarSeq"] = 12 });
+
+        var order = System.Text.RegularExpressions.Regex.Matches(html, "<table[^>]*data-grid=\"([^\"]+)\"").Select(m => m.Groups[1].Value).ToList();
+        Assert.Equal(AdaptiveScreenshotRenderer.RequiredGrids, order);
+        Assert.Contains("data-testid=\"market-summary-basket\" data-end-bar=\"12\"", html);
+        Assert.Equal("25050", System.Text.RegularExpressions.Regex.Match(html, "data-testid=\"summary-close-atm-strike\"[^>]*>([^<]*)<").Groups[1].Value);
+        Assert.DoesNotContain("next bar", html);
+    }
+
+    [Fact]
+    public async Task CapturePage_SubtitleNamesTheCurrentGrids_AndNoRemovedOne()
+    {
+        var factory = await SeedResearchAsync();
+        await using (var db = factory.CreateDbContext())
+        {
+            db.ScreenshotJobs.Add(AdaptiveScreenshotSchedule.New(1L, Day, 12, AdaptiveScreenshotKind.FiveBars, Open930.AddMinutes(12), Open930.AddMinutes(12)));
+            await db.SaveChangesAsync();
+        }
+
+        long jobId;
+        await using (var db = factory.CreateDbContext()) jobId = (await db.ScreenshotJobs.SingleAsync()).Id;
+        var services = GridServices(factory);
+        var source = new SourceFactory();
+        services.AddSingleton<IDbContextFactory<NiftySignalDbContext>>(source);
+        services.AddSingleton<AdaptiveQuoteAsOfService>();
+        using var live = new LiveDataService(source, new FlatTradeAuthClient(new HttpClient(),
+            Options.Create(new FlatTradeOptions { UserId = "t", ApiKey = "t", ApiSecret = "t" })), new Monitor(), NullLogger<LiveDataService>.Instance, startPolling: false);
+        services.AddSingleton(live);
+
+        var html = await RenderAsync<NiftySignal.Dashboard.Components.Pages.AdaptiveScreenshot>(services, new() { ["JobId"] = jobId });
+
+        var subtitle = System.Text.RegularExpressions.Regex.Match(html, "data-testid=\"capture-subtitle\"[^>]*>([^<]*)<").Groups[1].Value;
+        Assert.Equal($"Pinned completed boundary · Futures Summary, TOTAL summaries (ITM-shifted, ATM, OTM-shifted) and CE / PE theoretical residual · live incomplete bar excluded · job {jobId}", subtitle.Trim());
+        foreach (var obsolete in new[] { "CORE DIRECTION", "OPTION CONTEXT", "FIXED STRIKE HISTORY", "Every row below" })
+            Assert.DoesNotContain(obsolete, html);
+    }
+
+    [Fact]
+    public async Task CapturePage_PreLiveTestWithoutASession_ClaimsNoGridAndNoMarketBar()
+    {
+        var factory = await SeedResearchAsync();
+        await using (var db = factory.CreateDbContext())
+        {
+            db.ScreenshotJobs.Add(AdaptiveScreenshotSchedule.New(null, Day, 0, AdaptiveScreenshotKind.PreLiveTest, Open930, Open930));
+            await db.SaveChangesAsync();
+        }
+
+        long jobId;
+        await using (var db = factory.CreateDbContext()) jobId = (await db.ScreenshotJobs.SingleAsync()).Id;
+        var services = GridServices(factory);
+        var source = new SourceFactory();
+        services.AddSingleton<IDbContextFactory<NiftySignalDbContext>>(source);
+        services.AddSingleton<AdaptiveQuoteAsOfService>();
+        using var live = new LiveDataService(source, new FlatTradeAuthClient(new HttpClient(),
+            Options.Create(new FlatTradeOptions { UserId = "t", ApiKey = "t", ApiSecret = "t" })), new Monitor(), NullLogger<LiveDataService>.Instance, startPolling: false);
+        services.AddSingleton(live);
+
+        var html = await RenderAsync<NiftySignal.Dashboard.Components.Pages.AdaptiveScreenshot>(services, new() { ["JobId"] = jobId });
+
+        var subtitle = System.Text.RegularExpressions.Regex.Match(html, "data-testid=\"capture-subtitle\"[^>]*>([^<]*)<").Groups[1].Value;
+        Assert.Equal($"Delivery check only · no adaptive session is pinned, so no market grids are shown · job {jobId}", System.Net.WebUtility.HtmlDecode(subtitle).Trim());
+        Assert.Contains("no market bar", html);
+        Assert.DoesNotContain("completed bar 0", System.Text.RegularExpressions.Regex.Match(html, "<h1[^>]*>(.*?)</h1>", System.Text.RegularExpressions.RegexOptions.Singleline).Groups[1].Value);
+        Assert.DoesNotContain("data-grid=\"summary-", html);
+    }
+
+    [Fact]
     public async Task Capture_WithoutAnyCloseAtm_ShowsNoSummaryGrids_InsteadOfGuessingFromTheSelectorOrTheBandStart()
     {
         var factory = await SeedResearchAsync();
@@ -1097,12 +1153,12 @@ public sealed class AdaptiveCompactGridTests
         Assert.Contains("Selected strike: 25000", at11);
         Assert.Contains("Center: 25000", at11);
         Assert.Contains("Auto Follow: ON", at11);
-        Assert.Contains("data-strike=\"25000\"", at11);
+        Assert.Contains("data-end-bar=\"11\"", at11);
         var events11 = System.Text.RegularExpressions.Regex.Matches(at11, "data-event-id=\"([^\"]+)\"").Select(m => m.Groups[1].Value).ToList();
         Assert.Empty(events11);                                                                       // historical commentary rows are preserved in the database but never shown
         Assert.DoesNotContain("Commentary", at11, StringComparison.OrdinalIgnoreCase);
         Assert.Equal(4, await (await factory.CreateDbContextAsync()).CommentaryEvents.CountAsync());   // ... and nothing was deleted
-        var rows11 = RowsOf(at11, "options-core-direction");
+        var rows11 = RowsOf(at11, "residual-compact");
         Assert.Equal("11", rows11[0][0]);                                                             // the newest displayed row is the target bar, never a later one
         Assert.DoesNotContain(rows11, r => r[0] == "12");
 
@@ -1110,7 +1166,7 @@ public sealed class AdaptiveCompactGridTests
         Assert.Contains("data-bar=\"12\"", at12);
         Assert.Contains("Completed boundary: 09:42:00", at12);
         Assert.Contains("Selected strike: 25050", at12);
-        Assert.Contains("data-strike=\"25050\"", at12);
+        Assert.Contains("data-end-bar=\"12\"", at12);
         Assert.Empty(System.Text.RegularExpressions.Regex.Matches(at12, "data-event-id="));              // no commentary events; the strip only carries paper trade events
         Assert.DoesNotContain("Commentary", at12, StringComparison.OrdinalIgnoreCase);
     }
@@ -1121,7 +1177,7 @@ public sealed class AdaptiveCompactGridTests
         // The current incomplete bar (quantity, progress, start, staleness) lives only in the sticky live quote; the research panel keeps just the runtime recovery line.
         var factory = await SeedResearchAsync();
         var html = await LiveRenderAsync(factory);
-        Assert.Contains("data-grid=\"futures-compact\"", html);                                           // the live panel really rendered
+        Assert.Contains("data-grid=\"residual-compact\"", html);                                           // the live panel really rendered
         Assert.DoesNotContain("Current incomplete adaptive bar", html);
         Assert.DoesNotContain("adaptive-current-bar", html);
         Assert.DoesNotContain("adaptive-progress-fill", html);
@@ -1134,26 +1190,25 @@ public sealed class AdaptiveCompactGridTests
         var factory = await SeedResearchAsync();
         var html = await RenderAsync<AdaptiveObserverPanel>(GridServices(factory), new() { ["CaptureMode"] = true, ["CaptureSessionId"] = 1L, ["CaptureBarSeq"] = 12 });
         foreach (var required in AdaptiveScreenshotRenderer.RequiredGrids)
-            Assert.Single(System.Text.RegularExpressions.Regex.Matches(html, "<table[^>]*data-grid=\"" + required.Grid + "\""));
+            Assert.Single(System.Text.RegularExpressions.Regex.Matches(html, "<table[^>]*data-grid=\"" + required + "\""));
         foreach (var testId in AdaptiveScreenshotRenderer.RequiredBlocks)
             Assert.Single(System.Text.RegularExpressions.Regex.Matches(html, "data-testid=\"" + testId + "\""));
-        Assert.Equal(4, System.Text.RegularExpressions.Regex.Matches(html, "<table(?![^>]*data-grid=\"summary-)[ >]").Count);          // futures, core, context, residual: no diagnostic table slipped in
+        Assert.Single(System.Text.RegularExpressions.Regex.Matches(html, "<table(?![^>]*data-grid=\"summary-)[ >]"));          // the residual grid only: no removed or diagnostic table slipped in
         Assert.Equal(4, System.Text.RegularExpressions.Regex.Matches(html, "<table[^>]*data-grid=\"summary-").Count);                    // futures summary + the three compact TOTAL summaries (ITM-shifted, ATM, OTM-shifted)
         Assert.Contains("NIFTY RESEARCH SNAPSHOT", html);
         // The five retained sections appear once each, in order; the removed ATM / ITM / OTM summaries and the old two-table TOTAL are absent; there is no commentary.
         var order = System.Text.RegularExpressions.Regex.Matches(html, "<table[^>]*data-grid=\"([^\"]+)\"").Select(m => m.Groups[1].Value).ToList();
-        Assert.Equal(["summary-futures", "summary-total-itm", "summary-total", "summary-total-otm", "futures-compact", "options-core-direction", "options-context", "residual-compact"], order);
+        Assert.Equal(["summary-futures", "summary-total-itm", "summary-total", "summary-total-otm", "residual-compact"], order);
         Assert.True(AdaptiveScreenshotRenderer.IsExpectedGridSequence(order));
         foreach (var gone in new[] { "ATM SUMMARY", "ITM SUMMARY", "OTM SUMMARY", "summary-atm", "summary-itm", "summary-otm", "summary-total-core", "summary-total-context" })
             Assert.DoesNotContain(gone, html);
         Assert.Contains("FUTURES SUMMARY", html);
         Assert.Contains("TOTAL SUMMARY", html);
-        Assert.Contains("OPTIONS — FIXED STRIKE HISTORY", html);
+        Assert.DoesNotContain("FIXED STRIKE HISTORY", html);                                               // live-only section: its history grids were removed
+        Assert.DoesNotContain("Every row below", html);
         Assert.Contains("CE / PE theoretical residual — fixed 09:30 diagnostic", html);
         Assert.DoesNotContain("Commentary", html, StringComparison.OrdinalIgnoreCase);
-        // Direction-sign markup only on Direction cells: five families x (rows + AVG + DAY AVG) in CORE, five (price, IV, delta, vega, activity) in CONTEXT, none on CE / PE cells.
-        var coreRows = RowsOf(html, "options-core-direction").Length;
-        Assert.Equal(coreRows * 7 + RowsOf(html, "options-context").Length * 5, System.Text.RegularExpressions.Regex.Matches(html, "data-direction-sign=").Count);
+        Assert.Contains("data-testid=\"market-summary-basket\" data-end-bar=\"12\"", html);                       // what the renderer checks against the job's bar
     }
 
     [Fact]

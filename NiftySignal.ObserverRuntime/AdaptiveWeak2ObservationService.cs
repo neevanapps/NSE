@@ -93,7 +93,6 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
             .Where(x => x.SessionId == context.Session.Id && x.Status == AdaptiveObservationStatus.Completed)
             .OrderBy(x => x.TriggerBarSeq).ToListAsync(ct);
         if (completed.Count == 0) return;
-        var ticks = await ReadCachedSourceAsync(source, context, ct);
         var bars = await observer.FutureBars.AsNoTracking().Where(x => x.SessionId == context.Session.Id)
             .ToDictionaryAsync(x => x.BarSeq, ct);
         foreach (var actual in completed)
@@ -110,9 +109,10 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
                 H5TargetBarSeq = actual.H5TargetBarSeq, Status = AdaptiveObservationStatus.PendingH5,
                 SelectionPolicy = SelectionPolicyV1,
             };
-            FinalizeFromCleanTicks(context, expected, bars[actual.StrongBaseBarSeq].EndAvailableAtUtc,
+            // Observations are verified in trigger order, so their bases only move forward and earlier ticks can be released.
+            await FinalizeFromSourceAsync(source, context, expected, bars[actual.StrongBaseBarSeq].EndAvailableAtUtc, bars[actual.StrongBaseBarSeq].EndAvailableAtUtc,
                 bars[actual.H5TargetBarSeq].EndAvailableAtUtc,
-                bars[actual.H5TargetBarSeq].Close - bars[actual.TriggerBarSeq].Close, ticks, sessionClosing: true);
+                bars[actual.H5TargetBarSeq].Close - bars[actual.TriggerBarSeq].Close, sessionClosing: true, ct);
             foreach (var property in typeof(AdaptiveWeak2ObservationRow).GetProperties())
             {
                 if (property.Name == nameof(AdaptiveWeak2ObservationRow.Id)) continue;
@@ -203,38 +203,111 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
         nameof(AdaptiveWeak2ObservationRow.BandResidualDirectionalPct), nameof(AdaptiveWeak2ObservationRow.ResidualSupportsReversalDiagnostic),
         nameof(AdaptiveWeak2ObservationRow.H5TargetBarSeq), nameof(AdaptiveWeak2ObservationRow.SelectionPolicy) ];
 
+    const int SourceBatch = 10000;
+    /// <summary>A later source row is never received more than this long before an earlier one (the recovery read-ahead). A result found while rows remain unread is accepted only once this much data beyond its exit is loaded.</summary>
+    static readonly TimeSpan ReadAhead = TimeSpan.FromSeconds(120);
     long _cachedSessionId;
     DateOnly _cachedDay;
     long _cachedRawId;
+    DateTimeOffset _cachedFloor = DateTimeOffset.MinValue;
+    DateTimeOffset _cachedReceived = DateTimeOffset.MinValue;
     AdaptiveIncrementalTickNormalizer _cacheNormalizer = new();
     readonly Dictionary<string,List<CleanObserverTick>> _cachedTicks = new(StringComparer.Ordinal);
 
-    async Task<IReadOnlyDictionary<string,List<CleanObserverTick>>> ReadCachedSourceAsync(
-        NiftySignalDbContext source,AdaptiveObserverSessionContext context,CancellationToken ct)
+    /// <summary>Largest number of option ticks ever held at once (bounded-memory diagnostic).</summary>
+    public int PeakCachedTicks { get; private set; }
+
+    void Reset(AdaptiveObserverSessionContext context)
     {
-        if (_cachedSessionId!=context.Session.Id || _cachedDay!=context.Session.TradeDate)
-        {
-            _cachedSessionId=context.Session.Id;_cachedDay=context.Session.TradeDate;_cachedRawId=0;
-            _cacheNormalizer=new();_cachedTicks.Clear();
-        }
-        var reader=new AdaptiveSourceTickReader();
+        _cachedSessionId=context.Session.Id;_cachedDay=context.Session.TradeDate;_cachedRawId=0;
+        _cachedFloor=DateTimeOffset.MinValue;_cachedReceived=DateTimeOffset.MinValue;
+        _cacheNormalizer=new();_cachedTicks.Clear();
+    }
+
+    /// <summary>
+    /// Finalizes one observation from the option ticks, loading them in batches and only as far as needed. Held in memory: the ticks from <paramref name="floor"/> (the earliest instant any open observation can still
+    /// ask about) plus, per token, the last tick and the last tick carrying open interest before it, which is everything <see cref="FinalizeFromCleanTicks"/> can read, so the result equals a whole-day load.
+    /// </summary>
+    async Task FinalizeFromSourceAsync(NiftySignalDbContext source,AdaptiveObserverSessionContext context,AdaptiveWeak2ObservationRow observation,
+        DateTimeOffset floor,DateTimeOffset baseEndUtc,DateTimeOffset targetEndUtc,double futuresH5Move,bool sessionClosing,CancellationToken ct)
+    {
+        floor=AdaptiveResearchClock.DiagnosticTime(floor);
+        // A request older than what has been released needs the rows again.
+        if (_cachedSessionId!=context.Session.Id || _cachedDay!=context.Session.TradeDate || floor<_cachedFloor) Reset(context);
+        _cachedFloor=floor;
         var tokens=context.Options.Select(x=>x.Token).Distinct(StringComparer.Ordinal).ToArray();
-        var dirty=new HashSet<string>(StringComparer.Ordinal);
+        var reader=new AdaptiveSourceTickReader();
+        foreach(var series in _cachedTicks.Values) Release(series,floor);
         while(true)
         {
-            var batch=await reader.ReadRawAfterIdAsync(source,tokens,_cachedRawId,ct,context.Session.TradeDate,batchSize:10000);
+            long? after=_cachedRawId>0?_cachedRawId:await AdaptiveSourceTickReader.FindStartCursorAsync(source,tokens,context.Session.TradeDate,ReadAhead,ct);
+            IReadOnlyList<(string Token,ObserverRawTick Tick)> batch=after is { } from
+                ? await reader.ReadRawAfterIdAsync(source,tokens,from,ct,context.Session.TradeDate,batchSize:SourceBatch)
+                : [];
+            var dirty=new HashSet<string>(StringComparer.Ordinal);
             foreach(var item in batch)
             {
                 _cachedRawId=Math.Max(_cachedRawId,item.Tick.Id);
+                if(item.Tick.ReceivedAt>_cachedReceived)_cachedReceived=item.Tick.ReceivedAt;
                 if(_cacheNormalizer.Process(item.Token,item.Tick) is not { } clean)continue;
                 if(!_cachedTicks.TryGetValue(item.Token,out var series))_cachedTicks[item.Token]=series=[];
                 series.Add(clean);dirty.Add(item.Token);
             }
-            if(batch.Count<10000)break;
+            foreach(var token in dirty)
+            {
+                _cachedTicks[token].Sort(static (a,b)=> {
+                    var time=a.AvailableAt.CompareTo(b.AvailableAt);return time!=0?time:a.Id.CompareTo(b.Id); });
+            }
+            PeakCachedTicks=Math.Max(PeakCachedTicks,_cachedTicks.Values.Sum(x=>x.Count));
+            foreach(var token in dirty)Release(_cachedTicks[token],floor);
+            var exhausted=batch.Count<SourceBatch;
+
+            var candidate=Copy(observation);
+            FinalizeFromCleanTicks(context,candidate,baseEndUtc,targetEndUtc,futuresH5Move,_cachedTicks,sessionClosing && exhausted);
+            var decided=candidate.Status!=observation.Status
+                && (exhausted || (candidate.ExitTimestampUtc is { } exit && _cachedReceived-ReadAhead>=exit));
+            if(decided || exhausted)
+            {
+                CopyOnto(candidate,observation);
+                return;
+            }
         }
-        foreach(var token in dirty)_cachedTicks[token].Sort(static (a,b)=> {
-            var time=a.AvailableAt.CompareTo(b.AvailableAt);return time!=0?time:a.Id.CompareTo(b.Id); });
-        return _cachedTicks;
+    }
+
+    /// <summary>Drops the ticks before the floor except the last one and the last one carrying open interest.</summary>
+    static void Release(List<CleanObserverTick> series,DateTimeOffset floor)
+    {
+        var lo=0;var hi=series.Count;
+        while(lo<hi) { var mid=(lo+hi)/2;if(series[mid].AvailableAt<floor)lo=mid+1;else hi=mid; }
+        if(lo<=1)return;
+        var interest=lo-1;
+        while(interest>=0 && series[interest].OpenInterest is null)interest--;
+        var last=series[lo-1];
+        var keep=new List<CleanObserverTick>(2);
+        if(interest>=0 && interest!=lo-1)keep.Add(series[interest]);
+        keep.Add(last);
+        if(lo==keep.Count)return;
+        series.RemoveRange(0,lo);
+        series.InsertRange(0,keep);
+    }
+
+    static readonly System.Reflection.PropertyInfo[] RowProperties =
+        typeof(AdaptiveWeak2ObservationRow).GetProperties().Where(p=>p.CanRead && p.CanWrite).ToArray();
+
+    static AdaptiveWeak2ObservationRow Copy(AdaptiveWeak2ObservationRow row)
+    {
+        var copy=new AdaptiveWeak2ObservationRow { SelectionPolicy=row.SelectionPolicy,TriggerTimestampUtc=row.TriggerTimestampUtc };
+        CopyOnto(row,copy);
+        return copy;
+    }
+
+    static void CopyOnto(AdaptiveWeak2ObservationRow from,AdaptiveWeak2ObservationRow to)
+    {
+        foreach(var property in RowProperties)
+        {
+            var value=property.GetValue(from);
+            if(!Equals(property.GetValue(to),value))property.SetValue(to,value);
+        }
     }
 
     async Task TryFinalizeAsync(NiftySignalDbContext source,AdaptiveObserverDbContext observer,
@@ -245,8 +318,15 @@ public sealed class AdaptiveWeak2ObservationService(ILogger<AdaptiveWeak2Observa
         if(target is null)return;
         var baseBar=await observer.FutureBars.AsNoTracking().SingleAsync(x=>x.SessionId==context.Session.Id && x.BarSeq==observation.StrongBaseBarSeq,ct);
         var trigger=await observer.FutureBars.AsNoTracking().SingleAsync(x=>x.SessionId==context.Session.Id && x.BarSeq==observation.TriggerBarSeq,ct);
-        var ticks=await ReadCachedSourceAsync(source,context,ct);
-        FinalizeFromCleanTicks(context,observation,baseBar.EndAvailableAtUtc,target.EndAvailableAtUtc,target.Close-trigger.Close,ticks,sessionClosing);
+        // The earliest instant still needed: the oldest base of a pending observation, or of one that could trigger on the current bar (its base is two bars back).
+        var oldestPending=await observer.Weak2Observations.AsNoTracking()
+            .Where(x=>x.SessionId==context.Session.Id && x.Status==AdaptiveObservationStatus.PendingH5)
+            .Select(x=>(int?)x.StrongBaseBarSeq).MinAsync(ct) ?? observation.StrongBaseBarSeq;
+        var floorSeq=Math.Min(Math.Min(oldestPending,observation.StrongBaseBarSeq),Math.Max(1,currentBarSeq-2));
+        var floor=await observer.FutureBars.AsNoTracking().Where(x=>x.SessionId==context.Session.Id && x.BarSeq>=floorSeq)
+            .OrderBy(x=>x.BarSeq).Select(x=>x.EndAvailableAtUtc).FirstAsync(ct);
+        if(baseBar.EndAvailableAtUtc<floor)floor=baseBar.EndAvailableAtUtc;
+        await FinalizeFromSourceAsync(source,context,observation,floor,baseBar.EndAvailableAtUtc,target.EndAvailableAtUtc,target.Close-trigger.Close,sessionClosing,ct);
         await observer.SaveChangesAsync(ct);
         if(observation.Status==AdaptiveObservationStatus.Completed)
             logger.LogInformation("Adaptive Weak2 observation finalized: session={SessionId}, trigger={Trigger}, OI={OiGate}, H5PnL={Pnl:F2}",

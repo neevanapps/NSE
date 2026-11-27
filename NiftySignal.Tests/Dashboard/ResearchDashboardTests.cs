@@ -490,18 +490,17 @@ public class ResearchDashboardTests
     [Fact]
     public void Renderer_RequiresNamedPrimaryGrids_NotAnExactTableCount()
     {
-        // The original four detailed grids are unchanged and still required (in the same order, after the two Market Summary grids: Futures and the compact TOTAL; ATM / ITM / OTM were removed on 2026-11-02).
-        var grids = AdaptiveScreenshotRenderer.RequiredGrids.Select(g => g.Grid).ToList();
-        Assert.Equal(["futures-compact", "options-core-direction", "options-context", "residual-compact"], grids.TakeLast(4));
-        Assert.Equal(["summary-futures", "summary-total-itm", "summary-total", "summary-total-otm"], grids.Take(4));
-        Assert.Equal(8, grids.Count);
+        // The four Market Summary grids and the residual grid. The ATM / ITM / OTM summaries (2026-11-02) and the Futures, Core Direction and Option Context grids (decision A8) are removed.
+        var grids = AdaptiveScreenshotRenderer.RequiredGrids.ToList();
+        Assert.Equal(["summary-futures", "summary-total-itm", "summary-total", "summary-total-otm", "residual-compact"], grids);
+        foreach (var removed in new[] { "futures-compact", "options-core-direction", "options-context" }) Assert.Contains(removed, AdaptiveScreenshotRenderer.ForbiddenGrids);
         Assert.Contains("summary-atm-core", AdaptiveScreenshotRenderer.ForbiddenGrids);
         Assert.DoesNotContain(AdaptiveScreenshotRenderer.ForbiddenGrids, grids.Contains);
         Assert.Equal(["research-header", "research-data-quality", "recent-events"], AdaptiveScreenshotRenderer.RequiredBlocks);
-        Assert.False(AdaptiveScreenshotRenderer.RequiredGrids.Single(g => g.Grid == "residual-compact").StartsAtTarget);      // legitimately empty before the 09:30 anchor
         var source = File.ReadAllText(Path.Combine(NiftySignal.Tests.Trading.Data.TradingModelTests.RepoRoot(), "NiftySignal.Dashboard", "Services", "AdaptiveScreenshotRenderer.cs"));
         Assert.DoesNotContain("ToHaveCountAsync(3)", source);                                                                  // the obsolete "exactly three tables" assumption is gone
         Assert.Contains("did not render; image not uploaded", source);                                                         // a missing primary grid fails safely
         Assert.Contains("must not be sticky", source);
+        Assert.Contains("\"data-end-bar\", job.TargetBarSeq.ToString()", source);                                             // the picture must be of the job's completed bar
     }
 }

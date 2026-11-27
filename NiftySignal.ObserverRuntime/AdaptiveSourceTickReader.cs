@@ -44,6 +44,10 @@ public sealed class AdaptiveSourceTickReader
         return await ReadProjectionAsync(query,ct);
     }
 
+    /// <summary>
+    /// The whole day, normalized and sorted in memory. Callers must keep it to a bounded token set: historical seeding reads ONE futures instrument-day. Anything that spans the option universe
+    /// uses <see cref="AdaptiveRecoveryTickStream"/> instead.
+    /// </summary>
     public async Task<IReadOnlyList<ObserverTokenTick>> ReadCleanSessionAsync(
         NiftySignalDbContext db,
         DateOnly day,
@@ -73,6 +77,30 @@ public sealed class AdaptiveSourceTickReader
         return clean;
     }
 
+    /// <summary>Recovery slice: rows RECEIVED in [fromUtc, toUtc), same day predicates as <see cref="ReadRawSessionAsync"/> with every later row of the day included, Id order.</summary>
+    public async Task<IReadOnlyList<(string Token, ObserverRawTick Tick)>> ReadReceivedWindowAsync(
+        NiftySignalDbContext db,
+        IReadOnlyCollection<string> tokens,
+        DateTimeOffset fromUtc,
+        DateTimeOffset toUtc,
+        DateOnly day,
+        CancellationToken ct)
+    {
+        if (tokens.Count == 0)
+        {
+            return Array.Empty<(string, ObserverRawTick)>();
+        }
+
+        var tokenArray = tokens.Distinct(StringComparer.Ordinal).ToArray();
+        var lower = new DateTimeOffset(day.ToDateTime(MarketOpen), IstOffset).ToUniversalTime().AddMinutes(-1);
+        var upper = new DateTimeOffset(day.AddDays(1).ToDateTime(TimeOnly.MinValue), IstOffset).ToUniversalTime();
+        var query = db.Ticks.AsNoTracking()
+            .Where(t => tokenArray.Contains(t.Token) && t.ReceivedAt >= fromUtc && t.ReceivedAt < toUtc
+                && t.ExchangeTimestamp >= lower && t.ReceivedAt >= lower && t.ExchangeTimestamp < upper && t.ReceivedAt < upper)
+            .OrderBy(t => t.Id);
+        return await ReadProjectionAsync(query, ct);
+    }
+
     public async Task<IReadOnlyList<(string Token, ObserverRawTick Tick)>> ReadRawAfterIdAsync(
         NiftySignalDbContext db,
         IReadOnlyCollection<string> tokens,
@@ -99,6 +127,27 @@ public sealed class AdaptiveSourceTickReader
         query = query.OrderBy(t => t.Id);
         if (batchSize is { } size) query = query.Take(size);
         return await ReadProjectionAsync(query,ct);
+    }
+
+    /// <summary>
+    /// The Id cursor to start a bounded Id-ordered read of the day from, when nothing has been read yet: one below the lowest Id among the rows received in the first <paramref name="window"/> of the day's data
+    /// (the same read-ahead the recovery stream assumes: no row is received more than one window after a higher Id). Null when the tokens have no row for the day. Found through the received-time index,
+    /// because a LIMIT on an Id-ordered query starting at Id 0 makes PostgreSQL walk the whole primary key.
+    /// </summary>
+    public static async Task<long?> FindStartCursorAsync(
+        NiftySignalDbContext db, IReadOnlyCollection<string> tokens, DateOnly day, TimeSpan window, CancellationToken ct)
+    {
+        if (tokens.Count == 0) return null;
+        var tokenArray = tokens.Distinct(StringComparer.Ordinal).ToArray();
+        var lower = new DateTimeOffset(day.ToDateTime(MarketOpen), IstOffset).ToUniversalTime().AddMinutes(-1);
+        var upper = new DateTimeOffset(day.AddDays(1).ToDateTime(TimeOnly.MinValue), IstOffset).ToUniversalTime();
+        var rows = db.Ticks.AsNoTracking().Where(t => tokenArray.Contains(t.Token)
+            && t.ExchangeTimestamp >= lower && t.ReceivedAt >= lower && t.ExchangeTimestamp < upper && t.ReceivedAt < upper);
+        var first = await rows.OrderBy(t => t.ReceivedAt).Select(t => (DateTimeOffset?)t.ReceivedAt).FirstOrDefaultAsync(ct);
+        if (first is not { } start) return null;
+        var end = start + window;
+        var ids = await rows.Where(t => t.ReceivedAt < end).Select(t => t.Id).ToListAsync(ct);
+        return ids.Min() - 1;
     }
 
     // Select only authoritative scalar fields; avoid materializing millions of owned depth graphs.

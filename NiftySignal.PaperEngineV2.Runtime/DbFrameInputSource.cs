@@ -94,6 +94,26 @@ public sealed class DbFrameInputSource(Func<AdaptiveObserverDbContext> observerD
         catch (PostgresException) { return null; }
     }
 
+    public const int AverageWindow = 5;
+
+    /// <summary>
+    /// The completed-bar average of each exact contract over the <see cref="AverageWindow"/> bars ending at <paramref name="barSeq"/>, from the same verified rows the frame uses. An incomplete window is
+    /// reported as unavailable (null), never bridged or zero-filled.
+    /// </summary>
+    public static async Task<IReadOnlyList<Execution.ContractAverage>> AveragesAsync(AdaptiveObserverDbContext db, long sessionId, DateOnly expiry, IReadOnlyCollection<string> tokens, int barSeq, CancellationToken ct)
+    {
+        if (tokens.Count == 0 || barSeq < 1) return [];
+        var wanted = tokens.Distinct(StringComparer.Ordinal).ToArray();
+        var from = barSeq - AverageWindow + 1;
+        var unverified = await UnverifiedStrikeBars.LoadAsync(db, sessionId, barSeq, ct);
+        var rows = await db.OptionStrikeBars.AsNoTracking()
+            .Where(x => x.SessionId == sessionId && x.Expiry == expiry && wanted.Contains(x.Token) && x.BarSeq >= from && x.BarSeq <= barSeq)
+            .ToListAsync(ct);
+        var bars = ContractBars(unverified.Exclude(rows), wanted.ToHashSet(StringComparer.Ordinal), expiry, barSeq).ToDictionary(b => (b.Token, b.BarSeq));
+        return wanted.Select(token => new Execution.ContractAverage(token,
+            CompletedBarAverage.Compute(seq => bars.TryGetValue((token, seq), out var b) ? (true, b.PriceEnd) : (false, null), barSeq, AverageWindow).Value, barSeq)).ToList();
+    }
+
     static int VersionRank(string version) =>
         version == OptionStrikeBarMetrics.MetricsVersion ? 3 : version == OptionStrikeBarMetrics.PreviousMetricsVersion ? 2 : version == OptionStrikeBarMetrics.LegacyMetricsVersion ? 1 : 0;
 

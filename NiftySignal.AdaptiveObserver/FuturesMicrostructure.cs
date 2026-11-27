@@ -203,6 +203,15 @@ public sealed class FuturesMicrostructureTracker
         return e;
     }
 
+    /// <summary>
+    /// Releases the states no later bar can read: everything older than the state in force at <paramref name="instant"/>. Callers pass a completed bar's end; later bars start there or later.
+    /// </summary>
+    public void ReleaseBefore(DateTimeOffset instant)
+    {
+        var keepFrom = UpperBound(instant) - 1;
+        if (keepFrom > 0) _states.RemoveRange(0, keepFrom);
+    }
+
     // First index whose At is strictly greater than the instant (states are in non-decreasing At order).
     int UpperBound(DateTimeOffset instant)
     {

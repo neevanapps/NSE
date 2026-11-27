@@ -29,7 +29,8 @@ public sealed class AdaptiveSessionCoordinator(
     AdaptiveSourceTickReader tickReader,
     IOptionsMonitor<PricingOptions> pricing,
     ILogger<AdaptiveSessionCoordinator> logger,
-    AdaptiveClockMode clockMode = AdaptiveClockMode.OpeningVolumeV1)
+    AdaptiveClockMode clockMode = AdaptiveClockMode.OpeningVolumeV1,
+    IOptions<AdaptiveRecoveryOptions>? recoveryOptions = null)
 {
     static readonly TimeSpan IstOffset = TimeSpan.FromHours(5.5);
     static readonly TimeOnly MarketOpen = new(9, 15);
@@ -103,15 +104,10 @@ public sealed class AdaptiveSessionCoordinator(
         var spotInstrument = await NiftySpotInstrument.ResolveAsync(source, day, ct);
         var tokens = optionDescriptors.Select(x => x.Token).Append(future.Token).Concat(spotInstrument.Token is { } st ? [st] : []).Distinct(StringComparer.Ordinal).ToArray();
 
-        // Read through "now", not merely cutoff, so readiness can prove the persisted futures
+        // Read towards "now", not merely cutoff, so readiness can prove the persisted futures
         // stream actually crossed 09:30. Calculations below still use only <= cutoff data.
-        var clean = await tickReader.ReadCleanSessionAsync(source, day, tokens, nowUtc, ct);
-        var futureTicks = clean
-            .Where(x => x.Token == future.Token)
-            .Select(x => x.Tick)
-            .OrderBy(x => x.AvailableAt)
-            .ThenBy(x => x.Id)
-            .ToList();
+        var opening = await ReadOpeningAsync(source, day, tokens, future.Token, spotInstrument.Token, optionDescriptors, cutoffUtc, nowUtc, ct);
+        var futureTicks = opening.FutureTicks;
 
         if (!futureTicks.Any(x => x.AvailableAt >= cutoffUtc))
         {
@@ -182,10 +178,10 @@ public sealed class AdaptiveSessionCoordinator(
         if (future0930Tick.Id != 0
             && (cutoffUtc - future0930Tick.AvailableAt).TotalSeconds <= ResidualQuoteMaxAgeSeconds)
         {
-            var quotes = BuildLatestQuotesAt(clean, optionDescriptors, cutoffUtc);
+            var quotes = opening.OptionQuotesAtCutoff;
             // The anchor center is the strike nearest the spot in force at the cutoff (0 <= age <= 5 s). No unique spot instrument or no fresh spot -> no anchor; nothing else is substituted.
             var spotAtCutoff = spotInstrument.Token is { } spotToken
-                ? AtmCenterRules.FreshSpot(clean.Where(x => x.Token == spotToken).OrderBy(x => x.Tick.AvailableAt).ThenBy(x => x.Tick.Id).Select(x => (x.Tick.AvailableAt, x.Tick.Last)), cutoffUtc)
+                ? AtmCenterRules.FreshSpot(opening.SpotBeforeCutoff, cutoffUtc)
                 : null;
             anchor = OptionResidualModel.BuildAnchor(
                 cutoffUtc,
@@ -477,26 +473,43 @@ public sealed class AdaptiveSessionCoordinator(
             x.QuoteAgeSeconds,
             x.IsCenterStrike);
 
-    static IReadOnlyDictionary<string, OptionQuoteSnapshot> BuildLatestQuotesAt(
-        IReadOnlyList<ObserverTokenTick> clean,
-        IReadOnlyList<ObserverOptionInstrument> options,
-        DateTimeOffset cutoff)
-    {
-        var wanted = options.Select(x => x.Token).ToHashSet(StringComparer.Ordinal);
-        var result = new Dictionary<string, OptionQuoteSnapshot>(StringComparer.Ordinal);
-        foreach (var item in clean)
-        {
-            if (!wanted.Contains(item.Token) || item.Tick.AvailableAt > cutoff)
-            {
-                continue;
-            }
+    sealed record OpeningData(
+        List<CleanObserverTick> FutureTicks,
+        Dictionary<string, OptionQuoteSnapshot> OptionQuotesAtCutoff,
+        List<(DateTimeOffset At, double Price)> SpotBeforeCutoff);
 
-            var t = item.Tick;
-            result[item.Token] = new OptionQuoteSnapshot(
-                item.Token, t.AvailableAt, t.Last, t.Bid, t.Ask, t.OpenInterest);
+    /// <summary>
+    /// Everything session creation needs, with bounded memory: the day is read in ordered slices and reading stops at the first slice that proves the future crossed the cutoff. Retained: the future ticks up to the
+    /// cutoff and the first one at or after it, the latest quote of each option at the cutoff, and the spot ticks fresh enough to count at the cutoff. A late start never holds the option universe's whole day.
+    /// </summary>
+    async Task<OpeningData> ReadOpeningAsync(
+        NiftySignalDbContext source, DateOnly day, IReadOnlyCollection<string> tokens, string futureToken, string? spotToken,
+        IReadOnlyList<ObserverOptionInstrument> options, DateTimeOffset cutoffUtc, DateTimeOffset nowUtc, CancellationToken ct)
+    {
+        var data = new OpeningData([], new(StringComparer.Ordinal), []);
+        var wanted = options.Select(x => x.Token).ToHashSet(StringComparer.Ordinal);
+        var spotFrom = cutoffUtc - TimeSpan.FromSeconds(FuturesBasisBar.SpotFreshnessSeconds);
+        var window = TimeSpan.FromSeconds((recoveryOptions?.Value ?? new AdaptiveRecoveryOptions()).ReadWindowSeconds);
+        var stream = new AdaptiveRecoveryTickStream(tickReader, source, day, tokens, ToUtc(day, MarketOpen), nowUtc, window);
+        var crossed = false;
+        while (!crossed && await stream.NextAsync(ct) is { } batch)
+        {
+            foreach (var (token, tick) in batch)
+            {
+                if (token == futureToken)
+                {
+                    if (!crossed || tick.AvailableAt <= cutoffUtc) data.FutureTicks.Add(tick);
+                    if (tick.AvailableAt >= cutoffUtc) crossed = true;
+                }
+
+                if (tick.AvailableAt > cutoffUtc) continue;
+                if (wanted.Contains(token))
+                    data.OptionQuotesAtCutoff[token] = new OptionQuoteSnapshot(token, tick.AvailableAt, tick.Last, tick.Bid, tick.Ask, tick.OpenInterest);
+                if (token == spotToken && tick.AvailableAt >= spotFrom) data.SpotBeforeCutoff.Add((tick.AvailableAt, tick.Last));
+            }
         }
 
-        return result;
+        return data;
     }
 
     static DateTimeOffset ToUtc(DateOnly day, TimeOnly time) =>

@@ -32,19 +32,12 @@ public sealed class AdaptiveObserverPersistence(ILogger<AdaptiveObserverPersiste
 
         await using var transaction = await db.Database.BeginTransactionAsync(ct);
 
-        db.FutureBars.Add(MapFuture(session.Id, package.FutureBar));
-        if (package.FlowState.Rolling is not null)
-        {
-            db.RollingStates.Add(MapRolling(session.Id, package.FlowState));
-        }
-
-        db.OptionBandBars.Add(MapOptionBand(session.Id, package, OptionType.Call));
-        db.OptionBandBars.Add(MapOptionBand(session.Id, package, OptionType.Put));
-
-        foreach (var residual in package.Residuals)
-        {
-            db.OptionResidualBars.Add(MapResidual(session, package.FutureBar.BarSeq, package.FutureBar.EndAvailableAtUtc, residual));
-        }
+        var added = new List<object> { MapFuture(session.Id, package.FutureBar) };
+        if (package.FlowState.Rolling is not null) added.Add(MapRolling(session.Id, package.FlowState));
+        added.Add(MapOptionBand(session.Id, package, OptionType.Call));
+        added.Add(MapOptionBand(session.Id, package, OptionType.Put));
+        added.AddRange(package.Residuals.Select(r => MapResidual(session, package.FutureBar.BarSeq, package.FutureBar.EndAvailableAtUtc, r)));
+        db.AddRange(added);
 
         var runtime = await db.Runtime.SingleAsync(x => x.SessionId == session.Id, ct);
         runtime.LastHeartbeatUtc = nowUtc;
@@ -57,10 +50,49 @@ public sealed class AdaptiveObserverPersistence(ILogger<AdaptiveObserverPersiste
 
         await db.SaveChangesAsync(ct);
         await transaction.CommitAsync(ct);
+        // Released from the change tracker: a replay persists a whole day through one context, which would otherwise keep every row (and re-scan them all on each save).
+        foreach (var row in added) db.Entry(row).State = EntityState.Detached;
 
         return new AdaptivePersistResult(true, false, package.FutureBar.BarSeq);
     }
 
+
+    /// <summary>Persisted market rows per table up to a bar: what a restored state relies on without writing it again.</summary>
+    public async Task<Dictionary<string, int>> CountMarketRowsAsync(AdaptiveObserverDbContext db, long sessionId, int throughBar, CancellationToken ct) => new()
+    {
+        ["rolling"] = await db.RollingStates.CountAsync(x => x.SessionId == sessionId && x.EndBarSeq <= throughBar, ct),
+        ["optionBands"] = await db.OptionBandBars.CountAsync(x => x.SessionId == sessionId && x.BarSeq <= throughBar, ct),
+        ["residuals"] = await db.OptionResidualBars.CountAsync(x => x.SessionId == sessionId && x.BarSeq <= throughBar, ct),
+        ["anchors"] = await db.ResidualAnchorComponents.CountAsync(x => x.SessionId == sessionId, ct),
+        ["futures"] = await db.FuturesSupplemental.CountAsync(x => x.SessionId == sessionId && x.BarSeq <= throughBar, ct),
+        ["basis"] = await db.BasisSupplemental.CountAsync(x => x.SessionId == sessionId && x.BarSeq <= throughBar, ct),
+        ["options"] = await db.OptionsSupplemental.CountAsync(x => x.SessionId == sessionId && x.BarSeq <= throughBar, ct),
+        ["strikes"] = await db.OptionStrikeBars.CountAsync(x => x.SessionId == sessionId && x.BarSeq <= throughBar, ct),
+        ["strikeAttestations"] = await db.StrikeAttestations.CountAsync(x => x.SessionId == sessionId && x.BarSeq <= throughBar, ct),
+        ["closeAtm"] = await db.BarCloseAtm.CountAsync(x => x.SessionId == sessionId && x.BarSeq <= throughBar, ct),
+        ["futuresDepth5"] = await db.FuturesDepth5.CountAsync(x => x.SessionId == sessionId && x.BarSeq <= throughBar, ct),
+        ["optionsDepth5"] = await db.OptionsDepth5.CountAsync(x => x.SessionId == sessionId && x.BarSeq <= throughBar, ct),
+        ["optionsDepth5Attestations"] = await db.OptionsDepth5Attestations.CountAsync(x => x.SessionId == sessionId && x.BarSeq <= throughBar, ct),
+        ["observations"] = await db.Weak2Observations.CountAsync(x => x.SessionId == sessionId && x.TriggerBarSeq <= throughBar, ct),
+    };
+
+    /// <summary>
+    /// Reconciles persisted core futures bars with bars restored from a checkpoint: every restored complete bar must exist and match, with the same strictness as replay verification. Returns the number verified.
+    /// </summary>
+    public async Task<int> VerifyFutureBarsAsync(AdaptiveObserverDbContext db, long sessionId, IReadOnlyList<ExactAdaptiveBar> bars, CancellationToken ct)
+    {
+        var complete = bars.Where(x => x.IsComplete).ToArray();
+        var last = complete.Length == 0 ? 0 : complete[^1].BarSeq;
+        var stored = await db.FutureBars.AsNoTracking().Where(x => x.SessionId == sessionId && x.BarSeq <= last).ToDictionaryAsync(x => x.BarSeq, ct);
+        foreach (var bar in complete)
+        {
+            if (!stored.TryGetValue(bar.BarSeq, out var existing))
+                throw new InvalidOperationException($"Adaptive bar {bar.BarSeq} of the restored checkpoint is not persisted.");
+            VerifyRow(existing, MapFuture(sessionId, bar), bar.BarSeq);
+        }
+
+        return complete.Length;
+    }
 
     /// <summary>
     /// Fixed-clock sessions are frozen at 09:15, before the 09:30 residual anchor exists. When the engine freezes that anchor (causally, from its own ordered ticks) it is stored ONCE in the
@@ -143,7 +175,11 @@ public sealed class AdaptiveObserverPersistence(ILogger<AdaptiveObserverPersiste
         var runtime = await db.Runtime.SingleAsync(x => x.SessionId == sessionId, ct);
         runtime.RuntimeStatus = status;
         runtime.LastHeartbeatUtc = nowUtc;
-        runtime.LastError = error;
+        runtime.LastError = error is { Length: > 2048 } ? error[..2048] : error;
+        if (status == AdaptiveRuntimeStatus.RecoveryFailed)
+        {
+            runtime.RecoveryFailureCount++;
+        }
         if (status == AdaptiveRuntimeStatus.Rebuilding)
         {
             runtime.LastRecoveryStartedUtc = nowUtc;

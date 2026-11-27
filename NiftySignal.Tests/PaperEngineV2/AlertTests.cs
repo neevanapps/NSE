@@ -81,7 +81,12 @@ public class AlertTests
         Assert.Equal(AlertClass.ExecutionFailure, AlertFormatter.ClassOf(Faulted));
         Assert.Equal(AlertClass.ExecutionFailure, AlertFormatter.ClassOf(Unresolved));
         Assert.Null(AlertFormatter.ClassOf(Placed));
-        Assert.DoesNotContain(typeof(PaperEvent).Assembly.GetTypes(), t => typeof(PaperEvent).IsAssignableFrom(t) && t.Name.Contains("Partial", StringComparison.Ordinal));      // all-or-none: no partial fill is ever produced
+        var partial = new PartialExitFilled("p:pfill", "S01", "h", 8, T, "p", 65, 65, 150m, 10m, 1462.5m, 1440m, T, 13);
+        Assert.Equal(AlertClass.PartialFill, AlertFormatter.ClassOf(partial));
+        Assert.Contains("remaining 65", AlertFormatter.Format(partial), StringComparison.Ordinal);
+        var stuck = new LiquidationFailed("p:liqfail", "S01", "h", 8, T, "p", 130, "no quote");
+        Assert.Equal(AlertClass.ExecutionFailure, AlertFormatter.ClassOf(stuck));
+        Assert.Contains("NOT confirmed", AlertFormatter.Format(stuck), StringComparison.Ordinal);
     }
 
     [Fact]

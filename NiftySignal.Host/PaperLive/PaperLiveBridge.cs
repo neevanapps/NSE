@@ -18,7 +18,7 @@ namespace NiftySignal.Host.PaperLive;
 /// off (or with no strategy registered) every method returns immediately.
 /// </para>
 /// </summary>
-public sealed class PaperLiveBridge(IConfiguration configuration, ILogger<PaperLiveBridge> logger) : IDisposable
+public sealed class PaperLiveBridge(IConfiguration configuration, ILogger<PaperLiveBridge> logger) : IAdaptiveLiveSink, IDisposable
 {
     private readonly PaperLiveOptions _options = PaperLiveOptions.Bind(configuration);
     private PaperLiveCoordinator? _coordinator;
@@ -32,7 +32,7 @@ public sealed class PaperLiveBridge(IConfiguration configuration, ILogger<PaperL
     public PaperLiveStatus Status => _coordinator?.Status
         ?? new PaperLiveStatus(_options.Enabled ? PaperLiveState.Idle : PaperLiveState.Disabled, _options.Enabled ? "waiting for a session" : "Trading:PaperLive:Enabled is false", null, null, null, null, null, 0, new PaperLiveHandoffStats(0, 0, 0, 0, 0, 0, 0, 0));
 
-    internal void OnSessionStarted(AdaptiveObserverWorker.LiveState live)
+    public void OnSessionStarted(AdaptiveObserverWorker.LiveState live)
     {
         if (!_options.Enabled)
         {
@@ -62,7 +62,7 @@ public sealed class PaperLiveBridge(IConfiguration configuration, ILogger<PaperL
 
     /// <param name="group">The raw cleaned ticks of the availability group, exactly as the Observer processed them.</param>
     /// <param name="bars">The bars the Observer completed in this group, each with whether its persisted projection was verified.</param>
-    internal void OnGroup(DateTimeOffset at, IReadOnlyList<(string Token, CleanObserverTick Tick)> group, IReadOnlyList<(AdaptiveCompletedBarPackage Package, bool Verified)> bars, AdaptiveObserverWorker.LiveState live)
+    public void OnGroup(DateTimeOffset at, IReadOnlyList<(string Token, CleanObserverTick Tick)> group, IReadOnlyList<(AdaptiveCompletedBarPackage Package, bool Verified)> bars, AdaptiveObserverWorker.LiveState live)
     {
         if (_coordinator is null || _coordinator.Status.State != PaperLiveState.Live && _coordinator.Status.State != PaperLiveState.Faulted)
         {
@@ -116,7 +116,7 @@ public sealed class PaperLiveBridge(IConfiguration configuration, ILogger<PaperL
         return (quotes, liveBars);
     }
 
-    internal void OnPollCompleted(DateTimeOffset stableCutoff)
+    public void OnPollCompleted(DateTimeOffset stableCutoff)
     {
         try
         {
@@ -128,7 +128,7 @@ public sealed class PaperLiveBridge(IConfiguration configuration, ILogger<PaperL
         }
     }
 
-    internal void OnSessionClosing()
+    public void OnSessionClosing()
     {
         try
         {

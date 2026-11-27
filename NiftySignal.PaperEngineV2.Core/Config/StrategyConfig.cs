@@ -28,7 +28,17 @@ public enum AtLeastUnknownPolicy { Unknown }
 
 public sealed record CrossSpec(CrossDirection Direction, MetricSpec Metric, SummaryWindowId Window, double? ConstantLevel, MetricSpec? LevelMetric, SummaryWindowId LevelWindow) : ConditionSpec;
 
-public enum OnOppositeEntrySignal { Exit }
+/// <summary><c>Exit</c>: the opposite signal only closes the position. <c>ExitThenEnterOpposite</c>: the same signal also creates an opposite-direction entry intent that becomes eligible once the position is confirmed closed.</summary>
+public enum OnOppositeEntrySignal { Exit, ExitThenEnterOpposite }
+
+/// <summary><c>Immediate</c>: the order is placed when the signal triggers. <c>Avg5Pullback</c>: the signal creates a pending intent that waits until the frozen reference contract's live mid is strictly below its latest completed 5-bar average.</summary>
+public enum EntryTiming { Immediate, Avg5Pullback }
+
+/// <summary>Profit target (percent appreciation of the option premium) of the listed calendar-day DTE values, below / at-or-above the VIX threshold.</summary>
+public sealed record PartialTargetBucket(IReadOnlyList<int> Dte, double BelowVixPercent, double AtOrAboveVixPercent);
+
+/// <summary>Partial profit booking, frozen per position at its entry fill. Missing / stale VIX or an unmapped DTE disables it for that position only.</summary>
+public sealed record PartialProfitPolicy(double ExitQuantityPercent, double VixThreshold, int MaxVixAgeSeconds, IReadOnlyList<PartialTargetBucket> Targets);
 
 public enum FillQuoteRule { FirstAfterDecision, AsOfEligibleBarEnd }
 
@@ -74,7 +84,7 @@ public sealed record StrategyConfig(
     StrategyIdentity Identity, bool Enabled, string SourceModel,
     GroupSpec? BuyCall, GroupSpec? BuyPut, GroupSpec? ExitConditions, OnOppositeEntrySignal OnOppositeEntrySignal,
     EntryFilters Filters, PremiumRange Premium, ExecutionPolicy Execution, int Lots, double VirtualCapital, int MaxConcurrent, RiskPolicy Risk,
-    OptionalExits Exits, string FeeSchedule, string CanonicalJson, string? ExitMechanism = null);
+    OptionalExits Exits, string FeeSchedule, string CanonicalJson, string? ExitMechanism = null, EntryTiming Timing = EntryTiming.Immediate, PartialProfitPolicy? PartialProfit = null);
 
 /// <summary>One problem found while validating a configuration document. <see cref="Path"/> is a JSON-pointer-like location.</summary>
 public sealed record ConfigError(string Code, string Path, string Message)

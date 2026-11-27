@@ -14,7 +14,7 @@ using NiftySignal.Trading.Core.Costs;
 namespace NiftySignal.PaperEngineV2.Runtime;
 
 /// <summary>Seams for failure-injection tests only (never set by the Host): wrap the durable journal or the engine to delay or fail them.</summary>
-public sealed record V2RuntimeTestHooks(Func<IFrameJournal, IFrameJournal>? JournalDecorator = null, Func<IFrameProcessor, IFrameProcessor>? ProcessorDecorator = null);
+public sealed record V2RuntimeTestHooks(Func<IFrameJournal, IFrameJournal>? JournalDecorator = null, Func<IFrameProcessor, IFrameProcessor>? ProcessorDecorator = null, Func<IPaperEventSink, IPaperEventSink>? SinkDecorator = null);
 
 public enum V2RuntimeState { Disabled, NotStarted, Running, SchemaIncompatible, ConfigInvalid, Stopped }
 
@@ -41,6 +41,7 @@ public sealed class V2Runtime : IAsyncDisposable
     readonly SessionLotSizes _lots = new();
     readonly CancellationTokenSource _cts = new();
     NpgsqlDataSource? _db;
+    ExecutionOwnership? _ownership;
     PostgresEventStore? _store;
     AlertingEventSink? _alertSink;
     PostgresOpportunityStore? _opportunityStore;
@@ -53,6 +54,8 @@ public sealed class V2Runtime : IAsyncDisposable
     PostgresLiveMarkStore? _markStore;
     SessionPipeline? _pipeline;
     long _accepted, _dropped, _built, _buildFailures, _restarts, _inputFailures;
+    long _retiredFailures, _retiredConflicts, _retiredEnqueued, _retiredAlertFailures;       // counts of the stores replaced after an ownership change
+    bool _opportunitiesInstalled;
     int _started;
 
     public V2Runtime(V2RuntimeOptions options, IV2FrameFactory frames, IAlertTransport? transport = null, TimeProvider? clock = null, ILogger? log = null, Func<string, NpgsqlDataSource>? dataSourceFactory = null, V2RuntimeTestHooks? hooks = null)
@@ -83,6 +86,10 @@ public sealed class V2Runtime : IAsyncDisposable
             var verdict = await V2SchemaCheck.CheckAsync(_db, ct);
             if (!verdict.Compatible) { Fail(V2RuntimeState.SchemaIncompatible, "pev2 schema not usable (the owner script is not applied automatically): " + string.Join("; ", verdict.Problems)); return; }
 
+            // One execution writer only: the standalone execution service holds the same lock.
+            _ownership = await ExecutionOwnership.TryAcquireAsync(_db, ct);
+            if (_ownership is null) { Fail(V2RuntimeState.ConfigInvalid, "another execution writer holds the paper ledger (disable PaperEngineV2:Enabled in the Host when the execution service runs)"); return; }
+
             var brokerage = new FlatBrokerage { Unit = BrokerageUnit.PerOrder, Amount = _options.BrokeragePerOrder!.Value };
             try
             {
@@ -96,13 +103,11 @@ public sealed class V2Runtime : IAsyncDisposable
             var set = StrategySet.Load(docs);
             if (!set.SetAccepted) { Fail(V2RuntimeState.ConfigInvalid, "strategy set rejected: " + string.Join("; ", set.SetErrors.Select(e => e.Message))); return; }
             _strategies = set.Active;
-            _store = new PostgresEventStore(_db);
-            foreach (var cfg in set.Active.Select(a => a.Config).Concat(set.DisabledValid)) await _store.RecordConfigAsync(cfg, _clock.GetUtcNow(), ct);
-            _journal = new PostgresFrameJournal(_db);
+            _opportunitiesInstalled = await ObservabilitySchema.HasAsync(_db, "pev2_opportunities", ct);
+            BindStores();
+            foreach (var cfg in set.Active.Select(a => a.Config).Concat(set.DisabledValid)) await _store!.RecordConfigAsync(cfg, _clock.GetUtcNow(), ct);
             // The opportunity log is optional: it exists only after the owner runs the AddObservability script. Without it V2 runs exactly as before and says so.
-            if (await ObservabilitySchema.HasAsync(_db, "pev2_opportunities", ct)) _opportunityStore = new PostgresOpportunityStore(_db, _clock);
-            else _log?.LogWarning("Paper Engine V2: pev2.pev2_opportunities is not installed; the opportunity log is off (owner-run script: AddObservability).");
-            _alertSink = _options.AnyAlertEnabled ? new AlertingEventSink(_store, _db, _options.Alerts, _clock, id => _strategies.FirstOrDefault(s => s.Config.Identity.StrategyId == id)?.Config.Identity.Version) : null;
+            if (!_opportunitiesInstalled) _log?.LogWarning("Paper Engine V2: pev2.pev2_opportunities is not installed; the opportunity log is off (owner-run script: AddObservability).");
             foreach (var (src, errs) in set.Rejected) _log?.LogWarning("V2 strategy file {Source} rejected: {Errors}", src, string.Join("; ", errs.Select(e => e.Message)));
 
             State = V2RuntimeState.Running; Detail = $"{set.Active.Count} strategies active, {set.DisabledValid.Count} disabled, {set.Rejected.Count} rejected";
@@ -113,7 +118,7 @@ public sealed class V2Runtime : IAsyncDisposable
                 // Read-only indicative marks for the Dashboard. Optional: it needs the owner-run AddObservability script; without it V2 runs exactly as before and says so.
                 if (await ObservabilitySchema.HasAsync(_db, "pev2_live_marks", ct))
                 {
-                    _markStore = new PostgresLiveMarkStore(_db);
+                    _markStore = new PostgresLiveMarkStore(_db, () => _ownership);
                     _markPublisher = new LiveMarkPublisher(() => _pipeline?.Engine?.MarkPositions ?? [], () => _markBoard, _markStore, _clock, _options.LiveMarkInterval, _log);
                     _marks = Task.Run(() => _markPublisher.RunAsync(_cts.Token));
                 }
@@ -125,6 +130,15 @@ public sealed class V2Runtime : IAsyncDisposable
         {
             Fail(V2RuntimeState.ConfigInvalid, $"{ex.GetType().Name}: {ex.Message}");
         }
+    }
+
+    /// <summary>Every writing object is created for one ownership and keeps it: whatever still holds an old one is refused by the ledger.</summary>
+    void BindStores()
+    {
+        _store = new PostgresEventStore(_db!, _ownership);
+        _journal = new PostgresFrameJournal(_db!, _ownership);
+        _opportunityStore = _opportunitiesInstalled ? new PostgresOpportunityStore(_db!, _clock, _ownership) : null;
+        _alertSink = _options.AnyAlertEnabled ? new AlertingEventSink(_store, _db!, _options.Alerts, _clock, id => _strategies.FirstOrDefault(s => s.Config.Identity.StrategyId == id)?.Config.Identity.Version, _ownership) : null;
     }
 
     void Fail(V2RuntimeState state, string detail)
@@ -166,7 +180,7 @@ public sealed class V2Runtime : IAsyncDisposable
     {
         var p = _pipeline;
         return new V2RuntimeSnapshot(State, Detail, Interlocked.Read(ref _accepted), Interlocked.Read(ref _dropped), Interlocked.Read(ref _built), Interlocked.Read(ref _buildFailures), Interlocked.Read(ref _restarts), Interlocked.Read(ref _inputFailures),
-            p?.Handoff.Stats(), p?.Consumer.Status, (_store?.Failures ?? 0), (_store?.Conflicts ?? 0), _alertSink?.Enqueued ?? 0, _alertSink?.Failures ?? 0, p?.SessionId);
+            p?.Handoff.Stats(), p?.Consumer.Status, _retiredFailures + (_store?.Failures ?? 0), _retiredConflicts + (_store?.Conflicts ?? 0), _retiredEnqueued + (_alertSink?.Enqueued ?? 0), _retiredAlertFailures + (_alertSink?.Failures ?? 0), p?.SessionId);
     }
 
     /// <summary>The ledger of the current session's engine (test and diagnostics access; the durable store is the source of truth).</summary>
@@ -190,8 +204,40 @@ public sealed class V2Runtime : IAsyncDisposable
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
     }
 
+    /// <summary>
+    /// The writer lock goes with its connection (a database restart, a dropped link), and every ledger write is refused from that moment (<see cref="ExecutionOwnership"/>). Before each bar the ownership
+    /// must still be held. If it is not, the pipeline built under it is discarded together with its queued frames; when the lock is free, a new ownership rebuilds the session from the durable journal (the
+    /// lost bars show as a gap), and when another writer has it, this runtime closes.
+    /// </summary>
+    async Task<bool> StillOwnerAsync(CancellationToken ct)
+    {
+        if (State == V2RuntimeState.ConfigInvalid) return false;
+        if (_ownership is { } held)
+        {
+            if (await held.IsHeldAsync(ct)) return true;
+            var stale = _pipeline;
+            _pipeline = null;
+            if (stale is not null) await stale.AbandonAsync();
+            _ownership = null;
+            await held.DisposeAsync();
+        }
+
+        var next = await ExecutionOwnership.TryAcquireAsync(_db!, ct);
+        if (next is null)
+        {
+            Fail(V2RuntimeState.ConfigInvalid, "another execution writer took the paper ledger after this runtime lost it");
+            return false;
+        }
+
+        _retiredFailures += _store?.Failures ?? 0; _retiredConflicts += _store?.Conflicts ?? 0; _retiredEnqueued += _alertSink?.Enqueued ?? 0; _retiredAlertFailures += _alertSink?.Failures ?? 0;
+        _ownership = next;
+        BindStores();
+        return true;
+    }
+
     async Task HandleNoticeAsync(V2BarNotice notice, CancellationToken ct)
     {
+        if (!await StillOwnerAsync(ct)) return;
         var pipeline = await EnsurePipelineAsync(notice.Session, ct);
         MarketStateFrame? frame; string? problem = null; Exception? thrown = null;
         try { (frame, problem) = await _frames.BuildAsync(notice with { HeldTokens = pipeline.Engine.HeldTokens }, pipeline.Builder, ct); }
@@ -285,6 +331,7 @@ public sealed class V2Runtime : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         try { await StopAsync(); } catch (Exception) { }
+        if (_ownership is not null) await _ownership.DisposeAsync();
         if (_db is not null) await _db.DisposeAsync();
         _cts.Dispose();
     }
@@ -294,6 +341,10 @@ public sealed class V2Runtime : IAsyncDisposable
     {
         Task? _supervisor;
         readonly CancellationTokenSource _stop = new();
+        // the writers of the ownership this pipeline was built under, for its whole life (a consumer rebuild included)
+        readonly IPaperEventSink _sink = (IPaperEventSink?)owner._alertSink ?? owner._store!;
+        readonly IFrameJournal _durable = owner._journal!;
+        readonly PostgresOpportunityStore? _opportunities = owner._opportunityStore;
 
         public long SessionId { get; } = sessionId;
 
@@ -313,10 +364,10 @@ public sealed class V2Runtime : IAsyncDisposable
 
         async Task BuildConsumerAsync(CancellationToken ct)
         {
-            IPaperEventSink sink = (IPaperEventSink?)owner._alertSink ?? owner._store!;
-            Engine = new PaperEngine(owner._strategies, owner._execution!, sink, owner._opportunityStore);
+            var sink = owner._hooks?.SinkDecorator?.Invoke(_sink) ?? _sink;
+            Engine = new PaperEngine(owner._strategies, owner._execution!, sink, _opportunities);
             foreach (var f in Engine.ActivationFailures) owner._log?.LogWarning("V2 strategy {Strategy} did not activate: {Reason}", f.StrategyId, f.Detail);
-            IFrameJournal journal = owner._hooks?.JournalDecorator?.Invoke(owner._journal!) ?? owner._journal!;
+            IFrameJournal journal = owner._hooks?.JournalDecorator?.Invoke(_durable) ?? _durable;
             IFrameProcessor processor = owner._hooks?.ProcessorDecorator?.Invoke(Engine) ?? Engine;
             Consumer = new FrameConsumer(Handoff, Handoff.Options, journal, processor, owner._clock);
             await Consumer.RecoverFromJournalAsync(SessionId, ct);      // deterministic replay into the fresh engine; the idempotent ledger and outbox accept nothing twice
@@ -340,6 +391,14 @@ public sealed class V2Runtime : IAsyncDisposable
                 catch (OperationCanceledException) { return; }
                 catch (Exception ex) { owner._log?.LogError(ex, "V2 could not rebuild the consumer; retrying."); }
             }
+        }
+
+        /// <summary>Stops without working through the queue: the pipeline's ownership is gone, so nothing it would produce can be recorded.</summary>
+        public async Task AbandonAsync()
+        {
+            await _stop.CancelAsync();
+            Handoff.Complete();
+            if (_supervisor is not null) await Task.WhenAny(_supervisor, Task.Delay(TimeSpan.FromSeconds(10)));
         }
 
         public async Task DrainAsync(TimeSpan timeout)

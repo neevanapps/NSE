@@ -500,6 +500,8 @@ public class TotalStrategiesTests
         ExecFixtures.Run(e, [Fr(4, Flat, 0), Fr(5, Up, 1), Fr(6, Up, 1), Fr(7, Flat, 0), Fr(8, Up, 1)]);       // neutral / repeated signals never exit
         foreach (var id in Ids) { Assert.Single(Of<EntryFilled>(e, id)); Assert.Empty(Of<ExitRequested>(e, id)); }
         ExecFixtures.Run(e, [Fr(50, Up, 1, end: at1500.AddMinutes(-1)), Fr(51, Up, 1, end: at1500), Fr(52, Up, 1, end: at1500.AddMinutes(1))]);
+        foreach (var id in Ids) Assert.Empty(Of<ExitRequested>(e, id));                                    // 15:00 stops entries only; there is no time exit before the liquidation
+        ExecFixtures.Run(e, [Fr(53, Up, 1, end: at1500.AddMinutes(8)), Fr(54, Up, 1, end: at1500.AddMinutes(9))]);
         foreach (var id in Ids)
         {
             var req = Assert.Single(Of<ExitRequested>(e, id));

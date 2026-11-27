@@ -68,16 +68,10 @@ try
         options.UseNpgsql(volumeBarConnectionString);
     });
 
-    builder.Services.AddDbContext<AdaptiveObserverDbContext>(options =>
-    {
-        var baseConnectionString = builder.Configuration.GetConnectionString("NiftySignalDb")
-            ?? throw new InvalidOperationException("ConnectionStrings:NiftySignalDb is not set.");
-        var adaptiveConnectionString = new NpgsqlConnectionStringBuilder(baseConnectionString)
-        {
-            Database = AdaptiveObserverDbContext.DatabaseName,
-        }.ConnectionString;
-        options.UseNpgsql(adaptiveConnectionString);
-    });
+    // The Adaptive Observer runs in its own process (NiftySignalObserver) unless Adaptive:Observer:Process is InHost.
+    var observerInHost = AdaptiveObserverRegistration.ProcessMode(builder.Configuration) == AdaptiveObserverProcess.InHost;
+    if (!observerInHost && (NiftySignal.Trading.Live.PaperLiveOptions.Bind(builder.Configuration).Enabled || builder.Configuration.GetValue<bool>("PaperEngineV2:Enabled")))
+        throw new InvalidOperationException($"Trading:PaperLive and PaperEngineV2 run inside the Observer's process: they need {AdaptiveObserverRegistration.ProcessSetting}=InHost (the NiftySignalExecution service does not).");
 
     builder.Services.Configure<TelegramOptions>(builder.Configuration.GetSection(TelegramOptions.SectionName));
     builder.Services.AddHttpClient<TelegramNotifier>();
@@ -185,32 +179,28 @@ try
     // It reads authoritative persisted raw ticks, writes its own isolated database and never
     // creates a paper or real order.
     // Live PAPER trading path: off unless Trading:PaperLive:Enabled is set; no broker, order or HTTP type is involved.
-    builder.Services.AddSingleton<NiftySignal.Host.PaperLive.PaperLiveBridge>();
-    // Paper Engine V2 SHADOW (paper only, no broker): PaperEngineV2:Enabled is false in source; disabled, the bridge is inert (no connection, task or file). Startup only CHECKS the pev2 schema.
-    if (builder.Configuration.GetSection("PaperEngineV2:Alerts").GetChildren().Any(c => string.Equals(c.Value, "true", StringComparison.OrdinalIgnoreCase)))
-        builder.Services.AddHttpClient<NiftySignal.Notifications.ITelegramTextSender, NiftySignal.Notifications.TelegramTextSender>();
-    builder.Services.AddSingleton<NiftySignal.Host.PaperEngineV2.PaperEngineV2Bridge>();
-    builder.Services.AddHostedService(sp => sp.GetRequiredService<NiftySignal.Host.PaperEngineV2.PaperEngineV2Bridge>());
-    builder.Services.AddSingleton<AdaptiveSourceTickReader>();
-    // Futures Top-5 microstructure sidecar (S4). Adaptive:Top5Microstructure:Enabled defaults to FALSE; disabled, the gateway is inert (no depth read, no state, no sidecar row).
-    builder.Services.Configure<Top5MicrostructureOptions>(builder.Configuration.GetSection(Top5MicrostructureOptions.SectionName));
-    builder.Services.AddSingleton<AdaptiveDepthTickReader>();
-    builder.Services.AddSingleton<FuturesDepth5Gateway>();
-    builder.Services.AddSingleton<AdaptiveHistoricalBootstrapService>();
-    // New adaptive sessions use the fixed 13,650-contract clock (config Adaptive:Clock:Mode = OpeningVolumeV1 restores the legacy estimator for NEW sessions). Existing sessions keep their frozen model.
-    builder.Services.AddSingleton(sp => new AdaptiveSessionCoordinator(
-        sp.GetRequiredService<AdaptiveSourceTickReader>(),
-        sp.GetRequiredService<Microsoft.Extensions.Options.IOptionsMonitor<NiftySignal.Domain.Configuration.PricingOptions>>(),
-        sp.GetRequiredService<ILogger<AdaptiveSessionCoordinator>>(),
-        Enum.TryParse<NiftySignal.AdaptiveObserver.AdaptiveClockMode>(builder.Configuration["Adaptive:Clock:Mode"], true, out var clockMode)
-            ? clockMode : NiftySignal.AdaptiveObserver.AdaptiveClockMode.Fixed13650));
-    builder.Services.AddSingleton<AdaptiveObserverPersistence>();
-    builder.Services.AddSingleton<AdaptiveSupplementalPersistence>();
-    builder.Services.AddSingleton<AdaptiveSessionSupplementalService>();
-    builder.Services.AddSingleton<AdaptiveWeak2ObservationService>();
-    builder.Services.AddSingleton<AdaptiveStateRecoveryService>();
-    builder.Services.AddSingleton<AdaptiveEndedSessionRecoveryService>();
-    builder.Services.AddHostedService<AdaptiveObserverWorker>();
+    // A disabled paper path is not registered at all (decision A4): the Observer's processing path then makes no hand-off and nothing of it runs in the background.
+    if (NiftySignal.Trading.Live.PaperLiveOptions.Bind(builder.Configuration).Enabled)
+    {
+        builder.Services.AddSingleton<NiftySignal.Host.PaperLive.PaperLiveBridge>();
+        builder.Services.AddSingleton<IAdaptiveLiveSink>(sp => sp.GetRequiredService<NiftySignal.Host.PaperLive.PaperLiveBridge>());
+    }
+
+    // The in-Host Paper Engine V2 (paper only, no broker): PaperEngineV2:Enabled is false in source and stays false where the NiftySignalExecution service is the writer. Startup only CHECKS the pev2 schema.
+    if (builder.Configuration.GetValue<bool>("PaperEngineV2:Enabled"))
+    {
+        if (builder.Configuration.GetSection("PaperEngineV2:Alerts").GetChildren().Any(c => string.Equals(c.Value, "true", StringComparison.OrdinalIgnoreCase)))
+            builder.Services.AddHttpClient<NiftySignal.Notifications.ITelegramTextSender, NiftySignal.Notifications.TelegramTextSender>();
+        builder.Services.AddSingleton<NiftySignal.Host.PaperEngineV2.PaperEngineV2Bridge>();
+        builder.Services.AddSingleton<IAdaptiveLiveSink>(sp => sp.GetRequiredService<NiftySignal.Host.PaperEngineV2.PaperEngineV2Bridge>());
+        builder.Services.AddHostedService(sp => sp.GetRequiredService<NiftySignal.Host.PaperEngineV2.PaperEngineV2Bridge>());
+    }
+
+    if (observerInHost)
+    {
+        builder.Services.AddAdaptiveObserverDatabase(builder.Configuration);
+        builder.Services.AddAdaptiveObserver(builder.Configuration);
+    }
 
     // NPT1 M1 stream (PAPER only, off by default): a separate, parallel producer of the research M1 bar clock with its own hosted worker, reader, schema (npt1m1) and paper run.
     // Registered only when Trading:PaperLive:Enabled and at least one Trading:PaperLive:Strategies:NPT1-* is true. adaptive-v1 above is not touched by it.
@@ -243,8 +233,8 @@ try
         var volumeBarDb = scope.ServiceProvider.GetRequiredService<VolumeBarDbContext>();
         volumeBarDb.Database.Migrate();
 
-        var adaptiveObserverDb = scope.ServiceProvider.GetRequiredService<AdaptiveObserverDbContext>();
-        adaptiveObserverDb.Database.Migrate();
+        // The observer database belongs to whichever process runs the Observer.
+        if (observerInHost) scope.ServiceProvider.GetRequiredService<AdaptiveObserverDbContext>().Database.Migrate();
 
         // Force eager construction (and therefore eager startup validation -- see
         // ValidatedOptionsMonitor's own doc comment) rather than waiting for the first cadence

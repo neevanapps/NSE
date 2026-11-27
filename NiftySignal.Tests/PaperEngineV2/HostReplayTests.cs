@@ -153,6 +153,7 @@ public class HostReplayTests
             s.AddSingleton<IConfiguration>(new ConfigurationBuilder().AddInMemoryCollection(settings).Build());
             s.AddSingleton<ITelegramTextSender>(telegram);
             s.AddSingleton(sp => new PaperEngineV2Bridge(sp.GetRequiredService<IConfiguration>(), sp.GetRequiredService<IServiceScopeFactory>(), sp.GetRequiredService<ILogger<PaperEngineV2Bridge>>(), telegram, clock));
+            s.AddSingleton<IAdaptiveLiveSink>(sp => sp.GetRequiredService<PaperEngineV2Bridge>());
         }
 
         s.AddSingleton<AdaptiveObserverWorker>();

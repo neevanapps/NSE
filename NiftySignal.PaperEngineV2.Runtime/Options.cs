@@ -1,4 +1,5 @@
 using NiftySignal.PaperEngineV2.Alerts;
+using NiftySignal.PaperEngineV2.Execution;
 
 namespace NiftySignal.PaperEngineV2.Runtime;
 
@@ -26,7 +27,7 @@ public sealed record V2RuntimeOptions
     /// <summary>Bar notices the observer may leave unread before the runtime starts dropping them (visibly: the missing bars become a journaled gap).</summary>
     public int NoticeCapacity { get; init; } = 256;
 
-    /// <summary>Terminal-exit retry cut-off (must be later than 15:00 IST); after it an unfilled exit is reported UNRESOLVED.</summary>
+    /// <summary>Terminal-exit retry cut-off (must be later than the 15:10 IST liquidation deadline); after it an unfilled exit is reported UNRESOLVED.</summary>
     public TimeOnly TerminalRetryUntil { get; init; }
 
     /// <summary>Flat brokerage per order used for the paper cost schedules (the statutory charges come from the existing NSE schedules).</summary>
@@ -59,7 +60,7 @@ public sealed record V2RuntimeOptions
         if (MaxProcessingLag <= TimeSpan.Zero) errors.Add("PaperEngineV2:MaxProcessingLagSeconds must be positive");
         if (FramesToClearGap < 1) errors.Add("PaperEngineV2:FramesToClearGap must be >= 1");
         if (NoticeCapacity < 1) errors.Add("PaperEngineV2:NoticeCapacity must be >= 1");
-        if (TerminalRetryUntil <= new TimeOnly(15, 0)) errors.Add("PaperEngineV2:TerminalRetryUntil must be later than 15:00");
+        if (TerminalRetryUntil <= SessionTimes.Default.LiquidationDeadline) errors.Add("PaperEngineV2:TerminalRetryUntil must be later than the 15:10 liquidation deadline");
         if (CostScheduleVersion is not ("npt1-frozen-fees-v1" or "nse-index-options-2026-04-01-provisional")) errors.Add("PaperEngineV2:CostScheduleVersion must be npt1-frozen-fees-v1 or nse-index-options-2026-04-01-provisional");
         if (BrokeragePerOrder is not { } b || b < 0m) errors.Add("PaperEngineV2:BrokeragePerOrder is required (costs are never assumed zero)");
         return errors;

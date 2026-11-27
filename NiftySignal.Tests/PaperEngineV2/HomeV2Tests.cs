@@ -271,7 +271,9 @@ public class HomeV2Tests
 
         var home = File.ReadAllText(Path.Combine(root, "Components", "Pages", "Home.razor"));
         foreach (var kept in new[] { "<StatusBar />", "<LiveQuotePanel />", "<FlatTradeLoginPanel />", "<ToastHost />", "<AdaptiveObserverPanel />", "/adaptive-screenshots", "/paper-live" }) Assert.Contains(kept, home, StringComparison.Ordinal);
-        Assert.Contains("<PaperEngineV2Panel />", home, StringComparison.Ordinal);
+        // decision A8: the paper-trading section is the two-grid panel only; the earlier V2 panels are no longer on Home
+        Assert.Contains("<PaperEngineV2PositionsPanel />", home, StringComparison.Ordinal);
+        foreach (var gone in new[] { "<PaperEngineV2Panel />", "<PaperEngineV2LiveMarksPanel />", "<PaperEngineV2OpportunityPanel />" }) Assert.DoesNotContain(gone, home, StringComparison.Ordinal);
 
         foreach (var file in Directory.EnumerateFiles(Path.Combine(root, "Components", "Dashboard"), "PaperEngineV2*.razor"))
         {
@@ -285,7 +287,7 @@ public class HomeV2Tests
     public void LiveQuoteScreenshotsAndGrids_AreUntouchedByTheV2Section()
     {
         // the required screenshot grids and the sticky quote panel are what Phases 1-5 delivered; V2 adds nothing to them
-        Assert.Equal(8, AdaptiveScreenshotRenderer.RequiredGrids.Count);
+        Assert.Equal(5, AdaptiveScreenshotRenderer.RequiredGrids.Count);
         var root = Path.Combine(TradingModelTests.RepoRoot(), "NiftySignal.Dashboard");
         Assert.DoesNotContain("PaperEngineV2", File.ReadAllText(Path.Combine(root, "Services", "AdaptiveScreenshotRenderer.cs")), StringComparison.Ordinal);
         Assert.DoesNotContain("PaperEngineV2", File.ReadAllText(Path.Combine(root, "Components", "Dashboard", "LiveQuotePanel.razor")), StringComparison.Ordinal);

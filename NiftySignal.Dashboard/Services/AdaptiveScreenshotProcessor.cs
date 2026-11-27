@@ -11,7 +11,7 @@ public sealed class AdaptiveScreenshotProcessor(IAdaptiveScreenshotRenderer rend
     IOptions<AdaptiveScreenshotOptions> options, TimeProvider? clock = null, AdaptiveResearchService? research = null, PollingFailureLogger? failures = null)
 {
     /// <summary>
-    /// Research caption: it describes the view that was actually captured (fixed-strike CORE DIRECTION / OPTION CONTEXT, completed rows only), never the legacy BOTH / NOTIONAL / ATM±2 selector.
+    /// Research caption: it describes the view that was actually captured (completed rows only), never the legacy BOTH / NOTIONAL / ATM±2 selector.
     /// Built from the same pinned research model the screenshot rendered. The pre-live delivery test keeps its own plain caption. No secret is ever included.
     /// </summary>
     async Task<string> BuildCaptionAsync(AdaptiveScreenshotJobRow job, CancellationToken ct)

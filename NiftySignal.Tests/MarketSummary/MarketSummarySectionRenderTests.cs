@@ -252,7 +252,7 @@ public class MarketSummarySectionRenderTests
             .Where(f => (f.EndsWith(".razor") || f.EndsWith(".cs")) && !f.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}") && !f.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}"))
             .Select(File.ReadAllText));
         Assert.DoesNotMatch(@"(Invert|InvertDirectionOnly)\(\s*[\w.]*\.Delta\s*\)", src);
-        Assert.Contains("InvertDirectionOnly(d.Iv)", src); Assert.Contains("InvertDirectionOnly(d.Vega)", src);
+        // the Options Core Direction grid (its own IV / Vega inversion) was removed by decision A8; the market-summary grids keep the inversion
         Assert.Contains("Invert(d.Iv)", src); Assert.Contains("Invert(d.Vega)", src);
     }
 }

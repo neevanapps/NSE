@@ -16,7 +16,7 @@ namespace NiftySignal.Host.PaperEngineV2;
 /// it never reads the database, never builds a frame and never throws into the Observer. <b>Off by default:</b> with <c>PaperEngineV2:Enabled</c> false (the source default) every method returns immediately and no
 /// connection, task or file is touched. Startup only CHECKS the <c>pev2</c> schema; migrations are applied solely by the owner-run script.
 /// </summary>
-public sealed class PaperEngineV2Bridge : IHostedService, IAsyncDisposable
+public sealed class PaperEngineV2Bridge : IHostedService, IAsyncDisposable, IAdaptiveLiveSink
 {
     readonly V2RuntimeOptions _options;
     readonly IServiceScopeFactory _scopes;
@@ -94,7 +94,7 @@ public sealed class PaperEngineV2Bridge : IHostedService, IAsyncDisposable
         if (_runtime is not null) await _runtime.DisposeAsync();
     }
 
-    internal void OnSessionStarted(AdaptiveObserverWorker.LiveState live)
+    public void OnSessionStarted(AdaptiveObserverWorker.LiveState live)
     {
         if (_runtime is not { Accepting: true }) return;
         try
@@ -115,6 +115,8 @@ public sealed class PaperEngineV2Bridge : IHostedService, IAsyncDisposable
             _log.LogError(e, "Paper Engine V2 could not register the session; the Observer is unaffected.");
         }
     }
+
+    void IAdaptiveLiveSink.OnGroup(DateTimeOffset at, IReadOnlyList<(string Token, CleanObserverTick Tick)> group, IReadOnlyList<(AdaptiveCompletedBarPackage Package, bool Verified)> bars, AdaptiveObserverWorker.LiveState live) => OnGroup(group, bars);
 
     internal void OnGroup(IReadOnlyList<(string Token, CleanObserverTick Tick)> group, IReadOnlyList<(AdaptiveCompletedBarPackage Package, bool Verified)> bars)
     {

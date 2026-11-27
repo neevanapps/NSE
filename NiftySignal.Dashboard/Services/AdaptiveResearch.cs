@@ -169,7 +169,7 @@ public static class ResearchEvents
 
 public static class ResearchCaption
 {
-    /// <summary>Compact, secret-free Telegram caption that describes the research view (fixed-strike CORE DIRECTION / OPTION CONTEXT), not the legacy BOTH / NOTIONAL / ATM±2 selector.</summary>
+    /// <summary>Compact, secret-free Telegram caption that describes the research view (pinned strike and data quality), not the legacy BOTH / NOTIONAL / ATM±2 selector.</summary>
     public static string Build(AdaptiveScreenshotJobRow job, ResearchModel? m, string dashboardSha)
     {
         var ist = TimeSpan.FromHours(5.5);

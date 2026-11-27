@@ -103,166 +103,10 @@
         }
         <MarketSummarySection View="_summary" />
         <div class="adaptive-subtitle" data-testid="diagnostic-grids-banner">EXISTING DETAILED GRIDS – TEMPORARY DIAGNOSTICS</div>
-        <GridSection Title="Futures — exact adaptive bars">
-            @if (!ShowDiagnostic)
-            {
-            <div class="adaptive-table-wrap">
-                <table class="adaptive-table adaptive-table-compact" data-grid="futures-compact">
-                    <thead>
-                    <tr>
-                        <th>Seq</th><th>End IST</th><th>Dur s</th><th>Urgency</th>
-                        <th>Bar ΔPx</th><th>Roll ΔPx</th>
-                        <th title="raw Strict delta (Strict delta / volume, %)">Strict Δ</th><th title="raw Enriched delta (Enriched delta / classified volume, %)">Enriched Δ</th>
-                        <th title="time-weighted MicroDev (time-weighted TOB x 100), displayed inverted: displayed = −raw">@MicroDevDisplay.Label</th><th title="net OFI (net OFI / gross OFI, %)">OFI</th>
-                        <th title="Top-5 price-aligned OFI (net / gross, %). Unavailable when the Top-5 sidecar is off or the bar has no valid transition. Sign is a hypothesis.">OFI5</th><th title="Top-5 MicroDev5Proxy (EVENT-BASED) = mean over the bar's eligible depth snapshots of HalfSpread × TOB5, displayed inverted like MicroDev: displayed = −raw. Sign is a hypothesis.">@Depth5Label</th>
-                        <th>Roll OI Δ</th><th>ΔBasis</th><th>Roll Efficiency</th>
-                        <th title="existing 10-bar rolling metric: does the rolling price move agree in sign with the rolling Strict / Enriched delta? (S = Strict, E = Enriched)">Price–Flow Agree</th><th title="existing 10-bar rolling metric: share of the rolling window carried by fallback-classified trades">Fallback Share %</th>
-                        <th>Evolution</th><th>State</th>
-                    </tr>
-                    </thead>
-                    <tbody>
-                    @foreach (var x in _snapshot.Futures)
-                    {
-                        var r = x.Rolling;
-                        <tr class="@StateClass(r?.State)">
-                            <td class="sticky-col">@x.Bar.BarSeq</td>
-                            <td>@FmtIst(x.Bar.EndAvailableAtUtc)</td>
-                            <td>@x.Bar.DurationSeconds.ToString("0.0")</td>
-                            <td>@Fmt(AdaptiveGridProjection.Urgency(x.Bar.Volume, x.Bar.DurationSeconds), 1)</td>
-                            <td class="@Sc(x.Bar.BarPriceDisplacement)" data-sign="@RatioFormat.SignName(x.Bar.BarPriceDisplacement)">@FmtSigned(x.Bar.BarPriceDisplacement, 2)</td>
-                            <td class="@Sc(r?.PriceDisplacement)" data-sign="@RatioFormat.SignName(r?.PriceDisplacement)">@FmtSigned(r?.PriceDisplacement, 2)</td>
-                            @{ var fr = FuturesRatios.Build(x.Bar, Supplemental(x.Bar.BarSeq)); }
-                            <td class="@Sc(fr.Strict)" data-sign="@RatioFormat.SignName(fr.Strict)">@RatioFormat.Cell(fr.Strict)</td>
-                            <td class="@Sc(fr.Enriched)" data-sign="@RatioFormat.SignName(fr.Enriched)">@RatioFormat.Cell(fr.Enriched)</td>
-                            @{ var frMicro = MicroDevDisplay.Invert(fr.MicroDev); }
-                            <td class="@Sc(frMicro)" data-sign="@RatioFormat.SignName(frMicro)">@RatioFormat.Cell(frMicro, 2)</td>
-                            <td class="@Sc(fr.Ofi)" data-sign="@RatioFormat.SignName(fr.Ofi)">@RatioFormat.Cell(fr.Ofi)</td>
-                            @{ var d5 = _snapshot.FuturesDepth5?.GetValueOrDefault(x.Bar.BarSeq); var o5 = Depth5Ratios.Ofi5(d5); var m5 = MicroDevDisplay.Invert(Depth5Ratios.MicroDev5(d5)); }
-                            <td class="@Sc(o5)" data-sign="@RatioFormat.SignName(o5)" data-col="ofi5" title="@Ofi5Title(d5)">@RatioFormat.Cell(o5)</td>
-                            <td class="@Sc(m5)" data-sign="@RatioFormat.SignName(m5)" data-col="microdev5">@RatioFormat.Cell(m5, 2)</td>
-                            <td>@FmtSigned(r?.OiChange)</td>
-                            <td>@FmtSigned(Basis(x.Bar.BarSeq)?.DeltaBasis, 2)</td>
-                            <td>@Fmt(r?.Efficiency, 3)</td>
-                            <td data-col="price-flow-agree">@AgreeText(r)</td>
-                            <td data-col="fallback-share">@(r is null ? "—" : (r.FallbackShare * 100d).ToString("0.0", System.Globalization.CultureInfo.InvariantCulture))</td>
-                            <td>@(r?.StrictDominanceEvolution ?? "—")</td>
-                            <td><span class="state-badge">@((r?.State).ToString() ?? "—")</span></td>
-                        </tr>
-                    }
-                    @if (_snapshot.Futures.Count > 0)
-                    {
-                        var avg = FuturesAverage();
-                        <tr class="adaptive-avg-row" data-testid="futures-avg">
-                            <td class="sticky-col">AVG</td>
-                            <td>@_snapshot.Futures.Count rows</td>
-                            <td>@RatioFormat.Plain(avg.Duration, 1)</td>
-                            <td>@RatioFormat.Plain(avg.Urgency, 1)</td>
-                            <td class="@Sc(avg.BarPx)" data-sign="@RatioFormat.SignName(avg.BarPx)">@RatioFormat.Plain(avg.BarPx, 2)</td>
-                            <td class="@Sc(avg.RollPx)" data-sign="@RatioFormat.SignName(avg.RollPx)">@RatioFormat.Plain(avg.RollPx, 2)</td>
-                            <td class="@Sc(avg.Strict)" data-sign="@RatioFormat.SignName(avg.Strict)">@RatioFormat.Cell(avg.Strict)</td>
-                            <td class="@Sc(avg.Enriched)" data-sign="@RatioFormat.SignName(avg.Enriched)">@RatioFormat.Cell(avg.Enriched)</td>
-                            @{ var avgMicro = MicroDevDisplay.Invert(avg.MicroDev); }
-                            <td class="@Sc(avgMicro)" data-sign="@RatioFormat.SignName(avgMicro)">@RatioFormat.Cell(avgMicro, 2)</td>
-                            <td class="@Sc(avg.Ofi)" data-sign="@RatioFormat.SignName(avg.Ofi)">@RatioFormat.Cell(avg.Ofi)</td>
-                            @{ var a5 = Depth5Averages.Compute(_snapshot.Futures, s => _snapshot.FuturesDepth5?.GetValueOrDefault(s)); var a5m = MicroDevDisplay.Invert(a5.MicroDev5); }
-                            <td class="@Sc(a5.Ofi5)" data-sign="@RatioFormat.SignName(a5.Ofi5)">@RatioFormat.Cell(a5.Ofi5)</td>
-                            <td class="@Sc(a5m)" data-sign="@RatioFormat.SignName(a5m)">@RatioFormat.Cell(a5m, 2)</td>
-                            <td>@RatioFormat.Plain(avg.RollOi, 1)</td>
-                            <td>@RatioFormat.Plain(avg.Basis, 2)</td>
-                            <td>@RatioFormat.Plain(avg.Efficiency, 3)</td>
-                            <td>@AgreeAvgText(a5)</td>
-                            <td>@RatioFormat.Plain(a5.FallbackSharePct, 1)</td>
-                            <td>—</td><td>—</td>
-                        </tr>
-                    }
-                    @if (_day is { BarCount: > 0 } dayF)
-                    {
-                        var davg = dayF.FuturesAverage();
-                        <tr class="adaptive-avg-row adaptive-day-avg-row" data-testid="futures-day-avg">
-                            <td class="sticky-col">DAY AVG</td>
-                            <td>@dayF.BarCount bars</td>
-                            <td>@RatioFormat.Plain(davg.Duration, 1)</td>
-                            <td>@RatioFormat.Plain(davg.Urgency, 1)</td>
-                            <td class="@Sc(davg.BarPx)" data-sign="@RatioFormat.SignName(davg.BarPx)">@RatioFormat.Plain(davg.BarPx, 2)</td>
-                            <td class="@Sc(davg.RollPx)" data-sign="@RatioFormat.SignName(davg.RollPx)">@RatioFormat.Plain(davg.RollPx, 2)</td>
-                            <td class="@Sc(davg.Strict)" data-sign="@RatioFormat.SignName(davg.Strict)">@RatioFormat.Cell(davg.Strict)</td>
-                            <td class="@Sc(davg.Enriched)" data-sign="@RatioFormat.SignName(davg.Enriched)">@RatioFormat.Cell(davg.Enriched)</td>
-                            @{ var davgMicro = MicroDevDisplay.Invert(davg.MicroDev); }
-                            <td class="@Sc(davgMicro)" data-sign="@RatioFormat.SignName(davgMicro)">@RatioFormat.Cell(davgMicro, 2)</td>
-                            <td class="@Sc(davg.Ofi)" data-sign="@RatioFormat.SignName(davg.Ofi)">@RatioFormat.Cell(davg.Ofi)</td>
-                            @{ var da5 = dayF.Depth5Average(); var da5m = MicroDevDisplay.Invert(da5.MicroDev5); }
-                            <td class="@Sc(da5.Ofi5)" data-sign="@RatioFormat.SignName(da5.Ofi5)">@RatioFormat.Cell(da5.Ofi5)</td>
-                            <td class="@Sc(da5m)" data-sign="@RatioFormat.SignName(da5m)">@RatioFormat.Cell(da5m, 2)</td>
-                            <td>@RatioFormat.Plain(davg.RollOi, 1)</td>
-                            <td>@RatioFormat.Plain(davg.Basis, 2)</td>
-                            <td>@RatioFormat.Plain(davg.Efficiency, 3)</td>
-                            <td>@AgreeAvgText(da5)</td>
-                            <td>@RatioFormat.Plain(da5.FallbackSharePct, 1)</td>
-                            <td>—</td><td>—</td>
-                        </tr>
-                    }
-                    </tbody>
-                </table>
-            </div>
-            }
-            else
-            {
-            <div class="adaptive-table-wrap">
-                <table class="adaptive-table">
-                    <thead>
-                    <tr>
-                        <th>Seq</th><th>End IST</th><th>Dur s</th><th>Bar ΔPx</th>
-                        <th>Strict Δ</th><th>Strict ratio</th><th>Strict cov</th>
-                        <th>Enriched Δ</th><th>Enriched ratio</th><th>Updates</th>
-                        <th>Roll ΔPx</th><th>Roll strict Δ</th><th>Roll strict ratio</th><th>Roll quote cov</th>
-                        <th>Roll enriched Δ</th><th>Roll enriched ratio</th><th>|Strict| Δ</th><th>Enriched Δchg</th>
-                        <th>Efficiency</th><th>Return bps</th><th>Roll OI Δ</th><th>Roll OI Δ%</th><th>Vol/sec</th>
-                        <th>ΔBasis</th><th>Basis status</th><th>Spot age end s</th><th>Basis covered s</th>
-                        <th>Evolution</th><th>State</th>
-                    </tr>
-                    </thead>
-                    <tbody>
-                    @foreach (var x in _snapshot.Futures)
-                    {
-                        var r = x.Rolling;
-                        <tr class="@StateClass(r?.State)">
-                            <td class="sticky-col">@x.Bar.BarSeq</td>
-                            <td>@FmtIst(x.Bar.EndAvailableAtUtc)</td>
-                            <td>@x.Bar.DurationSeconds.ToString("0.0")</td>
-                            <td class="@Sc(x.Bar.BarPriceDisplacement)" data-sign="@RatioFormat.SignName(x.Bar.BarPriceDisplacement)">@FmtSigned(x.Bar.BarPriceDisplacement, 2)</td>
-                            <td class="@Sc(x.Bar.StrictDelta)" data-sign="@RatioFormat.SignName(x.Bar.StrictDelta)">@FmtSigned(x.Bar.StrictDelta)</td>
-                            <td class="@Sc(x.Bar.StrictDeltaRatioTotal)" data-sign="@RatioFormat.SignName(x.Bar.StrictDeltaRatioTotal)">@FmtSigned(x.Bar.StrictDeltaRatioTotal, 3)</td>
-                            <td>@FmtPct01(x.Bar.StrictCoverage)</td>
-                            <td class="@Sc(x.Bar.EnrichedDelta)" data-sign="@RatioFormat.SignName(x.Bar.EnrichedDelta)">@FmtSigned(x.Bar.EnrichedDelta)</td>
-                            <td class="@Sc(x.Bar.EnrichedDeltaRatio)" data-sign="@RatioFormat.SignName(x.Bar.EnrichedDeltaRatio)">@FmtSigned(x.Bar.EnrichedDeltaRatio, 3)</td>
-                            <td>@x.Bar.TradeUpdates</td>
-                            <td class="@Sc(r?.PriceDisplacement)" data-sign="@RatioFormat.SignName(r?.PriceDisplacement)">@FmtSigned(r?.PriceDisplacement, 2)</td>
-                            <td class="@Sc(r?.StrictDelta)" data-sign="@RatioFormat.SignName(r?.StrictDelta)">@FmtSigned(r?.StrictDelta)</td>
-                            <td class="@Sc(r?.StrictDeltaRatioTotal)" data-sign="@RatioFormat.SignName(r?.StrictDeltaRatioTotal)">@FmtSigned(r?.StrictDeltaRatioTotal, 3)</td>
-                            <td>@FmtPct01(r?.StrictQuoteCoverage)</td>
-                            <td class="@Sc(r?.EnrichedDelta)" data-sign="@RatioFormat.SignName(r?.EnrichedDelta)">@FmtSigned(r?.EnrichedDelta)</td>
-                            <td class="@Sc(r?.EnrichedDeltaRatio)" data-sign="@RatioFormat.SignName(r?.EnrichedDeltaRatio)">@FmtSigned(r?.EnrichedDeltaRatio, 3)</td>
-                            <td>@FmtSigned(r?.RollingStrictAbsDeltaChange)</td>
-                            <td>@FmtSigned(r?.RollingEnrichedDeltaChange)</td>
-                            <td>@Fmt(r?.Efficiency, 3)</td>
-                            <td class="@Sc(r?.ReturnBps)" data-sign="@RatioFormat.SignName(r?.ReturnBps)">@FmtSigned(r?.ReturnBps, 2)</td>
-                            <td>@FmtSigned(r?.OiChange)</td>
-                            <td>@FmtPct01(r?.OiChangePct)</td>
-                            <td>@Fmt(r?.VolumePerSecond, 1)</td>
-                            <td>@FmtSigned(Basis(x.Bar.BarSeq)?.DeltaBasis, 2)</td>
-                            <td>@(Basis(x.Bar.BarSeq)?.Status ?? "—")</td>
-                            <td>@Fmt(Basis(x.Bar.BarSeq)?.SpotAgeEndSeconds, 1)</td>
-                            <td>@Fmt(Basis(x.Bar.BarSeq)?.CoveredSeconds, 1)</td>
-                            <td>@(r?.StrictDominanceEvolution ?? "—")</td>
-                            <td><span class="state-badge">@((r?.State).ToString() ?? "—")</span></td>
-                        </tr>
-                    }
-                    </tbody>
-                </table>
-            </div>
-            }
-        </GridSection>
 
+        @* Live Dashboard only: since the fixed-strike history grids were removed, this section holds the strike selector and the live-quote price averages, neither of which belongs in a pinned capture. *@
+        @if (!CaptureMode)
+        {
         <GridSection Title="OPTIONS — FIXED STRIKE HISTORY">
             @if (_catalog is null)
             {
@@ -270,17 +114,6 @@
             }
             else
             {
-                @if (CaptureMode)
-                {
-                    <div class="fixed-strike-header" data-testid="fixed-strike-header">
-                        <span>Expiry: <b>@_catalog.Expiry.ToString("dd-MMM-yyyy")</b></span>
-                        <span>Auto follow center: <b>ON</b></span>
-                        <span>Selected strike: <b>@FmtStrike(_research?.SelectedStrike)</b></span>
-                        <span>Current center: <b>@FmtStrike(_research?.Center)</b></span>
-                    </div>
-                }
-                else
-                {
                     <div class="fixed-strike-header" data-testid="fixed-strike-header">
                     <span>Expiry: <b>@_catalog.Expiry.ToString("dd-MMM-yyyy")</b></span>
                     <label>
@@ -299,7 +132,6 @@
                     </label>
                     <span>Current center: <b>@FmtStrike(_sel.CurrentCenter)</b></span>
                 </div>
-                }
                 @if (_fixed is null)
                 {
                     <div class="adaptive-pending">@(_sel.SelectedStrike is null ? "Waiting for the first completed bar's center." : $"Strike {FmtStrike(_sel.SelectedStrike)} is not in the frozen option universe.")</div>
@@ -307,132 +139,11 @@
                 else
                 {
                     <div class="adaptive-note" data-testid="fixed-strike-identity">
-                        Every row below is exactly @_fixed.Expiry.ToString("dd-MMM-yyyy") · strike @FmtStrike(_fixed.Strike) · CE @(_fixed.Contract.CeSymbol ?? "—") · PE @(_fixed.Contract.PeSymbol ?? "—").
-                        A bar without a stored row for this strike shows — (no other strike is ever substituted).
+                        Exact contract: @_fixed.Expiry.ToString("dd-MMM-yyyy") · strike @FmtStrike(_fixed.Strike) · CE @(_fixed.Contract.CeSymbol ?? "—") · PE @(_fixed.Contract.PeSymbol ?? "—").
+                        An average whose window lacks a bar for this contract shows — (no other strike is ever substituted).
                     </div>
-                    var coreRows = _fixed.Rows.Select(r => (Row: r, D: OptionDirectionRatios.Core(r))).ToList();
-                    var coreAvg = OptionAverages.Core(coreRows.Select(x => x.D));
-                    var ctxAvg = OptionAverages.Context(coreRows.Select(x => x.D), _fixed.Rows.Select(r => OptionDirectionRatios.Context(r.Ce, r.Pe)));
-                    // DAY AVG is the history of the SAME exact strike/contract pair (a different strike's history is never shown under this one).
-                    (OptionsCoreAverage Core, OptionsContextAverage Context)? dayFixed = _day?.Fixed is { } df && df.Strike == _fixed.Strike && df.Contract == _fixed.Contract ? OptionAverages.Of(df) : null;
-                    var ctxRows = _fixed.Rows.Select(r => (Row: r, D: OptionDirectionRatios.Context(r.Ce, r.Pe))).ToList();
-                    <div class="adaptive-subtitle">CORE DIRECTION <span class="text-faint">raw (ratio %) — Direction = CE − PE, except OI = PE − CE · @MicroDevDisplay.Legend · tint = sign only</span></div>
-                    <div class="adaptive-table-wrap">
-                        <table class="adaptive-table adaptive-table-compact" data-grid="options-core-direction" data-strike="@_fixed.Strike.ToString("0")">
-                            <thead>
-                            <tr>
-                                <th>Seq</th><th>End IST</th>
-                                <th>CE Strict Δ</th><th>PE Strict Δ</th><th>Strict Dir</th>
-                                <th>CE Enriched Δ</th><th>PE Enriched Δ</th><th>Enriched Dir</th>
-                                <th>CE OI Δ</th><th>PE OI Δ</th><th>OI Dir (PE−CE)</th>
-                                <th>CE MicroDev (Inv)</th><th>PE MicroDev (Inv)</th><th title="raw CE − PE of the raw MicroDev values (NOT inverted; the CE / PE columns are shown inverted)">MicroDev Dir</th>
-                                <th>CE OFI</th><th>PE OFI</th><th>OFI Dir</th>
-                                <th title="Top-5 price-aligned OFI, attested rows only; sign is a hypothesis">CE OFI5</th><th>PE OFI5</th><th title="CE − PE over the combined gross OFI5">OFI5 Dir</th>
-                                <th title="Top-5 MicroDev5Proxy, displayed inverted: displayed = −raw; sign is a hypothesis">CE MicroDev5Proxy (Inv)</th><th>PE MicroDev5Proxy (Inv)</th><th title="raw CE − PE of the raw MicroDev5Proxy (NOT inverted; the CE / PE columns are shown inverted)">MicroDev5 Dir</th>
-                            </tr>
-                            </thead>
-                            <tbody>
-                            @foreach (var (r, d) in coreRows)
-                            {
-                                <tr>
-                                    <td class="sticky-col">@r.BarSeq</td>
-                                    <td>@FmtIst(r.EndAvailableAtUtc)</td>
-                                    @DirectionCells(d.Strict, 0, tint: false)
-                                    @DirectionCells(d.Enriched, 0, tint: false)
-                                    @DirectionCells(d.Oi, 0, tint: false)
-                                    @DirectionCells(MicroDevDisplay.InvertSides(d.MicroDev), 2, tint: false)
-                                    @DirectionCells(d.Ofi, 0, tint: false)
-                                    @DirectionCells(Depth5Ratios.OptionOfi5(r.CeDepth, r.PeDepth), 0, tint: false)
-                                    @DirectionCells(MicroDevDisplay.InvertSides(Depth5Ratios.OptionMicroDev5(r.CeDepth, r.PeDepth)), 2, tint: false)
-                                </tr>
-                            }
-                            @if (coreRows.Count > 0)
-                            {
-                                <tr class="adaptive-avg-row" data-testid="options-core-avg">
-                                    <td class="sticky-col">AVG</td>
-                                    <td>@coreRows.Count rows</td>
-                                    @DirectionCells(coreAvg.Strict, 0, tint: false)
-                                    @DirectionCells(coreAvg.Enriched, 0, tint: false)
-                                    @DirectionCells(coreAvg.Oi, 0, tint: false)
-                                    @DirectionCells(MicroDevDisplay.InvertSides(coreAvg.MicroDev), 2, tint: false)
-                                    @DirectionCells(coreAvg.Ofi, 0, tint: false)
-                                    @DirectionCells(OptionDirectionRatios.Average(_fixed.Rows.Select(r => Depth5Ratios.OptionOfi5(r.CeDepth, r.PeDepth))), 0, tint: false)
-                                    @DirectionCells(MicroDevDisplay.InvertSides(OptionDirectionRatios.Average(_fixed.Rows.Select(r => Depth5Ratios.OptionMicroDev5(r.CeDepth, r.PeDepth)))), 2, tint: false)
-                                </tr>
-                            }
-                            @if (dayFixed is { } dc && _day is not null)
-                            {
-                                <tr class="adaptive-avg-row adaptive-day-avg-row" data-testid="options-core-day-avg">
-                                    <td class="sticky-col">DAY AVG</td>
-                                    <td>@_day.BarCount bars</td>
-                                    @DirectionCells(dc.Core.Strict, 0, tint: false)
-                                    @DirectionCells(dc.Core.Enriched, 0, tint: false)
-                                    @DirectionCells(dc.Core.Oi, 0, tint: false)
-                                    @DirectionCells(MicroDevDisplay.InvertSides(dc.Core.MicroDev), 2, tint: false)
-                                    @DirectionCells(dc.Core.Ofi, 0, tint: false)
-                                    @DirectionCells(OptionDirectionRatios.Average(_day.Fixed!.Rows.Select(r => Depth5Ratios.OptionOfi5(r.CeDepth, r.PeDepth))), 0, tint: false)
-                                    @DirectionCells(MicroDevDisplay.InvertSides(OptionDirectionRatios.Average(_day.Fixed!.Rows.Select(r => Depth5Ratios.OptionMicroDev5(r.CeDepth, r.PeDepth)))), 2, tint: false)
-                                </tr>
-                            }
-                            </tbody>
-                        </table>
-                    </div>
-                    <div class="adaptive-subtitle">OPTION CONTEXT <span class="text-faint">same strike · IV raw in IV points · ΔDelta / ΔVega = bar change (end − start) of the Black-Scholes Greek, raw (Vega per 1.00 vol; blank until option-strike-v3 rows exist) · Activity = traded quantity per second · @DirectionDisplay.Legend</span></div>
-                    <div class="adaptive-table-wrap">
-                        <table class="adaptive-table adaptive-table-compact" data-grid="options-context" data-strike="@_fixed.Strike.ToString("0")">
-                            <thead>
-                            <tr>
-                                <th>Seq</th><th>End IST</th>
-                                <th>CE Price Δ</th><th>PE Price Δ</th><th>Price Dir</th>
-                                <th>CE ΔIV</th><th>PE ΔIV</th><th title="displayed inverted: displayed = −raw (CE − PE)">@DirectionDisplay.IvLabel</th>
-                                <th>CE ΔDelta</th><th>PE ΔDelta</th><th title="CE − PE (raw)">@DirectionDisplay.DeltaLabel</th>
-                                <th>CE ΔVega</th><th>PE ΔVega</th><th title="displayed inverted: displayed = −raw (CE − PE)">@DirectionDisplay.VegaLabel</th>
-                                <th>CE Activity</th><th>PE Activity</th><th>Activity Dir</th>
-                            </tr>
-                            </thead>
-                            <tbody>
-                            @foreach (var (r, d) in ctxRows)
-                            {
-                                var pr = OptionDirectionRatios.Core(r);
-                                <tr>
-                                    <td class="sticky-col">@r.BarSeq</td>
-                                    <td>@FmtIst(r.EndAvailableAtUtc)</td>
-                                    @DirectionCells(pr.Price, 2, tint: false)
-                                    @DirectionCells(DirectionDisplay.InvertDirectionOnly(d.Iv), 2, tint: false)
-                                    @DirectionCells(d.Delta, 4, tint: false)
-                                    @DirectionCells(DirectionDisplay.InvertDirectionOnly(d.Vega), 2, tint: false)
-                                    @DirectionCells(d.Activity, 1, tint: false)
-                                </tr>
-                            }
-                            @if (ctxRows.Count > 0)
-                            {
-                                <tr class="adaptive-avg-row" data-testid="options-context-avg">
-                                    <td class="sticky-col">AVG</td>
-                                    <td>@ctxRows.Count rows</td>
-                                    @DirectionCells(ctxAvg.Price, 2, tint: false)
-                                    @DirectionCells(DirectionDisplay.InvertDirectionOnly(ctxAvg.Iv), 2, tint: false)
-                                    @DirectionCells(ctxAvg.Delta, 4, tint: false)
-                                    @DirectionCells(DirectionDisplay.InvertDirectionOnly(ctxAvg.Vega), 2, tint: false)
-                                    @DirectionCells(ctxAvg.Activity, 1, tint: false)
-                                </tr>
-                            }
-                            @if (dayFixed is { } dx && _day is not null)
-                            {
-                                <tr class="adaptive-avg-row adaptive-day-avg-row" data-testid="options-context-day-avg">
-                                    <td class="sticky-col">DAY AVG</td>
-                                    <td>@_day.BarCount bars</td>
-                                    @DirectionCells(dx.Context.Price, 2, tint: false)
-                                    @DirectionCells(DirectionDisplay.InvertDirectionOnly(dx.Context.Iv), 2, tint: false)
-                                    @DirectionCells(dx.Context.Delta, 4, tint: false)
-                                    @DirectionCells(DirectionDisplay.InvertDirectionOnly(dx.Context.Vega), 2, tint: false)
-                                    @DirectionCells(dx.Context.Activity, 1, tint: false)
-                                </tr>
-                            }
-                            </tbody>
-                        </table>
-                    </div>
-                    @* Live Dashboard only: the Telegram screenshot keeps its fixed six-grid contract. *@
-                    @if (_avgPrice is { } ap && !CaptureMode)
+                    @* Live Dashboard only: this table quotes the live market, so it is not part of the pinned Telegram screenshot. *@
+                    @if (_avgPrice is { } ap)
                     {
                         <div class="adaptive-table-wrap" data-testid="option-price-averages">
                             <div class="adaptive-subtitle">OPTION PRICE AVERAGES · exact contract above · Avg = mean of the completed-bar mid (PriceEnd) of the latest 5 / 10 completed bars ending at bar @ap.TargetBarSeq · no bridging, no zero-fill · display only (no entry filter)</div>
@@ -465,6 +176,7 @@
                 }
             }
         </GridSection>
+        }
 
         @* The moving ATM±2 aggregate view is kept unchanged as a diagnostic (collapsed by default). Pinned captures (Telegram screenshots) render it open, exactly as before. *@
         @if (!CaptureMode)
@@ -873,29 +585,58 @@
     static string PxCell(double? v, bool signed = false, bool pct = false) =>
         v is not { } x || !double.IsFinite(x) ? "—" : (signed && x > 0 ? "+" : "") + x.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture) + (pct ? "%" : "");
 
+    // The quotes behind that view. On the live page they are re-read between completed bars, so the age shown is the real age of the quote shown.
+    PinnedQuote? _ceQuote, _peQuote;
+    long _quotesReadAt;
+    const long QuoteRereadMilliseconds = 1000;
+
     /// <summary>Builds the price-average view from the displayed (pinned) history of the selected contract. A failed quote read leaves the averages in place and the quotes unavailable; it never breaks the panel.</summary>
     async Task RefreshAvgPriceAsync(CancellationToken ct)
     {
         _avgPrice = null;
+        _ceQuote = _peQuote = null;
         var target = _snapshot?.Futures.FirstOrDefault()?.Bar;
         if (_fixed is null || _snapshot is null || target is null) { return; }
-        PinnedQuote? ce = null, pe = null;
         DateTimeOffset? boundary = CaptureMode ? target.EndAvailableAtUtc : DateTimeOffset.UtcNow;
+        await ReadAvgQuotesAsync(target.BarSeq, boundary!.Value, ct);
+        _avgPrice = OptionPriceAverages.Build(_fixed, target.BarSeq, boundary, _ceQuote, _peQuote);
+    }
+
+    /// <summary>
+    /// Live page only, on every header tick without a reload: re-reads the two quotes at most once a second and re-ages the quotes held to the current instant. A failed read keeps the last quotes, which age
+    /// into "stale". The averages and the contracts do not change here.
+    /// </summary>
+    async Task RefreshAvgQuotesAsync(CancellationToken ct)
+    {
+        if (CaptureMode || !await _reloadGate.WaitAsync(0, ct)) { return; }        // a reload in progress rebuilds the view itself
+        try
+        {
+            if (_avgPrice is not { } view || _fixed is null || _snapshot is null) { return; }
+            var now = DateTimeOffset.UtcNow;
+            if (Environment.TickCount64 - _quotesReadAt >= QuoteRereadMilliseconds) { await ReadAvgQuotesAsync(view.TargetBarSeq, now, ct); }
+            _avgPrice = OptionPriceAverages.Build(_fixed, view.TargetBarSeq, now, _ceQuote, _peQuote);
+        }
+        finally { _reloadGate.Release(); }
+    }
+
+    async Task ReadAvgQuotesAsync(int barSeq, DateTimeOffset boundary, CancellationToken ct)
+    {
+        if (_fixed is null || _snapshot is null) { return; }
+        _quotesReadAt = Environment.TickCount64;
         try
         {
             if (Services.GetService(typeof(AdaptiveQuoteAsOfService)) is AdaptiveQuoteAsOfService asOf)
             {
-                var q = await asOf.LoadBoundaryQuotesAsync(_snapshot.Session, [new AdaptiveQuoteAsOfService.BoundaryRequest(target.BarSeq, boundary!.Value, _fixed.Contract.CeToken, _fixed.Contract.PeToken)], ct);
-                if (q.TryGetValue(target.BarSeq, out var bq)) { ce = bq.Ce; pe = bq.Pe; }
+                var q = await asOf.LoadBoundaryQuotesAsync(_snapshot.Session, [new AdaptiveQuoteAsOfService.BoundaryRequest(barSeq, boundary, _fixed.Contract.CeToken, _fixed.Contract.PeToken)], ct);
+                if (q.TryGetValue(barSeq, out var bq)) { _ceQuote = bq.Ce; _peQuote = bq.Pe; }
             }
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception ex)
         {
             // quotes unavailable: the averages still render, but the failure is logged with its session / bar / strike context (deduplicated per cooldown)
-            Services.GetService<PollingFailureLogger>()?.Report("OptionAverageQuoteRead", ex, $"session={_snapshot.Session.Id}, bar={target.BarSeq}, strike={_fixed.Contract.Strike:0}, CE={_fixed.Contract.CeToken}, PE={_fixed.Contract.PeToken}");
+            Services.GetService<PollingFailureLogger>()?.Report("OptionAverageQuoteRead", ex, $"session={_snapshot.Session.Id}, bar={barSeq}, strike={_fixed.Contract.Strike:0}, CE={_fixed.Contract.CeToken}, PE={_fixed.Contract.PeToken}");
         }
-        _avgPrice = OptionPriceAverages.Build(_fixed, target.BarSeq, boundary, ce, pe);
     }
     // DAY AVG inputs (all completed bars of the session through the current boundary); reloaded only when the completed bar or the selected strike changes, never on a quote tick.
     DayAverageData? _day;
@@ -957,10 +698,11 @@
 
     async Task HeaderLoopAsync(CancellationToken ct)
     {
-        try
+        while (!ct.IsCancellationRequested)
         {
-            while (_headerTimer is not null && await _headerTimer.WaitForNextTickAsync(ct))
+            try
             {
+                if (_headerTimer is null || !await _headerTimer.WaitForNextTickAsync(ct)) return;
                 var displayed = _snapshot;
                 if (displayed is not null && _loadError is null && displayed.Session.TradeDate == TodayIst())
                 {
@@ -971,6 +713,7 @@
                     else if (runtime.LastCompletedBarSeq == (displayed.Futures.FirstOrDefault()?.Bar.BarSeq ?? 0))
                     {
                         _snapshot = displayed with { Runtime = runtime };
+                        await RefreshAvgQuotesAsync(ct);
                         await InvokeAsync(StateHasChanged);
                     }
                     else { await ReloadAsync(); }
@@ -982,15 +725,17 @@
                     if (header is not null) await ReloadAsync();
                 }
             }
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-        }
-        catch (Exception ex)
-        {
-            Services.GetService<PollingFailureLogger>()?.Report("AdaptiveHeaderRefresh", ex, "header poll");
-            _loadError = $"Adaptive header refresh failed: {ex.Message}";
-            await InvokeAsync(StateHasChanged);
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                // shown on the page; the next tick tries the full reload again, so one failed read never leaves the page frozen
+                Services.GetService<PollingFailureLogger>()?.Report("AdaptiveHeaderRefresh", ex, "header poll");
+                _loadError = $"Adaptive header refresh failed: {ex.Message}";
+                await InvokeAsync(StateHasChanged);
+            }
         }
     }
 
@@ -1210,11 +955,7 @@
         ? "—"
         : $"{_snapshot.Session.SourceBranch} / {(_snapshot.Session.SourceCommitSha.Length > 8 ? _snapshot.Session.SourceCommitSha[..8] : _snapshot.Session.SourceCommitSha)}";
 
-    string RecoveryText => _snapshot?.Runtime.RuntimeStatus == AdaptiveRuntimeStatus.Rebuilding
-        ? $"rebuilding since {FmtIst(_snapshot.Runtime.LastRecoveryStartedUtc)}"
-        : _snapshot?.Runtime.LastRecoveryCompletedUtc is { } t
-            ? $"last completed {FmtIst(t)} · reconciled {_snapshot.Runtime.LastRecoveryReconciledBars}"
-            : "not required yet";
+    string RecoveryText => _snapshot is null ? "not required yet" : ObserverRecoveryText.Describe(_snapshot.Runtime, DateTimeOffset.UtcNow);
 
     string ResidualComponentText
     {
@@ -1287,39 +1028,11 @@
 
     static string FmtPctPoints(double? x) => x.HasValue ? FmtSigned(x, 2) + "%" : "—";
 
-    // Sidecar metrics (futures Level-1 microstructure). Missing row => rendered as unavailable.
-    AdaptiveBasisSupplementalRow? Basis(int barSeq) =>
-        _snapshot?.BasisSupplemental is { } map && map.TryGetValue(barSeq, out var row) ? row : null;
-
-    AdaptiveFuturesSupplementalRow? Supplemental(int barSeq) =>
-        _snapshot?.FuturesSupplemental is { } map && map.TryGetValue(barSeq, out var row) ? row : null;
-
     static string PctAvg(double? x) => x is { } v ? RatioFormat.Plain(v, 2) + "%" : "—";
-
-    /// <summary>CE, PE and Direction cells. The Direction cell keeps its own style (sign only); CE and PE of a SIGNED metric get the same sign-only tint (<paramref name="tint"/>; Activity is never negative, so it passes false).
-    /// A tint is the sign of the defined metric, not a bullish/bearish reading (a positive PE value is not automatically bullish for NIFTY).</summary>
-    static RenderFragment DirectionCells(SideDirection d, int rawDecimals, bool tint = true) => __b =>
-    {
-        static string Side(RatioPart p, int decimals, bool tinted) =>
-            $"<td class=\"{(tinted ? RatioFormat.SignedClass(p) : string.Empty)}\" data-sign=\"{(tinted ? RatioFormat.SignName(p) : "none")}\">{RatioFormat.Cell(p, decimals)}</td>";
-        __b.AddMarkupContent(0, $"{Side(d.Ce, rawDecimals, tint)}{Side(d.Pe, rawDecimals, tint)}<td class=\"adaptive-direction {RatioFormat.SignClass(d.Direction)}\" data-direction-sign=\"{RatioFormat.SignName(d.Direction)}\">{RatioFormat.Cell(d.Direction, rawDecimals)}</td>");
-    };
-
-    // AVG of the VISIBLE rows only (same implementation as DAY AVG): arithmetic means of the continuous columns; ratios are SUM(numerator)/SUM(denominator); categorical columns are not averaged.
-    FuturesAvgRow FuturesAverage() =>
-        FuturesAverages.Compute(_snapshot?.Futures ?? [], Supplemental, Basis);
 
     static double? Relative(double? a, double? b) => a.HasValue && b.HasValue ? a.Value - b.Value : null;
     static string BoolMark(bool x) => x ? "YES" : "—";
     static string DirectionText(int direction) => direction > 0 ? "UP" : direction < 0 ? "DOWN" : "NEUTRAL";
-    static string StateClass(AdaptiveStateKind? state) => state switch
-    {
-        AdaptiveStateKind.Weak2 => "adaptive-row-weak2",
-        AdaptiveStateKind.Weak1 => "adaptive-row-weak1",
-        AdaptiveStateKind.Strong => "adaptive-row-strong",
-        _ => string.Empty,
-    };
-
     static string Fmt(double? x, int decimals = 2) => x.HasValue ? x.Value.ToString($"N{decimals}") : "—";
     static string Fmt0(double x) => x.ToString("N0");
     static string FmtInt(long x) => x.ToString("N0");
@@ -1329,24 +1042,6 @@
         var decimalPart = decimals > 0 ? "." + new string('0', decimals) : string.Empty;
         return x.Value.ToString($"+0{decimalPart};-0{decimalPart};0{decimalPart}");
     }
-    static string Depth5Label => "MicroDev5Proxy (Inv)";
-
-    /// <summary>Direct vs bridged OFI5 evidence of a bar: a bridged transition crossed an L1Superseded marker (both endpoints valid, at most 5 s apart).</summary>
-    static string Ofi5Title(AdaptiveFuturesDepth5Row? d) => d is null
-        ? "Top-5 sidecar unavailable for this bar (flag off, not yet recorded, or withheld after a failed verification)"
-        : $"OFI5 evidence: {Depth5Ratios.EvidenceText(d.Ofi5DirectTransitions, d.Ofi5BridgedTransitions)}; baseline resets {d.Ofi5BaselineResets}; eligible depth events {d.ValidDepthEvents?.ToString() ?? "—"} (repeats ignored {d.RepeatSnapshotsIgnored?.ToString() ?? "—"}, L1-superseded {d.SupersededMarkers}, invalid {d.InvalidSnapshots}, no-depth {d.NoDepthEvents?.ToString() ?? "—"}, feed gaps {d.FeedGapEvents?.ToString() ?? "—"})";
-
-    /// <summary>Price–Flow Agreement of the existing 10-bar rolling window: S = Strict, E = Enriched; ✓ agree, ✗ disagree, — undefined.</summary>
-    static string AgreeText(AdaptiveRollingStateRow? r)
-    {
-        static string One(string n, bool? v) => v is { } b ? $"{n}{(b ? "✓" : "✗")}" : $"{n}—";
-        return r is null ? "—" : One("S", r.PriceStrictDeltaAgree) + " " + One("E", r.PriceEnrichedDeltaAgree);
-    }
-
-    static string AgreeAvgText(Depth5AvgRow a) =>
-        a.AgreeStrictPct is null && a.AgreeEnrichedPct is null ? "—"
-            : $"S {(a.AgreeStrictPct is { } s ? s.ToString("0", System.Globalization.CultureInfo.InvariantCulture) + "%" : "—")} E {(a.AgreeEnrichedPct is { } e ? e.ToString("0", System.Globalization.CultureInfo.InvariantCulture) + "%" : "—")}";
-
     static string Sc(double? v) => RatioFormat.SignedClass(v);
     static string Sc(long? v) => RatioFormat.SignedClass(v);
     static string Sc(long v) => RatioFormat.SignedClass(v);

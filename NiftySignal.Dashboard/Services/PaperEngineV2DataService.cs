@@ -145,7 +145,7 @@ public sealed class PaperEngineV2DataService : IDisposable
                 var published = new DateTimeOffset(x.Published, TimeSpan.Zero);
                 var status = m.Status;
                 var detail = m.StatusDetail;
-                if (silent && status is MarkStatus.Fresh) { status = MarkStatus.Stale; detail = $"the Host's mark publisher has been silent for {(now - beatAt).TotalSeconds:0}s"; }
+                if (silent && status is MarkStatus.Fresh) { status = MarkStatus.Stale; detail = $"the mark publisher has been silent for {(now - beatAt).TotalSeconds:0}s"; }
                 var age = m.QuoteAvailableAt is { } at ? Math.Max(0d, (now - at).TotalSeconds) : (double?)null;
                 rows.Add(new V2LiveMarkRow(m, status, detail, age, published));
             }
@@ -163,6 +163,37 @@ public sealed class PaperEngineV2DataService : IDisposable
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             return V2LiveMarksView.Unavailable(V2PublisherState.Unreachable, $"live marks could not be read ({ex.GetType().Name})", day, now);
+        }
+    }
+
+    /// <summary>The execution writer's last heartbeat row, or null when it has never claimed the ledger (or the execution tables are not installed). Throws when the database cannot be read.</summary>
+    public async Task<ExecutionStateView?> ReadExecutionStateAsync(CancellationToken ct)
+    {
+        try
+        {
+            return await new ExecutionStore(_db).ReadStateAsync(ct);
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UndefinedTable || ex.SqlState == PostgresErrorCodes.InvalidSchemaName)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>The two Home grids. Two bounded reads (one state row, today's marks); safe to run every second.</summary>
+    public async Task<PaperPositionsView> LoadPaperPositionsAsync(DateTimeOffset now, TimeSpan staleAfter, CancellationToken ct)
+    {
+        try
+        {
+            var state = await ReadExecutionStateAsync(ct);
+            return PaperPositionsProjection.Build(now, state, await LoadLiveMarksAsync(now, ct), staleAfter);
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.InsufficientPrivilege)
+        {
+            return PaperPositionsView.Unavailable(now, "the Dashboard's read-only role has no SELECT permission on the execution state");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return PaperPositionsView.Unavailable(now, $"the execution state could not be read ({ex.GetType().Name}): positions are not known");
         }
     }
 

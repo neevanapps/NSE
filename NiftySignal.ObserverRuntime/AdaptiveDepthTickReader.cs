@@ -99,8 +99,11 @@ public sealed class AdaptiveDepthTickReader
 /// The Host's single entry to the Futures depth channel. Disabled (the default) it is inert; enabled it builds the <see cref="FuturesDepth5Feed"/> for recovery (streaming the whole session of the future token)
 /// and appends new rows during live polling. The same feed code serves both, so live and replay derive identical events from identical rows.
 /// </summary>
-public sealed class FuturesDepth5Gateway(IOptions<Top5MicrostructureOptions> options, AdaptiveDepthTickReader reader)
+public sealed class FuturesDepth5Gateway(IOptions<Top5MicrostructureOptions> options, AdaptiveDepthTickReader reader, IOptions<AdaptiveRecoveryOptions>? recoveryOptions = null)
 {
+    readonly int _liveBatch = (recoveryOptions?.Value ?? new AdaptiveRecoveryOptions()).LiveReadBatchSize;
+    readonly TimeSpan _window = TimeSpan.FromSeconds((recoveryOptions?.Value ?? new AdaptiveRecoveryOptions()).ReadWindowSeconds);
+
     public bool Enabled => options.Value.Enabled;
 
     /// <summary>S5: per-contract options Top-5 sidecar switch (default off, independent of <see cref="Enabled"/>).</summary>
@@ -109,8 +112,36 @@ public sealed class FuturesDepth5Gateway(IOptions<Top5MicrostructureOptions> opt
     public OptionsDepth5Source CreateOptionsSource(NiftySignalDbContext source, DateOnly day, IReadOnlyCollection<string> optionTokens, DateTimeOffset notBefore) =>
         new(reader, source, optionTokens, day, notBefore);
 
-    public async Task PollOptionsAsync(NiftySignalDbContext source, FuturesDepth5Feed feed, IReadOnlyCollection<string> optionTokens, DateOnly day, DateTimeOffset notBefore, CancellationToken ct) =>
-        feed.Ingest(await reader.ReadAfterIdAsync(source, optionTokens, feed.LastFetchedId, day, ct), notBefore);
+    public Task PollOptionsAsync(NiftySignalDbContext source, FuturesDepth5Feed feed, IReadOnlyCollection<string> optionTokens, DateOnly day, DateTimeOffset notBefore, CancellationToken ct,
+        DateTimeOffset? coverReceivedAt = null) =>
+        DrainAsync(source, feed, optionTokens, day, notBefore, coverReceivedAt, ct);
+
+    /// <summary>Bounded-memory recovery source for the future token (the same slicing and per-token Id order the options source uses).</summary>
+    public OptionsDepth5Source CreateFuturesSource(NiftySignalDbContext source, DateOnly day, string futureToken, DateTimeOffset notBefore) =>
+        new(reader, source, [futureToken], day, notBefore);
+
+    /// <summary>
+    /// Reads the rows after the feed's cursor in bounded queries: all of them, or (during a live backlog) only until a row received at or after <paramref name="coverReceivedAt"/> has been fed, so the feed never
+    /// holds much more depth than the Level-1 rows being processed. With no cursor yet the start is found through the received-time index (see <see cref="AdaptiveSourceTickReader.FindStartCursorAsync"/>).
+    /// </summary>
+    async Task DrainAsync(NiftySignalDbContext source, FuturesDepth5Feed feed, IReadOnlyCollection<string> tokens, DateOnly day, DateTimeOffset notBefore, DateTimeOffset? coverReceivedAt, CancellationToken ct)
+    {
+        while (true)
+        {
+            if (coverReceivedAt is { } cover && feed.LastFetchedReceivedAt >= cover) return;
+            var cursor = feed.LastFetchedId;
+            long after = cursor;
+            if (cursor <= 0)
+            {
+                if (await AdaptiveSourceTickReader.FindStartCursorAsync(source, tokens, day, _window, ct) is not { } start) return;
+                after = start;
+            }
+
+            var rows = await reader.ReadAfterIdAsync(source, tokens, after, day, ct, _liveBatch);
+            feed.Ingest(rows, notBefore);
+            if (rows.Count < _liveBatch || feed.LastFetchedId <= cursor) return;
+        }
+    }
 
     public async Task<FuturesDepth5Feed> RecoverFeedAsync(NiftySignalDbContext source, DateOnly day, string futureToken, DateTimeOffset notBefore, CancellationToken ct)
     {
@@ -130,8 +161,8 @@ public sealed class FuturesDepth5Gateway(IOptions<Top5MicrostructureOptions> opt
         return feed;
     }
 
-    public async Task PollAsync(NiftySignalDbContext source, FuturesDepth5Feed feed, string futureToken, DateOnly day, DateTimeOffset notBefore, CancellationToken ct) =>
-        feed.Ingest(await reader.ReadAfterIdAsync(source, [futureToken], feed.LastFetchedId, day, ct), notBefore);
+    public Task PollAsync(NiftySignalDbContext source, FuturesDepth5Feed feed, string futureToken, DateOnly day, DateTimeOffset notBefore, CancellationToken ct, DateTimeOffset? coverReceivedAt = null) =>
+        DrainAsync(source, feed, [futureToken], day, notBefore, coverReceivedAt, ct);
 }
 
 /// <summary>
@@ -140,7 +171,7 @@ public sealed class FuturesDepth5Gateway(IOptions<Top5MicrostructureOptions> opt
 /// ReceivedAt &lt;= T; the <see cref="LookaheadMargin"/> additionally covers a row whose ReceivedAt is slightly out of Id order. The events delivered through any instant are therefore exactly those a whole-day ingest
 /// would deliver (and exactly those live polling delivers), while the pending set stays tiny instead of holding the whole day.
 /// </summary>
-public sealed class OptionsDepth5Source
+public sealed class OptionsDepth5Source : IAdaptiveDepthSource
 {
     public static readonly TimeSpan LookaheadMargin = TimeSpan.FromSeconds(5);
     static readonly TimeSpan WindowLength = TimeSpan.FromMinutes(2);
@@ -155,6 +186,9 @@ public sealed class OptionsDepth5Source
     readonly Dictionary<string, TokenBuffer> _buffers = new(StringComparer.Ordinal);
     int _buffered;
     bool _exhausted;
+    long _lowestPreviousWindow = long.MaxValue;
+    long _lowestLastWindow = long.MaxValue;
+    long _lastReadId;
     DateTimeOffset _windowStart;
     readonly DateTimeOffset _dayEnd;
 
@@ -195,7 +229,10 @@ public sealed class OptionsDepth5Source
             var windowEnd = _windowStart + WindowLength;
             var rows = await _reader.ReadReceivedWindowAsync(_source, _tokens, _windowStart, windowEnd, _day, ct);
             _windowStart = windowEnd;
+            _lowestPreviousWindow = _lowestLastWindow;
+            _lowestLastWindow = rows.Count == 0 ? long.MaxValue : rows[0].Id;
             if (rows.Count == 0) continue;
+            _lastReadId = Math.Max(_lastReadId, rows[^1].Id);
             RowsRead += rows.Count;
             foreach (var r in rows)
             {
@@ -226,6 +263,17 @@ public sealed class OptionsDepth5Source
 
             if (b.Head > 1024 && b.Head * 2 > b.Rows.Count) { b.Rows.RemoveRange(0, b.Head); b.Head = 0; }
         }
+    }
+
+    /// <summary>The unfed rows expressed as an Id position (see <see cref="AdaptiveRecoveryTickStream.Capture"/>).</summary>
+    public AdaptiveSourcePosition Capture()
+    {
+        var lowest = Math.Min(_lowestPreviousWindow, _lowestLastWindow);
+        foreach (var b in _buffers.Values)
+            if (b.Head < b.Rows.Count) lowest = Math.Min(lowest, b.Rows[b.Head].Id);
+        var resume = lowest == long.MaxValue ? _lastReadId : lowest - 1;
+        var skip = _buffers.Where(x => x.Value.LastIngestedId > resume).ToDictionary(x => x.Key, x => x.Value.LastIngestedId, StringComparer.Ordinal);
+        return new AdaptiveSourcePosition(resume, skip);
     }
 
     sealed class IdComparer : IComparer<DepthRawRow>

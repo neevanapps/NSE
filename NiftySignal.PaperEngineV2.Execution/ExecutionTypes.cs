@@ -14,9 +14,12 @@ public enum RejectionReason
     DuplicateOrder, InfrastructureFailure,
     NoQualifyingContract, SpreadTooWide, OutsideEntryWindow, PositionLimit, EntriesBlocked, ConflictingSignals,
     WarmupIncomplete,           // appended: fewer than filters.minCompletedBars verified bars of the session have been evaluated
+    Avg5NotMet,                 // appended: the Avg5 condition no longer held at the fill; the intent keeps waiting
+    OppositeSignal,             // appended: an opposite signal arrived before the pending order filled
 }
 
-public enum ExitReason { Discretionary, OppositeSignal, StopLoss, Target, Trailing, MaxHold, Terminal, RiskLiquidation }
+/// <summary><see cref="Terminal"/> is the mandatory session liquidation; <see cref="Protective"/> the independent safety flatten.</summary>
+public enum ExitReason { Discretionary, OppositeSignal, StopLoss, Target, Trailing, MaxHold, Terminal, RiskLiquidation, Protective }
 
 public enum PositionState { Open, ExitPending, Closed, Unresolved }
 
@@ -27,21 +30,41 @@ public interface ILotSizeSource
 }
 
 /// <summary>
-/// Engine-level parameters that are REQUIRED (no defaults): the retry cut-off for a pending terminal exit is an owner decision, the cost schedules are the existing date-effective NSE schedules, and the lot sizes
-/// come from the instrument master.
+/// The IST session timers. No new entry at or after <see cref="EntryCutoff"/> (pending ones are cancelled) while open positions are still managed; every position still open at <see cref="LiquidationStart"/> is
+/// requested to exit, and anything not confirmed closed at <see cref="LiquidationDeadline"/> is a reported liquidation failure. The 15:08 start is a starting value.
+/// </summary>
+public sealed record SessionTimes(TimeOnly EntryCutoff, TimeOnly LiquidationStart, TimeOnly LiquidationDeadline)
+{
+    public static readonly SessionTimes Default = new(new(15, 0), new(15, 8), new(15, 10));
+
+    public IReadOnlyList<string> Validate()
+    {
+        var errors = new List<string>();
+        if (EntryCutoff > new TimeOnly(15, 0)) errors.Add("the entry cutoff cannot be later than 15:00 IST");
+        if (LiquidationStart < EntryCutoff) errors.Add("liquidation cannot start before the entry cutoff");
+        if (LiquidationDeadline <= LiquidationStart) errors.Add("the liquidation deadline must be later than its start");
+        if (LiquidationDeadline > new TimeOnly(15, 10)) errors.Add("the liquidation deadline cannot be later than 15:10 IST");
+        return errors;
+    }
+}
+
+/// <summary>
+/// Engine-level parameters: the retry cut-off for an unfilled liquidation is an owner decision, the cost schedules are the existing date-effective NSE schedules, the lot sizes come from the instrument master.
 /// </summary>
 public sealed record ExecutionOptions
 {
-    public static readonly TimeOnly TerminalTime = new(15, 0, 0);
-
-    public ExecutionOptions(TimeOnly terminalRetryUntil, IReadOnlyList<CostScheduleEntry> costSchedules, ILotSizeSource lotSizes)
+    public ExecutionOptions(TimeOnly terminalRetryUntil, IReadOnlyList<CostScheduleEntry> costSchedules, ILotSizeSource lotSizes, SessionTimes? times = null)
     {
-        if (terminalRetryUntil <= TerminalTime) throw new ArgumentOutOfRangeException(nameof(terminalRetryUntil), "the terminal retry cut-off must be later than the 15:00:00 terminal time");
+        Times = times ?? SessionTimes.Default;
+        if (Times.Validate() is { Count: > 0 } timeErrors) throw new ArgumentException(string.Join(" ", timeErrors), nameof(times));
+        if (terminalRetryUntil <= Times.LiquidationDeadline) throw new ArgumentOutOfRangeException(nameof(terminalRetryUntil), "the terminal retry cut-off must be later than the liquidation deadline");
         if (costSchedules.Count == 0) throw new ArgumentException("at least one cost schedule is required: costs are never assumed to be zero", nameof(costSchedules));
         var errors = new CostsConfig { Schedules = costSchedules }.Validate();
         if (errors.Count > 0) throw new ArgumentException(string.Join(" ", errors), nameof(costSchedules));
         TerminalRetryUntil = terminalRetryUntil; CostSchedules = costSchedules; LotSizes = lotSizes ?? throw new ArgumentNullException(nameof(lotSizes));
     }
+
+    public SessionTimes Times { get; }
 
     public TimeOnly TerminalRetryUntil { get; }
 
@@ -100,10 +123,53 @@ public sealed record StrategyFaulted(string EventId, string StrategyId, string C
     public override string Kind => "StrategyFaulted";
 }
 
+/// <summary>A directional entry intent: created by a signal, consumed by exactly one entry fill or cancelled. <see cref="ReferenceToken"/> is the frozen Avg5 reference contract (null for immediate entry).</summary>
+public sealed record EntryIntentCreated(string EventId, string StrategyId, string ConfigHash, int BarSeq, DateTimeOffset At, string IntentId, OptionRight Right, string? ReferenceToken, bool AwaitingFlat) : PaperEvent(EventId, StrategyId, ConfigHash, BarSeq, At)
+{
+    public override string Kind => "EntryIntentCreated";
+}
+
+public sealed record EntryIntentCancelled(string EventId, string StrategyId, string ConfigHash, int BarSeq, DateTimeOffset At, string IntentId, OptionRight Right, string Reason) : PaperEvent(EventId, StrategyId, ConfigHash, BarSeq, At)
+{
+    public override string Kind => "EntryIntentCancelled";
+}
+
+/// <summary>The evidence of an Avg5 entry: the signal instant, the reference contract, its live mid and its average at the fill.</summary>
+public sealed record Avg5EntryEvidence(string EventId, string StrategyId, string ConfigHash, int BarSeq, DateTimeOffset At, string PositionId, DateTimeOffset SignalAt, string ReferenceToken, double ReferenceMid, double Average, int AverageBarSeq, string ExecutionToken, double EntryDelaySeconds) : PaperEvent(EventId, StrategyId, ConfigHash, BarSeq, At)
+{
+    public override string Kind => "Avg5EntryEvidence";
+}
+
+/// <summary>The partial-profit policy frozen at the entry fill. <see cref="Quantity"/> 0 with a <see cref="DisabledReason"/> = partial booking is off for this position.</summary>
+public sealed record PartialTargetAssigned(string EventId, string StrategyId, string ConfigHash, int BarSeq, DateTimeOffset At, string PositionId, int Dte, double? Vix, DateTimeOffset? VixObservedAt, string? VixBucket,
+    double? TargetPercent, decimal? TargetPrice, int Quantity, decimal EntryPrice, int OriginalQuantity, DateOnly Expiry, string? DisabledReason) : PaperEvent(EventId, StrategyId, ConfigHash, BarSeq, At)
+{
+    public override string Kind => "PartialTargetAssigned";
+}
+
+public sealed record PartialExitRequested(string EventId, string StrategyId, string ConfigHash, int BarSeq, DateTimeOffset At, string PositionId, int Quantity, decimal TriggerBid, decimal TargetPrice, DecisionKey Decision) : PaperEvent(EventId, StrategyId, ConfigHash, BarSeq, At)
+{
+    public override string Kind => "PartialExitRequested";
+}
+
+/// <summary>A confirmed partial fill of a still-open position. The trade is counted closed only by its final <see cref="ExitFilled"/>, whose P&amp;L includes this one.</summary>
+public sealed record PartialExitFilled(string EventId, string StrategyId, string ConfigHash, int BarSeq, DateTimeOffset At, string PositionId, int Quantity, int RemainingQuantity, decimal FillPrice, decimal Fees,
+    decimal GrossPnl, decimal NetPnl, DateTimeOffset QuoteAvailableAt, long QuoteTickId) : PaperEvent(EventId, StrategyId, ConfigHash, BarSeq, At)
+{
+    public override string Kind => "PartialExitFilled";
+}
+
+/// <summary>A position not confirmed closed at the liquidation deadline. It stays open and keeps being retried: never reported closed without a fill.</summary>
+public sealed record LiquidationFailed(string EventId, string StrategyId, string ConfigHash, int BarSeq, DateTimeOffset At, string PositionId, int RemainingQuantity, string Detail) : PaperEvent(EventId, StrategyId, ConfigHash, BarSeq, At)
+{
+    public override string Kind => "LiquidationFailed";
+}
+
 /// <summary>A snapshot of one position for reporting (the live engine state is private to the strategy runtime).</summary>
 public sealed record PositionView(
     string PositionId, string StrategyId, OptionRight Right, string Token, double Strike, DateOnly Expiry, int Quantity, PositionState State, decimal EntryPrice, decimal EntryFees,
-    decimal? ExitPrice, decimal? ExitFees, decimal? GrossPnl, decimal? NetPnl, ExitReason? ExitReason, decimal Mfe, decimal Mae, int MarkGaps, int BarsHeld);
+    decimal? ExitPrice, decimal? ExitFees, decimal? GrossPnl, decimal? NetPnl, ExitReason? ExitReason, decimal Mfe, decimal Mae, int MarkGaps, int BarsHeld,
+    int RemainingQuantity = 0, decimal PartialGrossPnl = 0m, decimal PartialNetPnl = 0m, decimal? PartialTargetPrice = null, string? PartialStatus = null, DateTimeOffset? EntryAt = null);
 
 public enum ActivationFailureKind { UnsupportedFillQuoteRule, MissingCostSchedule }
 

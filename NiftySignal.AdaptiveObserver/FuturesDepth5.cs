@@ -340,6 +340,9 @@ public sealed class FuturesDepth5Feed
 
     public long LastFetchedId { get; private set; }
 
+    /// <summary>Latest received time among the rows fed so far; a live backlog uses it to read depth only as far as the Level-1 rows it is about to process.</summary>
+    public DateTimeOffset LastFetchedReceivedAt { get; private set; } = DateTimeOffset.MinValue;
+
     public int PendingCount => _pending.Count;
 
     /// <summary>Feeds source rows (Id order). Events before <paramref name="notBefore"/> are dropped exactly as the Level-1 path drops clean ticks before the observation start; the normalizer still sees every row.</summary>
@@ -348,6 +351,7 @@ public sealed class FuturesDepth5Feed
         foreach (var row in rows)
         {
             if (row.Id > LastFetchedId) LastFetchedId = row.Id;
+            if (row.ReceivedAt > LastFetchedReceivedAt) LastFetchedReceivedAt = row.ReceivedAt;
             if (_normalizer.Process(row) is { } o && o.AvailableAt >= notBefore)
                 _pending.Enqueue(o, (o.AvailableAt, o.Id));
         }

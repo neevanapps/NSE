@@ -10,8 +10,8 @@ public enum AlertClass { Opened, Closed, OrderRejected, PartialFill, ExecutionFa
 public enum AlertStatus { Pending = 0, Sent = 1, Uncertain = 2, Failed = 3, Expired = 4, Sending = 5 }
 
 /// <summary>
-/// Per-event opt-in. EVERYTHING is off by default: a strategy trading in the shadow engine sends nothing unless the owner enables that class. <see cref="PartialFill"/> exists for the contract but V2 v1 is
-/// all-or-none, so no partial-fill event is ever produced (the class can be enabled; nothing will ever match it).
+/// Per-event opt-in. EVERYTHING is off by default: a strategy trading in the shadow engine sends nothing unless the owner enables that class. <see cref="PartialFill"/> matches a filled partial-profit exit
+/// (each order leg itself still fills all-or-none).
 /// </summary>
 public sealed record AlertOptions(bool Opened = false, bool Closed = false, bool OrderRejected = false, bool PartialFill = false, bool ExecutionFailure = false,
     int MaxAttempts = 5, TimeSpan? MaxAge = null)
@@ -58,7 +58,8 @@ public static class AlertFormatter
         EntryFilled => AlertClass.Opened,
         ExitFilled => AlertClass.Closed,
         EntryRejected => AlertClass.OrderRejected,
-        StrategyFaulted or PositionUnresolved => AlertClass.ExecutionFailure,
+        PartialExitFilled => AlertClass.PartialFill,
+        StrategyFaulted or PositionUnresolved or LiquidationFailed => AlertClass.ExecutionFailure,
         _ => null,
     };
 
@@ -88,6 +89,8 @@ public static class AlertFormatter
             EntryRejected r => $"ORDER REJECTED {r.Right?.ToString().ToUpperInvariant() ?? "-"} | {r.Reason} | {Cut(r.Detail)} | bar {r.BarSeq} | {Time(r.At)}",
             StrategyFaulted s => $"EXECUTION FAILURE: strategy stopped | {Cut(s.Message)} | bar {s.BarSeq} | {Time(s.At)}",
             PositionUnresolved u => $"EXECUTION FAILURE: position UNRESOLVED (no exit fill) | {Cut(u.Detail)} | bar {u.BarSeq} | {Time(u.At)}",
+            PartialExitFilled p => $"PARTIAL EXIT {p.PositionId.Split(':').Last()} x{p.Quantity} @ {p.FillPrice:0.00} | remaining {p.RemainingQuantity} | gross {p.GrossPnl:0.00} | net {p.NetPnl:0.00} (this leg) | bar {p.BarSeq} | {Time(p.At)}",
+            LiquidationFailed l => $"EXECUTION FAILURE: session liquidation NOT confirmed, {l.RemainingQuantity} still open | {Cut(l.Detail)} | bar {l.BarSeq} | {Time(l.At)}",
             _ => throw new ArgumentException($"no alert text for {e.Kind}", nameof(e)),
         };
     }
@@ -97,7 +100,7 @@ public static class AlertFormatter
 /// Turns ledger events into outbox rows (idempotent by alert id = event id + class, so replay after a restart enqueues nothing twice and repairs a crash between the ledger write and the enqueue) for the
 /// ENABLED classes only. Wraps the durable event store; the ledger write happens first, so a failure of the outbox never loses the ledger event. A failure is counted and rethrown to the engine's sink containment.
 /// </summary>
-public sealed class AlertingEventSink(IPaperEventSink inner, NpgsqlDataSource db, AlertOptions options, TimeProvider clock, Func<string, int?>? versionOf = null) : IPaperEventSink
+public sealed class AlertingEventSink(IPaperEventSink inner, NpgsqlDataSource db, AlertOptions options, TimeProvider clock, Func<string, int?>? versionOf = null, ExecutionOwnership? writer = null) : IPaperEventSink
 {
     long _failures, _enqueued;
 
@@ -113,11 +116,15 @@ public sealed class AlertingEventSink(IPaperEventSink inner, NpgsqlDataSource db
         if (AlertFormatter.ClassOf(e) is not { } c || !options.Enabled(c)) return;
         try
         {
-            var now = clock.GetUtcNow().UtcTicks;
-            using var cmd = db.CreateCommand($"INSERT INTO {V2Schema.SchemaName}.pev2_alert_outbox (alert_id, alert_class, strategy_id, event_id, message_text, status, attempts, created_utc_ticks, next_attempt_utc_ticks) VALUES ($1,$2,$3,$4,$5,0,0,$6,$6) ON CONFLICT (alert_id) DO NOTHING");
-            cmd.Parameters.AddWithValue(AlertFormatter.AlertId(e, c)); cmd.Parameters.AddWithValue(c.ToString()); cmd.Parameters.AddWithValue(e.StrategyId); cmd.Parameters.AddWithValue(e.EventId);
-            cmd.Parameters.AddWithValue(AlertFormatter.Format(e, versionOf?.Invoke(e.StrategyId), ResolveEntry(e))); cmd.Parameters.AddWithValue(e.At.UtcTicks);
-            if (cmd.ExecuteNonQuery() == 1) Interlocked.Increment(ref _enqueued);
+            var text = AlertFormatter.Format(e, versionOf?.Invoke(e.StrategyId), ResolveEntry(e));          // read before the fenced write
+            var queued = Pev2Write.Run(db, writer, (connection, tx) =>
+            {
+                using var cmd = new NpgsqlCommand($"INSERT INTO {V2Schema.SchemaName}.pev2_alert_outbox (alert_id, alert_class, strategy_id, event_id, message_text, status, attempts, created_utc_ticks, next_attempt_utc_ticks) VALUES ($1,$2,$3,$4,$5,0,0,$6,$6) ON CONFLICT (alert_id) DO NOTHING", connection, tx);
+                cmd.Parameters.AddWithValue(AlertFormatter.AlertId(e, c)); cmd.Parameters.AddWithValue(c.ToString()); cmd.Parameters.AddWithValue(e.StrategyId); cmd.Parameters.AddWithValue(e.EventId);
+                cmd.Parameters.AddWithValue(text); cmd.Parameters.AddWithValue(e.At.UtcTicks);
+                return cmd.ExecuteNonQuery() == 1;
+            });
+            if (queued) Interlocked.Increment(ref _enqueued);
         }
         catch (Exception)
         {

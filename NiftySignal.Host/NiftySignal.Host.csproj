@@ -21,6 +21,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\NiftySignal.ObserverRuntime\NiftySignal.ObserverRuntime.csproj" />
     <ProjectReference Include="..\NiftySignal.AdaptiveObserver\NiftySignal.AdaptiveObserver.csproj" />
     <ProjectReference Include="..\NiftySignal.AdaptiveObserverData\NiftySignal.AdaptiveObserverData.csproj" />
     <ProjectReference Include="..\NiftySignal.Domain\NiftySignal.Domain.csproj" />
