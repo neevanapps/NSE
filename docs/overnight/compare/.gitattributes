@@ -1,0 +1,2 @@
+# Evidence files: keep the exact bytes, so the recorded SHA-256 values hold on every checkout.
+* -text

@@ -27,7 +27,7 @@ $env:GIT_INDEX_FILE="$env:TEMP\nse-fingerprint.index"; git read-tree HEAD; git a
 & "D:\Projects\NSE-release-20261124\docs\overnight\Run-FreshnessCertification.ps1"
 ```
 
-**A3.** Review `git status` and `git diff`, then commit on the feature branch and merge to `master` in your normal way. Expected: `git status --porcelain` prints nothing on `master`. Failure: the deploy scripts refuse a dirty or non-master checkout.
+**A3.** Done locally on 27 November: `master` was fast-forwarded to `17ce4c79ab819ef4466ed90a8de59c338e040fcb` (with its parent `78d9b8bd`), followed by a documentation and benchmark-tooling commit. **Not pushed**; pushing needs your approval. Before deploying, expected: `git status --porcelain` prints nothing on `master`, and A1 prints the expected tree. Record the SHA. Failure: the deploy scripts refuse a dirty or non-master checkout.
 
 ```powershell
 git rev-parse HEAD
@@ -99,6 +99,35 @@ psql -U <db role> -d niftysignal_adaptive_observer -c "SELECT tablename, tableow
 
 Expected: the role the Observer will connect as owns these tables (it applies migrations, including `ALTER TABLE`, at start). Failure: use that owner role for the Observer.
 
+**B8. Observer migrations** (observer database; changes nothing). Run now, keep the output, and run the second command again after the first Observer start (E5).
+
+```powershell
+@'
+SELECT "MigrationId" FROM "__EFMigrationsHistory" WHERE "MigrationId" >= '20261124' ORDER BY 1;
+SELECT table_name, count(*) AS event_columns FROM information_schema.columns
+ WHERE table_name IN ('adaptive_futures_depth5_bars', 'adaptive_options_depth5_bars')
+   AND column_name IN ('AskNotionalEventSum','BidNotionalEventSum','FeedGapEvents','MicroDev5EventSum','NoDepthEvents','RepeatSnapshotsIgnored','Tob5EventSum','ValidDepthEvents','ValidMicroDev5Events')
+ GROUP BY table_name ORDER BY table_name;
+'@ | Set-Content C:\Temp\observer-migrations.sql -Encoding ascii
+```
+
+```powershell
+psql -U <db role> -d niftysignal_adaptive_observer -v ON_ERROR_STOP=1 -f C:\Temp\observer-migrations.sql
+```
+
+Expected **after** the Observer start: these six rows, and `event_columns` = 9 for both tables.
+
+| Migration | Before deployment |
+|---|---|
+| `20261124060445_AddFuturesDepth5Sidecar` | normally present; if missing, the Observer applies it too: note it |
+| `20261124064802_AddOptionsDepth5Sidecar` | same |
+| `20261125074852_AddDepth5EventBasedColumns` | present only if the installed release already includes `78d9b8bd` (B3); otherwise pending |
+| `20261126043514_AddObserverRecoveryProgress` | pending |
+| `20261126053253_AddBarPublications` | pending |
+| `20261126080333_AddObserverCheckpoints` | pending |
+
+Failure after the start (a row missing or a count other than 9): do not activate execution (E1); read the Observer log.
+
 ## C. VM backups (changes: writes files only)
 
 **C1.** One per database: tick database, `niftysignal_adaptive_observer`, ledger database. Expected: exit code 0. Failure: do not continue.
@@ -124,7 +153,7 @@ Service folder backups are taken and verified by `vm-deploy.ps1` itself (D4).
 | D3 | Local settings | VM | configuration | **yes** |
 | D4 | Preflight, then deploy | desktop | binaries, services | **yes** |
 
-**D1. Migrations.** Applied automatically at start: the three observer migrations (`20261126043514`, `20261126053253`, `20261126080333`) by the Observer; Host tick/volume-bar migrations by the Host (none new in this release). **Owner-run only:** the ledger script. Copy `NiftySignal.PaperEngineV2.Data\Sql\pev2-schema.idempotent.sql` to the VM; remove the byte-order mark; apply with the schema owner role. It is idempotent.
+**D1. Migrations.** Observer database (`niftysignal_adaptive_observer`): the Observer applies every pending migration at start. This release needs `20261125074852` (Top-5 event-based columns) and the three new Observer migrations `20261126043514`, `20261126053253`, `20261126080333`; verify with B8 before and after. Execution service: its one migration, `20261126053557_AddExecutionService`, is in the ledger database and is **owner-run** (below). Host tick/volume-bar migrations: none new in this release. **Owner-run only:** the ledger script. Copy `NiftySignal.PaperEngineV2.Data\Sql\pev2-schema.idempotent.sql` to the VM; remove the byte-order mark; apply with the schema owner role. It is idempotent.
 
 ```powershell
 [IO.File]::WriteAllText("C:\Temp\pev2.sql", [IO.File]::ReadAllText("C:\Temp\pev2-schema.idempotent.sql"), (New-Object Text.UTF8Encoding $false))
@@ -273,7 +302,7 @@ psql -U <db role> -d <ledger db> -c "SELECT component, owner, epoch, status, to_
 Get-Content (Get-ChildItem C:\Naveen\NiftySignal.ExecutionService\logs\*.log | Sort-Object LastWriteTime | Select-Object -Last 1) -Tail 60
 ```
 
-**E5.** Observer log: build identity, no ownership refusal, recovery reaches Live. Host log: no adaptive observer start, no Paper Engine V2 start. After 09:20: Dashboard shows four market-summary grids, Option Price Averages, exactly two paper grids with four rows each, no execution banner. Telegram "Send pre-live test" sends a real message: your decision.
+**E5.** Run the second B8 command: six migration rows, 9 and 9. Observer log: build identity, no ownership refusal, recovery reaches Live. Host log: no adaptive observer start, no Paper Engine V2 start. After 09:20: Dashboard shows four market-summary grids, Option Price Averages, exactly two paper grids with four rows each, no execution banner. Telegram "Send pre-live test" sends a real message: your decision.
 
 **E6.** When verified, set both new services to start automatically (approval yes).
 

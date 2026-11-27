@@ -1,10 +1,10 @@
 # Release readiness, paper session of Monday 30 November 2026
 
-**Status (27 November, after 13:00): tree `45008e3...` has a passing full test suite, both real-data recovery certifications MET (section 13.6) and four packages built and validated locally (section 11). The owner approved the commit on 27 November (this report is part of it); nothing is merged, pushed or deployed. The 300-second recovery finding is closed by the owner.**
+**Status (27 November, after 13:00): tree `45008e3...` has a passing full test suite, both real-data recovery certifications MET (section 13.6) and four packages built and validated locally (section 11). The owner approved the commit on 27 November (this report is part of it); local `master` is merged; nothing is pushed or deployed. The 300-second recovery finding is closed by the owner.**
 
 **Recommendation: local validation complete; GO to proceed to owner approval, commit and merge for paper trading on Monday 30 November.** Deployment still depends on the VM preflight in the owner checklist. VM performance (recovery time, freshness false-block rate) is unmeasured. Real money: NO-GO. Paper only.
 
-Nothing has been merged, pushed or deployed. The VM was not contacted. No broker session was started and no order was placed.
+Nothing has been pushed or deployed. The VM was not contacted. No broker session was started and no order was placed.
 
 ## 1. Source identity
 
@@ -556,8 +556,9 @@ Inputs and all parity table hashes are identical to the `aa906ab...` certificati
 
 ### 13.7 Remaining steps
 
-1. Commit approved and made with the tree without `docs` at `45008e381918ec091c37b1b9c861ea9a1fa03630`. Merge and push need separate approval.
-   - Left out of the commit as temporary benchmark harnesses: `docs/overnight/compare/RecoveryComparisonBenchmark.cs` and `RecoveryTimeoutBenchmark.cs`. They remain in the release folder; `Run-RecoveryComparison.ps1` needs them and section 12 records their SHA-256.
+1. Commit `17ce4c79ab819ef4466ed90a8de59c338e040fcb` made with the tree without `docs` at `45008e381918ec091c37b1b9c861ea9a1fa03630`; local `master` fast-forwarded to it with owner approval. Push and deployment need separate approval.
+   - The benchmark harnesses, left out of that commit, follow in a documentation commit: `docs/overnight/compare/` with the pooled-run files, the first-run files of section 12.7 (recovered from local git objects, SHA-256 equal to the values recorded there), a patch back to tree `aa906ab...` and a `README.md` with the prerequisites.
+   - Checklist B8 and D1 now verify migration `20261125074852_AddDepth5EventBasedColumns` with the three new Observer migrations.
    - `git diff --check` reports one finding type: a blank line at the end of three `adaptive-*.idempotent.sql` files. Not changed, because it would change the certified tree.
 2. Owner VM preflight, backups and deployment (checklist), preferably 28 or 29 November.
 3. First session: watch the freshness blocks (checklist E7) and the first recovery duration (D3a).
